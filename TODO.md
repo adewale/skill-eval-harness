@@ -1,6 +1,8 @@
 # TODO — Jetty compatibility
 
-Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-api.jetty.io/v1/chat/completions`, trajectory recording, sandboxed runbook execution, agent runtimes, workflow steps, and `simple_judge` evaluation. To make this harness compatible, keep the harness manifest/grading model as source of truth and add a Jetty adapter layer.
+Detailed spec: [`docs/jetty-support-spec.md`](docs/jetty-support-spec.md).
+
+Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-api.jetty.io/v1/chat/completions`, trajectory recording, sandboxed runbook execution, agent runtimes, workflow steps, and `simple_judge` evaluation. Public docs consulted for the spec include Jetty's Chat Completions API, API Overview, Writing Runbooks, Custom Benchmarks, Evaluating LLMs, Agents Overview, and Architecture Overview pages. To make this harness compatible, keep the harness manifest/grading model as source of truth and add a Jetty adapter layer.
 
 ## API adapter
 
