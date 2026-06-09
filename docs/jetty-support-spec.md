@@ -1,34 +1,34 @@
 # Jetty Support Spec
 
-Status: planned implementation, grounded in public Jetty docs checked on 2026-06-09.
+Status: planned implementation, grounded in Jetty public docs and `jettyio/jettyio-skills` checked on 2026-06-09.
 
-This spec defines how Skill Eval Harness should integrate with Jetty without changing the harness manifest, split, assertion, or grading model. Jetty is an execution adapter: it can run tasks, record trajectories, persist artifacts, and optionally run LLM judges, but the local harness remains the source of truth for manifests and deterministic grading.
+This spec defines the simplest useful Jetty adapter for Skill Eval Harness. Jetty executes harness tasks in runbook mode and records trajectories/artifacts. Skill Eval Harness remains the source of truth for manifests, variants, splits, deterministic assertions, benchmark summaries, and saturation/no-lift flags.
 
-## Goals
+## Design principle
 
-1. Run existing `evals/shared-benchmark.json` manifests on Jetty.
-2. Preserve the current harness run layout so existing `benchmark`, `render-viewer`, `compare-results`, and judge-result merging keep working.
-3. Keep answer keys, hidden prompts, and skill files fail-closed by default.
-4. Support paired variants:
-   - `with_skill`
-   - `without_skill`
-   - `old_skill`
-   - `ablation:<id>`
-5. Import Jetty trajectories/artifacts into local run directories.
-6. Add Jetty judge support as an optional layer, not a replacement for local deterministic assertions.
-7. Implement the adapter with red-green-refactor TDD and correctness-by-construction constraints.
+**Jetty executes. Skill Eval Harness decides.**
 
-## Non-goals
+Jetty should provide:
 
-- Do not rewrite the manifest schema around Jetty.
-- Do not make Jetty required for local or non-Jetty users.
-- Do not make live Jetty API calls from deterministic unit tests.
-- Do not claim ablation value until `ablation:<id>` rows are actually run and benchmarked.
-- Do not upload answer keys or hidden prompt files into public artifacts.
+- sandboxed agent execution;
+- agent runtime/model/snapshot selection;
+- trajectory records;
+- artifact persistence;
+- optional LLM judge workflows later.
 
-## Jetty docs consulted
+The harness should continue to decide:
 
-Public docs checked:
+- which cases exist;
+- which split is being run;
+- which variant is being compared;
+- what files/prompts/skills are allowed in that variant;
+- which deterministic assertions pass;
+- how judge results are merged;
+- whether a case is saturated, no-lift, flaky, or failed.
+
+## Grounding sources
+
+Public Jetty docs consulted:
 
 - `https://docs.jetty.io/docs/api/chat-completions`
 - `https://docs.jetty.io/docs/api/overview`
@@ -38,107 +38,132 @@ Public docs checked:
 - `https://docs.jetty.io/docs/agents/overview`
 - `https://docs.jetty.io/docs/architecture/overview`
 
-Confirmed by docs:
+Jetty skills repo consulted:
 
-- Chat completions endpoint: `POST https://flows-api.jetty.io/v1/chat/completions`.
-- Auth: `Authorization: Bearer $JETTY_API_TOKEN`.
-- `chat/completions` has two modes:
-  - passthrough OpenAI-compatible mode, without a `jetty` block;
-  - runbook mode, with a `jetty` block.
-- Runbook-mode `jetty` block supports at least:
+- `https://github.com/jettyio/jettyio-skills`
+- `README.md` — MCP tools and setup flow.
+- `skills/jetty/SKILL.md` — concrete chat-completions runbook-mode payload, file upload, trajectory fetch, and sandbox conventions.
+- `skills/jetty/references/agents-and-models.md` — practical agent runtime IDs, model/provider mapping, snapshots, `primary_outputs`, and API-key storage.
+- `skills/create-runbook/SKILL.md` — runbook frontmatter and scaffold conventions.
+- `skills/jetty/templates/*.json` and `skills/jetty/references/workflow-templates.md` — `simple_judge` examples.
+
+## Confirmed facts to build on
+
+From Jetty docs and `jettyio-skills`:
+
+- Runbook execution uses `POST https://flows-api.jetty.io/v1/chat/completions`.
+- Auth uses `Authorization: Bearer $JETTY_API_TOKEN`.
+- Chat completions has:
+  - passthrough mode when there is no `jetty` block;
+  - runbook mode when the `jetty` block is present.
+- The runbook content goes in the **system** message.
+- The user message can simply be `Execute the runbook.`.
+- Runtime parameters go in `jetty.template_variables`, not in the user message.
+- Runbook-mode `jetty` block should include:
   - `runbook: true`
   - `collection`
   - `task`
   - `agent`
-  - `file_paths`
-- Runbook sandbox persists files written to `/app/results/` as trajectory artifacts.
-- Polling trajectory status is supported.
-- File upload exists before referencing uploaded paths in `file_paths`.
-- Workflow APIs also exist under `/api/v1/run/{collection}/{task}`, `/api/v1/run-sync/{collection}/{task}`, and trajectory detail/list endpoints.
-- Agent runtime IDs include:
+  - `model_provider`
+  - `snapshot`
+  - `template_variables`
+  - optional `file_paths`
+  - optional `use_trial_keys`
+- Files can be uploaded first with `POST https://flows-api.jetty.io/api/v1/files/upload` using multipart fields including `file=@...` and `collection=...`; the returned path is referenced in `jetty.file_paths`.
+- The practical agent runtimes from `jettyio-skills` are:
   - `claude-code`
+  - `opencode`
   - `codex`
   - `gemini-cli`
-  - `hermes`
-- `simple_judge` exists for binary and scale LLM-as-judge workflows.
+- Practical default runtime:
+  - `agent: claude-code`
+  - `model: claude-sonnet-4-6`
+  - `model_provider: anthropic`
+  - `snapshot: python312-uv`
+- Browser tasks should use `snapshot: prism-playwright`.
+- Files written under `/app/results/` persist as artifacts.
+- `results_dir` should default to `/app/results` and be passed through `jetty.template_variables`.
+- Trajectory details are available through `GET /api/v1/db/trajectory/{collection}/{task}/{trajectory_id}`.
+- Provider keys belong in Jetty collection environment variables, not in local harness payloads. The only local secret the adapter should require is `JETTY_API_TOKEN`.
+- `simple_judge` supports binary and scale judging for later qualitative judge integration.
 
-Open API questions to verify with a real Jetty token:
+## Goals
 
-1. Which polling endpoint is canonical for chat-completion runbook trajectories:
-   - docs mention `GET /api/v1/trajectories/{trajectory_id}`;
-   - API overview also documents `/api/v1/db/trajectory/{collection}/{task}/{trajectory_id}`.
-2. Exact file upload endpoint request/response shape for chat-completion runbook `file_paths`.
-3. Exact artifact download URLs and whether they require auth, signed URLs, or a separate API call.
-4. Whether `flows-api.jetty.io` vs `api.jetty.io` differences in docs are intentional or docs drift.
-5. Whether directory trees/full repo checkouts can be uploaded directly, zipped, or must be enumerated as individual files.
-6. Exact terminal status strings beyond `pending`, `running`, `completed`, and `failed`.
-7. Custom sandbox image support and availability by agent runtime.
+1. Run existing `evals/shared-benchmark.json` cases on Jetty.
+2. Keep the local harness run layout unchanged after import.
+3. Keep generation payloads answer-key-safe.
+4. Enforce variant file boundaries by construction, especially `without_skill`.
+5. Support these variants:
+   - `with_skill`
+   - `without_skill`
+   - `old_skill`
+   - `ablation:<id>`
+6. Import Jetty outputs so existing `benchmark` can grade them.
+7. Add optional Jetty `simple_judge` later, after execution/import works.
 
-## Architecture
+## Non-goals for the first slice
 
-The adapter has five layers:
+- No custom benchmark zip upload.
+- No MCP dependency in CI or core harness commands.
+- No live Jetty calls in unit tests.
+- No full repo checkout upload unless live API tests prove the shape.
+- No hidden answer-key upload to executor jobs.
+- No claim that ablations are useful until `ablation:<id>` rows are actually run.
+
+MCP remains useful for humans/operators. The harness adapter should use REST directly for reproducibility and CI.
+
+## Minimal architecture
 
 ```text
-manifest + cases
+manifest + prepare logic
    |
    v
-prepared harness task rows
+export-jetty: task -> runbook payload + upload plan
    |
    v
-Jetty export planner  ---> mount plan / upload plan / safety policy
+run-jetty: upload files, submit, poll trajectory
    |
    v
-Jetty payloads + runbook
+import-jetty-results: trajectory/artifacts -> local run layout
    |
    v
-Jetty execution / polling
-   |
-   v
-Jetty importer
-   |
-   v
-existing harness run layout -> existing benchmark/grading
+existing benchmark/grading
 ```
 
-The local deterministic grading path stays unchanged. Jetty produces `output.md`, `metadata.json`, and optional artifacts; the harness imports those into the same layout local runners already use.
+No grading logic moves into Jetty for the first implementation. Jetty returns artifacts; the harness grades them locally.
 
 ## CLI commands
 
 ### `export-jetty`
 
-Converts harness cases into Jetty payload JSONL. This should support two entry styles:
+Builds Jetty payload JSONL and upload plans. It should be pure/deterministic: no network required.
 
 ```sh
-# Directly from a manifest, mirroring prepare flags
 skill-benchmark export-jetty evals/shared-benchmark.json \
   --split tune \
   --runs-per-variant 3 \
   --out jetty-payloads.jsonl
-
-# Or from previously prepared task rows
-skill-benchmark prepare evals/shared-benchmark.json --split tune --out tasks.jsonl
-skill-benchmark export-jetty evals/shared-benchmark.json \
-  --tasks tasks.jsonl \
-  --out jetty-payloads.jsonl
 ```
 
-Flags:
+Initial flags:
 
 - `--split tune|holdout|holdback`
 - `--runs-per-variant N`
 - `--include-old-skill`
 - `--include-ablations`
 - `--allow-missing-prompts` only for dry-run planning
-- `--include-answer-key` should be rejected for executor payloads unless a future explicit judge-export mode needs it
 - `--jetty-collection NAME`
 - `--jetty-task-prefix PREFIX`
-- `--jetty-agent claude-code|codex|gemini-cli|hermes|...`
+- `--jetty-agent claude-code|opencode|codex|gemini-cli`
 - `--jetty-model MODEL`
-- `--runbook RUNBOOK.md` or `--runbook-template default`
-- `--upload-plan-out upload-plan.json`
+- `--jetty-model-provider anthropic|openrouter|openai|google|bedrock`
+- `--jetty-snapshot python312-uv|prism-playwright`
+- `--use-trial-keys`
 - `--dry-run`
 
-Output: JSONL rows. Each row contains a harness identity block, a Jetty request body, and a mount/upload plan. Example shape:
+Do not support `--include-answer-key` for executor payloads. If judge export later needs rubrics, it should be a separate `export-jetty-judge` path.
+
+Payload shape:
 
 ```json
 {
@@ -153,25 +178,37 @@ Output: JSONL rows. Each row contains a harness identity block, a Jetty request 
   "jetty_request": {
     "model": "claude-sonnet-4-6",
     "messages": [
-      {"role": "system", "content": "<runbook contents>"},
-      {"role": "user", "content": "Execute the harness task."}
+      {"role": "system", "content": "<RUNBOOK.md contents>"},
+      {"role": "user", "content": "Execute the runbook."}
     ],
-    "stream": true,
+    "stream": false,
     "jetty": {
       "runbook": true,
       "collection": "skill-evals",
       "task": "good-pr-pos-security-meaningless-test-with-skill-1",
       "agent": "claude-code",
-      "file_paths": ["uploads/.../task.json", "uploads/.../skills/good-pr/SKILL.md"]
+      "model_provider": "anthropic",
+      "snapshot": "python312-uv",
+      "template_variables": {
+        "results_dir": "/app/results",
+        "task_json": "uploads/.../task.json"
+      },
+      "file_paths": [
+        "uploads/.../task.json",
+        "uploads/.../skills/good-pr/SKILL.md",
+        "uploads/.../fixtures/diff.patch"
+      ]
     }
   },
   "upload_plan": {
     "files": [
-      {"local_path": "/abs/repo/evals/fixtures/security-pr/diff.patch", "remote_path": "uploads/fixtures/diff.patch", "role": "fixture"}
+      {"local_path": "/abs/repo/evals/fixtures/security-pr/diff.patch", "remote_path_hint": "fixtures/diff.patch", "role": "fixture", "private": false}
     ]
   }
 }
 ```
+
+Use `stream: false` by default for simplicity. Streaming can be added after non-streaming import is stable.
 
 ### `run-jetty`
 
@@ -186,22 +223,22 @@ skill-benchmark run-jetty \
 
 Environment:
 
-- `JETTY_API_TOKEN` or `JETTY_API_KEY`
-- optional `JETTY_BASE_URL`, default `https://flows-api.jetty.io`
+- `JETTY_API_TOKEN` required for live submission.
+- `JETTY_BASE_URL` optional; default `https://flows-api.jetty.io`.
 
 Responsibilities:
 
-- Upload files before submission.
-- Submit requests.
-- Persist `trajectory_id` immediately after receiving it.
-- Poll until terminal status.
-- Retry transient API failures with bounded backoff.
-- Respect concurrency and rate-limit responses.
-- Write a run record even on failure/timeout.
+1. Upload each file in `upload_plan.files` to `/api/v1/files/upload`.
+2. Replace local upload placeholders with returned Jetty file paths.
+3. Submit `jetty_request` to `/v1/chat/completions`.
+4. Persist the trajectory ID immediately.
+5. Poll `/api/v1/db/trajectory/{collection}/{task}/{trajectory_id}` until terminal status.
+6. Write one JSONL run record per task, including failures/timeouts.
+7. Retry bounded transient 429/5xx failures.
 
 ### `import-jetty-results`
 
-Downloads/imports Jetty trajectory outputs into the local run directory layout.
+Imports Jetty run records and artifacts into local run directories.
 
 ```sh
 skill-benchmark import-jetty-results \
@@ -214,7 +251,7 @@ skill-benchmark benchmark evals/shared-benchmark.json \
   --out benchmark.json
 ```
 
-Expected output layout:
+Expected layout:
 
 ```text
 eval-runs/jetty/<case_id>/<variant>/run-<n>/output.md
@@ -223,11 +260,11 @@ eval-runs/jetty/<case_id>/<variant>/run-<n>/outputs/...
 eval-runs/jetty/<case_id>/<variant>/run-<n>/jetty_raw.json
 ```
 
-For single-run variants, the importer may follow the existing harness convention and omit `run-<n>` if `runs_per_variant == 1`; repeated runs must use `run-<n>`.
+If there is only one run per variant, importer may follow the existing non-repeated layout. Repeated runs must use `run-<n>`.
 
-## Manifest extension
+## Optional manifest extension
 
-Add an optional `jetty` block. It is never required for local users.
+Keep this optional.
 
 ```json
 {
@@ -236,14 +273,12 @@ Add an optional `jetty` block. It is never required for local users.
     "task_prefix": "good-pr",
     "agent": "claude-code",
     "model": "claude-sonnet-4-6",
-    "runbook_url": null,
-    "sandbox_image": null,
+    "model_provider": "anthropic",
+    "snapshot": "python312-uv",
+    "use_trial_keys": false,
     "grader_mode": "local_only",
     "skill_mount_strategy": "variant-aware",
     "variants": {
-      "with_skill": {
-        "agent": "claude-code"
-      },
       "without_skill": {
         "skill_mount_strategy": "omit"
       }
@@ -252,26 +287,113 @@ Add an optional `jetty` block. It is never required for local users.
 }
 ```
 
-Validation rules:
+Validation:
 
 - `jetty` is optional.
-- Unknown `jetty` fields should warn, not fail, until the schema is stable.
-- `jetty.agent`, if present, must be a known runtime or explicitly allowed with `--allow-unknown-jetty-agent`.
-- `grader_mode` values:
-  - `local_only`
-  - `jetty_only`
-  - `merge`
+- `agent` should be one of `claude-code`, `opencode`, `codex`, `gemini-cli` unless an explicit override allows unknown runtimes.
+- `model_provider` should be explicit to avoid Jetty runtime inference surprises.
+- `snapshot` should default to `python312-uv`; use `prism-playwright` only for browser cases.
 - `skill_mount_strategy` values:
   - `variant-aware`
   - `force-mount`
   - `omit`
-- Per-variant overrides must not weaken the `without_skill` safety invariant.
+- `grader_mode` values:
+  - `local_only`
+  - `jetty_only`
+  - `merge`
 
-## Data model and correctness by construction
+## Canonical harness runbook
 
-Use typed internal objects rather than ad hoc dictionaries until final serialization.
+The harness should generate a small runbook rather than asking each skill repo to maintain one.
 
-Suggested Python types:
+```md
+---
+version: "1.0.0"
+evaluation: programmatic
+agent: claude-code
+model: claude-sonnet-4-6
+model_provider: anthropic
+snapshot: python312-uv
+primary_outputs:
+  - output.md
+---
+
+# Skill Eval Harness Task
+
+## Objective
+
+Execute one Skill Eval Harness task exactly once. Write the final assistant answer and metadata to the required output files.
+
+## REQUIRED OUTPUT FILES
+
+| Path | Purpose |
+|---|---|
+| `{{results_dir}}/output.md` | Final assistant answer only. |
+| `{{results_dir}}/metadata.json` | JSON metadata for model/runtime/tool/error data. |
+| `{{results_dir}}/outputs/` | Optional generated artifacts. |
+
+## Parameters
+
+- `{{results_dir}}` — defaults to `/app/results` on Jetty.
+- `{{task_json}}` — uploaded task JSON generated by Skill Eval Harness.
+
+## Steps
+
+1. Read `{{task_json}}`.
+2. Read every fixture listed in `task_json.input_files`.
+3. If `task_json.variant` is `with_skill`, read and follow the mounted skill files.
+4. If `task_json.variant` is `without_skill`, do not use a skill. No skill files should be mounted.
+5. Answer the user task directly.
+6. Write `{{results_dir}}/output.md`.
+7. Write `{{results_dir}}/metadata.json`.
+8. Put any additional generated artifacts under `{{results_dir}}/outputs/`.
+
+## Evaluation
+
+Programmatic evaluation happens after import by Skill Eval Harness. Do not include hidden grading rubrics or answer keys in the output.
+```
+
+## Mount policy
+
+| Variant | Skill files | Fixture files | Hidden prompt content | Notes |
+|---|---|---|---|---|
+| `with_skill` | include | include | executor-only | normal skill run |
+| `without_skill` | omit | include | executor-only | file controls matter more than prose |
+| `old_skill` | include old only | include | executor-only | requires `old_skill_paths` |
+| `ablation:<id>` | include materialized ablated skill or explicit approximation | include | executor-only | approximation must be labeled |
+
+`task.json` should include only generation-safe fields:
+
+- harness identity;
+- prompt/user task;
+- variant;
+- input file paths;
+- allowed skill file paths for mounted-skill variants;
+- no answer key;
+- no judge rubric.
+
+## Secrets policy
+
+Local harness:
+
+- may read `JETTY_API_TOKEN` to call Jetty;
+- must not upload local provider API keys;
+- must not write local provider API keys into payloads or metadata.
+
+Jetty collection:
+
+- stores provider keys such as `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`;
+- may use trial keys when `use_trial_keys: true` is explicitly set.
+
+Optional future preflight:
+
+- call Jetty collection environment endpoint;
+- check whether required provider key exists for selected `agent`/`model_provider`;
+- fail early with a helpful message if missing.
+
+## Correctness by construction
+
+Use typed internal objects before serializing to JSON.
 
 ```python
 class VariantKind(Enum):
@@ -301,107 +423,33 @@ class HarnessTaskIdentity:
 @dataclass(frozen=True)
 class MountItem:
     local_path: Path
-    remote_path: str
     role: Literal["task", "skill", "old_skill", "ablation_skill", "fixture", "prompt"]
     private: bool
 
 @dataclass(frozen=True)
 class MountPlan:
     items: tuple[MountItem, ...]
-
-@dataclass(frozen=True)
-class JettyPayload:
-    identity: HarnessTaskIdentity
-    request: dict[str, Any]
-    upload_plan: MountPlan
 ```
 
-Key invariants:
+Required invariants:
 
-- `without_skill` mount plans must not include `role in {"skill", "old_skill", "ablation_skill"}`.
-- `with_skill` mount plans must include at least one skill file unless `--instruction-only-skill` is explicitly set.
-- `old_skill` is invalid unless `manifest.old_skill_paths` exists.
-- `ablation:<id>` must either:
-  - mount a materialized ablated skill artifact, or
-  - include an explicit ablation patch/instruction marked as an approximation.
-- `prompt_ref` content can be loaded into executor payloads only when the split is being executed; it must not be included in public exports unless explicitly private-labeled.
-- `expected_behavior`, judge rubrics, and answer keys must not be present in executor payloads.
-- Unknown trajectory status fails closed and writes metadata; it must not be treated as success.
-
-## Skill, prompt, and fixture mounting
-
-Mount/upload roles:
-
-| Variant | Skill files | Fixture files | Hidden prompt refs | Notes |
-|---|---|---|---|---|
-| `with_skill` | include | include | include only for executor job | normal skill run |
-| `without_skill` | omit | include | include only for executor job | file-control matters more than prose instruction |
-| `old_skill` | include old only | include | include only for executor job | requires `old_skill_paths` |
-| `ablation:<id>` | include ablated artifact or patch | include | include only for executor job | approximation must be labeled |
-
-Implementation detail:
-
-- Generate a `task.json` file per Jetty task containing only the generation-safe prompt, identity, input file paths, and variant instruction.
-- Do not put answer keys or judge rubrics in `task.json`.
-- If a case uses `files`, upload them under a stable fixture prefix.
-- If a case uses `prompt_ref`, resolve it only when the execution split is intentionally being run.
-
-## Canonical runbook template
-
-Jetty docs say runbooks need structure, declared outputs, evaluation, and that files under `/app/results/` are persisted. The default harness runbook should be generated or shipped as a template.
-
-```md
----
-version: 1
-evaluation: programmatic
----
-
-# Skill Eval Harness Task
-
-## Objective
-
-Execute one Agent Skill benchmark task. Produce the final assistant answer and metadata in the required result files.
-
-## REQUIRED OUTPUT FILES
-
-- `/app/results/output.md` — final assistant answer only.
-- `/app/results/metadata.json` — JSON object with timing/model/tool/error metadata.
-- `/app/results/outputs/` — optional generated artifacts.
-
-## Parameters
-
-- `task_json`: uploaded task file path.
-- `skill_files`: uploaded skill file paths, if this variant allows them.
-- `fixture_files`: uploaded fixture file paths.
-
-## Steps
-
-1. Read `task_json`.
-2. Read fixture files listed in `task_json.input_files` before answering.
-3. For `with_skill`, read and follow mounted skill files and relevant references.
-4. For `without_skill`, do not read or use skill files; no skill files should be mounted.
-5. Produce the answer directly for the user task.
-6. Write `/app/results/output.md`.
-7. Write `/app/results/metadata.json`.
-8. Copy any additional artifacts into `/app/results/outputs/`.
-
-## Expected response
-
-The final response should be in `/app/results/output.md`. Do not include grading rubrics or hidden answer keys.
-
-## Evaluation
-
-Programmatic evaluation is performed later by Skill Eval Harness after importing results.
-```
+- `without_skill` mount plan contains no `skill`, `old_skill`, or `ablation_skill` items.
+- `with_skill` mount plan contains at least one skill item unless explicitly running in instruction-only mode.
+- `old_skill` cannot export unless `old_skill_paths` exists.
+- `ablation:<id>` must either mount a materialized ablated skill or mark the run as instruction-simulated approximation.
+- executor payload never contains `expected_behavior`, `review_rubric`, judge assertion rubrics, or answer keys.
+- dry-run payloads with missing prompt refs are labeled non-executable.
+- unknown Jetty statuses fail closed and write failure metadata.
 
 ## Import metadata
 
-`metadata.json` should normalize Jetty fields while preserving raw details.
+Normalize Jetty fields into `metadata.json`:
 
 ```json
 {
   "provider": "jetty",
   "model": "claude-sonnet-4-6",
+  "model_provider": "anthropic",
   "elapsed_ms": 12345,
   "input_tokens": 1000,
   "output_tokens": 500,
@@ -414,122 +462,88 @@ Programmatic evaluation is performed later by Skill Eval Harness after importing
   "jetty_collection": "skill-evals",
   "jetty_task": "good-pr-pos-security-meaningless-test-with-skill-1",
   "jetty_agent": "claude-code",
-  "trace_url": "https://...",
+  "jetty_snapshot": "python312-uv",
+  "trace_url": "https://jetty.io/<collection>/<task>/<trajectory_id>",
   "jetty_raw_path": "jetty_raw.json"
 }
 ```
 
-On failures, still write `metadata.json` and a minimal `output.md`:
+On failure, still write `output.md` and `metadata.json`:
 
 ```md
 [JETTY FAILURE: trajectory failed before producing output]
 ```
 
-This lets `benchmark` report missing/failing rows without crashing the entire import.
+## Optional `simple_judge` integration
 
-## Jetty judge integration
-
-Local deterministic assertions remain primary. Jetty judge support is optional.
+Do this after execution/import works.
 
 Modes:
 
-- `local_only`: do not export judge tasks to Jetty.
-- `jetty_only`: use Jetty `simple_judge` outputs for judge assertions.
+- `local_only`: default; no Jetty judge export.
+- `jetty_only`: use Jetty judge results for judge assertions.
 - `merge`: import Jetty judge results as `judge-results.jsonl` and combine with local objective assertions.
-
-`simple_judge` docs confirm:
-
-- `judge_type: "binary"` for yes/no.
-- `judge_type: "scale"` with `scale_range` for numeric scores.
-- `instruction` defines the evaluation criteria.
-- `item_path` points at the content being judged.
 
 Mapping:
 
 | Harness field | Jetty judge field |
 |---|---|
-| `judge_task_id` | preserved in metadata/input |
+| `judge_task_id` | preserved in task metadata |
 | `passed` | binary result or score >= threshold |
 | `score` | scale score |
-| `threshold` | manifest assertion threshold or default |
+| `threshold` | manifest threshold/default |
 | `evidence` | judge explanation/output |
 
-Answer-key safety:
+Judge payloads may include rubrics. Executor payloads may not.
 
-- Judge exports may include rubrics only for judge tasks, not executor tasks.
-- Judge task payloads must not be accessible to the generation run.
+## Red-green-refactor TDD plan
 
-## TDD plan
-
-Use red-green-refactor. Do not start with live Jetty calls.
-
-### Phase 1 — Exporter golden tests
+### Phase 1 — exporter, no network
 
 Red tests:
 
-1. `export-jetty` emits valid OpenAI-compatible fields: `model`, `messages`, `stream`.
-2. Runbook payload includes `jetty.runbook: true`, `collection`, `task`, `agent`, `file_paths`.
-3. Harness identity is preserved.
-4. Executor payload omits `expected_behavior`, judge rubrics, and answer keys.
-5. `prompt_ref` missing fails unless `--allow-missing-prompts` is used.
-6. `--allow-missing-prompts` dry-run labels payload as non-executable.
+1. `export-jetty` emits `model`, `messages`, `stream`, and `jetty` block.
+2. `jetty` block includes `runbook`, `collection`, `task`, `agent`, `model_provider`, `snapshot`, and `template_variables.results_dir`.
+3. `template_variables.task_json` is used instead of stuffing task params into the user message.
+4. Executor payload omits answer keys and rubrics.
+5. `without_skill` payload has no skill upload items.
+6. Fixture files appear in upload plan.
 
 Green:
 
-- Implement pure `build_jetty_payload(task, manifest, config)`.
-- Add CLI wrapper only after pure function tests pass.
+- Implement pure payload/mount-plan builders.
 
 Refactor:
 
-- Extract typed payload/mount plan builders.
+- Add typed internal objects and invariant checks.
 
-### Phase 2 — Variant mount-policy tests
+### Phase 2 — mocked importer
 
 Red tests:
 
-1. `with_skill` mount plan includes skill file(s).
-2. `without_skill` mount plan excludes all skill/reference files.
-3. `old_skill` without `old_skill_paths` fails.
-4. `ablation:<id>` without materialized ablation is labeled approximation or fails depending on mode.
-5. Fixture files from `case.files` are included.
-6. Private prompt refs are marked private.
+1. Completed trajectory with `output.md` artifact imports to the harness run layout.
+2. Repeated runs import under `run-<n>`.
+3. Missing artifact writes failure output/metadata.
+4. Imported run can be graded by existing `benchmark`.
 
 Green:
 
-- Implement `build_mount_plan`.
+- Implement importer with mocked trajectory/artifact objects.
 
 Refactor:
 
-- Make invalid mount states unrepresentable with dataclasses/enums.
+- Normalize metadata in one place.
 
-### Phase 3 — Importer round-trip tests
-
-Red tests:
-
-1. Mock completed trajectory with `output.md` artifact imports to expected run directory.
-2. Mock repeated run imports to `run-<n>` directory.
-3. Mock missing artifact writes failure `output.md` and `metadata.json`.
-4. Mock artifact directory imports into `outputs/`.
-5. Imported runs can be graded by existing `benchmark`.
-
-Green:
-
-- Implement `import_jetty_result` pure transformation.
-
-Refactor:
-
-- Normalize metadata extraction and raw preservation.
-
-### Phase 4 — Polling state-machine tests
+### Phase 3 — mocked Jetty client
 
 Red tests:
 
-1. `pending -> running -> completed` succeeds.
-2. `failed` writes failure record.
-3. timeout writes timeout record.
-4. unknown status fails closed.
-5. transient 429/5xx retries with bounded backoff.
-6. retry budget exhaustion writes failure record.
+1. Upload calls `/api/v1/files/upload` with `file` and `collection`.
+2. Submit calls `/v1/chat/completions`.
+3. Poll calls `/api/v1/db/trajectory/{collection}/{task}/{trajectory_id}`.
+4. `pending -> running -> completed` succeeds.
+5. `failed`, timeout, and unknown status fail closed.
+6. bounded retry handles transient 429/5xx.
 
 Green:
 
@@ -537,34 +551,27 @@ Green:
 
 Refactor:
 
-- Keep network code at the edge; keep state transitions pure.
+- Keep network code at the edge.
 
-### Phase 5 — CLI integration tests with mocked HTTP
+### Phase 4 — CLI round trip
 
 Red tests:
 
-1. `export-jetty | run-jetty --dry-run` produces stable run records.
-2. `run-jetty` with mocked upload/submission/polling writes `jetty-runs.jsonl`.
-3. `import-jetty-results` from mocked `jetty-runs.jsonl` creates benchmarkable run dirs.
+1. `export-jetty` JSONL -> mocked `run-jetty` -> `import-jetty-results` -> `benchmark`.
+2. `run-jetty --dry-run` works without token.
+3. Token-backed mode fails with a clear message when `JETTY_API_TOKEN` is absent.
 
 Green:
 
 - Wire CLI commands.
 
-Refactor:
+### Phase 5 — live smoke, opt-in only
 
-- Reduce duplication between `prepare` and `export-jetty`.
+Requires `JETTY_API_TOKEN` and should never run in default CI.
 
-### Phase 6 — Live smoke, opt-in only
-
-Requires `JETTY_API_TOKEN`.
-
-- One tiny fixture-free tune case.
-- One fixture-backed case.
-- One trigger/no-trigger check is not required initially; trigger checks are Pi-specific today.
-- One failed/timeout scenario if Jetty supports a cheap deterministic failure.
-
-Never run live tests in default CI.
+1. One fixture-free tune case.
+2. One fixture-backed tune case.
+3. One failure/timeout path if a cheap deterministic failure is available.
 
 ## Test fixtures
 
@@ -572,9 +579,11 @@ Add under `tests/fixtures/jetty/`:
 
 ```text
 tests/fixtures/jetty/
+├── manifest-with-jetty.json
 ├── prepared-task-with-skill.json
 ├── prepared-task-without-skill.json
-├── manifest-with-jetty.json
+├── export-payload-with-skill.json
+├── export-payload-without-skill.json
 ├── trajectory-completed.json
 ├── trajectory-failed.json
 ├── trajectory-unknown-status.json
@@ -582,68 +591,50 @@ tests/fixtures/jetty/
 └── artifact-metadata.json
 ```
 
-## Security and privacy tests
+## Security tests
 
-Required tests:
+Required:
 
-- Executor payload never contains `expected_behavior`.
-- Executor payload never contains `review_rubric`.
-- Executor payload never contains judge assertion rubrics unless using judge export mode.
-- `without_skill` payload cannot upload skill files.
-- Hidden `prompt_ref` content is not included in dry-run/public exports.
-- Private uploaded files are labeled private in the upload plan.
-- Raw Jetty metadata is preserved in `jetty_raw.json` but not used as grading truth.
+- executor payload never contains `expected_behavior`;
+- executor payload never contains judge rubrics;
+- `without_skill` never uploads skill files;
+- hidden `prompt_ref` content is not exported in dry-run/public payloads;
+- private uploaded files are marked private in upload plan;
+- local provider API keys are never serialized into payloads;
+- unknown statuses fail closed.
 
-## Acceptance criteria for first release
+## First release acceptance criteria
 
-The first Jetty release is acceptable when:
+Acceptable first Jetty release:
 
-1. `export-jetty` has golden tests and produces stable JSONL.
-2. `import-jetty-results` can import mocked trajectories and existing `benchmark` can grade the imported run layout.
+1. `export-jetty` has golden tests.
+2. `import-jetty-results` has mocked trajectory round-trip tests.
 3. Variant mount-policy tests pass.
-4. Hidden prompt/answer-key safety tests pass.
+4. Hidden prompt and answer-key safety tests pass.
 5. `run-jetty --dry-run` works without a token.
-6. Live `run-jetty` is behind `JETTY_API_TOKEN` and has at least one documented manual smoke test.
-7. README documents the Jetty flow and explicitly says local harness grading remains source of truth.
+6. Live `run-jetty` requires `JETTY_API_TOKEN` and has one documented manual smoke test.
+7. README documents Jetty as an execution adapter; local harness grading remains the source of truth.
 
-## Implementation order
+## Remaining live-token questions
 
-1. Add data types and pure export functions.
-2. Add `export-jetty` tests and command.
-3. Add mount-plan safety tests.
-4. Add mocked importer tests and `import-jetty-results`.
-5. Add mocked `JettyClient` and `run-jetty --dry-run`.
-6. Add live `run-jetty` submission/polling.
-7. Add optional `simple_judge` export/import.
-8. Add README and example manifest snippets.
-9. Only then run live token-backed validation.
+These are narrower after reading `jettyio-skills`:
 
-## Documentation updates after implementation
+1. Exact JSON response shape from `/api/v1/files/upload`.
+2. Exact artifact listing/download shape from trajectory details.
+3. Exact chat-completion response field containing `trajectory_id` in non-streaming runbook mode.
+4. Full terminal status set in production.
+5. Whether directory trees should be uploaded as individual files or archives.
+6. Whether `use_trial_keys` is available to all relevant accounts or only trial collections.
 
-Update:
+## Simplicity bias
 
-- `README.md` with Jetty quick start.
-- `TODO.md` to mark completed sections.
-- `LESSONS_LEARNED.md` with API surprises found during live testing.
-- `tests/fixtures/jetty/README.md` documenting fixture provenance.
+Implement only the REST path first:
 
-## Key design principle
+- no MCP dependency;
+- no custom benchmark zip upload;
+- no streaming;
+- no custom images;
+- no Jetty judge export until execution/import is working;
+- no full repo mounting until file upload behavior is proven live.
 
-Jetty executes. Skill Eval Harness decides.
-
-The harness should continue to decide:
-
-- which cases exist;
-- which split is being run;
-- which variant is being compared;
-- which deterministic assertions pass;
-- how judge results are merged;
-- whether a case is saturated, flaky, no-lift, or failed.
-
-Jetty should provide:
-
-- isolated execution;
-- agent runtime selection;
-- trajectory records;
-- artifact persistence;
-- optional judge workflows.
+The first useful integration is: export one task, run it on Jetty, import `output.md`, and grade it locally.

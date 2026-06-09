@@ -2,7 +2,7 @@
 
 Detailed spec: [`docs/jetty-support-spec.md`](docs/jetty-support-spec.md).
 
-Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-api.jetty.io/v1/chat/completions`, trajectory recording, sandboxed runbook execution, agent runtimes, workflow steps, and `simple_judge` evaluation. Public docs consulted for the spec include Jetty's Chat Completions API, API Overview, Writing Runbooks, Custom Benchmarks, Evaluating LLMs, Agents Overview, and Architecture Overview pages. To make this harness compatible, keep the harness manifest/grading model as source of truth and add a Jetty adapter layer.
+Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-api.jetty.io/v1/chat/completions`, trajectory recording, sandboxed runbook execution, agent runtimes, workflow steps, and `simple_judge` evaluation. The spec is grounded in Jetty public docs plus `github.com/jettyio/jettyio-skills` (`skills/jetty/SKILL.md`, `skills/jetty/references/agents-and-models.md`, and `skills/create-runbook/SKILL.md`). To keep the first implementation simple, target REST runbook mode first: `export-jetty`, `run-jetty`, `import-jetty-results`; no MCP dependency, no streaming, no custom images, and no Jetty judge export until execution/import works.
 
 ## API adapter
 
@@ -10,7 +10,7 @@ Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-a
 - [ ] Support Jetty auth via `JETTY_API_TOKEN` / `JETTY_API_KEY`.
 - [ ] Use base URL `https://flows-api.jetty.io` by default with override env/flag.
 - [ ] Emit OpenAI-compatible fields: `model`, `messages`, `stream`.
-- [ ] Emit Jetty extension block with `collection`, `task`, `agent`, `runbook`, `runbook_url`, and `file_paths` where applicable.
+- [ ] Emit Jetty extension block with `runbook`, `collection`, `task`, `agent`, `model_provider`, `snapshot`, `template_variables`, `use_trial_keys`, and `file_paths` where applicable.
 - [ ] Preserve harness IDs in Jetty metadata: `skill_name`, `case_id`, `variant`, `run_number`, `split`, `run_dir`.
 
 ## Runbook execution
@@ -19,7 +19,7 @@ Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-a
 - [ ] The runbook must write `/app/results/output.md`.
 - [ ] The runbook must write `/app/results/metadata.json`.
 - [ ] The runbook should copy artifacts to `/app/results/outputs/`.
-- [ ] Support Jetty agent runtimes such as `claude-code`, `codex`, and `gemini-cli`.
+- [ ] Support practical Jetty agent runtimes from `jettyio-skills`: `claude-code`, `opencode`, `codex`, and `gemini-cli`.
 - [ ] Add per-variant runbook instructions for `with_skill`, `without_skill`, `old_skill`, and `ablation:<id>`.
 
 ## Skill and fixture mounting
@@ -59,7 +59,7 @@ Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-a
 ## Manifest extensions
 
 - [ ] Add optional `jetty` block to manifests.
-- [ ] Suggested fields: `collection`, `task_prefix`, `agent`, `model`, `runbook_url`, `sandbox_image`, `grader_mode`, `skill_mount_strategy`.
+- [ ] Suggested fields: `collection`, `task_prefix`, `agent`, `model`, `model_provider`, `snapshot`, `use_trial_keys`, `grader_mode`, `skill_mount_strategy`.
 - [ ] Allow per-variant Jetty overrides under `jetty.variants.<variant>`.
 - [ ] Validate Jetty fields without making them required for non-Jetty users.
 
@@ -73,9 +73,9 @@ Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-a
 
 ## Open questions to verify against current Jetty docs/API
 
-- [ ] Exact trajectory polling endpoint and terminal statuses.
-- [ ] Artifact download endpoint and directory structure.
-- [ ] Whether arbitrary files can be uploaded directly in chat-completion `file_paths` or require a prior upload API.
-- [ ] Whether runbook sandboxes can receive a full repo checkout or only uploaded files.
-- [ ] Exact agent runtime IDs and provider/model mapping.
-- [ ] Whether Jetty supports custom sandbox images for all relevant agent runtimes.
+- [ ] Exact JSON response shape from `/api/v1/files/upload`.
+- [ ] Exact artifact listing/download shape from trajectory details.
+- [ ] Exact chat-completion response field containing `trajectory_id` in non-streaming runbook mode.
+- [ ] Full terminal status set in production.
+- [ ] Whether directory trees should be uploaded as individual files or archives.
+- [ ] Whether `use_trial_keys` is available to all relevant accounts or only trial collections.
