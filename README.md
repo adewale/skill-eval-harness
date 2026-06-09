@@ -20,10 +20,10 @@ Use it when you want to answer: **does this skill improve the agent, where does 
 
 ## Quick start
 
-> Requires Python 3.10+. Install from GitHub first:
+> Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Install from GitHub first:
 >
 > ```bash
-> python3 -m pip install git+https://github.com/adewale/skill-eval-harness.git
+> uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.1.1
 > ```
 
 ```bash
@@ -60,9 +60,12 @@ skill-benchmark render-viewer \
 ### From GitHub
 
 ```bash
-python3 -m pip install git+https://github.com/adewale/skill-eval-harness.git
+uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.1.1
 skill-benchmark --help
 skill-pi-trigger-eval --help
+
+# One-shot without installing globally:
+uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.1.1 skill-benchmark --help
 ```
 
 ### Local development
@@ -70,7 +73,7 @@ skill-pi-trigger-eval --help
 ```bash
 git clone https://github.com/adewale/skill-eval-harness.git
 cd skill-eval-harness
-python3 -m pip install -e .
+uv tool install --editable .
 skill-benchmark --help
 ```
 
@@ -85,7 +88,7 @@ Each skill repo owns an `evals/shared-benchmark.json` manifest. Add a `harness` 
   "harness": {
     "name": "skill-eval-harness",
     "url": "https://github.com/adewale/skill-eval-harness",
-    "version": ">=0.1.0"
+    "version": ">=0.1.1"
   },
   "skill_paths": ["skills/good-pr/SKILL.md"],
   "variants": ["with_skill", "without_skill"],
