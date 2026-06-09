@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Run autonomous Pi skill-trigger evals from shared-benchmark manifests.
+
+Unlike run_pi_smoke.py, this does not force `--skill` for the positive arm. It
+creates a temporary Pi config dir with the skill under `.pi/skills`, runs Pi with
+normal skill discovery, and detects whether the model loaded the skill by
+inspecting JSON stream events for Read/Skill tool calls against the copied skill
+path. This is a best-effort trigger test: models can under-trigger skills, and
+Pi can also load a skill when the user explicitly names `/skill:name`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def skill_name_from_manifest(manifest: dict[str, Any]) -> str:
+    return str(manifest.get("skill_name") or "skill-under-test")
+
+
+def seed_config_dir(config_dir: Path) -> None:
+    """Copy provider/auth config, but not user skills, into an isolated temp config dir."""
+    source = Path(os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent")))
+    for name in ["auth.json", "settings.json", "APPEND_SYSTEM.md"]:
+        src = source / name
+        if src.exists() and src.is_file():
+            shutil.copy2(src, config_dir / name)
+
+
+def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_dir: Path) -> list[Path]:
+    repo_root = manifest_path.parent.parent if manifest_path.name == "shared-benchmark.json" else manifest_path.parent
+    skills_dir = config_dir / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for rel in manifest.get("skill_paths", []):
+        src = (repo_root / rel).resolve()
+        if src.is_dir():
+            dest = skills_dir / src.name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(src, dest)
+        else:
+            # Preserve directory structure when the skill path is SKILL.md.
+            dest_dir = skills_dir / skill_name_from_manifest(manifest)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / "SKILL.md"
+            shutil.copy2(src, dest)
+            # Copy sibling references/scripts if available.
+            for sibling in ["references", "scripts", "assets"]:
+                s = src.parent / sibling
+                if s.exists() and s.is_dir():
+                    d = dest_dir / sibling
+                    if d.exists():
+                        shutil.rmtree(d)
+                    shutil.copytree(s, d)
+        copied.append(dest)
+    return copied
+
+
+def event_texts_for_tool_input(obj: Any) -> list[str]:
+    out = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in {"file_path", "path", "skill", "input", "partial_json"} and isinstance(value, str):
+                out.append(value)
+            out.extend(event_texts_for_tool_input(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(event_texts_for_tool_input(item))
+    return out
+
+
+def detect_trigger(stdout: str, skill_name: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
+    # Use copied temp skill paths, not the bare skill name: repo file paths such as
+    # good-readme/README.md can otherwise look like skill-load evidence.
+    needles = [str(p) for p in copied_paths] + [str(p.parent) for p in copied_paths]
+    evidence = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        haystacks = event_texts_for_tool_input(event)
+        for text in haystacks:
+            if any(n and n in text for n in needles):
+                evidence.append(text[:500])
+    return bool(evidence), evidence[:5]
+
+
+def _text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int, model: str | None) -> dict[str, Any]:
+    manifest = load_manifest(manifest_path)
+    with tempfile.TemporaryDirectory(prefix="pi-trigger-") as td:
+        config_dir = Path(td)
+        seed_config_dir(config_dir)
+        copied = copy_skill_to_config(manifest_path, manifest, config_dir)
+        cmd = [
+            "pi", "--no-session", "--mode", "json", "--no-context-files", "--no-prompt-templates", "--no-extensions",
+            "--thinking", "minimal", "--tools", "read,grep,find,ls", "-p", query,
+        ]
+        if model:
+            cmd[1:1] = ["--model", model]
+        env = os.environ.copy()
+        env["PI_CODING_AGENT_DIR"] = str(config_dir)
+        start = time.time()
+        timed_out = False
+        stdout = ""
+        stderr = ""
+        returncode = 0
+        try:
+            proc = subprocess.run(cmd, cwd=ROOT, env=env, text=True, capture_output=True, timeout=timeout)
+            stdout = _text(proc.stdout)
+            stderr = _text(proc.stderr)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            stdout = _text(exc.stdout)
+            stderr = _text(exc.stderr)
+            returncode = 124
+        elapsed_ms = int((time.time() - start) * 1000)
+        triggered, evidence = detect_trigger(stdout, skill_name_from_manifest(manifest), copied)
+        return {
+            "query": query,
+            "should_trigger": should_trigger,
+            "triggered": triggered,
+            "pass": returncode == 0 and triggered == should_trigger,
+            "elapsed_ms": elapsed_ms,
+            "returncode": returncode,
+            "timed_out": timed_out,
+            "evidence": evidence,
+            "stderr": stderr[-1000:] if stderr else "",
+        }
+
+
+def trigger_query_from_case(case: dict[str, Any]) -> str:
+    prompt = str(case.get("prompt") or case.get("scenario") or case.get("id"))
+    # Shared manifests often store trigger fixtures as a meta-classification prompt:
+    # "Trigger decision eval. User prompt: <real prompt>\n\nReturn exactly ...".
+    # Autonomous trigger testing must run the real user prompt, not the meta prompt,
+    # otherwise skill discovery is being tested on the wrong task.
+    match = re.search(r"User prompt:\s*(.*?)(?:\n\s*\n\s*Return exactly|$)", prompt, re.I | re.S)
+    if match:
+        return match.group(1).strip()
+    return prompt
+
+
+def cases_from_manifest(manifest: dict[str, Any], split: str | None) -> list[dict[str, Any]]:
+    out = []
+    for c in manifest.get("cases", []):
+        if split and c.get("split") != split:
+            continue
+        if c.get("kind") == "trigger":
+            prompt = trigger_query_from_case(c)
+            should = not re.search(r"NO_TRIGGER|not trigger|should not", " ".join(map(str, c.get("expected_behavior", []))), re.I)
+            out.append({"query": prompt, "should_trigger": should})
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("manifest")
+    ap.add_argument("--eval-set", help="JSON file with {query, should_trigger} rows; defaults to manifest trigger cases")
+    ap.add_argument("--split", choices=["tune", "holdout", "holdback"])
+    ap.add_argument("--runs-per-query", type=int, default=1)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--model")
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+
+    manifest_path = Path(args.manifest)
+    manifest = load_manifest(manifest_path)
+    if args.eval_set:
+        rows = json.loads(Path(args.eval_set).read_text(encoding="utf-8"))
+        if isinstance(rows, dict):
+            rows = rows.get("evals", rows.get("queries", []))
+    else:
+        rows = cases_from_manifest(manifest, args.split)
+    futures = []
+    results = []
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        for row in rows:
+            for _ in range(args.runs_per_query):
+                futures.append(ex.submit(run_query, manifest_path, str(row["query"]), bool(row["should_trigger"]), args.timeout, args.model))
+        for fut in as_completed(futures):
+            results.append(fut.result())
+    passed = sum(1 for r in results if r["pass"])
+    output = {
+        "skill_name": skill_name_from_manifest(manifest),
+        "generated_at": int(time.time()),
+        "summary": {"total": len(results), "passed": passed, "failed": len(results) - passed, "pass_rate": (passed / len(results)) if results else None},
+        "results": results,
+    }
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(output, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(json.dumps(output["summary"], indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

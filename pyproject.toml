@@ -1,0 +1,18 @@
+[project]
+name = "skill-eval-harness"
+version = "0.1.0"
+description = "Repo-agnostic Agent Skill evaluation harness with paired variants, holdout splits, repeated-run stats, Anthropic-compatible exports, and static review output."
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Adewale"}]
+
+[project.scripts]
+skill-benchmark = "skill_benchmark:main"
+skill-pi-trigger-eval = "run_pi_trigger_eval:main"
+
+[tool.setuptools]
+py-modules = ["skill_benchmark", "run_pi_trigger_eval"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

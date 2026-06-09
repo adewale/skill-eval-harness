@@ -1,0 +1,10 @@
+anti-slop-writing/evals/shared-benchmark.json
+audit-skill/evals/shared-benchmark.json
+cfdoctor/evals/shared-benchmark.json
+good-pr/evals/shared-benchmark.json
+good-readme/evals/shared-benchmark.json
+good-repo/evals/shared-benchmark.json
+guardrails-skill/evals/shared-benchmark.json
+slide-maker/evals/shared-benchmark.json
+swiss-poster-skill/evals/shared-benchmark.json
+testing-best-practices/evals/shared-benchmark.json
