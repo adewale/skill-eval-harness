@@ -17,13 +17,14 @@ Use it when you want to answer: **does this skill improve the agent, where does 
 - **Review UI** — render a static HTML benchmark viewer.
 - **Trigger checks** — run Pi skill-trigger smoke evals without forcing `--skill`.
 - **Manifest audits** — detect missing eval categories, hidden split gaps, missing ablations, trigger/no-trigger gaps, saturated cases, non-discriminating assertions, and fixture recommendations.
+- **Jetty adapter** — export runbook-mode Jetty payloads, run them via Jetty REST, and import trajectory artifacts back into the local run layout.
 
 ## Quick start
 
 > Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Install from GitHub first:
 >
 > ```bash
-> uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.1.1
+> uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.2.0
 > ```
 
 ```bash
@@ -60,12 +61,12 @@ skill-benchmark render-viewer \
 ### From GitHub
 
 ```bash
-uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.1.1
+uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.2.0
 skill-benchmark --help
 skill-pi-trigger-eval --help
 
 # One-shot without installing globally:
-uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.1.1 skill-benchmark --help
+uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.2.0 skill-benchmark --help
 ```
 
 ### Local development
@@ -309,6 +310,41 @@ skill-pi-trigger-eval ../repo/evals/shared-benchmark.json \
 
 This creates a temporary `PI_CODING_AGENT_DIR`, copies the skill under `skills/`, runs Pi without forced `--skill`, and detects whether the model loaded the skill from JSON stream events.
 
+### Jetty adapter
+
+Jetty support is an optional execution adapter. The harness still owns manifests and grading; Jetty runs the task and returns trajectory artifacts.
+
+```bash
+# Export runbook-mode Jetty chat-completion payloads. No network calls.
+skill-benchmark export-jetty ../repo/evals/shared-benchmark.json \
+  --split tune \
+  --out jetty-payloads.jsonl
+
+# Dry-run payload loading without a token.
+skill-benchmark run-jetty \
+  --payloads jetty-payloads.jsonl \
+  --dry-run \
+  --out jetty-dry-run.jsonl
+
+# Live execution requires JETTY_API_TOKEN.
+export JETTY_API_TOKEN=...
+skill-benchmark run-jetty \
+  --payloads jetty-payloads.jsonl \
+  --out jetty-runs.jsonl
+
+# Import Jetty artifacts into the normal run layout, then grade locally.
+skill-benchmark import-jetty-results \
+  --manifest ../repo/evals/shared-benchmark.json \
+  --jetty-runs jetty-runs.jsonl \
+  --runs ../repo/eval-runs/jetty
+
+skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
+  --runs ../repo/eval-runs/jetty \
+  --out jetty-benchmark.json
+```
+
+Defaults follow Jetty docs and `jettyio/jettyio-skills`: `claude-code`, `claude-sonnet-4-6`, `model_provider=anthropic`, `snapshot=python312-uv`, runbook content in the system message, runtime values in `jetty.template_variables`, and uploaded files in `jetty.file_paths`. Use `JETTY_BASE_URL` to override `https://flows-api.jetty.io`.
+
 ## Ablations
 
 Ablations are opt-in variants that simulate removing part of a skill. Add entries under `manifest.ablations`, then prepare with `--include-ablations`.
@@ -327,11 +363,11 @@ Ablation task variants are named `ablation:<id>`. Trigger cases are skipped for 
 - **Anthropic skill-creator**: use `grade --write-grading-files` and `export-anthropic` for compatible `grading.json`/`benchmark.json` shapes.
 - **Pi**: use `examples/adewale-workspace/run_pi_smoke.py` for the Adewale multi-repo smoke workflow and `skill-pi-trigger-eval` for autonomous trigger checks.
 - **Other runners**: use `prepare` JSONL as the import format and write results back to the run output contract.
-- **Jetty**: use the OpenAI-compatible `/v1/chat/completions` endpoint with a `jetty` block as an external runner; add an adapter that exports prepared rows and imports Jetty trajectories into the run layout.
+- **Jetty**: use `export-jetty`, `run-jetty`, and `import-jetty-results` for REST runbook-mode execution. Live API response shapes still need token-backed smoke validation before claiming broad Jetty production coverage.
 
 ## Non-goals
 
-- This harness does not call a model from `skill_benchmark.py`; execution stays runner-agnostic.
+- Local grading does not call a model. Execution stays runner-agnostic except for explicit adapter commands such as `run-jetty`.
 - It does not replace human/LLM qualitative review; it emits judge tasks and merges results.
 - It does not make hidden prompts safe if you pass `--include-answer-key` to generation jobs.
 - It does not guarantee a skill triggers autonomously unless you run trigger evals.
@@ -361,7 +397,7 @@ python3 -m py_compile *.py
 python3 -m unittest discover tests -v
 ```
 
-The test suite covers repeated runs, artifact outputs, judge-result merging, answer-key omission, and Anthropic export shape.
+The test suite covers repeated runs, artifact outputs, judge-result merging, answer-key omission, Anthropic export shape, Jetty export shape, mocked Jetty execution, and Jetty import round trips.
 
 ## Source checked
 

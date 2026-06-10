@@ -1,6 +1,6 @@
 # Jetty Support Spec
 
-Status: planned implementation, grounded in Jetty public docs and `jettyio/jettyio-skills` checked on 2026-06-09.
+Status: phase-1 adapter implemented for deterministic export, REST submission/polling, dry-run mode, and mocked trajectory import; live Jetty response shapes still need token-backed validation. Grounded in Jetty public docs and `jettyio/jettyio-skills` checked on 2026-06-09.
 
 This spec defines the simplest useful Jetty adapter for Skill Eval Harness. Jetty executes harness tasks in runbook mode and records trajectories/artifacts. Skill Eval Harness remains the source of truth for manifests, variants, splits, deterministic assertions, benchmark summaries, and saturation/no-lift flags.
 

@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("skill_benchmark", ROOT / "skill_benchmark.py")
@@ -213,6 +214,155 @@ class SkillBenchmarkTests(unittest.TestCase):
             sb.prepare(Args)
             first = json.loads(Path(Args.out).read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(first["input_files"], [str(fixture.resolve())])
+
+    def test_export_jetty_payload_has_runbook_contract_and_variant_mounts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            fixture = manifest.parent / "fixtures" / "case-1" / "input.txt"
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text("fixture", encoding="utf-8")
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["cases"][0]["files"] = ["fixtures/case-1/input.txt"]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            out = root / "jetty-payloads.jsonl"
+            args = SimpleNamespace(
+                manifest=str(manifest), split="tune", runs_per_variant=1,
+                include_old_skill=False, include_ablations=False, allow_missing_prompts=False,
+                jetty_collection="skill-evals", jetty_task_prefix=None,
+                jetty_agent="claude-code", jetty_model="claude-sonnet-4-6",
+                jetty_model_provider="anthropic", jetty_snapshot="python312-uv",
+                use_trial_keys=False, out=str(out), dry_run=False,
+            )
+            sb.export_jetty(args)
+            rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([r["harness"]["variant"] for r in rows], ["with_skill", "without_skill"])
+            with_row, without_row = rows
+            jetty = with_row["jetty_request"]["jetty"]
+            self.assertEqual(with_row["jetty_request"]["messages"][1]["content"], "Execute the runbook.")
+            self.assertEqual(jetty["model_provider"], "anthropic")
+            self.assertEqual(jetty["snapshot"], "python312-uv")
+            self.assertEqual(jetty["template_variables"]["results_dir"], "/app/results")
+            self.assertIn("task_json", jetty["template_variables"])
+            self.assertNotIn("expected_behavior", json.dumps(with_row))
+            self.assertNotIn("review_rubric", json.dumps(with_row))
+            self.assertIn("{{task_json}}", with_row["jetty_request"]["messages"][0]["content"])
+            with_roles = {f["role"] for f in with_row["upload_plan"]["files"]}
+            without_roles = {f["role"] for f in without_row["upload_plan"]["files"]}
+            self.assertTrue({"task", "skill", "fixture"}.issubset(with_roles))
+            self.assertNotIn("skill", without_roles)
+            self.assertTrue({"task", "fixture"}.issubset(without_roles))
+            without_task_json = next(f for f in without_row["upload_plan"]["files"] if f["role"] == "task")["content"]
+            self.assertEqual(json.loads(without_task_json)["skill_files"], [])
+
+    def test_import_jetty_results_roundtrip_can_be_benchmarked(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            runs = root / "runs"
+            jetty_runs = root / "jetty-runs.jsonl"
+            completed = {
+                "harness": {"skill_name": "demo", "case_id": "case-1", "variant": "with_skill", "run_number": 1, "split": "tune", "run_dir": "case-1/with_skill"},
+                "status": "completed",
+                "trajectory_id": "traj_1",
+                "jetty": {"collection": "skill-evals", "task": "demo-case-1-with-skill-1", "agent": "claude-code", "model": "claude-sonnet-4-6", "model_provider": "anthropic", "snapshot": "python312-uv"},
+                "trajectory": {"usage": {"total_tokens": 12}, "elapsed_ms": 34},
+                "artifacts": [
+                    {"path": "/app/results/output.md", "content": "alpha beta"},
+                    {"path": "/app/results/metadata.json", "content": {"total_tool_calls": 2}},
+                ],
+            }
+            failed = {
+                "harness": {"skill_name": "demo", "case_id": "case-1", "variant": "without_skill", "run_number": 1, "split": "tune", "run_dir": "case-1/without_skill"},
+                "status": "failed",
+                "trajectory_id": "traj_2",
+                "jetty": {"collection": "skill-evals", "task": "demo-case-1-without-skill-1", "agent": "claude-code", "model": "claude-sonnet-4-6", "model_provider": "anthropic", "snapshot": "python312-uv"},
+                "trajectory": {"error": "boom"},
+            }
+            jetty_runs.write_text(json.dumps(completed) + "\n" + json.dumps(failed) + "\n", encoding="utf-8")
+            sb.import_jetty_results(SimpleNamespace(manifest=str(manifest), jetty_runs=str(jetty_runs), runs=str(runs)))
+            self.assertEqual((runs / "case-1" / "with_skill" / "output.md").read_text(encoding="utf-8"), "alpha beta")
+            meta = json.loads((runs / "case-1" / "with_skill" / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["provider"], "jetty")
+            self.assertEqual(meta["jetty_trajectory_id"], "traj_1")
+            self.assertIn("JETTY FAILURE", (runs / "case-1" / "without_skill" / "output.md").read_text(encoding="utf-8"))
+            report = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"])
+            self.assertEqual(report["summary"]["with_skill"]["mean_objective_pass_rate"], 1.0)
+
+    def test_export_jetty_hidden_prompt_placeholder_is_non_executable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["cases"] = [{
+                "id": "holdout-1",
+                "split": "holdout",
+                "kind": "behavior",
+                "prompt_ref": "holdout/private.md",
+                "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}],
+            }]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            out = root / "jetty-payloads.jsonl"
+            args = SimpleNamespace(
+                manifest=str(manifest), split="holdout", runs_per_variant=1,
+                include_old_skill=False, include_ablations=False, allow_missing_prompts=True,
+                jetty_collection="skill-evals", jetty_task_prefix=None,
+                jetty_agent="claude-code", jetty_model="claude-sonnet-4-6",
+                jetty_model_provider="anthropic", jetty_snapshot="python312-uv",
+                use_trial_keys=False, out=str(out), dry_run=True,
+            )
+            sb.export_jetty(args)
+            row = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+            self.assertFalse(row["harness"]["executable"])
+
+            class ShouldNotCallClient:
+                def upload(self, *args, **kwargs):
+                    raise AssertionError("non-executable payload should not upload")
+
+            records = list(sb.execute_jetty_payloads([row], client=ShouldNotCallClient()))
+            self.assertEqual(records[0]["status"], "failed")
+            self.assertIn("non-executable", records[0]["error"])
+
+    def test_run_jetty_uploads_submits_polls_and_replaces_placeholders(self):
+        row = {
+            "harness": {"skill_name": "demo", "case_id": "case-1", "variant": "with_skill", "run_number": 1, "split": "tune", "run_dir": "case-1/with_skill"},
+            "jetty_request": {
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "system", "content": "runbook"}, {"role": "user", "content": "Execute the runbook."}],
+                "stream": False,
+                "jetty": {
+                    "runbook": True,
+                    "collection": "skill-evals",
+                    "task": "demo-case-1-with-skill-1",
+                    "agent": "claude-code",
+                    "model_provider": "anthropic",
+                    "snapshot": "python312-uv",
+                    "template_variables": {"results_dir": "/app/results", "task_json": "upload://task-json"},
+                    "file_paths": ["upload://task-json"],
+                },
+            },
+            "upload_plan": {"files": [{"role": "task", "placeholder": "upload://task-json", "content": "{}", "remote_path_hint": "task.json", "private": True}]},
+        }
+
+        class FakeClient:
+            def __init__(self):
+                self.submitted = None
+            def upload(self, item, collection):
+                self.uploaded = (item, collection)
+                return "uploads/task.json"
+            def submit(self, request_body):
+                self.submitted = request_body
+                return {"trajectory_id": "traj_1"}
+            def poll(self, collection, task, trajectory_id, *, timeout_s=1800, poll_interval_s=5):
+                return {"status": "completed", "artifacts": [{"path": "/app/results/output.md", "content": "alpha beta"}]}
+
+        client = FakeClient()
+        records = list(sb.execute_jetty_payloads([row], client=client, timeout_s=1, poll_interval_s=0))
+        self.assertEqual(client.uploaded[1], "skill-evals")
+        self.assertEqual(client.submitted["jetty"]["template_variables"]["task_json"], "uploads/task.json")
+        self.assertEqual(client.submitted["jetty"]["file_paths"], ["uploads/task.json"])
+        self.assertEqual(records[0]["status"], "completed")
+        self.assertEqual(records[0]["trajectory_id"], "traj_1")
 
 
 if __name__ == "__main__":

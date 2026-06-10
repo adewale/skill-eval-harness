@@ -8,13 +8,18 @@ and aggregates timing/token/pass-rate data.
 from __future__ import annotations
 
 import argparse
+import copy
 import html
 import json
+import os
 import random
 import re
 import statistics
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -189,49 +194,684 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
     return f"Run variant {variant}."
 
 
-def prepare(args: argparse.Namespace) -> int:
-    path = Path(args.manifest)
-    manifest = validate_manifest(path)
+def task_variants(manifest: dict[str, Any], *, include_old_skill: bool = False, include_ablations: bool = False) -> list[str]:
     variants = list(manifest.get("variants", DEFAULT_VARIANTS))
-    if args.include_old_skill:
+    if include_old_skill:
         old_paths = manifest.get("old_skill_paths") or []
         if not old_paths:
             die("--include-old-skill requires manifest.old_skill_paths to be populated")
         variants.append("old_skill")
-    if args.include_ablations:
+    if include_ablations:
         variants.extend(f"ablation:{a['id']}" for a in manifest.get("ablations", []))
-    runs_per_variant = max(1, int(getattr(args, "runs_per_variant", 1)))
-    cases = iter_cases(manifest, args.split)
-    repo_root = repo_root_for_manifest(path)
+    return variants
+
+
+def prepared_task_rows(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    *,
+    split: str | None = None,
+    include_old_skill: bool = False,
+    include_ablations: bool = False,
+    runs_per_variant: int = 1,
+    allow_missing_prompts: bool = False,
+    include_answer_key: bool = False,
+) -> list[dict[str, Any]]:
+    variants = task_variants(manifest, include_old_skill=include_old_skill, include_ablations=include_ablations)
+    runs_per_variant = max(1, int(runs_per_variant))
+    cases = iter_cases(manifest, split)
+    repo_root = repo_root_for_manifest(manifest_path)
+    rows: list[dict[str, Any]] = []
+    for case in cases:
+        for variant in variants:
+            if variant.startswith("ablation:") and case.get("kind") == "trigger":
+                continue
+            for run_number in range(1, runs_per_variant + 1):
+                run_dir = f"{case['id']}/{variant}" if runs_per_variant == 1 else f"{case['id']}/{variant}/run-{run_number}"
+                task = {
+                    "case_id": case["id"],
+                    "split": case["split"],
+                    "kind": case.get("kind", "behavior"),
+                    "variant": variant,
+                    "run_number": run_number,
+                    "skill_name": manifest["skill_name"],
+                    "repo_root": str(repo_root),
+                    "skill_paths": [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])],
+                    "input_files": [str((manifest_path.parent / f).resolve()) for f in case.get("files", [])],
+                    "run_dir": run_dir,
+                    "instruction": variant_instruction(variant, manifest, repo_root),
+                    "prompt": case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
+                    **({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else {}),
+                    "tags": case.get("tags", []),
+                }
+                rows.append(task)
+    return rows
+
+
+def prepare(args: argparse.Namespace) -> int:
+    path = Path(args.manifest)
+    manifest = validate_manifest(path)
+    rows = prepared_task_rows(
+        path,
+        manifest,
+        split=args.split,
+        include_old_skill=args.include_old_skill,
+        include_ablations=args.include_ablations,
+        runs_per_variant=getattr(args, "runs_per_variant", 1),
+        allow_missing_prompts=args.allow_missing_prompts,
+        include_answer_key=args.include_answer_key,
+    )
     out = Path(args.out) if args.out else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
     try:
-        for case in cases:
-            for variant in variants:
-                if variant.startswith("ablation:") and case.get("kind") == "trigger":
-                    continue
-                for run_number in range(1, runs_per_variant + 1):
-                    run_dir = f"{case['id']}/{variant}" if runs_per_variant == 1 else f"{case['id']}/{variant}/run-{run_number}"
-                    task = {
-                        "case_id": case["id"],
-                        "split": case["split"],
-                        "kind": case.get("kind", "behavior"),
-                        "variant": variant,
-                        "run_number": run_number,
-                        "skill_name": manifest["skill_name"],
-                        "repo_root": str(repo_root),
-                        "skill_paths": [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])],
-                        "input_files": [str((path.parent / f).resolve()) for f in case.get("files", [])],
-                        "run_dir": run_dir,
-                        "instruction": variant_instruction(variant, manifest, repo_root),
-                        "prompt": case_prompt(case, path, allow_missing=args.allow_missing_prompts),
-                        **({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if args.include_answer_key else {}),
-                        "tags": case.get("tags", []),
-                    }
-                    fh.write(json.dumps(task, ensure_ascii=False) + "\n")
+        for task in rows:
+            fh.write(json.dumps(task, ensure_ascii=False) + "\n")
     finally:
         if out:
             fh.close()
+    return 0
+
+
+JETTY_DEFAULT_AGENT = "claude-code"
+JETTY_DEFAULT_MODEL = "claude-sonnet-4-6"
+JETTY_DEFAULT_MODEL_PROVIDER = "anthropic"
+JETTY_DEFAULT_SNAPSHOT = "python312-uv"
+JETTY_ALLOWED_AGENTS = {"claude-code", "opencode", "codex", "gemini-cli"}
+JETTY_TERMINAL_SUCCESS = {"completed", "complete", "succeeded", "success"}
+JETTY_TERMINAL_FAILURE = {"failed", "failure", "error", "errored", "canceled", "cancelled", "timeout", "timed_out"}
+JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    return slug or "task"
+
+
+def jetty_task_name(task: dict[str, Any], prefix: str | None = None) -> str:
+    base = prefix or task.get("skill_name") or "skill-eval"
+    return "-".join(slugify(str(part)) for part in [base, task["case_id"], task["variant"], str(task.get("run_number", 1))])
+
+
+def canonical_jetty_runbook(agent: str, model: str, model_provider: str, snapshot: str) -> str:
+    return f'''---
+version: "1.0.0"
+evaluation: programmatic
+agent: {agent}
+model: {model}
+model_provider: {model_provider}
+snapshot: {snapshot}
+primary_outputs:
+  - output.md
+---
+
+# Skill Eval Harness Task
+
+## Objective
+
+Execute one Skill Eval Harness task exactly once. Write the final assistant answer and metadata to the required output files.
+
+## REQUIRED OUTPUT FILES
+
+| Path | Purpose |
+|---|---|
+| `{{{{results_dir}}}}/output.md` | Final assistant answer only. |
+| `{{{{results_dir}}}}/metadata.json` | JSON metadata for model/runtime/tool/error data. |
+| `{{{{results_dir}}}}/outputs/` | Optional generated artifacts. |
+
+## Parameters
+
+- `{{{{results_dir}}}}` — defaults to `/app/results` on Jetty.
+- `{{{{task_json}}}}` — uploaded task JSON generated by Skill Eval Harness.
+
+## Steps
+
+1. Read `{{{{task_json}}}}`.
+2. Read every fixture listed in `task_json.input_files`.
+3. If `task_json.variant` is `with_skill`, read and follow the mounted skill files.
+4. If `task_json.variant` is `without_skill`, do not use a skill. No skill files should be mounted.
+5. Answer the user task directly.
+6. Write `{{{{results_dir}}}}/output.md`.
+7. Write `{{{{results_dir}}}}/metadata.json`.
+8. Put any additional generated artifacts under `{{{{results_dir}}}}/outputs/`.
+
+## Evaluation
+
+Programmatic evaluation happens after import by Skill Eval Harness. Do not include hidden grading rubrics or answer keys in the output.
+'''
+
+
+def placeholder(task_name: str, role: str, index: int | str) -> str:
+    return f"upload://{task_name}/{role}/{index}"
+
+
+def safe_task_json(task: dict[str, Any], manifest: dict[str, Any], *, task_name: str, upload_files: list[dict[str, Any]]) -> dict[str, Any]:
+    variant = str(task["variant"])
+    safe = {
+        "case_id": task["case_id"],
+        "split": task["split"],
+        "kind": task.get("kind", "behavior"),
+        "variant": variant,
+        "run_number": task.get("run_number", 1),
+        "skill_name": task["skill_name"],
+        "instruction": task.get("instruction", ""),
+        "prompt": task.get("prompt", ""),
+        "input_files": [item["placeholder"] for item in upload_files if item.get("role") == "fixture"],
+        "skill_files": [],
+        "tags": task.get("tags", []),
+    }
+    if variant == "with_skill":
+        safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
+    elif variant == "old_skill":
+        safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "old_skill"]
+    elif variant.startswith("ablation:"):
+        aid = variant.split(":", 1)[1]
+        ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
+        safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
+        safe["ablation"] = {
+            "id": aid,
+            "mode": "instruction_simulated",
+            "removed_component": ablation.get("removed_component"),
+            "expected_regressions": ablation.get("expected_regressions", []),
+        }
+    else:
+        safe["skill_files"] = []
+    return safe
+
+
+def build_jetty_payload(
+    task: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    collection: str,
+    task_prefix: str | None,
+    agent: str,
+    model: str,
+    model_provider: str,
+    snapshot: str,
+    use_trial_keys: bool = False,
+) -> dict[str, Any]:
+    variant = str(task["variant"])
+    task_name = jetty_task_name(task, task_prefix)
+    files: list[dict[str, Any]] = []
+    for i, local in enumerate(task.get("input_files", []), 1):
+        files.append({
+            "role": "fixture",
+            "placeholder": placeholder(task_name, "fixture", i),
+            "local_path": str(Path(local).resolve()),
+            "remote_path_hint": f"fixtures/{Path(local).name}",
+            "private": False,
+        })
+    if variant == "with_skill":
+        for i, local in enumerate(task.get("skill_paths", []), 1):
+            files.append({
+                "role": "skill",
+                "placeholder": placeholder(task_name, "skill", i),
+                "local_path": str(Path(local).resolve()),
+                "remote_path_hint": f"skills/{task['skill_name']}/{Path(local).name}",
+                "private": False,
+            })
+    elif variant == "old_skill":
+        old_paths = manifest.get("old_skill_paths") or []
+        if not old_paths:
+            die("old_skill export requires manifest.old_skill_paths to be populated")
+        repo_root = Path(task["repo_root"])
+        for i, raw in enumerate(old_paths, 1):
+            local = Path(raw)
+            if not local.is_absolute():
+                local = repo_root / local
+            files.append({
+                "role": "old_skill",
+                "placeholder": placeholder(task_name, "old-skill", i),
+                "local_path": str(local.resolve()),
+                "remote_path_hint": f"old-skills/{task['skill_name']}/{local.name}",
+                "private": False,
+            })
+    elif variant.startswith("ablation:"):
+        for i, local in enumerate(task.get("skill_paths", []), 1):
+            files.append({
+                "role": "skill",
+                "placeholder": placeholder(task_name, "skill", i),
+                "local_path": str(Path(local).resolve()),
+                "remote_path_hint": f"skills/{task['skill_name']}/{Path(local).name}",
+                "private": False,
+            })
+    task_json = safe_task_json(task, manifest, task_name=task_name, upload_files=files)
+    task_placeholder = placeholder(task_name, "task", "json")
+    task_item = {
+        "role": "task",
+        "placeholder": task_placeholder,
+        "content": json.dumps(task_json, ensure_ascii=False, indent=2) + "\n",
+        "remote_path_hint": f"tasks/{task_name}.json",
+        "private": True,
+    }
+    all_files = [task_item] + files
+    if variant == "without_skill" and any(item.get("role") in {"skill", "old_skill", "ablation_skill"} for item in all_files):
+        die(f"{task['case_id']}: without_skill payload attempted to mount skill files")
+    if variant == "with_skill" and not any(item.get("role") == "skill" for item in all_files):
+        die(f"{task['case_id']}: with_skill payload has no skill files")
+    jetty_block = {
+        "runbook": True,
+        "collection": collection,
+        "task": task_name,
+        "agent": agent,
+        "model_provider": model_provider,
+        "snapshot": snapshot,
+        "template_variables": {
+            "results_dir": "/app/results",
+            "task_json": task_placeholder,
+        },
+        "file_paths": [item["placeholder"] for item in all_files],
+    }
+    if use_trial_keys:
+        jetty_block["use_trial_keys"] = True
+    return {
+        "harness": {
+            "skill_name": task["skill_name"],
+            "case_id": task["case_id"],
+            "variant": variant,
+            "run_number": task.get("run_number", 1),
+            "split": task["split"],
+            "run_dir": task["run_dir"],
+            "executable": not str(task.get("prompt", "")).startswith("<hidden prompt:"),
+        },
+        "jetty_request": {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": canonical_jetty_runbook(agent, model, model_provider, snapshot)},
+                {"role": "user", "content": "Execute the runbook."},
+            ],
+            "stream": False,
+            "jetty": jetty_block,
+        },
+        "upload_plan": {"files": all_files},
+    }
+
+
+def export_jetty(args: argparse.Namespace) -> int:
+    path = Path(args.manifest)
+    manifest = validate_manifest(path)
+    agent = getattr(args, "jetty_agent", None) or manifest.get("jetty", {}).get("agent") or JETTY_DEFAULT_AGENT
+    if agent not in JETTY_ALLOWED_AGENTS:
+        die(f"unsupported Jetty agent {agent!r}; expected one of {sorted(JETTY_ALLOWED_AGENTS)}")
+    model = getattr(args, "jetty_model", None) or manifest.get("jetty", {}).get("model") or JETTY_DEFAULT_MODEL
+    model_provider = getattr(args, "jetty_model_provider", None) or manifest.get("jetty", {}).get("model_provider") or JETTY_DEFAULT_MODEL_PROVIDER
+    snapshot = getattr(args, "jetty_snapshot", None) or manifest.get("jetty", {}).get("snapshot") or JETTY_DEFAULT_SNAPSHOT
+    collection = getattr(args, "jetty_collection", None) or manifest.get("jetty", {}).get("collection") or "skill-evals"
+    task_prefix = getattr(args, "jetty_task_prefix", None) or manifest.get("jetty", {}).get("task_prefix")
+    rows = prepared_task_rows(
+        path,
+        manifest,
+        split=getattr(args, "split", None),
+        include_old_skill=getattr(args, "include_old_skill", False),
+        include_ablations=getattr(args, "include_ablations", False),
+        runs_per_variant=getattr(args, "runs_per_variant", 1),
+        allow_missing_prompts=getattr(args, "allow_missing_prompts", False),
+        include_answer_key=False,
+    )
+    payloads = [build_jetty_payload(
+        row,
+        manifest,
+        collection=collection,
+        task_prefix=task_prefix,
+        agent=agent,
+        model=model,
+        model_provider=model_provider,
+        snapshot=snapshot,
+        use_trial_keys=bool(getattr(args, "use_trial_keys", False) or manifest.get("jetty", {}).get("use_trial_keys", False)),
+    ) for row in rows]
+    out = Path(args.out) if getattr(args, "out", None) else None
+    fh = out.open("w", encoding="utf-8") if out else sys.stdout
+    try:
+        for payload in payloads:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    finally:
+        if out:
+            fh.close()
+    return 0
+
+
+def replace_placeholders(value: Any, mapping: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        out = value
+        for old, new in mapping.items():
+            out = out.replace(old, new)
+        return out
+    if isinstance(value, list):
+        return [replace_placeholders(v, mapping) for v in value]
+    if isinstance(value, dict):
+        return {k: replace_placeholders(v, mapping) for k, v in value.items()}
+    return value
+
+
+def extract_trajectory_id(response: dict[str, Any]) -> str | None:
+    for key in ["trajectory_id", "trajectoryId", "id"]:
+        if response.get(key):
+            return str(response[key])
+    jetty = response.get("jetty")
+    if isinstance(jetty, dict):
+        for key in ["trajectory_id", "trajectoryId", "id"]:
+            if jetty.get(key):
+                return str(jetty[key])
+    return None
+
+
+class JettyClient:
+    def __init__(self, token: str, base_url: str = "https://flows-api.jetty.io"):
+        self.token = token
+        self.base_url = base_url.rstrip("/")
+
+    def _open_with_retries(self, req: urllib.request.Request, *, timeout: int = 120, attempts: int = 3) -> Any:
+        for attempt in range(attempts):
+            try:
+                return urllib.request.urlopen(req, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                transient = exc.code == 429 or 500 <= exc.code < 600
+                if not transient or attempt == attempts - 1:
+                    raise
+                time.sleep(min(2 ** attempt, 10))
+        raise RuntimeError("unreachable retry state")
+
+    def _json_request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            self.base_url + path,
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        with self._open_with_retries(req, timeout=120) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            return json.loads(text) if text.strip() else {}
+
+    def upload(self, item: dict[str, Any], collection: str) -> str:
+        boundary = f"----skill-eval-harness-{int(time.time() * 1000)}"
+        parts: list[bytes] = []
+        def add_field(name: str, value: str) -> None:
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode("utf-8"))
+        add_field("collection", collection)
+        filename = item.get("remote_path_hint") or (Path(str(item.get("local_path", "file"))).name)
+        if "content" in item:
+            raw = item["content"]
+            content = json.dumps(raw, ensure_ascii=False).encode("utf-8") if isinstance(raw, (dict, list)) else str(raw).encode("utf-8")
+        else:
+            content = Path(str(item["local_path"])).read_bytes()
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode("utf-8"))
+        parts.append(content)
+        parts.append(b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+        req = urllib.request.Request(
+            self.base_url + "/api/v1/files/upload",
+            data=b"".join(parts),
+            method="POST",
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with self._open_with_retries(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+        for key in ["path", "file_path", "filePath", "url", "id"]:
+            if data.get(key):
+                return str(data[key])
+        if isinstance(data.get("file"), dict):
+            for key in ["path", "file_path", "filePath", "url", "id"]:
+                if data["file"].get(key):
+                    return str(data["file"][key])
+        raise RuntimeError(f"Jetty upload response did not include a file path: {data}")
+
+    def submit(self, request_body: dict[str, Any]) -> dict[str, Any]:
+        return self._json_request("POST", "/v1/chat/completions", request_body)
+
+    def poll(self, collection: str, task: str, trajectory_id: str, *, timeout_s: int = 1800, poll_interval_s: float = 5) -> dict[str, Any]:
+        deadline = time.time() + timeout_s
+        quoted = "/".join(urllib.parse.quote(part, safe="") for part in [collection, task, trajectory_id])
+        path = f"/api/v1/db/trajectory/{quoted}"
+        last: dict[str, Any] = {}
+        while time.time() <= deadline:
+            last = self._json_request("GET", path)
+            status = str(last.get("status", last.get("state", "unknown"))).lower()
+            if status in JETTY_TERMINAL_SUCCESS | JETTY_TERMINAL_FAILURE:
+                return last
+            if status not in JETTY_PENDING:
+                last["status"] = status or "unknown"
+                return last
+            time.sleep(poll_interval_s)
+        last["status"] = "timeout"
+        return last
+
+
+def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeout_s: int = 1800, poll_interval_s: float = 5) -> Any:
+    for row in payloads:
+        harness = row.get("harness", {})
+        if harness.get("executable") is False:
+            yield {
+                "harness": harness,
+                "status": "failed",
+                "trajectory_id": None,
+                "jetty": row.get("jetty_request", {}).get("jetty", {}),
+                "error": "payload is non-executable; missing hidden prompt content or dry-run placeholder",
+                "artifacts": [],
+            }
+            continue
+        request = copy.deepcopy(row.get("jetty_request", {}))
+        jetty = request.get("jetty", {})
+        collection = str(jetty.get("collection", ""))
+        task_name = str(jetty.get("task", ""))
+        mapping: dict[str, str] = {}
+        trajectory_id = None
+        try:
+            files = list(row.get("upload_plan", {}).get("files", []))
+            files.sort(key=lambda item: 1 if item.get("role") == "task" else 0)
+            for item in files:
+                upload_item = replace_placeholders(copy.deepcopy(item), mapping)
+                remote = client.upload(upload_item, collection)
+                if item.get("placeholder"):
+                    mapping[str(item["placeholder"])] = remote
+            request = replace_placeholders(request, mapping)
+            submission = client.submit(request)
+            trajectory_id = extract_trajectory_id(submission)
+            if not trajectory_id:
+                raise RuntimeError(f"Jetty submit response did not include trajectory_id: {submission}")
+            trajectory = client.poll(collection, task_name, trajectory_id, timeout_s=timeout_s, poll_interval_s=poll_interval_s)
+            status = str(trajectory.get("status", trajectory.get("state", "unknown"))).lower()
+            if status in JETTY_TERMINAL_SUCCESS:
+                normalized_status = "completed"
+            elif status in JETTY_TERMINAL_FAILURE:
+                normalized_status = "failed" if status != "timeout" else "timeout"
+            else:
+                normalized_status = "unknown"
+            yield {
+                "harness": harness,
+                "status": normalized_status,
+                "trajectory_id": trajectory_id,
+                "jetty": {
+                    "collection": collection,
+                    "task": task_name,
+                    "agent": jetty.get("agent"),
+                    "model": request.get("model"),
+                    "model_provider": jetty.get("model_provider"),
+                    "snapshot": jetty.get("snapshot"),
+                },
+                "submitted_request": request,
+                "submission_response": submission,
+                "trajectory": trajectory,
+                "artifacts": trajectory.get("artifacts", trajectory.get("outputs", [])) if isinstance(trajectory, dict) else [],
+            }
+        except Exception as exc:
+            yield {
+                "harness": harness,
+                "status": "failed",
+                "trajectory_id": trajectory_id,
+                "jetty": {
+                    "collection": collection,
+                    "task": task_name,
+                    "agent": jetty.get("agent"),
+                    "model": request.get("model"),
+                    "model_provider": jetty.get("model_provider"),
+                    "snapshot": jetty.get("snapshot"),
+                },
+                "error": str(exc),
+                "artifacts": [],
+            }
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def run_jetty(args: argparse.Namespace) -> int:
+    payloads = load_jsonl(Path(args.payloads))
+    if getattr(args, "dry_run", False):
+        records = [{"harness": p.get("harness", {}), "status": "dry_run", "jetty": p.get("jetty_request", {}).get("jetty", {})} for p in payloads]
+    else:
+        token = os.environ.get("JETTY_API_TOKEN")
+        if not token:
+            die("JETTY_API_TOKEN is required for run-jetty (use --dry-run to validate payload loading only)")
+        client = JettyClient(token, os.environ.get("JETTY_BASE_URL", "https://flows-api.jetty.io"))
+        records = list(execute_jetty_payloads(payloads, client=client, timeout_s=getattr(args, "timeout", 1800), poll_interval_s=getattr(args, "poll_interval", 5)))
+    out = Path(args.out) if getattr(args, "out", None) else None
+    fh = out.open("w", encoding="utf-8") if out else sys.stdout
+    try:
+        for record in records:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    finally:
+        if out:
+            fh.close()
+    return 0
+
+
+def artifact_content(artifact: dict[str, Any]) -> Any:
+    for key in ["content", "text", "body"]:
+        if key in artifact:
+            return artifact[key]
+    return None
+
+
+def artifact_rel_path(artifact: dict[str, Any]) -> Path | None:
+    raw = str(artifact.get("path") or artifact.get("name") or artifact.get("filename") or "")
+    if not raw:
+        return None
+    raw = raw.replace("\\", "/")
+    for prefix in ["/app/results/", "app/results/", "results/"]:
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    raw = raw.lstrip("/")
+    if not raw or ".." in Path(raw).parts:
+        return None
+    rel = Path(raw)
+    if rel.parts and rel.parts[0] in {"output.md", "metadata.json", "outputs"}:
+        return rel
+    if rel.name in {"output.md", "metadata.json"}:
+        return Path(rel.name)
+    return Path("outputs") / rel.name
+
+
+def write_artifact(base: Path, artifact: dict[str, Any]) -> None:
+    rel = artifact_rel_path(artifact)
+    if rel is None:
+        return
+    content = artifact_content(artifact)
+    if content is None:
+        return
+    dest = base / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, (dict, list)):
+        dest.write_text(json.dumps(content, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    else:
+        dest.write_text(str(content), encoding="utf-8")
+
+
+def find_output_artifact(artifacts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for artifact in artifacts:
+        rel = artifact_rel_path(artifact)
+        if rel and rel.as_posix() == "output.md" and artifact_content(artifact) is not None:
+            return artifact
+    return None
+
+
+def artifact_metadata(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    for artifact in artifacts:
+        rel = artifact_rel_path(artifact)
+        if not rel or rel.as_posix() != "metadata.json":
+            continue
+        content = artifact_content(artifact)
+        if isinstance(content, dict):
+            return content
+        if isinstance(content, str):
+            try:
+                data = json.loads(content)
+                return data if isinstance(data, dict) else {}
+            except json.JSONDecodeError:
+                return {"metadata_error": "invalid Jetty metadata artifact"}
+    return {}
+
+
+def normalized_jetty_metadata(record: dict[str, Any], *, success: bool) -> dict[str, Any]:
+    jetty = record.get("jetty", {}) if isinstance(record.get("jetty"), dict) else {}
+    trajectory = record.get("trajectory", {}) if isinstance(record.get("trajectory"), dict) else {}
+    usage = trajectory.get("usage", {}) if isinstance(trajectory.get("usage"), dict) else {}
+    collection = jetty.get("collection")
+    task = jetty.get("task")
+    trajectory_id = record.get("trajectory_id")
+    elapsed = trajectory.get("elapsed_ms", trajectory.get("duration_ms"))
+    total_tokens = trajectory.get("total_tokens", usage.get("total_tokens"))
+    tool_calls = trajectory.get("total_tool_calls")
+    if tool_calls is None and isinstance(trajectory.get("tool_calls"), int):
+        tool_calls = trajectory.get("tool_calls")
+    meta = {
+        "provider": "jetty",
+        "model": jetty.get("model"),
+        "model_provider": jetty.get("model_provider"),
+        "elapsed_ms": elapsed,
+        "input_tokens": trajectory.get("input_tokens", usage.get("input_tokens", usage.get("prompt_tokens"))),
+        "output_tokens": trajectory.get("output_tokens", usage.get("output_tokens", usage.get("completion_tokens"))),
+        "total_tokens": total_tokens,
+        "total_tool_calls": tool_calls,
+        "errors_encountered": 0 if success else 1,
+        "returncode": 0 if success else 1,
+        "timed_out": record.get("status") == "timeout",
+        "jetty_trajectory_id": trajectory_id,
+        "jetty_collection": collection,
+        "jetty_task": task,
+        "jetty_agent": jetty.get("agent"),
+        "jetty_snapshot": jetty.get("snapshot"),
+        "trace_url": f"https://jetty.io/{collection}/{task}/{trajectory_id}" if collection and task and trajectory_id else None,
+        "jetty_raw_path": "jetty_raw.json",
+    }
+    return {k: v for k, v in meta.items() if v is not None}
+
+
+def import_jetty_results(args: argparse.Namespace) -> int:
+    validate_manifest(Path(args.manifest))
+    runs = Path(args.runs)
+    records = load_jsonl(Path(args.jetty_runs))
+    for record in records:
+        harness = record.get("harness", {})
+        run_dir = harness.get("run_dir")
+        if run_dir:
+            base = runs / str(run_dir)
+        else:
+            case_id = str(harness.get("case_id", "unknown-case"))
+            variant = str(harness.get("variant", "unknown-variant"))
+            run_number = int(harness.get("run_number", 1) or 1)
+            base = runs / case_id / variant if run_number == 1 else runs / case_id / variant / f"run-{run_number}"
+        base.mkdir(parents=True, exist_ok=True)
+        write_json(base / "jetty_raw.json", record)
+        artifacts = record.get("artifacts") or []
+        if not artifacts and isinstance(record.get("trajectory"), dict):
+            artifacts = record["trajectory"].get("artifacts", record["trajectory"].get("outputs", [])) or []
+        artifacts = [a for a in artifacts if isinstance(a, dict)]
+        success = str(record.get("status", "")).lower() == "completed" and find_output_artifact(artifacts) is not None
+        if success:
+            for artifact in artifacts:
+                write_artifact(base, artifact)
+        else:
+            (base / "output.md").write_text("[JETTY FAILURE: trajectory failed before producing output]\n", encoding="utf-8")
+        meta = artifact_metadata(artifacts)
+        meta.update(normalized_jetty_metadata(record, success=success))
+        write_json(base / "metadata.json", meta)
     return 0
 
 
@@ -1194,6 +1834,36 @@ def main() -> int:
     p.add_argument("--allow-missing-prompts", action="store_true", help="dry-run hidden prompt_ref cases even when private files are absent")
     p.add_argument("--include-answer-key", action="store_true", help="include expected_behavior/review_rubric in prepared tasks; use only for judge/debug tasks, not generation")
 
+    p = sub.add_parser("export-jetty")
+    p.add_argument("manifest")
+    p.add_argument("--split", choices=sorted(VALID_SPLITS))
+    p.add_argument("--out")
+    p.add_argument("--include-ablations", action="store_true")
+    p.add_argument("--include-old-skill", action="store_true")
+    p.add_argument("--runs-per-variant", type=int, default=1)
+    p.add_argument("--allow-missing-prompts", action="store_true")
+    p.add_argument("--jetty-collection", default=None)
+    p.add_argument("--jetty-task-prefix", default=None)
+    p.add_argument("--jetty-agent", default=None)
+    p.add_argument("--jetty-model", default=None)
+    p.add_argument("--jetty-model-provider", default=None)
+    p.add_argument("--jetty-snapshot", default=None)
+    p.add_argument("--use-trial-keys", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="accepted for symmetry; export never performs network calls")
+
+    p = sub.add_parser("run-jetty")
+    p.add_argument("--payloads", required=True)
+    p.add_argument("--out")
+    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--poll-interval", type=float, default=5)
+    p.add_argument("--concurrency", type=int, default=1, help="reserved; current implementation runs sequentially")
+    p.add_argument("--dry-run", action="store_true")
+
+    p = sub.add_parser("import-jetty-results")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--jetty-runs", required=True)
+    p.add_argument("--runs", required=True)
+
     p = sub.add_parser("grade")
     p.add_argument("manifest")
     p.add_argument("--runs", required=True)
@@ -1272,6 +1942,12 @@ def main() -> int:
         return 0
     if args.cmd == "prepare":
         return prepare(args)
+    if args.cmd == "export-jetty":
+        return export_jetty(args)
+    if args.cmd == "run-jetty":
+        return run_jetty(args)
+    if args.cmd == "import-jetty-results":
+        return import_jetty_results(args)
     if args.cmd == "grade":
         return grade(args)
     if args.cmd == "benchmark":
