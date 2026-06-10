@@ -15,6 +15,7 @@ import os
 import random
 import re
 import statistics
+import subprocess
 import sys
 import time
 import urllib.error
@@ -34,6 +35,7 @@ OBJECTIVE_ASSERTIONS = {
     "not_regex",
     "file_exists",
     "json_field_equals",
+    "script",
 }
 QUALITATIVE_ASSERTIONS = {"judge", "rubric"}
 
@@ -86,6 +88,76 @@ def repo_root_for_manifest(manifest_path: Path) -> Path:
     if manifest_path.name == "shared-benchmark.json" and manifest_path.parent.name == "evals":
         return manifest_path.parent.parent.resolve()
     return manifest_path.parent.resolve()
+
+
+def script_command_list(assertion: dict[str, Any]) -> list[str]:
+    command = assertion.get("command")
+    if isinstance(command, str):
+        return [command]
+    if isinstance(command, list) and command and all(isinstance(part, str) for part in command):
+        return list(command)
+    return []
+
+
+def validate_script_assertion(assertion: dict[str, Any], manifest_path: Path, cid: str, index: int) -> None:
+    command = script_command_list(assertion)
+    if not command:
+        die(f"{cid}: assertion #{index} script command must be a non-empty string or list of strings")
+    for part in command:
+        if "{" in part:
+            continue
+        candidate = Path(part)
+        should_exist = candidate.is_absolute() or "/" in part or part.endswith((".py", ".js", ".mjs", ".sh"))
+        if not should_exist:
+            continue
+        if not candidate.is_absolute():
+            candidate = manifest_path.parent / candidate
+        if not candidate.exists():
+            die(f"{cid}: assertion #{index} script path does not exist: {candidate}")
+    timeout = assertion.get("timeout_s", 30)
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        die(f"{cid}: assertion #{index} timeout_s must be a positive number")
+
+
+def assertion_values_for_leakage(assertion: dict[str, Any]) -> list[str]:
+    atype = assertion.get("type")
+    if atype == "contains":
+        return [str(assertion.get("value", ""))]
+    if atype in {"contains_any", "contains_all"}:
+        raw = assertion.get("values", assertion.get("value", []))
+        if isinstance(raw, list):
+            return [str(v) for v in raw]
+        return [str(raw)]
+    return []
+
+
+def prompt_assertion_leakage_findings(manifest: dict[str, Any], manifest_path: Path, *, min_chars: int = 4, split: str | None = None) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for case in iter_cases(manifest, split):
+        prompt = ""
+        if case.get("prompt"):
+            prompt = str(case["prompt"])
+        elif case.get("prompt_ref"):
+            ref = manifest_path.parent / str(case["prompt_ref"])
+            if ref.exists():
+                prompt = ref.read_text(encoding="utf-8", errors="replace")
+        if not prompt:
+            continue
+        folded_prompt = prompt.casefold()
+        for assertion in case.get("assertions", []) or []:
+            for value in assertion_values_for_leakage(assertion):
+                value = value.strip()
+                if len(value) < min_chars:
+                    continue
+                if value.casefold() in folded_prompt:
+                    findings.append({
+                        "case_id": case.get("id"),
+                        "assertion": assertion_label(assertion),
+                        "type": assertion.get("type"),
+                        "value": value,
+                        "message": f"assertion value {value!r} appears in prompt",
+                    })
+    return findings
 
 
 def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[str, Any]:
@@ -146,6 +218,8 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                     re.compile(pattern)
                 except re.error as exc:
                     die(f"{cid}: assertion #{j} invalid regex {pattern!r}: {exc}")
+            if atype == "script":
+                validate_script_assertion(assertion, path, cid, j)
 
     for i, ablation in enumerate(manifest.get("ablations", [])):
         if not isinstance(ablation, dict):
@@ -953,7 +1027,28 @@ def read_metadata(runs: Path, case_id: str, variant: str) -> dict[str, Any]:
     return read_metadata_base(runs / case_id / variant)
 
 
-def assertion_result(assertion: dict[str, Any], text: str, output_path: Path) -> dict[str, Any]:
+def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_dir: Path | None) -> tuple[bool, str]:
+    command = script_command_list(assertion)
+    command = [part.replace("{output_dir}", str(output_dir.resolve())).replace("{output_path}", str((output_dir / "output.md").resolve())) for part in command]
+    timeout = float(assertion.get("timeout_s", 30))
+    expected = int(assertion.get("pass_exit_code", 0))
+    try:
+        proc = subprocess.run(command, cwd=manifest_dir, text=True, capture_output=True, timeout=timeout)
+        evidence = f"exit={proc.returncode}"
+        if proc.stdout:
+            evidence += f"\nstdout:\n{proc.stdout[:4000]}"
+        if proc.stderr:
+            evidence += f"\nstderr:\n{proc.stderr[:4000]}"
+        return proc.returncode == expected, evidence
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        return False, f"script timed out after {timeout}s\nstdout:\n{stdout[:2000]}\nstderr:\n{stderr[:2000]}"
+    except Exception as exc:
+        return False, f"script execution failed: {exc}"
+
+
+def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *, run_base: Path | None = None, allow_scripts: bool = False, manifest_dir: Path | None = None) -> dict[str, Any]:
     atype = assertion.get("type")
     name = assertion.get("name") or assertion.get("description") or atype
     ci = assertion.get("ci", True)
@@ -1011,6 +1106,12 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path) ->
             evidence = f"{field}={actual!r}"
         except Exception as exc:
             evidence = f"json check failed: {exc}"
+    elif atype == "script":
+        if not allow_scripts:
+            passed = False
+            evidence = "script assertion skipped; rerun grade/benchmark with --allow-scripts to execute repo-owned oracle commands"
+        else:
+            passed, evidence = run_script_assertion(assertion, run_base or output_path.parent, manifest_dir)
     else:
         evidence = "qualitative/deferred"
     return {"name": name, "type": atype, "passed": passed, "evidence": evidence}
@@ -1054,6 +1155,132 @@ def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
     return lookup
 
 
+def extract_json_object(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text[i:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            return obj[0]
+    raise ValueError("no JSON object found in judge output")
+
+
+def judge_prompt(task: dict[str, Any], output_text: str) -> str:
+    assertion = task.get("assertion", {})
+    payload = {
+        "judge_task_id": task.get("judge_task_id"),
+        "case_id": task.get("case_id"),
+        "variant": task.get("variant"),
+        "run_number": task.get("run_number"),
+        "prompt": task.get("prompt"),
+        "expected_behavior": task.get("expected_behavior", []),
+        "review_rubric": task.get("review_rubric", []),
+        "assertion": assertion,
+        "candidate_output": output_text,
+    }
+    return (
+        "You are grading one Skill Eval Harness judge assertion.\n"
+        "Return only JSON with keys: passed (boolean), score (number optional), rationale (string).\n\n"
+        + json.dumps(payload, indent=2, ensure_ascii=False)
+    )
+
+
+def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = None, variants: list[str] | None = None) -> list[dict[str, Any]]:
+    manifest = validate_manifest(manifest_path)
+    selected_variants = variants or manifest.get("variants", DEFAULT_VARIANTS)
+    tasks: list[dict[str, Any]] = []
+    for case in iter_cases(manifest, split):
+        for variant in selected_variants:
+            for run_number, base in discover_run_bases(runs, case["id"], variant):
+                text, output_path = read_output_base(base)
+                meta = read_metadata_base(base)
+                _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={})
+                tasks.extend(judge_tasks)
+    return tasks
+
+
+def run_one_judge_task(task: dict[str, Any], judge_cmd: str, transcripts_dir: Path | None = None, repeat_index: int = 1) -> dict[str, Any]:
+    output_path = Path(task.get("output_path", ""))
+    output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
+    prompt = judge_prompt(task, output_text)
+    proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
+    parsed: dict[str, Any]
+    parse_error = None
+    try:
+        parsed = extract_json_object(proc.stdout)
+    except Exception as exc:
+        parsed = {}
+        parse_error = str(exc)
+    assertion = task.get("assertion", {})
+    threshold = assertion.get("threshold", parsed.get("threshold", 1))
+    score = parsed.get("score")
+    if "passed" in parsed:
+        passed = bool(parsed.get("passed"))
+    elif isinstance(score, (int, float)):
+        passed = score >= threshold
+    else:
+        passed = False
+    evidence = parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or parse_error or "judge command completed"
+    row = {
+        "judge_task_id": task["judge_task_id"],
+        "case_id": task.get("case_id"),
+        "variant": task.get("variant"),
+        "run_number": task.get("run_number"),
+        "passed": passed and proc.returncode == 0 and parse_error is None,
+        "score": score,
+        "threshold": threshold,
+        "evidence": evidence,
+        "returncode": proc.returncode,
+        "stderr": proc.stderr[:4000] if proc.stderr else "",
+    }
+    if transcripts_dir:
+        safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", task["judge_task_id"])
+        dest = transcripts_dir / safe / f"run-{repeat_index}"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "prompt.md").write_text(prompt, encoding="utf-8")
+        (dest / "stdout.txt").write_text(proc.stdout, encoding="utf-8")
+        if proc.stderr:
+            (dest / "stderr.txt").write_text(proc.stderr, encoding="utf-8")
+        write_json(dest / "result.json", row)
+    return row
+
+
+def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(rows) == 1:
+        return rows[0]
+    scores = [r.get("score") for r in rows if isinstance(r.get("score"), (int, float))]
+    passed_count = sum(1 for r in rows if r.get("passed"))
+    first = dict(rows[0])
+    first["passed"] = passed_count > len(rows) / 2
+    if scores:
+        first["score"] = statistics.median(scores)
+    first["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
+    first["judge_runs"] = rows
+    return first
+
+
+def judge_command(args: argparse.Namespace) -> int:
+    tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
+    transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
+    repeat = max(1, int(getattr(args, "judge_runs", 1)))
+    out = Path(args.out) if getattr(args, "out", None) else None
+    fh = out.open("w", encoding="utf-8") if out else sys.stdout
+    try:
+        for task in tasks:
+            rows = [run_one_judge_task(task, args.judge_cmd, transcripts, i) for i in range(1, repeat + 1)]
+            fh.write(json.dumps(merge_repeated_judge_rows(rows), ensure_ascii=False) + "\n")
+    finally:
+        if out:
+            fh.close()
+    return 0
+
+
 def grade_case_variant(
     case: dict[str, Any],
     variant: str,
@@ -1064,6 +1291,8 @@ def grade_case_variant(
     run_number: int = 1,
     run_base: Path | None = None,
     judge_results: dict[str, dict[str, Any]] | None = None,
+    allow_scripts: bool = False,
+    manifest_dir: Path | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     objective = []
     qualitative = []
@@ -1101,7 +1330,7 @@ def grade_case_variant(
                     "review_rubric": case.get("review_rubric", []),
                 })
         else:
-            objective.append(assertion_result(assertion, text, output_path))
+            objective.append(assertion_result(assertion, text, output_path, run_base=run_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir))
     objective_passed = sum(1 for r in objective if r["passed"])
     objective_total = len(objective)
     qualitative_passed = sum(1 for r in qualitative if r["passed"])
@@ -1195,7 +1424,7 @@ def grade(args: argparse.Namespace) -> int:
             for run_number, base in discover_run_bases(runs, case["id"], variant):
                 text, output_path = read_output_base(base)
                 meta = read_metadata_base(base)
-                result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup)
+                result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent)
                 all_results.append(result)
                 all_judge_tasks.extend(judge_tasks)
     report = {
@@ -1251,6 +1480,7 @@ def build_benchmark_report(
     split: str | None = None,
     variants_arg: list[str] | None = None,
     judge_results_path: str | None = None,
+    allow_scripts: bool = False,
 ) -> dict[str, Any]:
     manifest = validate_manifest(path)
     variants = variants_arg or manifest.get("variants", DEFAULT_VARIANTS)
@@ -1261,7 +1491,7 @@ def build_benchmark_report(
             for run_number, base in discover_run_bases(runs, case["id"], variant):
                 text, output_path = read_output_base(base)
                 meta = read_metadata_base(base)
-                result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup)
+                result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent)
                 results.append(result)
 
     by_variant: dict[str, list[dict[str, Any]]] = {v: [] for v in variants}
@@ -1333,7 +1563,7 @@ def build_benchmark_report(
 
 
 def benchmark(args: argparse.Namespace) -> int:
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None))
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False))
     if args.out:
         write_json(Path(args.out), report)
     else:
@@ -1349,7 +1579,7 @@ def aggregate(args: argparse.Namespace) -> int:
         runs = Path(args.runs_root) / repo_root.name / args.runs_subdir
         if args.runs:
             runs = Path(args.runs)
-        reports.append(build_benchmark_report(manifest_path, runs, args.split, args.variant, getattr(args, "judge_results", None)))
+        reports.append(build_benchmark_report(manifest_path, runs, args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False)))
 
     aggregate_summary: dict[str, Any] = {
         "skills": len(reports),
@@ -1447,7 +1677,7 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
 
 
 def export_anthropic(args: argparse.Namespace) -> int:
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None))
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False))
     benchmark = anthropic_benchmark_from_report(report, args.skill_path or "")
     if args.out:
         write_json(Path(args.out), benchmark)
@@ -1674,6 +1904,7 @@ def audit_manifest_report(
     min_adversarial: int = 3,
     min_trigger_pos: int = 2,
     min_trigger_neg: int = 2,
+    leakage_min_chars: int = 4,
 ) -> dict[str, Any]:
     manifest = validate_manifest(manifest_path)
     cases = iter_cases(manifest, split)
@@ -1700,6 +1931,11 @@ def audit_manifest_report(
         findings.append({"kind": kind, "severity": severity, "message": message, **({"evidence": evidence} if evidence is not None else {})})
     def rec(kind: str, message: str, example: Any = None) -> None:
         recommendations.append({"kind": kind, "message": message, **({"example": example} if example is not None else {})})
+
+    leakage = prompt_assertion_leakage_findings(manifest, manifest_path, min_chars=leakage_min_chars, split=split)
+    if leakage:
+        finding("prompt-assertion-leakage", "recommended", f"{len(leakage)} contains-style assertion values appear literally in their prompts.", leakage[:30])
+        rec("assertion-leakage", "Replace leaked literal keyword assertions with non-leaked wording, regex scoped to output structure, fixture/script oracles, or stricter artifact checks.")
 
     if counts["positive"] < min_positive:
         finding("missing-positive-evals", "required", f"Only {counts['positive']} positive cases; target at least {min_positive}.")
@@ -1786,6 +2022,7 @@ def audit_manifest(args: argparse.Namespace) -> int:
         min_adversarial=args.min_adversarial,
         min_trigger_pos=args.min_trigger_pos,
         min_trigger_neg=args.min_trigger_neg,
+        leakage_min_chars=args.leakage_min_chars,
     )
     if args.format == "markdown":
         lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "", "| Metric | Value |", "|---|---:|"]
@@ -1823,6 +2060,8 @@ def main() -> int:
     p = sub.add_parser("validate")
     p.add_argument("manifest")
     p.add_argument("--strict-holdback", action="store_true", help="require holdout/holdback prompt_ref files to exist")
+    p.add_argument("--strict-leakage", action="store_true", help="fail if contains-style assertion values appear literally in prompts")
+    p.add_argument("--leakage-min-chars", type=int, default=4, help="minimum assertion value length for prompt leakage lint")
 
     p = sub.add_parser("prepare")
     p.add_argument("manifest")
@@ -1872,7 +2111,18 @@ def main() -> int:
     p.add_argument("--out")
     p.add_argument("--judge-tasks")
     p.add_argument("--judge-results", help="JSONL/JSON results keyed by judge_task_id; merges qualitative scoring")
+    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
     p.add_argument("--write-grading-files", action="store_true", help="write Anthropic-compatible grading.json files into each run directory")
+
+    p = sub.add_parser("judge")
+    p.add_argument("manifest")
+    p.add_argument("--runs", required=True)
+    p.add_argument("--split", choices=sorted(VALID_SPLITS))
+    p.add_argument("--variant", action="append")
+    p.add_argument("--judge-cmd", required=True, help="shell command that reads a judge prompt on stdin and emits JSON on stdout")
+    p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
+    p.add_argument("--transcripts", help="directory for per-task prompt/stdout/stderr/result audit transcripts")
+    p.add_argument("--out")
 
     p = sub.add_parser("benchmark")
     p.add_argument("manifest")
@@ -1880,6 +2130,7 @@ def main() -> int:
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-results", help="merge qualitative judge scoring into combined pass rates")
+    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
     p.add_argument("--out")
 
     p = sub.add_parser("export-anthropic")
@@ -1888,6 +2139,7 @@ def main() -> int:
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-results")
+    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest before exporting")
     p.add_argument("--skill-path", default="")
     p.add_argument("--out")
 
@@ -1924,6 +2176,7 @@ def main() -> int:
     p.add_argument("--min-adversarial", type=int, default=3)
     p.add_argument("--min-trigger-pos", type=int, default=2)
     p.add_argument("--min-trigger-neg", type=int, default=2)
+    p.add_argument("--leakage-min-chars", type=int, default=4)
 
     p = sub.add_parser("aggregate")
     p.add_argument("manifests", nargs="+")
@@ -1933,11 +2186,18 @@ def main() -> int:
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-results")
+    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from manifests while aggregating")
     p.add_argument("--out")
 
     args = parser.parse_args()
     if args.cmd == "validate":
-        manifest = validate_manifest(Path(args.manifest), allow_missing_holdback=not args.strict_holdback)
+        manifest_path = Path(args.manifest)
+        manifest = validate_manifest(manifest_path, allow_missing_holdback=not args.strict_holdback)
+        leakage = prompt_assertion_leakage_findings(manifest, manifest_path, min_chars=args.leakage_min_chars)
+        for finding in leakage:
+            print(f"WARN {finding['case_id']}: assertion {finding['assertion']!r} value {finding['value']!r} appears in prompt (leakage; case may saturate)", file=sys.stderr)
+        if leakage and args.strict_leakage:
+            die(f"prompt/assertion leakage found in {len(leakage)} assertion value(s)")
         print(f"OK: {manifest['skill_name']} — {len(iter_cases(manifest))} cases, {len(manifest.get('ablations', []))} ablations")
         return 0
     if args.cmd == "prepare":
@@ -1950,6 +2210,8 @@ def main() -> int:
         return import_jetty_results(args)
     if args.cmd == "grade":
         return grade(args)
+    if args.cmd == "judge":
+        return judge_command(args)
     if args.cmd == "benchmark":
         return benchmark(args)
     if args.cmd == "export-anthropic":
