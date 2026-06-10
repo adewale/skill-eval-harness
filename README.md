@@ -10,8 +10,9 @@ Use it when you want to answer: **does this skill improve the agent, where does 
 - **Anti-overfitting splits** — keep `tune`, `holdout`, and `holdback` cases separate.
 - **Answer-key-safe preparation** — generation tasks omit expected behavior/rubrics unless explicitly requested.
 - **Repeated-run statistics** — measure mean, stddev, min, max, median, time, and token usage.
-- **Objective grading** — run string, regex, file, and JSON assertions locally.
-- **Qualitative review handoff** — emit judge tasks and merge external judge results.
+- **Objective grading** — run string, regex, file, JSON, and opt-in script assertions locally.
+- **Prompt/assertion leakage lint** — warn when literal `contains*` assertion values appear in prompts.
+- **Qualitative review handoff** — emit judge tasks, run an opt-in `--judge-cmd` backend, and merge judge results.
 - **Blind comparison** — generate A/B comparison tasks and unblind the aggregate winner.
 - **Compatibility exports** — write Anthropic-style `grading.json` and `benchmark.json` files.
 - **Review UI** — render a static HTML benchmark viewer.
@@ -24,7 +25,7 @@ Use it when you want to answer: **does this skill improve the agent, where does 
 > Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Install from GitHub first:
 >
 > ```bash
-> uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.2.0
+> uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.3.0
 > ```
 
 ```bash
@@ -61,12 +62,12 @@ skill-benchmark render-viewer \
 ### From GitHub
 
 ```bash
-uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.2.0
+uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.3.0
 skill-benchmark --help
 skill-pi-trigger-eval --help
 
 # One-shot without installing globally:
-uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.2.0 skill-benchmark --help
+uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.3.0 skill-benchmark --help
 ```
 
 ### Local development
@@ -89,7 +90,7 @@ Each skill repo owns an `evals/shared-benchmark.json` manifest. Add a `harness` 
   "harness": {
     "name": "skill-eval-harness",
     "url": "https://github.com/adewale/skill-eval-harness",
-    "version": ">=0.1.1"
+    "version": ">=0.3.0"
   },
   "skill_paths": ["skills/good-pr/SKILL.md"],
   "variants": ["with_skill", "without_skill"],
@@ -150,6 +151,21 @@ Objective assertion types:
 | `not_regex` | Regex does not match output. |
 | `file_exists` | A file exists relative to the run directory. |
 | `json_field_equals` | A JSON field equals an expected value. |
+| `script` | Opt-in deterministic oracle command against the output directory. |
+
+Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `benchmark`, `aggregate`, or `export-anthropic`:
+
+```json
+{
+  "name": "oracle-pass",
+  "type": "script",
+  "command": ["python3", "oracles/oracle.py", "{output_dir}"],
+  "pass_exit_code": 0,
+  "timeout_s": 30
+}
+```
+
+`command` runs with cwd set to the manifest directory. `{output_dir}` is replaced with the absolute run directory.
 
 Qualitative assertion types:
 
@@ -200,6 +216,7 @@ runs/<case_id>/<variant>/run-2/outputs/<artifact files>
 ```bash
 skill-benchmark validate ../repo/evals/shared-benchmark.json
 skill-benchmark validate ../repo/evals/shared-benchmark.json --strict-holdback
+skill-benchmark validate ../repo/evals/shared-benchmark.json --strict-leakage
 ```
 
 ### Prepare tasks
@@ -221,6 +238,15 @@ skill-benchmark grade ../repo/evals/shared-benchmark.json \
   --judge-tasks judge-tasks.jsonl
 ```
 
+Execute repo-owned script assertions explicitly:
+
+```bash
+skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
+  --runs ../repo/eval-runs/latest \
+  --allow-scripts \
+  --out benchmark.json
+```
+
 Write Anthropic-compatible per-run grading files:
 
 ```bash
@@ -237,6 +263,25 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --judge-results judge-results.jsonl \
   --out benchmark.json
 ```
+
+### Judge command backend
+
+Run deferred `judge`/`rubric` assertions with any command that reads a prompt from stdin and emits JSON on stdout:
+
+```bash
+skill-benchmark judge ../repo/evals/shared-benchmark.json \
+  --runs ../repo/eval-runs/latest \
+  --judge-cmd 'claude -p' \
+  --transcripts judge-transcripts \
+  --out judge-results.jsonl
+
+skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
+  --runs ../repo/eval-runs/latest \
+  --judge-results judge-results.jsonl \
+  --out benchmark.json
+```
+
+The judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting.
 
 ### Audit manifest quality
 

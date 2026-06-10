@@ -1,7 +1,7 @@
 [project]
 name = "skill-eval-harness"
-version = "0.2.0"
-description = "Repo-agnostic Agent Skill evaluation harness with paired variants, holdout splits, repeated-run stats, Anthropic-compatible exports, Jetty adapter support, and static review output."
+version = "0.3.0"
+description = "Repo-agnostic Agent Skill evaluation harness with paired variants, holdout splits, repeated-run stats, script assertions, judge command backends, Anthropic-compatible exports, Jetty adapter support, and static review output."
 requires-python = ">=3.10"
 readme = "README.md"
 license = {text = "MIT"}

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -322,6 +323,73 @@ class SkillBenchmarkTests(unittest.TestCase):
             records = list(sb.execute_jetty_payloads([row], client=ShouldNotCallClient()))
             self.assertEqual(records[0]["status"], "failed")
             self.assertIn("non-executable", records[0]["error"])
+
+    def test_script_assertion_requires_opt_in_and_executes_oracle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            oracle = manifest.parent / "oracles" / "oracle.py"
+            oracle.parent.mkdir(parents=True)
+            oracle.write_text(
+                "import pathlib, sys\n"
+                "out = pathlib.Path(sys.argv[1]) / 'output.md'\n"
+                "text = out.read_text()\n"
+                "print('checked output')\n"
+                "raise SystemExit(0 if 'alpha beta' in text else 2)\n",
+                encoding="utf-8",
+            )
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["cases"][0]["assertions"] = [{
+                "name": "oracle-pass",
+                "type": "script",
+                "command": [sys.executable, "oracles/oracle.py", "{output_dir}"],
+                "timeout_s": 5,
+            }]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            runs = root / "repo" / "eval-runs" / "latest"
+            base = runs / "case-1" / "with_skill"
+            base.mkdir(parents=True)
+            (base / "output.md").write_text("alpha beta", encoding="utf-8")
+            blocked = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"])
+            self.assertEqual(blocked["results"][0]["objective_pass_rate"], 0.0)
+            self.assertIn("--allow-scripts", blocked["results"][0]["assertions"][0]["evidence"])
+            allowed = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"], allow_scripts=True)
+            self.assertEqual(allowed["results"][0]["objective_pass_rate"], 1.0)
+            self.assertIn("checked output", allowed["results"][0]["assertions"][0]["evidence"])
+
+    def test_prompt_assertion_leakage_lint_finds_literal_contains_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            findings = sb.prompt_assertion_leakage_findings(sb.load_json(manifest), manifest)
+            self.assertTrue(any(f["case_id"] == "case-1" and f["value"] == "alpha" for f in findings))
+
+    def test_judge_command_backend_writes_loadable_results(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            runs = root / "repo" / "eval-runs" / "latest"
+            base = runs / "case-1" / "with_skill"
+            base.mkdir(parents=True)
+            (base / "output.md").write_text("alpha beta", encoding="utf-8")
+            judge = root / "judge.py"
+            judge.write_text(
+                "import json, sys\n"
+                "_ = sys.stdin.read()\n"
+                "print('prefix ' + json.dumps({'score': 4, 'passed': True, 'rationale': 'ok {brace}'}) + ' suffix')\n",
+                encoding="utf-8",
+            )
+            out = root / "judge-results.jsonl"
+            transcripts = root / "judge-transcripts"
+            sb.judge_command(SimpleNamespace(
+                manifest=str(manifest), runs=str(runs), split="tune", variant=["with_skill"],
+                judge_cmd=f"{sys.executable} {judge}", out=str(out), transcripts=str(transcripts), judge_runs=1,
+            ))
+            rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(rows[0]["judge_task_id"], "case-1::with_skill::run-1::quality")
+            self.assertTrue(rows[0]["passed"])
+            self.assertIn("{brace}", rows[0]["evidence"])
+            self.assertTrue(any(transcripts.rglob("prompt.md")))
 
     def test_run_jetty_uploads_submits_polls_and_replaces_placeholders(self):
         row = {
