@@ -88,26 +88,46 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+def variant_runtime(manifest: dict[str, Any], repo_root: Path, variant: str) -> tuple[str, list[str]]:
+    skill_paths = [repo_root / p for p in manifest.get("skill_paths", [])]
+    if variant == "with_skill":
+        skill_list = ", ".join(str(sp) for sp in skill_paths)
+        return (
+            f"Use the loaded {manifest['skill_name']} skill where it applies. "
+            f"Read and follow these skill path(s), including referenced files when relevant: {skill_list}. "
+            "If the skill defines a required output contract, follow it exactly rather than giving a shortcut answer.",
+            [arg for sp in skill_paths for arg in ("--skill", str(sp))],
+        )
+    if variant == "without_skill":
+        return (
+            f"Do not use or read the {manifest['skill_name']} skill or its references. "
+            "Use only general assistant ability.",
+            ["--no-skills"],
+        )
+    if variant.startswith("ablation:"):
+        aid = variant.split(":", 1)[1]
+        ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+        if not ablation:
+            raise RuntimeError(f"unknown ablation variant: {variant}")
+        skill_list = ", ".join(str(sp) for sp in skill_paths)
+        expected = "; ".join(ablation.get("expected_regressions", []))
+        return (
+            f"Use the loaded {manifest['skill_name']} skill where it applies. "
+            f"Read and follow these skill path(s), including referenced files when relevant: {skill_list}. "
+            f"Ablation mode for this empirical run: ignore/remove this component from the skill guidance: {ablation.get('removed_component')}. "
+            f"Expected regression to watch for: {expected}. "
+            "This is an instruction-simulated ablation, not a materialized alternate skill file.",
+            [arg for sp in skill_paths for arg in ("--skill", str(sp))],
+        )
+    raise RuntimeError(f"unsupported variant: {variant}")
+
+
 def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant: str, run_name: str, timeout: int) -> dict[str, Any]:
     repo_root = ROOT / repo
     out_dir = repo_root / "eval-runs" / run_name / case["id"] / variant
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    skill_paths = [repo_root / p for p in manifest.get("skill_paths", [])]
-    if variant == "with_skill":
-        skill_list = ", ".join(str(sp) for sp in skill_paths)
-        instruction = (
-            f"Use the loaded {manifest['skill_name']} skill where it applies. "
-            f"Read and follow these skill path(s), including referenced files when relevant: {skill_list}. "
-            "If the skill defines a required output contract, follow it exactly rather than giving a shortcut answer."
-        )
-        skill_args = [arg for sp in skill_paths for arg in ("--skill", str(sp))]
-    else:
-        instruction = (
-            f"Do not use or read the {manifest['skill_name']} skill or its references. "
-            "Use only general assistant ability."
-        )
-        skill_args = ["--no-skills"]
+    instruction, skill_args = variant_runtime(manifest, repo_root, variant)
 
     prompt = case.get("prompt")
     if not prompt:
@@ -186,6 +206,7 @@ def main() -> int:
     ap.add_argument("--run-name", default="baseline-smoke")
     ap.add_argument("--selection", help="JSON file mapping repo -> case IDs")
     ap.add_argument("--timeout", type=int, default=180)
+    ap.add_argument("--variant", action="append", help="Variant(s) to run; default with_skill and without_skill. Supports ablation:<id> instruction-simulated variants.")
     args = ap.parse_args()
 
     selection = DEFAULT_SELECTION
@@ -197,9 +218,10 @@ def main() -> int:
     for repo, case_ids in selection.items():
         manifest = load_manifest(repo)
         cases_by_id = {c["id"]: c for c in manifest["cases"]}
+        variants = args.variant or ["with_skill", "without_skill"]
         for cid in case_ids:
             case = cases_by_id[cid]
-            for variant in ["with_skill", "without_skill"]:
+            for variant in variants:
                 print(f"RUN {repo} {cid} {variant}", flush=True)
                 row = run_case(repo, manifest, case, variant, args.run_name, args.timeout)
                 summary.append(row)
