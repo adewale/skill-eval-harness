@@ -1,6 +1,6 @@
 # Trace-Aware Skill Eval Spec
 
-Status: phase-2 implementation in progress. The first code slice implemented trace import, a Codex JSONL runner adapter, process/efficiency assertions, telemetry-aware benchmark summaries, paired deltas/normalized gain, taxonomy slice summaries, taxonomy audit warnings, and skill-profile reporting. The next grounded slice adds variant-scoped assertions, live Pi/Codex event-shape support, Jetty trajectory trace import, isolated Pi smoke workspaces, and optional Pi trigger trace artifacts. Remaining sections describe follow-on work. This plan integrates the subset of ideas from OpenAI's `eval-skills` article, SkillsBench, and Anthropic's `skill-creator` that fit the existing harness model.
+Status: v0.4.1 implementation note. The shipped slice covers three things: trace artifacts, trace-backed assertions, and runner adapters. Concretely, the harness can import traces, run Codex JSONL tasks, normalize observed Pi/Codex shapes plus documented/mocked Jetty trajectory shapes, write Pi smoke and Pi trigger trace artifacts, scope assertions by variant, and report process/efficiency evidence alongside outcome scores. The unchecked boxes below are follow-on work, not shipped behavior. This plan uses the subset of ideas from OpenAI's `eval-skills` article, SkillsBench, and Anthropic's `skill-creator` that fit the existing harness model.
 
 ## Design principle
 
@@ -17,14 +17,14 @@ Pi, Codex, OpenCode, Gemini CLI, Jetty, Claude Code, or custom scripts may execu
 
 This mirrors the Jetty adapter principle: Jetty or any other runner supplies artifacts and trajectory evidence; the harness normalizes and grades them.
 
-## What is included
+## Trace-aware design scope
 
 The consistent, high-fit subset is:
 
 1. First-class trace artifacts for runner event streams.
 2. Normalized process and efficiency metrics derived from traces.
 3. Optional process/efficiency assertions that fail closed when required evidence is missing.
-4. A Codex `codex exec --json` adapter as the first new trace-native runner after Jetty/Pi imports.
+4. A Codex `codex exec --json` adapter alongside Pi and Jetty trace imports.
 5. Report additions for absolute delta, normalized gain, negative-delta cases, and domain/difficulty slices.
 6. Manifest taxonomy fields for trigger, domain, difficulty, and success-goal reporting.
 7. Stronger dataset/oracle audits inspired by SkillsBench.
@@ -33,14 +33,14 @@ The consistent, high-fit subset is:
 
 ## What is excluded or deferred
 
-The following ideas are useful but should not be part of the first trace-aware implementation:
+The following ideas remain deferred or deliberately out of scope:
 
 - **Self-generated skills as release proof.** They can be a research/control variant later, but release claims should continue to use curated `with_skill` versus `without_skill`/`old_skill`/materialized `ablation:<id>` runs.
 - **Mandatory containerization.** Containerized task environments improve rigor for some tasks, but the current repos already use lightweight fixtures and script oracles. Containers can be a runner requirement later, not a baseline harness dependency.
 - **Strict leakage by default.** Leakage lint should remain warning-first until legacy keyword checks are remediated.
 - **Live API/model calls in unit tests.** Runner adapters need mocked fixtures and opt-in live smoke paths only.
 - **Uploading hidden prompts, answer keys, or judge rubrics to executor jobs.** Generation payloads stay answer-key-safe.
-- **Runner-specific pass semantics.** Missing optional trace support is reported as unavailable; however, if a manifest declares a process assertion, missing trace evidence fails that assertion.
+- **Runner-specific pass semantics.** Missing optional trace support is reported as unavailable. If a manifest declares a process assertion, missing trace evidence fails that assertion.
 
 ## Existing contracts preserved
 
@@ -252,11 +252,11 @@ skill-benchmark import-trace \
   --run-dir eval-runs/latest/case/with_skill/run-1
 ```
 
-The first implementation can support `--source codex`; Jetty and Pi can follow by reusing existing metadata/import logic.
+`import-trace` currently accepts `generic`, `codex`, `pi`, and `jetty` source dialects. Runner-specific adapters can still add richer normalization as their event streams stabilize.
 
 ### `run-codex`
 
-Add a runner command for Codex once the trace schema lands:
+`run-codex` is the Codex runner command for prepared task rows:
 
 ```sh
 skill-benchmark prepare evals/shared-benchmark.json --split tune --out tasks.jsonl
@@ -264,7 +264,7 @@ skill-benchmark run-codex --tasks tasks.jsonl --runs eval-runs/codex-tune
 skill-benchmark benchmark evals/shared-benchmark.json --runs eval-runs/codex-tune
 ```
 
-Expected behavior:
+Current behavior:
 
 - execute each task with `codex exec --json`;
 - save raw stdout JSONL as `trace.jsonl`;
@@ -316,7 +316,7 @@ SkillsBench-style reference-solution verification can be added later as an opt-i
 {"oracle_reference_run": "evals/reference/case-id"}
 ```
 
-The first implementation should focus on warnings and report hygiene, not mandatory gates.
+Dataset/oracle audit work should continue as warnings and report hygiene before adding mandatory gates.
 
 ## Structured judge results
 
@@ -392,25 +392,28 @@ This adopts the SkillsBench lesson that focused 2–3-module skills often outper
 
 ### Phase 5 — broader runner import
 
-- Normalize Jetty trajectories to events after live API response shapes are verified.
-- Normalize Pi stream events where available.
-- Add OpenCode/Gemini adapters only when they expose stable machine-readable traces.
+- [x] Normalize mocked/documented Jetty trajectories into trace artifacts during `import-jetty-results`.
+- [x] Normalize Pi smoke and Pi trigger stream events where available.
+- [ ] Validate live Jetty trajectory shapes with `JETTY_API_TOKEN` before treating Jetty process evidence as production-grade.
+- [ ] Add OpenCode/Gemini adapters only when they expose stable machine-readable traces.
 
-## Acceptance criteria for the first code PR
+## Acceptance criteria for the shipped trace slice
 
-A first implementation PR should include:
+The shipped slice includes:
 
 - fixture-backed unit tests for trace normalization;
 - tests that process assertions fail when `events.json` is missing;
 - tests that efficiency assertions fail when required metrics are missing;
 - tests that existing manifests without trace fields still validate and benchmark;
-- README updates documenting the new artifacts and assertion types;
+- tests for variant-scoped process assertions;
+- tests for Pi, Codex, Jetty, and Pi-trigger trace artifact paths;
+- README updates documenting artifacts, assertion types, runner commands, and the isolated Pi smoke workspace;
 - no live runner/API dependency in unit tests;
 - no answer-key fields in executor payloads.
 
 ## Open questions
 
-- Which Codex JSONL event names are stable enough to normalize directly?
+- Which Codex JSONL event names beyond the observed `item.completed`, `command_execution`, and `turn.completed` shapes are stable enough to normalize directly?
 - Should `skill_invoked` require a file-read event, an explicit runner skill-load event, or either?
 - Should `normalized_gain` be reported only for aggregate variants or also per case?
 - How aggressively should command inputs be redacted in raw `trace.jsonl` copies?
