@@ -8,6 +8,7 @@ All notable public changes are listed here. Release tags are the source of truth
 - Add contributor guidance, PR template, and issue forms.
 - Tighten README quick start with expected output landmarks and repo-surface links.
 - Add a trace-aware eval proposal covering runner trace artifacts, process/efficiency assertions, Codex adapter support, richer reporting, dataset audits, structured judges, and skill-profile checks.
+- Implement the first trace-aware harness slice: `import-trace`, `run-codex`, process/efficiency assertion types, telemetry-aware benchmark summaries, paired deltas/normalized gain, taxonomy slice summaries, taxonomy audit warnings, and `profile-skill`.
 
 ## v0.3.0 — 2026-06-10
 

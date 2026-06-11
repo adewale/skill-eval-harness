@@ -26,7 +26,7 @@ from typing import Any
 
 VALID_SPLITS = {"tune", "holdout", "holdback"}
 DEFAULT_VARIANTS = ["with_skill", "without_skill"]
-OBJECTIVE_ASSERTIONS = {
+TEXT_ASSERTIONS = {
     "contains",
     "contains_any",
     "contains_all",
@@ -37,6 +37,20 @@ OBJECTIVE_ASSERTIONS = {
     "json_field_equals",
     "script",
 }
+PROCESS_ASSERTIONS = {
+    "skill_invoked",
+    "command_ran",
+    "command_not_ran",
+    "command_order",
+    "tool_count_le",
+    "no_repeated_command_loop",
+}
+EFFICIENCY_ASSERTIONS = {
+    "total_tokens_le",
+    "elapsed_seconds_le",
+    "command_count_le",
+}
+OBJECTIVE_ASSERTIONS = TEXT_ASSERTIONS | PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS
 QUALITATIVE_ASSERTIONS = {"judge", "rubric"}
 
 
@@ -1027,6 +1041,437 @@ def read_metadata(runs: Path, case_id: str, variant: str) -> dict[str, Any]:
     return read_metadata_base(runs / case_id / variant)
 
 
+def read_json_dict_or_list(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as exc:
+        return {"_error": f"invalid JSON in {path.name}: {exc}"}
+
+
+def read_events_base(base: Path) -> tuple[list[dict[str, Any]] | None, str | None]:
+    data = read_json_dict_or_list(base / "events.json")
+    if data is None:
+        return None, "missing events.json"
+    if isinstance(data, dict) and data.get("_error"):
+        return None, str(data["_error"])
+    events = data.get("events") if isinstance(data, dict) else data
+    if not isinstance(events, list) or not all(isinstance(e, dict) for e in events):
+        return None, "events.json must contain an events list"
+    return events, None
+
+
+def read_metrics_base(base: Path) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for rel in ["metadata.json", "timing.json", "outputs/metrics.json", "metrics.json"]:
+        data = read_json_dict_or_list(base / rel)
+        if isinstance(data, dict) and not data.get("_error"):
+            merged.update(data)
+    return merged
+
+
+def command_text(event: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ["input_summary", "command", "cmd", "name"]:
+        value = event.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, list):
+            parts.append(" ".join(str(v) for v in value))
+    details = event.get("details")
+    if isinstance(details, dict):
+        for key in ["command", "cmd", "input", "args"]:
+            value = details.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+            elif isinstance(value, list):
+                parts.append(" ".join(str(v) for v in value))
+    return " ".join(p for p in parts if p).strip()
+
+
+def command_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [e for e in events if e.get("type") == "command"]
+
+
+def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:
+    flags = re.I if ci else 0
+    try:
+        return re.search(pattern, text, flags) is not None
+    except re.error:
+        return pattern.lower() in text.lower() if ci else pattern in text
+
+
+def repeated_command_max(commands: list[str]) -> int:
+    last = None
+    current = 0
+    best = 0
+    for command in commands:
+        normed = re.sub(r"\s+", " ", command.strip().casefold())
+        if normed and normed == last:
+            current += 1
+        else:
+            last = normed
+            current = 1 if normed else 0
+        best = max(best, current)
+    return best
+
+
+def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = metrics.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    usage = metrics.get("usage")
+    if isinstance(usage, dict):
+        for key in keys:
+            value = usage.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+    return None
+
+
+def missing_evidence(name: str) -> dict[str, Any]:
+    return {"passed": False, "evidence": f"missing {name} evidence"}
+
+
+def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: Path | None, metadata: dict[str, Any]) -> tuple[bool, str]:
+    if run_base is None:
+        return False, "missing run directory for trace assertion"
+    atype = assertion.get("type")
+    events, event_error = read_events_base(run_base)
+    metrics = dict(metadata or {})
+    metrics.update(read_metrics_base(run_base))
+    ci = bool(assertion.get("ci", True))
+
+    if atype == "skill_invoked":
+        expected = bool(assertion.get("expected", True))
+        has_metric = isinstance(metrics.get("skill_invoked"), bool)
+        invoked = bool(metrics.get("skill_invoked")) if has_metric else False
+        evidence: list[str] = []
+        if events is not None:
+            skill_events = [e for e in events if e.get("type") == "skill_load"]
+            if skill_events:
+                invoked = True
+                evidence.extend(command_text(e) or str(e.get("path", "skill_load")) for e in skill_events[:5])
+        if has_metric:
+            evidence.extend(str(x) for x in metrics.get("skill_invocation_evidence", [])[:5] if isinstance(metrics.get("skill_invocation_evidence", []), list))
+        if events is None and not has_metric:
+            return False, f"missing skill invocation evidence ({event_error})"
+        return invoked == expected, f"skill_invoked={invoked}; expected={expected}; evidence={evidence[:5]}"
+
+    if atype in {"command_ran", "command_not_ran", "command_order", "tool_count_le", "no_repeated_command_loop"}:
+        if events is None:
+            return False, event_error or "missing events.json"
+        commands = [command_text(e) for e in command_events(events)]
+        if atype == "command_ran":
+            pattern = str(assertion.get("pattern", assertion.get("value", "")))
+            hit = next((cmd for cmd in commands if regex_hit(pattern, cmd, ci)), None)
+            return hit is not None, f"matched command {hit!r}" if hit else f"no command matched /{pattern}/"
+        if atype == "command_not_ran":
+            pattern = str(assertion.get("pattern", assertion.get("value", "")))
+            hit = next((cmd for cmd in commands if regex_hit(pattern, cmd, ci)), None)
+            return hit is None, "no banned command matched" if hit is None else f"banned command matched {hit!r}"
+        if atype == "command_order":
+            patterns = [str(p) for p in assertion.get("patterns", [])]
+            cursor = 0
+            matched: list[str] = []
+            for pattern in patterns:
+                found = None
+                for i in range(cursor, len(commands)):
+                    if regex_hit(pattern, commands[i], ci):
+                        found = i
+                        matched.append(commands[i])
+                        break
+                if found is None:
+                    return False, f"missing ordered command /{pattern}/ after index {cursor}; matched={matched}"
+                cursor = found + 1
+            return True, f"matched order: {matched}"
+        if atype == "tool_count_le":
+            max_allowed = int(assertion.get("max", 0))
+            tool = assertion.get("tool")
+            if tool:
+                count = sum(1 for e in events if str(e.get("name", "")).casefold() == str(tool).casefold() or (str(tool).casefold() == "bash" and e.get("type") == "command"))
+            else:
+                count = len([e for e in events if e.get("type") in {"tool_call", "command"}])
+            return count <= max_allowed, f"tool_count={count}; max={max_allowed}; tool={tool or '<any>'}"
+        if atype == "no_repeated_command_loop":
+            max_allowed = int(assertion.get("max_repeats", assertion.get("max", 1)))
+            observed = int(metric_number(metrics, "repeated_command_max") or repeated_command_max(commands))
+            return observed <= max_allowed, f"repeated_command_max={observed}; max={max_allowed}"
+
+    if atype == "total_tokens_le":
+        value = metric_number(metrics, "total_tokens")
+        if value is None:
+            return False, "missing total_tokens evidence"
+        max_allowed = float(assertion.get("max", assertion.get("value", 0)))
+        return value <= max_allowed, f"total_tokens={value:g}; max={max_allowed:g}"
+    if atype == "elapsed_seconds_le":
+        value = metric_number(metrics, "elapsed_seconds", "duration_seconds")
+        if value is None:
+            ms = metric_number(metrics, "elapsed_ms", "duration_ms")
+            value = (ms / 1000.0) if ms is not None else None
+        if value is None:
+            return False, "missing elapsed time evidence"
+        max_allowed = float(assertion.get("max", assertion.get("value", 0)))
+        return value <= max_allowed, f"elapsed_seconds={value:g}; max={max_allowed:g}"
+    if atype == "command_count_le":
+        value = metric_number(metrics, "commands", "command_count")
+        if value is None and events is not None:
+            value = float(len(command_events(events)))
+        if value is None:
+            return False, "missing command count evidence"
+        max_allowed = float(assertion.get("max", assertion.get("value", 0)))
+        return value <= max_allowed, f"command_count={value:g}; max={max_allowed:g}"
+    return False, f"unsupported trace assertion {atype!r}"
+
+
+def raw_trace_value(record: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in record:
+            return record[key]
+    for container_key in ["message", "delta", "data", "item", "tool_input", "input", "details"]:
+        nested = record.get(container_key)
+        if isinstance(nested, dict):
+            for key in keys:
+                if key in nested:
+                    return nested[key]
+    return None
+
+
+def stringify_trace_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(stringify_trace_value(v) for v in value)
+    if isinstance(value, dict):
+        for key in ["command", "cmd", "content", "text", "path"]:
+            if key in value:
+                return stringify_trace_value(value[key])
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def parse_trace_jsonl_text(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as exc:
+            errors.append(f"line {line_number}: {exc}")
+            continue
+        if isinstance(obj, dict):
+            records.append(obj)
+        else:
+            errors.append(f"line {line_number}: JSON value is not an object")
+    return records, errors
+
+
+def load_trace_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    return parse_trace_jsonl_text(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, line: int) -> dict[str, Any]:
+    raw_type = str(raw_trace_value(record, "type", "event", "name", "kind") or "").casefold()
+    path = stringify_trace_value(raw_trace_value(record, "path", "file"))
+    command = stringify_trace_value(raw_trace_value(record, "command", "cmd", "args"))
+    content = stringify_trace_value(raw_trace_value(record, "content", "text", "message"))
+    status = str(raw_trace_value(record, "status", "state") or "completed")
+    event_type = "tool_call"
+    name = stringify_trace_value(raw_trace_value(record, "tool", "tool_name", "name"))
+    if "skill" in raw_type and ("load" in raw_type or "read" in raw_type):
+        event_type = "skill_load"
+    elif path.endswith("SKILL.md") or "/SKILL.md" in path:
+        event_type = "skill_load"
+    elif "command" in raw_type or "exec" in raw_type or command:
+        event_type = "command"
+        name = name or "bash"
+    elif "file_write" in raw_type or "write" in raw_type or "edit" in raw_type:
+        event_type = "file_write"
+    elif "file_read" in raw_type or "read" in raw_type:
+        event_type = "file_read"
+    elif "error" in raw_type or str(status).casefold() in {"failed", "error", "errored"}:
+        event_type = "error"
+    elif "usage" in raw_type or "metric" in raw_type:
+        event_type = "metric"
+    elif raw_trace_value(record, "role") or content:
+        event_type = "message"
+    input_summary = command or path or content[:500]
+    output_summary = stringify_trace_value(raw_trace_value(record, "output", "stdout", "stderr", "result"))[:1000]
+    event = {
+        "index": index,
+        "type": event_type,
+        "status": status,
+        "raw_ref": {"file": "trace.jsonl", "line": line},
+    }
+    role = raw_trace_value(record, "role")
+    if role:
+        event["role"] = str(role)
+    if name:
+        event["name"] = name
+    if input_summary:
+        event["input_summary"] = input_summary[:1000]
+    if output_summary:
+        event["output_summary"] = output_summary
+    timestamp = raw_trace_value(record, "timestamp", "time", "created_at")
+    if timestamp:
+        event["timestamp"] = str(timestamp)
+    exit_code = raw_trace_value(record, "exit_code", "returncode")
+    if isinstance(exit_code, int):
+        event["exit_code"] = exit_code
+    duration = raw_trace_value(record, "duration_ms", "elapsed_ms")
+    if isinstance(duration, (int, float)):
+        event["duration_ms"] = duration
+    usage = raw_trace_value(record, "usage", "tokens")
+    if isinstance(usage, dict):
+        event["tokens"] = {k: v for k, v in usage.items() if isinstance(v, (int, float))}
+    event["source"] = source
+    return event
+
+
+def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "generic") -> tuple[dict[str, Any], dict[str, Any]]:
+    events = [normalize_trace_record(record, source=source, index=i, line=i) for i, record in enumerate(records, 1)]
+    commands = [command_text(e) for e in command_events(events)]
+    token_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    elapsed_ms = 0.0
+    for record, event in zip(records, events):
+        usage = raw_trace_value(record, "usage", "tokens")
+        if isinstance(usage, dict):
+            for key in token_totals:
+                value = usage.get(key)
+                if isinstance(value, (int, float)):
+                    token_totals[key] += value
+        duration = raw_trace_value(record, "duration_ms", "elapsed_ms")
+        if isinstance(duration, (int, float)):
+            elapsed_ms += float(duration)
+        tokens = event.get("tokens")
+        if isinstance(tokens, dict):
+            for key in token_totals:
+                value = tokens.get(key)
+                if isinstance(value, (int, float)) and not any(isinstance(raw_trace_value(r, "usage", "tokens"), dict) for r in [record]):
+                    token_totals[key] += value
+    skill_events = [e for e in events if e.get("type") == "skill_load"]
+    metrics: dict[str, Any] = {
+        "schema_version": 1,
+        "source": source,
+        "tool_calls": sum(1 for e in events if e.get("type") in {"tool_call", "command"}),
+        "commands": len(commands),
+        "file_reads": sum(1 for e in events if e.get("type") in {"file_read", "skill_load"}),
+        "file_writes": sum(1 for e in events if e.get("type") == "file_write"),
+        "errors": sum(1 for e in events if e.get("type") == "error"),
+        "retries": 0,
+        "repeated_command_max": repeated_command_max(commands),
+        "skill_invoked": bool(skill_events),
+        "skill_invocation_evidence": [command_text(e) or e.get("input_summary", "") for e in skill_events[:10]],
+    }
+    if elapsed_ms:
+        metrics["elapsed_ms"] = int(elapsed_ms)
+    for key, value in token_totals.items():
+        if value:
+            metrics[key] = int(value)
+    event_doc = {"schema_version": 1, "source": source, "events": events}
+    return event_doc, metrics
+
+
+def import_trace(args: argparse.Namespace) -> int:
+    trace = Path(args.trace)
+    run_dir = Path(args.run_dir)
+    records, parse_errors = load_trace_jsonl(trace)
+    events, metrics = normalize_trace_records(records, source=getattr(args, "source", "generic"))
+    if parse_errors:
+        metrics["parse_errors"] = parse_errors[:20]
+        metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
+    out_events = Path(args.out_events) if getattr(args, "out_events", None) else run_dir / "events.json"
+    out_metrics = Path(args.out_metrics) if getattr(args, "out_metrics", None) else run_dir / "metrics.json"
+    write_json(out_events, events)
+    write_json(out_metrics, metrics)
+    if getattr(args, "write_metadata", False):
+        existing = read_metadata_base(run_dir)
+        existing.update({k: v for k, v in metrics.items() if k not in {"schema_version", "source"}})
+        existing["trace_source"] = getattr(args, "source", "generic")
+        write_json(run_dir / "metadata.json", existing)
+    return 0
+
+
+def final_answer_from_events(events: dict[str, Any]) -> str:
+    messages = [e for e in events.get("events", []) if isinstance(e, dict) and e.get("type") == "message"]
+    for event in reversed(messages):
+        role = str(event.get("role", event.get("name", ""))).casefold()
+        if role and role not in {"assistant", "message", ""}:
+            continue
+        text = event.get("output_summary") or event.get("input_summary")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return ""
+
+
+def safe_child_path(root: Path, relative: str) -> Path:
+    rel = Path(relative)
+    if rel.is_absolute() or ".." in rel.parts:
+        die(f"unsafe run_dir escapes runs directory: {relative}")
+    dest = (root / rel).resolve()
+    root_resolved = root.resolve()
+    if dest != root_resolved and root_resolved not in dest.parents:
+        die(f"unsafe run_dir escapes runs directory: {relative}")
+    return dest
+
+
+def codex_task_prompt(task: dict[str, Any]) -> str:
+    files = task.get("input_files") or []
+    file_note = "\n".join(f"- {p}" for p in files) if files else "- none"
+    return (
+        f"{task.get('instruction', '')}\n\n"
+        f"Task prompt:\n{task.get('prompt', '')}\n\n"
+        f"Input files available to inspect:\n{file_note}\n\n"
+        "Return the final answer for this eval task. Do not include hidden answer keys or rubrics."
+    )
+
+
+def run_codex(args: argparse.Namespace) -> int:
+    tasks = load_jsonl(Path(args.tasks))
+    runs = Path(args.runs)
+    cmd = getattr(args, "codex_cmd", None) or "codex exec --json"
+    timeout = int(getattr(args, "timeout", 1800))
+    for task in tasks:
+        base = safe_child_path(runs, str(task.get("run_dir", f"{task.get('case_id','case')}/{task.get('variant','variant')}")))
+        base.mkdir(parents=True, exist_ok=True)
+        started = time.time()
+        try:
+            proc = subprocess.run(cmd, shell=True, input=codex_task_prompt(task), text=True, capture_output=True, timeout=timeout, cwd=task.get("repo_root") or None)
+            elapsed_ms = int((time.time() - started) * 1000)
+            trace_text = proc.stdout if proc.stdout.strip() else ""
+            if trace_text:
+                (base / "trace.jsonl").write_text(trace_text, encoding="utf-8")
+                records, parse_errors = parse_trace_jsonl_text(trace_text)
+                events, metrics = normalize_trace_records(records, source="codex")
+                if parse_errors:
+                    metrics["parse_errors"] = parse_errors[:20]
+                    metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
+            else:
+                events, metrics = {"schema_version": 1, "source": "codex", "events": []}, {"schema_version": 1, "source": "codex"}
+            metrics.setdefault("elapsed_ms", elapsed_ms)
+            metrics["returncode"] = proc.returncode
+            write_json(base / "events.json", events)
+            write_json(base / "metrics.json", metrics)
+            answer = final_answer_from_events(events) or proc.stdout.strip()
+            if proc.returncode != 0:
+                answer = f"[CODEX FAILURE: returncode={proc.returncode}]\n\n{answer}\n\nstderr:\n{proc.stderr[:4000]}"
+            (base / "output.md").write_text(answer or "[CODEX FAILURE: no output produced]\n", encoding="utf-8")
+            meta = dict(metrics)
+            meta.update({"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else ""})
+            write_json(base / "metadata.json", meta)
+        except subprocess.TimeoutExpired as exc:
+            elapsed_ms = int((time.time() - started) * 1000)
+            (base / "output.md").write_text(f"[CODEX FAILURE: timed out after {timeout}s]\n", encoding="utf-8")
+            write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timeout": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000]})
+    return 0
+
+
 def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_dir: Path | None) -> tuple[bool, str]:
     command = script_command_list(assertion)
     command = [part.replace("{output_dir}", str(output_dir.resolve())).replace("{output_path}", str((output_dir / "output.md").resolve())) for part in command]
@@ -1058,7 +1503,9 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
 
     passed = False
     evidence = ""
-    if atype == "contains":
+    if atype in PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS:
+        passed, evidence = process_or_efficiency_assertion_result(assertion, run_base, {})
+    elif atype == "contains":
         value = str(assertion.get("value", ""))
         passed = norm(value) in hay
         evidence = f"contains {value!r}" if passed else f"missing {value!r}"
@@ -1333,6 +1780,10 @@ def grade_case_variant(
             objective.append(assertion_result(assertion, text, output_path, run_base=run_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir))
     objective_passed = sum(1 for r in objective if r["passed"])
     objective_total = len(objective)
+    process_rows = [r for r in objective if r.get("type") in PROCESS_ASSERTIONS]
+    efficiency_rows = [r for r in objective if r.get("type") in EFFICIENCY_ASSERTIONS]
+    process_passed = sum(1 for r in process_rows if r["passed"])
+    efficiency_passed = sum(1 for r in efficiency_rows if r["passed"])
     qualitative_passed = sum(1 for r in qualitative if r["passed"])
     qualitative_total = len(qualitative)
     combined_passed = objective_passed + qualitative_passed
@@ -1341,6 +1792,10 @@ def grade_case_variant(
         "case_id": case["id"],
         "split": case["split"],
         "kind": case.get("kind", "behavior"),
+        "domain": case.get("domain"),
+        "difficulty": case.get("difficulty"),
+        "trigger_type": case.get("trigger_type"),
+        "success_goals": case.get("success_goals", []),
         "variant": variant,
         "run_number": run_number,
         "run_base": str(run_base or output_path.parent),
@@ -1348,6 +1803,12 @@ def grade_case_variant(
         "objective_passed": objective_passed,
         "objective_total": objective_total,
         "objective_pass_rate": (objective_passed / objective_total) if objective_total else None,
+        "process_passed": process_passed,
+        "process_total": len(process_rows),
+        "process_pass_rate": (process_passed / len(process_rows)) if process_rows else None,
+        "efficiency_passed": efficiency_passed,
+        "efficiency_total": len(efficiency_rows),
+        "efficiency_pass_rate": (efficiency_passed / len(efficiency_rows)) if efficiency_rows else None,
         "qualitative_passed": qualitative_passed,
         "qualitative_total": qualitative_total,
         "qualitative_pass_rate": (qualitative_passed / qualitative_total) if qualitative_total else None,
@@ -1474,6 +1935,102 @@ def stats(values: list[float]) -> dict[str, float | None]:
     }
 
 
+def telemetry_for_result(result: dict[str, Any]) -> dict[str, bool]:
+    base = Path(result.get("run_base", ""))
+    metrics = read_metrics_base(base) if str(base) else {}
+    events_exists = (base / "events.json").exists()
+    metrics_exists = (base / "metrics.json").exists()
+    events, _ = read_events_base(base) if events_exists else (None, None)
+    has_skill_event = bool(events and any(e.get("type") == "skill_load" for e in events))
+    return {
+        "trace": (base / "trace.jsonl").exists(),
+        "events": events_exists,
+        "metrics": metrics_exists,
+        "tokens": metric_number(metrics, "total_tokens") is not None,
+        "commands": metric_number(metrics, "commands", "command_count") is not None or events_exists,
+        "skill_invocation": isinstance(metrics.get("skill_invoked"), bool) or has_skill_event,
+    }
+
+
+def telemetry_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
+    keys = ["trace", "events", "metrics", "tokens", "commands", "skill_invocation"]
+    counts = {key: 0 for key in keys}
+    for row in rows:
+        flags = telemetry_for_result(row)
+        for key in keys:
+            counts[key] += 1 if flags.get(key) else 0
+    counts["runs"] = len(rows)
+    return counts
+
+
+def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> float | None:
+    vals = [r.get(key) for r in rows if r.get(key) is not None and not r.get("missing_output")]
+    return statistics.mean(vals) if vals else None
+
+
+def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    by_case_variant: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for row in results:
+        if row.get("missing_output"):
+            continue
+        by_case_variant.setdefault(row["case_id"], {}).setdefault(row["variant"], []).append(row)
+    paired_with_rates: list[float] = []
+    paired_without_rates: list[float] = []
+    for by_variant in by_case_variant.values():
+        w = mean_rate(by_variant.get("with_skill", []))
+        n = mean_rate(by_variant.get("without_skill", []))
+        if w is not None and n is not None:
+            paired_with_rates.append(w)
+            paired_without_rates.append(n)
+    with_rate = statistics.mean(paired_with_rates) if paired_with_rates else None
+    without_rate = statistics.mean(paired_without_rates) if paired_without_rates else None
+    absolute_delta = None
+    normalized_gain = None
+    if with_rate is not None and without_rate is not None:
+        absolute_delta = with_rate - without_rate
+        if with_rate >= without_rate and without_rate < 1:
+            normalized_gain = (with_rate - without_rate) / (1 - without_rate)
+    negative_cases = []
+    for case_id, by_variant in sorted(by_case_variant.items()):
+        w = mean_rate(by_variant.get("with_skill", []))
+        n = mean_rate(by_variant.get("without_skill", []))
+        if w is not None and n is not None and w < n:
+            negative_cases.append({"case_id": case_id, "with_skill": w, "without_skill": n, "delta": w - n})
+    return {
+        "with_skill_objective_pass_rate": with_rate,
+        "without_skill_objective_pass_rate": without_rate,
+        "absolute_delta": absolute_delta,
+        "normalized_gain": normalized_gain,
+        "negative_delta_cases": negative_cases,
+    }
+
+
+def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {"domain": {}, "difficulty": {}, "trigger_type": {}, "success_goals": {}}
+    for field in ["domain", "difficulty", "trigger_type"]:
+        values = sorted({str(r.get(field)) for r in results if r.get(field)})
+        for value in values:
+            out[field][value] = {}
+            for variant in variants:
+                rows = [r for r in results if r.get(field) == value and r.get("variant") == variant and not r.get("missing_output")]
+                out[field][value][variant] = {
+                    "runs": len(rows),
+                    "mean_objective_pass_rate": mean_rate(rows, "objective_pass_rate"),
+                    "mean_combined_pass_rate": mean_rate(rows, "combined_pass_rate"),
+                }
+    goals = sorted({str(goal) for r in results for goal in (r.get("success_goals") or [])})
+    for goal in goals:
+        out["success_goals"][goal] = {}
+        for variant in variants:
+            rows = [r for r in results if goal in (r.get("success_goals") or []) and r.get("variant") == variant and not r.get("missing_output")]
+            out["success_goals"][goal][variant] = {
+                "runs": len(rows),
+                "mean_objective_pass_rate": mean_rate(rows, "objective_pass_rate"),
+                "mean_combined_pass_rate": mean_rate(rows, "combined_pass_rate"),
+            }
+    return out
+
+
 def build_benchmark_report(
     path: Path,
     runs: Path,
@@ -1502,20 +2059,35 @@ def build_benchmark_report(
     for variant, rows in by_variant.items():
         objective_rates = [r["objective_pass_rate"] for r in rows if r["objective_pass_rate"] is not None and not r["missing_output"]]
         combined_rates = [r["combined_pass_rate"] for r in rows if r.get("combined_pass_rate") is not None and not r["missing_output"]]
-        elapsed = [num(r["metadata"], "elapsed_ms") for r in rows]
-        tokens = [num(r["metadata"], "total_tokens") for r in rows]
+        process_rates = [r["process_pass_rate"] for r in rows if r.get("process_pass_rate") is not None and not r["missing_output"]]
+        efficiency_rates = [r["efficiency_pass_rate"] for r in rows if r.get("efficiency_pass_rate") is not None and not r["missing_output"]]
+        merged_metrics = []
+        for r in rows:
+            merged = dict(r.get("metadata", {}) or {})
+            merged.update(read_metrics_base(Path(r.get("run_base", ""))))
+            merged_metrics.append(merged)
+        elapsed = [metric_number(m, "elapsed_ms") for m in merged_metrics]
+        tokens = [metric_number(m, "total_tokens") for m in merged_metrics]
+        commands = [metric_number(m, "commands", "command_count") for m in merged_metrics]
         elapsed = [x for x in elapsed if x is not None]
         tokens = [x for x in tokens if x is not None]
+        commands = [x for x in commands if x is not None]
         summary[variant] = {
             "cases": len({r["case_id"] for r in rows}),
             "runs": len(rows),
             "missing_outputs": sum(1 for r in rows if r["missing_output"]),
             "mean_objective_pass_rate": statistics.mean(objective_rates) if objective_rates else None,
             "mean_combined_pass_rate": statistics.mean(combined_rates) if combined_rates else None,
+            "mean_process_pass_rate": statistics.mean(process_rates) if process_rates else None,
+            "mean_efficiency_pass_rate": statistics.mean(efficiency_rates) if efficiency_rates else None,
             "objective_pass_rate": stats(objective_rates),
             "combined_pass_rate": stats(combined_rates),
+            "process_pass_rate": stats(process_rates),
+            "efficiency_pass_rate": stats(efficiency_rates),
             "elapsed_ms": stats(elapsed),
             "total_tokens": stats(tokens),
+            "command_count": stats(commands),
+            "telemetry_availability": telemetry_summary(rows),
             # Backward-compatible fields used by smoke_report.py callers.
             "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
             "median_total_tokens": statistics.median(tokens) if tokens else None,
@@ -1557,6 +2129,8 @@ def build_benchmark_report(
         "skill_name": manifest["skill_name"],
         "generated_at": int(time.time()),
         "summary": summary,
+        "paired_summary": build_paired_summary(results),
+        "slice_summary": build_slice_summary(results, variants),
         "case_flags": case_flags,
         "results": results,
     }
@@ -1837,6 +2411,121 @@ def read_skill_text(manifest_path: Path, manifest: dict[str, Any], override: str
     return "\n\n".join(chunks)
 
 
+def skill_paths_for_manifest(manifest_path: Path, manifest: dict[str, Any], override: str | None = None) -> list[Path]:
+    raw_paths = [override] if override else manifest.get("skill_paths", [])
+    repo_root = repo_root_for_manifest(manifest_path)
+    paths: list[Path] = []
+    for raw in raw_paths:
+        if not raw:
+            continue
+        path = Path(raw)
+        if not path.is_absolute():
+            path = repo_root / path
+        if path.is_dir():
+            path = path / "SKILL.md"
+        paths.append(path)
+    return paths
+
+
+def approximate_tokens(text: str) -> int:
+    return len(re.findall(r"\S+", text))
+
+
+def profile_skill_report(
+    manifest_path: Path,
+    *,
+    skill_path: str | None = None,
+    max_skill_tokens: int = 3000,
+    max_reference_tokens: int = 5000,
+    max_references: int = 8,
+    max_modules: int = 10,
+) -> dict[str, Any]:
+    manifest = validate_manifest(manifest_path)
+    skill_files = skill_paths_for_manifest(manifest_path, manifest, skill_path)
+    files: list[dict[str, Any]] = []
+    total_tokens = 0
+    module_count = 0
+    reference_files: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
+    for path in skill_files:
+        if not path.exists():
+            findings.append({"kind": "missing-skill-file", "severity": "required", "message": f"Skill path does not exist: {path}"})
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        tokens = approximate_tokens(text)
+        headings = skill_heading_components(text)
+        total_tokens += tokens
+        module_count += len(headings)
+        files.append({"path": str(path), "tokens": tokens, "bytes": path.stat().st_size, "modules": headings})
+        ref_dir = path.parent / "references"
+        if ref_dir.exists():
+            for ref in sorted(ref_dir.rglob("*")):
+                if not ref.is_file():
+                    continue
+                try:
+                    ref_text = ref.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                ref_tokens = approximate_tokens(ref_text)
+                reference_files.append({"path": str(ref), "tokens": ref_tokens, "bytes": ref.stat().st_size})
+    reference_tokens = sum(r["tokens"] for r in reference_files)
+    if total_tokens > max_skill_tokens:
+        findings.append({"kind": "skill-too-large", "severity": "recommended", "message": f"SKILL.md token count {total_tokens} exceeds {max_skill_tokens}; consider moving rare details to conditional references."})
+    if len(reference_files) > max_references:
+        findings.append({"kind": "many-references", "severity": "recommended", "message": f"{len(reference_files)} reference files exceeds {max_references}; check that navigation is conditional and focused."})
+    if reference_tokens > max_reference_tokens:
+        findings.append({"kind": "references-too-large", "severity": "recommended", "message": f"Reference token count {reference_tokens} exceeds {max_reference_tokens}; consider pruning or splitting by trigger."})
+    if module_count > max_modules:
+        findings.append({"kind": "many-modules", "severity": "recommended", "message": f"{module_count} skill headings/modules exceeds {max_modules}; focused 2–3-module skills are often easier for agents to apply."})
+    return {
+        "generated_at": int(time.time()),
+        "manifest": str(manifest_path),
+        "skill_name": manifest.get("skill_name"),
+        "summary": {
+            "skill_files": len(files),
+            "skill_tokens": total_tokens,
+            "reference_files": len(reference_files),
+            "reference_tokens": reference_tokens,
+            "modules": module_count,
+        },
+        "files": files,
+        "references": reference_files,
+        "findings": findings,
+    }
+
+
+def profile_skill(args: argparse.Namespace) -> int:
+    report = profile_skill_report(
+        Path(args.manifest),
+        skill_path=args.skill_path,
+        max_skill_tokens=args.max_skill_tokens,
+        max_reference_tokens=args.max_reference_tokens,
+        max_references=args.max_references,
+        max_modules=args.max_modules,
+    )
+    if args.format == "markdown":
+        lines = [f"# Skill profile — {report['skill_name']}", "", "## Summary", "", "| Metric | Value |", "|---|---:|"]
+        for k, v in report["summary"].items():
+            lines.append(f"| {k} | {v} |")
+        lines += ["", "## Findings", ""]
+        if report["findings"]:
+            for f in report["findings"]:
+                lines.append(f"- **{f['severity']} / {f['kind']}**: {f['message']}")
+        else:
+            lines.append("- No profile findings.")
+        text = "\n".join(lines) + "\n"
+        if args.out:
+            Path(args.out).write_text(text, encoding="utf-8")
+        else:
+            print(text)
+    else:
+        if args.out:
+            write_json(Path(args.out), report)
+        else:
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0
+
+
 def trigger_expectation(case: dict[str, Any]) -> str | None:
     text = " ".join(str(x) for x in case.get("expected_behavior", []))
     for assertion in case.get("assertions", []):
@@ -1921,9 +2610,15 @@ def audit_manifest_report(
         "trigger_negative": sum(1 for c in cases if c.get("kind") == "trigger" and trigger_expectation(c) == "NO_TRIGGER"),
         "ablations": len(manifest.get("ablations", [])),
         "objective_assertions": sum(1 for c in cases for a in c.get("assertions", []) if a.get("type") not in QUALITATIVE_ASSERTIONS),
+        "process_assertions": sum(1 for c in cases for a in c.get("assertions", []) if a.get("type") in PROCESS_ASSERTIONS),
+        "efficiency_assertions": sum(1 for c in cases for a in c.get("assertions", []) if a.get("type") in EFFICIENCY_ASSERTIONS),
         "judge_assertions": sum(1 for c in cases for a in c.get("assertions", []) if a.get("type") in QUALITATIVE_ASSERTIONS),
         "fixture_cases": sum(1 for c in cases if c.get("files")),
         "input_files": sum(len(c.get("files", []) or []) for c in cases),
+        "domain_tagged": sum(1 for c in cases if c.get("domain")),
+        "difficulty_tagged": sum(1 for c in cases if c.get("difficulty")),
+        "success_goal_tagged": sum(1 for c in cases if c.get("success_goals")),
+        "trigger_type_tagged": sum(1 for c in cases if c.get("trigger_type")),
     }
     findings: list[dict[str, Any]] = []
     recommendations: list[dict[str, Any]] = []
@@ -1932,10 +2627,27 @@ def audit_manifest_report(
     def rec(kind: str, message: str, example: Any = None) -> None:
         recommendations.append({"kind": kind, "message": message, **({"example": example} if example is not None else {})})
 
+    taxonomy = {
+        "domains": sorted({str(c.get("domain")) for c in cases if c.get("domain")}),
+        "difficulties": sorted({str(c.get("difficulty")) for c in cases if c.get("difficulty")}),
+        "trigger_types": sorted({str(c.get("trigger_type")) for c in cases if c.get("trigger_type")}),
+        "success_goals": sorted({str(goal) for c in cases for goal in (c.get("success_goals") or [])}),
+    }
+
     leakage = prompt_assertion_leakage_findings(manifest, manifest_path, min_chars=leakage_min_chars, split=split)
     if leakage:
         finding("prompt-assertion-leakage", "recommended", f"{len(leakage)} contains-style assertion values appear literally in their prompts.", leakage[:30])
         rec("assertion-leakage", "Replace leaked literal keyword assertions with non-leaked wording, regex scoped to output structure, fixture/script oracles, or stricter artifact checks.")
+
+    if cases and counts["domain_tagged"] < len(cases):
+        finding("missing-domain-taxonomy", "recommended", f"{len(cases) - counts['domain_tagged']} cases lack domain tags used for slice summaries.")
+        rec("taxonomy-domain", "Add a stable domain to each case, for example docs, testing, repo-quality, design, audit, or cloudflare.")
+    if cases and counts["difficulty_tagged"] < len(cases):
+        finding("missing-difficulty-taxonomy", "recommended", f"{len(cases) - counts['difficulty_tagged']} cases lack difficulty tags used for slice summaries.")
+        rec("taxonomy-difficulty", "Tag cases as core, extended, or extreme so regressions are visible by difficulty.")
+    if cases and counts["success_goal_tagged"] < len(cases):
+        finding("missing-success-goals", "recommended", f"{len(cases) - counts['success_goal_tagged']} cases lack success_goals such as outcome, style, process, efficiency, or trigger.")
+        rec("taxonomy-success-goals", "Add success_goals so benchmark reports can separate outcome, style, process, trigger, and efficiency evidence.")
 
     if counts["positive"] < min_positive:
         finding("missing-positive-evals", "required", f"Only {counts['positive']} positive cases; target at least {min_positive}.")
@@ -2004,6 +2716,7 @@ def audit_manifest_report(
         "manifest": str(manifest_path),
         "skill_name": manifest.get("skill_name"),
         "counts": counts,
+        "taxonomy": taxonomy,
         "findings": findings,
         "recommendations": recommendations,
         "recommended_fixture_repos_files": fixtures,
@@ -2103,6 +2816,20 @@ def main() -> int:
     p.add_argument("--jetty-runs", required=True)
     p.add_argument("--runs", required=True)
 
+    p = sub.add_parser("import-trace")
+    p.add_argument("--source", default="generic", choices=["generic", "codex", "pi", "jetty"], help="runner trace dialect to normalize")
+    p.add_argument("--trace", required=True, help="raw JSONL trace path")
+    p.add_argument("--run-dir", required=True, help="run directory where events.json/metrics.json should be written")
+    p.add_argument("--out-events")
+    p.add_argument("--out-metrics")
+    p.add_argument("--write-metadata", action="store_true", help="merge normalized metrics into metadata.json")
+
+    p = sub.add_parser("run-codex")
+    p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
+    p.add_argument("--runs", required=True, help="output runs directory")
+    p.add_argument("--codex-cmd", default="codex exec --json", help="shell command that reads prompt on stdin and emits Codex JSONL")
+    p.add_argument("--timeout", type=int, default=1800)
+
     p = sub.add_parser("grade")
     p.add_argument("manifest")
     p.add_argument("--runs", required=True)
@@ -2164,6 +2891,16 @@ def main() -> int:
     p.add_argument("--runs")
     p.add_argument("--out", required=True)
 
+    p = sub.add_parser("profile-skill")
+    p.add_argument("manifest")
+    p.add_argument("--skill-path", help="Override skill path used for profiling")
+    p.add_argument("--format", choices=["json", "markdown"], default="json")
+    p.add_argument("--out")
+    p.add_argument("--max-skill-tokens", type=int, default=3000)
+    p.add_argument("--max-reference-tokens", type=int, default=5000)
+    p.add_argument("--max-references", type=int, default=8)
+    p.add_argument("--max-modules", type=int, default=10)
+
     p = sub.add_parser("audit-manifest")
     p.add_argument("manifest")
     p.add_argument("--skill-path", help="Override skill path used for section/ablation suggestions")
@@ -2208,6 +2945,10 @@ def main() -> int:
         return run_jetty(args)
     if args.cmd == "import-jetty-results":
         return import_jetty_results(args)
+    if args.cmd == "import-trace":
+        return import_trace(args)
+    if args.cmd == "run-codex":
+        return run_codex(args)
     if args.cmd == "grade":
         return grade(args)
     if args.cmd == "judge":
@@ -2222,6 +2963,8 @@ def main() -> int:
         return compare_results(args)
     if args.cmd == "render-viewer":
         return render_viewer(args)
+    if args.cmd == "profile-skill":
+        return profile_skill(args)
     if args.cmd == "audit-manifest":
         return audit_manifest(args)
     if args.cmd == "aggregate":

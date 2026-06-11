@@ -1,6 +1,6 @@
 # Trace-Aware Skill Eval Spec
 
-Status: proposal. This is a docs-only implementation plan for extending Skill Eval Harness with runner traces, process assertions, efficiency reporting, stronger dataset audits, and structured qualitative review. It integrates the subset of ideas from OpenAI's `eval-skills` article, SkillsBench, and Anthropic's `skill-creator` that fit the existing harness model.
+Status: phase-1 implementation in progress. The first code slice implements trace import, a Codex JSONL runner adapter, process/efficiency assertions, telemetry-aware benchmark summaries, paired deltas/normalized gain, taxonomy slice summaries, taxonomy audit warnings, and skill-profile reporting. Remaining sections describe follow-on work. This plan integrates the subset of ideas from OpenAI's `eval-skills` article, SkillsBench, and Anthropic's `skill-creator` that fit the existing harness model.
 
 ## Design principle
 
@@ -364,25 +364,25 @@ This adopts the SkillsBench lesson that focused 2–3-module skills often outper
 
 ### Phase 1 — trace schema and local grading plumbing
 
-- Add `trace.jsonl`, `events.json`, `metrics.json`, and `environment.json` to the documented run contract.
-- Add pure parser/normalizer helpers with fixture tests.
-- Add process/efficiency assertion types with missing-evidence fail-closed tests.
-- Extend `benchmark` reports with telemetry availability and negative-delta sections.
+- [x] Add `trace.jsonl`, `events.json`, `metrics.json`, and `environment.json` to the documented run contract.
+- [x] Add pure parser/normalizer helpers with fixture tests.
+- [x] Add process/efficiency assertion types with missing-evidence fail-closed tests.
+- [x] Extend `benchmark` reports with telemetry availability and negative-delta sections.
 
 ### Phase 2 — Codex adapter
 
-- Implement `run-codex` around `codex exec --json`.
-- Save raw and normalized traces.
-- Extract final answer to `output.md`.
-- Treat timeout/nonzero runs as failed records.
-- Add mocked JSONL fixtures; keep live Codex smoke opt-in.
+- [x] Implement `run-codex` around a `codex exec --json`-compatible command.
+- [x] Save raw and normalized traces.
+- [x] Extract final answer to `output.md`.
+- [x] Treat timeout/nonzero runs as failed records.
+- [x] Add mocked JSONL fixtures; keep live Codex smoke opt-in.
 
 ### Phase 3 — audit/report quality
 
-- Add taxonomy warnings and slice summaries.
-- Add normalized gain for paired variants.
-- Expand leakage/anti-cheating lint beyond prompt/assertion literals.
-- Add skill-profile reporting.
+- [x] Add taxonomy warnings and slice summaries.
+- [x] Add normalized gain for paired variants.
+- [ ] Expand leakage/anti-cheating lint beyond prompt/assertion literals.
+- [x] Add skill-profile reporting.
 
 ### Phase 4 — judge/viewer improvements
 
