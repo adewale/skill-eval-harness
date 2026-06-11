@@ -174,3 +174,53 @@ Examples from saturation work:
 **Rule:**
 - Use official CLI installs only.
 - Do not forge install telemetry or call tracking endpoints directly.
+
+## 2026-06-11 — No-skill baselines need filesystem isolation
+
+**Problem:** A Pi smoke run with `without_skill` still found `skills/good-pr/SKILL.md` because the runner executed from the source repo. `--no-skills` stopped explicit skill loading, but grep/find/read could still discover the skill files and public eval manifests.
+
+**Lesson:** A disabled-skill flag is not a variant boundary when the runner can read the source workspace.
+
+**Rule:**
+- Run each generation task from a per-variant temporary workspace.
+- Copy skill files only for `with_skill`, `old_skill`, and materialized ablation variants.
+- For `without_skill`, provide only fixture inputs and pass `--no-skills` when the runner supports it.
+- Keep eval manifests, skill folders, and public answer scaffolding out of the no-skill workspace.
+- Add variant-scoped process assertions: `skill_invoked=true` for `with_skill`; `skill_invoked=false` for `without_skill`.
+
+## 2026-06-11 — Process assertions need real trace evidence
+
+**Problem:** Final output grading could not show whether a skill was loaded, which commands ran, or whether a run stayed inside tool/token/time budgets. Manifest-only process assertions would either fail without evidence or tempt the harness to infer process from answer text.
+
+**Lesson:** Process and efficiency claims are only valid when runner artifacts support them.
+
+**Rule:**
+- Runners should write raw `trace.jsonl` plus normalized `events.json` and `metrics.json`.
+- Do not infer skill-load or command evidence from final `output.md` prose.
+- Keep process/efficiency assertions fail-closed when required evidence is missing.
+- Add production process assertions only after a real runner has emitted stable evidence for that case and variant.
+
+## 2026-06-11 — Normalize observed runner shapes, not imagined schemas
+
+**Problem:** Pi, Codex, and Jetty expose different event shapes. Codex emitted `item.completed` / `command_execution` and `turn.completed` usage records; Pi exposed `message_end` usage aliases; Jetty trajectory shapes are still only documented/mocked until live token validation.
+
+**Lesson:** The normalized trace schema is an adapter boundary, not a reason to pretend every runner already emits the same evidence.
+
+**Rule:**
+- Preserve raw runner events before normalization.
+- Add fixture tests for every event shape the adapter claims to support.
+- Count completed command events, not in-progress starts or command output text.
+- Mark documented/mocked Jetty trajectory import as useful but not production-grade until `JETTY_API_TOKEN` live validation confirms response shapes.
+- Keep source-specific unknowns in docs or `TODO.md` instead of hiding them behind generic trace language.
+
+## 2026-06-11 — Specs need a release-tense pass
+
+**Problem:** After v0.4.1 shipped, the trace-aware spec still described some shipped behavior as future work. That made the docs internally inconsistent even though the code and changelog were correct.
+
+**Lesson:** Specs become misleading when release state changes but tense and caveats do not.
+
+**Rule:**
+- After each release, scan docs for stale “proposal,” “next,” and “first implementation” language.
+- Separate shipped behavior from follow-on work in specs.
+- Keep live-validation caveats visible, especially for external adapters.
+- Record docs-only corrections in `CHANGELOG.md` under `Unreleased`.
