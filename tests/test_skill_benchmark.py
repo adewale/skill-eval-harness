@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -390,6 +392,201 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertTrue(rows[0]["passed"])
             self.assertIn("{brace}", rows[0]["evidence"])
             self.assertTrue(any(transcripts.rglob("prompt.md")))
+
+    def test_trace_import_process_and_efficiency_assertions(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["cases"][0]["domain"] = "writing"
+            data["cases"][0]["difficulty"] = "core"
+            data["cases"][0]["trigger_type"] = "explicit"
+            data["cases"][0]["success_goals"] = ["outcome", "process", "efficiency"]
+            data["cases"][0]["assertions"] = [
+                {"name": "loaded-skill", "type": "skill_invoked", "expected": True},
+                {"name": "ran-tests", "type": "command_ran", "pattern": "npm test"},
+                {"name": "safe-command", "type": "command_not_ran", "pattern": "rm -rf"},
+                {"name": "ordered", "type": "command_order", "patterns": ["npm install", "npm test"]},
+                {"name": "command-budget", "type": "command_count_le", "max": 3},
+                {"name": "token-budget", "type": "total_tokens_le", "max": 200},
+                {"name": "time-budget", "type": "elapsed_seconds_le", "max": 5},
+            ]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            run_dir = root / "repo" / "eval-runs" / "latest" / "case-1" / "with_skill"
+            run_dir.mkdir(parents=True)
+            (run_dir / "output.md").write_text("alpha beta", encoding="utf-8")
+            trace = run_dir / "trace.jsonl"
+            rows = [
+                {"type": "file_read", "path": str(root / "repo" / "skill" / "SKILL.md")},
+                {"type": "exec_command", "command": "npm install", "duration_ms": 1000},
+                {"type": "exec_command", "command": "npm test", "duration_ms": 1200},
+                {"type": "usage", "usage": {"input_tokens": 80, "output_tokens": 20, "total_tokens": 100}},
+            ]
+            trace.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            sb.import_trace(SimpleNamespace(source="codex", trace=str(trace), run_dir=str(run_dir), out_events=None, out_metrics=None, write_metadata=True))
+            events = json.loads((run_dir / "events.json").read_text(encoding="utf-8"))
+            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+            self.assertEqual([e["type"] for e in events["events"]][:3], ["skill_load", "command", "command"])
+            self.assertTrue(metrics["skill_invoked"])
+            self.assertEqual(metrics["commands"], 2)
+            report = sb.build_benchmark_report(manifest, root / "repo" / "eval-runs" / "latest", variants_arg=["with_skill"])
+            result = report["results"][0]
+            self.assertEqual(result["objective_pass_rate"], 1.0)
+            self.assertEqual(result["process_pass_rate"], 1.0)
+            self.assertEqual(result["efficiency_pass_rate"], 1.0)
+            self.assertEqual(report["summary"]["with_skill"]["telemetry_availability"]["events"], 1)
+            self.assertEqual(report["slice_summary"]["domain"]["writing"]["with_skill"]["runs"], 1)
+
+    def test_process_and_efficiency_assertions_fail_closed_without_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["cases"][0]["assertions"] = [
+                {"name": "loaded-skill", "type": "skill_invoked", "expected": True},
+                {"name": "token-budget", "type": "total_tokens_le", "max": 200},
+            ]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            run_dir = root / "repo" / "eval-runs" / "latest" / "case-1" / "with_skill"
+            run_dir.mkdir(parents=True)
+            (run_dir / "output.md").write_text("alpha beta", encoding="utf-8")
+            report = sb.build_benchmark_report(manifest, root / "repo" / "eval-runs" / "latest", variants_arg=["with_skill"])
+            result = report["results"][0]
+            self.assertEqual(result["objective_pass_rate"], 0.0)
+            self.assertIn("missing", result["assertions"][0]["evidence"])
+            self.assertIn("missing", result["assertions"][1]["evidence"])
+
+    def test_benchmark_reports_delta_normalized_gain_and_negative_cases(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["cases"][0]["domain"] = "docs"
+            data["cases"][0]["difficulty"] = "core"
+            data["cases"].append({
+                "id": "case-2",
+                "split": "tune",
+                "kind": "behavior",
+                "domain": "docs",
+                "difficulty": "extended",
+                "prompt": "Say gamma.",
+                "assertions": [{"name": "has-gamma", "type": "contains", "value": "gamma"}],
+            })
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            runs = root / "repo" / "eval-runs" / "latest"
+            outputs = {
+                ("case-1", "with_skill"): "alpha",
+                ("case-1", "without_skill"): "alpha beta",
+                ("case-2", "with_skill"): "gamma",
+                ("case-2", "without_skill"): "nope",
+            }
+            for (case_id, variant), text in outputs.items():
+                base = runs / case_id / variant
+                base.mkdir(parents=True)
+                (base / "output.md").write_text(text, encoding="utf-8")
+            report = sb.build_benchmark_report(manifest, runs)
+            self.assertAlmostEqual(report["paired_summary"]["absolute_delta"], 0.25)
+            self.assertEqual(report["paired_summary"]["negative_delta_cases"][0]["case_id"], "case-1")
+            self.assertAlmostEqual(report["paired_summary"]["normalized_gain"], 0.5)
+            self.assertIn("extended", report["slice_summary"]["difficulty"])
+
+    def test_profile_skill_reports_size_and_reference_warnings(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            skill = root / "repo" / "skill" / "SKILL.md"
+            refs = root / "repo" / "skill" / "references"
+            refs.mkdir()
+            (refs / "a.md").write_text("one two three\n" * 200, encoding="utf-8")
+            (refs / "b.md").write_text("four five six\n" * 200, encoding="utf-8")
+            skill.write_text("---\nname: demo\n---\n# Demo\n" + "## Module\ntext\n" * 12, encoding="utf-8")
+            report = sb.profile_skill_report(manifest, max_skill_tokens=20, max_references=1, max_modules=3)
+            kinds = {f["kind"] for f in report["findings"]}
+            self.assertIn("skill-too-large", kinds)
+            self.assertIn("many-references", kinds)
+            self.assertIn("many-modules", kinds)
+
+    def test_command_assertions_match_command_inputs_not_outputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["cases"][0]["assertions"] = [
+                {"name": "did-not-run-rm", "type": "command_not_ran", "pattern": "rm -rf"},
+                {"name": "ran-tests", "type": "command_ran", "pattern": "npm test"},
+            ]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            run_dir = root / "repo" / "eval-runs" / "latest" / "case-1" / "with_skill"
+            run_dir.mkdir(parents=True)
+            (run_dir / "output.md").write_text("alpha beta", encoding="utf-8")
+            (run_dir / "events.json").write_text(json.dumps({
+                "schema_version": 1,
+                "source": "test",
+                "events": [{
+                    "index": 1,
+                    "type": "command",
+                    "name": "bash",
+                    "status": "completed",
+                    "input_summary": "echo harmless",
+                    "output_summary": "docs mention npm test and rm -rf as examples",
+                }],
+            }), encoding="utf-8")
+            report = sb.build_benchmark_report(manifest, root / "repo" / "eval-runs" / "latest", variants_arg=["with_skill"])
+            assertions = {a["name"]: a for a in report["results"][0]["assertions"]}
+            self.assertTrue(assertions["did-not-run-rm"]["passed"])
+            self.assertFalse(assertions["ran-tests"]["passed"])
+
+    def test_run_codex_writes_trace_output_and_metrics(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            tasks = root / "tasks.jsonl"
+            rows = sb.prepared_task_rows(manifest, sb.load_json(manifest))
+            tasks.write_text("".join(json.dumps(row) + "\n" for row in rows[:1]), encoding="utf-8")
+            fake = root / "fake_codex.py"
+            fake.write_text(
+                "import json, sys\n"
+                "_prompt = sys.stdin.read()\n"
+                "print(json.dumps({'type': 'exec_command', 'command': 'npm test'}))\n"
+                "print(json.dumps({'role': 'assistant', 'content': 'alpha beta'}))\n",
+                encoding="utf-8",
+            )
+            runs = root / "runs"
+            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs), codex_cmd=f"{sys.executable} {fake}", timeout=5))
+            base = runs / "case-1" / "with_skill"
+            self.assertTrue((base / "trace.jsonl").exists())
+            self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "alpha beta")
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+            self.assertEqual(metrics["commands"], 1)
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["provider"], "codex")
+
+    def test_run_codex_malformed_jsonl_still_writes_failure_artifacts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            tasks = root / "tasks.jsonl"
+            rows = sb.prepared_task_rows(manifest, sb.load_json(manifest))
+            tasks.write_text(json.dumps(rows[0]) + "\n", encoding="utf-8")
+            fake = root / "bad_codex.py"
+            fake.write_text("import sys\nprint('{not json')\nprint('plain diagnostic')\nsys.exit(2)\n", encoding="utf-8")
+            runs = root / "runs"
+            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs), codex_cmd=f"{sys.executable} {fake}", timeout=5))
+            base = runs / "case-1" / "with_skill"
+            self.assertIn("CODEX FAILURE", (base / "output.md").read_text(encoding="utf-8"))
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+            self.assertIn("parse_errors", metrics)
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["returncode"], 2)
+
+    def test_run_codex_rejects_unsafe_run_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = root / "tasks.jsonl"
+            tasks.write_text(json.dumps({"case_id": "case", "variant": "with_skill", "run_dir": "../outside", "prompt": "x"}) + "\n", encoding="utf-8")
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(root / "runs"), codex_cmd=f"{sys.executable} -c 'print(1)'", timeout=5))
+            self.assertFalse((root / "outside").exists())
 
     def test_run_jetty_uploads_submits_polls_and_replaces_placeholders(self):
         row = {

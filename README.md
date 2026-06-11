@@ -122,6 +122,7 @@ skill-benchmark --help
 | `CONTRIBUTING.md` | Local setup, validation commands, and eval-safety rules. |
 | `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
+| `docs/trace-aware-eval-spec.md` | Proposal for trace artifacts, process/efficiency assertions, Codex adapter support, richer reporting, and audit upgrades. |
 | `TODO.md` | Remaining Jetty work: streaming, concurrency, live API validation, materialized ablations. |
 | `examples/adewale-workspace/` | Adewale-specific runners for Pi smoke, trigger, ablation, and aggregate reports. |
 | `tests/test_skill_benchmark.py` | Executable examples for repeated runs, leakage lint, script assertions, judge commands, Jetty export/import, and trigger detection. |
@@ -152,6 +153,10 @@ Each skill repo owns an `evals/shared-benchmark.json` manifest. Add a `harness` 
       "id": "pos-security-meaningless-test",
       "split": "tune",
       "kind": "pr-review",
+      "domain": "pull-request-quality",
+      "difficulty": "core",
+      "trigger_type": "explicit",
+      "success_goals": ["outcome", "style"],
       "prompt": "Security fix PR includes `expect(result).toBeDefined()` as the only auth-bypass test...",
       "files": ["fixtures/security-pr/diff.patch"],
       "expected_behavior": ["Flag the weak test and require regression proof."],
@@ -199,6 +204,11 @@ Objective assertion types:
 | `file_exists` | A file exists relative to the run directory. |
 | `json_field_equals` | A JSON field equals an expected value. |
 | `script` | Opt-in deterministic oracle command against the output directory. |
+| `skill_invoked` | Trace/process check that the runner loaded the skill, or did not, as expected. |
+| `command_ran` / `command_not_ran` | Trace/process checks over normalized command events. |
+| `command_order` | Trace/process check that commands appeared in a required order. |
+| `tool_count_le` / `no_repeated_command_loop` | Trace/process budgets for tool use and thrashing. |
+| `total_tokens_le` / `elapsed_seconds_le` / `command_count_le` | Efficiency checks over `metrics.json`, `metadata.json`, or normalized events. |
 
 Use `script` when a keyword check is too weak for the property you care about. The command sees the candidate run directory, so it can inspect `output.md`, generated files under `outputs/`, or metadata. Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `benchmark`, `aggregate`, or `export-anthropic`:
 
@@ -213,6 +223,8 @@ Use `script` when a keyword check is too weak for the property you care about. T
 ```
 
 `command` runs with cwd set to the manifest directory. `{output_dir}` is replaced with the absolute run directory. The assertion passes when the command exits with `pass_exit_code` (default `0`); stdout and stderr are stored as evidence.
+
+Trace/process/efficiency assertions are optional and fail closed when declared evidence is missing. For example, `command_not_ran` cannot pass without `events.json`, and `total_tokens_le` cannot pass without token telemetry.
 
 Qualitative assertion types:
 
@@ -242,6 +254,15 @@ or repeated/artifact layout:
 runs/<case_id>/<variant>/run-1/output.md
 runs/<case_id>/<variant>/run-1/metadata.json
 runs/<case_id>/<variant>/run-2/outputs/<artifact files>
+```
+
+Trace-aware runners may also write:
+
+```text
+runs/<case_id>/<variant>/run-1/trace.jsonl       # raw runner event stream
+runs/<case_id>/<variant>/run-1/events.json       # normalized events used by process assertions
+runs/<case_id>/<variant>/run-1/metrics.json      # tokens, commands, tool calls, elapsed time, retries
+runs/<case_id>/<variant>/run-1/environment.json  # runner/model/sandbox details where available
 ```
 
 `metadata.json` is optional, but include what your runner can capture:
@@ -284,6 +305,29 @@ skill-benchmark prepare ../repo/evals/shared-benchmark.json --include-ablations 
 
 Use `--include-answer-key` only for judge/debug tasks, never for generation runs.
 
+### Import runner traces
+
+Normalize a raw JSONL trace into `events.json` and `metrics.json` for process and efficiency assertions:
+
+```bash
+skill-benchmark import-trace \
+  --source codex \
+  --trace ../repo/eval-runs/latest/case/with_skill/run-1/trace.jsonl \
+  --run-dir ../repo/eval-runs/latest/case/with_skill/run-1 \
+  --write-metadata
+```
+
+### Run Codex JSONL tasks
+
+`run-codex` executes prepared rows through a command compatible with `codex exec --json`, saves `trace.jsonl`, normalizes events/metrics, extracts the final answer into `output.md`, and records nonzero/timeouts as failed run artifacts:
+
+```bash
+skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl
+skill-benchmark run-codex --tasks tasks.jsonl --runs ../repo/eval-runs/codex-tune
+```
+
+Override `--codex-cmd` for local wrappers or tests.
+
 ### Grade
 
 `grade` produces per-run grading rows and can emit pending judge tasks:
@@ -305,7 +349,7 @@ skill-benchmark grade ../repo/evals/shared-benchmark.json \
 
 ### Benchmark
 
-`benchmark` aggregates graded rows into variant summaries and case flags. Add `--allow-scripts` only when you trust the repo-owned oracle commands in the manifest.
+`benchmark` aggregates graded rows into variant summaries, paired deltas, slice summaries, telemetry availability, and case flags. Add `--allow-scripts` only when you trust the repo-owned oracle commands in the manifest.
 
 ```bash
 skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
@@ -349,10 +393,21 @@ The audit reports:
 - missing positive, negative, and adversarial eval coverage,
 - missing holdout/holdback split coverage,
 - missing trigger/no-trigger coverage,
+- missing domain/difficulty/success-goal taxonomy for slice summaries,
 - ablation-plan suggestions from major skill sections,
 - saturated and no-lift cases when run data is available,
 - assertions with identical with/without pass rates, and
 - recommended fixture repos/files.
+
+### Profile skill size and references
+
+```bash
+skill-benchmark profile-skill ../repo/evals/shared-benchmark.json \
+  --format markdown \
+  --out skill-profile.md
+```
+
+`profile-skill` reports `SKILL.md` token estimates, reference-file counts/sizes, heading/module counts, and warnings for overly broad or oversized skills. These warnings are advisory; focused 2–3-module skills are often easier for agents to apply, but large skills can be justified when references are conditional.
 
 ### Aggregate many skills
 
