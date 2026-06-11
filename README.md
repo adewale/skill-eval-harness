@@ -122,10 +122,10 @@ skill-benchmark --help
 | `CONTRIBUTING.md` | Local setup, validation commands, and eval-safety rules. |
 | `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
-| `docs/trace-aware-eval-spec.md` | Proposal for trace artifacts, process/efficiency assertions, Codex adapter support, richer reporting, and audit upgrades. |
-| `TODO.md` | Remaining Jetty work: streaming, concurrency, live API validation, materialized ablations. |
+| `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
+| `TODO.md` | Remaining Jetty work: streaming/concurrency, live API validation, materialized ablations, judge export, and per-variant overrides. |
 | `examples/adewale-workspace/` | Adewale-specific runners for Pi smoke, trigger, ablation, and aggregate reports. |
-| `tests/test_skill_benchmark.py` | Executable examples for repeated runs, leakage lint, script assertions, judge commands, Jetty export/import, and trigger detection. |
+| `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
 
 ## Manifest format
 
@@ -335,7 +335,7 @@ skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out t
 skill-benchmark run-codex --tasks tasks.jsonl --runs ../repo/eval-runs/codex-tune
 ```
 
-Override `--codex-cmd` for local wrappers or tests. A grounded smoke command is:
+Override `--codex-cmd` for local wrappers or tests. A concrete Codex smoke command is:
 
 ```bash
 skill-benchmark run-codex \
@@ -354,7 +354,7 @@ python3 examples/adewale-workspace/run_pi_smoke.py \
   --selection /tmp/selection.json
 ```
 
-It runs from an isolated temporary workspace. `with_skill` receives copied skill files and fixtures; `without_skill` receives fixtures only and `--no-skills`, preventing grep/find/read from discovering the source repo's `skills/*/SKILL.md` or public eval manifests.
+The runner uses an isolated temporary workspace. `with_skill` receives copied skill files and fixtures. `without_skill` receives fixtures only and runs with `--no-skills`, so grep/find/read cannot discover the source repo's `skills/*/SKILL.md` or public eval manifests.
 
 `skill-pi-trigger-eval` can also write per-query trace artifacts:
 
@@ -602,7 +602,7 @@ python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```
 
-The test suite covers repeated runs, artifact outputs, answer-key omission, leakage lint, script assertions, judge-command parsing, Anthropic export shape, Jetty export shape, mocked Jetty execution, and Jetty import round trips.
+The test suite covers repeated runs, artifact outputs, answer-key omission, leakage lint, script assertions, judge-command parsing, Anthropic export shape, Jetty export/import, trace normalization, variant-scoped process assertions, Codex JSONL runs, Pi trigger traces, and Pi smoke workspace isolation.
 
 ## Source checked
 
@@ -613,6 +613,6 @@ This README was written against:
 - `pyproject.toml` package metadata
 - `tests/test_skill_benchmark.py` behavior coverage
 - `CHANGELOG.md`, `CONTRIBUTING.md`, and `.github/` contribution/CI surfaces
-- `anti-slop-writing/skills/anti-slop-writing/SKILL.md` for this prose pass
+- `anti-slop-writing/skills/anti-slop-writing/SKILL.md` for the v0.4.1 docs cleanup and consistency pass
 - the `good-readme` skill guidance from `https://www.skills.sh/adewale/good-readme/good-readme`
 - the `good-repo` skill guidance from `good-repo/skills/good-repo/references/quality-checklist.md`
