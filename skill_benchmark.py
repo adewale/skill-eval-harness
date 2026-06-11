@@ -113,6 +113,22 @@ def script_command_list(assertion: dict[str, Any]) -> list[str]:
     return []
 
 
+def validate_variant_filter(assertion: dict[str, Any], cid: str, index: int) -> None:
+    for key in ["variants", "only_variants", "except_variants"]:
+        if key in assertion and (not isinstance(assertion.get(key), list) or not all(isinstance(v, str) for v in assertion.get(key, []))):
+            die(f"{cid}: assertion #{index} {key} must be a list of strings")
+
+
+def assertion_applies_to_variant(assertion: dict[str, Any], variant: str) -> bool:
+    only = assertion.get("variants", assertion.get("only_variants"))
+    if isinstance(only, list) and variant not in only:
+        return False
+    excluded = assertion.get("except_variants")
+    if isinstance(excluded, list) and variant in excluded:
+        return False
+    return True
+
+
 def validate_script_assertion(assertion: dict[str, Any], manifest_path: Path, cid: str, index: int) -> None:
     command = script_command_list(assertion)
     if not command:
@@ -223,6 +239,7 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         for j, assertion in enumerate(assertions):
             if not isinstance(assertion, dict):
                 die(f"{cid}: assertion #{j} must be an object")
+            validate_variant_filter(assertion, cid, j)
             atype = assertion.get("type")
             if atype not in OBJECTIVE_ASSERTIONS | QUALITATIVE_ASSERTIONS:
                 die(f"{cid}: assertion #{j} has unsupported type {atype!r}")
@@ -896,6 +913,43 @@ def artifact_metadata(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
     return {}
 
 
+def jetty_trace_records(record: dict[str, Any], artifacts: list[dict[str, Any]], *, success: bool) -> list[dict[str, Any]]:
+    trajectory = record.get("trajectory", {}) if isinstance(record.get("trajectory"), dict) else {}
+    records: list[dict[str, Any]] = []
+    for key in ["events", "steps", "messages", "trace", "logs"]:
+        values = trajectory.get(key)
+        if isinstance(values, list):
+            for item in values:
+                if isinstance(item, dict):
+                    records.append(item)
+                else:
+                    records.append({"type": f"jetty.{key}", "content": str(item)})
+    usage = trajectory.get("usage") if isinstance(trajectory, dict) else None
+    metric_record: dict[str, Any] = {"type": "usage"}
+    if isinstance(usage, dict):
+        metric_record["usage"] = usage
+    for key in ["elapsed_ms", "duration_ms", "input_tokens", "output_tokens", "total_tokens", "total_tool_calls"]:
+        value = trajectory.get(key) if isinstance(trajectory, dict) else None
+        if isinstance(value, (int, float)):
+            metric_record[key] = value
+    if len(metric_record) > 1:
+        records.append(metric_record)
+    for artifact in artifacts:
+        rel = artifact_rel_path(artifact)
+        if rel:
+            records.append({"type": "file_write", "path": str(rel), "status": "completed"})
+    if not success:
+        error = record.get("error") or trajectory.get("error") if isinstance(trajectory, dict) else record.get("error")
+        records.append({"type": "error", "status": str(record.get("status") or "failed"), "message": str(error or "Jetty trajectory failed")})
+    if not records:
+        records.append({"type": "jetty_trajectory", "status": record.get("status"), "trajectory_id": record.get("trajectory_id")})
+    return records
+
+
+def jsonl_from_records(records: list[dict[str, Any]]) -> str:
+    return "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+
+
 def normalized_jetty_metadata(record: dict[str, Any], *, success: bool) -> dict[str, Any]:
     jetty = record.get("jetty", {}) if isinstance(record.get("jetty"), dict) else {}
     trajectory = record.get("trajectory", {}) if isinstance(record.get("trajectory"), dict) else {}
@@ -959,7 +1013,15 @@ def import_jetty_results(args: argparse.Namespace) -> int:
             (base / "output.md").write_text("[JETTY FAILURE: trajectory failed before producing output]\n", encoding="utf-8")
         meta = artifact_metadata(artifacts)
         meta.update(normalized_jetty_metadata(record, success=success))
-        write_json(base / "metadata.json", meta)
+        trace_records = jetty_trace_records(record, artifacts, success=success)
+        write_trace_artifacts(
+            base,
+            jsonl_from_records(trace_records),
+            source="jetty",
+            metadata=meta,
+            environment={"runner": "jetty", "jetty": record.get("jetty", {}), "trajectory_id": record.get("trajectory_id")},
+            write_metadata=True,
+        )
     return 0
 
 
@@ -1091,7 +1153,15 @@ def command_text(event: dict[str, Any]) -> str:
 
 
 def command_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [e for e in events if e.get("type") == "command"]
+    # Codex and other runners can emit both start and completion records for the
+    # same command. Process assertions care about commands that actually ran, so
+    # ignore in-progress start notifications when a status is present.
+    return [e for e in events if e.get("type") == "command" and str(e.get("status", "completed")).casefold() not in {"in_progress", "started", "running"}]
+
+
+def event_mentions_skill_file(event: dict[str, Any]) -> bool:
+    hay = " ".join(str(event.get(key, "")) for key in ["input_summary", "output_summary", "name"])
+    return "SKILL.md" in hay or "/skills/" in hay or "\\skills\\" in hay
 
 
 def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:
@@ -1150,7 +1220,7 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
         invoked = bool(metrics.get("skill_invoked")) if has_metric else False
         evidence: list[str] = []
         if events is not None:
-            skill_events = [e for e in events if e.get("type") == "skill_load"]
+            skill_events = [e for e in events if e.get("type") == "skill_load" or event_mentions_skill_file(e)]
             if skill_events:
                 invoked = True
                 evidence.extend(command_text(e) or str(e.get("path", "skill_load")) for e in skill_events[:5])
@@ -1276,8 +1346,34 @@ def load_trace_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
     return parse_trace_jsonl_text(path.read_text(encoding="utf-8", errors="replace"))
 
 
+def nested_item_type(record: dict[str, Any]) -> str:
+    item = record.get("item")
+    if isinstance(item, dict):
+        value = item.get("type") or item.get("kind") or item.get("name")
+        return str(value or "")
+    return ""
+
+
+def usage_number(usage: dict[str, Any], *keys: str) -> float | None:
+    aliases = {
+        "input_tokens": ["input_tokens", "input", "prompt_tokens", "cached_input_tokens"],
+        "output_tokens": ["output_tokens", "output", "completion_tokens"],
+        "total_tokens": ["total_tokens", "totalTokens", "total", "tokens"],
+    }
+    search: list[str] = []
+    for key in keys:
+        search.extend(aliases.get(key, [key]))
+    for key in search:
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
 def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, line: int) -> dict[str, Any]:
-    raw_type = str(raw_trace_value(record, "type", "event", "name", "kind") or "").casefold()
+    top_type = str(raw_trace_value(record, "type", "event", "name", "kind") or "")
+    item_type = nested_item_type(record)
+    raw_type = f"{top_type} {item_type}".casefold()
     path = stringify_trace_value(raw_trace_value(record, "path", "file"))
     command = stringify_trace_value(raw_trace_value(record, "command", "cmd", "args"))
     content = stringify_trace_value(raw_trace_value(record, "content", "text", "message"))
@@ -1297,10 +1393,10 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
         event_type = "file_read"
     elif "error" in raw_type or str(status).casefold() in {"failed", "error", "errored"}:
         event_type = "error"
-    elif "usage" in raw_type or "metric" in raw_type:
-        event_type = "metric"
-    elif raw_trace_value(record, "role") or content:
+    elif raw_trace_value(record, "role") or content or "agent_message" in raw_type:
         event_type = "message"
+    elif "usage" in raw_type or "metric" in raw_type or raw_trace_value(record, "usage", "tokens"):
+        event_type = "metric"
     input_summary = command or path or content[:500]
     output_summary = stringify_trace_value(raw_trace_value(record, "output", "stdout", "stderr", "result"))[:1000]
     event = {
@@ -1310,6 +1406,8 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
         "raw_ref": {"file": "trace.jsonl", "line": line},
     }
     role = raw_trace_value(record, "role")
+    if not role and "agent_message" in raw_type:
+        role = "assistant"
     if role:
         event["role"] = str(role)
     if name:
@@ -1329,7 +1427,19 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
         event["duration_ms"] = duration
     usage = raw_trace_value(record, "usage", "tokens")
     if isinstance(usage, dict):
-        event["tokens"] = {k: v for k, v in usage.items() if isinstance(v, (int, float))}
+        token_doc = {k: v for k, v in usage.items() if isinstance(v, (int, float))}
+        normalized_total = usage_number(usage, "total_tokens")
+        normalized_input = usage_number(usage, "input_tokens")
+        normalized_output = usage_number(usage, "output_tokens")
+        if normalized_total is None and normalized_input is not None and normalized_output is not None:
+            normalized_total = normalized_input + normalized_output
+        if normalized_input is not None:
+            token_doc["input_tokens"] = int(normalized_input)
+        if normalized_output is not None:
+            token_doc["output_tokens"] = int(normalized_output)
+        if normalized_total is not None:
+            token_doc["total_tokens"] = int(normalized_total)
+        event["tokens"] = token_doc
     event["source"] = source
     return event
 
@@ -1342,24 +1452,28 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
     for record, event in zip(records, events):
         usage = raw_trace_value(record, "usage", "tokens")
         if isinstance(usage, dict):
-            for key in token_totals:
-                value = usage.get(key)
+            input_tokens = usage_number(usage, "input_tokens")
+            output_tokens = usage_number(usage, "output_tokens")
+            total_tokens = usage_number(usage, "total_tokens")
+            if total_tokens is None and input_tokens is not None and output_tokens is not None:
+                total_tokens = input_tokens + output_tokens
+            for key, value in [("input_tokens", input_tokens), ("output_tokens", output_tokens), ("total_tokens", total_tokens)]:
                 if isinstance(value, (int, float)):
                     token_totals[key] += value
         duration = raw_trace_value(record, "duration_ms", "elapsed_ms")
         if isinstance(duration, (int, float)):
             elapsed_ms += float(duration)
         tokens = event.get("tokens")
-        if isinstance(tokens, dict):
+        if isinstance(tokens, dict) and not isinstance(usage, dict):
             for key in token_totals:
                 value = tokens.get(key)
-                if isinstance(value, (int, float)) and not any(isinstance(raw_trace_value(r, "usage", "tokens"), dict) for r in [record]):
+                if isinstance(value, (int, float)):
                     token_totals[key] += value
-    skill_events = [e for e in events if e.get("type") == "skill_load"]
+    skill_events = [e for e in events if e.get("type") == "skill_load" or event_mentions_skill_file(e)]
     metrics: dict[str, Any] = {
         "schema_version": 1,
         "source": source,
-        "tool_calls": sum(1 for e in events if e.get("type") in {"tool_call", "command"}),
+        "tool_calls": sum(1 for e in events if e.get("type") == "tool_call") + len(command_events(events)),
         "commands": len(commands),
         "file_reads": sum(1 for e in events if e.get("type") in {"file_read", "skill_load"}),
         "file_writes": sum(1 for e in events if e.get("type") == "file_write"),
@@ -1378,23 +1492,56 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
     return event_doc, metrics
 
 
-def import_trace(args: argparse.Namespace) -> int:
-    trace = Path(args.trace)
-    run_dir = Path(args.run_dir)
-    records, parse_errors = load_trace_jsonl(trace)
-    events, metrics = normalize_trace_records(records, source=getattr(args, "source", "generic"))
+def write_trace_artifacts(
+    run_dir: Path,
+    trace_text: str,
+    *,
+    source: str,
+    metadata: dict[str, Any] | None = None,
+    extra_metrics: dict[str, Any] | None = None,
+    environment: dict[str, Any] | None = None,
+    write_metadata: bool = True,
+    out_events: Path | None = None,
+    out_metrics: Path | None = None,
+    write_raw_trace: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if write_raw_trace:
+        (run_dir / "trace.jsonl").write_text(trace_text, encoding="utf-8")
+    records, parse_errors = parse_trace_jsonl_text(trace_text)
+    events, metrics = normalize_trace_records(records, source=source)
     if parse_errors:
         metrics["parse_errors"] = parse_errors[:20]
         metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
-    out_events = Path(args.out_events) if getattr(args, "out_events", None) else run_dir / "events.json"
-    out_metrics = Path(args.out_metrics) if getattr(args, "out_metrics", None) else run_dir / "metrics.json"
-    write_json(out_events, events)
-    write_json(out_metrics, metrics)
-    if getattr(args, "write_metadata", False):
+    if extra_metrics:
+        metrics.update(extra_metrics)
+    write_json(out_events or run_dir / "events.json", events)
+    write_json(out_metrics or run_dir / "metrics.json", metrics)
+    if environment:
+        write_json(run_dir / "environment.json", environment)
+    if write_metadata:
         existing = read_metadata_base(run_dir)
+        if metadata:
+            existing.update(metadata)
         existing.update({k: v for k, v in metrics.items() if k not in {"schema_version", "source"}})
-        existing["trace_source"] = getattr(args, "source", "generic")
+        existing["trace_source"] = source
         write_json(run_dir / "metadata.json", existing)
+    return events, metrics
+
+
+def import_trace(args: argparse.Namespace) -> int:
+    trace = Path(args.trace)
+    run_dir = Path(args.run_dir)
+    trace_text = trace.read_text(encoding="utf-8", errors="replace")
+    write_trace_artifacts(
+        run_dir,
+        trace_text,
+        source=getattr(args, "source", "generic"),
+        write_metadata=getattr(args, "write_metadata", False),
+        out_events=Path(args.out_events) if getattr(args, "out_events", None) else None,
+        out_metrics=Path(args.out_metrics) if getattr(args, "out_metrics", None) else None,
+        write_raw_trace=False,
+    )
     return 0
 
 
@@ -1446,25 +1593,24 @@ def run_codex(args: argparse.Namespace) -> int:
             elapsed_ms = int((time.time() - started) * 1000)
             trace_text = proc.stdout if proc.stdout.strip() else ""
             if trace_text:
-                (base / "trace.jsonl").write_text(trace_text, encoding="utf-8")
-                records, parse_errors = parse_trace_jsonl_text(trace_text)
-                events, metrics = normalize_trace_records(records, source="codex")
-                if parse_errors:
-                    metrics["parse_errors"] = parse_errors[:20]
-                    metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
+                events, metrics = write_trace_artifacts(
+                    base,
+                    trace_text,
+                    source="codex",
+                    metadata={"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else ""},
+                    extra_metrics={"elapsed_ms": elapsed_ms, "returncode": proc.returncode},
+                    environment={"runner": "codex", "command": cmd, "cwd": task.get("repo_root")},
+                    write_metadata=True,
+                )
             else:
-                events, metrics = {"schema_version": 1, "source": "codex", "events": []}, {"schema_version": 1, "source": "codex"}
-            metrics.setdefault("elapsed_ms", elapsed_ms)
-            metrics["returncode"] = proc.returncode
-            write_json(base / "events.json", events)
-            write_json(base / "metrics.json", metrics)
+                events, metrics = {"schema_version": 1, "source": "codex", "events": []}, {"schema_version": 1, "source": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode}
+                write_json(base / "events.json", events)
+                write_json(base / "metrics.json", metrics)
+                write_json(base / "metadata.json", {"provider": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode, "stderr": proc.stderr[:4000] if proc.stderr else "", "trace_source": "codex"})
             answer = final_answer_from_events(events) or proc.stdout.strip()
             if proc.returncode != 0:
                 answer = f"[CODEX FAILURE: returncode={proc.returncode}]\n\n{answer}\n\nstderr:\n{proc.stderr[:4000]}"
             (base / "output.md").write_text(answer or "[CODEX FAILURE: no output produced]\n", encoding="utf-8")
-            meta = dict(metrics)
-            meta.update({"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else ""})
-            write_json(base / "metadata.json", meta)
         except subprocess.TimeoutExpired as exc:
             elapsed_ms = int((time.time() - started) * 1000)
             (base / "output.md").write_text(f"[CODEX FAILURE: timed out after {timeout}s]\n", encoding="utf-8")
@@ -1748,6 +1894,8 @@ def grade_case_variant(
     text = text or ""
     judge_results = judge_results or {}
     for assertion in case.get("assertions", []):
+        if not assertion_applies_to_variant(assertion, variant):
+            continue
         atype = assertion.get("type")
         if atype in QUALITATIVE_ASSERTIONS:
             jid = judge_task_id(case["id"], variant, run_number, assertion)
