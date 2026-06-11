@@ -1,5 +1,8 @@
 # Skill Eval Harness
 
+[![CI](https://github.com/adewale/skill-eval-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/adewale/skill-eval-harness/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Skill Eval Harness is a Python CLI for testing whether an Agent Skill changes observable output. It reads `evals/shared-benchmark.json`, emits answer-key-safe task rows, grades files under `eval-runs/`, and writes benchmark reports you can diff across variants.
 
 The main question is narrow: **when the same case runs with and without the skill, what changed, what passed, and did the eval itself leak the answer?**
@@ -21,6 +24,17 @@ The main question is narrow: **when the same case runs with and without the skil
 - Interop: Anthropic-style exports, static HTML review pages, Pi trigger evals, and Jetty runbook-mode import/export.
 - Judge plumbing: `judge`/`rubric` assertions can be exported or run through a user-supplied `--judge-cmd`; the harness does not choose a model for you.
 
+## Contents
+
+- [Quick start](#quick-start)
+- [Installation](#installation)
+- [Manifest format](#manifest-format)
+- [Assertions](#assertions)
+- [Run output contract](#run-output-contract)
+- [Commands](#commands)
+- [Jetty adapter](#jetty-adapter)
+- [Contributing](#contributing)
+
 ## Quick start
 
 > Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Install from GitHub first:
@@ -29,31 +43,43 @@ The main question is narrow: **when the same case runs with and without the skil
 > uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.3.0
 > ```
 
+Run these from a skill repo that has `evals/shared-benchmark.json`:
+
 ```bash
-# 1. Validate a skill manifest
+# 1. Check manifest shape and fixture paths.
 skill-benchmark validate evals/shared-benchmark.json
 
-# 2. Prepare paired tasks for an agent runner
+# 2. Emit answer-key-safe task rows for a runner.
 skill-benchmark prepare evals/shared-benchmark.json \
   --split tune \
   --runs-per-variant 3 \
   --out /tmp/tasks.jsonl
 
-# 3. Run each JSONL task with your agent runner and save outputs as:
-# runs/<case_id>/<variant>/run-<n>/output.md
-# runs/<case_id>/<variant>/run-<n>/metadata.json
+# 3. Run each task with your agent runner and save:
+# eval-runs/latest/<case_id>/<variant>/run-<n>/output.md
+# eval-runs/latest/<case_id>/<variant>/run-<n>/metadata.json
 
-# 4. Grade and benchmark saved outputs
+# 4. Grade saved outputs. Add --allow-scripts only if you trust repo-owned oracles.
 skill-benchmark benchmark evals/shared-benchmark.json \
   --runs eval-runs/latest \
   --split tune \
+  --allow-scripts \
   --out benchmark.json
 
-# 5. Open a static review page
+# 5. Open a static review page.
 skill-benchmark render-viewer \
   --benchmark benchmark.json \
   --runs eval-runs/latest \
   --out review.html
+```
+
+Expected landmarks:
+
+```text
+validate  -> OK: <skill-name> — <case-count> cases, <ablation-count> ablations
+prepare   -> /tmp/tasks.jsonl, one JSON object per case/variant/run
+benchmark -> benchmark.json with summary, results, and case_flags
+viewer    -> review.html with assertion evidence and output previews
 ```
 
 `benchmark.json` records one row per case/variant/run, plus aggregate pass rates, timing/token summaries, and flags for saturated, no-lift, flaky, or with-skill-failed cases.
@@ -71,6 +97,13 @@ skill-pi-trigger-eval --help
 uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.3.0 skill-benchmark --help
 ```
 
+The installed commands are:
+
+| Command | What it does |
+|---|---|
+| `skill-benchmark` | Validate manifests, prepare tasks, grade outputs, compare variants, run judges, and import/export runner formats. |
+| `skill-pi-trigger-eval` | Runs Pi without forced `--skill` and checks whether the model loads the skill from stream events. |
+
 ### Local development
 
 ```bash
@@ -85,6 +118,8 @@ skill-benchmark --help
 | File | Use it for |
 |---|---|
 | `README.md` | Manifest shape, run layout, and command contracts. |
+| `CHANGELOG.md` | Release history and unreleased repo-surface changes. |
+| `CONTRIBUTING.md` | Local setup, validation commands, and eval-safety rules. |
 | `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
 | `TODO.md` | Remaining Jetty work: streaming, concurrency, live API validation, materialized ablations. |
@@ -426,6 +461,17 @@ Ablation task variants are named `ablation:<id>`. Trigger cases are skipped for 
 - **Other runners**: use `prepare` JSONL as the import format and write results back to the run output contract.
 - **Jetty**: use `export-jetty`, `run-jetty`, and `import-jetty-results` for REST runbook-mode execution. Live response shapes still need token-backed smoke validation before treating Jetty runs as production evidence.
 
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, validation commands, and eval-safety rules. The short version:
+
+```bash
+python3 -m py_compile *.py examples/adewale-workspace/*.py
+python3 -m unittest discover tests -v
+```
+
+For manifest or grading changes, add or update `tests/test_skill_benchmark.py`. For docs-only changes, still run the same commands so CLI examples stay tied to current behavior.
+
 ## Non-goals
 
 - Local grading does not call a model. Model execution happens outside the harness, except for explicit runner commands such as `run-jetty`.
@@ -438,9 +484,15 @@ Ablation task variants are named `ablation:<id>`. Trigger cases are skipped for 
 ```text
 skill-eval-harness/
 ├── README.md
+├── CHANGELOG.md
+├── CONTRIBUTING.md
 ├── pyproject.toml
 ├── skill_benchmark.py
 ├── run_pi_trigger_eval.py
+├── .github/
+│   ├── PULL_REQUEST_TEMPLATE.md
+│   ├── ISSUE_TEMPLATE/
+│   └── workflows/ci.yml
 ├── examples/
 │   └── adewale-workspace/
 │       ├── all-manifests.txt
@@ -454,7 +506,7 @@ skill-eval-harness/
 ## Development
 
 ```bash
-python3 -m py_compile *.py
+python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```
 
@@ -468,5 +520,7 @@ This README was written against:
 - `run_pi_trigger_eval.py` trigger runner
 - `pyproject.toml` package metadata
 - `tests/test_skill_benchmark.py` behavior coverage
+- `CHANGELOG.md`, `CONTRIBUTING.md`, and `.github/` contribution/CI surfaces
 - `anti-slop-writing/skills/anti-slop-writing/SKILL.md` for this prose pass
 - the `good-readme` skill guidance from `https://www.skills.sh/adewale/good-readme/good-readme`
+- the `good-repo` skill guidance from `good-repo/skills/good-repo/references/quality-checklist.md`

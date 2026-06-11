@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest a harness feature or eval workflow improvement
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What eval workflow is hard or brittle today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What command, manifest field, assertion type, or report shape should change?
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: Include a small manifest/assertion/result example if you have one.
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety / compatibility notes
+      description: Does this affect hidden prompts, answer keys, script execution, live model calls, or existing manifests?
