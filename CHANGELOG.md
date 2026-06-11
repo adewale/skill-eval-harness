@@ -4,6 +4,10 @@ All notable public changes are listed here. Release tags are the source of truth
 
 ## Unreleased
 
+- Nothing yet.
+
+## v0.4.0 — 2026-06-11
+
 - Add GitHub Actions CI for Python 3.10, 3.11, and 3.12.
 - Add contributor guidance, PR template, and issue forms.
 - Tighten README quick start with expected output landmarks and repo-surface links.
