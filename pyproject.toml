@@ -4,8 +4,26 @@ version = "0.4.1"
 description = "Repo-agnostic Agent Skill evaluation harness with paired variants, holdout splits, repeated-run stats, script assertions, judge command backends, Anthropic-compatible exports, Jetty adapter support, and static review output."
 requires-python = ">=3.10"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "Adewale"}]
+keywords = ["agent-skills", "benchmark", "evals", "codex", "jetty", "pi"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/adewale/skill-eval-harness"
+Repository = "https://github.com/adewale/skill-eval-harness"
+Issues = "https://github.com/adewale/skill-eval-harness/issues"
+Changelog = "https://github.com/adewale/skill-eval-harness/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/adewale/skill-eval-harness#readme"
 
 [project.scripts]
 skill-benchmark = "skill_benchmark:main"

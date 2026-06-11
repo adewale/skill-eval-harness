@@ -6,6 +6,7 @@ All notable public changes are listed here. Release tags are the source of truth
 
 - Tighten README and trace-aware spec language after the v0.4.1 runner release; no behavior changes.
 - Add trace-runner lessons on no-skill workspace isolation, trace-backed process assertions, runner-shape normalization, and post-release spec tense.
+- Add a `good-repo` effectiveness audit, package keywords/classifiers, and project URLs.
 
 ## v0.4.1 — 2026-06-11
 

@@ -123,6 +123,7 @@ skill-benchmark --help
 | `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
 | `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
+| `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
 | `TODO.md` | Remaining Jetty work: streaming/concurrency, live API validation, materialized ablations, judge export, and per-variant overrides. |
 | `examples/adewale-workspace/` | Adewale-specific runners for Pi smoke, trigger, ablation, and aggregate reports. |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
@@ -611,6 +612,7 @@ This README was written against:
 - `skill_benchmark.py` CLI and assertion implementation
 - `run_pi_trigger_eval.py` trigger runner
 - `pyproject.toml` package metadata
+- `docs/repo-effectiveness-audit.md` for the current `good-repo` audit
 - `tests/test_skill_benchmark.py` behavior coverage
 - `CHANGELOG.md`, `CONTRIBUTING.md`, and `.github/` contribution/CI surfaces
 - `anti-slop-writing/skills/anti-slop-writing/SKILL.md` for the v0.4.1 docs cleanup and consistency pass
