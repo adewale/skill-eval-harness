@@ -1,0 +1,37 @@
+name: Bug report
+description: Report a harness bug, wrong grading result, or broken CLI command
+title: "bug: "
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What command did you run, and what result did you get?
+      placeholder: |
+        skill-benchmark validate evals/shared-benchmark.json
+        FAIL: ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should the harness have done instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction files or snippet
+      description: Include the smallest manifest/run-output snippet that reproduces the issue. Do not paste private holdout prompts or answer keys.
+  - type: input
+    id: version
+    attributes:
+      label: Harness version
+      placeholder: v0.3.0 or commit SHA
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, OS, runner, and whether scripts/JETTY/PI were involved.
