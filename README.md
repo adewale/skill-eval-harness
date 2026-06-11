@@ -1,24 +1,25 @@
 # Skill Eval Harness
 
-Skill Eval Harness is a Python CLI for evaluating Agent Skills with paired variants, hidden splits, repeated runs, deterministic grading, qualitative judge handoff, and benchmark exports. It prepares tasks for any agent runner, normalizes outputs into a simple run directory, then grades and aggregates the results.
+Skill Eval Harness is a Python CLI for testing whether an Agent Skill changes observable output. It reads `evals/shared-benchmark.json`, emits answer-key-safe task rows, grades files under `eval-runs/`, and writes benchmark reports you can diff across variants.
 
-Use it when you want to answer: **does this skill improve the agent, where does it fail, and is the eval itself discriminating?**
+The main question is narrow: **when the same case runs with and without the skill, what changed, what passed, and did the eval itself leak the answer?**
 
-## What it does
+## Core loop
 
-- **Paired variants** — compare `with_skill` vs `without_skill`, plus optional `old_skill` and ablation variants.
-- **Anti-overfitting splits** — keep `tune`, `holdout`, and `holdback` cases separate.
-- **Answer-key-safe preparation** — generation tasks omit expected behavior/rubrics unless explicitly requested.
-- **Repeated-run statistics** — measure mean, stddev, min, max, median, time, and token usage.
-- **Objective grading** — run string, regex, file, JSON, and opt-in script assertions locally.
-- **Prompt/assertion leakage lint** — warn when literal `contains*` assertion values appear in prompts.
-- **Qualitative review handoff** — emit judge tasks, run an opt-in `--judge-cmd` backend, and merge judge results.
-- **Blind comparison** — generate A/B comparison tasks and unblind the aggregate winner.
-- **Compatibility exports** — write Anthropic-style `grading.json` and `benchmark.json` files.
-- **Review UI** — render a static HTML benchmark viewer.
-- **Trigger checks** — run Pi skill-trigger smoke evals without forcing `--skill`.
-- **Manifest audits** — detect missing eval categories, hidden split gaps, missing ablations, trigger/no-trigger gaps, saturated cases, non-discriminating assertions, and fixture recommendations.
-- **Jetty adapter** — export runbook-mode Jetty payloads, run them via Jetty REST, and import trajectory artifacts back into the local run layout.
+1. **Describe cases** in `evals/shared-benchmark.json`: prompt, split, fixture files, variants, assertions, and ablations.
+2. **Prepare tasks** with `skill-benchmark prepare`; generation rows omit `expected_behavior` and judge rubrics unless you explicitly request them.
+3. **Run tasks** with Pi, Claude Code, Jetty, or another runner; each run writes `output.md` and optional `metadata.json`.
+4. **Grade outputs** with deterministic assertions: string, regex, file, JSON field, and opt-in `script` oracles.
+5. **Inspect the report** for pass rates, flaky repeated runs, no-lift cases, saturated assertions, judge tasks, and trigger/no-trigger results.
+
+## What the CLI owns
+
+- Variant pairing: `with_skill`, `without_skill`, optional `old_skill`, and `ablation:<id>`.
+- Split discipline: `tune`, `holdout`, and `holdback` stay separate.
+- Local grading: deterministic assertions run without model calls.
+- Eval hygiene: leakage lint, manifest audit, trigger checks, repeated-run stats, and fixture recommendations.
+- Interop: Anthropic-style exports, static HTML review pages, Pi trigger evals, and Jetty runbook-mode import/export.
+- Judge plumbing: `judge`/`rubric` assertions can be exported or run through a user-supplied `--judge-cmd`; the harness does not choose a model for you.
 
 ## Quick start
 
@@ -55,7 +56,7 @@ skill-benchmark render-viewer \
   --out review.html
 ```
 
-`benchmark.json` reports pass rates, repeated-run variance, timing/token summaries, and flags for saturated, no-lift, flaky, or with-skill-failed cases.
+`benchmark.json` records one row per case/variant/run, plus aggregate pass rates, timing/token summaries, and flags for saturated, no-lift, flaky, or with-skill-failed cases.
 
 ## Installation
 
@@ -78,6 +79,17 @@ cd skill-eval-harness
 uv tool install --editable .
 skill-benchmark --help
 ```
+
+## Documentation map
+
+| File | Use it for |
+|---|---|
+| `README.md` | Manifest shape, run layout, and command contracts. |
+| `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work. |
+| `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
+| `TODO.md` | Remaining Jetty work: streaming, concurrency, live API validation, materialized ablations. |
+| `examples/adewale-workspace/` | Adewale-specific runners for Pi smoke, trigger, ablation, and aggregate reports. |
+| `tests/test_skill_benchmark.py` | Executable examples for repeated runs, leakage lint, script assertions, judge commands, Jetty export/import, and trigger detection. |
 
 ## Manifest format
 
@@ -153,7 +165,7 @@ Objective assertion types:
 | `json_field_equals` | A JSON field equals an expected value. |
 | `script` | Opt-in deterministic oracle command against the output directory. |
 
-Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `benchmark`, `aggregate`, or `export-anthropic`:
+Use `script` when a keyword check is too weak for the property you care about. The command sees the candidate run directory, so it can inspect `output.md`, generated files under `outputs/`, or metadata. Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `benchmark`, `aggregate`, or `export-anthropic`:
 
 ```json
 {
@@ -165,7 +177,7 @@ Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `ben
 }
 ```
 
-`command` runs with cwd set to the manifest directory. `{output_dir}` is replaced with the absolute run directory.
+`command` runs with cwd set to the manifest directory. `{output_dir}` is replaced with the absolute run directory. The assertion passes when the command exits with `pass_exit_code` (default `0`); stdout and stderr are stored as evidence.
 
 Qualitative assertion types:
 
@@ -219,6 +231,14 @@ skill-benchmark validate ../repo/evals/shared-benchmark.json --strict-holdback
 skill-benchmark validate ../repo/evals/shared-benchmark.json --strict-leakage
 ```
 
+`validate` checks manifest shape, fixture paths, regex syntax, script oracle paths, and hidden-prompt refs. It also warns when a `contains*` assertion value appears literally in the prompt:
+
+```text
+WARN pos-ui-no-screenshot: assertion 'detect-ui-no-screenshot' value 'screenshot' appears in prompt (leakage; case may saturate)
+```
+
+That warning means a weak answer can pass by echoing the task. Use `--strict-leakage` only after you have replaced noisy keyword checks with scoped regexes, fixture-backed checks, `script` oracles, or judge assertions.
+
 ### Prepare tasks
 
 ```bash
@@ -231,6 +251,8 @@ Use `--include-answer-key` only for judge/debug tasks, never for generation runs
 
 ### Grade
 
+`grade` produces per-run grading rows and can emit pending judge tasks:
+
 ```bash
 skill-benchmark grade ../repo/evals/shared-benchmark.json \
   --runs ../repo/eval-runs/latest \
@@ -238,16 +260,7 @@ skill-benchmark grade ../repo/evals/shared-benchmark.json \
   --judge-tasks judge-tasks.jsonl
 ```
 
-Execute repo-owned script assertions explicitly:
-
-```bash
-skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
-  --runs ../repo/eval-runs/latest \
-  --allow-scripts \
-  --out benchmark.json
-```
-
-Write Anthropic-compatible per-run grading files:
+Write Anthropic-compatible `grading.json` files into each run directory:
 
 ```bash
 skill-benchmark grade ../repo/evals/shared-benchmark.json \
@@ -257,16 +270,19 @@ skill-benchmark grade ../repo/evals/shared-benchmark.json \
 
 ### Benchmark
 
+`benchmark` aggregates graded rows into variant summaries and case flags. Add `--allow-scripts` only when you trust the repo-owned oracle commands in the manifest.
+
 ```bash
 skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --runs ../repo/eval-runs/latest \
+  --allow-scripts \
   --judge-results judge-results.jsonl \
   --out benchmark.json
 ```
 
 ### Judge command backend
 
-Run deferred `judge`/`rubric` assertions with any command that reads a prompt from stdin and emits JSON on stdout:
+Run deferred `judge`/`rubric` assertions with a command that reads one grading prompt from stdin and emits JSON on stdout. The prompt contains the original case prompt, `expected_behavior`, `review_rubric`, the assertion, and the saved candidate output.
 
 ```bash
 skill-benchmark judge ../repo/evals/shared-benchmark.json \
@@ -281,7 +297,7 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --out benchmark.json
 ```
 
-The judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting.
+The judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting. `--transcripts` saves the exact prompt, stdout, stderr, and parsed result for each judge task.
 
 ### Audit manifest quality
 
@@ -357,7 +373,7 @@ This creates a temporary `PI_CODING_AGENT_DIR`, copies the skill under `skills/`
 
 ### Jetty adapter
 
-Jetty support is an optional execution adapter. The harness still owns manifests and grading; Jetty runs the task and returns trajectory artifacts.
+Jetty support is optional. The harness exports runbook-mode chat-completion payloads, Jetty executes them, and `import-jetty-results` copies `output.md`, artifacts, and metadata back into the normal run layout.
 
 ```bash
 # Export runbook-mode Jetty chat-completion payloads. No network calls.
@@ -388,7 +404,7 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --out jetty-benchmark.json
 ```
 
-Defaults follow Jetty docs and `jettyio/jettyio-skills`: `claude-code`, `claude-sonnet-4-6`, `model_provider=anthropic`, `snapshot=python312-uv`, runbook content in the system message, runtime values in `jetty.template_variables`, and uploaded files in `jetty.file_paths`. Use `JETTY_BASE_URL` to override `https://flows-api.jetty.io`.
+Defaults follow Jetty docs and `jettyio/jettyio-skills`: `claude-code`, `claude-sonnet-4-6`, `model_provider=anthropic`, and `snapshot=python312-uv`. The runbook is the system message. Runtime values go in `jetty.template_variables`. Uploaded files go in `jetty.file_paths`. Use `JETTY_BASE_URL` to override `https://flows-api.jetty.io`.
 
 ## Ablations
 
@@ -408,14 +424,14 @@ Ablation task variants are named `ablation:<id>`. Trigger cases are skipped for 
 - **Anthropic skill-creator**: use `grade --write-grading-files` and `export-anthropic` for compatible `grading.json`/`benchmark.json` shapes.
 - **Pi**: use `examples/adewale-workspace/run_pi_smoke.py` for the Adewale multi-repo smoke workflow and `skill-pi-trigger-eval` for autonomous trigger checks.
 - **Other runners**: use `prepare` JSONL as the import format and write results back to the run output contract.
-- **Jetty**: use `export-jetty`, `run-jetty`, and `import-jetty-results` for REST runbook-mode execution. Live API response shapes still need token-backed smoke validation before claiming broad Jetty production coverage.
+- **Jetty**: use `export-jetty`, `run-jetty`, and `import-jetty-results` for REST runbook-mode execution. Live response shapes still need token-backed smoke validation before treating Jetty runs as production evidence.
 
 ## Non-goals
 
-- Local grading does not call a model. Execution stays runner-agnostic except for explicit adapter commands such as `run-jetty`.
-- It does not replace human/LLM qualitative review; it emits judge tasks and merges results.
-- It does not make hidden prompts safe if you pass `--include-answer-key` to generation jobs.
-- It does not guarantee a skill triggers autonomously unless you run trigger evals.
+- Local grading does not call a model. Model execution happens outside the harness, except for explicit runner commands such as `run-jetty`.
+- The harness does not decide qualitative truth by itself; it emits judge prompts, runs an opt-in judge command, and merges the returned JSON.
+- Hidden prompts are not protected if you pass `--include-answer-key` to generation jobs.
+- A passing answer benchmark does not prove autonomous skill loading; run `skill-pi-trigger-eval` for that.
 
 ## Repository layout
 
@@ -442,7 +458,7 @@ python3 -m py_compile *.py
 python3 -m unittest discover tests -v
 ```
 
-The test suite covers repeated runs, artifact outputs, judge-result merging, answer-key omission, Anthropic export shape, Jetty export shape, mocked Jetty execution, and Jetty import round trips.
+The test suite covers repeated runs, artifact outputs, answer-key omission, leakage lint, script assertions, judge-command parsing, Anthropic export shape, Jetty export shape, mocked Jetty execution, and Jetty import round trips.
 
 ## Source checked
 
@@ -452,4 +468,5 @@ This README was written against:
 - `run_pi_trigger_eval.py` trigger runner
 - `pyproject.toml` package metadata
 - `tests/test_skill_benchmark.py` behavior coverage
+- `anti-slop-writing/skills/anti-slop-writing/SKILL.md` for this prose pass
 - the `good-readme` skill guidance from `https://www.skills.sh/adewale/good-readme/good-readme`
