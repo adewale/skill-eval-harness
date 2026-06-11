@@ -122,6 +122,7 @@ skill-benchmark --help
 | `CONTRIBUTING.md` | Local setup, validation commands, and eval-safety rules. |
 | `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
+| `docs/trace-aware-eval-spec.md` | Proposal for trace artifacts, process/efficiency assertions, Codex adapter support, richer reporting, and audit upgrades. |
 | `TODO.md` | Remaining Jetty work: streaming, concurrency, live API validation, materialized ablations. |
 | `examples/adewale-workspace/` | Adewale-specific runners for Pi smoke, trigger, ablation, and aggregate reports. |
 | `tests/test_skill_benchmark.py` | Executable examples for repeated runs, leakage lint, script assertions, judge commands, Jetty export/import, and trigger detection. |
