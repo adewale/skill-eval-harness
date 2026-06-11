@@ -40,7 +40,7 @@ The main question is narrow: **when the same case runs with and without the skil
 > Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Install from GitHub first:
 >
 > ```bash
-> uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.4.0
+> uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.4.1
 > ```
 
 Run these from a skill repo that has `evals/shared-benchmark.json`:
@@ -89,12 +89,12 @@ viewer    -> review.html with assertion evidence and output previews
 ### From GitHub
 
 ```bash
-uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.4.0
+uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.4.1
 skill-benchmark --help
 skill-pi-trigger-eval --help
 
 # One-shot without installing globally:
-uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.4.0 skill-benchmark --help
+uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.4.1 skill-benchmark --help
 ```
 
 The installed commands are:
@@ -138,7 +138,7 @@ Each skill repo owns an `evals/shared-benchmark.json` manifest. Add a `harness` 
   "harness": {
     "name": "skill-eval-harness",
     "url": "https://github.com/adewale/skill-eval-harness",
-    "version": ">=0.4.0"
+    "version": ">=0.4.1"
   },
   "skill_paths": ["skills/good-pr/SKILL.md"],
   "variants": ["with_skill", "without_skill"],
@@ -225,6 +225,15 @@ Use `script` when a keyword check is too weak for the property you care about. T
 `command` runs with cwd set to the manifest directory. `{output_dir}` is replaced with the absolute run directory. The assertion passes when the command exits with `pass_exit_code` (default `0`); stdout and stderr are stored as evidence.
 
 Trace/process/efficiency assertions are optional and fail closed when declared evidence is missing. For example, `command_not_ran` cannot pass without `events.json`, and `total_tokens_le` cannot pass without token telemetry.
+
+Assertions can be scoped to variants when the expected process differs by arm:
+
+```json
+{"name":"with-skill-loaded","type":"skill_invoked","expected":true,"variants":["with_skill"]}
+{"name":"without-skill-clean","type":"skill_invoked","expected":false,"variants":["without_skill"]}
+```
+
+Use this for process checks such as `skill_invoked`; otherwise a with-skill requirement would incorrectly penalize the no-skill baseline.
 
 Qualitative assertion types:
 
@@ -326,7 +335,35 @@ skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out t
 skill-benchmark run-codex --tasks tasks.jsonl --runs ../repo/eval-runs/codex-tune
 ```
 
-Override `--codex-cmd` for local wrappers or tests.
+Override `--codex-cmd` for local wrappers or tests. A grounded smoke command is:
+
+```bash
+skill-benchmark run-codex \
+  --tasks tasks.jsonl \
+  --runs ../repo/eval-runs/codex-trace \
+  --codex-cmd 'codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral'
+```
+
+### Pi trace runners
+
+The Adewale Pi smoke example writes the trace-aware run layout directly:
+
+```bash
+python3 examples/adewale-workspace/run_pi_smoke.py \
+  --run-name trace-smoke \
+  --selection /tmp/selection.json
+```
+
+It runs from an isolated temporary workspace. `with_skill` receives copied skill files and fixtures; `without_skill` receives fixtures only and `--no-skills`, preventing grep/find/read from discovering the source repo's `skills/*/SKILL.md` or public eval manifests.
+
+`skill-pi-trigger-eval` can also write per-query trace artifacts:
+
+```bash
+skill-pi-trigger-eval ../repo/evals/shared-benchmark.json \
+  --eval-set trigger-queries.json \
+  --out trigger-results.json \
+  --trace-runs trigger-traces
+```
 
 ### Grade
 

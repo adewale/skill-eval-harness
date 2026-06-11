@@ -1,6 +1,6 @@
 # Trace-Aware Skill Eval Spec
 
-Status: phase-1 implementation in progress. The first code slice implements trace import, a Codex JSONL runner adapter, process/efficiency assertions, telemetry-aware benchmark summaries, paired deltas/normalized gain, taxonomy slice summaries, taxonomy audit warnings, and skill-profile reporting. Remaining sections describe follow-on work. This plan integrates the subset of ideas from OpenAI's `eval-skills` article, SkillsBench, and Anthropic's `skill-creator` that fit the existing harness model.
+Status: phase-2 implementation in progress. The first code slice implemented trace import, a Codex JSONL runner adapter, process/efficiency assertions, telemetry-aware benchmark summaries, paired deltas/normalized gain, taxonomy slice summaries, taxonomy audit warnings, and skill-profile reporting. The next grounded slice adds variant-scoped assertions, live Pi/Codex event-shape support, Jetty trajectory trace import, isolated Pi smoke workspaces, and optional Pi trigger trace artifacts. Remaining sections describe follow-on work. This plan integrates the subset of ideas from OpenAI's `eval-skills` article, SkillsBench, and Anthropic's `skill-creator` that fit the existing harness model.
 
 ## Design principle
 
@@ -216,7 +216,7 @@ Process and efficiency assertions are objective assertions, but they grade `even
 {"name": "no-command-loop", "type": "no_repeated_command_loop", "max_repeats": 2}
 ```
 
-Process assertions fail when required trace evidence is missing. That fail-closed behavior prevents a runner without trace support from silently satisfying a process requirement.
+Process assertions fail when required trace evidence is missing. That fail-closed behavior prevents a runner without trace support from silently satisfying a process requirement. Use variant filters for asymmetric checks, for example `skill_invoked=true` on `with_skill` and `skill_invoked=false` on `without_skill`.
 
 ### Efficiency assertions
 
@@ -275,8 +275,8 @@ Expected behavior:
 
 ### Existing runners
 
-- **Pi trigger eval** already uses stream events for skill-load evidence; adapt that event parsing into normalized `skill_load` events where possible.
-- **Jetty** already imports trajectories and metadata; add `trace.jsonl`/`events.json` emission after live response shapes are validated.
+- **Pi smoke and trigger evals** use stream events for skill-load evidence and now write normalized `trace.jsonl`, `events.json`, and `metrics.json` artifacts where enabled. Pi smoke runs execute from isolated temporary workspaces so `without_skill` cannot discover source-repo skill files by grep/find/read.
+- **Jetty** imports trajectories and metadata into `trace.jsonl`, `events.json`, and `metrics.json` using documented/mocked trajectory shapes; live token validation is still needed for production response shape drift.
 - **OpenCode/Gemini CLI** can be added later if they provide stable machine-readable event streams.
 
 ## Report additions

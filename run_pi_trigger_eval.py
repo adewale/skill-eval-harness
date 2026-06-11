@@ -22,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from skill_benchmark import write_trace_artifacts
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -110,7 +112,25 @@ def _text(value: Any) -> str:
     return str(value)
 
 
-def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int, model: str | None) -> dict[str, Any]:
+def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, Any]) -> None:
+    write_trace_artifacts(
+        run_dir,
+        stdout,
+        source="pi",
+        metadata={k: v for k, v in result.items() if k not in {"stderr"}},
+        extra_metrics={
+            "elapsed_ms": result.get("elapsed_ms"),
+            "returncode": result.get("returncode"),
+            "timed_out": result.get("timed_out"),
+            "skill_invoked": result.get("triggered"),
+            "skill_invocation_evidence": result.get("evidence", []),
+        },
+        environment={"runner": "pi", "mode": "json", "trigger_eval": True},
+        write_metadata=True,
+    )
+
+
+def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int, model: str | None, trace_dir: Path | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     with tempfile.TemporaryDirectory(prefix="pi-trigger-") as td:
         config_dir = Path(td)
@@ -141,7 +161,7 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             returncode = 124
         elapsed_ms = int((time.time() - start) * 1000)
         triggered, evidence = detect_trigger(stdout, skill_name_from_manifest(manifest), copied)
-        return {
+        result = {
             "query": query,
             "should_trigger": should_trigger,
             "triggered": triggered,
@@ -152,6 +172,9 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             "evidence": evidence,
             "stderr": stderr[-1000:] if stderr else "",
         }
+        if trace_dir is not None:
+            write_trigger_trace_artifacts(trace_dir, stdout, result)
+        return result
 
 
 def trigger_query_from_case(case: dict[str, Any]) -> str:
@@ -188,6 +211,7 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--model")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--trace-runs", help="optional directory for per-query trace.jsonl/events.json/metrics.json artifacts")
     args = ap.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -201,9 +225,13 @@ def main() -> int:
     futures = []
     results = []
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for row in rows:
-            for _ in range(args.runs_per_query):
-                futures.append(ex.submit(run_query, manifest_path, str(row["query"]), bool(row["should_trigger"]), args.timeout, args.model))
+        for i, row in enumerate(rows, 1):
+            for run_number in range(1, args.runs_per_query + 1):
+                trace_dir = None
+                if args.trace_runs:
+                    label = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(row.get("query", f"query-{i}")))[:80].strip("-") or f"query-{i}"
+                    trace_dir = Path(args.trace_runs) / f"query-{i:03d}-{label}" / f"run-{run_number}"
+                futures.append(ex.submit(run_query, manifest_path, str(row["query"]), bool(row["should_trigger"]), args.timeout, args.model, trace_dir))
         for fut in as_completed(futures):
             results.append(fut.result())
     passed = sum(1 for r in results if r["pass"])

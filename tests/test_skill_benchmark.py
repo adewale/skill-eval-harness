@@ -17,6 +17,10 @@ TRIGGER_SPEC = importlib.util.spec_from_file_location("run_pi_trigger_eval", ROO
 tr = importlib.util.module_from_spec(TRIGGER_SPEC)
 assert TRIGGER_SPEC.loader is not None
 TRIGGER_SPEC.loader.exec_module(tr)
+SMOKE_SPEC = importlib.util.spec_from_file_location("run_pi_smoke", ROOT / "examples" / "adewale-workspace" / "run_pi_smoke.py")
+smoke = importlib.util.module_from_spec(SMOKE_SPEC)
+assert SMOKE_SPEC.loader is not None
+SMOKE_SPEC.loader.exec_module(smoke)
 
 
 class SkillBenchmarkTests(unittest.TestCase):
@@ -258,6 +262,33 @@ class SkillBenchmarkTests(unittest.TestCase):
             without_task_json = next(f for f in without_row["upload_plan"]["files"] if f["role"] == "task")["content"]
             self.assertEqual(json.loads(without_task_json)["skill_files"], [])
 
+    def test_pi_message_end_trace_normalizes_usage_and_skill_load(self):
+        records = [
+            {"type": "tool_use", "tool_input": {"path": "/tmp/demo/skill/SKILL.md"}},
+            {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "alpha beta"}], "usage": {"input": 10, "output": 5, "totalTokens": 15}}},
+        ]
+        events, metrics = sb.normalize_trace_records(records, source="pi")
+        self.assertEqual([e["type"] for e in events["events"]], ["skill_load", "message"])
+        self.assertEqual(metrics["total_tokens"], 15)
+        self.assertTrue(metrics["skill_invoked"])
+
+    def test_actual_codex_jsonl_shape_extracts_answer_and_tokens(self):
+        records = [
+            {"type": "thread.started", "thread_id": "thread_1"},
+            {"type": "turn.started"},
+            {"type": "item.started", "item": {"id": "item_1", "type": "command_execution", "command": "/bin/zsh -lc \"sed -n '1,80p' skills/good-pr/SKILL.md\"", "status": "in_progress"}},
+            {"type": "item.completed", "item": {"id": "item_1", "type": "command_execution", "command": "/bin/zsh -lc \"sed -n '1,80p' skills/good-pr/SKILL.md\"", "aggregated_output": "---", "exit_code": 0, "status": "completed"}},
+            {"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "codex-trace-ok"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 9, "reasoning_output_tokens": 0}},
+        ]
+        events, metrics = sb.normalize_trace_records(records, source="codex")
+        self.assertEqual(sb.final_answer_from_events(events), "codex-trace-ok")
+        self.assertEqual(metrics["commands"], 1)
+        self.assertTrue(metrics["skill_invoked"])
+        self.assertEqual(metrics["input_tokens"], 100)
+        self.assertEqual(metrics["output_tokens"], 9)
+        self.assertEqual(metrics["total_tokens"], 109)
+
     def test_import_jetty_results_roundtrip_can_be_benchmarked(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -269,7 +300,14 @@ class SkillBenchmarkTests(unittest.TestCase):
                 "status": "completed",
                 "trajectory_id": "traj_1",
                 "jetty": {"collection": "skill-evals", "task": "demo-case-1-with-skill-1", "agent": "claude-code", "model": "claude-sonnet-4-6", "model_provider": "anthropic", "snapshot": "python312-uv"},
-                "trajectory": {"usage": {"total_tokens": 12}, "elapsed_ms": 34},
+                "trajectory": {
+                    "usage": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12},
+                    "elapsed_ms": 34,
+                    "events": [
+                        {"type": "tool_call", "tool_input": {"path": "/tmp/demo/skill/SKILL.md"}},
+                        {"type": "exec_command", "command": "python -m unittest"},
+                    ],
+                },
                 "artifacts": [
                     {"path": "/app/results/output.md", "content": "alpha beta"},
                     {"path": "/app/results/metadata.json", "content": {"total_tool_calls": 2}},
@@ -288,6 +326,12 @@ class SkillBenchmarkTests(unittest.TestCase):
             meta = json.loads((runs / "case-1" / "with_skill" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["provider"], "jetty")
             self.assertEqual(meta["jetty_trajectory_id"], "traj_1")
+            self.assertTrue((runs / "case-1" / "with_skill" / "trace.jsonl").exists())
+            events = json.loads((runs / "case-1" / "with_skill" / "events.json").read_text(encoding="utf-8"))
+            metrics = json.loads((runs / "case-1" / "with_skill" / "metrics.json").read_text(encoding="utf-8"))
+            self.assertTrue(any(e["type"] == "skill_load" for e in events["events"]))
+            self.assertEqual(metrics["commands"], 1)
+            self.assertEqual(metrics["total_tokens"], 12)
             self.assertIn("JETTY FAILURE", (runs / "case-1" / "without_skill" / "output.md").read_text(encoding="utf-8"))
             report = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"])
             self.assertEqual(report["summary"]["with_skill"]["mean_objective_pass_rate"], 1.0)
@@ -325,6 +369,45 @@ class SkillBenchmarkTests(unittest.TestCase):
             records = list(sb.execute_jetty_payloads([row], client=ShouldNotCallClient()))
             self.assertEqual(records[0]["status"], "failed")
             self.assertIn("non-executable", records[0]["error"])
+
+    def test_pi_smoke_workspace_omits_skill_for_without_skill(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            repo = manifest.parent.parent
+            fixture = manifest.parent / "fixtures" / "input.txt"
+            fixture.parent.mkdir()
+            fixture.write_text("fixture", encoding="utf-8")
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["cases"][0]["files"] = ["fixtures/input.txt"]
+            with tempfile.TemporaryDirectory() as wd:
+                instruction, skill_args, inputs, skill_paths = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "without_skill", Path(wd))
+                self.assertEqual(skill_args, ["--no-skills"])
+                self.assertEqual(skill_paths, [])
+                self.assertEqual(len(inputs), 1)
+                self.assertTrue(str(inputs[0]).startswith(str(Path(wd).resolve())))
+                self.assertFalse((Path(wd) / "skills").exists())
+                self.assertIn("not present", instruction)
+            with tempfile.TemporaryDirectory() as wd:
+                _, skill_args, _, skill_paths = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "with_skill", Path(wd))
+                self.assertTrue(skill_paths)
+                self.assertIn("--skill", skill_args)
+                self.assertTrue(all(str(p.resolve()).startswith(str(Path(wd).resolve())) for p in skill_paths))
+
+    def test_pi_trigger_trace_artifact_writer_uses_detector_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "trigger-run"
+            stdout = "\n".join([
+                json.dumps({"type": "tool_use", "tool_input": {"path": "/tmp/pi-trigger/skills/demo/SKILL.md"}}),
+                json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 3, "output": 2, "totalTokens": 5}}}),
+            ]) + "\n"
+            result = {"query": "demo", "should_trigger": True, "triggered": True, "pass": True, "elapsed_ms": 50, "returncode": 0, "timed_out": False, "evidence": ["/tmp/pi-trigger/skills/demo/SKILL.md"]}
+            tr.write_trigger_trace_artifacts(run_dir, stdout, result)
+            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+            meta = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertTrue(metrics["skill_invoked"])
+            self.assertEqual(metrics["total_tokens"], 5)
+            self.assertEqual(meta["query"], "demo")
 
     def test_script_assertion_requires_opt_in_and_executes_oracle(self):
         with tempfile.TemporaryDirectory() as td:
@@ -436,6 +519,29 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertEqual(result["efficiency_pass_rate"], 1.0)
             self.assertEqual(report["summary"]["with_skill"]["telemetry_availability"]["events"], 1)
             self.assertEqual(report["slice_summary"]["domain"]["writing"]["with_skill"]["runs"], 1)
+
+    def test_variant_scoped_process_assertions_do_not_penalize_other_variants(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["cases"][0]["assertions"] = [
+                {"name": "with-skill-load", "type": "skill_invoked", "expected": True, "variants": ["with_skill"]},
+                {"name": "without-skill-no-load", "type": "skill_invoked", "expected": False, "variants": ["without_skill"]},
+            ]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            runs = root / "repo" / "eval-runs" / "latest"
+            for variant, invoked in [("with_skill", True), ("without_skill", False)]:
+                base = runs / "case-1" / variant
+                base.mkdir(parents=True)
+                (base / "output.md").write_text("alpha beta", encoding="utf-8")
+                sb.write_trace_artifacts(base, "", source="test", extra_metrics={"skill_invoked": invoked, "skill_invocation_evidence": [variant] if invoked else []}, write_metadata=True)
+            report = sb.build_benchmark_report(manifest, runs)
+            by_variant = {r["variant"]: r for r in report["results"]}
+            self.assertEqual(by_variant["with_skill"]["objective_total"], 1)
+            self.assertEqual(by_variant["without_skill"]["objective_total"], 1)
+            self.assertEqual(by_variant["with_skill"]["objective_pass_rate"], 1.0)
+            self.assertEqual(by_variant["without_skill"]["objective_pass_rate"], 1.0)
 
     def test_process_and_efficiency_assertions_fail_closed_without_evidence(self):
         with tempfile.TemporaryDirectory() as td:

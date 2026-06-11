@@ -6,6 +6,14 @@ All notable public changes are listed here. Release tags are the source of truth
 
 - Nothing yet.
 
+## v0.4.1 — 2026-06-11
+
+- Add variant-scoped assertions with `variants` / `only_variants` / `except_variants`.
+- Ground trace import in live Pi and Codex event shapes: Pi `message_end` usage aliases and Codex `item.completed` / `command_execution` JSONL.
+- Add a shared trace artifact writer and use it for `import-trace`, `run-codex`, Jetty result import, Pi smoke runs, and optional Pi trigger traces.
+- Harden the Adewale Pi smoke runner by executing in an isolated temporary workspace with only allowed files for each variant.
+- Add `skill-pi-trigger-eval --trace-runs` for per-query trace artifacts.
+
 ## v0.4.0 — 2026-06-11
 
 - Add GitHub Actions CI for Python 3.10, 3.11, and 3.12.
