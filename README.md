@@ -447,6 +447,25 @@ skill-benchmark profile-skill ../repo/evals/shared-benchmark.json \
 
 `profile-skill` reports `SKILL.md` token estimates, reference-file counts/sizes, heading/module counts, and warnings for overly broad or oversized skills. These warnings are advisory; focused 2–3-module skills are often easier for agents to apply, but large skills can be justified when references are conditional.
 
+### Token overhead
+
+`token-overhead` combines static skill profile data with paired runtime traces. It reports the static `SKILL.md`/reference footprint, `with_skill - without_skill` token deltas, objective lift, and objective lift per 1k extra total tokens when paired `metrics.json` files exist.
+
+```bash
+skill-benchmark token-overhead ../repo/evals/shared-benchmark.json \
+  --runs-subdir eval-runs/latest \
+  --format markdown \
+  --out token-overhead.md
+
+skill-benchmark token-overhead \
+  ../skill-a/evals/shared-benchmark.json \
+  ../skill-b/evals/shared-benchmark.json \
+  --runs-subdir eval-runs/trace-smoke \
+  --out token-overhead.json
+```
+
+If a repo has no paired trace metrics, the report still includes the static footprint and shows `0` runtime pairs.
+
 ### Aggregate many skills
 
 ```bash

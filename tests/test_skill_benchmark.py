@@ -612,6 +612,32 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertIn("many-references", kinds)
             self.assertIn("many-modules", kinds)
 
+    def test_token_overhead_reports_static_and_runtime_pairs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            runs = root / "repo" / "eval-runs" / "latest"
+            for variant, total, input_tokens, output_tokens in [
+                ("with_skill", 150, 120, 30),
+                ("without_skill", 60, 50, 10),
+            ]:
+                base = runs / "case-1" / variant
+                base.mkdir(parents=True)
+                (base / "output.md").write_text("alpha beta", encoding="utf-8")
+                (base / "metrics.json").write_text(json.dumps({
+                    "total_tokens": total,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "skill_invoked": variant == "with_skill",
+                }), encoding="utf-8")
+            report = sb.paired_token_overhead_report(manifest, runs=runs)
+            self.assertEqual(report["summary"]["paired_runtime_rows"], 1)
+            self.assertEqual(report["pairs"][0]["total_token_delta"], 90)
+            self.assertEqual(report["pairs"][0]["input_token_delta"], 70)
+            self.assertEqual(report["pairs"][0]["objective_delta"], 0.0)
+            self.assertEqual(report["pairs"][0]["objective_lift_per_1k_total_tokens"], 0.0)
+            self.assertGreater(report["summary"]["static_skill_tokens"], 0)
+
     def test_command_assertions_match_command_inputs_not_outputs(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
