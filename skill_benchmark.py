@@ -2642,6 +2642,143 @@ def profile_skill_report(
     }
 
 
+def paired_token_overhead_report(
+    manifest_path: Path,
+    *,
+    runs: Path | None = None,
+    split: str | None = None,
+    variants: tuple[str, str] = ("with_skill", "without_skill"),
+) -> dict[str, Any]:
+    manifest = validate_manifest(manifest_path)
+    profile = profile_skill_report(manifest_path)
+    with_variant, without_variant = variants
+    pairs: list[dict[str, Any]] = []
+    if runs is not None:
+        for case in iter_cases(manifest, split):
+            with_runs = discover_run_bases(runs, case["id"], with_variant)
+            without_runs = discover_run_bases(runs, case["id"], without_variant)
+            without_by_run = {n: base for n, base in without_runs}
+            for run_number, with_base in with_runs:
+                without_base = without_by_run.get(run_number)
+                if without_base is None and len(with_runs) == 1 and len(without_runs) == 1:
+                    without_base = without_runs[0][1]
+                if without_base is None:
+                    continue
+                with_metrics = read_metrics_base(with_base)
+                without_metrics = read_metrics_base(without_base)
+                with_text, with_output_path = read_output_base(with_base)
+                without_text, without_output_path = read_output_base(without_base)
+                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, {}, run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
+                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, {}, run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
+                wt = metric_number(with_metrics, "total_tokens")
+                nt = metric_number(without_metrics, "total_tokens")
+                wi = metric_number(with_metrics, "input_tokens")
+                ni = metric_number(without_metrics, "input_tokens")
+                wo = metric_number(with_metrics, "output_tokens")
+                no = metric_number(without_metrics, "output_tokens")
+                if wt is None and wi is None and wo is None:
+                    continue
+                pairs.append({
+                    "case_id": case["id"],
+                    "run_number": run_number,
+                    "with_run_base": str(with_base),
+                    "without_run_base": str(without_base),
+                    "with_skill_invoked": with_metrics.get("skill_invoked"),
+                    "without_skill_invoked": without_metrics.get("skill_invoked"),
+                    "with_total_tokens": wt,
+                    "without_total_tokens": nt,
+                    "total_token_delta": (wt - nt) if wt is not None and nt is not None else None,
+                    "with_input_tokens": wi,
+                    "without_input_tokens": ni,
+                    "input_token_delta": (wi - ni) if wi is not None and ni is not None else None,
+                    "with_output_tokens": wo,
+                    "without_output_tokens": no,
+                    "output_token_delta": (wo - no) if wo is not None and no is not None else None,
+                    "with_objective_pass_rate": with_grade.get("objective_pass_rate"),
+                    "without_objective_pass_rate": without_grade.get("objective_pass_rate"),
+                    "objective_delta": (with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) if with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None,
+                    "objective_lift_per_1k_total_tokens": ((with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) / ((wt - nt) / 1000)) if wt is not None and nt is not None and wt > nt and with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None,
+                })
+    total_deltas = [p["total_token_delta"] for p in pairs if p.get("total_token_delta") is not None]
+    input_deltas = [p["input_token_delta"] for p in pairs if p.get("input_token_delta") is not None]
+    output_deltas = [p["output_token_delta"] for p in pairs if p.get("output_token_delta") is not None]
+    objective_deltas = [p["objective_delta"] for p in pairs if p.get("objective_delta") is not None]
+    lift_per_1k = [p["objective_lift_per_1k_total_tokens"] for p in pairs if p.get("objective_lift_per_1k_total_tokens") is not None]
+    static_skill_tokens = profile["summary"].get("skill_tokens") or 0
+    static_reference_tokens = profile["summary"].get("reference_tokens") or 0
+    return {
+        "generated_at": int(time.time()),
+        "manifest": str(manifest_path),
+        "runs": str(runs) if runs is not None else None,
+        "skill_name": manifest.get("skill_name"),
+        "summary": {
+            "skill_name": manifest.get("skill_name"),
+            "static_skill_tokens": static_skill_tokens,
+            "static_reference_tokens": static_reference_tokens,
+            "static_total_tokens": static_skill_tokens + static_reference_tokens,
+            "reference_files": profile["summary"].get("reference_files"),
+            "paired_runtime_rows": len(pairs),
+            "total_token_delta": stats(total_deltas),
+            "input_token_delta": stats(input_deltas),
+            "output_token_delta": stats(output_deltas),
+            "objective_delta": stats(objective_deltas),
+            "objective_lift_per_1k_total_tokens": stats(lift_per_1k),
+            "mean_total_overhead_per_static_skill_token": (statistics.mean(total_deltas) / static_skill_tokens) if total_deltas and static_skill_tokens else None,
+        },
+        "profile": profile,
+        "pairs": pairs,
+    }
+
+
+def token_overhead(args: argparse.Namespace) -> int:
+    reports = []
+    for raw in args.manifests:
+        manifest_path = Path(raw)
+        runs = Path(args.runs) if args.runs else None
+        if runs is None and args.runs_subdir:
+            runs = repo_root_for_manifest(manifest_path) / args.runs_subdir
+        reports.append(paired_token_overhead_report(manifest_path, runs=runs, split=args.split))
+    output = {
+        "generated_at": int(time.time()),
+        "summary": {
+            "skills": len(reports),
+            "skills_with_runtime_pairs": sum(1 for r in reports if r["summary"].get("paired_runtime_rows", 0)),
+            "runtime_pairs": sum(r["summary"].get("paired_runtime_rows", 0) for r in reports),
+            "mean_static_skill_tokens": statistics.mean([r["summary"]["static_skill_tokens"] for r in reports]) if reports else None,
+            "mean_static_reference_tokens": statistics.mean([r["summary"]["static_reference_tokens"] for r in reports]) if reports else None,
+        },
+        "reports": reports,
+    }
+    if args.format == "markdown":
+        lines = ["# Token overhead report", "", "| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | Median total delta | Mean input delta | Mean objective lift | Lift per 1k total tokens |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for r in reports:
+            s = r["summary"]
+            td = s.get("total_token_delta") or {}
+            idelta = s.get("input_token_delta") or {}
+            odelta = s.get("objective_delta") or {}
+            lift = s.get("objective_lift_per_1k_total_tokens") or {}
+            lines.append(f"| {r['skill_name']} | {s.get('static_skill_tokens')} | {s.get('static_reference_tokens')} | {s.get('paired_runtime_rows')} | {td.get('mean')} | {td.get('median')} | {idelta.get('mean')} | {odelta.get('mean')} | {lift.get('mean')} |")
+        lines += ["", "## Per-case runtime pairs", ""]
+        for r in reports:
+            if not r.get("pairs"):
+                continue
+            lines += [f"### {r['skill_name']}", "", "| Case | Run | Total delta | Input delta | Objective delta | Lift/1k | with total | without total |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
+            for p in r["pairs"]:
+                lines.append(f"| {p['case_id']} | {p['run_number']} | {p.get('total_token_delta')} | {p.get('input_token_delta')} | {p.get('objective_delta')} | {p.get('objective_lift_per_1k_total_tokens')} | {p.get('with_total_tokens')} | {p.get('without_total_tokens')} |")
+            lines.append("")
+        text = "\n".join(lines) + "\n"
+        if args.out:
+            Path(args.out).write_text(text, encoding="utf-8")
+        else:
+            print(text)
+    else:
+        if args.out:
+            write_json(Path(args.out), output)
+        else:
+            print(json.dumps(output, indent=2, ensure_ascii=False))
+    return 0
+
+
 def profile_skill(args: argparse.Namespace) -> int:
     report = profile_skill_report(
         Path(args.manifest),
@@ -3049,6 +3186,14 @@ def main() -> int:
     p.add_argument("--max-references", type=int, default=8)
     p.add_argument("--max-modules", type=int, default=10)
 
+    p = sub.add_parser("token-overhead")
+    p.add_argument("manifests", nargs="+")
+    p.add_argument("--runs", help="single runs directory to use for every manifest")
+    p.add_argument("--runs-subdir", default="eval-runs/latest", help="repo-relative runs directory when --runs is omitted")
+    p.add_argument("--split", choices=sorted(VALID_SPLITS))
+    p.add_argument("--format", choices=["json", "markdown"], default="json")
+    p.add_argument("--out")
+
     p = sub.add_parser("audit-manifest")
     p.add_argument("manifest")
     p.add_argument("--skill-path", help="Override skill path used for section/ablation suggestions")
@@ -3113,6 +3258,8 @@ def main() -> int:
         return render_viewer(args)
     if args.cmd == "profile-skill":
         return profile_skill(args)
+    if args.cmd == "token-overhead":
+        return token_overhead(args)
     if args.cmd == "audit-manifest":
         return audit_manifest(args)
     if args.cmd == "aggregate":
