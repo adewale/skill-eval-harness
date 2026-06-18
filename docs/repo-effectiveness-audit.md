@@ -1,8 +1,16 @@
 # Repo Effectiveness Audit
 
-Date: 2026-06-11
+Date: 2026-06-18 (re-audit; baseline 2026-06-11)
 
 This audit applies the `good-repo` skill to `adewale/skill-eval-harness` as a public Python CLI/package repo for Agent Skill evaluation.
+
+## Re-audit delta (2026-06-18)
+
+Re-run after `v0.4.2` and the `token-overhead` command shipped. Score is unchanged at 86/100; the substantive surfaces remain strong.
+
+- **Fixed:** README install commands pinned the stale `@v0.4.1` tag while the current release is `v0.4.2`. Quick start and Installation now pin `@v0.4.2` (`README.md`). Historical "shipped v0.4.1 runner support" references are intentionally left as-is.
+- **Verified:** all 31 unit tests pass locally via `python3 -m unittest discover tests`.
+- **Still pending (owner-only):** GitHub description, topics, and homepage URL remain empty on the repo page despite being present in `pyproject.toml`. See the manual settings checklist below.
 
 ## Snapshot
 
