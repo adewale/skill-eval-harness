@@ -4,6 +4,8 @@ All notable public changes are listed here. Release tags are the source of truth
 
 ## Unreleased
 
+- Add `docs/vocabulary.md` glossary and `docs/evals-are-not-tests.md` conceptual page; link both from the README documentation map. Docs only; no behavior changes.
+
 ## v0.4.2 — 2026-06-12
 
 - Tighten README and trace-aware spec language after the v0.4.1 runner release; no behavior changes.

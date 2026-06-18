@@ -121,6 +121,8 @@ skill-benchmark --help
 | `CHANGELOG.md` | Release history and unreleased repo-surface changes. |
 | `CONTRIBUTING.md` | Local setup, validation commands, and eval-safety rules. |
 | `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work. |
+| `docs/vocabulary.md` | Glossary of harness terms: variants, splits, ablations, assertions, trace artifacts, and report flags. |
+| `docs/evals-are-not-tests.md` | Why a skill eval is not a unit test, and what that changes about reading results. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
 | `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
