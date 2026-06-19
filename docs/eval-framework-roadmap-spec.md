@@ -312,15 +312,82 @@ These need a model, so they stay out of core grading.
 
 ## Sequencing
 
-1. **2.1 multi-model fan-out** (priority, plumbing partway) and **2.2 scores and severity**,
-   because the soft-scoring several later items lean on lands here.
-2. **1.1 judge presets**, **1.4 local similarity**, **1.2 reporters**: cheap wins on top of 2.2.
-3. **2.4 OTel normalization**, then **2.7 subagent runner**, then **2.3 tool replay**, in that
-   order, because replay needs a runner to host it.
-4. **2.5 datasets** into **3.3 registry**; **2.8 and 2.9 viewer and iteration**; **2.6 trend**.
-5. **3.1 multi-turn** and **3.2 per-model analysis** last, since they change the contract and the
+1. **Cheap wins with no dependency:** **1.6 golden_output**, **1.2 reporters**, **1.3 judge
+   guard**. None need the score channel, so they can land first.
+2. **The two shared abstractions:** **2.1 multi-model fan-out** (priority, plumbing partway) and
+   **2.2 graded scoring and severity**. Everything scored leans on 2.2, so it gates the next
+   group.
+3. **On top of 2.2's score channel:** **1.1 judge presets**, **1.4 local similarity**,
+   **1.8 graded script oracles**, and **1.7 oracle-strength** (its strong-oracle share reads best
+   once scores exist). **1.8 must follow 2.2** — it routes the oracle's stdout score into the
+   `score`/`severity` channel that 2.2 introduces, so building it earlier would have nowhere to
+   put the score.
+4. **The runner layer:** **2.4 OTel normalization**, then **2.7 subagent runner**, then
+   **2.3 tool replay** (replay needs a runner to host it), then **2.7b held-out rubric** (needs
+   both 2.2's graded scores and 2.7's subagent judge).
+5. **2.5 datasets** into **3.3 registry**; **2.8 and 2.9 viewer and iteration**; **2.6 trend**.
+6. **3.1 multi-turn** and **3.2 per-model analysis** last, since they change the contract and the
    report the most.
-6. Bucket 4 items only as opt-in escapes, never blocking the work above.
+7. Bucket 4 items only as opt-in escapes, never blocking the work above.
 
 The order is not arbitrary: it builds the two shared abstractions first (the scored assertion and
-the model axis), then everything else attaches to a surface that already exists.
+the model axis), then attaches everything else to a surface that already exists. The one hard
+edge is 1.8 after 2.2; the rest is preference, not dependency.
+
+---
+
+## Migration: upgrading existing evals
+
+Several items above change the manifest: the model axis (2.1), graded scoring and the
+`graded_dimensions` / `dynamic_rubric` shapes (2.2), `golden_output` (1.6), oracle tiers (1.7),
+and graded script oracles (1.8). The author already runs eight manifests
+(`examples/adewale-workspace/all-manifests.txt`), and external skills such as
+`adewale/swiss-poster-skill` run their own. None of them should need a hand-edit to keep working,
+and upgrading to the new features should be something an agent can drive.
+
+### Two principles, borrowed
+
+- **Additive and back-compatible (LangSmith's incremental adoption).** LangSmith's Vitest/Jest
+  integration lets you wrap existing tests rather than rewrite them: assertions still produce a
+  `pass`, and a scored evaluator is an opt-in `wrapEvaluator` returning `{key, score}`. We do the
+  same. Every new field is optional with a behavior-preserving default, so a `version: 1` manifest
+  grades identically after the upgrade. A binary assertion without a `severity` stays a gate; a
+  `script` oracle that prints no score line stays pass/fail.
+- **Agent-driven, not a rigid codemod (pi.dev's approach).** pi.dev ships no migration tool; its
+  stance is "ask the agent to convert it." The mechanical rewrites can be automated, but the
+  judgment calls (which binary assertions deserve graded dimensions, which oracles are `strong`)
+  are left to an agent following a guide. We split migration the same way: a command for the
+  mechanical part, a guide for the judgment.
+
+### What ships
+
+- **`skill-benchmark migrate <manifest>`**: a command that bumps `version`, applies the mechanical
+  rewrites, and writes a diff plus a checklist of judgment calls it deliberately did not make.
+  - Mechanical: bump `version` 1 -> 2; stamp default `severity: gate` on objective assertions and
+    `soft` on `judge`; default each assertion's `oracle` tier by type; leave a `# TODO: graded?`
+    marker beside binary `judge` rubrics.
+  - Left for the agent/human: turning a flat `rubric: [...]` into anchored `graded_dimensions`,
+    choosing reference-anchor floors, and marking which `script` oracles are demo seams. The
+    checklist names each, with a pointer to the relevant spec section.
+  - `--check` runs it dry (no writes), mirroring LangSmith's `LANGSMITH_TEST_TRACKING=false`.
+- **`docs/migrating-evals.md`**: a versioned, agent-runnable guide. It states, per manifest
+  version, what changed, what `migrate` does automatically, and the ordered steps an agent takes to
+  finish the judgment calls. An agent points at a repo, runs `migrate --check`, reads the
+  checklist, edits the manifest, and re-validates. This is the narrow, justified form of the
+  punted "ship-as-skill" idea: a migration runbook, not a general authoring skill.
+
+### Abstractions used or changed
+
+- `version` on the manifest (`validate_manifest:193`) becomes meaningful: `validate` accepts both
+  1 and 2, and warns (not errors) on a `version: 1` manifest once 2.2 has landed, pointing at
+  `migrate`.
+- No grading abstraction changes for migration itself; it is a source-rewrite plus a guide.
+
+### Testing
+
+- A golden round-trip: a `version: 1` fixture manifest through `migrate` to `version: 2`, then
+  `validate`, asserting the diff matches and the mechanical defaults are stamped.
+- A back-compat test proving the pre-migration manifest still grades to identical pass rates under
+  the new code (the same regression test 2.2 requires).
+- A `--check` test asserting no file is written and the judgment-call checklist lists every binary
+  `judge` rubric and every `script` oracle.
