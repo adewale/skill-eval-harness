@@ -103,7 +103,7 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
 
 ### 1.8 Graded script oracles
 - **Goal:** let a deterministic oracle report degree, not just pass/fail. `adewale/swiss-poster-skill`
-  splits "good poster" into seven `script` oracles, but each is forced all-or-nothing by our
+  splits "good poster" into seven `script` oracles, but each is forced all-or-nothing by the
   exit-code-only contract: a poster with six of seven drama carriers fails `drama_oracle` exactly
   like one with zero. That is the binary-saturation problem inside a single oracle.
 - **Abstractions used or changed:** extend `run_script_assertion` (`:1621`) and
@@ -142,7 +142,7 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   framework does this; vitest-evals, eve, and viteval all push it onto the test runner.
 - **Abstractions used or changed:** `prepared_task_rows` (`:314`) gains a `model` dimension
   beside `variant` and `run_number`. Each row carries its target `model`, and `run_dir` gains a
-  model segment (`<case>/<model>/<variant>/run-<n>`), kept backward compatible when one model
+  model segment (`<case>/<model>/<variant>/run-<n>`), kept backward-compatible when one model
   runs. Runners pass the row `model` through; per-run `model` already lands in `metadata.json`,
   so grading needs no change. `build_benchmark_report` (`:2182`) groups `by_variant` within
   `by_model`, and `build_paired_summary` (`:2119`) computes lift per (case, model).
@@ -180,8 +180,9 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
     (`:1767`) renders the dimensions; the result carries per-dimension scores in `evidence`.
   - **`dynamic_rubric`** as a second `judge` shape: `{instruction, minimum_criteria}`. The judge
     drafts 3-5 case-specific criteria before grading and must meet at least `minimum_criteria`.
-  - `grade_case_variant` (`:1877`) splits totals into gated and soft. A soft failure does not
-    lower the pass rate; it fills a `scored` bucket. A `--strict` flag promotes soft to gate.
+  - `grade_case_variant` (`:1877`) splits totals into critical, gated, and soft. A `critical`
+    failure vetoes the case; a `gate` failure lowers the pass rate; a `soft` failure lowers
+    neither and fills a `scored` bucket. A `--strict` flag promotes soft to gate.
   - **Statistical lift** in `build_paired_summary` (`:2119`): alongside the raw delta, compute a
     significance test over the per-case graded scores (paired bootstrap or sign-flip
     permutation, mirroring `score_delta.py`), so lift is tested, not eyeballed.
@@ -229,10 +230,10 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
 - **Abstractions used or changed:** `normalize_trace_record` (`:1373`) and
   `normalize_trace_records` (`:1447`) keep their inputs but emit OTel GenAI semantic-key
   attributes; the `events.json` schema version bumps. Process and efficiency assertions read the
-  new keys with back-compat fallbacks.
+  new keys with backward-compatible fallbacks.
 - **Design:** additive schema. An old `events.json` still grades.
 - **Testing:** extend the per-source normalization fixtures (codex, pi, jetty) to assert OTel
-  keys, plus a back-compat test on a pre-bump `events.json`.
+  keys, plus a backward-compatibility test on a pre-bump `events.json`.
 
 ### 2.5 Dataset abstraction
 - **Goal:** fan one case template over many rows instead of hand-authoring each case.
@@ -241,10 +242,9 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   concrete cases before fan-out; `validate_manifest` validates rows and runs leakage lint per
   materialized case.
 - **Design:** materialization happens early, so prepare, grade, and report stay unchanged.
-- **Representativeness guard:** fan-out makes it cheap to balloon a suite, which `howtoeval.com`
-  warns against (20 high-signal cases beat 200 edge cases). Pair this with the staleness check
-  (1.9): a generated row earns its place by discriminating, and flat rows are pruned. The point of
-  templating is coverage of real variation, not case count.
+- **Representativeness guard:** fan-out makes it cheap to balloon a suite, the failure mode 1.9
+  guards against. Pair the two: a generated row earns its place by discriminating, and flat rows
+  are pruned. The point of templating is coverage of real variation, not case count.
 - **Testing:** N rows materialize N cases with stable ids, and leakage lint fires on a leaky
   template.
 
@@ -327,7 +327,7 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   sequence; `grade_case_variant` grades per turn and aggregates.
 - **Design:** single-shot stays the default, so existing manifests are untouched.
 - **Testing:** a fixture multi-turn run asserting per-turn grading and aggregate, plus a
-  back-compat test on a single-`output.md` case.
+  backward-compatibility test on a single-`output.md` case.
 
 ### 3.2 Per-model lift and pairing analysis
 - **Goal:** the heavier reporting half of 2.1: rank models by lift and flag where a model loses
@@ -369,13 +369,13 @@ These need a model, so they stay out of core grading.
 
 **Macro-eval clustering and pattern discovery** (OpenAI's macro-evals notebook: embed traces ->
 UMAP -> HDBSCAN -> TF-IDF labels -> backward-walking "suspect" diagnosis). That layer sits *above*
-this harness: it mines thousands of *production* traces for unlabeled failure patterns. We are a
-pre-production, paired-comparison tool, so building clustering would pull us off the lift moat and
-toward a different product for a different stage. We take the two transferable ideas — severity-
-weighted failure ranking (into 2.6) and slice-lift concentration (into 3.2) — and leave the
-discovery engine out. The notebook's own caution is why: a discovered pattern "is not automatically
-a defect; it is where inspection begins," and "causality inference remains speculative" — the same
-flag-is-where-you-look discipline our saturation flags already hold.
+this harness: it mines thousands of *production* traces for unlabeled failure patterns. The
+harness is a pre-production, paired-comparison tool, so building clustering would pull it off the
+lift moat toward a different product for a different stage. The spec takes the two transferable
+ideas — severity-weighted failure ranking (into 2.6) and slice-lift concentration (into 3.2) — and
+leaves the discovery engine out. The notebook's own caution is why: a discovered pattern "is not
+automatically a defect; it is where inspection begins," and "causality inference remains
+speculative" — the same flag-is-where-you-look discipline the saturation flags already hold.
 
 ---
 
@@ -394,14 +394,16 @@ flag-is-where-you-look discipline our saturation flags already hold.
 4. **The runner layer:** **2.4 OTel normalization**, then **2.7 subagent runner**, then
    **2.3 tool replay** (replay needs a runner to host it), then **2.7b held-out rubric** (needs
    both 2.2's graded scores and 2.7's subagent judge).
-5. **2.5 datasets** into **3.3 registry**; **2.8 and 2.9 viewer and iteration**; **2.6 trend**.
+5. **2.5 datasets** into **3.3 registry**; **2.8 and 2.9 viewer and iteration**; then **2.6 trend**
+   and, on top of its history, the prune/grow pair **1.9 staleness** and **2.10 living-eval**.
 6. **3.1 multi-turn** and **3.2 per-model analysis** last, since they change the contract and the
    report the most.
 7. Bucket 4 items only as opt-in escapes, never blocking the work above.
 
 The order is not arbitrary: it builds the two shared abstractions first (the scored assertion and
-the model axis), then attaches everything else to a surface that already exists. The one hard
-edge is 1.8 after 2.2; the rest is preference, not dependency.
+the model axis), then attaches everything else to a surface that already exists. The dependencies
+are stated per item — 1.8 after 2.2, 1.9 after 2.6, 2.7b after 2.2 and 2.7, 2.3 after a runner,
+3.3 after 2.5 — and the rest of the order is preference.
 
 ---
 
@@ -416,12 +418,12 @@ and upgrading to the new features should be something an agent can drive.
 
 ### Two principles, borrowed
 
-- **Additive and back-compatible (LangSmith's incremental adoption).** LangSmith's Vitest/Jest
+- **Additive and backward-compatible (LangSmith's incremental adoption).** LangSmith's Vitest/Jest
   integration lets you wrap existing tests rather than rewrite them: assertions still produce a
-  `pass`, and a scored evaluator is an opt-in `wrapEvaluator` returning `{key, score}`. We do the
-  same. Every new field is optional with a behavior-preserving default, so a `version: 1` manifest
-  grades identically after the upgrade. A binary assertion without a `severity` stays a gate; a
-  `script` oracle that prints no score line stays pass/fail.
+  `pass`, and a scored evaluator is an opt-in `wrapEvaluator` returning `{key, score}`. The harness
+  follows the same rule: every new field is optional with a behavior-preserving default, so a
+  `version: 1` manifest grades identically after the upgrade. A binary assertion without a
+  `severity` stays a gate; a `script` oracle that prints no score line stays pass/fail.
 - **Agent-driven, not a rigid codemod (pi.dev's approach).** pi.dev ships no migration tool; its
   stance is "ask the agent to convert it." The mechanical rewrites can be automated, but the
   judgment calls (which binary assertions deserve graded dimensions, which oracles are `strong`)
@@ -456,7 +458,7 @@ and upgrading to the new features should be something an agent can drive.
 
 - A golden round-trip: a `version: 1` fixture manifest through `migrate` to `version: 2`, then
   `validate`, asserting the diff matches and the mechanical defaults are stamped.
-- A back-compat test proving the pre-migration manifest still grades to identical pass rates under
-  the new code (the same regression test 2.2 requires).
+- A backward-compatibility test proving the pre-migration manifest still grades to identical pass
+  rates under the new code (the same regression test 2.2 requires).
 - A `--check` test asserting no file is written and the judgment-call checklist lists every binary
   `judge` rubric and every `script` oracle.
