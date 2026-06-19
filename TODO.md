@@ -109,8 +109,9 @@ threshold, evidence}` (`load_judge_results:1721`, merged in `grade_case_variant:
 
 Backlog distilled from a comparison against eve.dev, Sentry vitest-evals, viteval,
 openai/evals, Anthropic skill-creator + eval-viewer, the "Your evals will break" essay,
-and the OpenAI eval-skills blog. Full design in
-[`docs/eval-framework-roadmap-spec.md`](docs/eval-framework-roadmap-spec.md).
+the OpenAI eval-skills blog, `jettyio/jettyio-skills`, and a deeper look at the author's
+own projects (`anti-slop-writing`, `slide-maker`, `xampler`, `pythonbyexample`). Full
+design in [`docs/eval-framework-roadmap-spec.md`](docs/eval-framework-roadmap-spec.md).
 
 **Moat — do not dilute:** causal lift, `tune`/`holdout`/`holdback` splits, leakage lint,
 ablations, and saturation/no-lift flags are unique to this harness. None of the surveyed
@@ -123,13 +124,16 @@ Every item below slots around these, not over them.
 - [ ] Add a GitHub Actions reporter (PR annotations + Check Runs) and/or JUnit XML emitter over `benchmark.json`.
 - [ ] Add a centralized judge config slot and a `validate` check that enforces "judge model ≠ model under test."
 - [ ] Add a local/deterministic `similarity` scorer (e.g. levenshtein/normalized-ratio) with a threshold. (Embedding-backed variant is Bucket 4.)
+- [ ] Add a `golden_output` assertion: normalize `output.md` and compare to a reference file (byte or normalized-text equality). Drawn from `adewale/pythonbyexample` and `adewale/xampler`, where an example *is* a deterministic eval case (input + expected output + check).
+- [ ] Add oracle-strength labeling + a hygiene check: let an assertion/fixture declare its oracle tier (strong deterministic / marked demo-seam / opt-in live, per `adewale/xampler`'s "best no-lies / deliberate demo seams / remote"), and report how much of a case's pass rate rests on strong vs. weak oracles. Extends leakage lint from prompts to oracles.
 - [x] Author an opinionated workflow/quickstart guide (`docs/authoring-evals.md`).
 - [ ] Fold the workflow guidance into `validate`/`audit-manifest` hints where enforceable.
 
 ## Bucket 2 — natural extension of an existing subsystem
 
 - [ ] **Multi-model fan-out (priority).** Accept a model list in `prepare`/`run-codex`; `benchmark` groups by model and computes per-model lift. Per-run `model` already lands in `metadata.json`; the fan-out parallels variant fan-out.
-- [ ] Numeric scores + gate/soft severity tier on assertions (`gate` / `soft` / `atLeast`), gated by split.
+- [ ] Graded scoring + gate/soft severity + statistical lift on assertions (`gate` / `soft` / `atLeast`), with anchored `graded_dimensions`, `dynamic_rubric`, and a paired-bootstrap lift gate. Reference impls: `adewale/anti-slop-writing` (graded dimensions, `score_delta.py`) and `adewale/slide-maker` (held-out rubric). Includes a `structurally-pass-but-forgettable` flag (objective saturated + graded low).
+- [ ] Held-out rubric discipline: withhold grading criteria from generation, not just prompts, and score with a subagent judge — as `adewale/slide-maker` does ("criteria deliberately absent from generation rules"). Extends `holdback` from prompts to rubrics. `prepare` already omits `review_rubric` from generation payloads; this makes it a first-class split-level rule.
 - [ ] Tool replay: record tool inputs+outputs (keyed/sanitized/versioned) so a live re-run is deterministic and free of external-dep cost. Runner-side; pairs with the subagent runner. (Distinct from grading, which already replays from disk.)
 - [ ] Adopt OpenTelemetry GenAI semantic conventions as the `events.json`/`metrics.json` normalization target.
 - [ ] Dataset abstraction: fan one case template over a row set; optionally persist/generate datasets.

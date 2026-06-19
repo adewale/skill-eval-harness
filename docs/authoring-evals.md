@@ -55,6 +55,13 @@ the kinds on purpose:
 Prefer fixture-backed cases (`files: [...]`) over inline-only prompts. A real diff, README, or
 repo tells you more than a prompt the model can answer from general knowledge.
 
+**Prompts-first has one exception: deterministic artifacts.** When a case has a single
+known-correct output (a file that must equal a reference, a value that must match), write the
+check first, the way `pythonbyexample` and `xampler` do: an example is an input, an expected
+output, and a check that the two still match. Use a `golden_output` or `json_field_equals`
+assertion up front. Reserve prompts-first for open-ended outputs, where you cannot know the
+right check until you have seen what the model actually produces.
+
 ## Step 2 — Scaffold a minimal manifest and validate
 
 The smallest useful `evals/shared-benchmark.json`:

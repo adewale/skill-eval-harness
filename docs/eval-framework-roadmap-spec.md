@@ -68,6 +68,34 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   at the relevant section.
 - **Testing:** assert the new hint strings appear for crafted manifests.
 
+### 1.6 `golden_output` assertion
+- **Goal:** the strongest deterministic check there is, for cases with a known-correct artifact.
+  In `adewale/pythonbyexample` and `adewale/xampler` an example *is* an eval case: an input, an
+  expected output, and a check that the output still matches. The harness has no equivalent of
+  "this output equals this reference."
+- **Abstractions used or changed:** a new type in `TEXT_ASSERTIONS` (`:29`), implemented in
+  `assertion_result` (`:1642`). It reads `output.md` (or a named artifact), applies an optional
+  normalization (trim, collapse whitespace, or a named normalizer), and compares to a reference
+  file under the manifest dir. Evidence is a unified diff on mismatch.
+- **Design:** normalization is the whole game, so it is explicit and per-assertion, never
+  implicit. Default is exact bytes; `normalize: "text"` collapses whitespace.
+- **Testing:** unit tests for exact match, normalized match, and a mismatch whose evidence
+  contains the diff.
+
+### 1.7 Oracle-strength labeling + hygiene
+- **Goal:** stop a case from looking solid when it passes only on weak checks. `adewale/xampler`
+  labels every verifier "best no-lies" (real, byte-compared), "deliberate demo seam" (a marked
+  stand-in), or "remote" (opt-in, real resources). The harness already spans this range but does
+  not name it.
+- **Abstractions used or changed:** an optional `oracle` tier on an assertion
+  (`strong` / `demo` / `live`), defaulting by type (deterministic text/process are `strong`,
+  `script` is `demo` unless marked, judge/live are `live`). `build_benchmark_report` (`:2182`)
+  reports, per case, the share of its pass rate carried by `strong` oracles;
+  `audit_manifest_report` (`:2870`) warns when a case passes only on weak ones. This extends
+  leakage lint (`:164`) from prompts to oracles.
+- **Testing:** unit tests for tier defaulting and for the "weak-oracle-only" warning on a crafted
+  case.
+
 ---
 
 ## Bucket 2 — natural extension
@@ -115,7 +143,9 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
 - **Design:** default severity keeps current behavior (objective is a gate; `judge`,
   `similarity`, and graded dimensions are soft), so existing manifests score identically. This
   also gives the saturation flags a next move: when a binary case saturates, the report points
-  to graded dimensions plus the statistical gate instead of stopping at the flag.
+  to graded dimensions plus the statistical gate instead of stopping at the flag. Add a
+  `structurally-pass-but-forgettable` flag (objective saturated, graded score low) — the
+  signal `adewale/slide-maker` names as "competent but forgettable work."
 - **Testing:** unit tests for gate-fail, soft-below-threshold, and `--strict`; a graded-dimension
   judge result merged from a fixture; a `dynamic_rubric` fixture asserting the `minimum_criteria`
   cutoff; a `score_delta` test with a known-significant and a known-flat fixture pair; a
@@ -173,6 +203,22 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   `metadata.json`, and `events.json`.
 - **Testing:** drive the runner against a mock subagent function, asserting the contract files
   exist and the `without_skill` workspace holds no skill files.
+
+### 2.7b Held-out rubric discipline
+- **Goal:** withhold grading criteria from generation, not only prompts, so a skill cannot teach
+  to a rubric it never sees. `adewale/slide-maker` does this today: after structural gates pass,
+  it dispatches a subagent with a rubric whose "criteria [are] deliberately absent from
+  generation rules."
+- **Abstractions used or changed:** mostly a discipline made first-class, not new machinery.
+  `prepared_task_rows` (`:314`) already omits `review_rubric` from generation payloads unless
+  `--include-answer-key`; extend `validate_manifest` (`:193`) to require that a `holdout`/
+  `holdback` case's rubric stays out of the skill and public eval text, and pair it with the
+  subagent judge from 2.7 and the graded scoring from 2.2. Track which rubrics were held out so
+  the report can separate held-out scores from tune-visible ones.
+- **Design:** held-out rubric scoring is where graded lift earns its keep — a deck that passes
+  every structural gate but scores low on a held-out rubric is the "forgettable" case 2.2 flags.
+- **Testing:** assert a held-out rubric never appears in a generation payload, and that a held-out
+  judge result merges and is reported separately from tune-visible scores.
 
 ### 2.8 Interactive served report and richer artifacts
 - **Goal:** capture feedback in the browser and render image, PDF, and xlsx artifacts, beyond the
