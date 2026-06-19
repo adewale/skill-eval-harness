@@ -143,6 +143,17 @@ Open the outputs and write the smallest assertions that capture the behavior, in
 If `validate` warns that a value is in the prompt, replace the keyword with a scoped regex, a
 fixture-backed check, a script oracle, or a judge.
 
+Two patterns from the hardest grading domains are worth copying. First, **check both presence
+and absence**: a strong oracle confirms the good traits are there *and* the bad ones are not.
+`adewale/swiss-poster-skill`'s `drama_oracle` passes only when every required carrier is present
+and no forbidden pattern (SVG-only, AI-palette gradients, soft-SaaS styling) appears — the same
+slop-detection instinct as `anti-slop-writing`. Use `excludes_any` / `not_regex`, or a script
+oracle that fails on a forbidden match, to catch output that claims the style but lacks the
+substance. Second, **the strongest oracle inspects the rendered artifact, not the source text**:
+`swiss-poster-skill`'s `rendered_poster_oracle.py` runs headless Chrome and audits the rendered
+pixels (overflow, contrast). When source text can lie about the result, render it and check what
+actually came out.
+
 ## Step 5 — Benchmark and read the report
 
 ```bash

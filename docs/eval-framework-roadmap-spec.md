@@ -93,8 +93,30 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   reports, per case, the share of its pass rate carried by `strong` oracles;
   `audit_manifest_report` (`:2870`) warns when a case passes only on weak ones. This extends
   leakage lint (`:164`) from prompts to oracles.
+- **Strongest tier — the rendered-artifact oracle:** the top of the ladder is an oracle that
+  builds or renders the artifact and inspects the result, not the source text.
+  `adewale/swiss-poster-skill`'s `rendered_poster_oracle.py` runs headless Chrome and audits the
+  rendered pixels (viewport bounds, contrast, overflow). Mark these `strong`; they are slow, so
+  they lean on `timeout_s` and `--allow-scripts`, both already in the `script` contract.
 - **Testing:** unit tests for tier defaulting and for the "weak-oracle-only" warning on a crafted
   case.
+
+### 1.8 Graded script oracles
+- **Goal:** let a deterministic oracle report degree, not just pass/fail. `adewale/swiss-poster-skill`
+  splits "good poster" into seven `script` oracles, but each is forced all-or-nothing by our
+  exit-code-only contract: a poster with six of seven drama carriers fails `drama_oracle` exactly
+  like one with zero. That is the binary-saturation problem inside a single oracle.
+- **Abstractions used or changed:** extend `run_script_assertion` (`:1621`) and
+  `assertion_result` (`:1642`) to optionally parse a score from the oracle's stdout — a JSON line
+  such as `{"score": 6, "max_score": 7}` (normalized to 0-1) — beside the existing
+  `pass_exit_code`. The parsed score flows into the `score`/`severity` channel from 2.2, so a
+  script oracle becomes a graded dimension while staying fully deterministic and model-free.
+- **Design:** the score channel is additive and opt-in. An oracle that prints no score line keeps
+  today's pure pass/fail behavior, so existing manifests are unaffected. `pass_exit_code` still
+  decides `passed`; the score only feeds graded lift and the saturation handoff.
+- **Testing:** unit tests for an oracle that emits a score line (graded), one that emits none
+  (binary, unchanged), and a malformed line (ignored, falls back to exit code). Reuse the
+  existing `script`-assertion fixtures under `--allow-scripts`.
 
 ---
 

@@ -125,7 +125,8 @@ Every item below slots around these, not over them.
 - [ ] Add a centralized judge config slot and a `validate` check that enforces "judge model ≠ model under test."
 - [ ] Add a local/deterministic `similarity` scorer (e.g. levenshtein/normalized-ratio) with a threshold. (Embedding-backed variant is Bucket 4.)
 - [ ] Add a `golden_output` assertion: normalize `output.md` and compare to a reference file (byte or normalized-text equality). Drawn from `adewale/pythonbyexample` and `adewale/xampler`, where an example *is* a deterministic eval case (input + expected output + check).
-- [ ] Add oracle-strength labeling + a hygiene check: let an assertion/fixture declare its oracle tier (strong deterministic / marked demo-seam / opt-in live, per `adewale/xampler`'s "best no-lies / deliberate demo seams / remote"), and report how much of a case's pass rate rests on strong vs. weak oracles. Extends leakage lint from prompts to oracles.
+- [ ] Add oracle-strength labeling + a hygiene check: let an assertion/fixture declare its oracle tier (strong deterministic / marked demo-seam / opt-in live, per `adewale/xampler`'s "best no-lies / deliberate demo seams / remote"), and report how much of a case's pass rate rests on strong vs. weak oracles. Extends leakage lint from prompts to oracles. The strongest tier is a rendered-artifact oracle (e.g. `adewale/swiss-poster-skill`'s headless-Chrome `rendered_poster_oracle.py`).
+- [ ] Add graded script oracles: extend `run_script_assertion` to optionally parse a `{score, max_score}` line from stdout (normalized 0-1) beside `pass_exit_code`, so a deterministic oracle reports degree, not just pass/fail. Bridges `adewale/swiss-poster-skill`'s seven binary oracles to graded scoring (2.2) while staying model-free.
 - [x] Author an opinionated workflow/quickstart guide (`docs/authoring-evals.md`).
 - [ ] Fold the workflow guidance into `validate`/`audit-manifest` hints where enforceable.
 
