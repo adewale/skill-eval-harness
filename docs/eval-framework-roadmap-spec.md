@@ -20,6 +20,91 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
 
 ---
 
+## Confidence floor — the smallest set that makes a reported lift believable
+
+Everything in the buckets below adds capability. This section adds *trust*: the smallest set of
+changes after which a reported lift can be believed. The buckets answer "what else can the harness
+measure"; this section answers "why should anyone believe the number it already prints."
+
+The harness exists to report one thing — lift, `with_skill` minus `without_skill` on the same case
+(`build_paired_summary` (`:2119`)). That number is believable only if three preconditions hold, and
+today each is *intended* but not *executable*:
+
+1. the detectors do not lie — no false fire, no false silence;
+2. the `without_skill` baseline genuinely cannot see the skill;
+3. grading is deterministic and model-free, so the same run dir always grades the same way.
+
+Each item below makes one precondition executable. They are mostly fixtures and tests, not engine
+changes, which is why this is the *smallest* set rather than the most ambitious one, and none touch
+the lift/splits/ablations moat. Sequence them before the buckets: a graded (2.2) or multi-model
+(2.1) feature built on detectors that are not themselves verified only scales an unverified result.
+
+### CF.1 — Detector meta-fixtures (the keystone)
+- **Goal:** prove no detector manufactures or erases lift. A false-positive `contains` or a
+  false-silent `excludes_any` does not merely annoy — it shifts a `with_skill` or `without_skill`
+  pass rate and so invents or hides the exact quantity the tool exists to measure.
+- **Abstractions used or changed:** none in the engine. Adds
+  `tests/fixtures/detectors/<detector_id>/should-fire.*` and `should-pass.*` that exercise
+  `assertion_result` (`:1642`) directly — which today has no direct unit test, and whose
+  `contains_any` / `excludes_any` / `not_regex` branches (the type sets at `:29`-`:54`) appear
+  nowhere in the suite.
+- **Design:** one table-driven test loads every pair: the detector fires on `should-fire` and stays
+  silent on `should-pass`. False-positive coverage is mandatory — a detector with no `should-pass`
+  twin fails the suite, the bar `authoring-evals.md` already imposes on skill authors ("check both
+  presence and absence"). Each `should-pass` set includes a baseline-echoes-the-prompt case, tying
+  the fixtures to leakage lint (`prompt_assertion_leakage_findings` (`:164`)), since a detector that
+  passes on echoed prompt text is a false oracle. Every detector bug then becomes a permanent
+  fixture pair; the existing `test_command_assertions_match_command_inputs_not_outputs` is the seed
+  of that pattern.
+- **Why it is the keystone:** it is also the trust contract that lets the exapted detector library
+  (TODO, end of 2026) and any third-party detector register safely, and it is the missing rung on
+  the oracle-strength ladder (1.7) — "strong" should mean *fixture-verified*, not merely
+  *deterministic*.
+- **Testing:** the fixtures are the test. Add a meta-test asserting every name in
+  `OBJECTIVE_ASSERTIONS` (`:53`) has a fixture pair, so a new detector cannot land unverified.
+
+### CF.2 — One cross-runner baseline-isolation invariant
+- **Goal:** prove the baseline is skill-free by construction, so lift is real and not an artifact of
+  a baseline that grepped the skill out of the source tree.
+- **Abstractions used or changed:** a single invariant over every runner's `without_skill`
+  workspace, consolidating today's per-runner checks
+  (`test_pi_smoke_workspace_omits_skill_for_without_skill`, the Jetty `without_skill` mount test)
+  into one guard the run-output contract must satisfy.
+- **Design:** construct each runner's `without_skill` workspace from a fixture manifest and assert
+  the skill files are unreachable by read/find/grep. A new runner (the subagent runner, 2.7)
+  inherits the test by registering its workspace builder, so the invariant cannot silently regress
+  when a runner is added — the failure mode prose controls exist to prevent.
+- **Testing:** the invariant test, parameterized over the registered runners.
+
+### CF.3 — Re-grade idempotence
+- **Goal:** prove the claim the cheap-re-grade workflow rests on — grading reads only from disk and
+  is deterministic.
+- **Abstractions used or changed:** none. A test over a fixture run set.
+- **Design:** grade the same run directory twice and assert a byte-identical `benchmark.json`
+  (modulo an explicit timestamp field). Any hidden nondeterminism — dict ordering, set iteration in
+  flag computation, a stray clock read — surfaces here rather than as drift between two real runs.
+- **Testing:** the idempotence test over an existing fixture run set.
+
+### CF.4 — A guard that the core grade path calls no model and no network
+- **Goal:** make the governing invariant — "core grading stays local and deterministic and never
+  calls a model" — executable rather than aspirational.
+- **Abstractions used or changed:** none. A test-time guard around `grade_case_variant` (`:1877`).
+- **Design:** patch `urllib` and `subprocess` to raise, then grade a fixture covering every
+  objective family (text, process, efficiency) and assert it completes. The sanctioned exceptions —
+  `script` oracles and `judge` plumbing — are excluded from this path by design and keep their own
+  opt-in tests (`--allow-scripts`, `--judge-cmd`). The guard fails loudly the day a new detector
+  reaches for the network or a subprocess inside the grade path.
+- **Testing:** the guard test across the objective families.
+
+### Boundary
+The set stops here on purpose. Report-level correctness — that the saturation, no-lift, flaky, and
+negative-delta flags (`build_benchmark_report` (`:2182`)) are computed right — matters, but it sits
+one layer above the raw measurement and is better served by the golden-report tests the buckets
+already plan (1.2, 2.6). CF.1–CF.4 are the floor: with them a printed lift is believable; without
+them every feature above only scales an unverified number.
+
+---
+
 ## Bucket 1 — near drop-in
 
 ### 1.1 Built-in judge presets (`factuality`, `tool_call`, `structured_output`)
