@@ -53,10 +53,30 @@ Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-a
 
 ## Jetty evaluation integration
 
+Jetty runbooks emit a standardized machine-readable `validation_report.json` per trajectory
+(`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
+dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
+items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
+threshold, evidence}` (`load_judge_results:1721`, merged in `grade_case_variant:1877`).
+
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
-- [ ] Import Jetty judge results as `judge-results.jsonl` keyed by `judge_task_id`.
-- [ ] Support `local_only`, `jetty_only`, and `merge` grader modes.
-- [ ] Map Jetty score scales to harness `passed`, `score`, `threshold`, and `evidence` fields.
+      Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
+      imported result can be keyed back without guessing. Manifest `judge`/`rubric` dimensions
+      become the runbook's rubric dimensions; a manifest `threshold` becomes the exit gate.
+- [ ] Import Jetty judge results as `judge-results.jsonl` keyed by `judge_task_id`, reading
+      from each trajectory's `validation_report.json`.
+- [ ] Map Jetty score scales to harness `passed`, `score`, `threshold`, `evidence`:
+  - [ ] Rubric (1-5): `score` = mean (or min) of the 1-5 dimension scores; `threshold` from the
+        manifest assertion (default `>= 4`); `passed` = `score >= threshold`. Keep per-dimension
+        scores in `evidence`.
+  - [ ] Programmatic: `PASS` -> `passed: true, score: 1.0`; `FAIL` -> `passed: false, score: 0.0`;
+        `PARTIAL` -> `score: 0.5`, with `passed` decided by `threshold` (soft by default once the
+        2.2 severity tier lands).
+  - [ ] `evidence` = the report's rationale/notes; preserve the raw Jetty score block alongside it.
+- [ ] Support `local_only`, `jetty_only`, and `merge` grader modes for combining locally-run and
+      Jetty-run judge results before benchmarking.
+- [ ] Add a round-trip test: manifest judge assertion -> exported Jetty rubric -> mocked
+      `validation_report.json` -> imported `judge-results.jsonl` -> `benchmark` merge. No live API.
 
 ## Manifest extensions
 
