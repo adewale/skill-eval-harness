@@ -154,6 +154,16 @@ substance. Second, **the strongest oracle inspects the rendered artifact, not th
 pixels (overflow, contrast). When source text can lie about the result, render it and check what
 actually came out.
 
+**Name the catastrophic failures separately.** Some failures cannot be averaged away — writing
+outside the results directory, reporting success after a check failed, leaking a secret. One such
+failure across twenty runs is a catastrophe, not a 95% pass rate (the "valley-dodging" point).
+Today, enforce these as their own hard assertions — an `excludes_any` / `not_regex` for the
+forbidden state, or a `script` oracle that exits non-zero on it — and keep them as distinct,
+clearly-named cases so a high score elsewhere can never bury them. `adewale/guardrails-skill`
+encodes exactly these fences ("never write outside the results directory," "do not report success
+if a check failed"). One caution: a hard prohibition that is too broad makes a skill obstinate, so
+pair each with a negative case proving the skill still does the reasonable thing.
+
 ## Step 5 — Benchmark and read the report
 
 ```bash

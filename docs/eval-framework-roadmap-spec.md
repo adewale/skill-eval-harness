@@ -163,7 +163,17 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   ones.
 - **Abstractions used or changed:**
   - `assertion_result` (`:1642`) gains an optional `score` (0-1 or a normalized 1-5) and
-    `severity` (`gate` or `soft`), read from `gate`/`soft`/`atLeast` on the assertion.
+    `severity` (`critical` / `gate` / `soft`), read from `critical`/`gate`/`soft`/`atLeast` on the
+    assertion.
+  - **`critical` (absorbing-barrier) tier — valley-dodging.** From the Jetty "valley-dodging"
+    post: some failures cannot be averaged away. "Once an agent can reach a state like that, the
+    average stops being a number you can trust — sequence is what does the damage." A `critical`
+    assertion failing **vetoes the case** and no graded score offsets it; a poster scoring 5/5 on
+    drama still fails if it wrote outside the results directory. This sits *above* `gate`: a gate
+    lowers a pass rate, a critical failure is excluded from averaging entirely and surfaced on its
+    own. These map to the safeguards skills already encode by hand — `adewale/guardrails-skill`'s
+    "never write outside the results directory," "do not report success if a check failed."
+    Declare them per case as explicit failure modes, not buried in a pass rate.
   - **Anchored `graded_dimensions`** as a `judge` assertion shape:
     `{name, scale: "1-5", rubric: "5 = …observable…; 1 = …observable…"}`. Anchors name what each
     score level looks like, so a judge scores against criteria, not a vibe. `judge_prompt`
@@ -183,16 +193,23 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   to graded dimensions plus the statistical gate instead of stopping at the flag. Add a
   `structurally-pass-but-forgettable` flag (objective saturated, graded score low) — the
   signal `adewale/slide-maker` names as "competent but forgettable work."
-- **Floor-raising, not benchmark-maxxing:** graded scores measure *how much better* and feed
-  lift; they are not the headline. Per `howtoeval.com`, the first question is always *which cases
-  fail*, so the report keeps the binary failing-case flags (`with-skill-failed`, negative-delta)
-  primary and presents the graded mean as a secondary measure. A high graded mean must never hide
-  a failing case.
-- **Testing:** unit tests for gate-fail, soft-below-threshold, and `--strict`; a graded-dimension
-  judge result merged from a fixture; a `dynamic_rubric` fixture asserting the `minimum_criteria`
-  cutoff; a `score_delta` test with a known-significant and a known-flat fixture pair; a
-  reference-floor regression test; and a regression test proving an unchanged binary manifest
-  yields identical pass rates.
+- **Floor-raising and valley-dodging — a mean hides two things.** Graded scores measure *how much
+  better* and feed lift; they are not the headline. Two failure modes must never be averaged into
+  them. Per `howtoeval.com`, the first question is *which cases fail*, so the report keeps the
+  binary failing-case flags (`with-skill-failed`, negative-delta) primary. Per the valley-dodging
+  post, a `critical` failure is worse still: it is excluded from the mean entirely and surfaced on
+  its own, because one catastrophe across twenty runs is a catastrophe, not a 95%. A high graded
+  mean must never hide a failing case, and never hide an absorbing-barrier hit.
+- **Caution — brittle solutions.** Stacking `critical` prohibitions backfires: an agent gets
+  obstinate or honors the rule while missing the objective. Pair every `critical` assertion with
+  negative / false-positive cases that prove the skill still does the reasonable thing, the same
+  way trigger evals guard against over-triggering.
+- **Testing:** unit tests for gate-fail, soft-below-threshold, and `--strict`; a `critical`-fail
+  test proving the case is vetoed and excluded from the graded mean even when other scores are
+  perfect; a graded-dimension judge result merged from a fixture; a `dynamic_rubric` fixture
+  asserting the `minimum_criteria` cutoff; a `score_delta` test with a known-significant and a
+  known-flat fixture pair; a reference-floor regression test; and a regression test proving an
+  unchanged binary manifest yields identical pass rates.
 
 ### 2.3 Tool replay
 - **Goal:** deterministic re-runs that pay nothing for external dependencies, by recording tool
