@@ -82,3 +82,63 @@ Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-a
 - [ ] Full terminal status set in production.
 - [ ] Whether directory trees should be uploaded as individual files or archives.
 - [ ] Whether `use_trial_keys` is available to all relevant accounts or only trial collections.
+
+---
+
+# Eval-framework parity & ideas
+
+Backlog distilled from a comparison against eve.dev, Sentry vitest-evals, viteval,
+openai/evals, Anthropic skill-creator + eval-viewer, the "Your evals will break" essay,
+and the OpenAI eval-skills blog. Full design in
+[`docs/eval-framework-roadmap-spec.md`](docs/eval-framework-roadmap-spec.md).
+
+**Moat — do not dilute:** causal lift, `tune`/`holdout`/`holdback` splits, leakage lint,
+ablations, and saturation/no-lift flags are unique to this harness. None of the surveyed
+frameworks have them, and notably *none* have first-class multi-model comparison either.
+Every item below slots around these, not over them.
+
+## Bucket 1 — near drop-in (fits the existing contract)
+
+- [ ] Ship built-in judge presets (`factuality`, `tool_call`, `structured_output`) that return the existing `{passed, score, rationale}` shape with numeric thresholds, layered on `--judge-cmd`. (`tool_call` / `structured_output` are largely deterministic; reuse `command_order` / `json_field_equals` substrate.)
+- [ ] Add a GitHub Actions reporter (PR annotations + Check Runs) and/or JUnit XML emitter over `benchmark.json`.
+- [ ] Add a centralized judge config slot and a `validate` check that enforces "judge model ≠ model under test."
+- [ ] Add a local/deterministic `similarity` scorer (e.g. levenshtein/normalized-ratio) with a threshold. (Embedding-backed variant is Bucket 4.)
+- [x] Author an opinionated workflow/quickstart guide (`docs/authoring-evals.md`).
+- [ ] Fold the workflow guidance into `validate`/`audit-manifest` hints where enforceable.
+
+## Bucket 2 — natural extension of an existing subsystem
+
+- [ ] **Multi-model fan-out (priority).** Accept a model list in `prepare`/`run-codex`; `benchmark` groups by model and computes per-model lift. Per-run `model` already lands in `metadata.json`; the fan-out parallels variant fan-out.
+- [ ] Numeric scores + gate/soft severity tier on assertions (`gate` / `soft` / `atLeast`), gated by split.
+- [ ] Tool replay: record tool inputs+outputs (keyed/sanitized/versioned) so a live re-run is deterministic and free of external-dep cost. Runner-side; pairs with the subagent runner. (Distinct from grading, which already replays from disk.)
+- [ ] Adopt OpenTelemetry GenAI semantic conventions as the `events.json`/`metrics.json` normalization target.
+- [ ] Dataset abstraction: fan one case template over a row set; optionally persist/generate datasets.
+- [ ] Cross-run trend tracking (lift / saturation / token-overhead drift over time).
+- [ ] Built-in subagent runner (Claude Code / Agent SDK Task) that emits the run-output contract; analogue of vitest-evals' OpenAI-Agents harness.
+- [ ] Interactive served report (feedback capture + richer artifact rendering: image/pdf/xlsx) over static `render-viewer`. eval-viewer's `generate_review.py` is a blueprint.
+- [ ] Iteration-over-time workflow: `iteration-N/` dirs + `--previous-workspace` diff + `feedback.json` capture.
+- [ ] "Living eval" loop: act on saturation flags by proposing harder cases (generation step opt-in/external, never in core grading).
+
+## Bucket 3 — bigger lift (new axis or core-contract change)
+
+- [ ] Multi-turn / scripted cases (changes the single-`output.md` run contract, runners, and grading).
+- [ ] Per-model lift/pairing analysis and reporting (the heavier half of multi-model, beyond simple fan-out).
+- [ ] No-code template/registry eval definitions (overlaps the dataset abstraction; broader reframing of manifest authoring).
+
+## Bucket 4 — adopt with care (design-principle tension)
+
+Core grading is local, deterministic, and never calls a model; the harness does not pick a
+model. Keep anything that needs a model behind opt-in commands / external `--judge-cmd`,
+never in the core grade path.
+
+- [ ] Embedding-backed `similarity` scorer (needs a model/embeddings) — keep optional like `script`.
+- [ ] Auto-generation of harder cases for the living-eval loop (needs a model) — separate opt-in command; generated cases reviewed before entering a manifest.
+
+## Punted — questionable value
+
+- [ ] **Ship the harness as an agent-authoring skill** (à la vitest-evals' `npx skills add ...`).
+      Punted as **questionable value**: it is meta/self-referential, overlaps the new
+      `docs/authoring-evals.md` guide, adds a packaging/maintenance surface, and serves a
+      narrow audience (agents authoring manifests) versus shipping real grading
+      capability. Revisit only if external skill authors actually adopt the harness and ask
+      for an agent-guided authoring path.
