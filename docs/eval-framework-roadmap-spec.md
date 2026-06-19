@@ -118,6 +118,21 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   (binary, unchanged), and a malformed line (ignored, falls back to exit code). Reuse the
   existing `script`-assertion fixtures under `--allow-scripts`.
 
+### 1.9 Staleness and pruning hygiene
+- **Goal:** keep the suite lean. `howtoeval.com` argues 20 high-signal cases beat 200 edge cases,
+  and that an eval which has not failed in months is either testing nothing or the agent improved
+  past it — either way, question it. This is the inverse of the saturation flag: saturation marks
+  a case as too easy *now*; staleness marks a case that has never discriminated *over time*.
+- **Abstractions used or changed:** reads the cross-run history from 2.6. A `prune` report (or a
+  flag in `build_benchmark_report` (`:2182`)) marks a case a removal candidate when, across the
+  last N runs, it never failed and never showed lift (`with_skill` == `without_skill` every time).
+  `audit_manifest_report` (`:2870`) lists the candidates; removal stays a human decision.
+- **Design:** the harness suggests, never deletes. A case may be kept deliberately as a
+  regression guard even when stale; the report says so rather than acting.
+- **Depends on:** 2.6 (needs run history to judge "never failed over time").
+- **Testing:** a fixture history where one case is always-flat and one discriminates; assert only
+  the flat one is flagged, and that a single run never flags anything.
+
 ---
 
 ## Bucket 2 — natural extension
@@ -168,6 +183,11 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   to graded dimensions plus the statistical gate instead of stopping at the flag. Add a
   `structurally-pass-but-forgettable` flag (objective saturated, graded score low) — the
   signal `adewale/slide-maker` names as "competent but forgettable work."
+- **Floor-raising, not benchmark-maxxing:** graded scores measure *how much better* and feed
+  lift; they are not the headline. Per `howtoeval.com`, the first question is always *which cases
+  fail*, so the report keeps the binary failing-case flags (`with-skill-failed`, negative-delta)
+  primary and presents the graded mean as a secondary measure. A high graded mean must never hide
+  a failing case.
 - **Testing:** unit tests for gate-fail, soft-below-threshold, and `--strict`; a graded-dimension
   judge result merged from a fixture; a `dynamic_rubric` fixture asserting the `minimum_criteria`
   cutoff; a `score_delta` test with a known-significant and a known-flat fixture pair; a
@@ -204,6 +224,10 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   concrete cases before fan-out; `validate_manifest` validates rows and runs leakage lint per
   materialized case.
 - **Design:** materialization happens early, so prepare, grade, and report stay unchanged.
+- **Representativeness guard:** fan-out makes it cheap to balloon a suite, which `howtoeval.com`
+  warns against (20 high-signal cases beat 200 edge cases). Pair this with the staleness check
+  (1.9): a generated row earns its place by discriminating, and flat rows are pruned. The point of
+  templating is coverage of real variation, not case count.
 - **Testing:** N rows materialize N cases with stable ids, and leakage lint fires on a leaky
   template.
 
@@ -262,6 +286,10 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
 - **Abstractions used or changed:** detection already exists in the saturation and no-lift flags
   of `build_benchmark_report`. Add an opt-in `suggest-cases` command that reads the flags and
   emits candidate prompts, with the generation step behind an external model command.
+- **Representativeness guard:** a suggested case is a candidate, not an addition. `howtoeval.com`'s
+  rule holds — do not add a case for every failure unless it represents a real pattern. The loop
+  runs both directions: 2.10 proposes hard cases, 1.9 prunes flat ones, so the suite tracks the
+  failure surface instead of growing without bound.
 - **Testing:** the flag-to-candidate selection is tested deterministically; generation is mocked,
   and a generated case never enters a manifest on its own.
 

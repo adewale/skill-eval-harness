@@ -186,6 +186,28 @@ eval case, so add it.
 Tune saturation is not release proof. Hold the claim of release quality until hidden prompts,
 private answer keys, and real fixtures are filled and scored on `holdout` and `holdback`.
 
+## Diagnosing a failure
+
+When `with_skill` fails a case, resist patching the symptom. Work the trace the way you would a
+production incident:
+
+1. **Find the seam.** Read the run's `events.json` and `output.md`, locate the last step that went
+   right, and the first that went wrong. The break between them is where the skill lost the thread.
+2. **Classify the failure.** Most fall into a few types: the skill never loaded (trigger gap),
+   it loaded but ignored a fixture (context loss), a command failed or was skipped (tool failure),
+   or it answered confidently past its evidence (overconfidence). The type points at the fix.
+3. **Fix the pattern, not the incident.** If the description under-triggered, widen the
+   description, not this one prompt. If a reference was ignored, fix how the skill points at
+   references. A fix that only satisfies one case usually just moves the failure.
+4. **Add a regression case — then prune.** Add a case only if the failure represents a real
+   pattern, not a one-off. A suite is a memory of bugs you refuse to reintroduce, but a case that
+   never fails again and never shows lift is dead weight; drop it. Twenty cases that discriminate
+   beat two hundred that always pass.
+
+The path matters as much as the answer. A case can produce the right final text for the wrong
+reason, so grade the trajectory (`skill_invoked`, `command_order`) alongside the output, and treat
+a right answer reached the wrong way as a finding, not a pass.
+
 ## Pitfalls that cost us rounds
 
 - **Leaky keyword assertions**: the no-skill baseline passes by echoing the task.
