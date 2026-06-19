@@ -75,6 +75,24 @@ An assertion is one check. The harness sorts them into four families
 is a `passed` boolean and no numeric score except the one a judge may attach. The roadmap's
 severity tier changes exactly this shape.
 
+The planned graded shape (roadmap 2.2, ported from `adewale/anti-slop-writing`) adds an optional
+`score` and `severity` (`gate` or `soft`), plus two `judge` assertion forms:
+
+```jsonc
+// anchored dimension: the judge scores against named, observable anchors
+{ "type": "judge", "graded_dimensions": [
+  { "name": "specificity", "scale": "1-5",
+    "rubric": "5 = names the failure mode and the mechanism; 1 = generic restatement" }
+] }
+
+// dynamic rubric: the judge drafts case-specific criteria, then grades against them
+{ "type": "judge", "dynamic_rubric": { "instruction": "draft 3-5 criteria from the brief",
+                                       "minimum_criteria": 3 } }
+```
+
+A graded assertion answers "how much better," where the binary `passed` answers only "right or
+wrong." That distinction is the reason a saturated binary case can still show graded lift.
+
 ## Prepared task row
 
 `prepared_task_rows` fans `cases × variants × runs_per_variant` into runner-neutral rows.

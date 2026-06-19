@@ -87,16 +87,40 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   correct `run_dir`s, and a report test over fixture runs under two models asserting per-model
   lift.
 
-### 2.2 Numeric scores and a gate/soft severity tier
-- **Goal:** replace binary pass/fail with scored, severity-tagged assertions, gated by split.
-- **Abstractions used or changed:** `assertion_result` (`:1642`) gains an optional `score` and
-  `severity` (`gate` or `soft`), read from `gate`/`soft`/`atLeast` on the assertion.
-  `grade_case_variant` (`:1877`) splits totals into gated and soft, where a soft failure does
-  not lower the pass rate but fills a `scored` bucket. A `--strict` flag promotes soft to gate.
-- **Design:** default severity keeps current behavior (objective is a gate; `judge` and
-  `similarity` are soft), so existing manifests score identically.
-- **Testing:** unit tests for gate-fail, soft-below-threshold, and `--strict`, plus a regression
-  test proving an unchanged manifest yields identical pass rates.
+### 2.2 Graded scoring, severity, and statistical lift
+- **Goal:** measure how much better or worse, not only pass or fail. A binary check saturates:
+  once `with_skill` and `without_skill` both pass, a zero delta reads as no-regression evidence,
+  not as proof of improvement. Graded scores keep measuring after the binary ceiling.
+- **Reference implementation:** `adewale/anti-slop-writing` already runs this model in
+  production. Its `evals/rewrite-evals.json` carries `graded_dimensions` and `dynamic_rubric`;
+  `scripts/score_delta.py` gates on a statistical delta; reference-anchor cases set a
+  no-regression floor. This spec ports those shapes into the harness rather than inventing new
+  ones.
+- **Abstractions used or changed:**
+  - `assertion_result` (`:1642`) gains an optional `score` (0-1 or a normalized 1-5) and
+    `severity` (`gate` or `soft`), read from `gate`/`soft`/`atLeast` on the assertion.
+  - **Anchored `graded_dimensions`** as a `judge` assertion shape:
+    `{name, scale: "1-5", rubric: "5 = …observable…; 1 = …observable…"}`. Anchors name what each
+    score level looks like, so a judge scores against criteria, not a vibe. `judge_prompt`
+    (`:1767`) renders the dimensions; the result carries per-dimension scores in `evidence`.
+  - **`dynamic_rubric`** as a second `judge` shape: `{instruction, minimum_criteria}`. The judge
+    drafts 3-5 case-specific criteria before grading and must meet at least `minimum_criteria`.
+  - `grade_case_variant` (`:1877`) splits totals into gated and soft. A soft failure does not
+    lower the pass rate; it fills a `scored` bucket. A `--strict` flag promotes soft to gate.
+  - **Statistical lift** in `build_paired_summary` (`:2119`): alongside the raw delta, compute a
+    significance test over the per-case graded scores (paired bootstrap or sign-flip
+    permutation, mirroring `score_delta.py`), so lift is tested, not eyeballed.
+  - **Reference-anchor floor:** an optional `reference_score` / `reference_graded_score` on a
+    case sets a floor; scoring below it on any dimension is flagged as a regression.
+- **Design:** default severity keeps current behavior (objective is a gate; `judge`,
+  `similarity`, and graded dimensions are soft), so existing manifests score identically. This
+  also gives the saturation flags a next move: when a binary case saturates, the report points
+  to graded dimensions plus the statistical gate instead of stopping at the flag.
+- **Testing:** unit tests for gate-fail, soft-below-threshold, and `--strict`; a graded-dimension
+  judge result merged from a fixture; a `dynamic_rubric` fixture asserting the `minimum_criteria`
+  cutoff; a `score_delta` test with a known-significant and a known-flat fixture pair; a
+  reference-floor regression test; and a regression test proving an unchanged binary manifest
+  yields identical pass rates.
 
 ### 2.3 Tool replay
 - **Goal:** deterministic re-runs that pay nothing for external dependencies, by recording tool
