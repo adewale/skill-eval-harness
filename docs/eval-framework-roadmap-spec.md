@@ -20,6 +20,97 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
 
 ---
 
+## Confidence floor — the smallest set that makes a reported lift believable
+
+These changes test the harness; they do not eval a skill. The difference is the one in
+[`evals-are-not-tests.md`](evals-are-not-tests.md): an eval samples a stochastic model and scores a
+difference, so one run is a sample, while a test runs one program against a known answer, so one run
+is a verdict. Every item here is a test in that sense: deterministic, local, no model call, settled
+in one run. None of them adds a new eval. Together they make executable the guarantees
+`evals-are-not-tests.md` states in prose — it claims the harness reports an honest lift, and these
+tests are where that claim is checked rather than trusted.
+
+The buckets below extend what the harness can measure. This floor decides whether the number it
+already prints can be believed. The harness reports one thing: lift, `with_skill` minus
+`without_skill` on the same case (`build_paired_summary` (`:2119`)). That number is believable only
+when three preconditions hold, each intended today, none enforced, and each restating a claim from
+`evals-are-not-tests.md`:
+
+1. the detectors do not lie, by firing falsely or staying silent falsely (CF.1; "assert the
+   *behavior*, not one spelling");
+2. the `without_skill` baseline cannot read the skill, or it "masquerades as a skilled run" (CF.2);
+3. grading is deterministic, local, and model-free, so a run dir grades the same way every time
+   (CF.3 and CF.4; "deterministic local grading … with no model call").
+
+These items are fixtures and tests, not engine changes, which is what keeps the set small, and none
+touches the lift/splits/ablations moat. Sequence them before the buckets, because a graded (2.2) or
+multi-model (2.1) feature built on unverified detectors only scales an unverified result.
+
+### CF.1 — Detector meta-fixtures (the keystone)
+- **Goal:** prove no detector manufactures or erases lift. A false-positive `contains` or a
+  false-silent `excludes_any` shifts a `with_skill` or `without_skill` pass rate, inventing or
+  hiding the quantity the tool exists to measure.
+- **Abstractions used or changed:** none in the engine. Adds
+  `tests/fixtures/detectors/<detector_id>/should-fire.*` and `should-pass.*` that exercise
+  `assertion_result` (`:1642`) directly. That function has no direct unit test today, and its
+  `contains_any`, `excludes_any`, and `not_regex` branches go unexercised even though their types
+  are declared at `:29`-`:54`.
+- **Design:** one table-driven test loads every pair and asserts the detector fires on `should-fire`
+  and stays silent on `should-pass`. A `should-pass` twin is mandatory: it enforces the
+  false-positive bar `authoring-evals.md` already sets for skill authors ("check both presence and
+  absence"). Each `should-pass` set includes a case where the baseline echoes the prompt, because a
+  detector that passes on echoed prompt text is a false oracle; this ties the fixtures to leakage
+  lint (`prompt_assertion_leakage_findings` (`:164`)). Every detector bug then becomes a permanent
+  fixture pair, and `test_command_assertions_match_command_inputs_not_outputs` is the first.
+- **Why it is the keystone:** the fixture pair is also the registration contract. It is what lets a
+  harvested or third-party detector be trusted on entry, so it gates the exapted detector library
+  (TODO, end of 2026), and it raises the oracle-strength ladder (1.7) so that "strong" means
+  fixture-verified, not only deterministic.
+- **Testing:** the fixtures are the test. A meta-test asserts every name in `OBJECTIVE_ASSERTIONS`
+  (`:53`) has a fixture pair, so a new detector cannot land unverified.
+
+### CF.2 — One cross-runner baseline-isolation invariant
+- **Goal:** prove the baseline is skill-free by construction, so a measured lift is the skill's
+  effect and not an artifact of a baseline that grepped the skill out of the source tree.
+- **Abstractions used or changed:** one invariant over every runner's `without_skill` workspace. It
+  folds today's per-runner checks — `test_pi_smoke_workspace_omits_skill_for_without_skill` and the
+  Jetty `without_skill` mount test — into a single guard the run-output contract must satisfy.
+- **Design:** build each runner's `without_skill` workspace from a fixture manifest and assert the
+  skill files are unreachable by read, find, and grep. A new runner such as the subagent runner
+  (2.7) inherits the check by registering its workspace builder, so adding a runner cannot quietly
+  reintroduce the leak.
+- **Testing:** the invariant test, parameterized over the registered runners.
+
+### CF.3 — Re-grade idempotence
+- **Goal:** prove the claim the cheap-re-grade workflow rests on — grading reads only from disk and
+  is deterministic.
+- **Abstractions used or changed:** none. A test over a fixture run set.
+- **Design:** grade the same run directory twice and assert a byte-identical `benchmark.json`
+  (modulo an explicit timestamp field). Any hidden nondeterminism — dict ordering, set iteration in
+  flag computation, a stray clock read — surfaces here rather than as drift between two real runs.
+- **Testing:** the idempotence test over an existing fixture run set.
+
+### CF.4 — A guard that the core grade path calls no model and no network
+- **Goal:** make the governing invariant — "core grading stays local and deterministic and never
+  calls a model" — executable rather than aspirational.
+- **Abstractions used or changed:** none. A test-time guard around `grade_case_variant` (`:1877`).
+- **Design:** patch `urllib` and `subprocess` to raise, then grade a fixture covering every
+  objective family (text, process, efficiency) and assert it completes. The sanctioned exceptions —
+  `script` oracles and `judge` plumbing — are excluded from this path by design and keep their own
+  opt-in tests (`--allow-scripts`, `--judge-cmd`). The guard fails the day a detector
+  reaches for the network or a subprocess inside the grade path.
+- **Testing:** the guard test across the objective families.
+
+### Boundary
+The set stops here deliberately. Report-level correctness — whether the saturation, no-lift, flaky,
+and negative-delta flags (`build_benchmark_report` (`:2182`)) are computed right — sits a layer
+above the raw measurement, where the golden-report tests the buckets already plan (1.2, 2.6) cover
+it. CF.1–CF.4 are the floor underneath that work: once they pass, a printed lift carries a checked
+measurement, and every feature in the buckets builds on a number that has been verified rather than
+assumed.
+
+---
+
 ## Bucket 1 — near drop-in
 
 ### 1.1 Built-in judge presets (`factuality`, `tool_call`, `structured_output`)
