@@ -40,7 +40,7 @@ The main question is narrow: **when the same case runs with and without the skil
 > Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Install from GitHub first:
 >
 > ```bash
-> uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.4.1
+> uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.4.2
 > ```
 
 Run these from a skill repo that has `evals/shared-benchmark.json`:
@@ -89,12 +89,12 @@ viewer    -> review.html with assertion evidence and output previews
 ### From GitHub
 
 ```bash
-uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.4.1
+uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.4.2
 skill-benchmark --help
 skill-pi-trigger-eval --help
 
 # One-shot without installing globally:
-uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.4.1 skill-benchmark --help
+uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.4.2 skill-benchmark --help
 ```
 
 The installed commands are:
