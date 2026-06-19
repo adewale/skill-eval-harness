@@ -236,7 +236,12 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
 - **Abstractions used or changed:** a consumer of `build_benchmark_report`. Add an append-only
   history store and a `trend` subcommand that diffs successive `benchmark.json` files, reusing
   the `compare_results` (`:2475`) logic.
-- **Testing:** a golden diff over two fixture reports.
+- **Severity-weighted ranking (from the macro-evals notebook):** when surfacing recurring
+  failures across runs, rank them by `prevalence × severity`, not raw count, so a rare but severe
+  failure outranks a common trivial one. This is the floor-raising principle made quantitative;
+  it reuses the per-assertion severity from 2.2.
+- **Testing:** a golden diff over two fixture reports, plus a ranking test where a low-frequency
+  high-severity failure outranks a high-frequency low-severity one.
 
 ### 2.7 Built-in subagent runner
 - **Goal:** a runner that needs no external CLI, dispatching a task to a Claude Code or Agent SDK
@@ -312,7 +317,12 @@ mock already in the suite. Each item below names the fixtures or mocks it adds.
   it.
 - **Abstractions used or changed:** extend `build_paired_summary` and `build_slice_summary` for
   the model axis, plus a viewer panel.
-- **Testing:** a report test over a two-model by two-variant fixture grid.
+- **Slice-lift concentration (from the macro-evals notebook):** compute, per slice, where lift (or
+  a failure) concentrates — `slice share ÷ overall share`, the macro-eval `lift` metric one level
+  up from per-case lift. `build_slice_summary` (`:2156`) already groups by domain/difficulty/
+  trigger/goal, so this is a ratio over groups it already forms, not new plumbing.
+- **Testing:** a report test over a two-model by two-variant fixture grid, plus a concentration
+  test asserting a failure confined to one slice scores a high ratio there.
 
 ### 3.3 No-code template/registry eval definitions
 - **Goal:** author in YAML and JSONL without editing the JSON manifest by hand.
@@ -335,6 +345,20 @@ These need a model, so they stay out of core grading.
 - The generation step behind 2.10. A separate opt-in command whose output is candidate prompts a
   person reviews before they enter a manifest.
 - **Testing:** a mocked generator, asserting no manifest is mutated automatically.
+
+---
+
+## Explicitly out of scope
+
+**Macro-eval clustering and pattern discovery** (OpenAI's macro-evals notebook: embed traces ->
+UMAP -> HDBSCAN -> TF-IDF labels -> backward-walking "suspect" diagnosis). That layer sits *above*
+this harness: it mines thousands of *production* traces for unlabeled failure patterns. We are a
+pre-production, paired-comparison tool, so building clustering would pull us off the lift moat and
+toward a different product for a different stage. We take the two transferable ideas — severity-
+weighted failure ranking (into 2.6) and slice-lift concentration (into 3.2) — and leave the
+discovery engine out. The notebook's own caution is why: a discovered pattern "is not automatically
+a defect; it is where inspection begins," and "causality inference remains speculative" — the same
+flag-is-where-you-look discipline our saturation flags already hold.
 
 ---
 
