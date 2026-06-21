@@ -64,6 +64,7 @@ All notable public changes are listed here. Release tags are the source of truth
 - Add a `preprocess` removal mechanism (inline `` !`command` `` and ```` ```! ```` blocks) and complete the materialization provenance (`skill_hash`, per-component `removed_bytes`). Add an end-to-end Pi smoke execution test (stubbed `pi` binary) proving the materialized ablated skill is what actually runs, plus coverage for the script/asset/reference-both/multi-root paths and symlink-escape containment.
 - Add `docs/skill-ablation-spec.md` (materialized-ablation design) and index it from the README.
 - Add `docs/vocabulary.md` glossary and `docs/evals-are-not-tests.md` conceptual page; link both from the README documentation map. Docs only; no behavior changes.
+- Add `docs/academic-grounding.md` mapping harness vocabulary to its research constructs (treatment effect, behavioral testing, construct validity, shortcut learning, contamination), qualify `adversarial` as a contrast set, and define case-polarity and negative-delta glossary entries. Docs only; no behavior changes.
 
 ## v0.4.2 — 2026-06-12
 
