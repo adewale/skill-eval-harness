@@ -1,400 +1,415 @@
 # Materialized Skill Ablation Spec
 
-Status: design spec, unimplemented. This closes the open `TODO.md` item
-"Materialize true ablated skill files instead of instruction-simulated
-ablations", discharges the "next improvement" recorded in `LESSONS_LEARNED.md`
-(2026-06-09, *Ablations are not evidence until they are run*), and supplies the
-materialized `ablation:<id>` runs that `docs/trace-aware-eval-spec.md` already
-names as the release-grade baseline.
+Status: design spec, unimplemented. Revised after the PR #20 review — it
+corrects a false claim that runners already consume materialized paths,
+separates component semantics from case routing, constrains manifest-controlled
+filesystem paths, and pins down the removal-vs-substitution boundary and the
+evidence a regression actually requires.
+
+This closes the `TODO.md` item "Materialize true ablated skill files", discharges
+the `LESSONS_LEARNED.md` "next improvement" note (2026-06-09, *Ablations are not
+evidence until they are run*), and supplies the materialized `ablation:<id>` runs
+that `docs/trace-aware-eval-spec.md` names as the release-grade baseline.
 
 ## Design principle
 
 **An ablation is a hypothesis; a materialized ablation is the experiment.
-Ablate along the skill format's seams, not along lines of text.**
+Ablate along the skill format's seams, not along lines of text. Removal and
+substitution are different experiments and must not be conflated.**
 
-A skill is not a prose blob. It is a specified artifact — YAML frontmatter plus
-a Markdown body plus bundled resources — loaded into context in three
-progressive-disclosure stages. The structure the spec defines *is* the
-component taxonomy worth ablating. The harness materializes a real, altered
-skill tree, points the `ablation:<id>` variant at it, and lets every runner
-consume it exactly as it consumes `with_skill`. Removal logic lives in the
-harness once, not in each runner.
+The harness produces a real, altered skill tree and the runners execute against
+it. Removal logic lives in the harness once. But materialization is not free:
+the runners and the Jetty exporter currently reconstruct skill files from the
+manifest, so they must be refactored to consume the materialized tree (see
+*Runner integration*). The earlier draft's claim that they "already copy
+whatever `skill_paths` resolves to" was wrong.
 
 ## Grounding sources
 
-External — the format under test (read these before extending the schema; the
-field list evolves, so the materializer reads frontmatter generically rather
-than hardcoding it):
+External — the format under test (read before extending the schema; the field
+list evolves, so handling is data-driven, never a hardcoded list):
 
-- Agent Skills specification — `https://agentskills.io/specification`
-- Claude Code skills docs & frontmatter reference — `https://code.claude.com/docs/en/skills`
-- Skill authoring best practices — `https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices`
+- Agent Skills specification — `https://agentskills.io/specification` (defines `name` and a non-empty `description` as **required**).
+- Claude Code skills docs & frontmatter reference — `https://code.claude.com/docs/en/skills`.
+- Skill authoring best practices — `https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices`.
 
 Internal — the contracts this builds on:
 
-- `validate_manifest` ablation block (`skill_benchmark.py:255`) — today checks only `id` + `removed_component`.
-- `variant_instruction` (`skill_benchmark.py:265`) — emits the per-arm instruction.
-- `task_variants` / `prepared_task_rows` (`skill_benchmark.py:302`, `:314`) — emit task rows; `skill_paths` is currently identical for every variant.
-- `safe_task_json` (`skill_benchmark.py:452`) — Jetty export; already stamps `ablation.mode = "instruction_simulated"` (`:471`).
-- `copy_skill_source` (`examples/adewale-workspace/run_pi_smoke.py:100`) — the skill-tree copy shape (SKILL.md + `references`/`scripts`/`assets`) to reuse.
-- `docs/vocabulary.md` — *Ablation*, *Variant*, *Token overhead*, *Trigger / no-trigger*.
-- `LESSONS_LEARNED.md` — *trigger boundary* (descriptions), *ablations are not evidence until run*, *per-variant workspaces*.
+- `validate_manifest` ablation block (`skill_benchmark.py:255`) — today checks only non-empty `id` + `removed_component`.
+- `variant_instruction` / `task_variants` / `prepared_task_rows` (`skill_benchmark.py:265`, `:302`, `:314`) — `skill_paths` is currently the manifest's, identical for every variant.
+- `safe_task_json` / `build_jetty_payload` (`skill_benchmark.py:452`, `:486`) — Jetty export; ablation reads `task["skill_paths"]`, uploads flat files via `JettyClient.upload` → `read_bytes` (`:706`) with a basename-only `remote_path_hint`.
+- `copy_skill_to_config` (`skill_benchmark.py:47`) and `copy_skill_source` (`run_pi_smoke.py:100`) — both collapse a file-valued path to `<dir>/SKILL.md`, `rmtree` the destination, and whitelist only `references`/`scripts`/`assets`.
+- `run_pi_trigger_eval.py` — the autonomous-trigger runner; copies from the manifest and takes no variant input.
 
 ## Current state: instruction-simulated ablations
 
-Every variant — including `ablation:<id>` — receives the **same unmodified
-skill**. `prepared_task_rows` emits the real `skill_paths` for all variants and
-differentiates only the instruction string. The runner copies the full real
-skill and appends "ignore component X … this is an instruction-simulated
-ablation, not a materialized alternate skill file" (`run_pi_smoke.py:161`).
+Every variant — including `ablation:<id>` — receives the same unmodified skill.
+The runner copies the full real skill and the instruction asks the model to
+"ignore component X" (`run_pi_smoke.py:161`). This is a prompt *about* the skill,
+not a changed skill: weak evidence, because the model still sees the full text.
+It stays supported as a fallback (see *Modes*), but it is no longer how an
+ablation that declares a removal behaves.
 
-This is a prompt *about* the skill, not a changed skill. It is a useful
-planning scaffold but weak evidence: the model still sees the full text and may
-follow it anyway, and the result cannot be attributed to the component's
-absence. Instruction-simulated mode remains supported as an explicit fallback;
-it stops being the default for ablations that declare a mechanism.
+## A skill is a structured artifact: component class vs case population
 
-## A skill is a three-layer artifact
+Two orthogonal axes, kept separate (the earlier draft fused them into one
+overloaded `layer`):
 
-Progressive disclosure loads a skill in three stages, and **the layer you cut
-determines what the ablation measures and which cases can show it**:
+**Component semantic class** — what kind of thing the component is. Selects the
+mechanism and the integrity rules.
 
-| Layer | Contents | Loaded | Ablation tests | Discriminating cases |
-|---|---|---|---|---|
-| **Discovery** | `name`, `description`, `when_to_use` | startup, always | does the skill **trigger**? | trigger / no-trigger cases |
-| **Execution** | `SKILL.md` body | on invocation | does **answer quality** degrade? | answer cases where `with_skill` > `without_skill` |
-| **On-demand** | `references/`, `scripts/`, `assets/`, inline `` !`cmd` `` | only if the body reaches them | is the resource **reached and load-bearing**? | answer cases that need the resource |
+| Class | Contents | Loaded / used | Notes |
+|---|---|---|---|
+| `discovery` | `name`, `description`, `when_to_use`, `paths`, `disable-model-invocation`, `user-invocable` | startup; governs activation | `name` + non-empty `description` are required by spec |
+| `runtime` | `allowed-tools`, `disallowed-tools`, `model`, `effort`, `context`, `agent`, `shell`, `hooks` | when active; configures behavior | the legal home for `model`/`effort` ablations |
+| `instructions` | `SKILL.md` body prose, sections, lists | on invocation | the bulk of execution guidance |
+| `resource` | `references/`, `scripts/`, `assets/` files | on demand, if the body reaches them | pointer vs content are separable |
+| `preprocess` | inline `` !`command` `` blocks | **before** the body reaches the model | executes at render time, not on demand |
 
-Two consequences:
+**Case population** — *derived* from the classes present, not declared:
 
-1. The current rule "ablations skip trigger cases" (`README.md:569`) is correct
-   *for execution and on-demand ablations* — but discovery ablations are the
-   opposite: they run **only** against trigger cases. The repo already holds
-   that this axis exists ("trigger evals are mostly description evals",
-   `LESSONS_LEARNED.md:119`); this spec wires the existing trigger path to the
-   ablation flow rather than inventing machinery.
-2. An on-demand resource loads only if the body points at it, so a reference has
-   two independently-removable parts (pointer vs content) that test different
-   things. See *Mechanisms*.
+- `discovery` components → **trigger** cases (does the skill activate?).
+- `runtime` / `instructions` / `resource` / `preprocess` components → **answer**
+  cases (does behavior degrade once active?).
+
+An ablation's population is the population of its components; the *layer
+cohesion* gate forbids mixing the two populations. This gives `model`/`effort` a
+defined class (`runtime`), routing (answer), and provenance slot — which the old
+three-value `layer` enum could not express.
 
 ## Vocabulary additions
 
-- **Materialized ablation** — an `ablation:<id>` variant whose skill files are a
-  real, altered copy of the skill, produced by the harness. Contrast with
-  *instruction-simulated*.
-- **Ablation layer** — `discovery` | `execution` | `on_demand`. Selects what the
-  ablation tests and which case kinds it runs against.
-- **Removal mechanism** — how a single component's alteration is produced
-  (`frontmatter_field`, `section`, `anchor`, `list_item`, `patch`, `reference`,
-  `script`, `asset`, `instruction_simulated`).
-- **Component** — one `{mechanism, target}` removal. An ablation removes one or
-  more components as a unit; multiple components test *joint* load-bearingness.
-- **Ablation provenance** — the recorded `{mode, layer, components, diff_stat,
-  skill_hash}` on every `ablation:<id>` run, so reports never conflate a
-  materialized regression with a simulated one.
+- **Materialized ablation** — an `ablation:<id>` whose skill files are a real,
+  altered copy, produced by the harness. Contrast *instruction-simulated*.
+- **Component** — one `{class, mechanism, target}` edit, scoped to one skill
+  root. An ablation removes one or more components as a unit.
+- **Component class** — `discovery | runtime | instructions | resource | preprocess`.
+- **Case population** — `trigger | answer`, derived from the classes.
+- **Mode** — *derived*, not declared: `materialized` iff the entry declares a
+  removal (`mechanism`+`target` or `components`); otherwise `instruction_simulated`.
+- **Skill root** — one entry of the manifest's `skill_paths`. Every component
+  names the root it edits; roots are materialized separately and never merged.
+- **Ablation provenance** — `{mode, population, components:[{class, mechanism,
+  skill_root, target, diff_stat}], skill_hash}` on every run.
 
 ## Manifest schema
 
-The ablation entry gains an optional `layer` plus a removal declaration in one
-of two forms: the single-component `mechanism` + `target` shown below, or a
-`components` list (see *Multi-component ablations*). Back-compat: an entry with
-no removal declaration keeps today's behavior exactly — `instruction_simulated`,
-execution layer. Existing manifests are untouched.
+The ablation entry gains an optional removal declaration in one of two forms:
+single-component `mechanism` + `target`, or a `components` list. **Mode is
+derived** — an entry with no removal declaration is `instruction_simulated`
+(today's behavior, untouched); `instruction_simulated` is not a mechanism value.
+Every component names a `skill_root` and carries a `class`.
 
 ```jsonc
 {
-  "id": "no-regression-proof",
-  "removed_component": "regression-proof requirement",   // kept: human-readable label
-  "expected_regressions": ["Accepts weak tests that pass without the fix"],
-  "layer": "execution",                                   // discovery | execution | on_demand
+  "id": "no-regression-proof",                 // unique, slug: ^[a-z0-9][a-z0-9-]*$
+  "removed_component": "regression-proof requirement",   // human label
+  "expected_regressions": [                     // structured; see Provenance
+    { "summary": "Accepts weak tests that pass without the fix",
+      "cases": ["pos-security-meaningless-test"],
+      "assertions": ["detect-weak-test"] }
+  ],
   "mechanism": "section",
-  "target": { "skill_path": "SKILL.md", "heading": "## Regression-proof requirement" }
+  "class": "instructions",
+  "target": { "skill_root": "skills/good-pr/SKILL.md", "heading": "## Regression-proof requirement" }
 }
 ```
 
-`target` shape per mechanism:
+`target` shape per mechanism — `skill_root` is **required on every component**:
 
-| Mechanism | Layer | `target` | Removes |
+| Mechanism | Class | `target` (besides `skill_root`) | Operation |
 |---|---|---|---|
-| `instruction_simulated` | execution | *(none; uses `removed_component`)* | nothing — prompt-level fallback |
-| `frontmatter_field` | discovery / runtime | `{ "field": "allowed-tools" }` | one frontmatter key |
-| `section` | execution | `{ "skill_path": "SKILL.md", "heading": "## …" }` | heading + body + nested subheadings |
-| `anchor` | execution | `{ "anchor": "no-scope-check" }` | span between `<!-- ablation:ID:start/end -->` |
-| `list_item` | execution | `{ "section": "## …", "contains": ["…"] }` | matching list items in a section |
-| `patch` | execution / discovery | `{ "patch": "evals/ablations/<id>.patch" }` | any byte-level change (incl. one word) |
-| `reference` | on_demand | `{ "path": "references/x.md", "remove": "pointer\|content\|both" }` | body link, file, or both |
-| `script` / `asset` | on_demand | `{ "path": "scripts/x.py" }` | a bundled executable / asset file |
-
-Discovery-layer examples: remove the whole `when_to_use`
-(`frontmatter_field`), or excise one trigger phrase from `description` with a
-`patch`. Both run against trigger cases only.
+| `frontmatter_field` | discovery / runtime | `{ "field": "allowed-tools" }` | delete one key |
+| `section` | instructions | `{ "heading": "## …" }` | delete heading + body + nested subheadings |
+| `anchor` | instructions | `{ "anchor": "no-scope-check" }` | delete span between `<!-- ablation:ID:start/end -->` |
+| `list_item` | instructions | `{ "section": "## …", "contains": ["…"] }` | delete matching list items |
+| `patch` | instructions / discovery | `{ "patch": "evals/ablations/<id>.patch" }` | **deletion-only** unified diff (no `+` lines) |
+| `reference` | resource | `{ "path": "references/x.md", "remove": "pointer\|content\|both" }` | unlink (drop target, keep visible text) / delete file / both |
+| `script` / `asset` | resource | `{ "path": "scripts/x.py" }` | delete a bundled file |
 
 ## Mechanisms and granularity
 
-Granularity is two-dimensional: **which layer** × **how surgical**. Within the
-body the unit ladder is section → subsection → list item → sentence/word
-(patch). Worked before/after (from the prototype, on a representative
-`good-pr` skill):
+Granularity is two-dimensional: **which class** × **how surgical**. Within
+`instructions` the unit ladder is section → subsection → list item → sentence
+(deletion-only patch). Worked before/after (from the prototype, on a
+representative `good-pr` skill):
 
-`section` — takes nested `###` children with it:
+`section` — deletes the heading and its nested `###` children:
 
 ```diff
 -## Regression-proof requirement
 -For any bug-fix or security PR, require a test that **fails without the fix
 -and passes with it**. …
--### Why  … ### How to check …
  ## Severity and verdict
 ```
 
-`frontmatter_field` — structured, no diff fuzz (a seam prose ablation cannot reach):
+`frontmatter_field` — a structured seam prose ablation cannot reach:
 
 ```diff
- when_to_use: When the user asks to review a PR, diff, or patch …
 -allowed-tools: Read, Grep, Bash(git diff:*)
- ---
 ```
 
-`reference` with `remove: pointer` — file stays, body link goes, so the model never loads it:
+`reference` with `remove: pointer` — **unlink**: drop the target, keep the
+visible words, so no new prose is introduced (the file stays, undiscovered):
 
 ```diff
 -examples live in [the severity guide](references/severity.md).
-+examples live in its calibration guide.
++examples live in the severity guide.
 ```
 
-`patch` — finest grain; weaken a single directive that no section/anchor could isolate:
+`patch` (deletion-only) — finest grain; delete one sentence:
 
 ```diff
--Mentally revert the fix and ask whether the new test still passes. If it does,
-+Optionally revert the fix and ask whether the new test still passes. If it does,
+-and passes with it**. A test that passes on the unpatched code proves nothing.
++and passes with it**.
 ```
+
+## Removal versus substitution
+
+An `ablation:<id>` is **removal-only**. Every mechanism produces a net deletion;
+the *net-deletion* gate enforces it (a component must remove content and add
+none). Specifically: a `patch` component's hunks may contain only context and
+`-` lines; `reference` pointer removal unlinks rather than rewording.
+
+Replacement-bearing edits — `replace_with`, `set`, or a patch with `+` lines —
+are **substitution**, a different experiment (counterfactual / A-B, the granular
+sibling of the existing `old_skill` variant). They are out of scope here and
+tracked as the `swap:<id>` variant in `TODO.md`; the prototype's
+`Mentally → Optionally` edit is a *swap* example, not an ablation. Keeping the
+two apart is why an ablation cannot smuggle new instructions in through `patch`.
 
 ## Multi-component ablations
 
-A single ablation may remove more than one component, to test **joint**
-load-bearingness — the interaction single removals cannot see. Two cases it is
-for:
-
-- **Redundant guidance.** The same rule stated in the body *and* a reference:
-  removing either alone regresses nothing because the other still carries it, so
-  both single-component ablations read as "redundant/unclear" and miss it;
-  removing both reveals the rule was load-bearing all along.
-- **A capability that spans seams.** Instructions, a worked example, and a helper
-  script in three places; ablate the cluster to measure the capability rather
-  than a fragment.
-
-Declare components as a list; the single-component `mechanism`/`target` form is
-exactly sugar for a one-element list.
-
-```jsonc
-{
-  "id": "no-test-discipline",
-  "removed_component": "test-strength guidance (body section + checklist bullet + its reference)",
-  "expected_regressions": ["Accepts weak tests that pass without the fix"],
-  "layer": "execution",
-  "components": [
-    { "mechanism": "section",   "target": { "heading": "## Regression-proof requirement" } },
-    { "mechanism": "list_item", "target": { "section": "## Review checklist", "contains": ["fail on the pre-change code"] } },
-    { "mechanism": "reference", "target": { "path": "references/severity.md", "remove": "both" } }
-  ]
-}
-```
+One ablation may remove several components, to test **joint** load-bearingness —
+redundant guidance stated in two places, or a capability spanning seams — which
+single removals cannot detect. Declare a `components` list; the single
+`mechanism`/`target` form is sugar for a one-element list.
 
 Rules:
 
-- **One case population per ablation.** Components may not mix `discovery` with
-  `execution`/`on_demand`: the first changes triggering (measured on trigger
-  cases), the others change post-trigger behavior (measured on answer cases), and
-  a regression spanning both is unattributable. `execution` and `on_demand`
-  components may be combined — they share the answer-case population. Enforced by
-  the *layer cohesion* gate.
-- **Joint attribution only.** A multi-component ablation scores the cluster, not
-  its parts. To learn which part carries the effect, also declare the
-  single-component ablations and compare.
-- **Order-independent.** Components resolve against the original skill and must be
-  pairwise disjoint, so declaration order never changes the result (see
-  *Materialization engine*).
+- **One case population per ablation.** Components must not mix the `discovery`
+  class with `runtime`/`instructions`/`resource`/`preprocess` (different case
+  populations; a regression spanning both is unattributable). The answer-population
+  classes may be freely combined. Enforced by *layer cohesion*.
+- **Joint attribution only.** A multi-component ablation scores the cluster; pair
+  it with single-component ablations to attribute the effect to a part.
+- **Order-independent.** Components resolve against the original tree and must be
+  pairwise disjoint, so declaration order never changes the result.
 
 ## Materialization engine
 
-A reusable `materialize_ablation(manifest, repo_root, ablation, out_dir) ->
-list[Path]`:
+`materialize_ablation(manifest, repo_root, ablation, out_root) -> dict[skill_root, Path]`:
 
-1. Copy the real skill tree into `out_dir/<id>/` (reuse the `copy_skill_source`
-   shape: SKILL.md + `references`/`scripts`/`assets`).
-2. Resolve every declared component independently against the **original** copy
-   to a concrete edit (a span → replacement, per file). A `patch` component
-   resolves to the line range its hunks touch.
-3. Require the component edits pairwise disjoint (gate), then apply them in one
-   pass per file, processing spans back to front so earlier offsets stay valid.
-   Resolving against the original — never against another component's output —
-   makes the result order-independent and byte-deterministic.
-4. Run the gates (below). Refuse on any failure.
-5. Return the ablated skill paths.
+1. For each `skill_root` referenced by the ablation, copy that root's **complete
+   directory** into a fresh temp dir — the whole tree, not a `SKILL.md` plus a
+   three-directory whitelist, because the format permits arbitrary files. Roots
+   are kept **separate** (keyed by their relative path), never merged into one
+   `<skill_name>/SKILL.md`. This replaces `copy_skill_source` /
+   `copy_skill_to_config`, which collapse and overwrite roots.
+2. Resolve every component against the **original** copy of its named root to a
+   concrete edit (a span → deletion). A `patch` resolves to the line range its
+   hunks touch.
+3. Require component edits pairwise disjoint within a root (gate); apply them in
+   one pass per file, back to front so earlier offsets stay valid. Resolving
+   against the original — never another component's output — makes the result
+   order-independent and byte-deterministic.
+4. Run the gates. Refuse on any failure.
+5. Atomically rename the temp dir into `out_root/<id>/` (never `rmtree` a
+   manifest-named destination). Return the per-root materialized paths.
 
-Requirements:
+Requirements: **parse, do not regex** (YAML frontmatter incl. multi-line
+scalars; a CommonMark sectioner — a `##` inside a ``` fence is code, not a
+heading; anchors are HTML blocks; pointers are link nodes; the patch applier is a
+strict pure-python deletion-only unified-diff applier whose exact-context match
+*is* the drift detector). **Deterministic / idempotent** (no clocks/randomness;
+re-run is byte-identical). **Generic over frontmatter** (data-driven class map,
+not a hardcoded field list).
 
-- **Parse, do not regex.** Frontmatter is parsed as YAML (multi-line `>`/`|`
-  descriptions exist); the body is parsed with a CommonMark-aware sectioner. A
-  `##` inside a ```` ``` ```` fence is code, not a heading — a fence-naive matcher
-  mis-stops on it and orphans the block (demonstrated in the prototype). Anchor
-  comments are HTML blocks; reference pointers are link nodes. The patch applier
-  is a strict pure-python unified-diff applier (no new dependency); exact-context
-  matching means a stale patch refuses to apply — that strictness *is* the
-  drift detector.
-- **Deterministic / idempotent.** No clocks or randomness; re-running yields
-  byte-identical output. (Aligns with CF.3 re-grade idempotence.)
-- **Multi-file aware.** Mechanisms may target `SKILL.md` or any bundled file.
-- **Generic over frontmatter.** Field handling is data-driven against a
-  discovery/runtime/metadata classification, not a hardcoded field list, so it
-  survives spec additions.
+## ID and path safety
 
-Materialized trees are generated artifacts. They land under `--ablation-dir`
-(default: beside the prepared tasks file) and should be git-ignored.
+Manifest content controls filesystem writes, so it is constrained:
+
+- **Unique slug IDs.** Ablation `id` must be unique within the manifest and match
+  `^[a-z0-9][a-z0-9-]*$`, so `ablation:<id>` is collision-free and path-safe.
+  (Today `id` is only checked non-empty.)
+- **No traversal.** Reject absolute paths and any `..` segment in `skill_root`,
+  `target.path`, and `patch`.
+- **Containment after symlink resolution.** Resolve real paths and verify each
+  target is contained within its declared `skill_root`, and the root within the
+  manifest repo. An ablation may never edit a file outside its skill root.
+- **Atomic, non-destructive output.** Materialize into a fresh temp dir, then
+  rename; never delete a pre-existing manifest-named path.
 
 ## Correctness gates
 
-Run inside materialization; this is where the "evidence, not assertion" stance
-lives. Any failure aborts the ablation with a specific message.
+Run inside materialization; abort with a specific message on any failure.
 
-1. **Per-component effect.** The combined diff must be non-empty *and every
-   declared component must remove something*. A component that matches nothing
-   fails the whole ablation — a stale target hidden inside an otherwise-effective
-   cluster is a manifest bug, not a silent pass. (Materialized analog of
-   *ablations are not evidence until run*.)
-2. **Component disjointness.** No two components may edit overlapping regions of
-   the same file; overlap is ambiguous — refuse, naming both components.
-3. **Layer cohesion.** An ablation must not mix `discovery` components with
-   `execution`/`on_demand` components: different case populations, unattributable
-   regression. See *Multi-component ablations*.
-4. **Layer integrity.** An `execution`/`on_demand` ablation must not touch
-   discovery frontmatter (`name`, `description`, `when_to_use`) — otherwise it
-   silently becomes a trigger experiment. Touching them is allowed only when
-   `layer: discovery`.
-5. **Spec-valid frontmatter.** The result must still parse and must not leave a
-   required field empty. Removing `description` is only legal as a discovery
-   ablation, never collateral damage.
-6. **Patch applies cleanly.** Exact-context match; a drifted patch errors and
-   forces a re-derive.
-7. **Isolation report.** Record the diff stat; flag (warn, not fail) an ablation
-   whose diff is implausibly large for its declared components.
+1. **Net-deletion per component.** Every component must remove content and add
+   none (deletion-only). A component that matches nothing fails the whole
+   ablation — a stale target hidden in a cluster is a bug, not a silent pass.
+2. **Component disjointness.** No two components edit overlapping regions of the
+   same file; refuse, naming both.
+3. **Layer cohesion.** No mixing the `discovery` case population with the answer
+   population.
+4. **Required-field preservation.** The result must remain a valid skill: `name`
+   present, `description` present and non-empty. A discovery ablation *weakens*
+   description/when_to_use content (e.g. drops a trigger phrase) but keeps the
+   required fields. Emptying a required field is rejected here and only allowed
+   under the separate *invalid-skill* mode.
+5. **Patch applies cleanly, deletions only.** Exact-context match; reject hunks
+   with `+` lines (those are swaps).
+6. **Containment.** Path/ID safety above holds.
+7. **Isolation report.** Record the diff stat; warn (not fail) when a diff is
+   implausibly large for its declared components.
+
+## Runner integration (required refactors)
+
+Pointing the prepared row at a materialized tree is **not** sufficient; each
+executor must be changed to consume it:
+
+- **Pi smoke** (`run_pi_smoke.py:materialize_runtime_workspace`) rebuilds sources
+  from `manifest["skill_paths"]`. It must instead copy the row's materialized
+  per-root trees, preserving each root's structure.
+- **Pi trigger** (`run_pi_trigger_eval.py:copy_skill_to_config`) also copies from
+  the manifest and takes **no variant input**. Routing discovery ablations to
+  trigger cases is inert until this runner accepts an ablation variant and mounts
+  the materialized tree. This is required for discovery ablations to mean
+  anything.
+- **Jetty** (`build_jetty_payload` + `JettyClient.upload`) uploads individual
+  files with a basename-only `remote_path_hint` (duplicate `SKILL.md` basenames
+  collide) and `read_bytes` per file (no recursion). It must recursively
+  enumerate each materialized root preserving relative paths, and the runbook +
+  `safe_task_json` must mount/read skill files for `ablation:*` (and later
+  `swap:*`), not only `with_skill`.
+
+A cross-runner test asserts the materialized content actually reaches the model
+(not the original skill) for each runner.
 
 ## Prepare and variant wiring
 
-- `prepared_task_rows`: for a materialized `ablation:<id>` row, set `skill_paths`
-  to the materialized tree (this also straightens the latent `old_skill` quirk
-  where the row emits current paths and leans on prose).
-- `variant_instruction`: materialized rows get the plain `with_skill`-style "use
-  the loaded skill as-is" text. The "simulate removing X" prose remains only for
-  `instruction_simulated`.
-- Case selection by layer: `discovery` ablations run **only** against trigger
-  cases; `execution`/`on_demand` continue to **skip** trigger cases
+- `prepared_task_rows`: a materialized `ablation:<id>` row carries the per-root
+  materialized paths (a structured `skill_files` mapping, not a flat list), so
+  runners can rebuild the tree. (This also fixes the latent `old_skill` quirk of
+  emitting current paths and leaning on prose.)
+- `variant_instruction`: materialized rows get the plain "use the loaded skill as
+  is" text; the "simulate removing X" prose remains only for the
+  instruction-simulated mode.
+- Case routing follows the **derived population**: discovery ablations run only
+  against trigger cases; answer-population ablations skip trigger cases
   (`prepared_task_rows:332`).
-- Runner/export: `run_pi_smoke.py` and `safe_task_json` upload the materialized
-  tree (they already copy whatever `skill_paths` resolves to) and stamp
-  `mode: "materialized"`.
 
 ## Provenance and reporting
 
-- Every `ablation:<id>` run record carries `{mode, layer, components, diff_stat,
-  skill_hash}` (a single-component ablation records a one-element `components`).
+- Each run record carries the provenance object above (per-component class,
+  skill_root, mechanism, diff_stat; derived population; mode; skill_hash).
   `benchmark` never compares a materialized arm against a simulated one without
   labeling which is which.
-- **Per-ablation regression view.** For each ablation on each discriminating
-  case, report whether the `expected_regressions` actually appeared — i.e.
-  whether the arm dropped below `with_skill`. This closes hypothesis → evidence
-  and is the payload that makes an ablation "run". A multi-component arm is
-  scored as one unit (joint effect); pair it with single-component ablations to
-  attribute the effect to a part.
-- **Token-overhead tie-in.** Execution/on-demand ablations compose with the
-  existing token-overhead signal (`vocabulary.md:84`): report tokens reclaimed
-  by the removal alongside its lift delta, so a no-regression ablation reads as
-  "costs N tokens, buys 0 lift → candidate for cut" (feeds the pruning work,
-  `TODO.md` 1.9 / 2.10).
-- Extend `negative_delta_cases` (`trace-aware-eval-spec.md:290`) to weight a
-  materialized regression above a simulated one.
+- **Two distinct report claims, not one.** `expected_regressions` is structured
+  (each names `cases` and `assertions`/rubric IDs). The report distinguishes:
+  - **score regressed** — the arm's aggregate objective pass rate dropped (what
+    the current reporting computes).
+  - **expected regression confirmed** — the *named* assertion(s) on the *named*
+    case(s) flipped pass→fail in the ablation arm.
+  A score drop is necessary, not sufficient: an arm can lose points on an
+  unrelated assertion, or show the named failure while its aggregate rate is
+  unchanged. Confirming the hypothesis requires assertion-level deltas, which the
+  reporting code does not yet produce; until that lands, results are labeled only
+  "score regressed".
+- Token-overhead tie-in (`vocabulary.md:84`) and weighting materialized above
+  simulated in `negative_delta_cases` (`trace-aware-eval-spec.md:290`) as before.
+
+## Invalid-skill experiments (separate mode)
+
+Removing a required field (`name`, or `description` entirely) produces a skill a
+conformant client may reject outright — so a measured "trigger failure" would be
+a parser/validation failure, not evidence the removed text was load-bearing.
+These are a distinct, explicitly-flagged mode with client-specific
+interpretation, reported separately and never as an ordinary trigger ablation.
 
 ## Validation additions
 
-`validate_manifest` (`skill_benchmark.py:255`), for each ablation:
+`validate_manifest` (`skill_benchmark.py:255`), per ablation:
 
-- Keep `id` + `removed_component`.
-- If a removal is declared: exactly one of `mechanism`+`target` or `components`
-  is present; `layer` ∈ the enum; each component's `target` matches its
-  mechanism's required keys; referenced paths/patches exist and resolve under the
-  manifest repo; layer-cohesion holds across components. The apply-and-diff gates
-  (per-component effect, disjointness, clean patch) run at materialize time (and
-  under an opt-in `--check-ablations` dry run), not in plain `validate`, so
-  `validate` stays file-surgery-free.
-- Add to `audit-manifest` hints: an ablation with no discriminating case is a
-  declared-but-unrunnable hypothesis; a `reference` ablation whose `path` is not
-  pointed at by the body is dead on arrival.
+- `id` unique and slug-formatted; keep `removed_component`.
+- If a removal is declared: exactly one of `mechanism`+`target` or `components`;
+  each component has a `class` in the enum, a `skill_root` that resolves to a
+  manifest `skill_paths` entry, and a `target` matching its mechanism's keys;
+  referenced paths/patches exist; **no absolute/`..` paths**; layer cohesion
+  holds. The apply-time gates (net-deletion, disjointness, clean deletion-only
+  patch, containment) run under an opt-in `--check-ablations` dry run, keeping
+  plain `validate` file-surgery-free.
+- `audit-manifest` hints: an ablation with no discriminating case; a `reference`
+  ablation whose `path` is not pointed at by the body; an `expected_regressions`
+  entry whose `cases`/`assertions` do not exist.
 
 ## Phased TDD plan
 
-1. **Schema + validation.** Parse `layer`/`mechanism`/`target`; validate shape
-   and path existence. No materialization yet. Pure-function tests.
-2. **Materializer — body mechanisms.** `section` (fence-aware), `anchor`,
-   `list_item`, `patch`, with all gates. Meta-fixtures (CF.1 style): a fixture
-   skill + each mechanism, asserting the diff removes the target and nothing
-   else, and that re-run is byte-identical.
-3. **Materializer — frontmatter + on-demand.** `frontmatter_field`, `reference`
-   (pointer/content/both), `script`/`asset`. Layer-integrity gate tests.
-4. **Multi-component composition.** Resolve-against-original, the disjointness
-   and layer-cohesion gates, back-to-front apply. Fixtures: a redundant-guidance
-   cluster that regresses only when all parts are removed, and an overlapping
-   pair that must refuse.
-5. **Prepare/variant wiring.** Rows point at the materialized tree; instruction
-   switches; discovery→trigger / execution→non-trigger case routing.
-6. **Export + provenance.** Jetty export uploads the tree and stamps
-   `materialized`; run records carry `components` + full provenance.
-7. **Reporting.** Per-ablation regression view + token-overhead column +
-   materialized/simulated weighting.
+1. **Schema + validation + safety.** Parse `class`/`mechanism`/`skill_root`/
+   `target`/`components`; unique-slug IDs; reject traversal; containment checks.
+   Pure-function tests, no materialization.
+2. **Full-root copy.** Replace the collapsing copiers with a complete-tree,
+   multi-root, atomic-rename copy; tests for arbitrary files and two roots not
+   overwriting.
+3. **Materializer — instruction mechanisms.** `section` (fence-aware), `anchor`,
+   `list_item`, deletion-only `patch`, with all gates. Meta-fixtures.
+4. **Materializer — frontmatter / resource / preprocess.** `frontmatter_field`,
+   `reference` (pointer-unlink/content/both), `script`/`asset`, inline command;
+   required-field-preservation and net-deletion gate tests.
+5. **Multi-component composition.** Resolve-against-original, disjointness, layer
+   cohesion, back-to-front apply; redundant-guidance cluster + overlap-refusal
+   fixtures.
+6. **Runner integration.** Refactor Pi smoke, Pi trigger (add variant input),
+   and Jetty (recursive upload, runbook mount) to consume the tree; cross-runner
+   "materialized content actually reaches the model" test.
+7. **Prepare/variant wiring + provenance.** Rows carry per-root paths; derived
+   population routing; provenance recorded; export stamps `materialized`.
+8. **Reporting.** Structured `expected_regressions`; "score regressed" vs
+   "expected regression confirmed" (assertion-level deltas).
 
 ## Test fixtures
 
-A self-contained fixture skill with: multi-field frontmatter (discovery +
-runtime fields), nested headings, a fenced code block containing a
-heading-shaped line (the fence-awareness trap), an anchored span, a bundled
-reference reached by a body link, and a script. Each mechanism gets a
-should-materialize fixture (plus a multi-component cluster), and the gates get
-should-refuse fixtures: empty diff, a no-op component inside a cluster,
-overlapping components, a discovery+execution mix, a discovery field touched in
-an execution-layer ablation, a drifted patch, and a missing reference pointer.
+A self-contained fixture skill with **two skill roots**, multi-field frontmatter
+(discovery + runtime), nested headings, a fenced code block with a heading-shaped
+line (the fence trap), an anchored span, a body-linked reference, a script, and
+an arbitrary extra file outside the three whitelisted dirs. Each mechanism gets a
+should-materialize fixture (plus a multi-component cluster). Should-refuse
+fixtures: empty/no-op component, overlapping components, discovery+answer mix, a
+required field emptied in a normal ablation, a `patch` with `+` lines, a `..`
+path, a duplicate ID, and a target outside its skill root.
 
 ## Acceptance criteria
 
 - A manifest with no removal declaration behaves byte-for-byte as today.
-- Each declared mechanism produces an ablated tree that passes all gates, and
-  each refusal fixture fails with a specific message.
-- A multi-component ablation removes all its components into one materialized
-  tree, is order-independent, and refuses on overlap or a discovery/non-discovery
-  layer mix.
-- Materialization is deterministic across runs.
-- A materialized `ablation:<id>` run is graded, labeled with provenance, and
-  appears in the per-ablation regression view.
-- No model call and no network in the materialize/grade path (CF.4).
+- Each mechanism materializes through the gates; each refusal fixture fails with
+  a specific message.
+- Two skill roots are preserved separately; arbitrary files survive the copy.
+- A multi-component ablation is order-independent and refuses on overlap, layer
+  mix, or any `+`-bearing patch.
+- For every runner (Pi smoke, Pi trigger, Jetty) the materialized content — not
+  the original skill — provably reaches the model.
+- Materialization is deterministic; no model/network in the materialize/grade
+  path (CF.4); no write escapes `out_root/<id>`.
+- A run is graded and labeled with provenance; "expected regression confirmed"
+  is reported only when assertion-level evidence supports it.
 
 ## Open questions — verify, do not assume
 
-- Exact context-loading thresholds (description listing truncation; retained
-  tokens after compaction) are docs-stated; measure rather than trust, and keep
-  them out of gate logic.
-- `paths`-glob and nested-reference behavior are under-specified upstream; the
-  `reference` mechanism handles one level and warns on deeper nesting.
-- How single- and multi-component ablations are linked for attribution in the
-  report. The draft pairs them by a shared `removed_component` label; an explicit
-  `attributes_to: [<id>…]` field may be cleaner. Decide when the reporting view
-  lands.
+- How single- and multi-component ablations are linked for attribution: shared
+  `removed_component` label vs an explicit `attributes_to: [<id>…]`. Decide with
+  the reporting view.
+- Whether `skill_root` is keyed by the `skill_paths` string or a stable index if
+  a manifest ever lists the same path twice.
+- Context-loading thresholds (description truncation; retained tokens) are
+  docs-stated; measure, and keep them out of gate logic.
 
 ## Out of scope (deferred)
 
-- Auto-generating ablation patches from a skill's section structure. The
-  `audit-manifest` ablation-plan hints already suggest candidates; turning a
-  suggestion into a materialized patch stays manual until the manual path is
-  proven.
-- Self-generated or model-rewritten skill variants as release proof — a research
-  control later, consistent with `trace-aware-eval-spec.md`.
-- Ablating runtime frontmatter (`model`, `effort`) as a *confound control* is
-  enabled by the `frontmatter_field` mechanism, but the reporting that
-  separates "model-driven lift" from "instruction-driven lift" is left to the
-  per-model work (`TODO.md` 3.2).
+- **Substitution / `swap:<id>`** — replacement-bearing component edits (the A-B
+  counterfactual). Tracked in `TODO.md`; shares this materialization machinery
+  but needs A-B (not lift-vs-baseline) reporting. This is where `model`/`effort`
+  swaps and high-vs-low-freedom instruction swaps land.
+- Auto-generating ablation patches from a skill's structure.
+- Self-generated or model-rewritten skill variants as release proof.
+- Reporting that separates model-driven from instruction-driven lift
+  (`runtime`-class ablations are enabled; the attribution analysis is the
+  per-model work, `TODO.md` 3.2).
