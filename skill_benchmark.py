@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import html
 import json
 import os
@@ -822,6 +823,7 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
         file_text: dict[Path, str] = {}
         file_ops: dict[Path, list[tuple[int, int, str]]] = {}
         all_deletes: set[Path] = set()
+        removed_by_component: list[int] = []
         for ci, comp in enumerate(comps):
             main, rdir = roots[root_for(comp)]
             ops, deletes = _resolve_component_ops(comp, main, rdir, repo_root, aid)
@@ -837,6 +839,7 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
             all_deletes |= deletes
             if removed <= 0:
                 raise AblationError(f"component #{ci} ({comp.get('mechanism')}) removed nothing (net-deletion gate)")
+            removed_by_component.append(removed)
 
         for f, edits in file_ops.items():
             _check_disjoint(edits)
@@ -848,6 +851,12 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
             if main.exists() and not required_fields_present(main.read_text(encoding="utf-8")):
                 raise AblationError("required frontmatter field (name/description) became empty or missing; use the invalid-skill mode for that experiment")
 
+        digest = hashlib.sha256()
+        for f in sorted(tmp.rglob("*")):
+            if f.is_file():
+                digest.update(f.relative_to(tmp).as_posix().encode("utf-8") + b"\0")
+                digest.update(f.read_bytes())
+        skill_hash = digest.hexdigest()
         tmp.rename(dest)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -858,8 +867,9 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
         "mode": "materialized",
         "population": population,
         "dir": str(dest),
+        "skill_hash": skill_hash,
         "skill_files": {r: str(dest / main.relative_to(tmp)) for r, (main, _) in roots.items()},
-        "components": [{"class": component_class(c), "mechanism": c.get("mechanism"), "skill_root": root_for(c)} for c in comps],
+        "components": [{"class": component_class(c), "mechanism": c.get("mechanism"), "skill_root": root_for(c), "removed_bytes": removed_by_component[i]} for i, c in enumerate(comps)],
     }
 
 

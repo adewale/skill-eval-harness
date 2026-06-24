@@ -1101,5 +1101,101 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertEqual(sb.build_ablation_regression_report(manifest, []), [])
 
 
+class AblationCoverageTests(unittest.TestCase):
+    """Exercises paths claimed in the spec acceptance criteria but not covered by
+    the other test classes: script/asset/reference-both mechanisms, multi-root
+    materialization with arbitrary-file survival, and provenance completeness."""
+
+    def multiroot_repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        a = repo / "skills" / "good-pr"
+        (a / "scripts").mkdir(parents=True)
+        (a / "assets").mkdir()
+        (a / "references").mkdir()
+        (a / "SKILL.md").write_text(SKILL_FIXTURE, encoding="utf-8")
+        (a / "references" / "severity.md").write_text("# sev\n", encoding="utf-8")
+        (a / "scripts" / "run.py").write_text("print('hi')\n", encoding="utf-8")
+        (a / "assets" / "tmpl.txt").write_text("template\n", encoding="utf-8")
+        (a / "NOTES.md").write_text("arbitrary extra file\n", encoding="utf-8")  # outside references/scripts/assets
+        b = repo / "skills" / "audit"
+        b.mkdir(parents=True)
+        (b / "SKILL.md").write_text("---\nname: audit\ndescription: Audit code. Use for audits.\nallowed-tools: Read\n---\n\n# Audit\n\nbody.\n", encoding="utf-8")
+        (repo / "evals").mkdir()
+        manifest = {
+            "version": 1, "skill_name": "good-pr",
+            "skill_paths": ["skills/good-pr/SKILL.md", "skills/audit/SKILL.md"],
+            "variants": ["with_skill", "without_skill"],
+            "cases": [{"id": "c1", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
+            "ablations": [],
+        }
+        p = repo / "evals" / "shared-benchmark.json"
+        p.write_text(json.dumps(manifest), encoding="utf-8")
+        return p
+
+    def materialize(self, root: Path, ablation: dict) -> dict:
+        p = self.multiroot_repo(root)
+        manifest = json.loads(p.read_text())
+        manifest["ablations"] = [ablation]
+        p.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest = sb.validate_manifest(p)
+        return sb.materialize_ablation(sb.repo_root_for_manifest(p), manifest, ablation, root / "out")
+
+    def test_script_mechanism_removes_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize(Path(td), {"id": "no-script", "removed_component": "s", "mechanism": "script", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "scripts/run.py"}})
+            base = Path(res["dir"]) / "skills_good-pr_SKILL.md"
+            self.assertFalse((base / "scripts" / "run.py").exists())
+
+    def test_asset_mechanism_removes_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize(Path(td), {"id": "no-asset", "removed_component": "a", "mechanism": "asset", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "assets/tmpl.txt"}})
+            base = Path(res["dir"]) / "skills_good-pr_SKILL.md"
+            self.assertFalse((base / "assets" / "tmpl.txt").exists())
+
+    def test_reference_both_unlinks_and_deletes(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize(Path(td), {"id": "no-sev", "removed_component": "r", "mechanism": "reference", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "references/severity.md", "remove": "both"}})
+            base = Path(res["dir"]) / "skills_good-pr_SKILL.md"
+            self.assertFalse((base / "references" / "severity.md").exists())
+            self.assertNotIn("](references/severity.md)", (base / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_multi_root_preserved_separately_with_arbitrary_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize(Path(td), {"id": "two-root", "removed_component": "two", "components": [
+                {"mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/good-pr/SKILL.md", "heading": "## Regression-proof requirement"}},
+                {"mechanism": "frontmatter_field", "class": "runtime", "target": {"skill_root": "skills/audit/SKILL.md", "field": "allowed-tools"}},
+            ]})
+            d = Path(res["dir"])
+            pr = d / "skills_good-pr_SKILL.md"
+            au = d / "skills_audit_SKILL.md"
+            # both roots present and independently ablated
+            self.assertNotIn("Regression-proof requirement", (pr / "SKILL.md").read_text(encoding="utf-8"))
+            self.assertNotIn("allowed-tools", (au / "SKILL.md").read_text(encoding="utf-8"))
+            # the audit root keeps its other content; the good-pr root keeps its checklist
+            self.assertIn("name: audit", (au / "SKILL.md").read_text(encoding="utf-8"))
+            self.assertIn("## Review checklist", (pr / "SKILL.md").read_text(encoding="utf-8"))
+            # arbitrary file outside references/scripts/assets survived the copy
+            self.assertTrue((pr / "NOTES.md").exists())
+            self.assertEqual(len(res["skill_files"]), 2)
+
+    def test_safe_under_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "root"
+            base.mkdir()
+            (Path(td) / "secret.txt").write_text("s", encoding="utf-8")
+            link = base / "link"
+            link.symlink_to(Path(td) / "secret.txt")
+            with self.assertRaises(sb.AblationError):
+                sb._safe_under(base, link)   # resolves outside base
+            (base / "ok.txt").write_text("x", encoding="utf-8")
+            self.assertTrue(str(sb._safe_under(base, base / "ok.txt")).endswith("ok.txt"))
+
+    def test_provenance_includes_diff_stat_and_hash(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize(Path(td), {"id": "p", "removed_component": "s", "mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/good-pr/SKILL.md", "heading": "## Regression-proof requirement"}})
+            self.assertIn("skill_hash", res)
+            self.assertTrue(all("removed_bytes" in c for c in res["components"]))
+
+
 if __name__ == "__main__":
     unittest.main()
