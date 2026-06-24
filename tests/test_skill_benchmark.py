@@ -762,5 +762,208 @@ class SkillBenchmarkTests(unittest.TestCase):
         self.assertEqual(records[0]["trajectory_id"], "traj_1")
 
 
+SKILL_FIXTURE = """\
+---
+name: good-pr
+description: Review pull requests for correctness and tests. Use when reviewing a PR or diff.
+when_to_use: When asked to review a PR, diff, or patch.
+allowed-tools: Read, Grep
+---
+
+# Good PR review
+
+Review like a careful maintainer.
+
+## Review checklist
+
+<!-- ablation:no-scope:start -->
+- Scope: flag unrelated changes and ask to split them.
+<!-- ablation:no-scope:end -->
+- Tests: confirm the tests would fail on the pre-change code.
+- Naming: match the surrounding conventions.
+
+## Regression-proof requirement
+
+Require a test that fails without the fix and passes with it.
+
+### How to check
+
+Revert the fix mentally and re-run.
+
+```text
+## (anti-pattern) toBeDefined as the only assertion
+```
+
+## Severity
+
+Pick a verdict. See [the severity guide](references/severity.md).
+"""
+
+
+class SkillAblationTests(unittest.TestCase):
+    def build(self, root: Path, *, skill_paths=None, ablations=None) -> Path:
+        repo = root / "repo"
+        skill_dir = repo / "skills" / "good-pr"
+        (skill_dir / "references").mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(SKILL_FIXTURE, encoding="utf-8")
+        (skill_dir / "references" / "severity.md").write_text("# Severity\n\nBlocking, Minor, Clean.\n", encoding="utf-8")
+        (repo / "evals").mkdir(exist_ok=True)
+        manifest = {
+            "version": 1,
+            "skill_name": "good-pr",
+            "skill_paths": skill_paths or ["skills/good-pr/SKILL.md"],
+            "variants": ["with_skill", "without_skill"],
+            "cases": [{"id": "c1", "split": "tune", "prompt": "Review.", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
+            "ablations": ablations if ablations is not None else [],
+        }
+        path = repo / "evals" / "shared-benchmark.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path
+
+    def materialize_one(self, root: Path, ablation: dict, out_name="out") -> dict:
+        path = self.build(root, ablations=[ablation])
+        manifest = sb.validate_manifest(path)
+        repo_root = sb.repo_root_for_manifest(path)
+        res = sb.materialize_ablation(repo_root, manifest, ablation, root / out_name)
+        return res
+
+    def skill_text(self, res: dict) -> str:
+        return Path(res["skill_files"]["skills/good-pr/SKILL.md"]).read_text(encoding="utf-8")
+
+    def test_section_removal_is_fence_aware(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize_one(Path(td), {"id": "no-regression-proof", "removed_component": "regression-proof", "mechanism": "section", "target": {"heading": "## Regression-proof requirement"}})
+            text = self.skill_text(res)
+            self.assertNotIn("Regression-proof requirement", text)
+            self.assertNotIn("(anti-pattern)", text)   # the fenced block went with the section
+            self.assertIn("## Severity", text)          # stopped at the real next heading, not the in-fence one
+            self.assertIn("## Review checklist", text)
+            self.assertEqual(res["population"], "answer")
+
+    def test_frontmatter_field_removal(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize_one(Path(td), {"id": "no-tools", "removed_component": "tool preapproval", "mechanism": "frontmatter_field", "target": {"field": "allowed-tools"}})
+            text = self.skill_text(res)
+            self.assertNotIn("allowed-tools", text)
+            self.assertIn("name: good-pr", text)
+            self.assertIn("description:", text)
+
+    def test_anchor_removal(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize_one(Path(td), {"id": "no-scope", "removed_component": "scope check", "mechanism": "anchor", "target": {"anchor": "no-scope"}})
+            text = self.skill_text(res)
+            self.assertNotIn("flag unrelated changes", text)
+            self.assertNotIn("ablation:no-scope", text)
+            self.assertIn("Naming: match", text)
+
+    def test_list_item_removal(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize_one(Path(td), {"id": "no-test-bullet", "removed_component": "test bullet", "mechanism": "list_item", "target": {"section": "## Review checklist", "contains": ["pre-change code"]}})
+            text = self.skill_text(res)
+            self.assertNotIn("fail on the pre-change code", text)
+            self.assertIn("Naming: match", text)
+
+    def test_reference_pointer_unlinks_but_keeps_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize_one(Path(td), {"id": "no-sev-ptr", "removed_component": "severity ref", "mechanism": "reference", "target": {"path": "references/severity.md", "remove": "pointer"}})
+            text = self.skill_text(res)
+            self.assertNotIn("](references/severity.md)", text)
+            self.assertIn("the severity guide", text)   # visible text kept; no new prose
+            self.assertTrue((Path(res["dir"]) / "skills_good-pr_SKILL.md" / "references" / "severity.md").exists())
+
+    def test_reference_content_deletes_file_keeps_pointer(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = self.materialize_one(Path(td), {"id": "no-sev-file", "removed_component": "severity ref", "mechanism": "reference", "target": {"path": "references/severity.md", "remove": "content"}})
+            text = self.skill_text(res)
+            self.assertIn("](references/severity.md)", text)
+            self.assertFalse((Path(res["dir"]) / "skills_good-pr_SKILL.md" / "references" / "severity.md").exists())
+
+    def test_patch_deletion_only_ok_and_plus_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lines = SKILL_FIXTURE.split("\n")
+            n = lines.index("Revert the fix mentally and re-run.") + 1
+            (root / "patch.diff").parent.mkdir(parents=True, exist_ok=True)
+            # deletion-only patch authored under the repo
+            path = self.build(root)
+            repo = path.parent.parent
+            (repo / "evals" / "ablations").mkdir(parents=True)
+            (repo / "evals" / "ablations" / "p.patch").write_text(f"@@ -{n},1 +{n},0 @@\n-Revert the fix mentally and re-run.\n", encoding="utf-8")
+            manifest = sb.validate_manifest(path)
+            ab = {"id": "weaken", "removed_component": "revert check", "mechanism": "patch", "target": {"patch": "evals/ablations/p.patch"}}
+            res = sb.materialize_ablation(sb.repo_root_for_manifest(path), manifest, ab, root / "out")
+            self.assertNotIn("Revert the fix mentally", self.skill_text(res))
+            # a '+'-bearing patch is a swap, not an ablation
+            with self.assertRaises(sb.AblationError):
+                sb.patch_delete_ops(SKILL_FIXTURE, f"@@ -{n},1 +{n},1 @@\n-Revert the fix mentally and re-run.\n+Optionally revert.\n")
+
+    def test_multi_component_is_order_independent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            a = {"mechanism": "frontmatter_field", "class": "runtime", "target": {"field": "allowed-tools"}}
+            b = {"mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}}
+            res1 = self.materialize_one(root, {"id": "combo", "removed_component": "two", "components": [a, b]}, out_name="o1")
+            res2 = self.materialize_one(root, {"id": "combo", "removed_component": "two", "components": [b, a]}, out_name="o2")
+            self.assertEqual(self.skill_text(res1), self.skill_text(res2))
+            self.assertNotIn("allowed-tools", self.skill_text(res1))
+            self.assertNotIn("Regression-proof requirement", self.skill_text(res1))
+
+    def test_overlapping_components_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(sb.AblationError):
+                self.materialize_one(Path(td), {"id": "overlap", "removed_component": "x", "components": [
+                    {"mechanism": "section", "class": "instructions", "target": {"heading": "## Review checklist"}},
+                    {"mechanism": "list_item", "class": "instructions", "target": {"section": "## Review checklist", "contains": ["Naming"]}},
+                ]})
+
+    def test_required_field_preservation_blocks_description_removal(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(sb.AblationError):
+                self.materialize_one(Path(td), {"id": "no-desc", "removed_component": "desc", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}})
+
+    def test_layer_cohesion_refuses_discovery_plus_answer(self):
+        with self.assertRaises(sb.AblationError):
+            sb.derived_population([
+                {"mechanism": "frontmatter_field", "target": {"field": "when_to_use"}},
+                {"mechanism": "section", "target": {"heading": "## x"}},
+            ])
+
+    def test_materialization_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ab = {"id": "no-regression-proof", "removed_component": "rp", "mechanism": "section", "target": {"heading": "## Regression-proof requirement"}}
+            r1 = self.materialize_one(root, ab, out_name="a")
+            r2 = self.materialize_one(root, ab, out_name="b")
+            self.assertEqual(self.skill_text(r1), self.skill_text(r2))
+
+    def test_instruction_simulated_has_no_components(self):
+        self.assertEqual(sb.ablation_components({"id": "x", "removed_component": "y"}), [])
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = self.build(root, ablations=[{"id": "x", "removed_component": "y"}])
+            with self.assertRaises(sb.AblationError):
+                sb.materialize_ablation(sb.repo_root_for_manifest(path), sb.validate_manifest(path), {"id": "x", "removed_component": "y"}, root / "out")
+
+    def test_validate_rejects_bad_and_duplicate_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(self.build(root, ablations=[{"id": "Bad_ID", "removed_component": "x"}]))
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(self.build(root, ablations=[{"id": "dup", "removed_component": "x"}, {"id": "dup", "removed_component": "y"}]))
+
+    def test_validate_rejects_path_traversal_and_missing_skill_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(self.build(root, ablations=[{"id": "esc", "removed_component": "x", "mechanism": "reference", "target": {"path": "../../etc/passwd", "remove": "content"}}]))
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(self.build(root, skill_paths=["SKILL.md", "skills/audit/SKILL.md"], ablations=[{"id": "noroot", "removed_component": "x", "mechanism": "section", "target": {"heading": "## X"}}]))
+
+
 if __name__ == "__main__":
     unittest.main()

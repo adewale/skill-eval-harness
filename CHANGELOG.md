@@ -4,6 +4,8 @@ All notable public changes are listed here. Release tags are the source of truth
 
 ## Unreleased
 
+- Add materialized skill ablations: `skill-benchmark materialize-ablations` writes real, altered skill trees (removal-only) for `manifest.ablations` that declare a `mechanism` or `components` + `target`. Mechanisms: `frontmatter_field`, fence-aware `section`, `anchor`, `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, `asset`; with multi-component composition and net-deletion / disjointness / layer-cohesion / required-field gates, unique slug ids, and path-traversal/containment checks. Manifests with no removal declaration keep instruction-simulated behavior unchanged. Runner consumption (Pi/Jetty) and assertion-level reporting are not yet wired; see `docs/skill-ablation-spec.md`.
+- Add `docs/skill-ablation-spec.md` (materialized-ablation design) and index it from the README.
 - Add `docs/vocabulary.md` glossary and `docs/evals-are-not-tests.md` conceptual page; link both from the README documentation map. Docs only; no behavior changes.
 
 ## v0.4.2 — 2026-06-12

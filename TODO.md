@@ -30,7 +30,8 @@ Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-a
 - [x] Generate an explicit instruction-simulated ablation marker for `ablation:<id>`.
 - [x] Put prompt content only in private generated `task.json`, not public artifacts.
 - [x] Upload fixture repos/files referenced by eval cases.
-- [ ] Materialize true ablated skill files instead of instruction-simulated ablations. Spec: [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md).
+- [x] Materialize true ablated skill files (removal-only engine, `materialize-ablations` CLI, validation, and gates) — spec: [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md).
+- [ ] Wire materialized ablation trees into the executors: Pi smoke (`materialize_runtime_workspace` rebuilds from the manifest), Pi trigger (`run_pi_trigger_eval.py` takes no variant input), and Jetty (recursive upload preserving relative paths; runbook mounts skill files for `ablation:*`). Plus assertion-level "expected regression confirmed" reporting (not just an aggregate score drop).
 - [ ] Support component **swap/substitution**, not just removal: generalize the ablation mechanisms with `replace_with`/`set`, add whole-file swap for `reference`/`script`/`asset`, and report A-B deltas between two live variants. Recommended as a sibling `swap:<id>` variant (keeping `ablation:<id>` removal-only); framing decision and design in [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md). Builds on materialized ablations above; unlocks the `model`/`effort` confound control and degrees-of-freedom experiments.
 
 ## Running and polling

@@ -1,6 +1,6 @@
 # Materialized Skill Ablation Spec
 
-Status: design spec, unimplemented. Revised after the PR #20 review — it
+Status: harness-side engine implemented and tested (phases 1–5: schema/validation/safety, full-root copy, all removal mechanisms with gates, multi-component composition, and the `materialize-ablations` CLI); runner integration and assertion-level reporting (phases 6–8) remain. Revised after the PR #20 review — it
 corrects a false claim that runners already consume materialized paths,
 separates component semantics from case routing, constrains manifest-controlled
 filesystem paths, and pins down the removal-vs-substitution boundary and the

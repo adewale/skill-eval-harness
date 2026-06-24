@@ -558,7 +558,7 @@ Defaults follow Jetty docs and `jettyio/jettyio-skills`: `claude-code`, `claude-
 
 ## Ablations
 
-Ablations are opt-in variants that simulate removing part of a skill. Add entries under `manifest.ablations`, then prepare with `--include-ablations`.
+Ablations are opt-in variants that remove part of a skill — by simulation, or by materializing a real altered skill (below). Add entries under `manifest.ablations`, then prepare with `--include-ablations`.
 
 ```bash
 skill-benchmark prepare ../repo/evals/shared-benchmark.json \
@@ -568,6 +568,17 @@ skill-benchmark prepare ../repo/evals/shared-benchmark.json \
 ```
 
 Ablation task variants are named `ablation:<id>`. Trigger cases are skipped for ablation tasks because trigger behavior depends on the description/frontmatter rather than the body component being ablated.
+
+### Materialized ablations
+
+By default an ablation is *instruction-simulated*: the runner is told to ignore a component. To produce a real, altered skill instead, declare a removal `mechanism` (or a `components` list) and `target` on the ablation, then materialize the trees:
+
+```bash
+skill-benchmark materialize-ablations ../repo/evals/shared-benchmark.json \
+  --out-dir ablated --out ablated/provenance.json
+```
+
+Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree. Mechanisms are `frontmatter_field`, `section` (fence-aware), `anchor`, `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, and `asset`, composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, the correctness gates, and what remains (runner integration, assertion-level reporting).
 
 ## Compatibility notes
 

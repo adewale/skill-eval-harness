@@ -14,9 +14,11 @@ import json
 import os
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -252,13 +254,24 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             if atype == "script":
                 validate_script_assertion(assertion, path, cid, j)
 
+    seen_ablation_ids: set[str] = set()
     for i, ablation in enumerate(manifest.get("ablations", [])):
         if not isinstance(ablation, dict):
             die(f"ablation #{i} must be an object")
-        if not ablation.get("id"):
+        aid = ablation.get("id")
+        if not aid:
             die(f"ablation #{i} missing id")
+        if not ABLATION_ID_RE.match(str(aid)):
+            die(f"ablation {aid!r}: id must be a slug matching {ABLATION_ID_RE.pattern}")
+        if aid in seen_ablation_ids:
+            die(f"ablation id {aid!r} is not unique")
+        seen_ablation_ids.add(aid)
         if not ablation.get("removed_component"):
-            die(f"ablation {ablation.get('id')}: missing removed_component")
+            die(f"ablation {aid}: missing removed_component")
+        try:
+            validate_ablation_removal(ablation, manifest)
+        except AblationError as exc:
+            die(f"ablation {aid}: {exc}")
     return manifest
 
 
@@ -385,6 +398,460 @@ JETTY_ALLOWED_AGENTS = {"claude-code", "opencode", "codex", "gemini-cli"}
 JETTY_TERMINAL_SUCCESS = {"completed", "complete", "succeeded", "success"}
 JETTY_TERMINAL_FAILURE = {"failed", "failure", "error", "errored", "canceled", "cancelled", "timeout", "timed_out"}
 JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
+
+
+# ---------------------------------------------------------------------------
+# Skill ablation materialization (docs/skill-ablation-spec.md)
+#
+# An ablation:<id> produces a real, altered copy of the skill tree by removing
+# one or more components. Ablation is removal-only; replacement-bearing edits
+# are a separate swap:<id> feature (not implemented). All edits resolve against
+# the ORIGINAL copy, must be pairwise disjoint, and apply back-to-front so the
+# result is order-independent and byte-deterministic.
+# ---------------------------------------------------------------------------
+
+ABLATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+COMPONENT_CLASSES = {"discovery", "runtime", "instructions", "resource", "preprocess"}
+SKILL_MECHANISMS = {"frontmatter_field", "section", "anchor", "list_item", "patch", "reference", "script", "asset"}
+# Frontmatter fields that govern activation/discovery; everything else a
+# frontmatter_field ablation can touch is treated as runtime configuration.
+DISCOVERY_FIELDS = {"name", "description", "when_to_use", "paths", "disable-model-invocation", "user-invocable"}
+REQUIRED_FRONTMATTER_FIELDS = ("name", "description")
+_COPY_EXCLUDE = {"evals", ".git"}
+
+
+class AblationError(Exception):
+    """Raised when an ablation cannot be validated or materialized."""
+
+
+def ablation_components(ablation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize an ablation entry to a list of components. Returns [] when the
+    entry declares no removal — that absence IS the instruction-simulated mode."""
+    if ablation.get("components"):
+        return list(ablation["components"])
+    if ablation.get("mechanism"):
+        return [{"mechanism": ablation["mechanism"], "class": ablation.get("class"), "target": ablation.get("target", {})}]
+    return []
+
+
+def component_class(comp: dict[str, Any]) -> str | None:
+    """The declared class, or one inferred from the mechanism/field."""
+    if comp.get("class"):
+        return comp["class"]
+    mech, tgt = comp.get("mechanism"), comp.get("target", {})
+    if mech == "frontmatter_field":
+        return "discovery" if tgt.get("field") in DISCOVERY_FIELDS else "runtime"
+    if mech in {"section", "anchor", "list_item", "patch"}:
+        return "instructions"
+    if mech in {"reference", "script", "asset"}:
+        return "resource"
+    return None
+
+
+def derived_population(components: list[dict[str, Any]]) -> str:
+    """trigger if every component is discovery, else answer. Mixing the two is a
+    cohesion error (different case populations, unattributable regression)."""
+    classes = {component_class(c) for c in components}
+    if "discovery" in classes and classes - {"discovery"}:
+        raise AblationError("layer cohesion: discovery components cannot mix with answer-population components")
+    return "trigger" if classes == {"discovery"} else "answer"
+
+
+def split_frontmatter(text: str) -> tuple[str, str]:
+    """Return (frontmatter_block_including_fences, body)."""
+    if text.startswith("---\n"):
+        i = text.find("\n---\n", 3)
+        if i != -1:
+            return text[: i + 5], text[i + 5:]
+    return "", text
+
+
+def frontmatter_value(text: str, field: str) -> str | None:
+    fm, _ = split_frontmatter(text)
+    m = re.search(rf"(?m)^{re.escape(field)}:[ \t]*(.*)$", fm)
+    return m.group(1).strip() if m else None
+
+
+def required_fields_present(text: str) -> bool:
+    return all(frontmatter_value(text, f) for f in REQUIRED_FRONTMATTER_FIELDS)
+
+
+def _line_starts(text: str) -> tuple[list[str], list[int]]:
+    lines = text.splitlines(keepends=True)
+    starts, pos = [], 0
+    for ln in lines:
+        starts.append(pos)
+        pos += len(ln)
+    starts.append(pos)  # sentinel: end of text
+    return lines, starts
+
+
+def _fenced_mask(lines: list[str]) -> list[bool]:
+    """True for lines inside a ``` fenced code block (delimiters included)."""
+    mask, in_fence = [], False
+    for ln in lines:
+        if re.match(r"^\s*```", ln):
+            in_fence = not in_fence
+            mask.append(True)
+        else:
+            mask.append(in_fence)
+    return mask
+
+
+def frontmatter_field_span(text: str, field: str) -> tuple[int, int] | None:
+    """Char span of a top-level frontmatter field line plus any indented
+    block-scalar continuation lines."""
+    if not text.startswith("---\n"):
+        return None
+    lines, starts = _line_starts(text)
+    field_re = re.compile(rf"^{re.escape(field)}:")
+    start_i = None
+    for idx in range(1, len(lines)):
+        if lines[idx].rstrip("\n") == "---":
+            break
+        if field_re.match(lines[idx]):
+            start_i = idx
+            break
+    if start_i is None:
+        return None
+    end_i = start_i + 1
+    while end_i < len(lines) and lines[end_i].rstrip("\n") != "---" and re.match(r"^[ \t]", lines[end_i]) and lines[end_i].strip():
+        end_i += 1
+    return (starts[start_i], starts[end_i])
+
+
+def section_span(text: str, heading: str) -> tuple[int, int]:
+    """Char span of a markdown section: heading line through the next heading of
+    equal-or-higher level. Fence-aware: a '##' inside a ``` block is code."""
+    fm, body = split_frontmatter(text)
+    base = len(fm)
+    lines, starts = _line_starts(body)
+    mask = _fenced_mask(lines)
+    want = heading.strip().lstrip("#").strip().lower()
+    start_i = level = None
+    for i, ln in enumerate(lines):
+        if mask[i]:
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", ln)
+        if m and m.group(2).strip().lower() == want:
+            start_i, level = i, len(m.group(1))
+            break
+    if start_i is None:
+        raise AblationError(f"section not found: {heading!r}")
+    end_i = len(lines)
+    for j in range(start_i + 1, len(lines)):
+        if mask[j]:
+            continue
+        m = re.match(r"^(#{1,6})\s+", lines[j])
+        if m and len(m.group(1)) <= level:
+            end_i = j
+            break
+    return (base + starts[start_i], base + starts[end_i])
+
+
+def anchor_span(text: str, anchor_id: str) -> tuple[int, int]:
+    start_marker = f"<!-- ablation:{anchor_id}:start -->"
+    end_marker = f"<!-- ablation:{anchor_id}:end -->"
+    si = text.find(start_marker)
+    if si == -1:
+        raise AblationError(f"anchor start not found: {anchor_id!r}")
+    ei = text.find(end_marker, si)
+    if ei == -1:
+        raise AblationError(f"anchor end not found: {anchor_id!r}")
+    end = text.find("\n", ei + len(end_marker))
+    end = end + 1 if end != -1 else len(text)
+    line_start = text.rfind("\n", 0, si)
+    start = line_start + 1 if line_start != -1 else 0
+    return (start, end)
+
+
+def list_item_ops(text: str, section: str, contains: list[str]) -> list[tuple[int, int, str]]:
+    fm, body = split_frontmatter(text)
+    base = len(fm)
+    lines, starts = _line_starts(body)
+    mask = _fenced_mask(lines)
+    want = section.strip().lstrip("#").strip().lower()
+    body_start = level = None
+    for i, ln in enumerate(lines):
+        if mask[i]:
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", ln)
+        if m and m.group(2).strip().lower() == want:
+            body_start, level = i + 1, len(m.group(1))
+            break
+    if body_start is None:
+        raise AblationError(f"section not found for list_item: {section!r}")
+    section_end = len(lines)
+    for j in range(body_start, len(lines)):
+        if mask[j]:
+            continue
+        m = re.match(r"^(#{1,6})\s+", lines[j])
+        if m and len(m.group(1)) <= level:
+            section_end = j
+            break
+    ops = []
+    for k in range(body_start, section_end):
+        stripped = lines[k].lstrip()
+        is_bullet = stripped.startswith(("- ", "* ", "+ ")) or re.match(r"^\d+\.\s", stripped)
+        if is_bullet and any(c.lower() in lines[k].lower() for c in contains):
+            ops.append((base + starts[k], base + starts[k + 1], ""))
+    if not ops:
+        raise AblationError(f"no matching list items in {section!r}")
+    return ops
+
+
+def reference_pointer_ops(text: str, relpath: str) -> list[tuple[int, int, str]]:
+    """Unlink markdown links whose target is relpath: [text](relpath) -> text.
+    Keeps the existing visible text, so no new prose is introduced (removal,
+    not substitution)."""
+    ops = [(m.start(), m.end(), m.group(1)) for m in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text) if m.group(2).strip() == relpath]
+    if not ops:
+        raise AblationError(f"reference pointer not found: {relpath!r}")
+    return ops
+
+
+def patch_delete_ops(text: str, patch: str) -> list[tuple[int, int, str]]:
+    """Resolve a deletion-only unified diff to char-span deletions. A '+' line
+    means the patch adds content — that is a swap, not an ablation."""
+    lines, starts = _line_starts(text)
+    ops, idx, saw = [], 0, False
+    plines = patch.split("\n")
+    k = 0
+    while k < len(plines):
+        h = re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", plines[k])
+        if not h:
+            k += 1
+            continue
+        idx = int(h.group(1)) - 1
+        k += 1
+        while k < len(plines) and plines[k][:1] in (" ", "-", "+"):
+            tag, content = plines[k][0], plines[k][1:]
+            if tag == "+":
+                raise AblationError("ablation patch is deletion-only; '+' lines indicate a swap (use swap:<id>)")
+            cur = lines[idx].rstrip("\n") if idx < len(lines) else None
+            if cur != content:
+                raise AblationError(f"patch context mismatch at line {idx + 1}: {content!r}")
+            if tag == "-":
+                ops.append((starts[idx], starts[idx + 1], ""))
+                saw = True
+            idx += 1
+            k += 1
+    if not saw:
+        raise AblationError("patch removed nothing")
+    return ops
+
+
+def _check_disjoint(ops: list[tuple[int, int, str]]) -> None:
+    spans = sorted((s, e) for s, e, _ in ops)
+    for i in range(1, len(spans)):
+        if spans[i][0] < spans[i - 1][1]:
+            raise AblationError(f"components overlap near char {spans[i][0]}")
+
+
+def _apply_edits(text: str, ops: list[tuple[int, int, str]]) -> str:
+    for s, e, r in sorted(ops, key=lambda o: o[0], reverse=True):
+        text = text[:s] + r + text[e:]
+    return text
+
+
+def _safe_under(base: Path, path: Path) -> Path:
+    base_r = base.resolve()
+    p = path.resolve()
+    if p != base_r and base_r not in p.parents:
+        raise AblationError(f"path escapes {base_r}: {path}")
+    return p
+
+
+def _copy_skill_root(src_dir: Path, dst_dir: Path) -> None:
+    """Copy a skill's complete directory (arbitrary files, not a 3-dir
+    whitelist), excluding eval answers, VCS, and dotfiles."""
+    def ignore(_dir: str, names: list[str]) -> list[str]:
+        return [n for n in names if n in _COPY_EXCLUDE or n.startswith(".")]
+    shutil.copytree(src_dir, dst_dir, ignore=ignore)
+
+
+def _required_target_keys(mech: str) -> list[str]:
+    return {
+        "frontmatter_field": ["field"], "section": ["heading"], "anchor": ["anchor"],
+        "list_item": ["section"], "patch": ["patch"], "reference": ["path"],
+        "script": ["path"], "asset": ["path"],
+    }.get(mech, [])
+
+
+def validate_ablation_removal(ablation: dict[str, Any], manifest: dict[str, Any]) -> None:
+    """Shape + safety validation for a declared removal. Apply-time gates
+    (effect, disjointness, required-field preservation) run at materialize time."""
+    if ablation.get("components") and ablation.get("mechanism"):
+        raise AblationError("declare either mechanism+target or components, not both")
+    comps = ablation_components(ablation)
+    if not comps:
+        return  # instruction-simulated
+    skill_paths = manifest.get("skill_paths", [])
+    classes: set[str | None] = set()
+    for comp in comps:
+        mech = comp.get("mechanism")
+        if mech not in SKILL_MECHANISMS:
+            raise AblationError(f"unknown mechanism {mech!r}")
+        cls = component_class(comp)
+        if cls not in COMPONENT_CLASSES:
+            raise AblationError(f"invalid component class {cls!r}")
+        classes.add(cls)
+        tgt = comp.get("target", {})
+        if not isinstance(tgt, dict):
+            raise AblationError("target must be an object")
+        root = tgt.get("skill_root")
+        if root is None and len(skill_paths) != 1:
+            raise AblationError(f"component target missing skill_root (manifest has {len(skill_paths)} skill_paths)")
+        if root is not None and root not in skill_paths:
+            raise AblationError(f"skill_root {root!r} is not in manifest.skill_paths")
+        for key in _required_target_keys(mech):
+            if not tgt.get(key):
+                raise AblationError(f"{mech} target missing {key!r}")
+        for key in ("path", "patch"):
+            v = tgt.get(key)
+            if v and (Path(v).is_absolute() or ".." in Path(v).parts):
+                raise AblationError(f"unsafe path (absolute or traversal): {v!r}")
+        if mech == "frontmatter_field" and comp.get("class"):
+            inferred = "discovery" if tgt.get("field") in DISCOVERY_FIELDS else "runtime"
+            if comp["class"] != inferred:
+                raise AblationError(f"frontmatter_field {tgt.get('field')!r} is class {inferred}, not {comp['class']!r}")
+    if "discovery" in classes and classes - {"discovery"}:
+        raise AblationError("layer cohesion: discovery cannot mix with answer-population components")
+
+
+def _resolve_component_ops(comp: dict[str, Any], main_file: Path, root_dir: Path, repo_root: Path, aid: str) -> tuple[dict[Path, list[tuple[int, int, str]]], set[Path]]:
+    mech = comp.get("mechanism")
+    tgt = comp.get("target", {})
+    text = main_file.read_text(encoding="utf-8")
+    ops: dict[Path, list[tuple[int, int, str]]] = {}
+    deletes: set[Path] = set()
+    if mech == "frontmatter_field":
+        span = frontmatter_field_span(text, tgt["field"])
+        if span is None:
+            raise AblationError(f"frontmatter field not found: {tgt['field']!r}")
+        ops[main_file] = [(span[0], span[1], "")]
+    elif mech == "section":
+        s, e = section_span(text, tgt["heading"])
+        ops[main_file] = [(s, e, "")]
+    elif mech == "anchor":
+        s, e = anchor_span(text, tgt["anchor"])
+        ops[main_file] = [(s, e, "")]
+    elif mech == "list_item":
+        ops[main_file] = list_item_ops(text, tgt["section"], tgt.get("contains", []))
+    elif mech == "patch":
+        patch_file = _safe_under(repo_root, repo_root / tgt["patch"])
+        ops[main_file] = patch_delete_ops(text, patch_file.read_text(encoding="utf-8"))
+    elif mech == "reference":
+        mode = tgt.get("remove", "both")
+        if mode in ("pointer", "both"):
+            ops[main_file] = reference_pointer_ops(text, tgt["path"])
+        if mode in ("content", "both"):
+            deletes.add(_safe_under(root_dir, root_dir / tgt["path"]))
+    elif mech in ("script", "asset"):
+        deletes.add(_safe_under(root_dir, root_dir / tgt["path"]))
+    else:
+        raise AblationError(f"unknown mechanism {mech!r}")
+    return ops, deletes
+
+
+def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: dict[str, Any], out_root: Path) -> dict[str, Any]:
+    """Produce out_root/<id>/ holding the altered skill tree. Returns provenance
+    with per-root materialized SKILL paths. Raises AblationError on any gate."""
+    comps = ablation_components(ablation)
+    if not comps:
+        raise AblationError(f"ablation {ablation.get('id')!r} declares no removal (instruction-simulated)")
+    validate_ablation_removal(ablation, manifest)
+    population = derived_population(comps)
+    aid = ablation["id"]
+    skill_paths = manifest.get("skill_paths", [])
+
+    def root_for(comp: dict[str, Any]) -> str:
+        r = comp.get("target", {}).get("skill_root")
+        if r is None:
+            r = skill_paths[0]
+        return r
+
+    dest = out_root / aid
+    if dest.exists():
+        raise AblationError(f"output already exists: {dest}")
+    out_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=f".ablation-{aid}-", dir=out_root))
+    try:
+        roots: dict[str, tuple[Path, Path]] = {}
+        for r in {root_for(c) for c in comps}:
+            src = _safe_under(repo_root, repo_root / r)
+            src_dir = src if src.is_dir() else src.parent
+            key = re.sub(r"[^A-Za-z0-9_.-]", "_", r)
+            dst_dir = tmp / key
+            _copy_skill_root(src_dir, dst_dir)
+            main = dst_dir / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dst_dir / src.name
+            roots[r] = (main, dst_dir)
+
+        file_text: dict[Path, str] = {}
+        file_ops: dict[Path, list[tuple[int, int, str]]] = {}
+        all_deletes: set[Path] = set()
+        for ci, comp in enumerate(comps):
+            main, rdir = roots[root_for(comp)]
+            ops, deletes = _resolve_component_ops(comp, main, rdir, repo_root, aid)
+            removed = 0
+            for f, edits in ops.items():
+                file_text.setdefault(f, f.read_text(encoding="utf-8"))
+                file_ops.setdefault(f, []).extend(edits)
+                removed += sum((e - s) - len(rep) for s, e, rep in edits)
+            for d in deletes:
+                if not d.exists():
+                    raise AblationError(f"component #{ci}: file to remove not found: {d}")
+                removed += d.stat().st_size
+            all_deletes |= deletes
+            if removed <= 0:
+                raise AblationError(f"component #{ci} ({comp.get('mechanism')}) removed nothing (net-deletion gate)")
+
+        for f, edits in file_ops.items():
+            _check_disjoint(edits)
+            f.write_text(_apply_edits(file_text[f], edits), encoding="utf-8")
+        for d in all_deletes:
+            d.unlink()
+
+        for main, _ in roots.values():
+            if main.exists() and not required_fields_present(main.read_text(encoding="utf-8")):
+                raise AblationError("required frontmatter field (name/description) became empty or missing; use the invalid-skill mode for that experiment")
+
+        tmp.rename(dest)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+    return {
+        "id": aid,
+        "mode": "materialized",
+        "population": population,
+        "dir": str(dest),
+        "skill_files": {r: str(dest / main.relative_to(tmp)) for r, (main, _) in roots.items()},
+        "components": [{"class": component_class(c), "mechanism": c.get("mechanism"), "skill_root": root_for(c)} for c in comps],
+    }
+
+
+def materialize_ablations(args: argparse.Namespace) -> int:
+    path = Path(args.manifest)
+    manifest = validate_manifest(path)
+    repo_root = repo_root_for_manifest(path)
+    out_root = Path(args.out_dir)
+    results = []
+    for ablation in manifest.get("ablations", []):
+        if not ablation_components(ablation):
+            print(f"skip ablation:{ablation.get('id')} (instruction-simulated; nothing to materialize)")
+            continue
+        try:
+            res = materialize_ablation(repo_root, manifest, ablation, out_root)
+        except AblationError as exc:
+            die(f"ablation {ablation.get('id')}: {exc}")
+        results.append(res)
+        print(f"materialized ablation:{res['id']} -> {res['dir']} ({res['population']}, {len(res['components'])} component(s))")
+    if args.out:
+        write_json(Path(args.out), {"ablations": results})
+    if not results:
+        print("no materialized ablations declared")
+    return 0
 
 
 def slugify(value: str) -> str:
@@ -3208,6 +3675,11 @@ def main() -> int:
     p.add_argument("--min-trigger-neg", type=int, default=2)
     p.add_argument("--leakage-min-chars", type=int, default=4)
 
+    p = sub.add_parser("materialize-ablations", help="Write real, ablated skill trees for declared materialized ablations")
+    p.add_argument("manifest")
+    p.add_argument("--out-dir", required=True, help="Directory to write <id>/ ablated skill trees into")
+    p.add_argument("--out", help="Optional JSON file recording materialized ablation provenance")
+
     p = sub.add_parser("aggregate")
     p.add_argument("manifests", nargs="+")
     p.add_argument("--runs-root", default=".", help="Root containing <repo>/<runs-subdir>")
@@ -3264,6 +3736,8 @@ def main() -> int:
         return audit_manifest(args)
     if args.cmd == "aggregate":
         return aggregate(args)
+    if args.cmd == "materialize-ablations":
+        return materialize_ablations(args)
     return 1
 
 
