@@ -126,6 +126,7 @@ Every component names a `skill_root` and carries a `class`.
 | `patch` | instructions / discovery | `{ "patch": "evals/ablations/<id>.patch" }` | **deletion-only** unified diff (no `+` lines) |
 | `reference` | resource | `{ "path": "references/x.md", "remove": "pointer\|content\|both" }` | unlink (drop target, keep visible text) / delete file / both |
 | `script` / `asset` | resource | `{ "path": "scripts/x.py" }` | delete a bundled file |
+| `preprocess` | preprocess | `{ "contains": ["git diff"] }` | delete matching inline `` !`cmd` `` / ```` ```! ```` blocks |
 
 ## Mechanisms and granularity
 

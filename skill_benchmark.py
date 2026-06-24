@@ -445,7 +445,7 @@ JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
 
 ABLATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 COMPONENT_CLASSES = {"discovery", "runtime", "instructions", "resource", "preprocess"}
-SKILL_MECHANISMS = {"frontmatter_field", "section", "anchor", "list_item", "patch", "reference", "script", "asset"}
+SKILL_MECHANISMS = {"frontmatter_field", "section", "anchor", "list_item", "patch", "reference", "script", "asset", "preprocess"}
 # Frontmatter fields that govern activation/discovery; everything else a
 # frontmatter_field ablation can touch is treated as runtime configuration.
 DISCOVERY_FIELDS = {"name", "description", "when_to_use", "paths", "disable-model-invocation", "user-invocable"}
@@ -478,6 +478,8 @@ def component_class(comp: dict[str, Any]) -> str | None:
         return "instructions"
     if mech in {"reference", "script", "asset"}:
         return "resource"
+    if mech == "preprocess":
+        return "preprocess"
     return None
 
 
@@ -633,6 +635,32 @@ def list_item_ops(text: str, section: str, contains: list[str]) -> list[tuple[in
     return ops
 
 
+def preprocess_ops(text: str, contains: list[str]) -> list[tuple[int, int, str]]:
+    """Remove inline `` !`command` `` spans and ```! fenced blocks whose command
+    text matches any of `contains`. These preprocessing commands execute before
+    the skill body reaches the model."""
+    def matches(s: str) -> bool:
+        return any(c.lower() in s.lower() for c in contains)
+    ops: list[tuple[int, int, str]] = []
+    for m in re.finditer(r"(?ms)^[ \t]*```!.*?\n[ \t]*```[ \t]*\n?", text):
+        if matches(m.group(0)):
+            ops.append((m.start(), m.end(), ""))
+    covered = [(s, e) for s, e, _ in ops]
+    for m in re.finditer(r"!`[^`]*`", text):
+        if any(s <= m.start() < e for s, e in covered) or not matches(m.group(0)):
+            continue
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        line_end = line_end + 1 if line_end != -1 else len(text)
+        if text[line_start:m.start()].strip() == "" and text[m.end():line_end].strip() == "":
+            ops.append((line_start, line_end, ""))   # command is alone on its line
+        else:
+            ops.append((m.start(), m.end(), ""))
+    if not ops:
+        raise AblationError(f"no preprocess command matched: {contains!r}")
+    return ops
+
+
 def reference_pointer_ops(text: str, relpath: str) -> list[tuple[int, int, str]]:
     """Unlink markdown links whose target is relpath: [text](relpath) -> text.
     Keeps the existing visible text, so no new prose is introduced (removal,
@@ -707,7 +735,7 @@ def _required_target_keys(mech: str) -> list[str]:
     return {
         "frontmatter_field": ["field"], "section": ["heading"], "anchor": ["anchor"],
         "list_item": ["section"], "patch": ["patch"], "reference": ["path"],
-        "script": ["path"], "asset": ["path"],
+        "script": ["path"], "asset": ["path"], "preprocess": ["contains"],
     }.get(mech, [])
 
 
@@ -771,6 +799,8 @@ def _resolve_component_ops(comp: dict[str, Any], main_file: Path, root_dir: Path
         ops[main_file] = [(s, e, "")]
     elif mech == "list_item":
         ops[main_file] = list_item_ops(text, tgt["section"], tgt.get("contains", []))
+    elif mech == "preprocess":
+        ops[main_file] = preprocess_ops(text, tgt["contains"])
     elif mech == "patch":
         patch_file = _safe_under(repo_root, repo_root / tgt["patch"])
         ops[main_file] = patch_delete_ops(text, patch_file.read_text(encoding="utf-8"))

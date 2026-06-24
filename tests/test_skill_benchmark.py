@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -1190,11 +1191,91 @@ class AblationCoverageTests(unittest.TestCase):
             (base / "ok.txt").write_text("x", encoding="utf-8")
             self.assertTrue(str(sb._safe_under(base, base / "ok.txt")).endswith("ok.txt"))
 
+    def test_preprocess_mechanism_removes_inline_command(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            sd = repo / "skills" / "good-pr"
+            sd.mkdir(parents=True)
+            (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# PR\n\n## Gather\n\n!`git diff --stat`\n\nThen review.\n", encoding="utf-8")
+            (repo / "evals").mkdir()
+            ablation = {"id": "no-pre", "removed_component": "diff preprocess", "mechanism": "preprocess", "class": "preprocess", "target": {"skill_root": "skills/good-pr/SKILL.md", "contains": ["git diff"]}}
+            manifest = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": [ablation]}
+            p = repo / "evals" / "shared-benchmark.json"
+            p.write_text(json.dumps(manifest), encoding="utf-8")
+            m = sb.validate_manifest(p)
+            res = sb.materialize_ablation(sb.repo_root_for_manifest(p), m, ablation, root / "out")
+            text = Path(res["skill_files"]["skills/good-pr/SKILL.md"]).read_text(encoding="utf-8")
+            self.assertNotIn("git diff --stat", text)
+            self.assertIn("Then review.", text)
+            self.assertEqual(res["population"], "answer")
+
     def test_provenance_includes_diff_stat_and_hash(self):
         with tempfile.TemporaryDirectory() as td:
             res = self.materialize(Path(td), {"id": "p", "removed_component": "s", "mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/good-pr/SKILL.md", "heading": "## Regression-proof requirement"}})
             self.assertIn("skill_hash", res)
             self.assertTrue(all("removed_bytes" in c for c in res["components"]))
+
+
+FAKE_PI = '''#!/usr/bin/env python3
+import sys, json
+args = sys.argv[1:]
+texts = []
+i = 0
+while i < len(args):
+    if args[i] == "--skill":
+        try:
+            texts.append(open(args[i + 1], encoding="utf-8").read())
+        except Exception:
+            pass
+        i += 2
+    else:
+        i += 1
+joined = "\\n".join(texts)
+marker = "NO_SKILL" if not joined else ("HAS_RP" if "Regression-proof" in joined else "NO_RP")
+print(json.dumps({"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": marker}], "usage": {"input": 1, "output": 1, "totalTokens": 2}, "model": "fake", "provider": "fake"}]}))
+'''
+
+
+class AblationLiveExecutionTests(unittest.TestCase):
+    """End-to-end through the real Pi smoke execution path (subprocess ->
+    event parse -> output.md) with a stubbed `pi` binary. Only the model is
+    faked; the fake echoes a token derived from the skill files it is actually
+    given, proving the materialized (ablated) content is what gets executed."""
+
+    def test_pi_smoke_executes_materialized_ablated_skill(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bindir = root / "bin"
+            bindir.mkdir()
+            (bindir / "pi").write_text(FAKE_PI, encoding="utf-8")
+            (bindir / "pi").chmod(0o755)
+            repo = root / "good-pr"
+            sd = repo / "skills" / "good-pr"
+            (sd / "references").mkdir(parents=True)
+            (sd / "SKILL.md").write_text(SKILL_FIXTURE, encoding="utf-8")
+            (sd / "references" / "severity.md").write_text("# sev\n", encoding="utf-8")
+            (repo / "evals").mkdir()
+            manifest = {
+                "version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
+                "variants": ["with_skill", "without_skill"],
+                "cases": [{"id": "ans", "split": "tune", "prompt": "Review.", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
+                "ablations": [{"id": "no-rp", "removed_component": "rp", "mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}}],
+            }
+            (repo / "evals" / "shared-benchmark.json").write_text(json.dumps(manifest), encoding="utf-8")
+            old_root, old_path = smoke.ROOT, os.environ["PATH"]
+            results = {}
+            try:
+                smoke.ROOT = root
+                os.environ["PATH"] = str(bindir) + os.pathsep + old_path
+                for variant in ("with_skill", "without_skill", "ablation:no-rp"):
+                    smoke.run_case("good-pr", manifest, manifest["cases"][0], variant, "run", 60)
+                    results[variant] = (root / "good-pr" / "eval-runs" / "run" / "ans" / variant / "output.md").read_text(encoding="utf-8").strip()
+            finally:
+                smoke.ROOT, os.environ["PATH"] = old_root, old_path
+            self.assertEqual(results["with_skill"], "HAS_RP")        # full skill executed
+            self.assertEqual(results["without_skill"], "NO_SKILL")   # no skill executed
+            self.assertEqual(results["ablation:no-rp"], "NO_RP")     # the ABLATED skill is what ran
 
 
 if __name__ == "__main__":
