@@ -30,7 +30,8 @@ Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-a
 - [x] Generate an explicit instruction-simulated ablation marker for `ablation:<id>`.
 - [x] Put prompt content only in private generated `task.json`, not public artifacts.
 - [x] Upload fixture repos/files referenced by eval cases.
-- [ ] Materialize true ablated skill files instead of instruction-simulated ablations.
+- [ ] Materialize true ablated skill files instead of instruction-simulated ablations. Spec: [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md).
+- [ ] Support component **swap/substitution**, not just removal: generalize the ablation mechanisms with `replace_with`/`set`, add whole-file swap for `reference`/`script`/`asset`, and report A-B deltas between two live variants. Recommended as a sibling `swap:<id>` variant (keeping `ablation:<id>` removal-only); framing decision and design in [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md). Builds on materialized ablations above; unlocks the `model`/`effort` confound control and degrees-of-freedom experiments.
 
 ## Running and polling
 
