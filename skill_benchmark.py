@@ -372,9 +372,13 @@ def prepared_task_rows(
                     continue
                 aid = variant.split(":", 1)[1]
                 ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
-                abl_meta = {"id": aid, "mode": "materialized" if ablation_components(ablation) else "instruction_simulated", "population": population}
+                comps_present = ablation_components(ablation)
+                mode = ("invalid_skill" if ablation.get("invalid_skill") else "materialized") if comps_present else "instruction_simulated"
+                abl_meta = {"id": aid, "mode": mode, "population": population}
                 if aid in trees:
                     skill_paths = list(trees[aid]["skill_files"].values())
+                    abl_meta["skill_hash"] = trees[aid]["skill_hash"]
+                    abl_meta["components"] = trees[aid]["components"]
             for run_number in range(1, runs_per_variant + 1):
                 run_dir = f"{case['id']}/{variant}" if runs_per_variant == 1 else f"{case['id']}/{variant}/run-{run_number}"
                 task = {
@@ -854,6 +858,7 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
         file_ops: dict[Path, list[tuple[int, int, str]]] = {}
         all_deletes: set[Path] = set()
         removed_by_component: list[int] = []
+        isolation_warnings: list[str] = []
         for ci, comp in enumerate(comps):
             main, rdir = roots[root_for(comp)]
             ops, deletes = _resolve_component_ops(comp, main, rdir, repo_root, aid)
@@ -861,7 +866,11 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
             for f, edits in ops.items():
                 file_text.setdefault(f, f.read_text(encoding="utf-8"))
                 file_ops.setdefault(f, []).extend(edits)
-                removed += sum((e - s) - len(rep) for s, e, rep in edits)
+                edit_removed = sum((e - s) - len(rep) for s, e, rep in edits)
+                removed += edit_removed
+                orig_len = len(file_text[f])
+                if orig_len and edit_removed / orig_len > 0.6:
+                    isolation_warnings.append(f"component #{ci} ({comp.get('mechanism')}) removed {edit_removed}/{orig_len} bytes ({edit_removed / orig_len:.0%}) of {f.name} — large for one declared component")
             for d in deletes:
                 if not d.exists():
                     raise AblationError(f"component #{ci}: file to remove not found: {d}")
@@ -877,9 +886,11 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
         for d in all_deletes:
             d.unlink()
 
-        for main, _ in roots.values():
-            if main.exists() and not required_fields_present(main.read_text(encoding="utf-8")):
-                raise AblationError("required frontmatter field (name/description) became empty or missing; use the invalid-skill mode for that experiment")
+        # Required-field preservation, unless this is an explicit invalid-skill experiment.
+        if not ablation.get("invalid_skill"):
+            for main, _ in roots.values():
+                if main.exists() and not required_fields_present(main.read_text(encoding="utf-8")):
+                    raise AblationError('required frontmatter field (name/description) became empty or missing; set "invalid_skill": true to run that as an invalid-skill experiment')
 
         digest = hashlib.sha256()
         for f in sorted(tmp.rglob("*")):
@@ -892,14 +903,17 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
         shutil.rmtree(tmp, ignore_errors=True)
         raise
 
+    for w in isolation_warnings:
+        print(f"WARN ablation {aid}: {w}", file=sys.stderr)
     return {
         "id": aid,
-        "mode": "materialized",
+        "mode": "invalid_skill" if ablation.get("invalid_skill") else "materialized",
         "population": population,
         "dir": str(dest),
         "skill_hash": skill_hash,
         "skill_files": {r: str(dest / main.relative_to(tmp)) for r, (main, _) in roots.items()},
-        "components": [{"class": component_class(c), "mechanism": c.get("mechanism"), "skill_root": root_for(c), "removed_bytes": removed_by_component[i]} for i, c in enumerate(comps)],
+        "components": [{"class": component_class(c), "mechanism": c.get("mechanism"), "skill_root": root_for(c), "target": c.get("target", {}), "removed_bytes": removed_by_component[i]} for i, c in enumerate(comps)],
+        "isolation_warnings": isolation_warnings,
     }
 
 
@@ -962,6 +976,27 @@ def materialize_ablations(args: argparse.Namespace) -> int:
     if not results:
         print("no materialized ablations declared")
     return 0
+
+
+def check_ablations_dry_run(manifest_path: Path, manifest: dict[str, Any]) -> int:
+    """Apply-time gate dry run: materialize each declared-removal ablation into a
+    throwaway temp dir so every gate fires, writing no output. Returns the number
+    of ablations that failed."""
+    repo_root = repo_root_for_manifest(manifest_path)
+    declared = [a for a in manifest.get("ablations", []) if ablation_components(a)]
+    if not declared:
+        print("check-ablations: no declared-removal ablations to check", file=sys.stderr)
+        return 0
+    failures = 0
+    for ablation in declared:
+        with tempfile.TemporaryDirectory(prefix="check-ablations-") as td:
+            try:
+                materialize_ablation(repo_root, manifest, ablation, Path(td))
+                print(f"check-ablations: ablation:{ablation['id']} OK", file=sys.stderr)
+            except AblationError as exc:
+                failures += 1
+                print(f"check-ablations: ablation:{ablation['id']} FAIL — {exc}", file=sys.stderr)
+    return failures
 
 
 def slugify(value: str) -> str:
@@ -2840,7 +2875,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 "expected_regression_confirmed": bool(evidence),
                 "evidence": evidence,
             })
-        out.append({"id": aid, "population": ablation_variant_population(manifest, variant), "regressions": regressions})
+        out.append({"id": aid, "population": ablation_variant_population(manifest, variant), "invalid_skill": bool(ablation.get("invalid_skill")), "regressions": regressions})
     return out
 
 
@@ -3662,6 +3697,30 @@ def audit_manifest_report(
     if fixtures:
         rec("fixture-repos-files", "Add fixture-backed evals to reduce keyword gaming and verify artifacts/source evidence.", fixtures)
 
+    # Ablation hygiene (docs/skill-ablation-spec.md).
+    ablation_case_ids = {c.get("id") for c in cases}
+    ablation_assertion_names = {a.get("name") for c in cases for a in c.get("assertions", []) if a.get("name")}
+    for ablation in manifest.get("ablations", []):
+        if not ablation_components(ablation):
+            continue
+        aid = ablation.get("id")
+        if not ablation.get("expected_regressions"):
+            finding("ablation-no-expected-regression", "recommended", f"ablation {aid!r} declares a removal but no expected_regressions; without a discriminating case it cannot become evidence.")
+        for comp in ablation_components(ablation):
+            if comp.get("mechanism") == "reference":
+                rpath = comp.get("target", {}).get("path")
+                if rpath and f"]({rpath})" not in skill_text:
+                    finding("ablation-dangling-reference", "recommended", f"ablation {aid!r}: reference {rpath!r} is not linked from the skill body; its pointer removal may be a no-op.")
+        for spec in ablation.get("expected_regressions", []):
+            if not isinstance(spec, dict):
+                continue
+            for cid in spec.get("cases", []):
+                if cid not in ablation_case_ids:
+                    finding("ablation-unknown-case", "recommended", f"ablation {aid!r}: expected_regression names unknown case {cid!r}.")
+            for an in spec.get("assertions", []):
+                if an not in ablation_assertion_names:
+                    finding("ablation-unknown-assertion", "recommended", f"ablation {aid!r}: expected_regression names unknown assertion {an!r}.")
+
     return {
         "generated_at": int(time.time()),
         "manifest": str(manifest_path),
@@ -3726,6 +3785,7 @@ def main() -> int:
     p.add_argument("--strict-holdback", action="store_true", help="require holdout/holdback prompt_ref files to exist")
     p.add_argument("--strict-leakage", action="store_true", help="fail if contains-style assertion values appear literally in prompts")
     p.add_argument("--leakage-min-chars", type=int, default=4, help="minimum assertion value length for prompt leakage lint")
+    p.add_argument("--check-ablations", action="store_true", help="dry-run apply-time gates for declared-removal ablations (materializes to a temp dir, writes nothing)")
 
     p = sub.add_parser("prepare")
     p.add_argument("manifest")
@@ -3901,6 +3961,10 @@ def main() -> int:
             print(f"WARN {finding['case_id']}: assertion {finding['assertion']!r} value {finding['value']!r} appears in prompt (leakage; case may saturate)", file=sys.stderr)
         if leakage and args.strict_leakage:
             die(f"prompt/assertion leakage found in {len(leakage)} assertion value(s)")
+        if getattr(args, "check_ablations", False):
+            failures = check_ablations_dry_run(manifest_path, manifest)
+            if failures:
+                die(f"{failures} ablation(s) failed --check-ablations")
         print(f"OK: {manifest['skill_name']} — {len(iter_cases(manifest))} cases, {len(manifest.get('ablations', []))} ablations")
         return 0
     if args.cmd == "prepare":

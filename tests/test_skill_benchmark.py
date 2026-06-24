@@ -1217,6 +1217,73 @@ class AblationCoverageTests(unittest.TestCase):
             self.assertTrue(all("removed_bytes" in c for c in res["components"]))
 
 
+class AblationSpecCompletenessTests(unittest.TestCase):
+    def repo(self, root: Path, ablations: list) -> Path:
+        repo = root / "repo"
+        sd = repo / "skills" / "good-pr"
+        (sd / "references").mkdir(parents=True, exist_ok=True)
+        (sd / "SKILL.md").write_text(SKILL_FIXTURE, encoding="utf-8")
+        (sd / "references" / "severity.md").write_text("# sev\n", encoding="utf-8")
+        (repo / "evals").mkdir(exist_ok=True)
+        manifest = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "ans", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": ablations}
+        p = repo / "evals" / "shared-benchmark.json"
+        p.write_text(json.dumps(manifest), encoding="utf-8")
+        return p
+
+    def test_invalid_skill_mode_allows_required_field_removal(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ab = {"id": "no-desc", "removed_component": "desc", "invalid_skill": True, "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}}
+            p = self.repo(root, [ab])
+            res = sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
+            self.assertEqual(res["mode"], "invalid_skill")
+            self.assertNotIn("description:", Path(res["skill_files"]["skills/good-pr/SKILL.md"]).read_text(encoding="utf-8"))
+
+    def test_required_field_removal_refused_without_invalid_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ab = {"id": "no-desc", "removed_component": "desc", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}}
+            p = self.repo(root, [ab])
+            with self.assertRaises(sb.AblationError):
+                sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
+
+    def test_isolation_warning_on_oversized_removal(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ab = {"id": "big", "removed_component": "most of body", "mechanism": "section", "class": "instructions", "target": {"heading": "# Good PR review"}}
+            p = self.repo(root, [ab])
+            res = sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
+            self.assertTrue(res["isolation_warnings"])
+
+    def test_check_ablations_dry_run_pass_and_fail(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [{"id": "good", "removed_component": "rp", "mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}}])
+            self.assertEqual(sb.check_ablations_dry_run(p, sb.validate_manifest(p)), 0)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [{"id": "bad", "removed_component": "x", "mechanism": "section", "class": "instructions", "target": {"heading": "## Nonexistent"}}])
+            self.assertEqual(sb.check_ablations_dry_run(p, sb.validate_manifest(p)), 1)  # gate fires at materialize, not validate
+
+    def test_audit_manifest_flags_ablation_hygiene(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ablations = [
+                {"id": "dangling", "removed_component": "x", "mechanism": "reference", "class": "resource", "target": {"path": "references/nope.md", "remove": "both"}},
+                {"id": "badrefs", "removed_component": "x", "mechanism": "section", "class": "instructions", "target": {"heading": "## Severity"}, "expected_regressions": [{"summary": "s", "cases": ["ghost"], "assertions": ["missing"]}]},
+            ]
+            rep = sb.audit_manifest_report(self.repo(root, ablations))
+            kinds = {f["kind"] for f in rep["findings"]}
+            self.assertIn("ablation-dangling-reference", kinds)
+            self.assertIn("ablation-no-expected-regression", kinds)
+            self.assertIn("ablation-unknown-case", kinds)
+            self.assertIn("ablation-unknown-assertion", kinds)
+
+    def test_regression_report_tags_invalid_skill(self):
+        manifest = {"skill_name": "s", "skill_paths": ["x"], "ablations": [{"id": "no-desc", "removed_component": "d", "invalid_skill": True, "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}, "expected_regressions": []}]}
+        self.assertTrue(sb.build_ablation_regression_report(manifest, [])[0]["invalid_skill"])
+
+
 FAKE_PI = '''#!/usr/bin/env python3
 import sys, json
 args = sys.argv[1:]

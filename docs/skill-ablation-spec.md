@@ -1,6 +1,6 @@
 # Materialized Skill Ablation Spec
 
-Status: implemented and tested end to end (phases 1–8) — the materialization engine and `materialize-ablations` CLI; Pi smoke, Pi trigger (`--ablation`), and Jetty (`export-jetty`, recursive tree upload) all consume the materialized tree; `prepare`/`export-jetty` gain `--ablation-dir`; ablation rows route by case population and carry provenance; and the benchmark report adds `ablation_regressions` distinguishing "score regressed" from assertion-level "expected regression confirmed". Revised after the PR #20 review — it
+Status: implemented and tested end to end (phases 1–8) — the materialization engine and `materialize-ablations` CLI; Pi smoke, Pi trigger (`--ablation`), and Jetty (`export-jetty`, recursive tree upload) all consume the materialized tree; `prepare`/`export-jetty` gain `--ablation-dir`; ablation rows route by case population and carry provenance; and the benchmark report adds `ablation_regressions` distinguishing "score regressed" from assertion-level "expected regression confirmed". `validate --check-ablations`, the `invalid_skill` mode, isolation warnings, and `audit-manifest` ablation-hygiene hints are also implemented. Revised after the PR #20 review — it
 corrects a false claim that runners already consume materialized paths,
 separates component semantics from case routing, constrains manifest-controlled
 filesystem paths, and pins down the removal-vs-substitution boundary and the
@@ -47,8 +47,9 @@ Every variant — including `ablation:<id>` — receives the same unmodified ski
 The runner copies the full real skill and the instruction asks the model to
 "ignore component X" (`run_pi_smoke.py:161`). This is a prompt *about* the skill,
 not a changed skill: weak evidence, because the model still sees the full text.
-It stays supported as a fallback (see *Modes*), but it is no longer how an
-ablation that declares a removal behaves.
+It stays supported as a fallback (the derived `instruction_simulated` mode; see
+*Vocabulary additions*), but it is no longer how an ablation that declares a
+removal behaves.
 
 ## A skill is a structured artifact: component class vs case population
 
@@ -89,8 +90,9 @@ three-value `layer` enum could not express.
   removal (`mechanism`+`target` or `components`); otherwise `instruction_simulated`.
 - **Skill root** — one entry of the manifest's `skill_paths`. Every component
   names the root it edits; roots are materialized separately and never merged.
-- **Ablation provenance** — `{mode, population, components:[{class, mechanism,
-  skill_root, target, diff_stat}], skill_hash}` on every run.
+- **Ablation provenance** — `{mode, population, skill_hash, isolation_warnings,
+  components:[{class, mechanism, skill_root, target, removed_bytes}]}` on every
+  materialized run.
 
 ## Manifest schema
 
@@ -260,8 +262,9 @@ Run inside materialization; abort with a specific message on any failure.
 5. **Patch applies cleanly, deletions only.** Exact-context match; reject hunks
    with `+` lines (those are swaps).
 6. **Containment.** Path/ID safety above holds.
-7. **Isolation report.** Record the diff stat; warn (not fail) when a diff is
-   implausibly large for its declared components.
+7. **Isolation report.** Record per-component `removed_bytes`; warn (not fail,
+   collected in `isolation_warnings`) when one component removes an implausibly
+   large fraction (>60%) of its file.
 
 ## Runner integration (required refactors)
 
@@ -302,7 +305,7 @@ A cross-runner test asserts the materialized content actually reaches the model
 ## Provenance and reporting
 
 - Each run record carries the provenance object above (per-component class,
-  skill_root, mechanism, diff_stat; derived population; mode; skill_hash).
+  skill_root, mechanism, removed_bytes; derived population; mode; skill_hash).
   `benchmark` never compares a materialized arm against a simulated one without
   labeling which is which.
 - **Two distinct report claims, not one.** `expected_regressions` is structured
@@ -313,9 +316,9 @@ A cross-runner test asserts the materialized content actually reaches the model
     case(s) flipped pass→fail in the ablation arm.
   A score drop is necessary, not sufficient: an arm can lose points on an
   unrelated assertion, or show the named failure while its aggregate rate is
-  unchanged. Confirming the hypothesis requires assertion-level deltas, which the
-  reporting code does not yet produce; until that lands, results are labeled only
-  "score regressed".
+  unchanged. `build_ablation_regression_report` computes both from the graded
+  results — it marks `expected_regression_confirmed` only when the named
+  assertion(s) flip pass→fail, and otherwise reports just `score_regressed`.
 - Token-overhead tie-in (`vocabulary.md:84`) and weighting materialized above
   simulated in `negative_delta_cases` (`trace-aware-eval-spec.md:290`) as before.
 
@@ -326,6 +329,9 @@ conformant client may reject outright — so a measured "trigger failure" would 
 a parser/validation failure, not evidence the removed text was load-bearing.
 These are a distinct, explicitly-flagged mode with client-specific
 interpretation, reported separately and never as an ordinary trigger ablation.
+Opt in with `"invalid_skill": true` on the ablation: the run is tagged
+`mode: invalid_skill`, bypasses the required-field gate, and is flagged in the
+`ablation_regressions` report.
 
 ## Validation additions
 
