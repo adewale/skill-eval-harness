@@ -304,10 +304,16 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
         ab = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
         if not ab:
             return f"Use an ablated skill variant {aid}; ablation metadata was not found."
+        if ablation_components(ab):
+            # Materialized: the mounted skill is already altered — use it as-is.
+            return (
+                f"Use the skill under test ({manifest['skill_name']}). Read and follow the mounted (ablated) skill files. "
+                "Load only references relevant to the task."
+            )
         return (
             f"Use the {manifest['skill_name']} skill, but simulate this ablation: remove/ignore "
             f"{ab['removed_component']}. Expected regression to watch for: "
-            f"{'; '.join(ab.get('expected_regressions', []))}."
+            f"{'; '.join(expected_regression_summaries(ab))}."
         )
     return f"Run variant {variant}."
 
@@ -334,16 +340,40 @@ def prepared_task_rows(
     runs_per_variant: int = 1,
     allow_missing_prompts: bool = False,
     include_answer_key: bool = False,
+    ablation_dir: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     variants = task_variants(manifest, include_old_skill=include_old_skill, include_ablations=include_ablations)
     runs_per_variant = max(1, int(runs_per_variant))
     cases = iter_cases(manifest, split)
     repo_root = repo_root_for_manifest(manifest_path)
+    real_skill_paths = [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])]
+    # When an ablation directory is provided, materialize each declared-removal
+    # ablation once and point its rows at the altered tree.
+    trees: dict[str, Any] = {}
+    if include_ablations and ablation_dir is not None:
+        ablation_dir = Path(ablation_dir)
+        if ablation_dir.exists():
+            shutil.rmtree(ablation_dir)
+        for ablation in manifest.get("ablations", []):
+            if ablation_components(ablation):
+                trees[ablation["id"]] = materialize_ablation(repo_root, manifest, ablation, ablation_dir)
     rows: list[dict[str, Any]] = []
     for case in cases:
+        is_trigger = case.get("kind") == "trigger"
         for variant in variants:
-            if variant.startswith("ablation:") and case.get("kind") == "trigger":
-                continue
+            abl_meta = None
+            skill_paths = real_skill_paths
+            if variant.startswith("ablation:"):
+                population = ablation_variant_population(manifest, variant)
+                # Discovery ablations run only on trigger cases; answer-population
+                # ablations only on non-trigger cases.
+                if (population == "trigger") != is_trigger:
+                    continue
+                aid = variant.split(":", 1)[1]
+                ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
+                abl_meta = {"id": aid, "mode": "materialized" if ablation_components(ablation) else "instruction_simulated", "population": population}
+                if aid in trees:
+                    skill_paths = list(trees[aid]["skill_files"].values())
             for run_number in range(1, runs_per_variant + 1):
                 run_dir = f"{case['id']}/{variant}" if runs_per_variant == 1 else f"{case['id']}/{variant}/run-{run_number}"
                 task = {
@@ -354,11 +384,12 @@ def prepared_task_rows(
                     "run_number": run_number,
                     "skill_name": manifest["skill_name"],
                     "repo_root": str(repo_root),
-                    "skill_paths": [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])],
+                    "skill_paths": skill_paths,
                     "input_files": [str((manifest_path.parent / f).resolve()) for f in case.get("files", [])],
                     "run_dir": run_dir,
                     "instruction": variant_instruction(variant, manifest, repo_root),
                     "prompt": case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
+                    **({"ablation": abl_meta} if abl_meta else {}),
                     **({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else {}),
                     "tags": case.get("tags", []),
                 }
@@ -378,6 +409,7 @@ def prepare(args: argparse.Namespace) -> int:
         runs_per_variant=getattr(args, "runs_per_variant", 1),
         allow_missing_prompts=args.allow_missing_prompts,
         include_answer_key=args.include_answer_key,
+        ablation_dir=getattr(args, "ablation_dir", None),
     )
     out = Path(args.out) if args.out else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
@@ -831,6 +863,44 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
     }
 
 
+def expected_regression_summaries(ablation: dict[str, Any]) -> list[str]:
+    """Human summaries of an ablation's expected regressions, accepting both the
+    legacy list[str] form and the structured list[{summary, cases, assertions}]."""
+    out = []
+    for r in ablation.get("expected_regressions", []):
+        out.append(r.get("summary", "") if isinstance(r, dict) else str(r))
+    return [s for s in out if s]
+
+
+def materialized_tree_for_variant(repo_root: Path, manifest: dict[str, Any], variant: str, out_root: Path) -> dict[str, Any] | None:
+    """For an ablation:<id> variant that declares a removal, materialize the tree
+    and return its provenance (with skill_files). Returns None for non-ablation
+    variants and for instruction-simulated ablations (no removal declared)."""
+    if not str(variant).startswith("ablation:"):
+        return None
+    aid = str(variant).split(":", 1)[1]
+    ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+    if ablation is None:
+        raise AblationError(f"unknown ablation variant: {variant}")
+    if not ablation_components(ablation):
+        return None
+    return materialize_ablation(repo_root, manifest, ablation, out_root)
+
+
+def enumerate_tree(root_dir: Path) -> list[tuple[Path, str]]:
+    """All files under root_dir as (absolute_path, posix_relpath), sorted."""
+    return [(p, p.relative_to(root_dir).as_posix()) for p in sorted(root_dir.rglob("*")) if p.is_file()]
+
+
+def ablation_variant_population(manifest: dict[str, Any], variant: str) -> str:
+    """Case population for an ablation:<id> variant: trigger (discovery ablation)
+    or answer (everything else, including instruction-simulated)."""
+    aid = str(variant).split(":", 1)[1]
+    ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+    comps = ablation_components(ablation) if ablation else []
+    return derived_population(comps) if comps else "answer"
+
+
 def materialize_ablations(args: argparse.Namespace) -> int:
     path = Path(args.manifest)
     manifest = validate_manifest(path)
@@ -899,8 +969,8 @@ Execute one Skill Eval Harness task exactly once. Write the final assistant answ
 
 1. Read `{{{{task_json}}}}`.
 2. Read every fixture listed in `task_json.input_files`.
-3. If `task_json.variant` is `with_skill`, read and follow the mounted skill files.
-4. If `task_json.variant` is `without_skill`, do not use a skill. No skill files should be mounted.
+3. If `task_json.skill_files` is non-empty (variants `with_skill`, `old_skill`, or `ablation:<id>`), read and follow the mounted skill files.
+4. If `task_json.variant` is `without_skill`, do not use a skill. No skill files are mounted.
 5. Answer the user task directly.
 6. Write `{{{{results_dir}}}}/output.md`.
 7. Write `{{{{results_dir}}}}/metadata.json`.
@@ -938,12 +1008,14 @@ def safe_task_json(task: dict[str, Any], manifest: dict[str, Any], *, task_name:
     elif variant.startswith("ablation:"):
         aid = variant.split(":", 1)[1]
         ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
+        comps = ablation_components(ablation)
         safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
         safe["ablation"] = {
             "id": aid,
-            "mode": "instruction_simulated",
+            "mode": "materialized" if comps else "instruction_simulated",
+            "population": derived_population(comps) if comps else "answer",
             "removed_component": ablation.get("removed_component"),
-            "expected_regressions": ablation.get("expected_regressions", []),
+            "expected_regressions": expected_regression_summaries(ablation),
         }
     else:
         safe["skill_files"] = []
@@ -961,6 +1033,7 @@ def build_jetty_payload(
     model_provider: str,
     snapshot: str,
     use_trial_keys: bool = False,
+    ablation_trees: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     variant = str(task["variant"])
     task_name = jetty_task_name(task, task_prefix)
@@ -999,14 +1072,28 @@ def build_jetty_payload(
                 "private": False,
             })
     elif variant.startswith("ablation:"):
-        for i, local in enumerate(task.get("skill_paths", []), 1):
-            files.append({
-                "role": "skill",
-                "placeholder": placeholder(task_name, "skill", i),
-                "local_path": str(Path(local).resolve()),
-                "remote_path_hint": f"skills/{task['skill_name']}/{Path(local).name}",
-                "private": False,
-            })
+        aid = variant.split(":", 1)[1]
+        tree = (ablation_trees or {}).get(aid)
+        if tree:
+            # Materialized: upload the whole altered tree, preserving relative paths
+            # (no basename flattening, so duplicate SKILL.md names cannot collide).
+            for i, (abs_path, rel) in enumerate(enumerate_tree(Path(tree["dir"])), 1):
+                files.append({
+                    "role": "skill",
+                    "placeholder": placeholder(task_name, "skill", i),
+                    "local_path": str(abs_path),
+                    "remote_path_hint": f"skills/{task['skill_name']}/{rel}",
+                    "private": False,
+                })
+        else:
+            for i, local in enumerate(task.get("skill_paths", []), 1):
+                files.append({
+                    "role": "skill",
+                    "placeholder": placeholder(task_name, "skill", i),
+                    "local_path": str(Path(local).resolve()),
+                    "remote_path_hint": f"skills/{task['skill_name']}/{Path(local).name}",
+                    "private": False,
+                })
     task_json = safe_task_json(task, manifest, task_name=task_name, upload_files=files)
     task_placeholder = placeholder(task_name, "task", "json")
     task_item = {
@@ -1080,6 +1167,18 @@ def export_jetty(args: argparse.Namespace) -> int:
         allow_missing_prompts=getattr(args, "allow_missing_prompts", False),
         include_answer_key=False,
     )
+    ablation_trees: dict[str, Any] = {}
+    if getattr(args, "include_ablations", False):
+        abl_root = Path(getattr(args, "ablation_dir", None) or (str(args.out) + ".ablations" if getattr(args, "out", None) else "jetty-ablations"))
+        if abl_root.exists():
+            shutil.rmtree(abl_root)
+        repo_root = repo_root_for_manifest(path)
+        for ablation in manifest.get("ablations", []):
+            if ablation_components(ablation):
+                try:
+                    ablation_trees[ablation["id"]] = materialize_ablation(repo_root, manifest, ablation, abl_root)
+                except AblationError as exc:
+                    die(f"ablation {ablation.get('id')}: {exc}")
     payloads = [build_jetty_payload(
         row,
         manifest,
@@ -1090,6 +1189,7 @@ def export_jetty(args: argparse.Namespace) -> int:
         model_provider=model_provider,
         snapshot=snapshot,
         use_trial_keys=bool(getattr(args, "use_trial_keys", False) or manifest.get("jetty", {}).get("use_trial_keys", False)),
+        ablation_trees=ablation_trees,
     ) for row in rows]
     out = Path(args.out) if getattr(args, "out", None) else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
@@ -2646,6 +2746,64 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
     return out
 
 
+def build_ablation_regression_report(manifest: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-ablation regression evidence. Distinguishes 'score regressed' (the
+    ablation arm's aggregate objective pass rate dropped vs with_skill on the
+    named cases) from 'expected regression confirmed' (a *named* assertion flips
+    pass->fail in the ablation arm). A score drop is necessary, not sufficient."""
+    passed_map: dict[tuple[str, str], dict[str, bool]] = {}
+    rate_runs: dict[tuple[str, str], list[float]] = {}
+    for r in results:
+        key = (r.get("case_id"), str(r.get("variant")))
+        amap = passed_map.setdefault(key, {})
+        for a in list(r.get("assertions", [])) + list(r.get("qualitative_assertions", [])):
+            name = a.get("name")
+            if name is not None:
+                amap[name] = amap.get(name, True) and bool(a.get("passed"))
+        rate = r.get("objective_pass_rate")
+        if rate is not None:
+            rate_runs.setdefault(key, []).append(rate)
+
+    def mean_rate_cv(case_id: str, variant: str) -> float | None:
+        vals = rate_runs.get((case_id, variant))
+        return (sum(vals) / len(vals)) if vals else None
+
+    out = []
+    for ablation in manifest.get("ablations", []):
+        if not ablation_components(ablation):
+            continue
+        aid = ablation["id"]
+        variant = f"ablation:{aid}"
+        regressions = []
+        for spec in ablation.get("expected_regressions", []):
+            if not isinstance(spec, dict):
+                regressions.append({"summary": str(spec), "expected_regression_confirmed": None, "note": "unstructured expected_regression; add cases+assertions to confirm at assertion level"})
+                continue
+            cases, names = spec.get("cases", []), spec.get("assertions", [])
+            evidence = []
+            for cid in cases:
+                w = passed_map.get((cid, "with_skill"), {})
+                a = passed_map.get((cid, variant), {})
+                for name in names:
+                    if w.get(name) is True and a.get(name) is False:
+                        evidence.append({"case": cid, "assertion": name})
+            score_regressed = None
+            for cid in cases:
+                wr, ar = mean_rate_cv(cid, "with_skill"), mean_rate_cv(cid, variant)
+                if wr is not None and ar is not None:
+                    score_regressed = bool(score_regressed) or (ar < wr)
+            regressions.append({
+                "summary": spec.get("summary", ""),
+                "cases": cases,
+                "assertions": names,
+                "score_regressed": score_regressed,
+                "expected_regression_confirmed": bool(evidence),
+                "evidence": evidence,
+            })
+        out.append({"id": aid, "population": ablation_variant_population(manifest, variant), "regressions": regressions})
+    return out
+
+
 def build_benchmark_report(
     path: Path,
     runs: Path,
@@ -2746,6 +2904,7 @@ def build_benchmark_report(
         "summary": summary,
         "paired_summary": build_paired_summary(results),
         "slice_summary": build_slice_summary(results, variants),
+        "ablation_regressions": build_ablation_regression_report(manifest, results),
         "case_flags": case_flags,
         "results": results,
     }
@@ -3537,6 +3696,7 @@ def main() -> int:
     p.add_argument("--runs-per-variant", type=int, default=1, help="emit repeated run tasks as <case>/<variant>/run-N")
     p.add_argument("--allow-missing-prompts", action="store_true", help="dry-run hidden prompt_ref cases even when private files are absent")
     p.add_argument("--include-answer-key", action="store_true", help="include expected_behavior/review_rubric in prepared tasks; use only for judge/debug tasks, not generation")
+    p.add_argument("--ablation-dir", default=None, help="materialize declared-removal ablations into this dir and point their rows at the altered tree")
 
     p = sub.add_parser("export-jetty")
     p.add_argument("manifest")
@@ -3546,6 +3706,7 @@ def main() -> int:
     p.add_argument("--include-old-skill", action="store_true")
     p.add_argument("--runs-per-variant", type=int, default=1)
     p.add_argument("--allow-missing-prompts", action="store_true")
+    p.add_argument("--ablation-dir", default=None, help="materialize declared-removal ablations into this dir and upload the altered trees")
     p.add_argument("--jetty-collection", default=None)
     p.add_argument("--jetty-task-prefix", default=None)
     p.add_argument("--jetty-agent", default=None)

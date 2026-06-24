@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from skill_benchmark import write_trace_artifacts
+from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -44,10 +44,28 @@ def seed_config_dir(config_dir: Path) -> None:
             shutil.copy2(src, config_dir / name)
 
 
-def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_dir: Path) -> list[Path]:
+def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_dir: Path, ablation_id: str | None = None) -> list[Path]:
     repo_root = manifest_path.parent.parent if manifest_path.name == "shared-benchmark.json" else manifest_path.parent
     skills_dir = config_dir / "skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
+    if ablation_id:
+        # Mount a real, altered skill (e.g. a weakened description) so the trigger
+        # test measures whether the ablated skill still autonomously loads.
+        ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == ablation_id), None)
+        if ablation is None:
+            raise RuntimeError(f"unknown ablation: {ablation_id}")
+        if not ablation_components(ablation):
+            raise RuntimeError(f"ablation {ablation_id} is instruction-simulated; a trigger ablation must declare a removal")
+        res = materialize_ablation(repo_root, manifest, ablation, config_dir / "_materialized")
+        copied = []
+        for sp in res["skill_files"].values():
+            root_dir = Path(sp).parent
+            dest = skills_dir / root_dir.name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(root_dir, dest)
+            copied.append(dest / "SKILL.md" if (dest / "SKILL.md").exists() else dest)
+        return copied
     copied = []
     for rel in manifest.get("skill_paths", []):
         src = (repo_root / rel).resolve()
@@ -130,12 +148,12 @@ def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, 
     )
 
 
-def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int, model: str | None, trace_dir: Path | None = None) -> dict[str, Any]:
+def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int, model: str | None, trace_dir: Path | None = None, ablation: str | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     with tempfile.TemporaryDirectory(prefix="pi-trigger-") as td:
         config_dir = Path(td)
         seed_config_dir(config_dir)
-        copied = copy_skill_to_config(manifest_path, manifest, config_dir)
+        copied = copy_skill_to_config(manifest_path, manifest, config_dir, ablation_id=ablation)
         cmd = [
             "pi", "--no-session", "--mode", "json", "--no-context-files", "--no-prompt-templates", "--no-extensions",
             "--thinking", "minimal", "--tools", "read,grep,find,ls", "-p", query,
@@ -170,6 +188,7 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             "returncode": returncode,
             "timed_out": timed_out,
             "evidence": evidence,
+            "ablation": ablation,
             "stderr": stderr[-1000:] if stderr else "",
         }
         if trace_dir is not None:
@@ -212,6 +231,7 @@ def main() -> int:
     ap.add_argument("--model")
     ap.add_argument("--out", required=True)
     ap.add_argument("--trace-runs", help="optional directory for per-query trace.jsonl/events.json/metrics.json artifacts")
+    ap.add_argument("--ablation", help="materialize this (discovery-population) ablation id and trigger-test the altered skill")
     args = ap.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -231,7 +251,7 @@ def main() -> int:
                 if args.trace_runs:
                     label = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(row.get("query", f"query-{i}")))[:80].strip("-") or f"query-{i}"
                     trace_dir = Path(args.trace_runs) / f"query-{i:03d}-{label}" / f"run-{run_number}"
-                futures.append(ex.submit(run_query, manifest_path, str(row["query"]), bool(row["should_trigger"]), args.timeout, args.model, trace_dir))
+                futures.append(ex.submit(run_query, manifest_path, str(row["query"]), bool(row["should_trigger"]), args.timeout, args.model, trace_dir, args.ablation))
         for fut in as_completed(futures):
             results.append(fut.result())
     passed = sum(1 for r in results if r["pass"])

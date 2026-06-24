@@ -21,7 +21,7 @@ from typing import Any
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
-from skill_benchmark import write_trace_artifacts  # noqa: E402
+from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, expected_regression_summaries  # noqa: E402
 
 # Workspace-specific example: by default this assumes the harness directory is a
 # sibling of the skill repos. Override with SKILL_EVAL_WORKSPACE_ROOT.
@@ -127,16 +127,24 @@ def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, cas
     workspace.mkdir(parents=True, exist_ok=True)
     copied_skill_paths: list[Path] = []
     skill_args: list[str] = []
-    skill_sources = [(repo_root / p).resolve() for p in manifest.get("skill_paths", [])]
-    if variant != "without_skill":
+    # A materialized ablation mounts a real, altered skill tree instead of the
+    # original skill; instruction-simulated ablations (no declared removal) fall
+    # through to the with_skill path plus an "ignore X" instruction.
+    materialized = materialized_tree_for_variant(repo_root, manifest, variant, workspace / "materialized") if variant.startswith("ablation:") else None
+
+    if variant == "without_skill":
+        skill_args = ["--no-skills"]
+    elif materialized is not None:
+        for sp in materialized["skill_files"].values():
+            copied_skill_paths.append(Path(sp))
+            skill_args.extend(["--skill", str(sp)])
+    else:
         skill_dest_root = workspace / "skills"
         skill_dest_root.mkdir(parents=True, exist_ok=True)
-        for src in skill_sources:
+        for src in [(repo_root / p).resolve() for p in manifest.get("skill_paths", [])]:
             copied = copy_skill_source(src, skill_dest_root, str(manifest.get("skill_name", "skill")))
             copied_skill_paths.append(copied)
             skill_args.extend(["--skill", str(copied)])
-    else:
-        skill_args = ["--no-skills"]
 
     copied_inputs: list[Path] = []
     for rel in case.get("files", []) or []:
@@ -146,25 +154,26 @@ def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, cas
         shutil.copy2(src, dest)
         copied_inputs.append(dest.resolve())
 
-    if variant == "with_skill":
-        skill_list = ", ".join(str(sp) for sp in copied_skill_paths)
+    skill_list = ", ".join(str(sp) for sp in copied_skill_paths)
+    if variant == "without_skill":
+        instruction = (
+            f"Do not use or read the {manifest['skill_name']} skill or its references. "
+            "Use only general assistant ability. The skill files are intentionally not present in this workspace."
+        )
+    elif variant == "with_skill" or materialized is not None:
+        # A materialized ablation is run exactly like with_skill: the skill itself
+        # is altered, so the model just uses the loaded (ablated) skill as-is.
         instruction = (
             f"Use the loaded {manifest['skill_name']} skill where it applies. "
             f"Read and follow these skill path(s), including referenced files when relevant: {skill_list}. "
             "If the skill defines a required output contract, follow it exactly rather than giving a shortcut answer."
-        )
-    elif variant == "without_skill":
-        instruction = (
-            f"Do not use or read the {manifest['skill_name']} skill or its references. "
-            "Use only general assistant ability. The skill files are intentionally not present in this workspace."
         )
     elif variant.startswith("ablation:"):
         aid = variant.split(":", 1)[1]
         ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
         if not ablation:
             raise RuntimeError(f"unknown ablation variant: {variant}")
-        skill_list = ", ".join(str(sp) for sp in copied_skill_paths)
-        expected = "; ".join(ablation.get("expected_regressions", []))
+        expected = "; ".join(expected_regression_summaries(ablation))
         instruction = (
             f"Use the loaded {manifest['skill_name']} skill where it applies. "
             f"Read and follow these skill path(s), including referenced files when relevant: {skill_list}. "

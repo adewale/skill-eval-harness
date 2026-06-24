@@ -578,7 +578,9 @@ skill-benchmark materialize-ablations ../repo/evals/shared-benchmark.json \
   --out-dir ablated --out ablated/provenance.json
 ```
 
-Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree. Mechanisms are `frontmatter_field`, `section` (fence-aware), `anchor`, `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, and `asset`, composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, the correctness gates, and what remains (runner integration, assertion-level reporting).
+Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree. Mechanisms are `frontmatter_field`, `section` (fence-aware), `anchor`, `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, and `asset`, composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`.
+
+The materialized tree flows through the runners: the Pi smoke runner mounts it, `run_pi_trigger_eval.py --ablation <id>` trigger-tests a materialized (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. `prepare`/`export-jetty` route ablation rows by case population (discovery→trigger, answer→non-trigger) and the benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed". See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
 
 ## Compatibility notes
 
