@@ -1855,6 +1855,12 @@ def import_jetty_results(args: argparse.Namespace) -> int:
             (base / "output.md").write_text("[JETTY FAILURE: trajectory failed before producing output]\n", encoding="utf-8")
         meta = artifact_metadata(artifacts)
         meta.update(normalized_jetty_metadata(record, success=success))
+        # Persist the harness-only ablation provenance into the run metadata so the
+        # benchmark report can VERIFY (mode/population/skill_hash/components) that a
+        # materialized ablation was actually mounted — never trusting the manifest
+        # and the run-dir name alone.
+        if isinstance(harness.get("ablation"), dict):
+            meta["ablation"] = harness["ablation"]
         trace_records = jetty_trace_records(record, artifacts, success=success)
         write_trace_artifacts(
             base,
@@ -3068,6 +3074,35 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
     return out
 
 
+def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], expected_pop: str, declared_comps: list[dict[str, Any]], invalid: bool) -> tuple[bool, str]:
+    """Check the provenance the RUNNERS actually recorded for an ablation variant
+    (persisted in each run's metadata), so a confirmation rests on proof that a
+    materialized tree was mounted — not on the manifest plus the run-dir name. A
+    run whose recorded mode is instruction_simulated, whose population disagrees
+    with the manifest, that carries no skill_hash, whose component shape differs,
+    or that disagrees with sibling runs about which tree was mounted, cannot
+    support a confirmation."""
+    if not provs:
+        return False, "no run recorded ablation provenance (cannot prove a materialized tree was mounted)"
+    expected_mode = "invalid_skill" if invalid else "materialized"
+    expected_classes = [component_class(c) for c in declared_comps]
+    hashes: set[str] = set()
+    for p in provs:
+        if p.get("mode") != expected_mode:
+            return False, f"recorded mode {p.get('mode')!r} != expected {expected_mode!r} (run may not have mounted a materialized ablation)"
+        if p.get("population") != expected_pop:
+            return False, f"recorded population {p.get('population')!r} != manifest-derived {expected_pop!r}"
+        if not p.get("skill_hash"):
+            return False, "recorded provenance is missing skill_hash"
+        rec_classes = [c.get("class") for c in (p.get("components") or [])]
+        if rec_classes != expected_classes:
+            return False, f"recorded component classes {rec_classes} != declared {expected_classes}"
+        hashes.add(str(p.get("skill_hash")))
+    if len(hashes) > 1:
+        return False, f"runs disagree on which tree was mounted (skill_hash mismatch: {sorted(hashes)})"
+    return True, ""
+
+
 def build_ablation_regression_report(manifest: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Per-ablation regression evidence. Distinguishes 'score regressed' (the
     ablation arm's aggregate objective pass rate dropped vs with_skill on the
@@ -3081,6 +3116,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     measured_variants: set[str] = set()
     measured_cv: set[tuple[str, str]] = set()
     coverage: dict[str, dict[str, int]] = {}
+    recorded_prov: dict[str, list[dict[str, Any]]] = {}
     for r in results:
         variant = str(r.get("variant"))
         cov = coverage.setdefault(variant, {"runs": 0, "missing": 0})
@@ -3093,6 +3129,9 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         if r.get("missing_output"):
             cov["missing"] += 1
             continue
+        prov = (r.get("metadata") or {}).get("ablation")
+        if isinstance(prov, dict):
+            recorded_prov.setdefault(variant, []).append(prov)
         key = (r.get("case_id"), variant)
         measured_variants.add(variant)
         measured_cv.add(key)
@@ -3120,7 +3159,8 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         aid = ablation["id"]
         variant = f"ablation:{aid}"
         invalid = bool(ablation.get("invalid_skill"))
-        entry: dict[str, Any] = {"id": aid, "population": ablation_variant_population(manifest, variant), "invalid_skill": invalid}
+        expected_pop = ablation_variant_population(manifest, variant)
+        entry: dict[str, Any] = {"id": aid, "population": expected_pop, "invalid_skill": invalid}
         abl_cov = coverage.get(variant, {"runs": 0, "missing": 0})
         ws_cov = coverage.get("with_skill", {"runs": 0, "missing": 0})
         entry["coverage"] = {"ablation": abl_cov, "with_skill": ws_cov}
@@ -3133,6 +3173,11 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             out.append(entry)
             continue
         entry["status"] = "measured"
+        # Verify the provenance the runners RECORDED, not just the manifest + dirname.
+        prov_ok, prov_note = _verify_recorded_ablation_provenance(recorded_prov.get(variant, []), expected_pop, ablation_components(ablation), invalid)
+        entry["provenance_verified"] = prov_ok
+        if not prov_ok:
+            entry["provenance_note"] = prov_note
         regressions = []
         for spec in ablation.get("expected_regressions", []):
             if not isinstance(spec, dict):
@@ -3155,7 +3200,12 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             # rests on missing output and must not be reported as confirmed/refuted.
             measured_pairs = [cid for cid in cases if (cid, "with_skill") in measured_cv and (cid, variant) in measured_cv]
             reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence, "measured_cases": measured_pairs}
-            if invalid:
+            if not prov_ok:
+                # Without verified recorded provenance we cannot prove the graded runs
+                # actually mounted the materialized ablation — never confirm on that.
+                reg["expected_regression_confirmed"] = None
+                reg["note"] = f"provenance unverified: {prov_note}"
+            elif invalid:
                 # An invalid-skill experiment's failure may be a parser/validation
                 # rejection — never report it as a behavioral-hypothesis confirmation.
                 reg["expected_regression_confirmed"] = None
