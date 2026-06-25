@@ -966,6 +966,41 @@ class SkillAblationTests(unittest.TestCase):
                 sb.materialize_ablation(repo_root, manifest, ab, root / "out")
             self.assertIn("body", str(cm.exception))
 
+    def test_patch_discovery_class_on_runtime_field_rejected(self):
+        # allowed-tools is a RUNTIME field; a discovery patch (routed to trigger
+        # cases) must not delete it.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lines = SKILL_FIXTURE.split("\n")
+            n = lines.index("allowed-tools: Read, Grep") + 1
+            manifest, repo_root, ab = self._patch_ablation(
+                root, f"@@ -{n},1 +{n},0 @@\n-allowed-tools: Read, Grep\n", cls="discovery")
+            with self.assertRaises(sb.AblationError) as cm:
+                sb.materialize_ablation(repo_root, manifest, ab, root / "out")
+            self.assertIn("non-discovery", str(cm.exception))
+
+    def test_patch_runtime_class_on_runtime_field_ok(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lines = SKILL_FIXTURE.split("\n")
+            n = lines.index("allowed-tools: Read, Grep") + 1
+            manifest, repo_root, ab = self._patch_ablation(
+                root, f"@@ -{n},1 +{n},0 @@\n-allowed-tools: Read, Grep\n", cls="runtime")
+            res = sb.materialize_ablation(repo_root, manifest, ab, root / "out")
+            self.assertNotIn("allowed-tools", self.skill_text(res))
+            self.assertEqual(res["population"], "answer")   # runtime -> answer cases, not trigger
+
+    def test_patch_runtime_class_on_discovery_field_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lines = SKILL_FIXTURE.split("\n")
+            n = lines.index("when_to_use: When asked to review a PR, diff, or patch.") + 1
+            manifest, repo_root, ab = self._patch_ablation(
+                root, f"@@ -{n},1 +{n},0 @@\n-when_to_use: When asked to review a PR, diff, or patch.\n", cls="runtime")
+            with self.assertRaises(sb.AblationError) as cm:
+                sb.materialize_ablation(repo_root, manifest, ab, root / "out")
+            self.assertIn("discovery frontmatter field", str(cm.exception))
+
     def test_patch_spanning_frontmatter_and_body_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

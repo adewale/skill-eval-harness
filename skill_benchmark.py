@@ -479,7 +479,7 @@ SKILL_MECHANISMS = {"frontmatter_field", "section", "anchor", "list_item", "patc
 MECHANISM_CLASSES = {
     "frontmatter_field": {"discovery", "runtime"},
     "section": {"instructions"}, "anchor": {"instructions"}, "list_item": {"instructions"},
-    "patch": {"instructions", "discovery"},
+    "patch": {"instructions", "discovery", "runtime"},
     "reference": {"resource"}, "script": {"resource"}, "asset": {"resource"},
     "preprocess": {"preprocess"},
 }
@@ -852,11 +852,30 @@ def _verify_hunks_match_class(text: str, spans: list[tuple[int, int, str]], decl
     in_fm = any(e <= fm_end for s, e, _ in spans)
     in_body = any(s >= fm_end for s, e, _ in spans)
     if in_fm and in_body:
-        raise AblationError("patch deletes from both the frontmatter and the body; split it into separate discovery and instructions patch components")
-    if declared_class == "discovery" and in_body:
-        raise AblationError("patch declares class 'discovery' but a hunk deletes body (instructions) content")
-    if declared_class != "discovery" and in_fm:
-        raise AblationError(f"patch declares class {declared_class!r} but a hunk deletes frontmatter (discovery) content")
+        raise AblationError("patch deletes from both the frontmatter and the body; split it into separate frontmatter and instructions patch components")
+    if declared_class in ("discovery", "runtime"):
+        # A frontmatter patch. It must stay in the frontmatter AND only touch fields
+        # of the right kind: discovery patches route to trigger cases, so they must
+        # not silently delete a RUNTIME field (allowed-tools/model/effort/...) — and
+        # vice versa — which would change the wrong behavior for the wrong population.
+        if in_body:
+            raise AblationError(f"patch declares class {declared_class!r} (a frontmatter edit) but a hunk deletes body content")
+        deleted_fields = set()
+        for s, e, _ in spans:
+            for line in text[s:e].splitlines():
+                m = re.match(r"^([A-Za-z0-9_-]+):", line)   # top-level (column-0) YAML key
+                if m:
+                    deleted_fields.add(m.group(1))
+        if declared_class == "discovery":
+            bad = sorted(f for f in deleted_fields if f not in DISCOVERY_FIELDS)
+            if bad:
+                raise AblationError(f"discovery patch deletes non-discovery frontmatter field(s) {bad}; use class 'runtime' for runtime fields or split the patch")
+        else:
+            bad = sorted(f for f in deleted_fields if f in DISCOVERY_FIELDS)
+            if bad:
+                raise AblationError(f"runtime patch deletes discovery frontmatter field(s) {bad}; use class 'discovery' for discovery fields")
+    elif in_fm:
+        raise AblationError(f"patch declares class {declared_class!r} but a hunk deletes frontmatter content")
 
 
 def _check_disjoint(ops: list[tuple[int, int, str]]) -> None:
