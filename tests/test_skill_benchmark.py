@@ -1486,6 +1486,43 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertEqual(reg["measured_cases"], [])
         self.assertIn("insufficient coverage", reg["note"])
 
+    def test_qualitative_regression_confirms_via_combined_score(self):
+        # The objective rate is unchanged; only a judge/rubric (qualitative)
+        # assertion regresses. Scoring on the COMBINED rate must let it confirm.
+        manifest = {"skill_name": "s", "skill_paths": ["skills/good-pr/SKILL.md"], "ablations": [{
+            "id": "no-rp", "removed_component": "rp", "mechanism": "section", "class": "instructions",
+            "target": {"heading": "## X"}, "expected_regressions": [{"summary": "weaker rubric", "cases": ["c1"], "assertions": ["rubric"]}],
+        }]}
+        results = [
+            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "combined_pass_rate": 1.0, "assertions": [], "qualitative_assertions": [{"name": "rubric", "passed": True}]},
+            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 1.0, "combined_pass_rate": 0.0, "assertions": [], "qualitative_assertions": [{"name": "rubric", "passed": False}], **self.PROV},
+        ]
+        reg = sb.build_ablation_regression_report(manifest, results)[0]["regressions"][0]
+        self.assertTrue(reg["expected_regression_confirmed"])
+        self.assertEqual(reg["confirmed_cases"], ["c1"])
+
+    def test_cross_case_evidence_does_not_confirm(self):
+        # Flip on case cA but NO score drop on cA (a sibling assertion compensates);
+        # score drop on cB but NO flip on cB. OR-ing across cases used to confirm;
+        # per-case logic must not.
+        manifest = {"skill_name": "s", "skill_paths": ["skills/good-pr/SKILL.md"], "ablations": [{
+            "id": "no-rp", "removed_component": "rp", "mechanism": "section", "class": "instructions",
+            "target": {"heading": "## X"}, "expected_regressions": [{"summary": "x", "cases": ["cA", "cB"], "assertions": ["x"]}],
+        }]}
+        results = [
+            # cA: x flips 1->0 but combined stays 0.5 (y compensates), so no score drop on cA
+            {"case_id": "cA", "variant": "with_skill", "objective_pass_rate": 0.5, "combined_pass_rate": 0.5, "assertions": [{"name": "x", "passed": True}, {"name": "y", "passed": False}], "qualitative_assertions": []},
+            {"case_id": "cA", "variant": "ablation:no-rp", "objective_pass_rate": 0.5, "combined_pass_rate": 0.5, "assertions": [{"name": "x", "passed": False}, {"name": "y", "passed": True}], "qualitative_assertions": [], **self.PROV},
+            # cB: combined drops 1.0->0.5 but x does NOT flip
+            {"case_id": "cB", "variant": "with_skill", "objective_pass_rate": 1.0, "combined_pass_rate": 1.0, "assertions": [{"name": "x", "passed": True}, {"name": "z", "passed": True}], "qualitative_assertions": []},
+            {"case_id": "cB", "variant": "ablation:no-rp", "objective_pass_rate": 0.5, "combined_pass_rate": 0.5, "assertions": [{"name": "x", "passed": True}, {"name": "z", "passed": False}], "qualitative_assertions": [], **self.PROV},
+        ]
+        reg = sb.build_ablation_regression_report(manifest, results)[0]["regressions"][0]
+        self.assertTrue(reg["evidence"])                          # there IS a flip (on cA)
+        self.assertTrue(reg["score_regressed"])                   # there IS a score drop (on cB)
+        self.assertEqual(reg["confirmed_cases"], [])              # but no single case had both
+        self.assertFalse(reg["expected_regression_confirmed"])
+
     def test_confirmation_blocked_when_provenance_missing(self):
         # A genuine flip + score drop, but NO run recorded ablation provenance: we
         # cannot prove a materialized tree was mounted, so we must not confirm.

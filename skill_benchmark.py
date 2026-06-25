@@ -3280,6 +3280,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     # the ablation arm are treated identically (no all-pass-vs-one-fail asymmetry).
     assertion_runs: dict[tuple[str, str], dict[str, list[bool]]] = {}
     rate_runs: dict[tuple[str, str], list[float]] = {}
+    combined_rate_runs: dict[tuple[str, str], list[float]] = {}
     measured_variants: set[str] = set()
     measured_cv: set[tuple[str, str]] = set()
     coverage: dict[str, dict[str, int]] = {}
@@ -3314,6 +3315,13 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         rate = r.get("objective_pass_rate")
         if rate is not None:
             rate_runs.setdefault(key, []).append(rate)
+        # Combined rate (objective + qualitative) so a judge/rubric regression also
+        # counts as a score drop; fall back to the objective rate when absent.
+        crate = r.get("combined_pass_rate")
+        if crate is None:
+            crate = r.get("objective_pass_rate")
+        if crate is not None:
+            combined_rate_runs.setdefault(key, []).append(crate)
 
     def pass_rate(case_id: str, variant: str, name: str) -> float | None:
         vals = assertion_runs.get((case_id, variant), {}).get(name)
@@ -3321,6 +3329,10 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
 
     def mean_rate_cv(case_id: str, variant: str) -> float | None:
         vals = rate_runs.get((case_id, variant))
+        return (sum(vals) / len(vals)) if vals else None
+
+    def combined_rate(case_id: str, variant: str) -> float | None:
+        vals = combined_rate_runs.get((case_id, variant))
         return (sum(vals) / len(vals)) if vals else None
 
     out = []
@@ -3356,22 +3368,33 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 regressions.append({"summary": str(spec), "expected_regression_confirmed": None, "note": "unstructured expected_regression; add cases+assertions to confirm at assertion level"})
                 continue
             cases, names = spec.get("cases", []), spec.get("assertions", [])
+            # Confirmation is evaluated PER CASE and tied together: a case confirms
+            # only if a named assertion flips AND that SAME case's combined score
+            # (objective + qualitative) drops. Evidence on case A must not borrow a
+            # score drop from case B, and a qualitative-only regression still counts
+            # because the score is the combined rate, not objective-only.
             evidence = []
+            confirmed_cases = []
+            score_regressed = None
             for cid in cases:
+                case_flips = []
                 for name in names:
                     w, a = pass_rate(cid, "with_skill", name), pass_rate(cid, variant, name)
                     if w is not None and a is not None and a < w:   # symmetric paired rate drop
-                        evidence.append({"case": cid, "assertion": name, "with_skill_rate": w, "ablation_rate": a})
-            score_regressed = None
-            for cid in cases:
-                wr, ar = mean_rate_cv(cid, "with_skill"), mean_rate_cv(cid, variant)
+                        ev = {"case": cid, "assertion": name, "with_skill_rate": w, "ablation_rate": a}
+                        evidence.append(ev)
+                        case_flips.append(ev)
+                wr, ar = combined_rate(cid, "with_skill"), combined_rate(cid, variant)
+                case_score_dropped = wr is not None and ar is not None and ar < wr
                 if wr is not None and ar is not None:
                     score_regressed = bool(score_regressed) or (ar < wr)
+                if case_flips and case_score_dropped:
+                    confirmed_cases.append(cid)
             # A confirmation is only meaningful if BOTH arms actually produced a
             # graded run for at least one cited case. Otherwise the comparison
             # rests on missing output and must not be reported as confirmed/refuted.
             measured_pairs = [cid for cid in cases if (cid, "with_skill") in measured_cv and (cid, variant) in measured_cv]
-            reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence, "measured_cases": measured_pairs}
+            reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence, "measured_cases": measured_pairs, "confirmed_cases": confirmed_cases}
             if not prov_ok:
                 # Without verified recorded provenance we cannot prove the graded runs
                 # actually mounted the materialized ablation — never confirm on that.
@@ -3386,8 +3409,8 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 reg["expected_regression_confirmed"] = None
                 reg["note"] = "insufficient coverage: no cited case has a graded run in both with_skill and the ablation arm (missing output?)"
             else:
-                # A score drop is necessary, not sufficient: require both the named flip and the aggregate drop.
-                reg["expected_regression_confirmed"] = bool(evidence) and bool(score_regressed)
+                # Confirmed iff some cited case had BOTH a named flip and a combined-score drop.
+                reg["expected_regression_confirmed"] = bool(confirmed_cases)
             regressions.append(reg)
         entry["regressions"] = regressions
         out.append(entry)
