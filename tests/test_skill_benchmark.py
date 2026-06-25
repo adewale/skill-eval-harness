@@ -1031,13 +1031,22 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL, self.DISCO_ABL])
             manifest = sb.validate_manifest(p)
-            rows = sb.prepared_task_rows(p, manifest, include_ablations=True)
+            rows = sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl")
             rp = [r for r in rows if r["variant"] == "ablation:no-rp"]
             wtu = [r for r in rows if r["variant"] == "ablation:no-wtu"]
             self.assertEqual({r["case_id"] for r in rp}, {"ans"})    # answer pop -> non-trigger only
             self.assertEqual({r["case_id"] for r in wtu}, {"trig"})  # discovery pop -> trigger only
-            self.assertEqual(rp[0]["ablation"], {"id": "no-rp", "mode": "materialized", "population": "answer"})
+            self.assertEqual(rp[0]["ablation"]["mode"], "materialized")
+            self.assertEqual(rp[0]["ablation"]["population"], "answer")
+            self.assertIn("skill_hash", rp[0]["ablation"])           # provenance on the row
             self.assertEqual(wtu[0]["ablation"]["population"], "trigger")
+
+    def test_prepare_fails_without_ablation_dir_for_materialized(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.SECTION_ABL])
+            with self.assertRaises(SystemExit):  # must materialize, never label original skill materialized
+                sb.prepared_task_rows(p, sb.validate_manifest(p), include_ablations=True)
 
     def test_prepare_ablation_dir_points_rows_at_altered_tree(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1054,7 +1063,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])
             manifest = sb.validate_manifest(p)
-            row = [r for r in sb.prepared_task_rows(p, manifest, include_ablations=True) if r["variant"] == "ablation:no-rp"][0]
+            row = [r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "rabl") if r["variant"] == "ablation:no-rp"][0]
             trees = {"no-rp": sb.materialize_ablation(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL, root / "jabl")}
             payload = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
             skill_files = [f for f in payload["upload_plan"]["files"] if f["role"] == "skill"]
@@ -1062,8 +1071,11 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             self.assertTrue(any(h.endswith("references/severity.md") for h in hints))  # structure preserved, not flattened
             skill_md = next(f for f in skill_files if f["remote_path_hint"].endswith("SKILL.md"))
             self.assertNotIn("Regression-proof requirement", Path(skill_md["local_path"]).read_text(encoding="utf-8"))
-            task_file = next(f for f in payload["upload_plan"]["files"] if f["role"] == "task")
-            self.assertEqual(json.loads(task_file["content"])["ablation"]["mode"], "materialized")
+            task_json = json.loads(next(f for f in payload["upload_plan"]["files"] if f["role"] == "task")["content"])
+            self.assertEqual(task_json["variant"], "with_skill")              # blinded: model sees with_skill
+            self.assertNotIn("ablation", task_json)                          # no hypothesis leaked to the model
+            self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")           # truth in harness-only record
+            self.assertEqual(payload["harness"]["ablation"]["mode"], "materialized")
 
 
 class AblationRegressionReportTests(unittest.TestCase):
@@ -1081,10 +1093,13 @@ class AblationRegressionReportTests(unittest.TestCase):
             {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": []},
             {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": []},
         ]
-        reg = sb.build_ablation_regression_report(self.MANIFEST, results)[0]["regressions"][0]
+        entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
+        self.assertEqual(entry["status"], "measured")
+        reg = entry["regressions"][0]
         self.assertTrue(reg["expected_regression_confirmed"])
         self.assertTrue(reg["score_regressed"])
-        self.assertEqual(reg["evidence"], [{"case": "c1", "assertion": "detect-weak"}])
+        self.assertEqual(reg["evidence"][0]["case"], "c1")
+        self.assertEqual(reg["evidence"][0]["assertion"], "detect-weak")
 
     def test_score_drop_without_named_flip_is_not_confirmed(self):
         # The named assertion still passes; an unrelated assertion fails and drags
@@ -1100,6 +1115,32 @@ class AblationRegressionReportTests(unittest.TestCase):
     def test_instruction_simulated_ablation_omitted_from_report(self):
         manifest = {"skill_name": "s", "skill_paths": ["x"], "ablations": [{"id": "sim", "removed_component": "x", "expected_regressions": ["y"]}]}
         self.assertEqual(sb.build_ablation_regression_report(manifest, []), [])
+
+    def test_unmeasured_when_no_ablation_rows(self):
+        results = [{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": []}]
+        entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
+        self.assertEqual(entry["status"], "unmeasured")   # absence of evidence, not confirmed:false
+        self.assertNotIn("regressions", entry)
+
+    def test_repeated_runs_use_symmetric_rates(self):
+        # with_skill 1/2 pass, ablation 1/2 pass -> equal rates, no flip (not all-pass-vs-one-fail)
+        results = [
+            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 0.5, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": []},
+            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": []},
+            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.5, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": []},
+            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": []},
+        ]
+        reg = sb.build_ablation_regression_report(self.MANIFEST, results)[0]["regressions"][0]
+        self.assertFalse(reg["expected_regression_confirmed"])
+
+    def test_invalid_skill_never_confirms_behavioral_regression(self):
+        manifest = {"skill_name": "s", "skill_paths": ["x"], "ablations": [{"id": "no-desc", "invalid_skill": True, "removed_component": "d", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}, "expected_regressions": [{"summary": "x", "cases": ["c1"], "assertions": ["a"]}]}]}
+        results = [
+            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "a", "passed": True}], "qualitative_assertions": []},
+            {"case_id": "c1", "variant": "ablation:no-desc", "objective_pass_rate": 0.0, "assertions": [{"name": "a", "passed": False}], "qualitative_assertions": []},
+        ]
+        reg = sb.build_ablation_regression_report(manifest, results)[0]["regressions"][0]
+        self.assertIsNone(reg["expected_regression_confirmed"])   # parser rejection != behavioral evidence
 
 
 class AblationCoverageTests(unittest.TestCase):
@@ -1343,6 +1384,111 @@ class AblationLiveExecutionTests(unittest.TestCase):
             self.assertEqual(results["with_skill"], "HAS_RP")        # full skill executed
             self.assertEqual(results["without_skill"], "NO_SKILL")   # no skill executed
             self.assertEqual(results["ablation:no-rp"], "NO_RP")     # the ABLATED skill is what ran
+
+
+class AblationReviewFixesTests(unittest.TestCase):
+    MIN_SKILL = "---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# PR\n\n## A\n\nbody\n"
+
+    def manifest(self, root: Path, ablations: list, skill_paths=None, second_root=False) -> Path:
+        repo = root / "repo"
+        sd = repo / "skills" / "good-pr"
+        sd.mkdir(parents=True)
+        (sd / "SKILL.md").write_text(self.MIN_SKILL, encoding="utf-8")
+        if second_root:
+            (repo / "skills" / "audit").mkdir(parents=True)
+            (repo / "skills" / "audit" / "SKILL.md").write_text("---\nname: audit\ndescription: Audit. Use for audits.\n---\n\n# Audit\n", encoding="utf-8")
+        (repo / "evals").mkdir()
+        m = {"version": 1, "skill_name": "good-pr", "skill_paths": skill_paths or ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": ablations}
+        p = repo / "evals" / "shared-benchmark.json"
+        p.write_text(json.dumps(m), encoding="utf-8")
+        return p
+
+    # --- #7 parsing ---
+    def test_block_scalar_with_blank_line_removed_cleanly(self):
+        text = "---\nname: s\ndescription: A skill.\nwhen_to_use: >\n  line one\n\n  line two\n---\n\n# Body\n\nkeep.\n"
+        s, e = sb.frontmatter_field_span(text, "when_to_use")
+        new = text[:s] + text[e:]
+        self.assertNotIn("line one", new)
+        self.assertNotIn("line two", new)          # whole block scalar gone, not truncated at the blank line
+        self.assertIn("description: A skill.", new)
+        self.assertTrue(sb.required_fields_present(new))
+
+    def test_empty_folded_description_fails_required(self):
+        self.assertFalse(sb.required_fields_present("---\nname: s\ndescription: >\n---\n\n# B\n"))
+        self.assertTrue(sb.required_fields_present("---\nname: s\ndescription: Real.\n---\n\n# B\n"))
+
+    def test_section_deletion_is_tilde_fence_aware(self):
+        text = "---\nname: s\ndescription: d.\n---\n\n## Target\n\nbody\n\n~~~\n## not a heading\n~~~\n\n## Next\n\nkeep\n"
+        s, e = sb.section_span(text, "## Target")
+        new = text[:s] + text[e:]
+        self.assertNotIn("body", new)
+        self.assertNotIn("not a heading", new)     # the ~~~-fenced line is code, section runs to ## Next
+        self.assertIn("## Next", new)
+
+    def test_list_item_removes_continuation_lines(self):
+        text = "---\nname: s\ndescription: d.\n---\n\n## L\n\n- First item\n  continued guidance here\n- Second item\n"
+        new = sb._apply_edits(text, sb.list_item_ops(text, "## L", ["First item"]))
+        self.assertNotIn("continued guidance here", new)
+        self.assertIn("Second item", new)
+
+    def test_reference_pointer_skips_code_fences(self):
+        ops = sb.reference_pointer_ops("See [x](references/a.md).\n\n```\n[y](references/a.md)\n```\n", "references/a.md")
+        self.assertEqual(len(ops), 1)              # only the real link, not the fenced example
+
+    # --- #5 filesystem safety ---
+    def test_copy_rejects_symlink_escaping_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "skill"
+            src.mkdir()
+            (src / "SKILL.md").write_text(self.MIN_SKILL, encoding="utf-8")
+            (root / "secret.txt").write_text("secret", encoding="utf-8")
+            (src / "link").symlink_to(root / "secret.txt")
+            with self.assertRaises(sb.AblationError):
+                sb._copy_skill_root(src, root / "dst")
+
+    def test_ensure_ablation_dir_refuses_nonempty_unowned(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "user-data"
+            d.mkdir()
+            (d / "important.txt").write_text("keep", encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                sb._ensure_ablation_dir(d)
+            self.assertTrue((d / "important.txt").exists())   # never deleted
+
+    # --- #6 gate soundness ---
+    def test_validate_rejects_mechanism_class_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(self.manifest(Path(td), [{"id": "x", "removed_component": "x", "mechanism": "section", "class": "discovery", "target": {"heading": "## A"}}]))
+
+    def test_validate_rejects_resource_targeting_skill_md(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(self.manifest(Path(td), [{"id": "x", "removed_component": "x", "mechanism": "asset", "class": "resource", "target": {"path": "SKILL.md"}}]))
+
+    def test_two_components_deleting_same_file_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.manifest(root, [])
+            (p.parent.parent / "skills" / "good-pr" / "scripts").mkdir()
+            (p.parent.parent / "skills" / "good-pr" / "scripts" / "x.py").write_text("print(1)\n", encoding="utf-8")
+            ab = {"id": "dup-del", "removed_component": "x", "components": [
+                {"mechanism": "script", "class": "resource", "target": {"path": "scripts/x.py"}},
+                {"mechanism": "asset", "class": "resource", "target": {"path": "scripts/x.py"}},
+            ]}
+            with self.assertRaises(sb.AblationError):
+                sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
+
+    # --- #3a all roots ---
+    def test_unreferenced_root_is_still_materialized(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ab = {"id": "a-only", "removed_component": "x", "mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/good-pr/SKILL.md", "heading": "## A"}}
+            p = self.manifest(root, [ab], skill_paths=["skills/good-pr/SKILL.md", "skills/audit/SKILL.md"], second_root=True)
+            res = sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
+            self.assertEqual(set(res["skill_files"]), {"skills/good-pr/SKILL.md", "skills/audit/SKILL.md"})  # B not dropped
+            self.assertTrue(Path(res["skill_files"]["skills/audit/SKILL.md"]).exists())
 
 
 if __name__ == "__main__":

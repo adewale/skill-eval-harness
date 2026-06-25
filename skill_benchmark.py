@@ -27,6 +27,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 VALID_SPLITS = {"tune", "holdout", "holdback"}
 DEFAULT_VARIANTS = ["with_skill", "without_skill"]
 TEXT_ASSERTIONS = {
@@ -306,11 +308,9 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
         if not ab:
             return f"Use an ablated skill variant {aid}; ablation metadata was not found."
         if ablation_components(ab):
-            # Materialized: the mounted skill is already altered — use it as-is.
-            return (
-                f"Use the skill under test ({manifest['skill_name']}). Read and follow the mounted (ablated) skill files. "
-                "Load only references relevant to the task."
-            )
+            # Materialized: blind the model — present exactly as with_skill so the
+            # model-visible instruction is indistinguishable from the full-skill arm.
+            return variant_instruction("with_skill", manifest, repo_root)
         return (
             f"Use the {manifest['skill_name']} skill, but simulate this ablation: remove/ignore "
             f"{ab['removed_component']}. Expected regression to watch for: "
@@ -351,13 +351,13 @@ def prepared_task_rows(
     # When an ablation directory is provided, materialize each declared-removal
     # ablation once and point its rows at the altered tree.
     trees: dict[str, Any] = {}
-    if include_ablations and ablation_dir is not None:
-        ablation_dir = Path(ablation_dir)
-        if ablation_dir.exists():
-            shutil.rmtree(ablation_dir)
-        for ablation in manifest.get("ablations", []):
-            if ablation_components(ablation):
-                trees[ablation["id"]] = materialize_ablation(repo_root, manifest, ablation, ablation_dir)
+    declared_materialized = [a for a in manifest.get("ablations", []) if ablation_components(a)]
+    if include_ablations and declared_materialized:
+        if ablation_dir is None:
+            die("materialized ablations require --ablation-dir so prepared rows point at the altered tree (a declared-removal ablation must be materialized, never labelled materialized while the original skill is mounted)")
+        ablation_dir = _ensure_ablation_dir(ablation_dir)
+        for ablation in declared_materialized:
+            trees[ablation["id"]] = materialize_ablation(repo_root, manifest, ablation, ablation_dir)
     rows: list[dict[str, Any]] = []
     for case in cases:
         is_trigger = case.get("kind") == "trigger"
@@ -372,11 +372,13 @@ def prepared_task_rows(
                     continue
                 aid = variant.split(":", 1)[1]
                 ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
-                comps_present = ablation_components(ablation)
-                mode = ("invalid_skill" if ablation.get("invalid_skill") else "materialized") if comps_present else "instruction_simulated"
+                if aid in trees:
+                    mode = "invalid_skill" if ablation.get("invalid_skill") else "materialized"
+                    skill_paths = list(trees[aid]["skill_files"].values())   # mounted files == ablated tree
+                else:
+                    mode = "instruction_simulated"   # no tree -> original skill is mounted
                 abl_meta = {"id": aid, "mode": mode, "population": population}
                 if aid in trees:
-                    skill_paths = list(trees[aid]["skill_files"].values())
                     abl_meta["skill_hash"] = trees[aid]["skill_hash"]
                     abl_meta["components"] = trees[aid]["components"]
             for run_number in range(1, runs_per_variant + 1):
@@ -450,11 +452,22 @@ JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
 ABLATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 COMPONENT_CLASSES = {"discovery", "runtime", "instructions", "resource", "preprocess"}
 SKILL_MECHANISMS = {"frontmatter_field", "section", "anchor", "list_item", "patch", "reference", "script", "asset", "preprocess"}
+# Which component classes each mechanism is allowed to declare (a declared class
+# is not trusted blindly — a section may not claim class: discovery to route to
+# trigger cases).
+MECHANISM_CLASSES = {
+    "frontmatter_field": {"discovery", "runtime"},
+    "section": {"instructions"}, "anchor": {"instructions"}, "list_item": {"instructions"},
+    "patch": {"instructions", "discovery"},
+    "reference": {"resource"}, "script": {"resource"}, "asset": {"resource"},
+    "preprocess": {"preprocess"},
+}
 # Frontmatter fields that govern activation/discovery; everything else a
 # frontmatter_field ablation can touch is treated as runtime configuration.
 DISCOVERY_FIELDS = {"name", "description", "when_to_use", "paths", "disable-model-invocation", "user-invocable"}
 REQUIRED_FRONTMATTER_FIELDS = ("name", "description")
 _COPY_EXCLUDE = {"evals", ".git"}
+_ABLATION_MARKER = ".skill-ablation-dir"
 
 
 class AblationError(Exception):
@@ -505,14 +518,28 @@ def split_frontmatter(text: str) -> tuple[str, str]:
     return "", text
 
 
-def frontmatter_value(text: str, field: str) -> str | None:
+def parse_frontmatter(text: str) -> dict[str, Any]:
+    """Parse the YAML frontmatter mapping with a real YAML parser, so block
+    scalars, folded values, and empty values are handled correctly. {} if
+    absent or not a mapping."""
     fm, _ = split_frontmatter(text)
-    m = re.search(rf"(?m)^{re.escape(field)}:[ \t]*(.*)$", fm)
-    return m.group(1).strip() if m else None
+    if not fm:
+        return {}
+    try:
+        data = yaml.safe_load(fm[4:-5])
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def frontmatter_value(text: str, field: str) -> Any:
+    return parse_frontmatter(text).get(field)
 
 
 def required_fields_present(text: str) -> bool:
-    return all(frontmatter_value(text, f) for f in REQUIRED_FRONTMATTER_FIELDS)
+    data = parse_frontmatter(text)
+    name, desc = data.get("name"), data.get("description")
+    return isinstance(name, str) and bool(name.strip()) and isinstance(desc, str) and bool(desc.strip())
 
 
 def _line_starts(text: str) -> tuple[list[str], list[int]]:
@@ -526,15 +553,31 @@ def _line_starts(text: str) -> tuple[list[str], list[int]]:
 
 
 def _fenced_mask(lines: list[str]) -> list[bool]:
-    """True for lines inside a ``` fenced code block (delimiters included)."""
-    mask, in_fence = [], False
+    """True for lines inside a fenced code block (``` or ~~~), delimiters
+    included. A fence is closed only by the same fence character it opened with."""
+    mask: list[bool] = []
+    open_char: str | None = None
     for ln in lines:
-        if re.match(r"^\s*```", ln):
-            in_fence = not in_fence
-            mask.append(True)
+        m = re.match(r"^\s*(`{3,}|~{3,})", ln)
+        ch = m.group(1)[0] if m else None
+        if open_char is None:
+            mask.append(bool(ch))
+            if ch:
+                open_char = ch
         else:
-            mask.append(in_fence)
+            mask.append(True)
+            if ch == open_char:
+                open_char = None
     return mask
+
+
+def _fenced_char_spans(text: str) -> list[tuple[int, int]]:
+    lines, starts = _line_starts(text)
+    return [(starts[i], starts[i + 1]) for i, masked in enumerate(_fenced_mask(lines)) if masked]
+
+
+def _in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(s <= pos < e for s, e in spans)
 
 
 def frontmatter_field_span(text: str, field: str) -> tuple[int, int] | None:
@@ -553,9 +596,18 @@ def frontmatter_field_span(text: str, field: str) -> tuple[int, int] | None:
             break
     if start_i is None:
         return None
+    # Consume continuation lines: blanks and indented lines (a block scalar body
+    # may contain internal blank lines), stopping only at the closing fence or
+    # the next top-level key.
     end_i = start_i + 1
-    while end_i < len(lines) and lines[end_i].rstrip("\n") != "---" and re.match(r"^[ \t]", lines[end_i]) and lines[end_i].strip():
-        end_i += 1
+    while end_i < len(lines):
+        ln = lines[end_i]
+        if ln.rstrip("\n") == "---":
+            break
+        if ln.strip() == "" or re.match(r"^[ \t]", ln):
+            end_i += 1
+        else:
+            break
     return (starts[start_i], starts[end_i])
 
 
@@ -629,11 +681,27 @@ def list_item_ops(text: str, section: str, contains: list[str]) -> list[tuple[in
             section_end = j
             break
     ops = []
-    for k in range(body_start, section_end):
+    k = body_start
+    while k < section_end:
+        if mask[k]:
+            k += 1
+            continue
         stripped = lines[k].lstrip()
+        indent = len(lines[k]) - len(stripped)
         is_bullet = stripped.startswith(("- ", "* ", "+ ")) or re.match(r"^\d+\.\s", stripped)
         if is_bullet and any(c.lower() in lines[k].lower() for c in contains):
-            ops.append((base + starts[k], base + starts[k + 1], ""))
+            j = k + 1
+            while j < section_end and not mask[j]:   # consume the item's continuation lines
+                nstripped = lines[j].lstrip()
+                nindent = len(lines[j]) - len(nstripped)
+                if nstripped == "" or nindent > indent:
+                    j += 1
+                else:
+                    break
+            ops.append((base + starts[k], base + starts[j], ""))
+            k = j
+        else:
+            k += 1
     if not ops:
         raise AblationError(f"no matching list items in {section!r}")
     return ops
@@ -649,10 +717,10 @@ def preprocess_ops(text: str, contains: list[str]) -> list[tuple[int, int, str]]
     for m in re.finditer(r"(?ms)^[ \t]*```!.*?\n[ \t]*```[ \t]*\n?", text):
         if matches(m.group(0)):
             ops.append((m.start(), m.end(), ""))
-    covered = [(s, e) for s, e, _ in ops]
+    covered = [(s, e) for s, e, _ in ops] + _fenced_char_spans(text)
     for m in re.finditer(r"!`[^`]*`", text):
-        if any(s <= m.start() < e for s, e in covered) or not matches(m.group(0)):
-            continue
+        if _in_spans(m.start(), covered) or not matches(m.group(0)):
+            continue  # skip inline commands inside ordinary code fences (examples)
         line_start = text.rfind("\n", 0, m.start()) + 1
         line_end = text.find("\n", m.end())
         line_end = line_end + 1 if line_end != -1 else len(text)
@@ -669,9 +737,11 @@ def reference_pointer_ops(text: str, relpath: str) -> list[tuple[int, int, str]]
     """Unlink markdown links whose target is relpath: [text](relpath) -> text.
     Keeps the existing visible text, so no new prose is introduced (removal,
     not substitution)."""
-    ops = [(m.start(), m.end(), m.group(1)) for m in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text) if m.group(2).strip() == relpath]
+    spans = _fenced_char_spans(text)
+    ops = [(m.start(), m.end(), m.group(1)) for m in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text)
+           if m.group(2).strip() == relpath and not _in_spans(m.start(), spans)]
     if not ops:
-        raise AblationError(f"reference pointer not found: {relpath!r}")
+        raise AblationError(f"reference pointer not found outside code fences: {relpath!r}")
     return ops
 
 
@@ -729,10 +799,41 @@ def _safe_under(base: Path, path: Path) -> Path:
 
 def _copy_skill_root(src_dir: Path, dst_dir: Path) -> None:
     """Copy a skill's complete directory (arbitrary files, not a 3-dir
-    whitelist), excluding eval answers, VCS, and dotfiles."""
+    whitelist), excluding eval answers, VCS, and dotfiles. Reject any symlink
+    that resolves outside the root — copytree would otherwise pull external
+    (possibly private) content into the materialized tree."""
+    src_real = src_dir.resolve()
+    for root, dirs, files in os.walk(src_dir):
+        dirs[:] = [d for d in dirs if d not in _COPY_EXCLUDE and not d.startswith(".")]
+        for name in [*dirs, *files]:
+            p = Path(root) / name
+            if p.is_symlink():
+                target = p.resolve()
+                if target != src_real and src_real not in target.parents:
+                    raise AblationError(f"skill root contains a symlink escaping the root: {p}")
     def ignore(_dir: str, names: list[str]) -> list[str]:
         return [n for n in names if n in _COPY_EXCLUDE or n.startswith(".")]
     shutil.copytree(src_dir, dst_dir, ignore=ignore)
+
+
+def _ensure_ablation_dir(path: Path) -> Path:
+    """Create/clear a harness-owned ablation output dir. Refuses to touch a
+    non-empty directory that lacks the harness ownership marker, so a wrong
+    --ablation-dir can never erase user data."""
+    path = Path(path)
+    if path.exists():
+        if not path.is_dir():
+            die(f"--ablation-dir {path} exists and is not a directory")
+        if any(path.iterdir()) and not (path / _ABLATION_MARKER).exists():
+            die(f"--ablation-dir {path} is non-empty and not a harness-created ablation dir; refusing to clear it")
+        for child in path.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    path.mkdir(parents=True, exist_ok=True)
+    (path / _ABLATION_MARKER).write_text("skill-eval-harness ablation output\n", encoding="utf-8")
+    return path
 
 
 def _required_target_keys(mech: str) -> list[str]:
@@ -776,10 +877,14 @@ def validate_ablation_removal(ablation: dict[str, Any], manifest: dict[str, Any]
             v = tgt.get(key)
             if v and (Path(v).is_absolute() or ".." in Path(v).parts):
                 raise AblationError(f"unsafe path (absolute or traversal): {v!r}")
-        if mech == "frontmatter_field" and comp.get("class"):
+        if comp.get("class") and comp["class"] not in MECHANISM_CLASSES.get(mech, COMPONENT_CLASSES):
+            raise AblationError(f"mechanism {mech!r} is incompatible with declared class {comp['class']!r} (allowed: {sorted(MECHANISM_CLASSES.get(mech, []))})")
+        if mech == "frontmatter_field":
             inferred = "discovery" if tgt.get("field") in DISCOVERY_FIELDS else "runtime"
-            if comp["class"] != inferred:
+            if comp.get("class") and comp["class"] != inferred:
                 raise AblationError(f"frontmatter_field {tgt.get('field')!r} is class {inferred}, not {comp['class']!r}")
+        if mech in ("reference", "script", "asset") and Path(str(tgt.get("path", ""))).name == "SKILL.md":
+            raise AblationError(f"{mech} may not target the skill's SKILL.md (use a frontmatter/section/anchor/patch mechanism)")
     if "discovery" in classes and classes - {"discovery"}:
         raise AblationError("layer cohesion: discovery cannot mix with answer-population components")
 
@@ -845,7 +950,10 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
     tmp = Path(tempfile.mkdtemp(prefix=f".ablation-{aid}-", dir=out_root))
     try:
         roots: dict[str, tuple[Path, Path]] = {}
-        for r in {root_for(c) for c in comps}:
+        # Copy EVERY manifest root (not just the ones a component touches) so the
+        # ablated arm has the same file surface as with_skill, differing only by
+        # the declared edits.
+        for r in (skill_paths or list(dict.fromkeys(root_for(c) for c in comps))):
             src = _safe_under(repo_root, repo_root / r)
             src_dir = src if src.is_dir() else src.parent
             key = re.sub(r"[^A-Za-z0-9_.-]", "_", r)
@@ -856,7 +964,7 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
 
         file_text: dict[Path, str] = {}
         file_ops: dict[Path, list[tuple[int, int, str]]] = {}
-        all_deletes: set[Path] = set()
+        delete_owner: dict[Path, int] = {}
         removed_by_component: list[int] = []
         isolation_warnings: list[str] = []
         for ci, comp in enumerate(comps):
@@ -874,22 +982,30 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
             for d in deletes:
                 if not d.exists():
                     raise AblationError(f"component #{ci}: file to remove not found: {d}")
+                if d in delete_owner:
+                    raise AblationError(f"components #{delete_owner[d]} and #{ci} both delete {d.name} (overlap)")
+                delete_owner[d] = ci
                 removed += d.stat().st_size
-            all_deletes |= deletes
             if removed <= 0:
                 raise AblationError(f"component #{ci} ({comp.get('mechanism')}) removed nothing (net-deletion gate)")
             removed_by_component.append(removed)
 
+        for d in delete_owner:
+            if d in file_ops:
+                raise AblationError(f"{d.name} is both edited and deleted by the ablation (overlap)")
         for f, edits in file_ops.items():
             _check_disjoint(edits)
             f.write_text(_apply_edits(file_text[f], edits), encoding="utf-8")
-        for d in all_deletes:
+        for d in delete_owner:
             d.unlink()
 
-        # Required-field preservation, unless this is an explicit invalid-skill experiment.
+        # Every root must keep a regular SKILL.md with required fields, unless this
+        # is an explicit invalid-skill experiment.
         if not ablation.get("invalid_skill"):
             for main, _ in roots.values():
-                if main.exists() and not required_fields_present(main.read_text(encoding="utf-8")):
+                if not (main.exists() and main.is_file()):
+                    raise AblationError(f'ablation removed the skill main file {main.name!r}; set "invalid_skill": true to run that as an invalid-skill experiment')
+                if not required_fields_present(main.read_text(encoding="utf-8")):
                     raise AblationError('required frontmatter field (name/description) became empty or missing; set "invalid_skill": true to run that as an invalid-skill experiment')
 
         digest = hashlib.sha256()
@@ -959,7 +1075,7 @@ def materialize_ablations(args: argparse.Namespace) -> int:
     path = Path(args.manifest)
     manifest = validate_manifest(path)
     repo_root = repo_root_for_manifest(path)
-    out_root = Path(args.out_dir)
+    out_root = _ensure_ablation_dir(Path(args.out_dir))
     results = []
     for ablation in manifest.get("ablations", []):
         if not ablation_components(ablation):
@@ -1083,15 +1199,21 @@ def safe_task_json(task: dict[str, Any], manifest: dict[str, Any], *, task_name:
     elif variant.startswith("ablation:"):
         aid = variant.split(":", 1)[1]
         ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
-        comps = ablation_components(ablation)
         safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
-        safe["ablation"] = {
-            "id": aid,
-            "mode": "materialized" if comps else "instruction_simulated",
-            "population": derived_population(comps) if comps else "answer",
-            "removed_component": ablation.get("removed_component"),
-            "expected_regressions": expected_regression_summaries(ablation),
-        }
+        if ablation_components(ablation):
+            # Materialized: the model-visible task must be indistinguishable from
+            # with_skill — present as with_skill and carry NO ablation hypothesis.
+            # True variant + provenance live only in the harness record.
+            safe["variant"] = "with_skill"
+        else:
+            # Instruction-simulated is non-blind by design.
+            safe["ablation"] = {
+                "id": aid,
+                "mode": "instruction_simulated",
+                "population": "answer",
+                "removed_component": ablation.get("removed_component"),
+                "expected_regressions": expected_regression_summaries(ablation),
+            }
     else:
         safe["skill_files"] = []
     return safe
@@ -1207,6 +1329,7 @@ def build_jetty_payload(
             "split": task["split"],
             "run_dir": task["run_dir"],
             "executable": not str(task.get("prompt", "")).startswith("<hidden prompt:"),
+            **({"ablation": task["ablation"]} if task.get("ablation") else {}),
         },
         "jetty_request": {
             "model": model,
@@ -1245,8 +1368,7 @@ def export_jetty(args: argparse.Namespace) -> int:
     ablation_trees: dict[str, Any] = {}
     if getattr(args, "include_ablations", False):
         abl_root = Path(getattr(args, "ablation_dir", None) or (str(args.out) + ".ablations" if getattr(args, "out", None) else "jetty-ablations"))
-        if abl_root.exists():
-            shutil.rmtree(abl_root)
+        abl_root = _ensure_ablation_dir(abl_root)
         repo_root = repo_root_for_manifest(path)
         for ablation in manifest.get("ablations", []):
             if ablation_components(ablation):
@@ -2826,18 +2948,28 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     ablation arm's aggregate objective pass rate dropped vs with_skill on the
     named cases) from 'expected regression confirmed' (a *named* assertion flips
     pass->fail in the ablation arm). A score drop is necessary, not sufficient."""
-    passed_map: dict[tuple[str, str], dict[str, bool]] = {}
+    # Repeated runs are collapsed symmetrically into per-(case, variant) pass
+    # RATES for each assertion and for the objective score — so with_skill and
+    # the ablation arm are treated identically (no all-pass-vs-one-fail asymmetry).
+    assertion_runs: dict[tuple[str, str], dict[str, list[bool]]] = {}
     rate_runs: dict[tuple[str, str], list[float]] = {}
+    measured_variants: set[str] = set()
     for r in results:
-        key = (r.get("case_id"), str(r.get("variant")))
-        amap = passed_map.setdefault(key, {})
+        variant = str(r.get("variant"))
+        key = (r.get("case_id"), variant)
+        measured_variants.add(variant)
+        amap = assertion_runs.setdefault(key, {})
         for a in list(r.get("assertions", [])) + list(r.get("qualitative_assertions", [])):
             name = a.get("name")
             if name is not None:
-                amap[name] = amap.get(name, True) and bool(a.get("passed"))
+                amap.setdefault(name, []).append(bool(a.get("passed")))
         rate = r.get("objective_pass_rate")
         if rate is not None:
             rate_runs.setdefault(key, []).append(rate)
+
+    def pass_rate(case_id: str, variant: str, name: str) -> float | None:
+        vals = assertion_runs.get((case_id, variant), {}).get(name)
+        return (sum(vals) / len(vals)) if vals else None
 
     def mean_rate_cv(case_id: str, variant: str) -> float | None:
         vals = rate_runs.get((case_id, variant))
@@ -2849,6 +2981,14 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             continue
         aid = ablation["id"]
         variant = f"ablation:{aid}"
+        invalid = bool(ablation.get("invalid_skill"))
+        entry: dict[str, Any] = {"id": aid, "population": ablation_variant_population(manifest, variant), "invalid_skill": invalid}
+        if variant not in measured_variants:
+            # No ablation rows were graded — absence of evidence, not evidence of absence.
+            entry["status"] = "unmeasured"
+            out.append(entry)
+            continue
+        entry["status"] = "measured"
         regressions = []
         for spec in ablation.get("expected_regressions", []):
             if not isinstance(spec, dict):
@@ -2857,25 +2997,27 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             cases, names = spec.get("cases", []), spec.get("assertions", [])
             evidence = []
             for cid in cases:
-                w = passed_map.get((cid, "with_skill"), {})
-                a = passed_map.get((cid, variant), {})
                 for name in names:
-                    if w.get(name) is True and a.get(name) is False:
-                        evidence.append({"case": cid, "assertion": name})
+                    w, a = pass_rate(cid, "with_skill", name), pass_rate(cid, variant, name)
+                    if w is not None and a is not None and a < w:   # symmetric paired rate drop
+                        evidence.append({"case": cid, "assertion": name, "with_skill_rate": w, "ablation_rate": a})
             score_regressed = None
             for cid in cases:
                 wr, ar = mean_rate_cv(cid, "with_skill"), mean_rate_cv(cid, variant)
                 if wr is not None and ar is not None:
                     score_regressed = bool(score_regressed) or (ar < wr)
-            regressions.append({
-                "summary": spec.get("summary", ""),
-                "cases": cases,
-                "assertions": names,
-                "score_regressed": score_regressed,
-                "expected_regression_confirmed": bool(evidence),
-                "evidence": evidence,
-            })
-        out.append({"id": aid, "population": ablation_variant_population(manifest, variant), "invalid_skill": bool(ablation.get("invalid_skill")), "regressions": regressions})
+            reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence}
+            if invalid:
+                # An invalid-skill experiment's failure may be a parser/validation
+                # rejection — never report it as a behavioral-hypothesis confirmation.
+                reg["expected_regression_confirmed"] = None
+                reg["note"] = "invalid-skill experiment: a parser/validation rejection is not evidence of a behavioral regression"
+            else:
+                # A score drop is necessary, not sufficient: require both the named flip and the aggregate drop.
+                reg["expected_regression_confirmed"] = bool(evidence) and bool(score_regressed)
+            regressions.append(reg)
+        entry["regressions"] = regressions
+        out.append(entry)
     return out
 
 
