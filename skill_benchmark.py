@@ -279,28 +279,29 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
 
 
 def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path | None = None) -> str:
-    raw_paths = manifest.get("skill_paths", [])
-    if repo_root:
-        skill_paths = ", ".join(str((repo_root / p).resolve()) for p in raw_paths)
-    else:
-        skill_paths = ", ".join(raw_paths)
+    # Path-neutral by design: the instruction must NOT embed absolute repo paths.
+    # Each runner mounts the correct (possibly altered) skill files at its own
+    # workspace-relative location and points the model at them; embedding the
+    # original repo path here would tell a repo-aware runner to read the ORIGINAL
+    # skill — silently defeating a materialized ablation — and would also make the
+    # two arms distinguishable. (repo_root is accepted for call-site compatibility
+    # but intentionally unused.)
+    name = manifest["skill_name"]
     if variant == "with_skill":
         return (
-            f"Use the skill under test ({manifest['skill_name']}). Read and follow: {skill_paths}. "
-            "Load only references relevant to the task."
+            f"Use the skill under test ({name}). Its files are provided in your workspace — "
+            "read and follow them, loading only the references relevant to the task. "
+            "If the skill defines a required output contract, follow it exactly."
         )
     if variant == "without_skill":
         return (
-            f"Do not read or use the {manifest['skill_name']} skill or its references. "
+            f"Do not read or use the {name} skill or its references. "
             "Use only your general capabilities and the task context."
         )
     if variant == "old_skill":
-        old = manifest.get("old_skill_paths") or []
-        if repo_root and old:
-            old = [str((repo_root / p).resolve()) for p in old]
         return (
-            "Use the old/baseline version of the skill only. "
-            f"Old skill paths: {', '.join(old) if old else '<provide old_skill_paths or inject externally>'}."
+            "Use the old/baseline version of the skill only. Its files are provided in your "
+            "workspace — read and follow them."
         )
     if variant.startswith("ablation:"):
         aid = variant.split(":", 1)[1]
@@ -312,7 +313,7 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
             # model-visible instruction is indistinguishable from the full-skill arm.
             return variant_instruction("with_skill", manifest, repo_root)
         return (
-            f"Use the {manifest['skill_name']} skill, but simulate this ablation: remove/ignore "
+            f"Use the {name} skill, but simulate this ablation: remove/ignore "
             f"{ab['removed_component']}. Expected regression to watch for: "
             f"{'; '.join(expected_regression_summaries(ab))}."
         )

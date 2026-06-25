@@ -1081,6 +1081,36 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
                 self.assertIn("instruction-simulated", instr)
                 self.assertIn("Regression-proof requirement", Path(skill_args[skill_args.index("--skill") + 1]).read_text(encoding="utf-8"))
 
+    def test_pi_smoke_materialized_arm_is_blind_no_path_leak(self):
+        # The materialized arm must be indistinguishable from with_skill: same
+        # mount paths, same instruction, and NOTHING in the model-visible
+        # workspace, mount path, or prompt that names the ablation id.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.SECTION_ABL])   # id "no-rp"
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+            with tempfile.TemporaryDirectory() as wd_w, tempfile.TemporaryDirectory() as wd_a:
+                instr_w, args_w, _, paths_w, _ = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "with_skill", Path(wd_w))
+                instr_a, args_a, _, paths_a, prov = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:no-rp", Path(wd_a))
+                # identical workspace-relative mount names
+                rel_w = [str(Path(x).relative_to(wd_w)) for x in paths_w]
+                rel_a = [str(Path(x).relative_to(wd_a)) for x in paths_a]
+                self.assertEqual(rel_w, rel_a)
+                self.assertTrue(all(r.startswith("skills/root-") for r in rel_a))
+                # ablated content actually reaches the runner
+                self.assertNotIn("Regression-proof requirement", Path(args_a[args_a.index("--skill") + 1]).read_text(encoding="utf-8"))
+                self.assertIn("Regression-proof requirement", Path(args_w[args_w.index("--skill") + 1]).read_text(encoding="utf-8"))
+                # the model-visible instruction is byte-identical (blinding)
+                self.assertEqual(instr_w, instr_a)
+                # no ablation id leaks into the prompt, mount path, or workspace tree
+                self.assertNotIn("no-rp", instr_a)
+                self.assertNotIn("no-rp", " ".join(rel_a))
+                tree = [str(q.relative_to(wd_a)) for q in Path(wd_a).rglob("*")]
+                self.assertFalse(any("no-rp" in entry for entry in tree), f"ablation id leaked into workspace: {tree}")
+                # provenance is still returned for the harness-only record
+                self.assertEqual(prov["mode"], "materialized")
+
     def test_pi_trigger_mounts_materialized_discovery_skill(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1803,6 +1833,20 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
                 sb.variant_instruction("ablation:x", manifest, repo_root),
                 sb.variant_instruction("with_skill", manifest, repo_root),
             )
+
+    def test_variant_instruction_is_path_neutral(self):
+        # The instruction must never embed an absolute repo path: a repo-aware
+        # runner would otherwise read the ORIGINAL skill and silently defeat a
+        # materialized ablation. Each runner mounts the (possibly altered) files.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root)
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+            for variant in ("with_skill", "without_skill", "old_skill"):
+                instr = sb.variant_instruction(variant, manifest, repo_root)
+                self.assertNotIn(str(repo_root), instr)
+                self.assertNotIn("/SKILL.md", instr)   # no embedded filesystem path
 
 
 CORPUS_DIR = ROOT / "tests" / "corpus"

@@ -129,30 +129,46 @@ def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, cas
     skill_args: list[str] = []
     # A materialized ablation mounts a real, altered skill tree instead of the
     # original skill; instruction-simulated ablations (no declared removal) fall
-    # through to the with_skill path plus an "ignore X" instruction.
-    materialized = materialized_tree_for_variant(repo_root, manifest, variant, workspace / "materialized") if variant.startswith("ablation:") else None
+    # through to the with_skill path plus an "ignore X" instruction. Materialize
+    # into a staging dir OUTSIDE the model-visible workspace: the altered tree's
+    # top-level directory is named after the ablation id, and we must never let
+    # that id appear inside cwd where `ls`/`find` could surface the hypothesis.
+    staging: Path | None = None
+    materialized = None
+    if variant.startswith("ablation:"):
+        staging = Path(tempfile.mkdtemp(prefix="skill-abl-stage-"))
+        materialized = materialized_tree_for_variant(repo_root, manifest, variant, staging)
 
-    if variant == "without_skill":
-        skill_args = ["--no-skills"]
-    elif materialized is not None:
-        for sp in materialized["skill_files"].values():
-            copied_skill_paths.append(Path(sp))
-            skill_args.extend(["--skill", str(sp)])
-    else:
-        # with_skill (and instruction-simulated ablation): copy EVERY skill root via
-        # the SAME canonical copier the materialized arm uses, so the full and
-        # ablated arms have an identical file surface (differing only by the edit).
-        skill_dest_root = workspace / "skills"
-        skill_dest_root.mkdir(parents=True, exist_ok=True)
-        for i, p in enumerate(manifest.get("skill_paths", [])):
-            src = (repo_root / p).resolve()
-            src_dir = src if src.is_dir() else src.parent
-            dest = skill_dest_root / f"root-{i}"
-            _copy_skill_root(src_dir, dest)
-            main = dest / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dest / src.name
-            copied = main if main.exists() else dest
-            copied_skill_paths.append(copied)
-            skill_args.extend(["--skill", str(copied)])
+    try:
+        if variant == "without_skill":
+            skill_args = ["--no-skills"]
+        else:
+            # with_skill, materialized ablation, AND instruction-simulated ablation all
+            # mount under IDENTICAL workspace-relative names (skills/root-N) via the
+            # same canonical copier, so the arms differ only by the bytes of the
+            # (possibly altered) skill — never by a path that could leak the variant.
+            # Materialized sources each root from the altered staging tree; the others
+            # source from the repo.
+            skill_dest_root = workspace / "skills"
+            skill_dest_root.mkdir(parents=True, exist_ok=True)
+            for i, p in enumerate(manifest.get("skill_paths", [])):
+                if materialized is not None:
+                    main_src = Path(materialized["skill_files"][p])
+                    src_dir, main_name = main_src.parent, main_src.name
+                else:
+                    src = (repo_root / p).resolve()
+                    src_dir = src if src.is_dir() else src.parent
+                    main_name = "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else src.name
+                dest = skill_dest_root / f"root-{i}"
+                _copy_skill_root(src_dir, dest)
+                main = dest / main_name
+                copied = main if main.exists() else dest
+                copied_skill_paths.append(copied)
+                skill_args.extend(["--skill", str(copied)])
+    finally:
+        # The neutral copies under skills/root-N persist; drop the id-named staging tree.
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
 
     copied_inputs: list[Path] = []
     for rel in case.get("files", []) or []:
@@ -162,7 +178,11 @@ def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, cas
         shutil.copy2(src, dest)
         copied_inputs.append(dest.resolve())
 
-    skill_list = ", ".join(str(sp) for sp in copied_skill_paths)
+    # Workspace-RELATIVE paths only: the model runs with cwd=workspace, so these
+    # resolve correctly and are byte-identical between with_skill and a materialized
+    # ablation (both are skills/root-N/SKILL.md). An absolute path would embed the
+    # temp dir and could differ between arms.
+    skill_list = ", ".join(str(Path(sp).relative_to(workspace)) for sp in copied_skill_paths)
     if variant == "without_skill":
         instruction = (
             f"Do not use or read the {manifest['skill_name']} skill or its references. "
@@ -203,7 +223,9 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
     if not prompt:
         raise RuntimeError(f"{repo}/{case['id']} has no inline prompt; smoke runner only handles tune inline prompts")
 
-    with tempfile.TemporaryDirectory(prefix=f"skill-smoke-{repo}-{case['id']}-{variant.replace(':', '-')}-") as td:
+    # The temp dir name must not encode the variant: the model's cwd IS this dir,
+    # so an "ablation-no-rp" suffix would leak the hypothesis to any `pwd`/abs path.
+    with tempfile.TemporaryDirectory(prefix=f"skill-smoke-{repo}-{case['id']}-") as td:
         workspace = Path(td)
         instruction, skill_args, input_files, copied_skill_paths, ablation_provenance = materialize_runtime_workspace(manifest, repo_root, case, variant, workspace)
         fixture_note = ""
