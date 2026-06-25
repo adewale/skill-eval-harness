@@ -1949,6 +1949,36 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
                 self.assertEqual(set(abl_files) - set(with_files), set(), "added nothing")
                 self.assertEqual(with_files[skill_key], abl_files[skill_key], "SKILL.md must be untouched by a content deletion")
 
+    def test_removed_span_is_exact_not_just_subsequence(self):
+        # Subsequence is necessary but NOT sufficient: removing the WRONG region is
+        # still a subsequence of the original. Pin the EXACT removed bytes with an
+        # independent slice of the known fixture (the oracle), so a parser that
+        # deleted a different span would be caught.
+        end_marker = "<!-- ablation:no-scope:end -->"
+        cases = {
+            "section": (
+                {"mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}},
+                self.SKILL[self.SKILL.index("## Regression-proof"):self.SKILL.index("## Severity")],
+            ),
+            "anchor": (
+                {"mechanism": "anchor", "class": "instructions", "target": {"anchor": "no-scope"}},
+                self.SKILL[self.SKILL.index("<!-- ablation:no-scope:start -->"):self.SKILL.index(end_marker) + len(end_marker) + 1],
+            ),
+            "frontmatter_field": (
+                {"mechanism": "frontmatter_field", "class": "runtime", "target": {"field": "allowed-tools"}},
+                "allowed-tools: Read, Grep\n",
+            ),
+        }
+        for name, (target, expected_removed) in cases.items():
+            with self.subTest(mechanism=name), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                p = self.repo(root)
+                with_files, abl_files, skill_key = self.pair(root, p, {"id": f"x-{name}", "removed_component": name, **target}, name)
+                w = with_files[skill_key].decode("utf-8")
+                a = abl_files[skill_key].decode("utf-8")
+                self.assertIn(expected_removed, w)                        # the oracle slice is real
+                self.assertEqual(a, w.replace(expected_removed, "", 1))   # EXACTLY that span removed, once
+
     # --- regression-proof: prove the invariant has teeth against the ORIGINAL bug classes ---
     def test_invariant_catches_added_file(self):
         with self.assertRaises(AssertionError):  # the "different file surface" bug
@@ -1988,6 +2018,66 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
                 instr = sb.variant_instruction(variant, manifest, repo_root)
                 self.assertNotIn(str(repo_root), instr)
                 self.assertNotIn("/SKILL.md", instr)   # no embedded filesystem path
+
+
+class AblationParserExactnessTests(unittest.TestCase):
+    """Markdown/byte-level exactness of the removal parsers: fence length, heading
+    level, inline-code safety, and CRLF preservation."""
+
+    def test_fenced_mask_tracks_fence_length(self):
+        # A 4-backtick fence is NOT closed by a 3-backtick line; the heading inside
+        # stays masked (code), and only the matching 4-backtick line closes it.
+        lines = "````\n```\n## Inside\n````\n## Real\n".splitlines(keepends=True)
+        self.assertEqual(sb._fenced_mask(lines), [True, True, True, True, False])
+
+    def test_fenced_mask_closer_needs_clean_line(self):
+        # An info-string after the fence chars cannot close a block (it would be a
+        # nested opener); only a fence followed by whitespace closes.
+        lines = "```\ncode\n```python\nstill code\n```\nout\n".splitlines(keepends=True)
+        self.assertEqual(sb._fenced_mask(lines), [True, True, True, True, True, False])
+
+    def test_section_span_requires_declared_heading_level(self):
+        # '### Foo' appears BEFORE '## Foo'; a '## Foo' target must skip the level-3
+        # one and remove the level-2 section.
+        text = "# T\n\n### Foo\n\nsub-body\n\n## Foo\n\nmain-body\n"
+        s, e = sb.section_span(text, "## Foo")
+        removed = text[s:e]
+        self.assertTrue(removed.startswith("## Foo"))
+        self.assertIn("main-body", removed)
+        self.assertNotIn("sub-body", removed)
+
+    def test_section_span_bare_text_target_matches_any_level(self):
+        text = "# T\n\n### Foo\n\nsub-body\n\n## Foo\n\nmain-body\n"
+        s, e = sb.section_span(text, "Foo")   # no '#': first 'Foo' at any level
+        self.assertTrue(text[s:e].startswith("### Foo"))
+
+    def test_reference_pointer_ignores_inline_code_sample(self):
+        # The real link is unlinked; a link literal shown inside inline code is not.
+        text = "See [guide](references/g.md) now.\n\nSyntax: `[guide](references/g.md)` shows a link.\n"
+        ops = sb.reference_pointer_ops(text, "references/g.md")
+        self.assertEqual(len(ops), 1)
+        s, e, rep = ops[0]
+        self.assertEqual(rep, "guide")
+        self.assertLess(s, text.index("`"))    # the matched link precedes the inline-code span
+
+    def test_crlf_is_preserved_through_materialization(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sd = root / "repo" / "skills" / "good-pr"
+            sd.mkdir(parents=True)
+            (sd / "SKILL.md").write_bytes(SKILL_FIXTURE.replace("\n", "\r\n").encode("utf-8"))
+            (root / "repo" / "evals").mkdir()
+            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
+            p = root / "repo" / "evals" / "shared-benchmark.json"
+            p.write_text(json.dumps(m), encoding="utf-8")
+            manifest = sb.validate_manifest(p)
+            ab = {"id": "x", "removed_component": "rp", "mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}}
+            res = sb.materialize_ablation(sb.repo_root_for_manifest(p), manifest, ab, root / "out")
+            raw = Path(res["skill_files"]["skills/good-pr/SKILL.md"]).read_bytes()
+            self.assertIn(b"\r\n", raw)                              # CRLF preserved
+            self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"))   # every LF is part of a CRLF; none introduced
+            self.assertNotIn(b"Regression-proof requirement", raw)   # the edit still applied
+            self.assertIn(b"## Severity", raw)
 
 
 CORPUS_DIR = ROOT / "tests" / "corpus"

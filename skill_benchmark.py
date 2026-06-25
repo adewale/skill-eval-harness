@@ -575,20 +575,22 @@ def _line_starts(text: str) -> tuple[list[str], list[int]]:
 
 def _fenced_mask(lines: list[str]) -> list[bool]:
     """True for lines inside a fenced code block (``` or ~~~), delimiters
-    included. A fence is closed only by the same fence character it opened with."""
+    included. Per CommonMark, a fence is closed only by a fence of the SAME
+    character that is at least as long as the opener and has nothing but
+    whitespace after it — so a ```` (4-tick) block is not closed by ``` (3)."""
     mask: list[bool] = []
-    open_char: str | None = None
+    open_fence: tuple[str, int] | None = None   # (char, length)
     for ln in lines:
-        m = re.match(r"^\s*(`{3,}|~{3,})", ln)
-        ch = m.group(1)[0] if m else None
-        if open_char is None:
-            mask.append(bool(ch))
-            if ch:
-                open_char = ch
+        if open_fence is None:
+            m = re.match(r"^\s*(`{3,}|~{3,})", ln)   # opener may carry an info string
+            mask.append(bool(m))
+            if m:
+                open_fence = (m.group(1)[0], len(m.group(1)))
         else:
             mask.append(True)
-            if ch == open_char:
-                open_char = None
+            c = re.match(r"^\s*(`{3,}|~{3,})\s*$", ln)   # closer: only whitespace after
+            if c and c.group(1)[0] == open_fence[0] and len(c.group(1)) >= open_fence[1]:
+                open_fence = None
     return mask
 
 
@@ -599,6 +601,38 @@ def _fenced_char_spans(text: str) -> list[tuple[int, int]]:
 
 def _in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
     return any(s <= pos < e for s, e in spans)
+
+
+def _inline_code_spans(text: str) -> list[tuple[int, int]]:
+    """Char spans of inline code: a run of N backticks closed by the next run of
+    exactly N backticks (CommonMark). Lets link/reference parsing ignore code
+    samples like `` `[x](path)` `` so they are never treated as real links."""
+    spans: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "`":
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] == "`":
+            j += 1
+        ticks = j - i
+        k, closed = j, False
+        while k < n:
+            if text[k] == "`":
+                m = k
+                while m < n and text[m] == "`":
+                    m += 1
+                if m - k == ticks:
+                    spans.append((i, m))
+                    i, closed = m, True
+                    break
+                k = m
+            else:
+                k += 1
+        if not closed:
+            i = j   # unterminated run: not inline code, skip past the run
+    return spans
 
 
 def frontmatter_field_span(text: str, field: str) -> tuple[int, int] | None:
@@ -639,13 +673,18 @@ def section_span(text: str, heading: str) -> tuple[int, int]:
     base = len(fm)
     lines, starts = _line_starts(body)
     mask = _fenced_mask(lines)
-    want = heading.strip().lstrip("#").strip().lower()
+    h = heading.strip()
+    # If the target carries '#' markers, require that exact heading LEVEL — so a
+    # '## Foo' target does not accidentally match a '### Foo' subheading with the
+    # same text. A bare-text target (no '#') still matches any level.
+    want_level = (len(h) - len(h.lstrip("#"))) if h.startswith("#") else None
+    want = h.lstrip("#").strip().lower()
     start_i = level = None
     for i, ln in enumerate(lines):
         if mask[i]:
             continue
         m = re.match(r"^(#{1,6})\s+(.*)$", ln)
-        if m and m.group(2).strip().lower() == want:
+        if m and m.group(2).strip().lower() == want and (want_level is None or len(m.group(1)) == want_level):
             start_i, level = i, len(m.group(1))
             break
     if start_i is None:
@@ -758,11 +797,13 @@ def reference_pointer_ops(text: str, relpath: str) -> list[tuple[int, int, str]]
     """Unlink markdown links whose target is relpath: [text](relpath) -> text.
     Keeps the existing visible text, so no new prose is introduced (removal,
     not substitution)."""
-    spans = _fenced_char_spans(text)
+    # Exclude both fenced blocks and inline code, so a link literal shown as a
+    # code sample is never silently unlinked.
+    spans = _fenced_char_spans(text) + _inline_code_spans(text)
     ops = [(m.start(), m.end(), m.group(1)) for m in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text)
            if m.group(2).strip() == relpath and not _in_spans(m.start(), spans)]
     if not ops:
-        raise AblationError(f"reference pointer not found outside code fences: {relpath!r}")
+        raise AblationError(f"reference pointer not found outside code: {relpath!r}")
     return ops
 
 
@@ -829,6 +870,22 @@ def _apply_edits(text: str, ops: list[tuple[int, int, str]]) -> str:
     for s, e, r in sorted(ops, key=lambda o: o[0], reverse=True):
         text = text[:s] + r + text[e:]
     return text
+
+
+def _detect_newline(raw: bytes) -> str:
+    """The line ending to write back with: CRLF if the file's bytes contain any
+    CRLF, else LF. Parsing/editing happens on LF-normalized text (what read_text
+    returns), so a removal-only edit must restore the original EOL on write —
+    otherwise a CRLF skill file would be silently rewritten LF on every line."""
+    return "\r\n" if b"\r\n" in raw else "\n"
+
+
+def _write_text_preserving_newlines(path: Path, text_lf: str) -> None:
+    """Write LF-normalized text back to `path`, restoring the EOL style the file
+    on disk currently uses (read before this call, so it reflects the original)."""
+    nl = _detect_newline(path.read_bytes()) if path.exists() else "\n"
+    out = text_lf.replace("\n", nl) if nl != "\n" else text_lf
+    path.write_bytes(out.encode("utf-8"))
 
 
 def _safe_under(base: Path, path: Path) -> Path:
@@ -1057,7 +1114,8 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
                 raise AblationError(f"{d.name} is both edited and deleted by the ablation (overlap)")
         for f, edits in file_ops.items():
             _check_disjoint(edits)
-            f.write_text(_apply_edits(file_text[f], edits), encoding="utf-8")
+            # Detect the EOL from the still-original copied file, then restore it.
+            _write_text_preserving_newlines(f, _apply_edits(file_text[f], edits))
         for d in delete_owner:
             d.unlink()
 
