@@ -28,6 +28,7 @@ adopt it without a cycle.
 from __future__ import annotations
 
 import hashlib
+import statistics
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable
@@ -251,12 +252,21 @@ class ResultSet:
     def where(self, **eq: Any) -> "ResultSet":
         return ResultSet(r for r in self._rows if all(r.get(k) == v for k, v in eq.items()))
 
+    def matching(self, predicate) -> "ResultSet":
+        return ResultSet(r for r in self._rows if predicate(r))
+
     def by_case_variant(self) -> dict[Any, dict[Any, list[dict[str, Any]]]]:
         out: dict[Any, dict[Any, list[dict[str, Any]]]] = {}
         for r in self.scorable()._rows:
             out.setdefault(r.get("case_id"), {}).setdefault(r.get("variant"), []).append(r)
         return out
 
+    def by_variant(self) -> dict[Any, list[dict[str, Any]]]:
+        out: dict[Any, list[dict[str, Any]]] = {}
+        for r in self.scorable()._rows:
+            out.setdefault(r.get("variant"), []).append(r)
+        return out
+
     def mean_rate(self, key: str = "objective_pass_rate") -> float | None:
         vals = [r.get(key) for r in self.scorable()._rows if r.get(key) is not None]
-        return (sum(vals) / len(vals)) if vals else None
+        return statistics.mean(vals) if vals else None

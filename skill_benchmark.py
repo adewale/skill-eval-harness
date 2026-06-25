@@ -3227,8 +3227,8 @@ def telemetry_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> float | None:
-    vals = [r.get(key) for r in rows if r.get(key) is not None and scorable_run(r)]
-    return statistics.mean(vals) if vals else None
+    # Single scorable+mean path: ResultSet owns the predicate.
+    return ResultSet(rows).mean_rate(key)
 
 
 def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3268,27 +3268,21 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> dict[str, Any]:
     out: dict[str, Any] = {"domain": {}, "difficulty": {}, "trigger_type": {}, "success_goals": {}}
+    # Each slice routes through ResultSet so the scorable predicate is never
+    # re-rolled inline; the value enumeration is over all rows (it lists which
+    # slices exist), the scoring is over the scorable subset.
+    def slice_stats(rs: ResultSet) -> dict[str, Any]:
+        s = rs.scorable()
+        return {"runs": len(s), "mean_objective_pass_rate": s.mean_rate("objective_pass_rate"), "mean_combined_pass_rate": s.mean_rate("combined_pass_rate")}
+
+    everything = ResultSet(results)
     for field in ["domain", "difficulty", "trigger_type"]:
-        values = sorted({str(r.get(field)) for r in results if r.get(field)})
-        for value in values:
-            out[field][value] = {}
-            for variant in variants:
-                rows = [r for r in results if r.get(field) == value and r.get("variant") == variant and scorable_run(r)]
-                out[field][value][variant] = {
-                    "runs": len(rows),
-                    "mean_objective_pass_rate": mean_rate(rows, "objective_pass_rate"),
-                    "mean_combined_pass_rate": mean_rate(rows, "combined_pass_rate"),
-                }
+        for value in sorted({str(r.get(field)) for r in results if r.get(field)}):
+            out[field][value] = {v: slice_stats(everything.where(**{field: value, "variant": v})) for v in variants}
     goals = sorted({str(goal) for r in results for goal in (r.get("success_goals") or [])})
     for goal in goals:
-        out["success_goals"][goal] = {}
-        for variant in variants:
-            rows = [r for r in results if goal in (r.get("success_goals") or []) and r.get("variant") == variant and scorable_run(r)]
-            out["success_goals"][goal][variant] = {
-                "runs": len(rows),
-                "mean_objective_pass_rate": mean_rate(rows, "objective_pass_rate"),
-                "mean_combined_pass_rate": mean_rate(rows, "combined_pass_rate"),
-            }
+        in_goal = everything.matching(lambda r, g=goal: g in (r.get("success_goals") or []))
+        out["success_goals"][goal] = {v: slice_stats(in_goal.where(variant=v)) for v in variants}
     return out
 
 
@@ -3536,10 +3530,11 @@ def build_benchmark_report(
 
     summary: dict[str, Any] = {}
     for variant, rows in by_variant.items():
-        objective_rates = [r["objective_pass_rate"] for r in rows if r["objective_pass_rate"] is not None and scorable_run(r)]
-        combined_rates = [r["combined_pass_rate"] for r in rows if r.get("combined_pass_rate") is not None and scorable_run(r)]
-        process_rates = [r["process_pass_rate"] for r in rows if r.get("process_pass_rate") is not None and scorable_run(r)]
-        efficiency_rates = [r["efficiency_pass_rate"] for r in rows if r.get("efficiency_pass_rate") is not None and scorable_run(r)]
+        scorable_rows = ResultSet(rows).scorable().all   # the scorable predicate, once
+        objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
+        combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
+        process_rates = [r["process_pass_rate"] for r in scorable_rows if r.get("process_pass_rate") is not None]
+        efficiency_rates = [r["efficiency_pass_rate"] for r in scorable_rows if r.get("efficiency_pass_rate") is not None]
         merged_metrics = []
         for r in rows:
             merged = dict(r.get("metadata", {}) or {})
@@ -3575,13 +3570,9 @@ def build_benchmark_report(
 
     case_flags = []
     case_ids = sorted({r["case_id"] for r in results})
+    everything = ResultSet(results)
     for cid in case_ids:
-        rows = [r for r in results if r["case_id"] == cid]
-        by_var_case: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
-            if not scorable_run(row):
-                continue
-            by_var_case.setdefault(row["variant"], []).append(row)
+        by_var_case = everything.where(case_id=cid).by_variant()   # scorable + grouped, never hand-rolled
         ws_rows = by_var_case.get("with_skill", [])
         ns_rows = by_var_case.get("without_skill", [])
         if not ws_rows or not ns_rows:
@@ -4306,11 +4297,7 @@ def audit_manifest_report(
                 elif "flaky" in f:
                     finding("flaky-eval", "required", f"Case {flag['case_id']} has repeated-run variance.", flag)
         assertion_rows = []
-        by_case: dict[str, dict[str, list[dict[str, Any]]]] = {}
-        for row in report["results"]:
-            if not scorable_run(row):
-                continue
-            by_case.setdefault(row["case_id"], {}).setdefault(row["variant"], []).append(row)
+        by_case = ResultSet(report["results"]).by_case_variant()   # scorable + grouped, once
         for case_id, by_variant in by_case.items():
             names = sorted({a.get("name") for rows in by_variant.values() for r in rows for a in r.get("assertions", [])})
             for name in names:
