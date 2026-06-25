@@ -1364,6 +1364,41 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             # And the harness still records the truth out of the model's sight.
             self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")
 
+    def test_every_runner_emits_the_same_minimum_provenance_schema(self):
+        # Invariant: every provenance source records the same minimum schema, so the
+        # report's verifier can rely on it uniformly regardless of which runner ran.
+        REQUIRED = {"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.SECTION_ABL])
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+
+            # Source A: materialize_ablation (consumed by Pi smoke and Pi trigger).
+            res = sb.materialize_ablation(repo_root, manifest, self.SECTION_ABL, root / "abl")
+            self.assertTrue(REQUIRED.issubset(res), f"materialize missing {REQUIRED - set(res)}")
+
+            # Source B: prepared rows (consumed by codex and Jetty). The ablation arm
+            # carries the full schema; both skill-bearing arms carry skill_tree_hash.
+            rows = sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl2")
+            arow = next(r for r in rows if r["variant"] == "ablation:no-rp")
+            wrow = next(r for r in rows if r["variant"] == "with_skill")
+            self.assertTrue(REQUIRED.issubset(arow["ablation"]), f"prepared row missing {REQUIRED - set(arow['ablation'])}")
+            self.assertIn("skill_tree_hash", arow)
+            self.assertIn("skill_tree_hash", wrow)
+
+            # Jetty harness record carries the same ablation provenance + canonical hash.
+            payload = sb.build_jetty_payload(arow, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees={"no-rp": res})
+            self.assertTrue(REQUIRED.issubset(payload["harness"]["ablation"]))
+            self.assertIn("skill_tree_hash", payload["harness"])
+
+            # Source C: Pi trigger adapter (discovery ablation).
+            pd = self.repo(root / "disc", [self.DISCO_ABL])
+            dm = sb.validate_manifest(pd)
+            with tempfile.TemporaryDirectory() as cd:
+                _, tprov = tr.copy_skill_to_config(pd, dm, Path(cd), ablation_id="no-wtu")
+            self.assertTrue(REQUIRED.issubset(tprov), f"pi-trigger missing {REQUIRED - set(tprov)}")
+
     def test_prepare_skips_discovery_ablations_for_generic_runners(self):
         # Answer-population ablations are emitted for non-trigger cases; discovery
         # ablations are NOT emitted at all (the forced-load generic runners can't
@@ -1994,7 +2029,11 @@ class AblationLiveExecutionTests(unittest.TestCase):
             self.assertEqual(results["ablation:no-rp"], "NO_RP")     # the ABLATED skill is what ran
             meta = json.loads((root / "good-pr" / "eval-runs" / "run" / "ans" / "ablation:no-rp" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["ablation"]["mode"], "materialized")   # provenance persisted on the run (#9)
-            self.assertIn("skill_hash", meta["ablation"])
+            # the runner emits the full minimum provenance schema + canonical hash
+            self.assertTrue({"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"}.issubset(meta["ablation"]))
+            self.assertEqual(meta["skill_tree_hash"], meta["ablation"]["parent_skill_hash"])
+            ws_meta = json.loads((root / "good-pr" / "eval-runs" / "run" / "ans" / "with_skill" / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(ws_meta["skill_tree_hash"], meta["ablation"]["parent_skill_hash"])   # both arms, same revision
 
 
 class AblationReviewFixesTests(unittest.TestCase):

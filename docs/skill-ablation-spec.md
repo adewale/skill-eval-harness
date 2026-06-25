@@ -67,6 +67,28 @@ mechanism and the integrity rules.
 | `resource` | `references/`, `scripts/`, `assets/` files | on demand, if the body reaches them | pointer vs content are separable |
 | `preprocess` | inline `` !`command` `` blocks | **before** the body reaches the model | executes at render time, not on demand |
 
+### Supported Markdown / YAML subset
+
+The parsers target the CommonMark + YAML subset that real skills use, and are
+intentionally bounded — the contract is this subset, not all of CommonMark.
+A target that relies on a form outside it should be expressed with a different
+mechanism (e.g. an explicit `anchor` or a `patch`).
+
+Supported: YAML frontmatter via PyYAML (incl. `>`/`|` block scalars; field
+removal by parsed span); ATX headings (`#`–`######` + space), fence-aware and
+length-tracked (` ``` `/`~~~`), heading-level honored; `<!-- ablation:ID:start/end -->`
+anchors outside code; `-`/`*`/`+`/`N.` list items within a section, fence-aware,
+consuming indented continuation incl. nested code blocks; inline links
+`[text](path)` outside fenced **and** inline code; inline `` !`cmd` `` /
+```` ```! ```` preprocess blocks outside ordinary code; deletion-only unified-diff
+patches with exact-context line match and per-field ownership. Line endings
+(LF/CRLF) are preserved.
+
+Out of scope (declare as unsupported rather than expand the parser): setext
+headings (`===`/`---` underlines), 4-space indented code blocks treated as code
+regions, reference-style links (`[text][ref]`) and autolinks, raw HTML blocks,
+and YAML anchors/aliases/flow-mapping frontmatter.
+
 **Case population** — *derived* from the classes present, not declared:
 
 - `discovery` components → **trigger** cases (does the skill activate?).
