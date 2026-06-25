@@ -1692,6 +1692,32 @@ class AblationReviewFixesTests(unittest.TestCase):
                 self.assertTrue(sk and (ws / sk[0]).exists())  # skill mounted inside the isolated workspace
                 self.assertTrue(sk[0].startswith("skills/"))   # workspace-relative, not the original repo path
 
+    def test_codex_prompt_branches_on_ablation_mode(self):
+        skills = ["skills/root-0/SKILL.md"]
+        # instruction_simulated: the on-disk skill is the FULL skill, so the prompt
+        # MUST carry the directive to drop the component — otherwise it's just with_skill.
+        sim = {
+            "variant": "ablation:no-rp", "prompt": "Review.",
+            "ablation": {"id": "no-rp", "mode": "instruction_simulated", "removed_component": "regression-proof"},
+            "instruction": "Use the good-pr skill, but simulate this ablation: remove/ignore regression-proof. Expected regression to watch for: accepts weak tests.",
+        }
+        sim_prompt = sb.codex_task_prompt(sim, skills, [])
+        self.assertIn("simulate this ablation", sim_prompt)
+        self.assertIn("regression-proof", sim_prompt)
+        # materialized: the on-disk skill is already altered -> blind, no hypothesis text.
+        mat = {
+            "variant": "ablation:no-rp", "prompt": "Review.",
+            "ablation": {"id": "no-rp", "mode": "materialized"},
+            "instruction": "Use the skill under test (good-pr). Its files are provided in your workspace ...",
+        }
+        mat_prompt = sb.codex_task_prompt(mat, skills, [])
+        with_prompt = sb.codex_task_prompt({"variant": "with_skill", "prompt": "Review.", "instruction": "x"}, skills, [])
+        self.assertNotIn("simulate", mat_prompt)
+        self.assertNotIn("ignore/remove", mat_prompt)
+        self.assertNotIn("regression-proof", mat_prompt)
+        # blinded materialized prompt is identical to the with_skill prompt
+        self.assertEqual(mat_prompt, with_prompt)
+
     # --- #3b Jetty with_skill surface parity ---
     def test_jetty_with_skill_uploads_tree_recursively(self):
         with tempfile.TemporaryDirectory() as td:

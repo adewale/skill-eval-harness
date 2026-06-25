@@ -2439,12 +2439,22 @@ def codex_skill_workspace(task: dict[str, Any], ws: Path) -> tuple[list[str], li
 
 def codex_task_prompt(task: dict[str, Any], skill_paths: list[str] | None = None, input_files: list[str] | None = None) -> str:
     variant = str(task.get("variant"))
+    abl = task.get("ablation") or {}
     file_note = "\n".join(f"- {p}" for p in (input_files or [])) if input_files else "- none"
     if variant == "without_skill":
         skill_note = "Do not use any skill. No skill files are present in this workspace."
     else:
         listed = "\n".join(f"- {p}" for p in (skill_paths or [])) if skill_paths else "- none"
         skill_note = f"Read and follow the skill file(s) below (including referenced files when relevant), then do the task:\n{listed}"
+        # Branch on the ablation MODE, not just the variant name:
+        #  - materialized / invalid_skill: the skill on disk is ALREADY altered, so
+        #    the prompt stays blind (byte-identical to with_skill) — no hypothesis.
+        #  - instruction_simulated: the skill on disk is the FULL skill, so the
+        #    regression only occurs if we explicitly instruct the model to drop the
+        #    component. Without this directive the run silently equals with_skill.
+        if variant.startswith("ablation:") and abl.get("mode") == "instruction_simulated":
+            directive = task.get("instruction") or f"Ablation for this run: ignore/remove the component '{abl.get('removed_component', '')}' from the skill guidance."
+            skill_note += f"\n\n{directive}"
     return (
         f"{skill_note}\n\n"
         f"Task prompt:\n{task.get('prompt', '')}\n\n"
