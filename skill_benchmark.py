@@ -29,6 +29,17 @@ from typing import Any
 
 import yaml
 
+from ablation_model import (
+    Arm,
+    Component,
+    EvidenceClass,
+    Provenance,
+    ResultSet,
+    TreeIdentity,
+    execution_valid,
+    scorable_run,
+)
+
 VALID_SPLITS = {"tune", "holdout", "holdback"}
 DEFAULT_VARIANTS = ["with_skill", "without_skill"]
 TEXT_ASSERTIONS = {
@@ -1236,15 +1247,23 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
 
     for w in isolation_warnings:
         print(f"WARN ablation {aid}: {w}", file=sys.stderr)
+    # The recorded provenance schema is defined ONCE, by Provenance.as_dict() — not
+    # re-spelled here. The materialize-only fields (where the tree lives, isolation
+    # warnings) are merged on top.
+    prov = Provenance(
+        id=aid,
+        mode="invalid_skill" if ablation.get("invalid_skill") else "materialized",
+        population=population,
+        identity=TreeIdentity(canonical=parent_skill_hash, edited=skill_hash),
+        components=tuple(
+            Component(cls=component_class(c), mechanism=c.get("mechanism"), skill_root=root_for(c), target=c.get("target", {}), removed_bytes=removed_by_component[i])
+            for i, c in enumerate(comps)
+        ),
+    )
     return {
-        "id": aid,
-        "mode": "invalid_skill" if ablation.get("invalid_skill") else "materialized",
-        "population": population,
+        **prov.as_dict(),
         "dir": str(dest),
-        "skill_hash": skill_hash,
-        "parent_skill_hash": parent_skill_hash,
         "skill_files": {r: str(dest / main.relative_to(tmp)) for r, (main, _) in roots.items()},
-        "components": [{"class": component_class(c), "mechanism": c.get("mechanism"), "skill_root": root_for(c), "target": c.get("target", {}), "removed_bytes": removed_by_component[i]} for i, c in enumerate(comps)],
         "isolation_warnings": isolation_warnings,
     }
 
@@ -1368,13 +1387,10 @@ def jetty_task_name(task: dict[str, Any], prefix: str | None = None) -> str:
     base = prefix or task.get("skill_name") or "skill-eval"
     variant = str(task["variant"])
     # The task filename and upload placeholders are MODEL-VISIBLE (the runbook
-    # directs the agent to read the task JSON by that path). Never embed
-    # "ablation:<id>" there — use an opaque, deterministic arm token instead. The
-    # true variant lives only in the harness-only record (harness.variant/run_dir).
-    if variant.startswith("ablation:"):
-        token = "arm-" + hashlib.sha256(variant.encode("utf-8")).hexdigest()[:10]
-    else:
-        token = variant
+    # directs the agent to read the task JSON by that path). The Arm owns the rule
+    # that a blind (ablation) arm never exposes "ablation:<id>" — it returns an
+    # opaque, deterministic token. The truth stays in the harness-only record.
+    token = Arm(variant_truth=variant, blind=variant.startswith("ablation:")).upload_token()
     return "-".join(slugify(str(part)) for part in [base, task["case_id"], token, str(task.get("run_number", 1))])
 
 
@@ -1455,9 +1471,9 @@ def safe_task_json(task: dict[str, Any], manifest: dict[str, Any], *, task_name:
         safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
         if ablation_components(ablation):
             # Materialized: the model-visible task must be indistinguishable from
-            # with_skill — present as with_skill and carry NO ablation hypothesis.
-            # True variant + provenance live only in the harness record.
-            safe["variant"] = "with_skill"
+            # with_skill. The Arm enforces that a blind arm presents as with_skill;
+            # the true variant + provenance live only in the harness record.
+            safe["variant"] = Arm(variant_truth=variant, blind=True).model_visible_variant()
         else:
             # Instruction-simulated is non-blind by design.
             safe["ablation"] = {
@@ -2971,32 +2987,6 @@ def judge_command(args: argparse.Namespace) -> int:
     return 0
 
 
-_RUNNER_FAILURE_MARKERS = ("[CODEX FAILURE", "[JETTY FAILURE", "[TIMEOUT")
-
-
-def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:
-    """False when a run is an INFRASTRUCTURE failure — a nonzero exit, a timeout,
-    or a synthetic failure body a runner wrote when it never got a real answer.
-    Such a run's assertions fail for reasons unrelated to the skill, so it must be
-    excluded from scoring and from regression confirmation just like missing output."""
-    m = metadata or {}
-    rc = m.get("returncode")
-    if rc not in (0, None):
-        return False
-    if m.get("timed_out") or m.get("timeout"):
-        return False
-    return not (text or "").lstrip().startswith(_RUNNER_FAILURE_MARKERS)
-
-
-def scorable_run(row: dict[str, Any]) -> bool:
-    """THE predicate for 'this run counts toward scoring': it produced output AND
-    was not an infrastructure failure. Every report view — summary rates, paired
-    deltas/normalized gain, taxonomy and success-goal slices, assertion-level
-    comparisons, and the ablation regression report — must filter through this, so
-    an infra failure can't be excluded from one view yet corrupt another."""
-    return not row.get("missing_output") and row.get("execution_valid", True)
-
-
 def grade_case_variant(
     case: dict[str, Any],
     variant: str,
@@ -3242,11 +3232,9 @@ def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> f
 
 
 def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
-    by_case_variant: dict[str, dict[str, list[dict[str, Any]]]] = {}
-    for row in results:
-        if not scorable_run(row):
-            continue
-        by_case_variant.setdefault(row["case_id"], {}).setdefault(row["variant"], []).append(row)
+    # ResultSet.by_case_variant() applies the scorable predicate and the grouping
+    # for us — the view cannot forget to exclude infra failures.
+    by_case_variant = ResultSet(results).by_case_variant()
     paired_with_rates: list[float] = []
     paired_without_rates: list[float] = []
     for by_variant in by_case_variant.values():

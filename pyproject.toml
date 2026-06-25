@@ -31,7 +31,7 @@ skill-benchmark = "skill_benchmark:main"
 skill-pi-trigger-eval = "run_pi_trigger_eval:main"
 
 [tool.setuptools]
-py-modules = ["skill_benchmark", "run_pi_trigger_eval"]
+py-modules = ["skill_benchmark", "run_pi_trigger_eval", "ablation_model"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
