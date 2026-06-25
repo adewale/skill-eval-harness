@@ -379,6 +379,9 @@ def prepared_task_rows(
         if ablation_dir is None:
             die("materialized ablations require --ablation-dir so prepared rows point at the altered tree (a declared-removal ablation must be materialized, never labelled materialized while the original skill is mounted)")
         trees = materialize_declared_ablations(repo_root, manifest, ablation_dir)
+    # Every materialized ablation derives from the same canonical (unedited) tree,
+    # so its parent_skill_hash is the canonical hash recorded on the with_skill arm.
+    canonical_hash = next(iter(trees.values()))["parent_skill_hash"] if trees else None
     rows: list[dict[str, Any]] = []
     for case in cases:
         is_trigger = case.get("kind") == "trigger"
@@ -407,6 +410,7 @@ def prepared_task_rows(
                 abl_meta = {"id": aid, "mode": mode, "population": population}
                 if aid in trees:
                     abl_meta["skill_hash"] = trees[aid]["skill_hash"]
+                    abl_meta["parent_skill_hash"] = trees[aid]["parent_skill_hash"]
                     abl_meta["components"] = trees[aid]["components"]
             for run_number in range(1, runs_per_variant + 1):
                 run_dir = f"{case['id']}/{variant}" if runs_per_variant == 1 else f"{case['id']}/{variant}/run-{run_number}"
@@ -424,6 +428,9 @@ def prepared_task_rows(
                     "instruction": variant_instruction(variant, manifest, repo_root),
                     "prompt": case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
                     **({"ablation": abl_meta} if abl_meta else {}),
+                    # Canonical-tree hash on every skill-bearing arm so the report can
+                    # confirm with_skill and the ablation share a skill revision.
+                    **({"skill_tree_hash": canonical_hash} if canonical_hash and variant != "without_skill" else {}),
                     **({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else {}),
                     "tags": case.get("tags", []),
                 }
@@ -936,6 +943,19 @@ def _write_text_preserving_newlines(path: Path, text_lf: str) -> None:
     path.write_bytes(out.encode("utf-8"))
 
 
+def _hash_tree(root: Path) -> str:
+    """Stable content hash of a directory tree: sorted posix relpaths plus bytes.
+    Identical inputs (same files, same content, same relative layout) hash equal,
+    so a materialized ablation's pre-edit tree and the canonical with_skill tree —
+    built by the same copier with the same key naming — produce the same hash."""
+    digest = hashlib.sha256()
+    for f in sorted(root.rglob("*")):
+        if f.is_file():
+            digest.update(f.relative_to(root).as_posix().encode("utf-8") + b"\0")
+            digest.update(f.read_bytes())
+    return digest.hexdigest()
+
+
 def _safe_under(base: Path, path: Path) -> Path:
     base_r = base.resolve()
     p = path.resolve()
@@ -1151,6 +1171,10 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
             main = dst_dir / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dst_dir / src.name
             roots[r] = (main, dst_dir)
 
+        # Hash the canonical (pre-edit) tree: the with_skill arm's oracle. Both
+        # arms record this so the report can prove they share a skill revision.
+        parent_skill_hash = _hash_tree(tmp)
+
         file_text: dict[Path, str] = {}
         file_ops: dict[Path, list[tuple[int, int, str]]] = {}
         delete_owner: dict[Path, int] = {}
@@ -1198,12 +1222,7 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
                 if not required_fields_present(main.read_text(encoding="utf-8")):
                     raise AblationError('required frontmatter field (name/description) became empty or missing; set "invalid_skill": true to run that as an invalid-skill experiment')
 
-        digest = hashlib.sha256()
-        for f in sorted(tmp.rglob("*")):
-            if f.is_file():
-                digest.update(f.relative_to(tmp).as_posix().encode("utf-8") + b"\0")
-                digest.update(f.read_bytes())
-        skill_hash = digest.hexdigest()
+        skill_hash = _hash_tree(tmp)
         tmp.rename(dest)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1217,6 +1236,7 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
         "population": population,
         "dir": str(dest),
         "skill_hash": skill_hash,
+        "parent_skill_hash": parent_skill_hash,
         "skill_files": {r: str(dest / main.relative_to(tmp)) for r, (main, _) in roots.items()},
         "components": [{"class": component_class(c), "mechanism": c.get("mechanism"), "skill_root": root_for(c), "target": c.get("target", {}), "removed_bytes": removed_by_component[i]} for i, c in enumerate(comps)],
         "isolation_warnings": isolation_warnings,
@@ -1260,6 +1280,19 @@ def build_canonical_skill_tree(repo_root: Path, manifest: dict[str, Any], dest_d
         src_dir = src if src.is_dir() else src.parent
         _copy_skill_root(src_dir, dest_dir / re.sub(r"[^A-Za-z0-9_.-]", "_", r))
     return dest_dir
+
+
+def canonical_skill_tree_hash(repo_root: Path, manifest: dict[str, Any]) -> str:
+    """Hash of the canonical (unedited) skill tree — the with_skill oracle. Built by
+    the same copier and key-naming as materialize_ablation's pre-edit tree, so it
+    equals a materialized ablation's parent_skill_hash. Both arms record it so the
+    report can prove they were derived from the same skill revision."""
+    tmp = Path(tempfile.mkdtemp(prefix=".canon-hash-"))
+    try:
+        build_canonical_skill_tree(repo_root, manifest, tmp / "tree")
+        return _hash_tree(tmp / "tree")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def enumerate_tree(root_dir: Path) -> list[tuple[Path, str]]:
@@ -1548,6 +1581,7 @@ def build_jetty_payload(
             "run_dir": task["run_dir"],
             "executable": not str(task.get("prompt", "")).startswith("<hidden prompt:"),
             **({"ablation": task["ablation"]} if task.get("ablation") else {}),
+            **({"skill_tree_hash": task["skill_tree_hash"]} if task.get("skill_tree_hash") else {}),
         },
         "jetty_request": {
             "model": model,
@@ -2009,6 +2043,8 @@ def import_jetty_results(args: argparse.Namespace) -> int:
         # and the run-dir name alone.
         if isinstance(harness.get("ablation"), dict):
             meta["ablation"] = harness["ablation"]
+        if harness.get("skill_tree_hash"):
+            meta["skill_tree_hash"] = harness["skill_tree_hash"]
         trace_records = jetty_trace_records(record, artifacts, success=success)
         write_trace_artifacts(
             base,
@@ -2626,6 +2662,9 @@ def run_codex(args: argparse.Namespace) -> int:
         base = safe_child_path(runs, str(task.get("run_dir", f"{task.get('case_id','case')}/{task.get('variant','variant')}")))
         base.mkdir(parents=True, exist_ok=True)
         abl = task.get("ablation")
+        # Provenance persisted on every run so the report can verify the ablation
+        # arm and the with_skill arm share a skill revision (skill_tree_hash).
+        prov_extra = {**({"ablation": abl} if abl else {}), **({"skill_tree_hash": task["skill_tree_hash"]} if task.get("skill_tree_hash") else {})}
         started = time.time()
         with tempfile.TemporaryDirectory(prefix="codex-ws-") as wd:
             ws = Path(wd)
@@ -2640,7 +2679,7 @@ def run_codex(args: argparse.Namespace) -> int:
                         base,
                         trace_text,
                         source="codex",
-                        metadata={"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else "", **({"ablation": abl} if abl else {})},
+                        metadata={"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else "", **prov_extra},
                         extra_metrics={"elapsed_ms": elapsed_ms, "returncode": proc.returncode},
                         environment={"runner": "codex", "command": cmd, "cwd": "<isolated workspace>", "variant": task.get("variant")},
                         write_metadata=True,
@@ -2649,7 +2688,7 @@ def run_codex(args: argparse.Namespace) -> int:
                     events, metrics = {"schema_version": 1, "source": "codex", "events": []}, {"schema_version": 1, "source": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode}
                     write_json(base / "events.json", events)
                     write_json(base / "metrics.json", metrics)
-                    write_json(base / "metadata.json", {"provider": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode, "stderr": proc.stderr[:4000] if proc.stderr else "", "trace_source": "codex", **({"ablation": abl} if abl else {})})
+                    write_json(base / "metadata.json", {"provider": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode, "stderr": proc.stderr[:4000] if proc.stderr else "", "trace_source": "codex", **prov_extra})
                 answer = final_answer_from_events(events) or proc.stdout.strip()
                 if proc.returncode != 0:
                     answer = f"[CODEX FAILURE: returncode={proc.returncode}]\n\n{answer}\n\nstderr:\n{proc.stderr[:4000]}"
@@ -2657,7 +2696,7 @@ def run_codex(args: argparse.Namespace) -> int:
             except subprocess.TimeoutExpired as exc:
                 elapsed_ms = int((time.time() - started) * 1000)
                 (base / "output.md").write_text(f"[CODEX FAILURE: timed out after {timeout}s]\n", encoding="utf-8")
-                write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timeout": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **({"ablation": abl} if abl else {})})
+                write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timeout": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **prov_extra})
     return 0
 
 
@@ -3241,32 +3280,64 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
     return out
 
 
-def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], expected_pop: str, declared_comps: list[dict[str, Any]], invalid: bool) -> tuple[bool, str]:
-    """Check the provenance the RUNNERS actually recorded for an ablation variant
-    (persisted in each run's metadata), so a confirmation rests on proof that a
-    materialized tree was mounted — not on the manifest plus the run-dir name. A
-    run whose recorded mode is instruction_simulated, whose population disagrees
-    with the manifest, that carries no skill_hash, whose component shape differs,
-    or that disagrees with sibling runs about which tree was mounted, cannot
-    support a confirmation."""
+def _component_fingerprint(comp: dict[str, Any], skill_paths: list[str]) -> dict[str, Any]:
+    """Comparable identity of one declared component: class, mechanism, resolved
+    skill_root, and the full target. Computed identically for the manifest-declared
+    component and the runner-recorded one, so the report can require an EXACT match."""
+    root = comp.get("target", {}).get("skill_root")
+    if root is None and comp.get("skill_root") is not None:
+        root = comp["skill_root"]   # already-resolved (recorded) form
+    if root is None:
+        root = skill_paths[0] if skill_paths else None
+    cls = comp.get("class") or component_class(comp)
+    return {"class": cls, "mechanism": comp.get("mechanism"), "skill_root": root, "target": comp.get("target", {})}
+
+
+def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], measured_count: int, expected: dict[str, Any], ws_tree_hashes: list[Any]) -> tuple[bool, str]:
+    """Confirm only when the provenance the RUNNERS actually recorded proves, for
+    EVERY measured run, that the declared materialized ablation was mounted against
+    the same skill revision as the with_skill arm:
+
+      - every measured ablation run recorded provenance (no unprovenanced run can
+        be silently driving the regression rate);
+      - id / mode / population / full component definitions exactly match the
+        manifest (not just the class), and skill_hash + parent_skill_hash present;
+      - all ablation runs agree on the ablated tree (skill_hash) and its parent;
+      - every measured with_skill run recorded the canonical parent hash, and it
+        equals the ablation arm's parent — so the two arms share a skill revision.
+    """
     if not provs:
         return False, "no run recorded ablation provenance (cannot prove a materialized tree was mounted)"
-    expected_mode = "invalid_skill" if invalid else "materialized"
-    expected_classes = [component_class(c) for c in declared_comps]
-    hashes: set[str] = set()
+    if len(provs) != measured_count:
+        return False, f"{measured_count - len(provs)} of {measured_count} measured ablation run(s) recorded no provenance"
+    parent_hashes: set[str] = set()
+    ablated_hashes: set[str] = set()
     for p in provs:
-        if p.get("mode") != expected_mode:
-            return False, f"recorded mode {p.get('mode')!r} != expected {expected_mode!r} (run may not have mounted a materialized ablation)"
-        if p.get("population") != expected_pop:
-            return False, f"recorded population {p.get('population')!r} != manifest-derived {expected_pop!r}"
+        if p.get("id") != expected["id"]:
+            return False, f"recorded ablation id {p.get('id')!r} != {expected['id']!r}"
+        if p.get("mode") != expected["mode"]:
+            return False, f"recorded mode {p.get('mode')!r} != expected {expected['mode']!r} (run may not have mounted a materialized ablation)"
+        if p.get("population") != expected["population"]:
+            return False, f"recorded population {p.get('population')!r} != manifest-derived {expected['population']!r}"
         if not p.get("skill_hash"):
             return False, "recorded provenance is missing skill_hash"
-        rec_classes = [c.get("class") for c in (p.get("components") or [])]
-        if rec_classes != expected_classes:
-            return False, f"recorded component classes {rec_classes} != declared {expected_classes}"
-        hashes.add(str(p.get("skill_hash")))
-    if len(hashes) > 1:
-        return False, f"runs disagree on which tree was mounted (skill_hash mismatch: {sorted(hashes)})"
+        if not p.get("parent_skill_hash"):
+            return False, "recorded provenance is missing parent_skill_hash (canonical tree)"
+        rec = [_component_fingerprint(c, []) for c in (p.get("components") or [])]
+        if rec != expected["components"]:
+            return False, f"recorded components {rec} != declared {expected['components']}"
+        ablated_hashes.add(str(p.get("skill_hash")))
+        parent_hashes.add(str(p.get("parent_skill_hash")))
+    if len(ablated_hashes) > 1:
+        return False, f"ablation runs disagree on the ablated tree (skill_hash mismatch: {sorted(ablated_hashes)})"
+    if len(parent_hashes) > 1:
+        return False, f"ablation runs disagree on the parent tree (parent_skill_hash mismatch: {sorted(parent_hashes)})"
+    if not ws_tree_hashes:
+        return False, "no with_skill run recorded a canonical skill_tree_hash to pair against"
+    if any(h is None for h in ws_tree_hashes):
+        return False, "a measured with_skill run recorded no canonical skill_tree_hash"
+    if {str(h) for h in ws_tree_hashes} != parent_hashes:
+        return False, f"with_skill canonical hash {sorted({str(h) for h in ws_tree_hashes})} != ablation parent hash {sorted(parent_hashes)} (arms built from different skill revisions)"
     return True, ""
 
 
@@ -3285,6 +3356,8 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     measured_cv: set[tuple[str, str]] = set()
     coverage: dict[str, dict[str, int]] = {}
     recorded_prov: dict[str, list[dict[str, Any]]] = {}
+    measured_runs: dict[str, int] = {}
+    recorded_tree_hash: dict[str, list[Any]] = {}
     for r in results:
         variant = str(r.get("variant"))
         cov = coverage.setdefault(variant, {"runs": 0, "missing": 0, "errored": 0})
@@ -3301,9 +3374,14 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         if not r.get("execution_valid", True):
             cov["errored"] += 1
             continue
-        prov = (r.get("metadata") or {}).get("ablation")
+        meta = r.get("metadata") or {}
+        prov = meta.get("ablation")
         if isinstance(prov, dict):
             recorded_prov.setdefault(variant, []).append(prov)
+        # Every measured run is counted; the with_skill arm's canonical tree hash is
+        # collected so the ablation's parent hash can be paired against it.
+        measured_runs[variant] = measured_runs.get(variant, 0) + 1
+        recorded_tree_hash.setdefault(variant, []).append(meta.get("skill_tree_hash"))
         key = (r.get("case_id"), variant)
         measured_variants.add(variant)
         measured_cv.add(key)
@@ -3357,8 +3435,17 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             out.append(entry)
             continue
         entry["status"] = "measured"
-        # Verify the provenance the runners RECORDED, not just the manifest + dirname.
-        prov_ok, prov_note = _verify_recorded_ablation_provenance(recorded_prov.get(variant, []), expected_pop, ablation_components(ablation), invalid)
+        # Verify the provenance the runners RECORDED, not just the manifest + dirname:
+        # every measured run must carry an exact match, and the with_skill arm must
+        # have recorded the same canonical parent hash.
+        expected_prov = {
+            "id": aid,
+            "mode": "invalid_skill" if invalid else "materialized",
+            "population": expected_pop,
+            "components": [_component_fingerprint(c, manifest.get("skill_paths", [])) for c in ablation_components(ablation)],
+        }
+        prov_ok, prov_note = _verify_recorded_ablation_provenance(
+            recorded_prov.get(variant, []), measured_runs.get(variant, 0), expected_prov, recorded_tree_hash.get("with_skill", []))
         entry["provenance_verified"] = prov_ok
         if not prov_ok:
             entry["provenance_note"] = prov_note
