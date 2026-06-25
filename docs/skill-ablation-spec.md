@@ -274,11 +274,11 @@ executor must be changed to consume it:
 - **Pi smoke** (`run_pi_smoke.py:materialize_runtime_workspace`) rebuilds sources
   from `manifest["skill_paths"]`. It must instead copy the row's materialized
   per-root trees, preserving each root's structure.
-- **Pi trigger** (`run_pi_trigger_eval.py:copy_skill_to_config`) also copies from
-  the manifest and takes **no variant input**. Routing discovery ablations to
-  trigger cases is inert until this runner accepts an ablation variant and mounts
-  the materialized tree. This is required for discovery ablations to mean
-  anything.
+- **Pi trigger** (`run_pi_trigger_eval.py:copy_skill_to_config`) is the
+  autonomous-trigger adapter: `--ablation <id>` materializes a discovery ablation
+  and mounts the altered tree so the eval measures whether it still loads. It
+  rejects answer-population ablations. Discovery ablations are measured **only**
+  here — the forced-load generic runners cannot observe autonomous loading.
 - **Jetty** (`build_jetty_payload` + `JettyClient.upload`) uploads individual
   files with a basename-only `remote_path_hint` (duplicate `SKILL.md` basenames
   collide) and `read_bytes` per file (no recursion). It must recursively
@@ -298,9 +298,12 @@ A cross-runner test asserts the materialized content actually reaches the model
 - `variant_instruction`: materialized rows get the plain "use the loaded skill as
   is" text; the "simulate removing X" prose remains only for the
   instruction-simulated mode.
-- Case routing follows the **derived population**: discovery ablations run only
-  against trigger cases; answer-population ablations skip trigger cases
-  (`prepared_task_rows:332`).
+- Case routing follows the **derived population**: `prepared_task_rows` emits
+  rows only for **answer-population** ablations (on non-trigger cases). Discovery
+  (trigger-population) ablations are *not* emitted for the generic forced-load
+  runners — they are measured by the autonomous-trigger adapter
+  (`run_pi_trigger_eval.py --ablation`), which is the only place autonomous skill
+  loading can be observed.
 
 ## Provenance and reporting
 
