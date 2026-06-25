@@ -896,20 +896,26 @@ def _verify_hunks_match_class(text: str, spans: list[tuple[int, int, str]], decl
         # vice versa — which would change the wrong behavior for the wrong population.
         if in_body:
             raise AblationError(f"patch declares class {declared_class!r} (a frontmatter edit) but a hunk deletes body content")
-        deleted_fields = set()
+        # STRUCTURAL ownership, not a regex on the deleted text: map each deleted
+        # line to the parsed top-level field whose span CONTAINS it. A block-scalar
+        # body line that merely looks like `key:` is correctly attributed to its
+        # enclosing field, and gutting a discovery field's multi-line value can no
+        # longer slip through as a runtime edit. Every deleted byte must belong to a
+        # field of the declared kind.
+        field_spans = []
+        for name in parse_frontmatter(text):
+            fsp = frontmatter_field_span(text, str(name))
+            if fsp is not None:
+                field_spans.append((str(name), fsp[0], fsp[1]))
         for s, e, _ in spans:
-            for line in text[s:e].splitlines():
-                m = re.match(r"^([A-Za-z0-9_-]+):", line)   # top-level (column-0) YAML key
-                if m:
-                    deleted_fields.add(m.group(1))
-        if declared_class == "discovery":
-            bad = sorted(f for f in deleted_fields if f not in DISCOVERY_FIELDS)
-            if bad:
-                raise AblationError(f"discovery patch deletes non-discovery frontmatter field(s) {bad}; use class 'runtime' for runtime fields or split the patch")
-        else:
-            bad = sorted(f for f in deleted_fields if f in DISCOVERY_FIELDS)
-            if bad:
-                raise AblationError(f"runtime patch deletes discovery frontmatter field(s) {bad}; use class 'discovery' for discovery fields")
+            owner = next((nm for nm, fs, fe in field_spans if fs <= s and e <= fe), None)
+            if owner is None:
+                raise AblationError("patch deletes frontmatter content outside any field (a fence or blank line); patch a specific field instead")
+            owner_is_discovery = owner in DISCOVERY_FIELDS
+            if declared_class == "discovery" and not owner_is_discovery:
+                raise AblationError(f"discovery patch deletes non-discovery field {owner!r}; use class 'runtime' for runtime fields or split the patch")
+            if declared_class == "runtime" and owner_is_discovery:
+                raise AblationError(f"runtime patch deletes discovery frontmatter field {owner!r}; use class 'discovery' for discovery fields")
     elif in_fm:
         raise AblationError(f"patch declares class {declared_class!r} but a hunk deletes frontmatter content")
 

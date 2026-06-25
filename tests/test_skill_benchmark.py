@@ -1020,6 +1020,41 @@ class SkillAblationTests(unittest.TestCase):
                 sb.materialize_ablation(repo_root, manifest, ab, root / "out")
             self.assertIn("discovery frontmatter field", str(cm.exception))
 
+    def test_patch_runtime_cannot_gut_block_scalar_discovery_field(self):
+        # Bypass the OLD line-regex heuristic: deleting the INDENTED body of a
+        # block-scalar `description` (a discovery field) under a runtime patch. The
+        # deleted lines don't start with a column-0 key, so the heuristic saw no
+        # field and allowed it; structural ownership attributes them to description.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"; sd = repo / "skills" / "good-pr"; sd.mkdir(parents=True)
+            skill = ("---\nname: good-pr\ndescription: >\n  first line of the description\n"
+                     "  second line of the description\nallowed-tools: Read\n---\n\n# Body\n\nText.\n")
+            (sd / "SKILL.md").write_text(skill, encoding="utf-8")
+            (repo / "evals" / "ablations").mkdir(parents=True)
+            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
+            p = repo / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            lines = skill.split("\n")
+            n = lines.index("  first line of the description") + 1
+            (repo / "evals" / "ablations" / "p.patch").write_text(
+                f"@@ -{n},2 +{n},0 @@\n-  first line of the description\n-  second line of the description\n", encoding="utf-8")
+            manifest = sb.validate_manifest(p)
+            ab = {"id": "p", "removed_component": "x", "mechanism": "patch", "class": "runtime", "target": {"patch": "evals/ablations/p.patch"}}
+            with self.assertRaises(sb.AblationError) as cm:
+                sb.materialize_ablation(sb.repo_root_for_manifest(p), manifest, ab, root / "out")
+            self.assertIn("discovery frontmatter field 'description'", str(cm.exception))
+
+    def test_patch_frontmatter_fence_deletion_rejected(self):
+        # Deleting a structural line (the closing '---') belongs to no field.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lines = SKILL_FIXTURE.split("\n")
+            close = lines.index("---", 1) + 1
+            manifest, repo_root, ab = self._patch_ablation(root, f"@@ -{close},1 +{close},0 @@\n----\n", cls="discovery")
+            with self.assertRaises(sb.AblationError) as cm:
+                sb.materialize_ablation(repo_root, manifest, ab, root / "out")
+            self.assertIn("outside any field", str(cm.exception))
+
     def test_patch_spanning_frontmatter_and_body_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
