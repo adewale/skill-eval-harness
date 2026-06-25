@@ -1246,6 +1246,67 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
                 self.assertIsNone(base_prov)
                 self.assertEqual(abl_prov["mode"], "materialized")
 
+    def test_materialized_ablation_is_blind_across_every_runner(self):
+        # Invariant (not a single surface): a materialized ablation must be
+        # model-indistinguishable from with_skill on EVERY channel the model
+        # receives bytes through. The ablation id must leak into none of them, and
+        # the harness-controlled model-visible surface must equal the with_skill
+        # arm's. This is the generalization of the blinding leaks found one-per-round
+        # (instruction text -> mount path -> temp dir name -> Jetty filename -> runbook).
+        ID = "no-rp"
+
+        def names_under(d):
+            return [q.relative_to(d).as_posix() for q in Path(d).rglob("*")]
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.SECTION_ABL])       # answer-population, materialized
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+            case = manifest["cases"][0]
+            leaks = {}   # channel -> the model-visible string(s) that must not contain ID
+
+            # 1) generic instruction
+            instr_a = sb.variant_instruction("ablation:no-rp", manifest, repo_root)
+            instr_w = sb.variant_instruction("with_skill", manifest, repo_root)
+            self.assertEqual(instr_a, instr_w)             # blinded: identical
+            leaks["variant_instruction"] = instr_a
+
+            # 2) Pi smoke: instruction + mount names (relative) + workspace tree names
+            with tempfile.TemporaryDirectory() as wa, tempfile.TemporaryDirectory() as wb:
+                pi_instr_a, pi_args_a, _, paths_a, _ = smoke.materialize_runtime_workspace(manifest, repo_root, case, "ablation:no-rp", Path(wa))
+                pi_instr_w, _, _, paths_w, _ = smoke.materialize_runtime_workspace(manifest, repo_root, case, "with_skill", Path(wb))
+                self.assertEqual(pi_instr_a, pi_instr_w)
+                self.assertEqual([Path(x).relative_to(wa).as_posix() for x in paths_a],
+                                 [Path(x).relative_to(wb).as_posix() for x in paths_w])
+                leaks["pi_smoke_instruction"] = pi_instr_a
+                leaks["pi_smoke_workspace_tree"] = " ".join(names_under(wa))
+
+            # 3) codex: prompt + mounted relative paths + workspace tree names
+            rows = sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl")
+            arow = next(r for r in rows if r["variant"] == "ablation:no-rp")
+            wrow = next(r for r in rows if r["variant"] == "with_skill")
+            with tempfile.TemporaryDirectory() as ca, tempfile.TemporaryDirectory() as cb:
+                sa, ia = sb.codex_skill_workspace(arow, Path(ca))
+                sw, iw = sb.codex_skill_workspace(wrow, Path(cb))
+                cpa, cpw = sb.codex_task_prompt(arow, sa, ia), sb.codex_task_prompt(wrow, sw, iw)
+                self.assertEqual(cpa, cpw)
+                self.assertEqual(sa, sw)                   # identical relative mounts
+                leaks["codex_prompt"] = cpa
+                leaks["codex_workspace_tree"] = " ".join(names_under(ca))
+
+            # 4) Jetty: the jetty request (runbook + jetty block) + upload names
+            trees = {"no-rp": sb.materialize_ablation(repo_root, manifest, self.SECTION_ABL, root / "jabl")}
+            payload = sb.build_jetty_payload(arow, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
+            leaks["jetty_request"] = json.dumps(payload["jetty_request"])
+            leaks["jetty_upload_names"] = json.dumps([{"p": f.get("placeholder"), "h": f.get("remote_path_hint")} for f in payload["upload_plan"]["files"]])
+
+            # The ablation id leaks into NONE of the model-visible channels.
+            for channel, blob in leaks.items():
+                self.assertNotIn(ID, blob, f"ablation id leaked via {channel}: {blob[:200]}")
+            # And the harness still records the truth out of the model's sight.
+            self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")
+
     def test_prepare_skips_discovery_ablations_for_generic_runners(self):
         # Answer-population ablations are emitted for non-trigger cases; discovery
         # ablations are NOT emitted at all (the forced-load generic runners can't
@@ -2326,6 +2387,44 @@ class AblationParserExactnessTests(unittest.TestCase):
         self.assertEqual(len(ops), 1)
         s, e, _ = ops[0]
         self.assertLess(s, text.index("Example"))   # only the first (real) command line
+
+    def test_every_text_mechanism_ignores_code_and_layer_decoys(self):
+        # The RULE behind the R3/R4 parser findings, applied to EVERY text-searching
+        # mechanism (including list_item and frontmatter_field, which no reviewer
+        # named): a removal must ignore a lookalike target placed inside a code
+        # region or the wrong structural layer, and remove only the live one. A
+        # regression that weakened any one mechanism's code-awareness fails here.
+        def removed_text(fn, text):
+            r = fn(text)
+            if isinstance(r, tuple):                          # a single (start, end) span
+                return text[r[0]:r[1]]
+            return "".join(text[s:e] for s, e, _ in r)        # a list of ops
+
+        cases = [
+            ("section",
+             "# T\n\n```\n## Target\nDECOY\n```\n\n## Target\n\nLIVE body.\n\n## Next\n",
+             lambda t: sb.section_span(t, "## Target")),
+            ("anchor",
+             "# T\n\n```\n<!-- ablation:a:start -->\nDECOY\n<!-- ablation:a:end -->\n```\n\n<!-- ablation:a:start -->\nLIVE\n<!-- ablation:a:end -->\n",
+             lambda t: sb.anchor_span(t, "a")),
+            ("list_item",
+             "# T\n\n## S\n\n```\n- hit DECOY\n```\n- hit LIVE\n- keep\n",
+             lambda t: sb.list_item_ops(t, "## S", ["hit"])),
+            ("reference",   # removal keeps the visible text, so put the markers inside it
+             "See [LIVE](refs/g.md) now.\n\nCode: `[DECOY](refs/g.md)` sample.\n",
+             lambda t: sb.reference_pointer_ops(t, "refs/g.md")),
+            ("preprocess",
+             "Run !`go LIVE` now.\n\nCode: `!`go DECOY`` sample.\n",
+             lambda t: sb.preprocess_ops(t, ["go"])),
+            ("frontmatter_field",
+             "---\nname: s\ndescription: d.\nwhen_to_use: LIVE.\n---\n\n# B\n\nwhen_to_use: DECOY body.\n",
+             lambda t: sb.frontmatter_field_span(t, "when_to_use")),
+        ]
+        for name, text, fn in cases:
+            with self.subTest(mechanism=name):
+                out = removed_text(fn, text)
+                self.assertIn("LIVE", out, f"{name}: removed the wrong region")
+                self.assertNotIn("DECOY", out, f"{name}: removed a code/layer decoy")
 
     def test_crlf_is_preserved_through_materialization(self):
         with tempfile.TemporaryDirectory() as td:
