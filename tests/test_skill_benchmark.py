@@ -1002,6 +1002,28 @@ class SkillAblationTests(unittest.TestCase):
             res = sb.materialize_ablation(repo_root, manifest, ab, root / "safe-out")
             self.assertEqual(res["mode"], "materialized")
 
+    def test_overlapping_ancestor_skill_roots_rejected(self):
+        # A root-level SKILL.md (copy-dir = repo root) alongside skills/audit/SKILL.md:
+        # copying the ancestor would include an UNABLATED duplicate of the audit skill.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            (repo / "skills" / "audit").mkdir(parents=True)
+            (repo / "SKILL.md").write_text("---\nname: top\ndescription: Top. Use for top.\n---\n\n# Top\n\n## A\n\nbody\n", encoding="utf-8")
+            (repo / "skills" / "audit" / "SKILL.md").write_text("---\nname: audit\ndescription: Audit. Use for audits.\n---\n\n# Audit\n\n## A\n\nx\n", encoding="utf-8")
+            (repo / "evals").mkdir()
+            m = {"version": 1, "skill_name": "top", "skill_paths": ["SKILL.md", "skills/audit/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
+            p = repo / "evals" / "shared-benchmark.json"
+            p.write_text(json.dumps(m), encoding="utf-8")
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+            ab = {"id": "x", "removed_component": "audit-a", "mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/audit/SKILL.md", "heading": "## A"}}
+            with self.assertRaises(sb.AblationError) as cm:
+                sb.materialize_ablation(repo_root, manifest, ab, root / "out")
+            self.assertIn("ancestor", str(cm.exception))
+            with self.assertRaises(sb.AblationError):   # the canonical with_skill tree rejects too
+                sb.build_canonical_skill_tree(repo_root, manifest, root / "wst")
+
     def test_multi_component_is_order_independent(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

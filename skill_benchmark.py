@@ -913,6 +913,27 @@ def _reject_output_root_overlap(out_root: Path, repo_root: Path, manifest: dict[
             raise AblationError(f"output dir {out} contains source skill root {src_dir}; choose a directory outside the skill tree")
 
 
+def _reject_overlapping_skill_roots(repo_root: Path, manifest: dict[str, Any]) -> None:
+    """Refuse a manifest whose skill_paths roots nest. Each root's parent directory
+    is copied wholesale, so if one root's copy-dir is an ancestor of (or identical
+    to) another's, the ancestor copy contains an UNABLATED duplicate of the
+    descendant — a runner could read that duplicate and the ablation would not
+    actually be removed. Declare non-overlapping roots (point at each skill's own
+    directory, not a shared ancestor such as the repo root)."""
+    dirs: list[tuple[str, Path]] = []
+    for r in manifest.get("skill_paths", []):
+        src = (repo_root / r).resolve()
+        dirs.append((r, src if src.is_dir() else src.parent))
+    for i, (ri, di) in enumerate(dirs):
+        for j, (rj, dj) in enumerate(dirs):
+            if i == j:
+                continue
+            if di == dj:
+                raise AblationError(f"skill roots {ri!r} and {rj!r} are copied from the same directory {di}; the ablated copy and an unablated copy would coexist — declare a single root")
+            if di in dj.parents:
+                raise AblationError(f"skill root {ri!r} (dir {di}) is an ancestor of skill root {rj!r}; copying it would include an unablated duplicate of {rj!r} — declare non-overlapping roots")
+
+
 def _copy_skill_root(src_dir: Path, dst_dir: Path) -> None:
     """Copy a skill's complete directory (arbitrary files, not a 3-dir
     whitelist), excluding eval answers, VCS, and dotfiles. Reject any symlink
@@ -1051,6 +1072,7 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
     if not comps:
         raise AblationError(f"ablation {ablation.get('id')!r} declares no removal (instruction-simulated)")
     validate_ablation_removal(ablation, manifest)
+    _reject_overlapping_skill_roots(repo_root, manifest)
     _reject_output_root_overlap(out_root, repo_root, manifest)
     population = derived_population(comps)
     aid = ablation["id"]
@@ -1182,6 +1204,7 @@ def build_canonical_skill_tree(repo_root: Path, manifest: dict[str, Any], dest_d
     canonical surface for with_skill, so it matches a materialized ablation arm
     file-for-file (the only difference being the ablation's declared edit)."""
     dest_dir = Path(dest_dir)
+    _reject_overlapping_skill_roots(repo_root, manifest)
     _reject_output_root_overlap(dest_dir, repo_root, manifest)
     dest_dir.mkdir(parents=True, exist_ok=True)
     for r in manifest.get("skill_paths", []):
