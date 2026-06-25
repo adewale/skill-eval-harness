@@ -3045,10 +3045,23 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     assertion_runs: dict[tuple[str, str], dict[str, list[bool]]] = {}
     rate_runs: dict[tuple[str, str], list[float]] = {}
     measured_variants: set[str] = set()
+    measured_cv: set[tuple[str, str]] = set()
+    coverage: dict[str, dict[str, int]] = {}
     for r in results:
         variant = str(r.get("variant"))
+        cov = coverage.setdefault(variant, {"runs": 0, "missing": 0})
+        cov["runs"] += 1
+        # A run that produced no output is NOT measured evidence: its assertions
+        # were graded against an empty string (all-fail), which would otherwise
+        # masquerade as a regression. Exclude it from variant detection, rates,
+        # and per-(case,variant) coverage — and count it under `missing` so the
+        # report can show how thin the evidence is.
+        if r.get("missing_output"):
+            cov["missing"] += 1
+            continue
         key = (r.get("case_id"), variant)
         measured_variants.add(variant)
+        measured_cv.add(key)
         amap = assertion_runs.setdefault(key, {})
         for a in list(r.get("assertions", [])) + list(r.get("qualitative_assertions", [])):
             name = a.get("name")
@@ -3074,9 +3087,15 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         variant = f"ablation:{aid}"
         invalid = bool(ablation.get("invalid_skill"))
         entry: dict[str, Any] = {"id": aid, "population": ablation_variant_population(manifest, variant), "invalid_skill": invalid}
+        abl_cov = coverage.get(variant, {"runs": 0, "missing": 0})
+        ws_cov = coverage.get("with_skill", {"runs": 0, "missing": 0})
+        entry["coverage"] = {"ablation": abl_cov, "with_skill": ws_cov}
         if variant not in measured_variants:
-            # No ablation rows were graded — absence of evidence, not evidence of absence.
+            # No graded ablation rows — absence of evidence, not evidence of absence.
+            # Distinguish "no rows at all" from "rows present but every output was missing".
             entry["status"] = "unmeasured"
+            if abl_cov["runs"] > 0:
+                entry["note"] = f"all {abl_cov['runs']} ablation run(s) had missing output; nothing was graded"
             out.append(entry)
             continue
         entry["status"] = "measured"
@@ -3097,12 +3116,19 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 wr, ar = mean_rate_cv(cid, "with_skill"), mean_rate_cv(cid, variant)
                 if wr is not None and ar is not None:
                     score_regressed = bool(score_regressed) or (ar < wr)
-            reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence}
+            # A confirmation is only meaningful if BOTH arms actually produced a
+            # graded run for at least one cited case. Otherwise the comparison
+            # rests on missing output and must not be reported as confirmed/refuted.
+            measured_pairs = [cid for cid in cases if (cid, "with_skill") in measured_cv and (cid, variant) in measured_cv]
+            reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence, "measured_cases": measured_pairs}
             if invalid:
                 # An invalid-skill experiment's failure may be a parser/validation
                 # rejection — never report it as a behavioral-hypothesis confirmation.
                 reg["expected_regression_confirmed"] = None
                 reg["note"] = "invalid-skill experiment: a parser/validation rejection is not evidence of a behavioral regression"
+            elif not measured_pairs:
+                reg["expected_regression_confirmed"] = None
+                reg["note"] = "insufficient coverage: no cited case has a graded run in both with_skill and the ablation arm (missing output?)"
             else:
                 # A score drop is necessary, not sufficient: require both the named flip and the aggregate drop.
                 reg["expected_regression_confirmed"] = bool(evidence) and bool(score_regressed)

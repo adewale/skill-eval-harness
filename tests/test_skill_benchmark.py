@@ -1180,6 +1180,51 @@ class AblationRegressionReportTests(unittest.TestCase):
         reg = sb.build_ablation_regression_report(manifest, results)[0]["regressions"][0]
         self.assertIsNone(reg["expected_regression_confirmed"])   # parser rejection != behavioral evidence
 
+    def test_missing_output_ablation_row_never_confirms_regression(self):
+        # The ablation arm produced NO output (the run failed/never ran). Its
+        # assertions were graded against an empty string (all-fail). That must
+        # not masquerade as a confirmed regression — it is absence of evidence.
+        results = [
+            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "missing_output": False, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": []},
+            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "missing_output": True, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": []},
+        ]
+        entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
+        self.assertEqual(entry["status"], "unmeasured")            # every ablation run was missing output
+        self.assertNotIn("regressions", entry)
+        self.assertEqual(entry["coverage"]["ablation"], {"runs": 1, "missing": 1})
+        self.assertIn("missing output", entry["note"])
+
+    def test_partial_coverage_uses_only_graded_runs(self):
+        # Two ablation runs: one missing output, one real run that still passes.
+        # The missing run must be dropped; the real run shows no flip -> not confirmed.
+        results = [
+            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "missing_output": False, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": []},
+            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "missing_output": True, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": []},
+            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 1.0, "missing_output": False, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": []},
+        ]
+        entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
+        self.assertEqual(entry["status"], "measured")
+        self.assertEqual(entry["coverage"]["ablation"], {"runs": 2, "missing": 1})
+        reg = entry["regressions"][0]
+        self.assertFalse(reg["expected_regression_confirmed"])     # the one graded run passed
+        self.assertEqual(reg["measured_cases"], ["c1"])
+
+    def test_no_measured_pair_yields_none_not_false(self):
+        # with_skill has a graded run but the ablation arm has only a missing one
+        # for the cited case: confirmation is indeterminate (None), not refuted.
+        results = [
+            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "missing_output": False, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": []},
+            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "missing_output": True, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": []},
+            # a second, graded ablation run on a DIFFERENT (uncited) case keeps the variant "measured"
+            {"case_id": "c2", "variant": "ablation:no-rp", "objective_pass_rate": 1.0, "missing_output": False, "assertions": [{"name": "x", "passed": True}], "qualitative_assertions": []},
+        ]
+        entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
+        self.assertEqual(entry["status"], "measured")
+        reg = entry["regressions"][0]
+        self.assertIsNone(reg["expected_regression_confirmed"])
+        self.assertEqual(reg["measured_cases"], [])
+        self.assertIn("insufficient coverage", reg["note"])
+
 
 class AblationCoverageTests(unittest.TestCase):
     """Exercises paths claimed in the spec acceptance criteria but not covered by
