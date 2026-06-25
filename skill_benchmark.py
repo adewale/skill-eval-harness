@@ -703,12 +703,22 @@ def section_span(text: str, heading: str) -> tuple[int, int]:
 def anchor_span(text: str, anchor_id: str) -> tuple[int, int]:
     start_marker = f"<!-- ablation:{anchor_id}:start -->"
     end_marker = f"<!-- ablation:{anchor_id}:end -->"
-    si = text.find(start_marker)
+    # Ignore markers shown inside code (fenced or inline) — those are examples, not
+    # the real anchors that wrap live guidance.
+    code = _fenced_char_spans(text) + _inline_code_spans(text)
+
+    def find_outside(marker: str, frm: int) -> int:
+        i = text.find(marker, frm)
+        while i != -1 and _in_spans(i, code):
+            i = text.find(marker, i + 1)
+        return i
+
+    si = find_outside(start_marker, 0)
     if si == -1:
-        raise AblationError(f"anchor start not found: {anchor_id!r}")
-    ei = text.find(end_marker, si)
+        raise AblationError(f"anchor start not found outside code: {anchor_id!r}")
+    ei = find_outside(end_marker, si)
     if ei == -1:
-        raise AblationError(f"anchor end not found: {anchor_id!r}")
+        raise AblationError(f"anchor end not found outside code: {anchor_id!r}")
     end = text.find("\n", ei + len(end_marker))
     end = end + 1 if end != -1 else len(text)
     line_start = text.rfind("\n", 0, si)
@@ -721,13 +731,15 @@ def list_item_ops(text: str, section: str, contains: list[str]) -> list[tuple[in
     base = len(fm)
     lines, starts = _line_starts(body)
     mask = _fenced_mask(lines)
-    want = section.strip().lstrip("#").strip().lower()
+    h = section.strip()
+    want_level = (len(h) - len(h.lstrip("#"))) if h.startswith("#") else None
+    want = h.lstrip("#").strip().lower()
     body_start = level = None
     for i, ln in enumerate(lines):
         if mask[i]:
             continue
         m = re.match(r"^(#{1,6})\s+(.*)$", ln)
-        if m and m.group(2).strip().lower() == want:
+        if m and m.group(2).strip().lower() == want and (want_level is None or len(m.group(1)) == want_level):
             body_start, level = i + 1, len(m.group(1))
             break
     if body_start is None:
@@ -751,7 +763,18 @@ def list_item_ops(text: str, section: str, contains: list[str]) -> list[tuple[in
         is_bullet = stripped.startswith(("- ", "* ", "+ ")) or re.match(r"^\d+\.\s", stripped)
         if is_bullet and any(c.lower() in lines[k].lower() for c in contains):
             j = k + 1
-            while j < section_end and not mask[j]:   # consume the item's continuation lines
+            while j < section_end:
+                if mask[j]:
+                    # A fenced code block belongs to the item only if its opening
+                    # fence is indented under the bullet; consume the whole block so
+                    # the item is removed in full, not truncated at the fence.
+                    open_indent = len(lines[j]) - len(lines[j].lstrip())
+                    if open_indent > indent:
+                        j += 1
+                        while j < section_end and mask[j]:
+                            j += 1
+                        continue
+                    break
                 nstripped = lines[j].lstrip()
                 nindent = len(lines[j]) - len(nstripped)
                 if nstripped == "" or nindent > indent:
@@ -777,10 +800,10 @@ def preprocess_ops(text: str, contains: list[str]) -> list[tuple[int, int, str]]
     for m in re.finditer(r"(?ms)^[ \t]*```!.*?\n[ \t]*```[ \t]*\n?", text):
         if matches(m.group(0)):
             ops.append((m.start(), m.end(), ""))
-    covered = [(s, e) for s, e, _ in ops] + _fenced_char_spans(text)
+    covered = [(s, e) for s, e, _ in ops] + _fenced_char_spans(text) + _inline_code_spans(text)
     for m in re.finditer(r"!`[^`]*`", text):
         if _in_spans(m.start(), covered) or not matches(m.group(0)):
-            continue  # skip inline commands inside ordinary code fences (examples)
+            continue  # skip inline commands inside ordinary code (fenced or inline examples)
         line_start = text.rfind("\n", 0, m.start()) + 1
         line_end = text.find("\n", m.end())
         line_end = line_end + 1 if line_end != -1 else len(text)

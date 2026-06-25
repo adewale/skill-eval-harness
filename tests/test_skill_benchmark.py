@@ -2117,6 +2117,53 @@ class AblationParserExactnessTests(unittest.TestCase):
         self.assertEqual(rep, "guide")
         self.assertLess(s, text.index("`"))    # the matched link precedes the inline-code span
 
+    def test_anchor_span_ignores_markers_inside_code(self):
+        # The same anchor markers appear first inside a fenced example; the real
+        # anchor (outside code) must be the one removed.
+        text = (
+            "# T\n\n```\n<!-- ablation:x:start -->\nEXAMPLE\n<!-- ablation:x:end -->\n```\n\n"
+            "<!-- ablation:x:start -->\nREAL guidance.\n<!-- ablation:x:end -->\n\nkeep.\n"
+        )
+        s, e = sb.anchor_span(text, "x")
+        removed = text[s:e]
+        self.assertIn("REAL guidance.", removed)
+        self.assertNotIn("EXAMPLE", removed)
+        self.assertNotIn("```", removed)
+
+    def test_list_item_continuation_includes_indented_code_block(self):
+        # The targeted item contains an indented fenced code block; removing the
+        # item must take the whole block, not stop at the fence.
+        text = (
+            "# T\n\n## Steps\n\n"
+            "- Target item with code:\n  ```\n  do-it --now\n  ```\n  more of the item.\n"
+            "- Keep this item.\n"
+        )
+        ops = sb.list_item_ops(text, "## Steps", ["Target item"])
+        self.assertEqual(len(ops), 1)
+        s, e, _ = ops[0]
+        removed = text[s:e]
+        self.assertIn("do-it --now", removed)       # the fenced block went with the item
+        self.assertIn("more of the item.", removed)  # and the trailing continuation line
+        self.assertNotIn("Keep this item", removed)
+
+    def test_list_item_honors_heading_level(self):
+        # '### Steps' (level 3) before '## Steps' (level 2): a '## Steps' target must
+        # operate on the level-2 section.
+        text = "# T\n\n### Steps\n\n- decoy item\n\n## Steps\n\n- real item\n"
+        ops = sb.list_item_ops(text, "## Steps", ["item"])
+        self.assertEqual(len(ops), 1)
+        s, e, _ = ops[0]
+        self.assertIn("real item", text[s:e])
+        self.assertNotIn("decoy", text[s:e])
+
+    def test_preprocess_skips_inline_code_example(self):
+        # A real preprocess command is removed; one shown inside inline code is not.
+        text = "Run !`deploy --prod` now.\n\nExample shown as code: `!`deploy --prod`` stays.\n"
+        ops = sb.preprocess_ops(text, ["deploy"])
+        self.assertEqual(len(ops), 1)
+        s, e, _ = ops[0]
+        self.assertLess(s, text.index("Example"))   # only the first (real) command line
+
     def test_crlf_is_preserved_through_materialization(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
