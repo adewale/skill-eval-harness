@@ -1318,6 +1318,24 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")           # truth in harness-only record
             self.assertEqual(payload["harness"]["ablation"]["mode"], "materialized")
 
+    def test_jetty_blinds_ablation_id_from_model_visible_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.SECTION_ABL])
+            manifest = sb.validate_manifest(p)
+            row = [r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl") if r["variant"] == "ablation:no-rp"][0]
+            trees = {"no-rp": sb.materialize_ablation(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL, root / "jabl")}
+            payload = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
+            # What the model actually sees: the jetty request (runbook + jetty block,
+            # incl. file_paths and template_variables) and each upload's remote path.
+            model_visible = json.dumps(payload["jetty_request"]) + json.dumps(
+                [{"placeholder": f.get("placeholder"), "remote_path_hint": f.get("remote_path_hint")} for f in payload["upload_plan"]["files"]])
+            self.assertNotIn("no-rp", model_visible)
+            self.assertNotIn("ablation", model_visible.lower())
+            # the harness-only record still carries the truth
+            self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")
+            self.assertEqual(payload["harness"]["ablation"]["mode"], "materialized")
+
     def test_export_jetty_command_materializes_declared_ablation(self):
         # Regression guard: export-jetty used to call prepared_task_rows WITHOUT
         # an ablation dir, so a declared-removal ablation tripped the prepare-or-fail

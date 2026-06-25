@@ -1360,7 +1360,16 @@ def slugify(value: str) -> str:
 
 def jetty_task_name(task: dict[str, Any], prefix: str | None = None) -> str:
     base = prefix or task.get("skill_name") or "skill-eval"
-    return "-".join(slugify(str(part)) for part in [base, task["case_id"], task["variant"], str(task.get("run_number", 1))])
+    variant = str(task["variant"])
+    # The task filename and upload placeholders are MODEL-VISIBLE (the runbook
+    # directs the agent to read the task JSON by that path). Never embed
+    # "ablation:<id>" there — use an opaque, deterministic arm token instead. The
+    # true variant lives only in the harness-only record (harness.variant/run_dir).
+    if variant.startswith("ablation:"):
+        token = "arm-" + hashlib.sha256(variant.encode("utf-8")).hexdigest()[:10]
+    else:
+        token = variant
+    return "-".join(slugify(str(part)) for part in [base, task["case_id"], token, str(task.get("run_number", 1))])
 
 
 def canonical_jetty_runbook(agent: str, model: str, model_provider: str, snapshot: str) -> str:
@@ -1398,8 +1407,8 @@ Execute one Skill Eval Harness task exactly once. Write the final assistant answ
 
 1. Read `{{{{task_json}}}}`.
 2. Read every fixture listed in `task_json.input_files`.
-3. If `task_json.skill_files` is non-empty (variants `with_skill`, `old_skill`, or `ablation:<id>`), read and follow the mounted skill files.
-4. If `task_json.variant` is `without_skill`, do not use a skill. No skill files are mounted.
+3. If `task_json.skill_files` is non-empty, read and follow the mounted skill files.
+4. If `task_json.skill_files` is empty, do not use a skill. No skill files are mounted.
 5. Answer the user task directly.
 6. Write `{{{{results_dir}}}}/output.md`.
 7. Write `{{{{results_dir}}}}/metadata.json`.
