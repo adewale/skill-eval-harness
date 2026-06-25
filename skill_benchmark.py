@@ -331,6 +331,25 @@ def task_variants(manifest: dict[str, Any], *, include_old_skill: bool = False, 
     return variants
 
 
+def materialize_declared_ablations(repo_root: Path, manifest: dict[str, Any], ablation_dir: Path | str) -> dict[str, Any]:
+    """Materialize every declared-removal ablation once into ``ablation_dir``.
+
+    Returns ``{ablation_id: tree}`` for each ablation that declares a removal
+    (``ablation_components`` is non-empty). Instruction-simulated ablations are
+    not materialized and do not appear in the result. ``AblationError`` from a
+    gate is reported through ``die`` so every caller fails the same way.
+    """
+    ablation_dir = _ensure_ablation_dir(ablation_dir)
+    trees: dict[str, Any] = {}
+    for ablation in manifest.get("ablations", []):
+        if ablation_components(ablation):
+            try:
+                trees[ablation["id"]] = materialize_ablation(repo_root, manifest, ablation, ablation_dir)
+            except AblationError as exc:
+                die(f"ablation {ablation.get('id')}: {exc}")
+    return trees
+
+
 def prepared_task_rows(
     manifest_path: Path,
     manifest: dict[str, Any],
@@ -342,6 +361,7 @@ def prepared_task_rows(
     allow_missing_prompts: bool = False,
     include_answer_key: bool = False,
     ablation_dir: Path | str | None = None,
+    trees: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     variants = task_variants(manifest, include_old_skill=include_old_skill, include_ablations=include_ablations)
     runs_per_variant = max(1, int(runs_per_variant))
@@ -349,15 +369,15 @@ def prepared_task_rows(
     repo_root = repo_root_for_manifest(manifest_path)
     real_skill_paths = [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])]
     # When an ablation directory is provided, materialize each declared-removal
-    # ablation once and point its rows at the altered tree.
-    trees: dict[str, Any] = {}
+    # ablation once and point its rows at the altered tree. A caller that has
+    # already materialized (e.g. export-jetty, which also needs the trees for
+    # upload) passes ``trees`` so we never materialize the same ablation twice.
+    trees = dict(trees) if trees else {}
     declared_materialized = [a for a in manifest.get("ablations", []) if ablation_components(a)]
-    if include_ablations and declared_materialized:
+    if include_ablations and declared_materialized and not trees:
         if ablation_dir is None:
             die("materialized ablations require --ablation-dir so prepared rows point at the altered tree (a declared-removal ablation must be materialized, never labelled materialized while the original skill is mounted)")
-        ablation_dir = _ensure_ablation_dir(ablation_dir)
-        for ablation in declared_materialized:
-            trees[ablation["id"]] = materialize_ablation(repo_root, manifest, ablation, ablation_dir)
+        trees = materialize_declared_ablations(repo_root, manifest, ablation_dir)
     rows: list[dict[str, Any]] = []
     for case in cases:
         is_trigger = case.get("kind") == "trigger"
@@ -1381,6 +1401,22 @@ def export_jetty(args: argparse.Namespace) -> int:
     snapshot = getattr(args, "jetty_snapshot", None) or manifest.get("jetty", {}).get("snapshot") or JETTY_DEFAULT_SNAPSHOT
     collection = getattr(args, "jetty_collection", None) or manifest.get("jetty", {}).get("collection") or "skill-evals"
     task_prefix = getattr(args, "jetty_task_prefix", None) or manifest.get("jetty", {}).get("task_prefix")
+    # Materialize declared-removal ablations ONCE, before building rows, and
+    # reuse the trees for both the prepared rows (which must point at the
+    # altered tree) and the upload payloads. Materializing here also avoids the
+    # prepare-or-fail guard in prepared_task_rows tripping because export-jetty
+    # forgot to thread the ablation dir through.
+    ablation_trees: dict[str, Any] = {}
+    with_skill_tree_dir: Path | None = None
+    abl_root: Path | None = None
+    if getattr(args, "include_ablations", False):
+        repo_root = repo_root_for_manifest(path)
+        declared = [a for a in manifest.get("ablations", []) if ablation_components(a)]
+        if declared:
+            abl_root = _ensure_ablation_dir(Path(getattr(args, "ablation_dir", None) or (str(args.out) + ".ablations" if getattr(args, "out", None) else "jetty-ablations")))
+            ablation_trees = materialize_declared_ablations(repo_root, manifest, abl_root)
+            # Build the with_skill canonical tree so its arm matches the ablation arm.
+            with_skill_tree_dir = build_canonical_skill_tree(repo_root, manifest, abl_root / "_with_skill")
     rows = prepared_task_rows(
         path,
         manifest,
@@ -1390,22 +1426,9 @@ def export_jetty(args: argparse.Namespace) -> int:
         runs_per_variant=getattr(args, "runs_per_variant", 1),
         allow_missing_prompts=getattr(args, "allow_missing_prompts", False),
         include_answer_key=False,
+        ablation_dir=str(abl_root) if abl_root is not None else None,
+        trees=ablation_trees or None,
     )
-    ablation_trees: dict[str, Any] = {}
-    with_skill_tree_dir: Path | None = None
-    if getattr(args, "include_ablations", False):
-        abl_root = Path(getattr(args, "ablation_dir", None) or (str(args.out) + ".ablations" if getattr(args, "out", None) else "jetty-ablations"))
-        abl_root = _ensure_ablation_dir(abl_root)
-        repo_root = repo_root_for_manifest(path)
-        for ablation in manifest.get("ablations", []):
-            if ablation_components(ablation):
-                try:
-                    ablation_trees[ablation["id"]] = materialize_ablation(repo_root, manifest, ablation, abl_root)
-                except AblationError as exc:
-                    die(f"ablation {ablation.get('id')}: {exc}")
-        if ablation_trees:
-            # Build the with_skill canonical tree so its arm matches the ablation arm.
-            with_skill_tree_dir = build_canonical_skill_tree(repo_root, manifest, abl_root / "_with_skill")
     payloads = [build_jetty_payload(
         row,
         manifest,

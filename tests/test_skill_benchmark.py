@@ -1078,6 +1078,43 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")           # truth in harness-only record
             self.assertEqual(payload["harness"]["ablation"]["mode"], "materialized")
 
+    def test_export_jetty_command_materializes_declared_ablation(self):
+        # Regression guard: export-jetty used to call prepared_task_rows WITHOUT
+        # an ablation dir, so a declared-removal ablation tripped the prepare-or-fail
+        # guard and the whole command died. The command must materialize once and
+        # thread the trees through to both rows and upload payloads.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.SECTION_ABL])
+            out = root / "jetty.jsonl"
+            args = SimpleNamespace(
+                manifest=str(p), split=None, runs_per_variant=1,
+                include_old_skill=False, include_ablations=True, allow_missing_prompts=False,
+                jetty_collection="skill-evals", jetty_task_prefix=None,
+                jetty_agent="claude-code", jetty_model="claude-sonnet-4-6",
+                jetty_model_provider="anthropic", jetty_snapshot="python312-uv",
+                use_trial_keys=False, out=str(out), dry_run=False,
+                ablation_dir=str(root / "abl"),
+            )
+            rc = sb.export_jetty(args)   # must NOT raise SystemExit
+            self.assertEqual(rc, 0)
+            payloads = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
+            abl = [p for p in payloads if p["harness"]["variant"] == "ablation:no-rp"]
+            withs = [p for p in payloads if p["harness"]["variant"] == "with_skill"]
+            self.assertTrue(abl, "export-jetty produced no ablation payloads")
+            self.assertEqual(abl[0]["harness"]["ablation"]["mode"], "materialized")
+            # The mounted ablated SKILL.md really has the section removed.
+            skill_files = [f for f in abl[0]["upload_plan"]["files"] if f["role"] == "skill"]
+            skill_md = next(f for f in skill_files if f["remote_path_hint"].endswith("SKILL.md"))
+            self.assertNotIn("Regression-proof requirement", Path(skill_md["local_path"]).read_text(encoding="utf-8"))
+            # with_skill and the ablation arm expose an identical remote file surface.
+            abl_hints = {f["remote_path_hint"] for f in skill_files}
+            with_hints = {f["remote_path_hint"] for f in withs[0]["upload_plan"]["files"] if f["role"] == "skill"}
+            self.assertEqual(abl_hints, with_hints)
+            # Materialized exactly once: a single tree dir per ablation id, no dup suffixes.
+            abl_dirs = sorted(d.name for d in (root / "abl").iterdir() if d.is_dir() and not d.name.startswith("_"))
+            self.assertEqual(abl_dirs, ["no-rp"])
+
 
 class AblationRegressionReportTests(unittest.TestCase):
     MANIFEST = {
