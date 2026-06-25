@@ -1399,6 +1399,21 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
                 _, tprov = tr.copy_skill_to_config(pd, dm, Path(cd), ablation_id="no-wtu")
             self.assertTrue(REQUIRED.issubset(tprov), f"pi-trigger missing {REQUIRED - set(tprov)}")
 
+    def test_recorded_provenance_is_a_provenance_value_object(self):
+        # The recorded provenance IS Provenance.as_dict(), not a coincidentally-shaped
+        # dict: the prepared row records exactly the materialize tree's provenance.
+        import ablation_model as am
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.SECTION_ABL])
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+            res = sb.materialize_ablation(repo_root, manifest, self.SECTION_ABL, root / "abl")
+            expected = am.Provenance.from_dict(res).as_dict()
+            arow = next(r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl2") if r["variant"] == "ablation:no-rp")
+            self.assertEqual(arow["ablation"], expected)                     # one schema, end to end
+            self.assertEqual(set(arow["ablation"]), {"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
+
     def test_prepare_skips_discovery_ablations_for_generic_runners(self):
         # Answer-population ablations are emitted for non-trigger cases; discovery
         # ablations are NOT emitted at all (the forced-load generic runners can't
@@ -1571,6 +1586,7 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertTrue(entry["provenance_verified"])
         reg = entry["regressions"][0]
         self.assertTrue(reg["expected_regression_confirmed"])
+        self.assertEqual(reg["evidence_class"], "confirmed_causal")   # the typed verdict, via the guard
         self.assertTrue(reg["score_regressed"])
         self.assertEqual(reg["evidence"][0]["case"], "c1")
         self.assertEqual(reg["evidence"][0]["assertion"], "detect-weak")

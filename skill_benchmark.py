@@ -320,10 +320,11 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
         ab = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
         if not ab:
             return f"Use an ablated skill variant {aid}; ablation metadata was not found."
-        if ablation_components(ab):
-            # Materialized: blind the model — present exactly as with_skill so the
-            # model-visible instruction is indistinguishable from the full-skill arm.
-            return variant_instruction("with_skill", manifest, repo_root)
+        # The Arm owns the blind/transparent decision: a materialized ablation is
+        # blind, so the model sees exactly the with_skill instruction.
+        arm = Arm(variant_truth=variant, blind=bool(ablation_components(ab)))
+        if arm.blind:
+            return variant_instruction(arm.model_visible_variant(), manifest, repo_root)
         return (
             f"Use the {name} skill, but simulate this ablation: remove/ignore "
             f"{ab['removed_component']}. Expected regression to watch for: "
@@ -2667,13 +2668,12 @@ def codex_task_prompt(task: dict[str, Any], skill_paths: list[str] | None = None
     else:
         listed = "\n".join(f"- {p}" for p in (skill_paths or [])) if skill_paths else "- none"
         skill_note = f"Read and follow the skill file(s) below (including referenced files when relevant), then do the task:\n{listed}"
-        # Branch on the ablation MODE, not just the variant name:
-        #  - materialized / invalid_skill: the skill on disk is ALREADY altered, so
-        #    the prompt stays blind (byte-identical to with_skill) — no hypothesis.
-        #  - instruction_simulated: the skill on disk is the FULL skill, so the
-        #    regression only occurs if we explicitly instruct the model to drop the
-        #    component. Without this directive the run silently equals with_skill.
-        if variant.startswith("ablation:") and abl.get("mode") == "instruction_simulated":
+        # The Arm owns the blind decision: a materialized/invalid_skill arm is blind
+        # (the skill on disk is already altered, so the prompt stays byte-identical to
+        # with_skill); an instruction_simulated arm is NOT blind (the full skill is on
+        # disk, so the regression occurs only if we explicitly add the directive).
+        arm = Arm(variant_truth=variant, blind=abl.get("mode") in ("materialized", "invalid_skill"))
+        if variant.startswith("ablation:") and not arm.blind:
             directive = task.get("instruction") or f"Ablation for this run: ignore/remove the component '{abl.get('removed_component', '')}' from the skill guidance."
             skill_note += f"\n\n{directive}"
     return (
