@@ -226,6 +226,38 @@ class Arm:
         return rec
 
 
+@dataclass(frozen=True)
+class MaterializedArm:
+    """The result of actually materializing a validated ablation: a real altered
+    tree on disk. Constructing one REQUIRES an Arm that carries provenance and an
+    EDITED TreeIdentity (edited != canonical), and that is blind for a materialized
+    mode. So a value typed MaterializedArm cannot be claiming "materialized" while
+    no edit happened — the round-3 "labeled materialized while the original is
+    mounted" lie is unrepresentable, not merely checked at runtime."""
+
+    arm: Arm
+    dir: str
+    skill_files: dict[str, str]
+    isolation_warnings: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.arm.provenance is None:
+            raise ValueError("a MaterializedArm must carry provenance")
+        if self.arm.identity is None or not self.arm.identity.is_edited:
+            raise ValueError("a MaterializedArm must have an edited tree (edited != canonical)")
+        if self.arm.provenance.mode == "materialized" and not self.arm.blind:
+            raise ValueError("a materialized ablation arm must be blind")
+
+    def as_legacy_dict(self) -> dict[str, Any]:
+        """The historical materialize_ablation() dict shape, derived from the typed
+        core so the on-disk/on-wire contract is unchanged for existing consumers."""
+        d = dict(self.arm.provenance.as_dict())
+        d["dir"] = self.dir
+        d["skill_files"] = dict(self.skill_files)
+        d["isolation_warnings"] = list(self.isolation_warnings)
+        return d
+
+
 # --------------------------------------------------------------------------- #
 # ResultSet — scorable + grouping as the default access to graded rows.
 # --------------------------------------------------------------------------- #

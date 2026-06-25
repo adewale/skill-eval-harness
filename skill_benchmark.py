@@ -33,6 +33,7 @@ from ablation_model import (
     Arm,
     Component,
     EvidenceClass,
+    MaterializedArm,
     Provenance,
     ResultSet,
     TreeIdentity,
@@ -40,6 +41,7 @@ from ablation_model import (
     execution_valid,
     scorable_run,
 )
+from dataclasses import dataclass as _dataclass
 
 VALID_SPLITS = {"tune", "holdout", "holdback"}
 DEFAULT_VARIANTS = ["with_skill", "without_skill"]
@@ -1151,16 +1153,47 @@ def _resolve_component_ops(comp: dict[str, Any], main_file: Path, root_dir: Path
     return ops, deletes
 
 
+@_dataclass(frozen=True)
+class ValidatedAblation:
+    """The gate pile as a SMART CONSTRUCTOR. The only way to obtain one is
+    ValidatedAblation.validate(), which runs every declaration-time gate
+    (removal declared, mechanism/class/field consistency, path safety,
+    non-overlapping skill roots, layer cohesion). Its existence is therefore proof
+    the ablation is well-formed, so materialize() can take a ValidatedAblation
+    instead of a raw dict — you cannot materialize an unvalidated ablation."""
+
+    repo_root: Path
+    manifest: dict[str, Any]
+    ablation: dict[str, Any]
+    components: tuple[dict[str, Any], ...]
+    population: str
+
+    @classmethod
+    def validate(cls, repo_root: Path, manifest: dict[str, Any], ablation: dict[str, Any]) -> "ValidatedAblation":
+        comps = ablation_components(ablation)
+        if not comps:
+            raise AblationError(f"ablation {ablation.get('id')!r} declares no removal (instruction-simulated)")
+        validate_ablation_removal(ablation, manifest)
+        _reject_overlapping_skill_roots(repo_root, manifest)
+        population = derived_population(comps)   # runs the layer-cohesion gate
+        return cls(repo_root=repo_root, manifest=manifest, ablation=ablation, components=tuple(comps), population=population)
+
+
 def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: dict[str, Any], out_root: Path) -> dict[str, Any]:
-    """Produce out_root/<id>/ holding the altered skill tree. Returns provenance
-    with per-root materialized SKILL paths. Raises AblationError on any gate."""
-    comps = ablation_components(ablation)
-    if not comps:
-        raise AblationError(f"ablation {ablation.get('id')!r} declares no removal (instruction-simulated)")
-    validate_ablation_removal(ablation, manifest)
-    _reject_overlapping_skill_roots(repo_root, manifest)
+    """Backward-compatible dict facade over the typed core: validate, materialize,
+    serialize. New code should use ValidatedAblation.validate() + materialize()."""
+    return materialize(ValidatedAblation.validate(repo_root, manifest, ablation), out_root).as_legacy_dict()
+
+
+def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm:
+    """Produce out_root/<id>/ holding the altered skill tree for a VALIDATED
+    ablation, and return a MaterializedArm (which itself cannot exist without an
+    edited tree + provenance). Runs the apply-time gates (output containment,
+    net-deletion, disjointness, required-field). Raises AblationError on any gate."""
+    repo_root, manifest, ablation = validated.repo_root, validated.manifest, validated.ablation
+    comps = list(validated.components)
+    population = validated.population
     _reject_output_root_overlap(out_root, repo_root, manifest)
-    population = derived_population(comps)
     aid = ablation["id"]
     skill_paths = manifest.get("skill_paths", [])
 
@@ -1261,12 +1294,15 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
             for i, c in enumerate(comps)
         ),
     )
-    return {
-        **prov.as_dict(),
-        "dir": str(dest),
-        "skill_files": {r: str(dest / main.relative_to(tmp)) for r, (main, _) in roots.items()},
-        "isolation_warnings": isolation_warnings,
-    }
+    # A blind Arm carrying the provenance + edited identity, wrapped in a
+    # MaterializedArm — whose constructor refuses anything that isn't a real edit.
+    arm = Arm(variant_truth=f"ablation:{aid}", blind=True, identity=prov.identity, provenance=prov)
+    return MaterializedArm(
+        arm=arm,
+        dir=str(dest),
+        skill_files={r: str(dest / main.relative_to(tmp)) for r, (main, _) in roots.items()},
+        isolation_warnings=tuple(isolation_warnings),
+    )
 
 
 def expected_regression_summaries(ablation: dict[str, Any]) -> list[str]:
