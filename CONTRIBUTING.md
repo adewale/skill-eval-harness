@@ -11,7 +11,7 @@ uv tool install --editable .
 skill-benchmark --help
 ```
 
-The code has no runtime package dependencies beyond Python 3.10+.
+The only runtime dependency is PyYAML (declared in `pyproject.toml`, used to parse skill frontmatter); install it with `pip install -e .` before running tests. CI installs the package this way.
 
 ## Validation
 
