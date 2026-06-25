@@ -2917,6 +2917,23 @@ def judge_command(args: argparse.Namespace) -> int:
     return 0
 
 
+_RUNNER_FAILURE_MARKERS = ("[CODEX FAILURE", "[JETTY FAILURE", "[TIMEOUT")
+
+
+def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:
+    """False when a run is an INFRASTRUCTURE failure — a nonzero exit, a timeout,
+    or a synthetic failure body a runner wrote when it never got a real answer.
+    Such a run's assertions fail for reasons unrelated to the skill, so it must be
+    excluded from scoring and from regression confirmation just like missing output."""
+    m = metadata or {}
+    rc = m.get("returncode")
+    if rc not in (0, None):
+        return False
+    if m.get("timed_out") or m.get("timeout"):
+        return False
+    return not (text or "").lstrip().startswith(_RUNNER_FAILURE_MARKERS)
+
+
 def grade_case_variant(
     case: dict[str, Any],
     variant: str,
@@ -2934,6 +2951,7 @@ def grade_case_variant(
     qualitative = []
     judge_tasks = []
     missing_output = text is None
+    exec_valid = execution_valid(metadata, text)
     text = text or ""
     judge_results = judge_results or {}
     for assertion in case.get("assertions", []):
@@ -2991,6 +3009,7 @@ def grade_case_variant(
         "run_number": run_number,
         "run_base": str(run_base or output_path.parent),
         "missing_output": missing_output,
+        "execution_valid": exec_valid,
         "objective_passed": objective_passed,
         "objective_total": objective_total,
         "objective_pass_rate": (objective_passed / objective_total) if objective_total else None,
@@ -3267,15 +3286,19 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     recorded_prov: dict[str, list[dict[str, Any]]] = {}
     for r in results:
         variant = str(r.get("variant"))
-        cov = coverage.setdefault(variant, {"runs": 0, "missing": 0})
+        cov = coverage.setdefault(variant, {"runs": 0, "missing": 0, "errored": 0})
         cov["runs"] += 1
-        # A run that produced no output is NOT measured evidence: its assertions
-        # were graded against an empty string (all-fail), which would otherwise
-        # masquerade as a regression. Exclude it from variant detection, rates,
-        # and per-(case,variant) coverage — and count it under `missing` so the
-        # report can show how thin the evidence is.
+        # A run that produced no output, or that was an infrastructure failure
+        # (nonzero exit / timeout / synthetic failure body), is NOT measured
+        # evidence: its assertions failed for reasons unrelated to the skill, which
+        # would otherwise masquerade as a regression. Exclude it from variant
+        # detection, rates, and per-(case,variant) coverage, and count it so the
+        # report shows how thin the evidence is.
         if r.get("missing_output"):
             cov["missing"] += 1
+            continue
+        if not r.get("execution_valid", True):
+            cov["errored"] += 1
             continue
         prov = (r.get("metadata") or {}).get("ablation")
         if isinstance(prov, dict):
@@ -3309,15 +3332,16 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         invalid = bool(ablation.get("invalid_skill"))
         expected_pop = ablation_variant_population(manifest, variant)
         entry: dict[str, Any] = {"id": aid, "population": expected_pop, "invalid_skill": invalid}
-        abl_cov = coverage.get(variant, {"runs": 0, "missing": 0})
-        ws_cov = coverage.get("with_skill", {"runs": 0, "missing": 0})
+        abl_cov = coverage.get(variant, {"runs": 0, "missing": 0, "errored": 0})
+        ws_cov = coverage.get("with_skill", {"runs": 0, "missing": 0, "errored": 0})
         entry["coverage"] = {"ablation": abl_cov, "with_skill": ws_cov}
         if variant not in measured_variants:
             # No graded ablation rows — absence of evidence, not evidence of absence.
-            # Distinguish "no rows at all" from "rows present but every output was missing".
+            # Distinguish "no rows at all" from "rows present but none produced a
+            # usable, non-errored output".
             entry["status"] = "unmeasured"
             if abl_cov["runs"] > 0:
-                entry["note"] = f"all {abl_cov['runs']} ablation run(s) had missing output; nothing was graded"
+                entry["note"] = f"all {abl_cov['runs']} ablation run(s) had missing output or were infrastructure failures; nothing was graded"
             out.append(entry)
             continue
         entry["status"] = "measured"
@@ -3396,10 +3420,14 @@ def build_benchmark_report(
 
     summary: dict[str, Any] = {}
     for variant, rows in by_variant.items():
-        objective_rates = [r["objective_pass_rate"] for r in rows if r["objective_pass_rate"] is not None and not r["missing_output"]]
-        combined_rates = [r["combined_pass_rate"] for r in rows if r.get("combined_pass_rate") is not None and not r["missing_output"]]
-        process_rates = [r["process_pass_rate"] for r in rows if r.get("process_pass_rate") is not None and not r["missing_output"]]
-        efficiency_rates = [r["efficiency_pass_rate"] for r in rows if r.get("efficiency_pass_rate") is not None and not r["missing_output"]]
+        # A row counts toward scoring only if it produced output AND was not an
+        # infrastructure failure (nonzero exit / timeout / synthetic failure body).
+        def _scorable(r: dict[str, Any]) -> bool:
+            return not r["missing_output"] and r.get("execution_valid", True)
+        objective_rates = [r["objective_pass_rate"] for r in rows if r["objective_pass_rate"] is not None and _scorable(r)]
+        combined_rates = [r["combined_pass_rate"] for r in rows if r.get("combined_pass_rate") is not None and _scorable(r)]
+        process_rates = [r["process_pass_rate"] for r in rows if r.get("process_pass_rate") is not None and _scorable(r)]
+        efficiency_rates = [r["efficiency_pass_rate"] for r in rows if r.get("efficiency_pass_rate") is not None and _scorable(r)]
         merged_metrics = []
         for r in rows:
             merged = dict(r.get("metadata", {}) or {})
@@ -3415,6 +3443,7 @@ def build_benchmark_report(
             "cases": len({r["case_id"] for r in rows}),
             "runs": len(rows),
             "missing_outputs": sum(1 for r in rows if r["missing_output"]),
+            "execution_errors": sum(1 for r in rows if not r["missing_output"] and not r.get("execution_valid", True)),
             "mean_objective_pass_rate": statistics.mean(objective_rates) if objective_rates else None,
             "mean_combined_pass_rate": statistics.mean(combined_rates) if combined_rates else None,
             "mean_process_pass_rate": statistics.mean(process_rates) if process_rates else None,
@@ -3438,7 +3467,7 @@ def build_benchmark_report(
         rows = [r for r in results if r["case_id"] == cid]
         by_var_case: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            if row.get("missing_output"):
+            if row.get("missing_output") or not row.get("execution_valid", True):
                 continue
             by_var_case.setdefault(row["variant"], []).append(row)
         ws_rows = by_var_case.get("with_skill", [])

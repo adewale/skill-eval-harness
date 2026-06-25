@@ -1439,7 +1439,7 @@ class AblationRegressionReportTests(unittest.TestCase):
         entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
         self.assertEqual(entry["status"], "unmeasured")            # every ablation run was missing output
         self.assertNotIn("regressions", entry)
-        self.assertEqual(entry["coverage"]["ablation"], {"runs": 1, "missing": 1})
+        self.assertEqual(entry["coverage"]["ablation"], {"runs": 1, "missing": 1, "errored": 0})
         self.assertIn("missing output", entry["note"])
 
     def test_partial_coverage_uses_only_graded_runs(self):
@@ -1452,10 +1452,23 @@ class AblationRegressionReportTests(unittest.TestCase):
         ]
         entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
         self.assertEqual(entry["status"], "measured")
-        self.assertEqual(entry["coverage"]["ablation"], {"runs": 2, "missing": 1})
+        self.assertEqual(entry["coverage"]["ablation"], {"runs": 2, "missing": 1, "errored": 0})
         reg = entry["regressions"][0]
         self.assertFalse(reg["expected_regression_confirmed"])     # the one graded run passed
         self.assertEqual(reg["measured_cases"], ["c1"])
+
+    def test_infra_failure_ablation_row_never_confirms_regression(self):
+        # The ablation arm crashed: a runner wrote a synthetic failure output (so
+        # missing_output is False) and the assertions failed. That is not a
+        # behavioral regression — it must be excluded from scoring/confirmation.
+        results = [
+            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "missing_output": False, "execution_valid": True, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": []},
+            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "missing_output": False, "execution_valid": False, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.PROV},
+        ]
+        entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
+        self.assertEqual(entry["status"], "unmeasured")            # the only run was an infra failure
+        self.assertEqual(entry["coverage"]["ablation"], {"runs": 1, "missing": 0, "errored": 1})
+        self.assertNotIn("regressions", entry)
 
     def test_no_measured_pair_yields_none_not_false(self):
         # with_skill has a graded run but the ablation arm has only a missing one
@@ -1830,6 +1843,16 @@ class AblationReviewFixesTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 sb._ensure_ablation_dir(d)
             self.assertTrue((d / "important.txt").exists())   # never deleted
+
+    def test_execution_valid_flags_infrastructure_failures(self):
+        self.assertTrue(sb.execution_valid({"returncode": 0}, "a real answer"))
+        self.assertTrue(sb.execution_valid(None, "answer with no metadata"))
+        self.assertFalse(sb.execution_valid({"returncode": 1}, "x"))
+        self.assertFalse(sb.execution_valid({"timed_out": True}, "x"))
+        self.assertFalse(sb.execution_valid({"timeout": True}, "x"))
+        self.assertFalse(sb.execution_valid({}, "[CODEX FAILURE: returncode=1]\n\n"))
+        self.assertFalse(sb.execution_valid({}, "[JETTY FAILURE: trajectory failed before producing output]\n"))
+        self.assertFalse(sb.execution_valid({}, "[TIMEOUT: no final assistant message captured]"))
 
     # --- #6 gate soundness ---
     def test_validate_rejects_mechanism_class_mismatch(self):
