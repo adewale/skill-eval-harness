@@ -1535,5 +1535,196 @@ class AblationReviewFixesTests(unittest.TestCase):
             self.assertTrue(any(h.endswith("references/g.md") for h in hints))  # recursive, matching the ablation arm
 
 
+def _is_subsequence(small: bytes, big: bytes) -> bool:
+    """True if `small` can be obtained from `big` by deleting bytes only (no
+    additions/substitutions) — i.e. the change is a pure deletion."""
+    it = iter(big)
+    return all(ch in it for ch in small)
+
+
+def _tree_files(d: Path) -> dict[str, bytes]:
+    return {p.relative_to(d).as_posix(): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
+
+
+class AblationDifferentialInvariantTests(unittest.TestCase):
+    """Differential testing (testing-best-practices/references/differential-testing.md):
+    the with_skill canonical tree is the trusted oracle; an ablation must equal it
+    MINUS EXACTLY the declared edit and nothing else. This is the core
+    experimental-contract invariant the earlier tests failed to assert."""
+
+    SKILL = (
+        "---\nname: good-pr\ndescription: Review pull requests for correctness and tests. Use when reviewing a PR.\n"
+        "when_to_use: When asked to review a PR, diff, or patch.\nallowed-tools: Read, Grep\n---\n\n"
+        "# Good PR review\n\n## Gather context\n\n!`git diff --stat`\n\n## Review checklist\n\n"
+        "<!-- ablation:no-scope:start -->\n- Scope: flag unrelated changes and ask to split them.\n<!-- ablation:no-scope:end -->\n"
+        "- Tests: confirm the tests would fail on the pre-change code.\n\n"
+        "## Regression-proof requirement\n\nRequire a test that fails without the fix and passes with it.\n\n"
+        "## Severity\n\nPick a verdict. See [the severity guide](references/severity.md).\n"
+    )
+
+    def repo(self, root: Path) -> Path:
+        sd = root / "repo" / "skills" / "good-pr"
+        (sd / "references").mkdir(parents=True)
+        (sd / "scripts").mkdir()
+        (sd / "assets").mkdir()
+        (sd / "SKILL.md").write_text(self.SKILL, encoding="utf-8")
+        (sd / "references" / "severity.md").write_text("# Severity\n\nBlocking, Minor, Clean.\n", encoding="utf-8")
+        (sd / "scripts" / "run.py").write_text("print('hi')\n", encoding="utf-8")
+        (sd / "assets" / "tmpl.txt").write_text("template\n", encoding="utf-8")
+        (sd / "NOTES.md").write_text("arbitrary extra file\n", encoding="utf-8")  # not in references/scripts/assets
+        (root / "repo" / "evals").mkdir()
+        m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
+        p = root / "repo" / "evals" / "shared-benchmark.json"
+        p.write_text(json.dumps(m), encoding="utf-8")
+        return p
+
+    def pair(self, root: Path, p: Path, ablation: dict, tag: str):
+        manifest = sb.validate_manifest(p)
+        repo_root = sb.repo_root_for_manifest(p)
+        with_dir = sb.build_canonical_skill_tree(repo_root, manifest, root / f"with-{tag}")
+        res = sb.materialize_ablation(repo_root, manifest, ablation, root / f"abl-{tag}")
+        abl_dir = Path(res["dir"])
+        skill_key = Path(res["skill_files"]["skills/good-pr/SKILL.md"]).relative_to(abl_dir).as_posix()
+        return _tree_files(with_dir), _tree_files(abl_dir), skill_key
+
+    def assertDiffersOnlyBy(self, with_files, abl_files, *, edited=None, deleted=()):
+        self.assertEqual(set(abl_files) - set(with_files), set(), "ablation ADDED files absent from with_skill")
+        self.assertEqual(set(with_files) - set(abl_files), set(deleted), "removed-file set != declared deletions")
+        changed = {k for k in set(with_files) & set(abl_files) if with_files[k] != abl_files[k]}
+        self.assertEqual(changed, ({edited} if edited else set()), "content changed in unexpected file(s)")
+        if edited:
+            w, a = with_files[edited], abl_files[edited]
+            self.assertLess(len(a), len(w), "edit did not shrink the file")
+            self.assertTrue(_is_subsequence(a, w), "edit ADDED/substituted bytes — not a pure deletion")
+
+    def test_edit_mechanisms_are_pure_deletions_vs_with_skill(self):
+        edit_cases = {
+            "section": {"mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}},
+            "anchor": {"mechanism": "anchor", "class": "instructions", "target": {"anchor": "no-scope"}},
+            "list_item": {"mechanism": "list_item", "class": "instructions", "target": {"section": "## Review checklist", "contains": ["pre-change code"]}},
+            "frontmatter_field": {"mechanism": "frontmatter_field", "class": "runtime", "target": {"field": "allowed-tools"}},
+            "preprocess": {"mechanism": "preprocess", "class": "preprocess", "target": {"contains": ["git diff"]}},
+            "reference_pointer": {"mechanism": "reference", "class": "resource", "target": {"path": "references/severity.md", "remove": "pointer"}},
+        }
+        for name, target in edit_cases.items():
+            with self.subTest(mechanism=name), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                p = self.repo(root)
+                ablation = {"id": f"e-{name}", "removed_component": name, **target}
+                with_files, abl_files, skill_key = self.pair(root, p, ablation, name)
+                self.assertDiffersOnlyBy(with_files, abl_files, edited=skill_key)
+
+    def test_file_deletion_mechanisms_remove_only_target(self):
+        delete_cases = {
+            "reference_content": ({"mechanism": "reference", "class": "resource", "target": {"path": "references/severity.md", "remove": "content"}}, "references/severity.md"),
+            "script": ({"mechanism": "script", "class": "resource", "target": {"path": "scripts/run.py"}}, "scripts/run.py"),
+            "asset": ({"mechanism": "asset", "class": "resource", "target": {"path": "assets/tmpl.txt"}}, "assets/tmpl.txt"),
+        }
+        for name, (target, rel) in delete_cases.items():
+            with self.subTest(mechanism=name), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                p = self.repo(root)
+                with_files, abl_files, skill_key = self.pair(root, p, {"id": f"d-{name}", "removed_component": name, **target}, name)
+                removed = set(with_files) - set(abl_files)
+                self.assertEqual({r.split("/", 1)[1] for r in removed}, {rel}, "removed exactly the target file")
+                self.assertEqual(set(abl_files) - set(with_files), set(), "added nothing")
+                self.assertEqual(with_files[skill_key], abl_files[skill_key], "SKILL.md must be untouched by a content deletion")
+
+    # --- regression-proof: prove the invariant has teeth against the ORIGINAL bug classes ---
+    def test_invariant_catches_added_file(self):
+        with self.assertRaises(AssertionError):  # the "different file surface" bug
+            self.assertDiffersOnlyBy({"k/SKILL.md": b"x"}, {"k/SKILL.md": b"x", "k/EXTRA.md": b"y"})
+
+    def test_invariant_catches_dropped_root(self):
+        with self.assertRaises(AssertionError):  # the "copies only referenced roots" bug — root B vanishes
+            self.assertDiffersOnlyBy({"a/SKILL.md": b"x", "b/SKILL.md": b"y"}, {"a/SKILL.md": b"x"})
+
+    def test_invariant_catches_added_bytes(self):
+        with self.assertRaises(AssertionError):  # a substitution leaking through "removal-only"
+            self.assertDiffersOnlyBy({"k/SKILL.md": b"hello world"}, {"k/SKILL.md": b"hello brave world"}, edited="k/SKILL.md")
+
+    # --- property: blinding invariant (model-visible instruction is identical across arms) ---
+    def test_materialized_instruction_is_identical_to_with_skill(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root)
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+            manifest = {**manifest, "ablations": [{"id": "x", "removed_component": "x", "mechanism": "section", "class": "instructions", "target": {"heading": "## Severity"}}]}
+            self.assertEqual(
+                sb.variant_instruction("ablation:x", manifest, repo_root),
+                sb.variant_instruction("with_skill", manifest, repo_root),
+            )
+
+
+CORPUS_DIR = ROOT / "tests" / "corpus"
+
+
+class SkillCorpusConformanceTests(unittest.TestCase):
+    """Conformance/fuzz testing over a vendored corpus of REAL skills (not
+    synthetic fixtures), so the parser and materializer face real-world YAML and
+    Markdown — block-scalar descriptions, varied fences/headings/lists."""
+
+    corpus = sorted(CORPUS_DIR.glob("*.SKILL.md")) if CORPUS_DIR.exists() else []
+
+    @staticmethod
+    def _has_block_scalar_desc(text: str) -> bool:
+        return any(line.startswith("description:") and line.split(":", 1)[1].strip() in (">", "|", ">-", "|-", ">+", "|+") for line in text.splitlines())
+
+    def test_corpus_is_present(self):
+        self.assertGreaterEqual(len(self.corpus), 5, "expected a vendored real-skill corpus under tests/corpus/")
+
+    def test_real_skills_parse_without_error_and_keep_required_fields(self):
+        for f in self.corpus:
+            with self.subTest(skill=f.name):
+                text = f.read_text(encoding="utf-8")
+                fm = sb.parse_frontmatter(text)
+                self.assertIsInstance(fm, dict)
+                self.assertTrue(isinstance(fm.get("name"), str) and fm["name"].strip(), "real skill must parse a name")
+                self.assertTrue(sb.required_fields_present(text), f"{f.name}: required fields not detected")
+                sb._fenced_mask(text.split("\n"))   # must not raise on real markdown
+
+    def test_block_scalar_descriptions_parse_as_real_text(self):
+        # the real-world YAML the old regex parser mangled: folded `description: >`
+        block = [f for f in self.corpus if self._has_block_scalar_desc(f.read_text(encoding="utf-8"))]
+        self.assertTrue(block, "corpus should include real skills with block-scalar descriptions")
+        for f in block:
+            with self.subTest(skill=f.name):
+                desc = sb.parse_frontmatter(f.read_text(encoding="utf-8")).get("description")
+                self.assertIsInstance(desc, str)
+                self.assertGreater(len(desc.split()), 5, "folded description must parse to real text, not '>' or ''")
+
+    def test_differential_invariant_holds_on_a_real_skill(self):
+        src = CORPUS_DIR / "good-pr.SKILL.md"
+        if not src.exists():
+            self.skipTest("good-pr corpus missing")
+        text = src.read_text(encoding="utf-8")
+        lines = text.split("\n")
+        mask = sb._fenced_mask(lines)
+        heading = next((ln for i, ln in enumerate(lines) if not mask[i] and ln.startswith("## ")), None)
+        self.assertIsNotNone(heading, "real skill should have a level-2 heading to ablate")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sd = root / "repo" / "skills" / "good-pr"
+            sd.mkdir(parents=True)
+            (sd / "SKILL.md").write_text(text, encoding="utf-8")
+            (root / "repo" / "evals").mkdir()
+            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
+            p = root / "repo" / "evals" / "shared-benchmark.json"
+            p.write_text(json.dumps(m), encoding="utf-8")
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+            with_dir = sb.build_canonical_skill_tree(repo_root, manifest, root / "w")
+            res = sb.materialize_ablation(repo_root, manifest, {"id": "real-sec", "removed_component": "a real section", "mechanism": "section", "class": "instructions", "target": {"heading": heading.strip()}}, root / "a")
+            wf, af = _tree_files(with_dir), _tree_files(Path(res["dir"]))
+            skill_key = Path(res["skill_files"]["skills/good-pr/SKILL.md"]).relative_to(Path(res["dir"])).as_posix()
+            self.assertEqual(set(af) - set(wf), set(), "added files")
+            self.assertEqual(set(wf) - set(af), set(), "removed files")
+            changed = {k for k in set(wf) & set(af) if wf[k] != af[k]}
+            self.assertEqual(changed, {skill_key}, "changed an unexpected file")
+            self.assertTrue(_is_subsequence(af[skill_key], wf[skill_key]), "real-skill section removal must be a pure deletion")
+            self.assertLess(len(af[skill_key]), len(wf[skill_key]))
+
+
 if __name__ == "__main__":
     unittest.main()
