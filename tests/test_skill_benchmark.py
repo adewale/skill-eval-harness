@@ -984,6 +984,24 @@ class SkillAblationTests(unittest.TestCase):
                 sb.materialize_ablation(repo_root, manifest, ab, root / "out")
             self.assertIn("both", str(cm.exception))
 
+    def test_output_dir_overlapping_skill_root_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ab = {"id": "x", "removed_component": "sev", "mechanism": "section", "target": {"heading": "## Severity"}}
+            path = self.build(root, ablations=[ab])
+            manifest = sb.validate_manifest(path)
+            repo_root = sb.repo_root_for_manifest(path)
+            skill_dir = repo_root / "skills" / "good-pr"
+            with self.assertRaises(sb.AblationError):                 # equal to a skill root
+                sb.materialize_ablation(repo_root, manifest, ab, skill_dir)
+            with self.assertRaises(sb.AblationError):                 # inside a skill root
+                sb.materialize_ablation(repo_root, manifest, ab, skill_dir / "out")
+            with self.assertRaises(sb.AblationError):                 # contains a skill root
+                sb.materialize_ablation(repo_root, manifest, ab, repo_root)
+            # a sibling output dir is fine
+            res = sb.materialize_ablation(repo_root, manifest, ab, root / "safe-out")
+            self.assertEqual(res["mode"], "materialized")
+
     def test_multi_component_is_order_independent(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

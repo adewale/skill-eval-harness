@@ -839,6 +839,23 @@ def _safe_under(base: Path, path: Path) -> Path:
     return p
 
 
+def _reject_output_root_overlap(out_root: Path, repo_root: Path, manifest: dict[str, Any]) -> None:
+    """Refuse an output directory that equals, sits inside, or contains any source
+    skill root. Writing the materialized tree into (or around) a source root could
+    clobber the original skill or recursively copy our own output, corrupting both
+    the with_skill oracle and the ablated arm."""
+    out = out_root.resolve()
+    for r in manifest.get("skill_paths", []):
+        src = (repo_root / r).resolve()
+        src_dir = src if src.is_dir() else src.parent
+        if out == src_dir:
+            raise AblationError(f"output dir {out} is a source skill root; choose a directory outside the skill")
+        if src_dir in out.parents:
+            raise AblationError(f"output dir {out} is inside source skill root {src_dir}; choose a directory outside the skill")
+        if out in src_dir.parents:
+            raise AblationError(f"output dir {out} contains source skill root {src_dir}; choose a directory outside the skill tree")
+
+
 def _copy_skill_root(src_dir: Path, dst_dir: Path) -> None:
     """Copy a skill's complete directory (arbitrary files, not a 3-dir
     whitelist), excluding eval answers, VCS, and dotfiles. Reject any symlink
@@ -977,6 +994,7 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
     if not comps:
         raise AblationError(f"ablation {ablation.get('id')!r} declares no removal (instruction-simulated)")
     validate_ablation_removal(ablation, manifest)
+    _reject_output_root_overlap(out_root, repo_root, manifest)
     population = derived_population(comps)
     aid = ablation["id"]
     skill_paths = manifest.get("skill_paths", [])
@@ -1106,6 +1124,7 @@ def build_canonical_skill_tree(repo_root: Path, manifest: dict[str, Any], dest_d
     canonical surface for with_skill, so it matches a materialized ablation arm
     file-for-file (the only difference being the ablation's declared edit)."""
     dest_dir = Path(dest_dir)
+    _reject_output_root_overlap(dest_dir, repo_root, manifest)
     dest_dir.mkdir(parents=True, exist_ok=True)
     for r in manifest.get("skill_paths", []):
         src = _safe_under(repo_root, repo_root / r)
