@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree
+from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -74,6 +74,8 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
             raise RuntimeError(f"unknown ablation: {ablation_id}")
         if not ablation_components(ablation):
             raise RuntimeError(f"ablation {ablation_id} is instruction-simulated; a trigger ablation must declare a removal")
+        if derived_population(ablation_components(ablation)) != "trigger":
+            raise RuntimeError(f"ablation {ablation_id} is an answer-population ablation; the trigger eval only measures discovery (trigger-population) ablations. Run it through the benchmark / Pi-smoke path.")
         res = materialize_ablation(repo_root, manifest, ablation, config_dir / "_materialized")
         return _mount_tree_into_config(Path(res["dir"]), skills_dir), res
     # Baseline (no ablation): build the SAME canonical tree the ablation arm starts

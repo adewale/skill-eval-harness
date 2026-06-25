@@ -1246,7 +1246,10 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
                 self.assertIsNone(base_prov)
                 self.assertEqual(abl_prov["mode"], "materialized")
 
-    def test_prepare_routes_ablations_by_population(self):
+    def test_prepare_skips_discovery_ablations_for_generic_runners(self):
+        # Answer-population ablations are emitted for non-trigger cases; discovery
+        # ablations are NOT emitted at all (the forced-load generic runners can't
+        # measure autonomous triggering — that is the trigger adapter's job).
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL, self.DISCO_ABL])
@@ -1255,11 +1258,29 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             rp = [r for r in rows if r["variant"] == "ablation:no-rp"]
             wtu = [r for r in rows if r["variant"] == "ablation:no-wtu"]
             self.assertEqual({r["case_id"] for r in rp}, {"ans"})    # answer pop -> non-trigger only
-            self.assertEqual({r["case_id"] for r in wtu}, {"trig"})  # discovery pop -> trigger only
+            self.assertEqual(wtu, [])                                # discovery pop -> not emitted here
             self.assertEqual(rp[0]["ablation"]["mode"], "materialized")
             self.assertEqual(rp[0]["ablation"]["population"], "answer")
-            self.assertIn("skill_hash", rp[0]["ablation"])           # provenance on the row
-            self.assertEqual(wtu[0]["ablation"]["population"], "trigger")
+            self.assertIn("skill_hash", rp[0]["ablation"])
+
+    def test_pi_smoke_rejects_discovery_ablation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.DISCO_ABL])
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+            with tempfile.TemporaryDirectory() as wd, self.assertRaises(RuntimeError) as cm:
+                smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:no-wtu", Path(wd))
+            self.assertIn("trigger", str(cm.exception))
+
+    def test_pi_trigger_rejects_answer_population_ablation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.SECTION_ABL])   # answer-population (section/instructions)
+            manifest = sb.validate_manifest(p)
+            with tempfile.TemporaryDirectory() as cd, self.assertRaises(RuntimeError) as cm:
+                tr.copy_skill_to_config(p, manifest, Path(cd), ablation_id="no-rp")
+            self.assertIn("answer-population", str(cm.exception))
 
     def test_prepare_fails_without_ablation_dir_for_materialized(self):
         with tempfile.TemporaryDirectory() as td:

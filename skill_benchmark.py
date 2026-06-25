@@ -387,9 +387,15 @@ def prepared_task_rows(
             skill_paths = real_skill_paths
             if variant.startswith("ablation:"):
                 population = ablation_variant_population(manifest, variant)
-                # Discovery ablations run only on trigger cases; answer-population
-                # ablations only on non-trigger cases.
-                if (population == "trigger") != is_trigger:
+                # Discovery (trigger-population) ablations measure AUTONOMOUS skill
+                # loading, which these generic forced-load runners (codex/Jetty)
+                # cannot observe — they tell the model to read the mounted skill.
+                # They are emitted ONLY by the autonomous-trigger adapter
+                # (run_pi_trigger_eval.py --ablation), so skip them here.
+                if population == "trigger":
+                    continue
+                # Answer-population ablations apply only to non-trigger cases.
+                if is_trigger:
                     continue
                 aid = variant.split(":", 1)[1]
                 ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})

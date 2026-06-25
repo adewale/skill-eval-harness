@@ -21,7 +21,7 @@ from typing import Any
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
-from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, expected_regression_summaries, _copy_skill_root  # noqa: E402
+from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, expected_regression_summaries, _copy_skill_root, ablation_variant_population  # noqa: E402
 
 # Workspace-specific example: by default this assumes the harness directory is a
 # sibling of the skill repos. Override with SKILL_EVAL_WORKSPACE_ROOT.
@@ -136,6 +136,11 @@ def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, cas
     staging: Path | None = None
     materialized = None
     if variant.startswith("ablation:"):
+        # The Pi smoke runner force-loads the skill, so it can only measure
+        # ANSWER-population (behavioral) ablations. A discovery ablation must run
+        # through run_pi_trigger_eval.py --ablation, which observes autonomous loading.
+        if ablation_variant_population(manifest, variant) == "trigger":
+            raise RuntimeError(f"{variant} is a discovery (trigger-population) ablation; run it through run_pi_trigger_eval.py --ablation. The Pi smoke runner force-loads the skill and cannot measure autonomous triggering.")
         staging = Path(tempfile.mkdtemp(prefix="skill-abl-stage-"))
         materialized = materialized_tree_for_variant(repo_root, manifest, variant, staging)
 
