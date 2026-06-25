@@ -585,6 +585,11 @@ Each declared ablation is written to `ablated/<id>/` as a complete altered skill
 
 The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), `run_pi_trigger_eval.py --ablation <id>` trigger-tests a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the trigger adapter. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
 
+**Evidence asymmetry (discovery vs answer).** The two paths do not yet have equal evidentiary strength:
+
+- **Answer-population** ablations get *confirmed* causal evidence: a provenance-gated, paired with_skill-vs-ablation comparison where a confirmation requires verified provenance and a same-revision canonical hash on both arms.
+- **Discovery** ablations run through `run_pi_trigger_eval.py --ablation`, which currently emits a **raw autonomous-trigger measurement for a single arm** (`evidence_class: raw_autonomous_trigger_measurement`), not a paired, provenance-verified baseline-vs-ablation comparison. Each result records a `skill_tree_hash` (baseline = canonical tree; ablation = parent tree) so a future pairing can verify both arms ran the same revision, but until that pairing exists, **read a trigger pass-rate as a measurement, not a confirmed ablation effect.**
+
 ## Compatibility notes
 
 - **Anthropic skill-creator**: use `grade --write-grading-files` and `export-anthropic` for compatible `grading.json`/`benchmark.json` shapes.

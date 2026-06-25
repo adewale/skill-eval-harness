@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population
+from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population, canonical_skill_tree_hash
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -81,8 +81,11 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
     # Baseline (no ablation): build the SAME canonical tree the ablation arm starts
     # from, so the two arms are file-for-file identical apart from the declared
     # edit — never differing by an ad-hoc copier that dropped or renamed files.
+    # Record the canonical tree hash so a baseline run can be paired with an
+    # ablation run from the same skill revision (baseline.skill_tree_hash ==
+    # ablation.parent_skill_hash).
     tree = build_canonical_skill_tree(repo_root, manifest, config_dir / "_canonical")
-    return _mount_tree_into_config(Path(tree), skills_dir), None
+    return _mount_tree_into_config(Path(tree), skills_dir), {"mode": "baseline", "skill_tree_hash": canonical_skill_tree_hash(repo_root, manifest)}
 
 
 def event_texts_for_tool_input(obj: Any) -> list[str]:
@@ -172,16 +175,27 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             returncode = 124
         elapsed_ms = int((time.time() - start) * 1000)
         triggered, evidence = detect_trigger(stdout, skill_name_from_manifest(manifest), copied)
+        is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
+        # Record the canonical (parent) tree hash on BOTH arms under the same field
+        # the answer-population path uses, so a baseline and an ablation run can be
+        # checked for the same skill revision.
+        skill_tree_hash = abl_prov.get("parent_skill_hash") if is_ablation else (abl_prov or {}).get("skill_tree_hash")
         result = {
             "query": query,
             "should_trigger": should_trigger,
             "triggered": triggered,
+            # RAW measurement, NOT a confirmed ablation effect: this is one arm's
+            # autonomous-trigger outcome. The harness does not yet pair baseline vs
+            # ablation here, so do not read a "pass" as a provenance-verified
+            # causal ablation result (unlike the answer-population path).
             "pass": returncode == 0 and triggered == should_trigger,
+            "measurement": "raw_autonomous_trigger",
             "elapsed_ms": elapsed_ms,
             "returncode": returncode,
             "timed_out": timed_out,
             "evidence": evidence,
-            "ablation": ({"id": ablation, "mode": abl_prov["mode"], "population": abl_prov["population"], "skill_hash": abl_prov["skill_hash"], "components": abl_prov["components"]} if abl_prov else ablation),
+            "ablation": ({"id": ablation, "mode": abl_prov["mode"], "population": abl_prov["population"], "skill_hash": abl_prov["skill_hash"], "parent_skill_hash": abl_prov.get("parent_skill_hash"), "components": abl_prov["components"]} if is_ablation else ablation),
+            "skill_tree_hash": skill_tree_hash,
             "stderr": stderr[-1000:] if stderr else "",
         }
         if trace_dir is not None:
@@ -251,6 +265,16 @@ def main() -> int:
     output = {
         "skill_name": skill_name_from_manifest(manifest),
         "generated_at": int(time.time()),
+        # This report is a RAW autonomous-trigger measurement for a single arm —
+        # either the baseline skill or one --ablation. It is NOT a
+        # provenance-verified baseline-vs-ablation comparison: the harness does not
+        # yet pair the two arms or gate a confirmed trigger regression on recorded
+        # provenance the way the answer-population (benchmark) path does. Treat the
+        # pass_rate as a measurement, not a confirmed ablation effect. The recorded
+        # skill_tree_hash on each result lets a future pairing verify both arms ran
+        # the same skill revision.
+        "evidence_class": "raw_autonomous_trigger_measurement",
+        "ablation": args.ablation,
         "summary": {"total": len(results), "passed": passed, "failed": len(results) - passed, "pass_rate": (passed / len(results)) if results else None},
         "results": results,
     }

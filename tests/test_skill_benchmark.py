@@ -1268,6 +1268,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as cd:
                 copied, prov = tr.copy_skill_to_config(p, manifest, Path(cd), ablation_id="no-wtu")
                 self.assertIn("skill_hash", prov)               # provenance returned for the run record (#9)
+                self.assertIn("parent_skill_hash", prov)        # canonical hash for same-revision pairing
                 self.assertIn("components", prov)               # components recorded for the run record (#8)
                 text = Path(copied[0]).read_text(encoding="utf-8")
                 self.assertNotIn("when_to_use", text)
@@ -1297,8 +1298,10 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
                 # only difference is the edited frontmatter
                 self.assertIn("when_to_use", Path(base_copied[0]).read_text(encoding="utf-8"))
                 self.assertNotIn("when_to_use", Path(abl_copied[0]).read_text(encoding="utf-8"))
-                self.assertIsNone(base_prov)
+                self.assertEqual(base_prov["mode"], "baseline")
                 self.assertEqual(abl_prov["mode"], "materialized")
+                # both arms record the SAME canonical parent hash -> same revision, pairable
+                self.assertEqual(base_prov["skill_tree_hash"], abl_prov["parent_skill_hash"])
 
     def test_materialized_ablation_is_blind_across_every_runner(self):
         # Invariant (not a single surface): a materialized ablation must be
