@@ -105,5 +105,122 @@ class ValidatedAblationTests(unittest.TestCase):
             self.assertEqual({k: typed[k] for k in keys}, {k: legacy[k] for k in keys})
 
 
+class AblationRecordTests(unittest.TestCase):
+    """Move B: 'an ablation record on a row' is a CLOSED set of typed shapes, not an
+    ad-hoc dict that each stage hand-builds slightly differently. Materialized is a
+    Provenance; instruction-simulated is its sibling InstructionSimulated; there is
+    no third shape, so the report's parse is total."""
+
+    def test_record_is_a_closed_discriminated_set(self):
+        mat = am.ablation_record_from_dict({"id": "x", "mode": "materialized", "population": "answer",
+                                            "skill_hash": "E", "parent_skill_hash": "C", "components": []})
+        sim = am.ablation_record_from_dict({"id": "x", "mode": "instruction_simulated", "population": "answer"})
+        self.assertIsInstance(mat, am.Provenance)
+        self.assertIsInstance(sim, am.InstructionSimulated)
+        with self.assertRaises(ValueError):
+            am.ablation_record_from_dict({"id": "x", "mode": "make-believe"})   # no third inhabitant
+
+    def test_instruction_simulated_is_not_a_provenance(self):
+        sim = am.InstructionSimulated(id="x", population="answer", removed_component="rp",
+                                      expected_regressions=("accepts weak tests",))
+        self.assertNotIsInstance(sim, am.Provenance)        # cannot be read as a materialization
+        d = sim.as_dict()
+        self.assertEqual(d["mode"], "instruction_simulated")
+        self.assertNotIn("skill_hash", d)                   # no altered tree to attest
+        self.assertNotIn("components", d)
+        self.assertEqual(am.InstructionSimulated.from_dict(d), sim)   # round-trips
+
+    def test_minimal_instruction_simulated_is_three_keys(self):
+        # The prepared-row form is exactly {id, mode, population} — unchanged shape.
+        self.assertEqual(am.InstructionSimulated(id="a", population="answer").as_dict(),
+                         {"id": "a", "mode": "instruction_simulated", "population": "answer"})
+
+
+class PreparedTaskTests(unittest.TestCase):
+    """Move C: the prepared row OWNS blinding. The only model-facing variant comes
+    from its Arm, so a blind arm cannot leak the hypothesis no matter which exporter
+    reads it — and the two DISTINCT blinds are both honored: the experiment-blind
+    (materialized -> present as with_skill) and the path-hygiene blind (any ablation
+    -> opaque upload token)."""
+
+    def mat_row(self):
+        prov = am.Provenance(id="no-rp", mode="materialized", population="answer",
+                             identity=am.TreeIdentity(canonical="C", edited="E"),
+                             components=(am.Component("instructions", "section", "s", {}),))
+        return am.PreparedTask(case_id="c", split="tune", kind="behavior", variant_truth="ablation:no-rp",
+                               run_number=1, skill_name="good-pr", repo_root="/r", skill_paths=("/m/SKILL.md",),
+                               input_files=(), run_dir="c/ablation:no-rp", instruction="Use the skill under test (good-pr).",
+                               prompt="Review.", tags=(), ablation=prov, skill_tree_hash="C")
+
+    def sim_row(self):
+        sim = am.InstructionSimulated(id="no-rp", population="answer", removed_component="rp")
+        return am.PreparedTask(case_id="c", split="tune", kind="behavior", variant_truth="ablation:no-rp",
+                               run_number=1, skill_name="good-pr", repo_root="/r", skill_paths=("/m/SKILL.md",),
+                               input_files=(), run_dir="c/ablation:no-rp", instruction="...directive...",
+                               prompt="Review.", tags=(), ablation=sim)
+
+    def test_materialized_arm_presents_as_with_skill(self):
+        pt = self.mat_row()
+        self.assertTrue(pt.is_materialized_ablation)
+        self.assertTrue(pt.is_blind)
+        self.assertEqual(pt.model_facing_variant(), "with_skill")             # experiment-blind
+        self.assertEqual(pt.harness_record()["variant"], "ablation:no-rp")    # truth on the row
+
+    def test_instruction_simulated_arm_is_transparent(self):
+        pt = self.sim_row()
+        self.assertFalse(pt.is_materialized_ablation)
+        self.assertFalse(pt.is_blind)
+        self.assertEqual(pt.model_facing_variant(), "ablation:no-rp")         # model is told what to simulate
+
+    def test_upload_token_is_opaque_for_any_ablation(self):
+        for pt in (self.mat_row(), self.sim_row()):
+            tok = pt.upload_token()
+            self.assertNotIn("no-rp", tok)
+            self.assertNotIn("ablation", tok)
+
+    def test_no_model_facing_method_leaks_truth_for_a_blind_arm(self):
+        pt = self.mat_row()
+        for out in (pt.model_facing_variant(), pt.upload_token()):
+            self.assertNotIn("no-rp", out)
+        self.assertIn("no-rp", pt.harness_record()["variant"])               # truth reachable only on the harness side
+
+    def test_round_trips_through_the_row(self):
+        for pt in (self.mat_row(), self.sim_row()):
+            back = am.PreparedTask.from_row(pt.harness_record())
+            self.assertEqual(back.variant_truth, pt.variant_truth)
+            self.assertEqual(type(back.ablation), type(pt.ablation))          # record type survives the round trip
+            self.assertEqual(back.is_blind, pt.is_blind)
+            self.assertEqual(back.harness_record(), pt.harness_record())      # serialization is stable
+
+
+class MaterializeCarriesTypedArmTests(unittest.TestCase):
+    """Move A: materialize_declared_ablations carries MaterializedArm objects, not
+    re-parsed dicts, so prepare reads typed provenance instead of indexing string
+    keys — the drop-then-reparse that re-created the original bug shape is gone."""
+
+    def test_declared_ablations_are_typed_materialized_arms(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = repo(root, [SECTION_ABL])
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+            trees = sb.materialize_declared_ablations(repo_root, manifest, root / "abl")
+            self.assertIsInstance(trees["no-rp"], am.MaterializedArm)
+            self.assertIsInstance(trees["no-rp"].arm.provenance, am.Provenance)
+            self.assertTrue(trees["no-rp"].arm.identity.is_edited)
+            self.assertTrue(trees["no-rp"].skill_files)
+
+    def test_prepared_rows_use_the_typed_provenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = repo(root, [SECTION_ABL])
+            manifest = sb.validate_manifest(p)
+            rows = sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl")
+            arow = next(r for r in rows if r["variant"] == "ablation:no-rp")
+            wrow = next(r for r in rows if r["variant"] == "with_skill")
+            self.assertEqual(set(arow["ablation"]), {"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
+            self.assertEqual(wrow["skill_tree_hash"], arow["ablation"]["parent_skill_hash"])   # both arms, same revision
+
+
 if __name__ == "__main__":
     unittest.main()

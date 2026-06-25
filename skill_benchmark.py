@@ -30,10 +30,13 @@ from typing import Any
 import yaml
 
 from ablation_model import (
+    AblationRecord,
     Arm,
     Component,
     EvidenceClass,
+    InstructionSimulated,
     MaterializedArm,
+    PreparedTask,
     Provenance,
     ResultSet,
     TreeIdentity,
@@ -347,20 +350,23 @@ def task_variants(manifest: dict[str, Any], *, include_old_skill: bool = False, 
     return variants
 
 
-def materialize_declared_ablations(repo_root: Path, manifest: dict[str, Any], ablation_dir: Path | str) -> dict[str, Any]:
-    """Materialize every declared-removal ablation once into ``ablation_dir``.
+def materialize_declared_ablations(repo_root: Path, manifest: dict[str, Any], ablation_dir: Path | str) -> dict[str, MaterializedArm]:
+    """Materialize every declared-removal ablation once into ``ablation_dir``,
+    carrying the TYPED ``MaterializedArm`` (not its serialized dict) so callers read
+    ``.arm.provenance`` / ``.skill_files`` / ``.arm.identity`` instead of indexing
+    string keys — the construct-then-immediately-reparse seam is gone.
 
-    Returns ``{ablation_id: tree}`` for each ablation that declares a removal
-    (``ablation_components`` is non-empty). Instruction-simulated ablations are
-    not materialized and do not appear in the result. ``AblationError`` from a
-    gate is reported through ``die`` so every caller fails the same way.
+    Returns ``{ablation_id: MaterializedArm}`` for each ablation that declares a
+    removal (``ablation_components`` is non-empty). Instruction-simulated ablations
+    are not materialized and do not appear. ``AblationError`` from a gate is reported
+    through ``die`` so every caller fails the same way.
     """
     ablation_dir = _ensure_ablation_dir(ablation_dir)
-    trees: dict[str, Any] = {}
+    trees: dict[str, MaterializedArm] = {}
     for ablation in manifest.get("ablations", []):
         if ablation_components(ablation):
             try:
-                trees[ablation["id"]] = materialize_ablation(repo_root, manifest, ablation, ablation_dir)
+                trees[ablation["id"]] = materialize(ValidatedAblation.validate(repo_root, manifest, ablation), ablation_dir)
             except AblationError as exc:
                 die(f"ablation {ablation.get('id')}: {exc}")
     return trees
@@ -396,12 +402,12 @@ def prepared_task_rows(
         trees = materialize_declared_ablations(repo_root, manifest, ablation_dir)
     # Every materialized ablation derives from the same canonical (unedited) tree,
     # so its parent_skill_hash is the canonical hash recorded on the with_skill arm.
-    canonical_hash = next(iter(trees.values()))["parent_skill_hash"] if trees else None
+    canonical_hash = next(iter(trees.values())).arm.identity.canonical if trees else None
     rows: list[dict[str, Any]] = []
     for case in cases:
         is_trigger = case.get("kind") == "trigger"
         for variant in variants:
-            abl_meta = None
+            record: AblationRecord | None = None
             skill_paths = real_skill_paths
             if variant.startswith("ablation:"):
                 population = ablation_variant_population(manifest, variant)
@@ -417,38 +423,39 @@ def prepared_task_rows(
                     continue
                 aid = variant.split(":", 1)[1]
                 if aid in trees:
-                    # Materialized: the recorded provenance is the materialize tree's
-                    # provenance, re-serialized through Provenance — one schema, no
-                    # hand-picked key subset.
-                    skill_paths = list(trees[aid]["skill_files"].values())   # mounted files == ablated tree
-                    abl_meta = Provenance.from_dict(trees[aid]).as_dict()
+                    # Materialized: carry the arm's TYPED provenance straight through —
+                    # no dict round-trip, no re-parse (the drop-then-reparse is gone).
+                    skill_paths = list(trees[aid].skill_files.values())   # mounted files == ablated tree
+                    record = trees[aid].arm.provenance
                 else:
-                    # Instruction-simulated: no tree, original skill mounted; not a
-                    # materialized Provenance (no hashes/components).
-                    abl_meta = {"id": aid, "mode": "instruction_simulated", "population": population}
+                    # Instruction-simulated: no tree, original skill mounted; its typed
+                    # record is the sibling InstructionSimulated, not a Provenance.
+                    record = InstructionSimulated(id=aid, population=population)
             for run_number in range(1, runs_per_variant + 1):
                 run_dir = f"{case['id']}/{variant}" if runs_per_variant == 1 else f"{case['id']}/{variant}/run-{run_number}"
-                task = {
-                    "case_id": case["id"],
-                    "split": case["split"],
-                    "kind": case.get("kind", "behavior"),
-                    "variant": variant,
-                    "run_number": run_number,
-                    "skill_name": manifest["skill_name"],
-                    "repo_root": str(repo_root),
-                    "skill_paths": skill_paths,
-                    "input_files": [str((manifest_path.parent / f).resolve()) for f in case.get("files", [])],
-                    "run_dir": run_dir,
-                    "instruction": variant_instruction(variant, manifest, repo_root),
-                    "prompt": case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
-                    **({"ablation": abl_meta} if abl_meta else {}),
+                # The PreparedTask is the typed owner; harness_record() serializes the
+                # exact JSONL row shape at the prepare boundary.
+                task = PreparedTask(
+                    case_id=case["id"],
+                    split=case["split"],
+                    kind=case.get("kind", "behavior"),
+                    variant_truth=variant,
+                    run_number=run_number,
+                    skill_name=manifest["skill_name"],
+                    repo_root=str(repo_root),
+                    skill_paths=tuple(skill_paths),
+                    input_files=tuple(str((manifest_path.parent / f).resolve()) for f in case.get("files", [])),
+                    run_dir=run_dir,
+                    instruction=variant_instruction(variant, manifest, repo_root),
+                    prompt=case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
+                    tags=tuple(case.get("tags", [])),
+                    ablation=record,
                     # Canonical-tree hash on every skill-bearing arm so the report can
                     # confirm with_skill and the ablation share a skill revision.
-                    **({"skill_tree_hash": canonical_hash} if canonical_hash and variant != "without_skill" else {}),
-                    **({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else {}),
-                    "tags": case.get("tags", []),
-                }
-                rows.append(task)
+                    skill_tree_hash=(canonical_hash if (canonical_hash and variant != "without_skill") else None),
+                    answer_key=({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else None),
+                )
+                rows.append(task.harness_record())
     return rows
 
 
@@ -1422,12 +1429,11 @@ def slugify(value: str) -> str:
 
 def jetty_task_name(task: dict[str, Any], prefix: str | None = None) -> str:
     base = prefix or task.get("skill_name") or "skill-eval"
-    variant = str(task["variant"])
     # The task filename and upload placeholders are MODEL-VISIBLE (the runbook
-    # directs the agent to read the task JSON by that path). The Arm owns the rule
-    # that a blind (ablation) arm never exposes "ablation:<id>" — it returns an
-    # opaque, deterministic token. The truth stays in the harness-only record.
-    token = Arm(variant_truth=variant, blind=variant.startswith("ablation:")).upload_token()
+    # directs the agent to read the task JSON by that path). The PreparedTask owns
+    # the rule that a blind (ablation) arm never exposes "ablation:<id>" — its
+    # upload_token() is opaque and deterministic. The truth stays harness-only.
+    token = PreparedTask.from_row(task).upload_token()
     return "-".join(slugify(str(part)) for part in [base, task["case_id"], token, str(task.get("run_number", 1))])
 
 
@@ -1506,20 +1512,21 @@ def safe_task_json(task: dict[str, Any], manifest: dict[str, Any], *, task_name:
         aid = variant.split(":", 1)[1]
         ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
         safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
-        if ablation_components(ablation):
+        pt = PreparedTask.from_row(task)
+        if pt.is_materialized_ablation:
             # Materialized: the model-visible task must be indistinguishable from
-            # with_skill. The Arm enforces that a blind arm presents as with_skill;
-            # the true variant + provenance live only in the harness record.
-            safe["variant"] = Arm(variant_truth=variant, blind=True).model_visible_variant()
+            # with_skill. The PreparedTask OWNS blinding — model_facing_variant()
+            # presents as with_skill; the true variant + provenance stay harness-only.
+            safe["variant"] = pt.model_facing_variant()
         else:
-            # Instruction-simulated is non-blind by design.
-            safe["ablation"] = {
-                "id": aid,
-                "mode": "instruction_simulated",
-                "population": "answer",
-                "removed_component": ablation.get("removed_component"),
-                "expected_regressions": expected_regression_summaries(ablation),
-            }
+            # Instruction-simulated is non-blind by design: the model is told what to
+            # simulate, via the ONE typed instruction-sim record (no hand-built dict).
+            safe["ablation"] = InstructionSimulated(
+                id=aid,
+                population="answer",
+                removed_component=ablation.get("removed_component"),
+                expected_regressions=tuple(expected_regression_summaries(ablation)),
+            ).as_dict()
     else:
         safe["skill_files"] = []
     return safe
@@ -1536,7 +1543,7 @@ def build_jetty_payload(
     model_provider: str,
     snapshot: str,
     use_trial_keys: bool = False,
-    ablation_trees: dict[str, Any] | None = None,
+    ablation_trees: dict[str, MaterializedArm] | None = None,
     with_skill_tree_dir: Path | None = None,
 ) -> dict[str, Any]:
     variant = str(task["variant"])
@@ -1593,7 +1600,7 @@ def build_jetty_payload(
         if tree:
             # Materialized: upload the whole altered tree, preserving relative paths
             # (no basename flattening, so duplicate SKILL.md names cannot collide).
-            for i, (abs_path, rel) in enumerate(enumerate_tree(Path(tree["dir"])), 1):
+            for i, (abs_path, rel) in enumerate(enumerate_tree(Path(tree.dir)), 1):
                 files.append({
                     "role": "skill",
                     "placeholder": placeholder(task_name, "skill", i),
@@ -2704,12 +2711,12 @@ def codex_task_prompt(task: dict[str, Any], skill_paths: list[str] | None = None
     else:
         listed = "\n".join(f"- {p}" for p in (skill_paths or [])) if skill_paths else "- none"
         skill_note = f"Read and follow the skill file(s) below (including referenced files when relevant), then do the task:\n{listed}"
-        # The Arm owns the blind decision: a materialized/invalid_skill arm is blind
-        # (the skill on disk is already altered, so the prompt stays byte-identical to
+        # The PreparedTask owns the blind decision: a materialized arm is blind (the
+        # skill on disk is already altered, so the prompt stays byte-identical to
         # with_skill); an instruction_simulated arm is NOT blind (the full skill is on
         # disk, so the regression occurs only if we explicitly add the directive).
-        arm = Arm(variant_truth=variant, blind=abl.get("mode") in ("materialized", "invalid_skill"))
-        if variant.startswith("ablation:") and not arm.blind:
+        pt = PreparedTask.from_row(task)
+        if pt.is_ablation and not pt.is_blind:
             directive = task.get("instruction") or f"Ablation for this run: ignore/remove the component '{abl.get('removed_component', '')}' from the skill guidance."
             skill_note += f"\n\n{directive}"
     return (

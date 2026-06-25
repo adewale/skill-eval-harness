@@ -31,7 +31,7 @@ import hashlib
 import statistics
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional, Union
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +187,55 @@ class Provenance:
         )
 
 
+@dataclass(frozen=True)
+class InstructionSimulated:
+    """An ablation DESCRIBED to the model in the prompt rather than materialized on
+    disk: the original skill is mounted intact and the removal is simulated by a
+    directive. It is deliberately NOT a Provenance — there is no altered tree to
+    attest, so it has no hashes and no components. Making it a sibling type (not an
+    ad-hoc dict) means the two encodings of 'an ablation record on a row' can no
+    longer drift apart one hand-built key at a time."""
+
+    id: str
+    population: str
+    removed_component: Optional[str] = None
+    expected_regressions: tuple[str, ...] = ()
+
+    MODE = "instruction_simulated"
+
+    def as_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"id": self.id, "mode": self.MODE, "population": self.population}
+        if self.removed_component is not None:
+            d["removed_component"] = self.removed_component
+        if self.expected_regressions:
+            d["expected_regressions"] = list(self.expected_regressions)
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "InstructionSimulated":
+        return cls(id=d.get("id"), population=d.get("population"),
+                   removed_component=d.get("removed_component"),
+                   expected_regressions=tuple(d.get("expected_regressions") or ()))
+
+
+# The CLOSED set of records that can describe an ablation on a prepared row.
+AblationRecord = Union[Provenance, InstructionSimulated]
+_MATERIALIZED_MODES = ("materialized", "invalid_skill")
+
+
+def ablation_record_from_dict(d: dict[str, Any]) -> AblationRecord:
+    """Parse the ONE 'ablation on a row' concept into its closed set of shapes,
+    discriminated on `mode`. Every consumer that reads a row's ablation goes through
+    here, so 'what kinds of ablation record exist' has a single, total answer — an
+    unknown mode raises rather than slipping through as an untyped dict."""
+    mode = (d or {}).get("mode")
+    if mode in _MATERIALIZED_MODES:
+        return Provenance.from_dict(d)
+    if mode == InstructionSimulated.MODE:
+        return InstructionSimulated.from_dict(d)
+    raise ValueError(f"unknown ablation record mode: {mode!r}")
+
+
 # --------------------------------------------------------------------------- #
 # Arm — owns model-visibility; the truth cannot leak through a model-facing API.
 # --------------------------------------------------------------------------- #
@@ -256,6 +305,118 @@ class MaterializedArm:
         d["skill_files"] = dict(self.skill_files)
         d["isolation_warnings"] = list(self.isolation_warnings)
         return d
+
+
+@dataclass(frozen=True)
+class PreparedTask:
+    """One (case, variant, run) unit of work. It OWNS blinding: the only
+    model-facing variant comes from its Arm, so a blind arm cannot leak the
+    hypothesis no matter which exporter reads it — every exporter asks the
+    PreparedTask instead of re-deriving 'is this blind?' its own way (the divergence
+    that let one exporter blind while another could leak). Two DISTINCT blinds are
+    both owned here: the experiment-blind (a materialized ablation presents as
+    with_skill) and the path-hygiene blind (any ablation gets an opaque upload
+    token, so a model-visible path never embeds 'ablation:<id>').
+
+    harness_record() is the truth side, serialized to JSONL at the prepare boundary;
+    from_row() reconstructs the typed task on the far side of that boundary. The row
+    dict is the only thing that crosses to disk — the type is the in-process owner."""
+
+    case_id: str
+    split: str
+    kind: str
+    variant_truth: str
+    run_number: int
+    skill_name: str
+    repo_root: str
+    skill_paths: tuple[str, ...]
+    input_files: tuple[str, ...]
+    run_dir: str
+    instruction: str
+    prompt: str
+    tags: tuple[str, ...]
+    ablation: Optional[AblationRecord] = None
+    skill_tree_hash: Optional[str] = None
+    answer_key: Optional[dict[str, Any]] = None
+
+    # --- typed predicates: one definition each, shared by every exporter ---
+    @property
+    def is_ablation(self) -> bool:
+        return self.variant_truth.startswith("ablation:")
+
+    @property
+    def is_materialized_ablation(self) -> bool:
+        # A materialized ablation is exactly one whose record is a Provenance (a real
+        # altered tree was attested); instruction-simulated is the transparent case.
+        return isinstance(self.ablation, Provenance)
+
+    def _experiment_arm(self) -> Arm:
+        return Arm(variant_truth=self.variant_truth, blind=self.is_materialized_ablation)
+
+    @property
+    def is_blind(self) -> bool:
+        return self._experiment_arm().blind
+
+    # --- model-facing surface (blinded) ---
+    def model_facing_variant(self) -> str:
+        """The variant the model may see: with_skill for a blind (materialized) arm,
+        otherwise the true variant (instruction-simulated tells the model what to do)."""
+        return self._experiment_arm().model_visible_variant()
+
+    def upload_token(self) -> str:
+        """Opaque, deterministic token for any ablation (path hygiene): a
+        model-visible upload path never embeds 'ablation:<id>', even for an
+        instruction-simulated arm whose CONTENT reveals the hypothesis by design."""
+        return Arm(variant_truth=self.variant_truth, blind=self.is_ablation).upload_token()
+
+    # --- harness-only surface (truth) ---
+    def harness_record(self) -> dict[str, Any]:
+        """The prepared-row dict, in the exact shape the JSONL pipeline expects."""
+        row: dict[str, Any] = {
+            "case_id": self.case_id,
+            "split": self.split,
+            "kind": self.kind,
+            "variant": self.variant_truth,
+            "run_number": self.run_number,
+            "skill_name": self.skill_name,
+            "repo_root": self.repo_root,
+            "skill_paths": list(self.skill_paths),
+            "input_files": list(self.input_files),
+            "run_dir": self.run_dir,
+            "instruction": self.instruction,
+            "prompt": self.prompt,
+        }
+        if self.ablation is not None:
+            row["ablation"] = self.ablation.as_dict()
+        if self.skill_tree_hash is not None:
+            row["skill_tree_hash"] = self.skill_tree_hash
+        if self.answer_key:
+            row.update(self.answer_key)
+        row["tags"] = list(self.tags)
+        return row
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "PreparedTask":
+        rec = ablation_record_from_dict(row["ablation"]) if row.get("ablation") else None
+        answer_key = {k: row[k] for k in ("expected_behavior", "review_rubric") if k in row} or None
+        return cls(
+            case_id=row.get("case_id"),
+            split=row.get("split"),
+            kind=row.get("kind", "behavior"),
+            variant_truth=str(row.get("variant")),
+            run_number=row.get("run_number", 1),
+            skill_name=row.get("skill_name"),
+            repo_root=row.get("repo_root"),
+            skill_paths=tuple(row.get("skill_paths") or ()),
+            input_files=tuple(row.get("input_files") or ()),
+            run_dir=row.get("run_dir"),
+            instruction=row.get("instruction", ""),
+            prompt=row.get("prompt", ""),
+            tags=tuple(row.get("tags") or ()),
+            ablation=rec,
+            skill_tree_hash=row.get("skill_tree_hash"),
+            answer_key=answer_key,
+        )
 
 
 # --------------------------------------------------------------------------- #

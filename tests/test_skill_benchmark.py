@@ -1353,7 +1353,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
                 leaks["codex_workspace_tree"] = " ".join(names_under(ca))
 
             # 4) Jetty: the jetty request (runbook + jetty block) + upload names
-            trees = {"no-rp": sb.materialize_ablation(repo_root, manifest, self.SECTION_ABL, root / "jabl")}
+            trees = {"no-rp": sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, self.SECTION_ABL), root / "jabl")}
             payload = sb.build_jetty_payload(arow, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
             leaks["jetty_request"] = json.dumps(payload["jetty_request"])
             leaks["jetty_upload_names"] = json.dumps([{"p": f.get("placeholder"), "h": f.get("remote_path_hint")} for f in payload["upload_plan"]["files"]])
@@ -1388,7 +1388,8 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             self.assertIn("skill_tree_hash", wrow)
 
             # Jetty harness record carries the same ablation provenance + canonical hash.
-            payload = sb.build_jetty_payload(arow, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees={"no-rp": res})
+            arm = sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, self.SECTION_ABL), root / "jabl")
+            payload = sb.build_jetty_payload(arow, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees={"no-rp": arm})
             self.assertTrue(REQUIRED.issubset(payload["harness"]["ablation"]))
             self.assertIn("skill_tree_hash", payload["harness"])
 
@@ -1473,7 +1474,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             p = self.repo(root, [self.SECTION_ABL])
             manifest = sb.validate_manifest(p)
             row = [r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "rabl") if r["variant"] == "ablation:no-rp"][0]
-            trees = {"no-rp": sb.materialize_ablation(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL, root / "jabl")}
+            trees = {"no-rp": sb.materialize(sb.ValidatedAblation.validate(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL), root / "jabl")}
             payload = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
             skill_files = [f for f in payload["upload_plan"]["files"] if f["role"] == "skill"]
             hints = [f["remote_path_hint"] for f in skill_files]
@@ -1492,7 +1493,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             p = self.repo(root, [self.SECTION_ABL])
             manifest = sb.validate_manifest(p)
             row = [r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl") if r["variant"] == "ablation:no-rp"][0]
-            trees = {"no-rp": sb.materialize_ablation(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL, root / "jabl")}
+            trees = {"no-rp": sb.materialize(sb.ValidatedAblation.validate(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL), root / "jabl")}
             payload = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
             # What the model actually sees: the jetty request (runbook + jetty block,
             # incl. file_paths and template_variables) and each upload's remote path.
