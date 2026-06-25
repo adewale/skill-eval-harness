@@ -567,7 +567,7 @@ skill-benchmark prepare ../repo/evals/shared-benchmark.json \
   --out ablation-tasks.jsonl
 ```
 
-Ablation task variants are named `ablation:<id>`. Trigger cases are skipped for ablation tasks because trigger behavior depends on the description/frontmatter rather than the body component being ablated.
+Ablation task variants are named `ablation:<id>`. Routing is by case population: **answer-population** ablations (instructions/resource/runtime/preprocess) skip trigger cases, while **discovery-population** ablations (e.g. a weakened `description`/`when_to_use`) run *only* on trigger cases.
 
 ### Materialized ablations
 
@@ -578,7 +578,7 @@ skill-benchmark materialize-ablations ../repo/evals/shared-benchmark.json \
   --out-dir ablated --out ablated/provenance.json
 ```
 
-Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree. Mechanisms are `frontmatter_field`, `section` (fence-aware), `anchor`, `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, and `asset`, composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`.
+Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree (every manifest root, identical surface to `with_skill`, differing only by the declared edit). Mechanisms are `frontmatter_field`, `section` (fence-aware), `anchor`, `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, `asset`, and `preprocess` (inline `` !`command` ``), composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`. Materialized arms are blind: the model-visible input is identical to `with_skill` (the hypothesis lives only in harness metadata).
 
 The materialized tree flows through the runners: the Pi smoke runner mounts it, `run_pi_trigger_eval.py --ablation <id>` trigger-tests a materialized (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. `prepare`/`export-jetty` route ablation rows by case population (discovery→trigger, answer→non-trigger) and the benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed". See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
 

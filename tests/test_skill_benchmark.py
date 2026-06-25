@@ -382,7 +382,7 @@ class SkillBenchmarkTests(unittest.TestCase):
             data = json.loads(manifest.read_text(encoding="utf-8"))
             data["cases"][0]["files"] = ["fixtures/input.txt"]
             with tempfile.TemporaryDirectory() as wd:
-                instruction, skill_args, inputs, skill_paths = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "without_skill", Path(wd))
+                instruction, skill_args, inputs, skill_paths, _ = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "without_skill", Path(wd))
                 self.assertEqual(skill_args, ["--no-skills"])
                 self.assertEqual(skill_paths, [])
                 self.assertEqual(len(inputs), 1)
@@ -390,7 +390,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                 self.assertFalse((Path(wd) / "skills").exists())
                 self.assertIn("not present", instruction)
             with tempfile.TemporaryDirectory() as wd:
-                _, skill_args, _, skill_paths = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "with_skill", Path(wd))
+                _, skill_args, _, skill_paths, _ = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "with_skill", Path(wd))
                 self.assertTrue(skill_paths)
                 self.assertIn("--skill", skill_args)
                 self.assertTrue(all(str(p.resolve()).startswith(str(Path(wd).resolve())) for p in skill_paths))
@@ -998,7 +998,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             manifest = sb.validate_manifest(p)
             repo_root = sb.repo_root_for_manifest(p)
             with tempfile.TemporaryDirectory() as wd:
-                instr, skill_args, _, _ = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:no-rp", Path(wd))
+                instr, skill_args, _, _, _ = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:no-rp", Path(wd))
                 mounted = Path(skill_args[skill_args.index("--skill") + 1]).read_text(encoding="utf-8")
                 self.assertNotIn("Regression-proof requirement", mounted)   # ablated content reaches the runner
                 self.assertNotIn("ignore/remove", instr)                    # not the instruction-simulated text
@@ -1011,7 +1011,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             manifest = sb.validate_manifest(p)
             repo_root = sb.repo_root_for_manifest(p)
             with tempfile.TemporaryDirectory() as wd:
-                instr, skill_args, _, _ = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:sim", Path(wd))
+                instr, skill_args, _, _, _ = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:sim", Path(wd))
                 self.assertIn("instruction-simulated", instr)
                 self.assertIn("Regression-proof requirement", Path(skill_args[skill_args.index("--skill") + 1]).read_text(encoding="utf-8"))
 
@@ -1021,7 +1021,8 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             p = self.repo(root, [self.DISCO_ABL])
             manifest = sb.validate_manifest(p)
             with tempfile.TemporaryDirectory() as cd:
-                copied = tr.copy_skill_to_config(p, manifest, Path(cd), ablation_id="no-wtu")
+                copied, prov = tr.copy_skill_to_config(p, manifest, Path(cd), ablation_id="no-wtu")
+                self.assertIn("skill_hash", prov)               # provenance returned for the run record (#9)
                 text = Path(copied[0]).read_text(encoding="utf-8")
                 self.assertNotIn("when_to_use", text)
                 self.assertIn("name: good-pr", text)
@@ -1384,6 +1385,9 @@ class AblationLiveExecutionTests(unittest.TestCase):
             self.assertEqual(results["with_skill"], "HAS_RP")        # full skill executed
             self.assertEqual(results["without_skill"], "NO_SKILL")   # no skill executed
             self.assertEqual(results["ablation:no-rp"], "NO_RP")     # the ABLATED skill is what ran
+            meta = json.loads((root / "good-pr" / "eval-runs" / "run" / "ans" / "ablation:no-rp" / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["ablation"]["mode"], "materialized")   # provenance persisted on the run (#9)
+            self.assertIn("skill_hash", meta["ablation"])
 
 
 class AblationReviewFixesTests(unittest.TestCase):
@@ -1489,6 +1493,46 @@ class AblationReviewFixesTests(unittest.TestCase):
             res = sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
             self.assertEqual(set(res["skill_files"]), {"skills/good-pr/SKILL.md", "skills/audit/SKILL.md"})  # B not dropped
             self.assertTrue(Path(res["skill_files"]["skills/audit/SKILL.md"]).exists())
+
+    # --- #2 codex isolation ---
+    def test_codex_workspace_isolates_skill_by_variant(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill = root / "skills" / "good-pr"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(self.MIN_SKILL, encoding="utf-8")
+            base = {"skill_paths": [str(skill / "SKILL.md")], "input_files": [], "prompt": "x"}
+            with tempfile.TemporaryDirectory() as w1:
+                ws = Path(w1)
+                sk, _ = sb.codex_skill_workspace({**base, "variant": "without_skill"}, ws)
+                self.assertEqual(sk, [])                       # without_skill mounts no skill
+                self.assertFalse((ws / "skills").exists())
+                self.assertIn("Do not use any skill", sb.codex_task_prompt({"variant": "without_skill", "prompt": "x"}, sk, []))
+            with tempfile.TemporaryDirectory() as w2:
+                ws = Path(w2)
+                sk, _ = sb.codex_skill_workspace({**base, "variant": "with_skill"}, ws)
+                self.assertTrue(sk and (ws / sk[0]).exists())  # skill mounted inside the isolated workspace
+                self.assertTrue(sk[0].startswith("skills/"))   # workspace-relative, not the original repo path
+
+    # --- #3b Jetty with_skill surface parity ---
+    def test_jetty_with_skill_uploads_tree_recursively(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            sd = repo / "skills" / "good-pr"
+            (sd / "references").mkdir(parents=True)
+            (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: d.\n---\n\n# B\n\nSee [g](references/g.md).\n", encoding="utf-8")
+            (sd / "references" / "g.md").write_text("guide\n", encoding="utf-8")
+            (repo / "evals").mkdir()
+            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
+            p = repo / "evals" / "shared-benchmark.json"
+            p.write_text(json.dumps(m), encoding="utf-8")
+            manifest = sb.validate_manifest(p)
+            row = [r for r in sb.prepared_task_rows(p, manifest) if r["variant"] == "with_skill"][0]
+            tree_dir = sb.build_canonical_skill_tree(sb.repo_root_for_manifest(p), manifest, root / "wst")
+            payload = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", with_skill_tree_dir=tree_dir)
+            hints = [f["remote_path_hint"] for f in payload["upload_plan"]["files"] if f["role"] == "skill"]
+            self.assertTrue(any(h.endswith("references/g.md") for h in hints))  # recursive, matching the ablation arm
 
 
 if __name__ == "__main__":

@@ -1057,6 +1057,19 @@ def materialized_tree_for_variant(repo_root: Path, manifest: dict[str, Any], var
     return materialize_ablation(repo_root, manifest, ablation, out_root)
 
 
+def build_canonical_skill_tree(repo_root: Path, manifest: dict[str, Any], dest_dir: Path) -> Path:
+    """Copy every manifest skill root into dest_dir/<key> with no edits — the
+    canonical surface for with_skill, so it matches a materialized ablation arm
+    file-for-file (the only difference being the ablation's declared edit)."""
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for r in manifest.get("skill_paths", []):
+        src = _safe_under(repo_root, repo_root / r)
+        src_dir = src if src.is_dir() else src.parent
+        _copy_skill_root(src_dir, dest_dir / re.sub(r"[^A-Za-z0-9_.-]", "_", r))
+    return dest_dir
+
+
 def enumerate_tree(root_dir: Path) -> list[tuple[Path, str]]:
     """All files under root_dir as (absolute_path, posix_relpath), sorted."""
     return [(p, p.relative_to(root_dir).as_posix()) for p in sorted(root_dir.rglob("*")) if p.is_file()]
@@ -1231,6 +1244,7 @@ def build_jetty_payload(
     snapshot: str,
     use_trial_keys: bool = False,
     ablation_trees: dict[str, Any] | None = None,
+    with_skill_tree_dir: Path | None = None,
 ) -> dict[str, Any]:
     variant = str(task["variant"])
     task_name = jetty_task_name(task, task_prefix)
@@ -1244,14 +1258,26 @@ def build_jetty_payload(
             "private": False,
         })
     if variant == "with_skill":
-        for i, local in enumerate(task.get("skill_paths", []), 1):
-            files.append({
-                "role": "skill",
-                "placeholder": placeholder(task_name, "skill", i),
-                "local_path": str(Path(local).resolve()),
-                "remote_path_hint": f"skills/{task['skill_name']}/{Path(local).name}",
-                "private": False,
-            })
+        if with_skill_tree_dir is not None:
+            # Upload the canonical tree recursively, same as the ablation arm, so
+            # the two arms have an identical remote file surface.
+            for i, (abs_path, rel) in enumerate(enumerate_tree(Path(with_skill_tree_dir)), 1):
+                files.append({
+                    "role": "skill",
+                    "placeholder": placeholder(task_name, "skill", i),
+                    "local_path": str(abs_path),
+                    "remote_path_hint": f"skills/{task['skill_name']}/{rel}",
+                    "private": False,
+                })
+        else:
+            for i, local in enumerate(task.get("skill_paths", []), 1):
+                files.append({
+                    "role": "skill",
+                    "placeholder": placeholder(task_name, "skill", i),
+                    "local_path": str(Path(local).resolve()),
+                    "remote_path_hint": f"skills/{task['skill_name']}/{Path(local).name}",
+                    "private": False,
+                })
     elif variant == "old_skill":
         old_paths = manifest.get("old_skill_paths") or []
         if not old_paths:
@@ -1366,6 +1392,7 @@ def export_jetty(args: argparse.Namespace) -> int:
         include_answer_key=False,
     )
     ablation_trees: dict[str, Any] = {}
+    with_skill_tree_dir: Path | None = None
     if getattr(args, "include_ablations", False):
         abl_root = Path(getattr(args, "ablation_dir", None) or (str(args.out) + ".ablations" if getattr(args, "out", None) else "jetty-ablations"))
         abl_root = _ensure_ablation_dir(abl_root)
@@ -1376,6 +1403,9 @@ def export_jetty(args: argparse.Namespace) -> int:
                     ablation_trees[ablation["id"]] = materialize_ablation(repo_root, manifest, ablation, abl_root)
                 except AblationError as exc:
                     die(f"ablation {ablation.get('id')}: {exc}")
+        if ablation_trees:
+            # Build the with_skill canonical tree so its arm matches the ablation arm.
+            with_skill_tree_dir = build_canonical_skill_tree(repo_root, manifest, abl_root / "_with_skill")
     payloads = [build_jetty_payload(
         row,
         manifest,
@@ -1387,6 +1417,7 @@ def export_jetty(args: argparse.Namespace) -> int:
         snapshot=snapshot,
         use_trial_keys=bool(getattr(args, "use_trial_keys", False) or manifest.get("jetty", {}).get("use_trial_keys", False)),
         ablation_trees=ablation_trees,
+        with_skill_tree_dir=with_skill_tree_dir,
     ) for row in rows]
     out = Path(args.out) if getattr(args, "out", None) else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
@@ -2332,11 +2363,43 @@ def safe_child_path(root: Path, relative: str) -> Path:
     return dest
 
 
-def codex_task_prompt(task: dict[str, Any]) -> str:
-    files = task.get("input_files") or []
-    file_note = "\n".join(f"- {p}" for p in files) if files else "- none"
+def codex_skill_workspace(task: dict[str, Any], ws: Path) -> tuple[list[str], list[str]]:
+    """Build an isolated workspace holding ONLY the row's selected skill tree (per
+    variant) and fixtures, so executing with cwd here cannot reach the original
+    repo skill. For an ablation the row's skill_paths are the materialized tree;
+    for without_skill nothing is mounted. with_skill and ablation use the same
+    copier, so their file surfaces are identical apart from the declared edit."""
+    ws.mkdir(parents=True, exist_ok=True)
+    variant = str(task.get("variant"))
+    skill_rel: list[str] = []
+    if variant != "without_skill":
+        for i, sp in enumerate(task.get("skill_paths", [])):
+            src = Path(sp)
+            src_dir = src if src.is_dir() else src.parent
+            dest = ws / "skills" / f"root-{i}"
+            _copy_skill_root(src_dir, dest)
+            main = dest / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dest / src.name
+            skill_rel.append(str((main if main.exists() else dest).relative_to(ws)))
+    input_rel: list[str] = []
+    for raw in task.get("input_files", []):
+        src = Path(raw)
+        dest = ws / "inputs" / src.name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        input_rel.append(str(dest.relative_to(ws)))
+    return skill_rel, input_rel
+
+
+def codex_task_prompt(task: dict[str, Any], skill_paths: list[str] | None = None, input_files: list[str] | None = None) -> str:
+    variant = str(task.get("variant"))
+    file_note = "\n".join(f"- {p}" for p in (input_files or [])) if input_files else "- none"
+    if variant == "without_skill":
+        skill_note = "Do not use any skill. No skill files are present in this workspace."
+    else:
+        listed = "\n".join(f"- {p}" for p in (skill_paths or [])) if skill_paths else "- none"
+        skill_note = f"Read and follow the skill file(s) below (including referenced files when relevant), then do the task:\n{listed}"
     return (
-        f"{task.get('instruction', '')}\n\n"
+        f"{skill_note}\n\n"
         f"Task prompt:\n{task.get('prompt', '')}\n\n"
         f"Input files available to inspect:\n{file_note}\n\n"
         "Return the final answer for this eval task. Do not include hidden answer keys or rubrics."
@@ -2351,34 +2414,39 @@ def run_codex(args: argparse.Namespace) -> int:
     for task in tasks:
         base = safe_child_path(runs, str(task.get("run_dir", f"{task.get('case_id','case')}/{task.get('variant','variant')}")))
         base.mkdir(parents=True, exist_ok=True)
+        abl = task.get("ablation")
         started = time.time()
-        try:
-            proc = subprocess.run(cmd, shell=True, input=codex_task_prompt(task), text=True, capture_output=True, timeout=timeout, cwd=task.get("repo_root") or None)
-            elapsed_ms = int((time.time() - started) * 1000)
-            trace_text = proc.stdout if proc.stdout.strip() else ""
-            if trace_text:
-                events, metrics = write_trace_artifacts(
-                    base,
-                    trace_text,
-                    source="codex",
-                    metadata={"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else ""},
-                    extra_metrics={"elapsed_ms": elapsed_ms, "returncode": proc.returncode},
-                    environment={"runner": "codex", "command": cmd, "cwd": task.get("repo_root")},
-                    write_metadata=True,
-                )
-            else:
-                events, metrics = {"schema_version": 1, "source": "codex", "events": []}, {"schema_version": 1, "source": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode}
-                write_json(base / "events.json", events)
-                write_json(base / "metrics.json", metrics)
-                write_json(base / "metadata.json", {"provider": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode, "stderr": proc.stderr[:4000] if proc.stderr else "", "trace_source": "codex"})
-            answer = final_answer_from_events(events) or proc.stdout.strip()
-            if proc.returncode != 0:
-                answer = f"[CODEX FAILURE: returncode={proc.returncode}]\n\n{answer}\n\nstderr:\n{proc.stderr[:4000]}"
-            (base / "output.md").write_text(answer or "[CODEX FAILURE: no output produced]\n", encoding="utf-8")
-        except subprocess.TimeoutExpired as exc:
-            elapsed_ms = int((time.time() - started) * 1000)
-            (base / "output.md").write_text(f"[CODEX FAILURE: timed out after {timeout}s]\n", encoding="utf-8")
-            write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timeout": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000]})
+        with tempfile.TemporaryDirectory(prefix="codex-ws-") as wd:
+            ws = Path(wd)
+            skill_rel, input_rel = codex_skill_workspace(task, ws)
+            prompt = codex_task_prompt(task, skill_paths=skill_rel, input_files=input_rel)
+            try:
+                proc = subprocess.run(cmd, shell=True, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=str(ws))
+                elapsed_ms = int((time.time() - started) * 1000)
+                trace_text = proc.stdout if proc.stdout.strip() else ""
+                if trace_text:
+                    events, metrics = write_trace_artifacts(
+                        base,
+                        trace_text,
+                        source="codex",
+                        metadata={"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else "", **({"ablation": abl} if abl else {})},
+                        extra_metrics={"elapsed_ms": elapsed_ms, "returncode": proc.returncode},
+                        environment={"runner": "codex", "command": cmd, "cwd": "<isolated workspace>", "variant": task.get("variant")},
+                        write_metadata=True,
+                    )
+                else:
+                    events, metrics = {"schema_version": 1, "source": "codex", "events": []}, {"schema_version": 1, "source": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode}
+                    write_json(base / "events.json", events)
+                    write_json(base / "metrics.json", metrics)
+                    write_json(base / "metadata.json", {"provider": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode, "stderr": proc.stderr[:4000] if proc.stderr else "", "trace_source": "codex", **({"ablation": abl} if abl else {})})
+                answer = final_answer_from_events(events) or proc.stdout.strip()
+                if proc.returncode != 0:
+                    answer = f"[CODEX FAILURE: returncode={proc.returncode}]\n\n{answer}\n\nstderr:\n{proc.stderr[:4000]}"
+                (base / "output.md").write_text(answer or "[CODEX FAILURE: no output produced]\n", encoding="utf-8")
+            except subprocess.TimeoutExpired as exc:
+                elapsed_ms = int((time.time() - started) * 1000)
+                (base / "output.md").write_text(f"[CODEX FAILURE: timed out after {timeout}s]\n", encoding="utf-8")
+                write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timeout": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **({"ablation": abl} if abl else {})})
     return 0
 
 

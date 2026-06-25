@@ -21,7 +21,7 @@ from typing import Any
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
-from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, expected_regression_summaries  # noqa: E402
+from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, expected_regression_summaries, _copy_skill_root  # noqa: E402
 
 # Workspace-specific example: by default this assumes the harness directory is a
 # sibling of the skill repos. Override with SKILL_EVAL_WORKSPACE_ROOT.
@@ -116,7 +116,7 @@ def copy_skill_source(src: Path, dest_root: Path, skill_name: str) -> Path:
     return dest / "SKILL.md"
 
 
-def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, case: dict[str, Any], variant: str, workspace: Path) -> tuple[str, list[str], list[Path], list[Path]]:
+def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, case: dict[str, Any], variant: str, workspace: Path) -> tuple[str, list[str], list[Path], list[Path], dict[str, Any] | None]:
     """Return instruction, Pi skill args, copied input files, copied skill paths.
 
     The smoke runner intentionally does not execute from the source repo. It
@@ -139,10 +139,18 @@ def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, cas
             copied_skill_paths.append(Path(sp))
             skill_args.extend(["--skill", str(sp)])
     else:
+        # with_skill (and instruction-simulated ablation): copy EVERY skill root via
+        # the SAME canonical copier the materialized arm uses, so the full and
+        # ablated arms have an identical file surface (differing only by the edit).
         skill_dest_root = workspace / "skills"
         skill_dest_root.mkdir(parents=True, exist_ok=True)
-        for src in [(repo_root / p).resolve() for p in manifest.get("skill_paths", [])]:
-            copied = copy_skill_source(src, skill_dest_root, str(manifest.get("skill_name", "skill")))
+        for i, p in enumerate(manifest.get("skill_paths", [])):
+            src = (repo_root / p).resolve()
+            src_dir = src if src.is_dir() else src.parent
+            dest = skill_dest_root / f"root-{i}"
+            _copy_skill_root(src_dir, dest)
+            main = dest / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dest / src.name
+            copied = main if main.exists() else dest
             copied_skill_paths.append(copied)
             skill_args.extend(["--skill", str(copied)])
 
@@ -183,7 +191,7 @@ def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, cas
         )
     else:
         raise RuntimeError(f"unsupported variant: {variant}")
-    return instruction, skill_args, copied_inputs, copied_skill_paths
+    return instruction, skill_args, copied_inputs, copied_skill_paths, materialized
 
 
 def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant: str, run_name: str, timeout: int) -> dict[str, Any]:
@@ -197,7 +205,7 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
 
     with tempfile.TemporaryDirectory(prefix=f"skill-smoke-{repo}-{case['id']}-{variant.replace(':', '-')}-") as td:
         workspace = Path(td)
-        instruction, skill_args, input_files, copied_skill_paths = materialize_runtime_workspace(manifest, repo_root, case, variant, workspace)
+        instruction, skill_args, input_files, copied_skill_paths, ablation_provenance = materialize_runtime_workspace(manifest, repo_root, case, variant, workspace)
         fixture_note = ""
         if input_files:
             fixture_lines = []
@@ -262,6 +270,8 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
         "skill_invoked": runner_skill_invoked,
         "skill_invocation_evidence": copied_skill_evidence if runner_skill_invoked else [],
     })
+    if ablation_provenance:
+        meta["ablation"] = {k: ablation_provenance.get(k) for k in ("id", "mode", "population", "skill_hash", "components")}
     (out_dir / "output.md").write_text(text, encoding="utf-8")
     trace_metrics = {
         "elapsed_ms": elapsed_ms,

@@ -44,7 +44,7 @@ def seed_config_dir(config_dir: Path) -> None:
             shutil.copy2(src, config_dir / name)
 
 
-def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_dir: Path, ablation_id: str | None = None) -> list[Path]:
+def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_dir: Path, ablation_id: str | None = None) -> tuple[list[Path], dict[str, Any] | None]:
     repo_root = manifest_path.parent.parent if manifest_path.name == "shared-benchmark.json" else manifest_path.parent
     skills_dir = config_dir / "skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
@@ -65,7 +65,7 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
                 shutil.rmtree(dest)
             shutil.copytree(root_dir, dest)
             copied.append(dest / "SKILL.md" if (dest / "SKILL.md").exists() else dest)
-        return copied
+        return copied, res
     copied = []
     for rel in manifest.get("skill_paths", []):
         src = (repo_root / rel).resolve()
@@ -89,7 +89,7 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
                         shutil.rmtree(d)
                     shutil.copytree(s, d)
         copied.append(dest)
-    return copied
+    return copied, None
 
 
 def event_texts_for_tool_input(obj: Any) -> list[str]:
@@ -153,7 +153,7 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
     with tempfile.TemporaryDirectory(prefix="pi-trigger-") as td:
         config_dir = Path(td)
         seed_config_dir(config_dir)
-        copied = copy_skill_to_config(manifest_path, manifest, config_dir, ablation_id=ablation)
+        copied, abl_prov = copy_skill_to_config(manifest_path, manifest, config_dir, ablation_id=ablation)
         cmd = [
             "pi", "--no-session", "--mode", "json", "--no-context-files", "--no-prompt-templates", "--no-extensions",
             "--thinking", "minimal", "--tools", "read,grep,find,ls", "-p", query,
@@ -188,7 +188,7 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             "returncode": returncode,
             "timed_out": timed_out,
             "evidence": evidence,
-            "ablation": ablation,
+            "ablation": ({"id": ablation, "mode": abl_prov["mode"], "population": abl_prov["population"], "skill_hash": abl_prov["skill_hash"]} if abl_prov else ablation),
             "stderr": stderr[-1000:] if stderr else "",
         }
         if trace_dir is not None:
