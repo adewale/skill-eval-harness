@@ -898,6 +898,72 @@ class SkillAblationTests(unittest.TestCase):
             with self.assertRaises(sb.AblationError):
                 sb.patch_delete_ops(SKILL_FIXTURE, f"@@ -{n},1 +{n},1 @@\n-Revert the fix mentally and re-run.\n+Optionally revert.\n")
 
+    def _patch_ablation(self, root: Path, patch_text: str, *, cls=None):
+        """Build a repo with a patch file and return (manifest, repo_root, ablation)."""
+        path = self.build(root)
+        repo = path.parent.parent
+        (repo / "evals" / "ablations").mkdir(parents=True, exist_ok=True)
+        (repo / "evals" / "ablations" / "p.patch").write_text(patch_text, encoding="utf-8")
+        manifest = sb.validate_manifest(path)
+        tgt = {"patch": "evals/ablations/p.patch"}
+        ab = {"id": "p", "removed_component": "x", "mechanism": "patch", "target": tgt}
+        if cls:
+            ab["class"] = cls
+        return manifest, sb.repo_root_for_manifest(path), ab
+
+    def test_patch_discovery_class_deletes_frontmatter_ok(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lines = SKILL_FIXTURE.split("\n")
+            n = lines.index("when_to_use: When asked to review a PR, diff, or patch.") + 1
+            manifest, repo_root, ab = self._patch_ablation(
+                root, f"@@ -{n},1 +{n},0 @@\n-when_to_use: When asked to review a PR, diff, or patch.\n", cls="discovery")
+            res = sb.materialize_ablation(repo_root, manifest, ab, root / "out")
+            text = self.skill_text(res)
+            self.assertNotIn("when_to_use", text)
+            self.assertEqual(res["population"], "trigger")   # discovery -> trigger cases
+
+    def test_patch_instructions_class_on_frontmatter_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lines = SKILL_FIXTURE.split("\n")
+            n = lines.index("when_to_use: When asked to review a PR, diff, or patch.") + 1
+            # default class for a patch is instructions; deleting a frontmatter line must be rejected
+            manifest, repo_root, ab = self._patch_ablation(
+                root, f"@@ -{n},1 +{n},0 @@\n-when_to_use: When asked to review a PR, diff, or patch.\n")
+            with self.assertRaises(sb.AblationError) as cm:
+                sb.materialize_ablation(repo_root, manifest, ab, root / "out")
+            self.assertIn("frontmatter", str(cm.exception))
+
+    def test_patch_discovery_class_on_body_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lines = SKILL_FIXTURE.split("\n")
+            n = lines.index("Revert the fix mentally and re-run.") + 1
+            manifest, repo_root, ab = self._patch_ablation(
+                root, f"@@ -{n},1 +{n},0 @@\n-Revert the fix mentally and re-run.\n", cls="discovery")
+            with self.assertRaises(sb.AblationError) as cm:
+                sb.materialize_ablation(repo_root, manifest, ab, root / "out")
+            self.assertIn("body", str(cm.exception))
+
+    def test_patch_spanning_frontmatter_and_body_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lines = SKILL_FIXTURE.split("\n")
+            close = lines.index("---", 1) + 1   # 1-based line of the closing frontmatter fence
+            # One hunk deletes the closing '---' (frontmatter) plus the blank line
+            # and heading (body): a deletion that crosses the layer boundary.
+            patch = (
+                f"@@ -{close},3 +{close},0 @@\n"
+                "----\n"               # tag '-' + content '---' (the closing fence)
+                "-\n"                  # tag '-' + empty content (the blank line)
+                "-# Good PR review\n"  # tag '-' + the heading
+            )
+            manifest, repo_root, ab = self._patch_ablation(root, patch, cls="discovery")
+            with self.assertRaises(sb.AblationError) as cm:
+                sb.materialize_ablation(repo_root, manifest, ab, root / "out")
+            self.assertIn("both", str(cm.exception))
+
     def test_multi_component_is_order_independent(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

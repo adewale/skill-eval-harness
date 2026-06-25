@@ -796,6 +796,27 @@ def patch_delete_ops(text: str, patch: str) -> list[tuple[int, int, str]]:
     return ops
 
 
+def _verify_hunks_match_class(text: str, spans: list[tuple[int, int, str]], declared_class: str) -> None:
+    """A patch may delete from the frontmatter (a discovery edit) or the body (an
+    instructions edit). Verify every hunk lands in the region the declared class
+    names, so a frontmatter edit can't be mislabeled `instructions` (or a body
+    edit `discovery`) and routed to the wrong case population. A hunk that
+    straddles the boundary, or a set of hunks split across both regions, is
+    rejected — declare two single-region patch components instead."""
+    fm, _ = split_frontmatter(text)
+    fm_end = len(fm)
+    # Spans are whole-line deletions and fm_end is a line boundary, so each hunk
+    # is wholly inside the frontmatter (e <= fm_end) or wholly in the body.
+    in_fm = any(e <= fm_end for s, e, _ in spans)
+    in_body = any(s >= fm_end for s, e, _ in spans)
+    if in_fm and in_body:
+        raise AblationError("patch deletes from both the frontmatter and the body; split it into separate discovery and instructions patch components")
+    if declared_class == "discovery" and in_body:
+        raise AblationError("patch declares class 'discovery' but a hunk deletes body (instructions) content")
+    if declared_class != "discovery" and in_fm:
+        raise AblationError(f"patch declares class {declared_class!r} but a hunk deletes frontmatter (discovery) content")
+
+
 def _check_disjoint(ops: list[tuple[int, int, str]]) -> None:
     spans = sorted((s, e) for s, e, _ in ops)
     for i in range(1, len(spans)):
@@ -932,7 +953,9 @@ def _resolve_component_ops(comp: dict[str, Any], main_file: Path, root_dir: Path
         ops[main_file] = preprocess_ops(text, tgt["contains"])
     elif mech == "patch":
         patch_file = _safe_under(repo_root, repo_root / tgt["patch"])
-        ops[main_file] = patch_delete_ops(text, patch_file.read_text(encoding="utf-8"))
+        spans = patch_delete_ops(text, patch_file.read_text(encoding="utf-8"))
+        _verify_hunks_match_class(text, spans, component_class(comp))
+        ops[main_file] = spans
     elif mech == "reference":
         mode = tgt.get("remove", "both")
         if mode in ("pointer", "both"):
