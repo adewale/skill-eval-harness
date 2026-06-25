@@ -2982,6 +2982,15 @@ def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:
     return not (text or "").lstrip().startswith(_RUNNER_FAILURE_MARKERS)
 
 
+def scorable_run(row: dict[str, Any]) -> bool:
+    """THE predicate for 'this run counts toward scoring': it produced output AND
+    was not an infrastructure failure. Every report view — summary rates, paired
+    deltas/normalized gain, taxonomy and success-goal slices, assertion-level
+    comparisons, and the ablation regression report — must filter through this, so
+    an infra failure can't be excluded from one view yet corrupt another."""
+    return not row.get("missing_output") and row.get("execution_valid", True)
+
+
 def grade_case_variant(
     case: dict[str, Any],
     variant: str,
@@ -3222,14 +3231,14 @@ def telemetry_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> float | None:
-    vals = [r.get(key) for r in rows if r.get(key) is not None and not r.get("missing_output")]
+    vals = [r.get(key) for r in rows if r.get(key) is not None and scorable_run(r)]
     return statistics.mean(vals) if vals else None
 
 
 def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     by_case_variant: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for row in results:
-        if row.get("missing_output"):
+        if not scorable_run(row):
             continue
         by_case_variant.setdefault(row["case_id"], {}).setdefault(row["variant"], []).append(row)
     paired_with_rates: list[float] = []
@@ -3270,7 +3279,7 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
         for value in values:
             out[field][value] = {}
             for variant in variants:
-                rows = [r for r in results if r.get(field) == value and r.get("variant") == variant and not r.get("missing_output")]
+                rows = [r for r in results if r.get(field) == value and r.get("variant") == variant and scorable_run(r)]
                 out[field][value][variant] = {
                     "runs": len(rows),
                     "mean_objective_pass_rate": mean_rate(rows, "objective_pass_rate"),
@@ -3280,7 +3289,7 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
     for goal in goals:
         out["success_goals"][goal] = {}
         for variant in variants:
-            rows = [r for r in results if goal in (r.get("success_goals") or []) and r.get("variant") == variant and not r.get("missing_output")]
+            rows = [r for r in results if goal in (r.get("success_goals") or []) and r.get("variant") == variant and scorable_run(r)]
             out["success_goals"][goal][variant] = {
                 "runs": len(rows),
                 "mean_objective_pass_rate": mean_rate(rows, "objective_pass_rate"),
@@ -3539,14 +3548,10 @@ def build_benchmark_report(
 
     summary: dict[str, Any] = {}
     for variant, rows in by_variant.items():
-        # A row counts toward scoring only if it produced output AND was not an
-        # infrastructure failure (nonzero exit / timeout / synthetic failure body).
-        def _scorable(r: dict[str, Any]) -> bool:
-            return not r["missing_output"] and r.get("execution_valid", True)
-        objective_rates = [r["objective_pass_rate"] for r in rows if r["objective_pass_rate"] is not None and _scorable(r)]
-        combined_rates = [r["combined_pass_rate"] for r in rows if r.get("combined_pass_rate") is not None and _scorable(r)]
-        process_rates = [r["process_pass_rate"] for r in rows if r.get("process_pass_rate") is not None and _scorable(r)]
-        efficiency_rates = [r["efficiency_pass_rate"] for r in rows if r.get("efficiency_pass_rate") is not None and _scorable(r)]
+        objective_rates = [r["objective_pass_rate"] for r in rows if r["objective_pass_rate"] is not None and scorable_run(r)]
+        combined_rates = [r["combined_pass_rate"] for r in rows if r.get("combined_pass_rate") is not None and scorable_run(r)]
+        process_rates = [r["process_pass_rate"] for r in rows if r.get("process_pass_rate") is not None and scorable_run(r)]
+        efficiency_rates = [r["efficiency_pass_rate"] for r in rows if r.get("efficiency_pass_rate") is not None and scorable_run(r)]
         merged_metrics = []
         for r in rows:
             merged = dict(r.get("metadata", {}) or {})
@@ -3586,7 +3591,7 @@ def build_benchmark_report(
         rows = [r for r in results if r["case_id"] == cid]
         by_var_case: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            if row.get("missing_output") or not row.get("execution_valid", True):
+            if not scorable_run(row):
                 continue
             by_var_case.setdefault(row["variant"], []).append(row)
         ws_rows = by_var_case.get("with_skill", [])
@@ -4315,7 +4320,7 @@ def audit_manifest_report(
         assertion_rows = []
         by_case: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for row in report["results"]:
-            if row.get("missing_output"):
+            if not scorable_run(row):
                 continue
             by_case.setdefault(row["case_id"], {}).setdefault(row["variant"], []).append(row)
         for case_id, by_variant in by_case.items():
