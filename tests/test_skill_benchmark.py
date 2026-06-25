@@ -1119,9 +1119,37 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as cd:
                 copied, prov = tr.copy_skill_to_config(p, manifest, Path(cd), ablation_id="no-wtu")
                 self.assertIn("skill_hash", prov)               # provenance returned for the run record (#9)
+                self.assertIn("components", prov)               # components recorded for the run record (#8)
                 text = Path(copied[0]).read_text(encoding="utf-8")
                 self.assertNotIn("when_to_use", text)
                 self.assertIn("name: good-pr", text)
+
+    def test_pi_trigger_baseline_matches_ablation_surface(self):
+        # The baseline (no-ablation) arm must use the SAME canonical tree builder as
+        # the ablation arm, so the two are file-for-file identical apart from the edit.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.DISCO_ABL])
+            manifest = sb.validate_manifest(p)
+            with tempfile.TemporaryDirectory() as cb, tempfile.TemporaryDirectory() as ca:
+                base_copied, base_prov = tr.copy_skill_to_config(p, manifest, Path(cb))
+                abl_copied, abl_prov = tr.copy_skill_to_config(p, manifest, Path(ca), ablation_id="no-wtu")
+
+                def rel_files(cfg):
+                    sd = Path(cfg) / "skills"
+                    return {q.relative_to(sd).as_posix() for q in sd.rglob("*") if q.is_file()}
+
+                # identical mount dir names and identical relative file trees
+                self.assertEqual({d.name for d in (Path(cb) / "skills").iterdir()},
+                                 {d.name for d in (Path(ca) / "skills").iterdir()})
+                self.assertEqual(rel_files(cb), rel_files(ca))
+                # the references file survives in BOTH arms (the old ad-hoc copier path is gone)
+                self.assertTrue(any(f.endswith("references/severity.md") for f in rel_files(cb)))
+                # only difference is the edited frontmatter
+                self.assertIn("when_to_use", Path(base_copied[0]).read_text(encoding="utf-8"))
+                self.assertNotIn("when_to_use", Path(abl_copied[0]).read_text(encoding="utf-8"))
+                self.assertIsNone(base_prov)
+                self.assertEqual(abl_prov["mode"], "materialized")
 
     def test_prepare_routes_ablations_by_population(self):
         with tempfile.TemporaryDirectory() as td:

@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components
+from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -44,6 +44,24 @@ def seed_config_dir(config_dir: Path) -> None:
             shutil.copy2(src, config_dir / name)
 
 
+def _mount_tree_into_config(tree_dir: Path, skills_dir: Path) -> list[Path]:
+    """Copy each per-root subdir of a canonical/materialized tree into skills_dir.
+
+    Both the baseline and ablation arms route through here, so they mount under
+    IDENTICAL names and expose an identical file surface — the only difference is
+    the bytes the ablation's declared edit removed. Returns the copied SKILL.md
+    (or root dir) paths used as skill-load detection needles.
+    """
+    copied: list[Path] = []
+    for root_dir in sorted(p for p in tree_dir.iterdir() if p.is_dir()):
+        dest = skills_dir / root_dir.name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(root_dir, dest)
+        copied.append(dest / "SKILL.md" if (dest / "SKILL.md").exists() else dest)
+    return copied
+
+
 def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_dir: Path, ablation_id: str | None = None) -> tuple[list[Path], dict[str, Any] | None]:
     repo_root = manifest_path.parent.parent if manifest_path.name == "shared-benchmark.json" else manifest_path.parent
     skills_dir = config_dir / "skills"
@@ -57,39 +75,12 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
         if not ablation_components(ablation):
             raise RuntimeError(f"ablation {ablation_id} is instruction-simulated; a trigger ablation must declare a removal")
         res = materialize_ablation(repo_root, manifest, ablation, config_dir / "_materialized")
-        copied = []
-        for sp in res["skill_files"].values():
-            root_dir = Path(sp).parent
-            dest = skills_dir / root_dir.name
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(root_dir, dest)
-            copied.append(dest / "SKILL.md" if (dest / "SKILL.md").exists() else dest)
-        return copied, res
-    copied = []
-    for rel in manifest.get("skill_paths", []):
-        src = (repo_root / rel).resolve()
-        if src.is_dir():
-            dest = skills_dir / src.name
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(src, dest)
-        else:
-            # Preserve directory structure when the skill path is SKILL.md.
-            dest_dir = skills_dir / skill_name_from_manifest(manifest)
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / "SKILL.md"
-            shutil.copy2(src, dest)
-            # Copy sibling references/scripts if available.
-            for sibling in ["references", "scripts", "assets"]:
-                s = src.parent / sibling
-                if s.exists() and s.is_dir():
-                    d = dest_dir / sibling
-                    if d.exists():
-                        shutil.rmtree(d)
-                    shutil.copytree(s, d)
-        copied.append(dest)
-    return copied, None
+        return _mount_tree_into_config(Path(res["dir"]), skills_dir), res
+    # Baseline (no ablation): build the SAME canonical tree the ablation arm starts
+    # from, so the two arms are file-for-file identical apart from the declared
+    # edit — never differing by an ad-hoc copier that dropped or renamed files.
+    tree = build_canonical_skill_tree(repo_root, manifest, config_dir / "_canonical")
+    return _mount_tree_into_config(Path(tree), skills_dir), None
 
 
 def event_texts_for_tool_input(obj: Any) -> list[str]:
@@ -188,7 +179,7 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             "returncode": returncode,
             "timed_out": timed_out,
             "evidence": evidence,
-            "ablation": ({"id": ablation, "mode": abl_prov["mode"], "population": abl_prov["population"], "skill_hash": abl_prov["skill_hash"]} if abl_prov else ablation),
+            "ablation": ({"id": ablation, "mode": abl_prov["mode"], "population": abl_prov["population"], "skill_hash": abl_prov["skill_hash"], "components": abl_prov["components"]} if abl_prov else ablation),
             "stderr": stderr[-1000:] if stderr else "",
         }
         if trace_dir is not None:
