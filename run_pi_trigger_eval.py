@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population, canonical_skill_tree_hash
+from ablation_model import EvidenceClass, Provenance
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -176,10 +177,17 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
         elapsed_ms = int((time.time() - start) * 1000)
         triggered, evidence = detect_trigger(stdout, skill_name_from_manifest(manifest), copied)
         is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
-        # Record the canonical (parent) tree hash on BOTH arms under the same field
-        # the answer-population path uses, so a baseline and an ablation run can be
-        # checked for the same skill revision.
-        skill_tree_hash = abl_prov.get("parent_skill_hash") if is_ablation else (abl_prov or {}).get("skill_tree_hash")
+        # The materialized ablation's provenance goes through Provenance (one
+        # schema); the canonical (parent) tree hash is recorded on BOTH arms under
+        # the same field the answer path uses, so a baseline and an ablation run can
+        # be checked for the same skill revision.
+        if is_ablation:
+            prov = Provenance.from_dict(abl_prov)
+            ablation_field = prov.as_dict()
+            skill_tree_hash = prov.identity.canonical
+        else:
+            ablation_field = ablation
+            skill_tree_hash = (abl_prov or {}).get("skill_tree_hash")
         result = {
             "query": query,
             "should_trigger": should_trigger,
@@ -189,12 +197,12 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             # ablation here, so do not read a "pass" as a provenance-verified
             # causal ablation result (unlike the answer-population path).
             "pass": returncode == 0 and triggered == should_trigger,
-            "measurement": "raw_autonomous_trigger",
+            "measurement": EvidenceClass.RAW_MEASUREMENT.value,
             "elapsed_ms": elapsed_ms,
             "returncode": returncode,
             "timed_out": timed_out,
             "evidence": evidence,
-            "ablation": ({"id": ablation, "mode": abl_prov["mode"], "population": abl_prov["population"], "skill_hash": abl_prov["skill_hash"], "parent_skill_hash": abl_prov.get("parent_skill_hash"), "components": abl_prov["components"]} if is_ablation else ablation),
+            "ablation": ablation_field,
             "skill_tree_hash": skill_tree_hash,
             "stderr": stderr[-1000:] if stderr else "",
         }

@@ -98,15 +98,15 @@ class ArmBlindingTests(unittest.TestCase):
 
 class EvidenceClassTests(unittest.TestCase):
     def test_confirmed_causal_only_reachable_through_the_guard(self):
-        # CONFIRMED_CAUSAL requires verified provenance AND coverage AND both signals.
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True, named_flip=True, score_dropped=True),
+        # CONFIRMED_CAUSAL requires verified provenance AND coverage AND the observed regression.
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True, regression_observed=True),
                          am.EvidenceClass.CONFIRMED_CAUSAL)
         # Missing any precondition cannot reach a confirmation.
-        self.assertEqual(am.causal_confirmation(provenance_verified=False, has_coverage=True, named_flip=True, score_dropped=True),
+        self.assertEqual(am.causal_confirmation(provenance_verified=False, has_coverage=True, regression_observed=True),
                          am.EvidenceClass.INDETERMINATE)
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=False, named_flip=True, score_dropped=True),
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=False, regression_observed=True),
                          am.EvidenceClass.INDETERMINATE)
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True, named_flip=True, score_dropped=False),
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True, regression_observed=False),
                          am.EvidenceClass.REFUTED)
 
     def test_raw_measurement_is_not_a_confirmation(self):

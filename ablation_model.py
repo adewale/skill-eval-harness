@@ -98,13 +98,16 @@ class EvidenceClass(str, Enum):
         return self is EvidenceClass.CONFIRMED_CAUSAL
 
 
-def causal_confirmation(*, provenance_verified: bool, has_coverage: bool, named_flip: bool, score_dropped: bool) -> EvidenceClass:
-    """The ONLY path to CONFIRMED_CAUSAL. A raw-measurement runner never calls
-    this, so its results cannot be upgraded to a confirmed causal effect; and a
-    confirmation is impossible without verified provenance and coverage."""
+def causal_confirmation(*, provenance_verified: bool, has_coverage: bool, regression_observed: bool) -> EvidenceClass:
+    """The ONLY path to CONFIRMED_CAUSAL. `regression_observed` is the domain's
+    already-resolved behavioral verdict (for the report: at least one cited case
+    showed a named flip AND a same-case score drop). The guard adds the
+    epistemic preconditions: without verified provenance and coverage a
+    confirmation is impossible, and a raw-measurement runner never calls this, so
+    its results cannot be upgraded to a confirmed causal effect."""
     if not provenance_verified or not has_coverage:
         return EvidenceClass.INDETERMINATE
-    return EvidenceClass.CONFIRMED_CAUSAL if (named_flip and score_dropped) else EvidenceClass.REFUTED
+    return EvidenceClass.CONFIRMED_CAUSAL if regression_observed else EvidenceClass.REFUTED
 
 
 # --------------------------------------------------------------------------- #

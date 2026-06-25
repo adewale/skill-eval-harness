@@ -22,6 +22,7 @@ HARNESS_ROOT = Path(__file__).resolve().parents[2]
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
 from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, expected_regression_summaries, _copy_skill_root, ablation_variant_population, canonical_skill_tree_hash  # noqa: E402
+from ablation_model import Provenance, TreeIdentity  # noqa: E402
 
 # Workspace-specific example: by default this assumes the harness directory is a
 # sibling of the skill repos. Override with SKILL_EVAL_WORKSPACE_ROOT.
@@ -298,10 +299,12 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
         "skill_invocation_evidence": copied_skill_evidence if runner_skill_invoked else [],
     })
     if ablation_provenance:
-        meta["ablation"] = {k: ablation_provenance.get(k) for k in ("id", "mode", "population", "skill_hash", "parent_skill_hash", "components")}
+        # One provenance schema, via Provenance — not a hand-picked key subset.
+        prov = Provenance.from_dict(ablation_provenance)
+        meta["ablation"] = prov.as_dict()
         # Record the canonical (pre-edit) tree hash so the report can pair this
         # ablation run with a with_skill run from the same skill revision.
-        meta["skill_tree_hash"] = ablation_provenance.get("parent_skill_hash")
+        meta["skill_tree_hash"] = prov.identity.canonical
     elif variant == "with_skill":
         meta["skill_tree_hash"] = canonical_skill_tree_hash(repo_root, manifest)
     (out_dir / "output.md").write_text(text, encoding="utf-8")

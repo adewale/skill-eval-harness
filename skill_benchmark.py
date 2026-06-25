@@ -36,6 +36,7 @@ from ablation_model import (
     Provenance,
     ResultSet,
     TreeIdentity,
+    causal_confirmation,
     execution_valid,
     scorable_run,
 )
@@ -412,17 +413,16 @@ def prepared_task_rows(
                 if is_trigger:
                     continue
                 aid = variant.split(":", 1)[1]
-                ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
                 if aid in trees:
-                    mode = "invalid_skill" if ablation.get("invalid_skill") else "materialized"
+                    # Materialized: the recorded provenance is the materialize tree's
+                    # provenance, re-serialized through Provenance — one schema, no
+                    # hand-picked key subset.
                     skill_paths = list(trees[aid]["skill_files"].values())   # mounted files == ablated tree
+                    abl_meta = Provenance.from_dict(trees[aid]).as_dict()
                 else:
-                    mode = "instruction_simulated"   # no tree -> original skill is mounted
-                abl_meta = {"id": aid, "mode": mode, "population": population}
-                if aid in trees:
-                    abl_meta["skill_hash"] = trees[aid]["skill_hash"]
-                    abl_meta["parent_skill_hash"] = trees[aid]["parent_skill_hash"]
-                    abl_meta["components"] = trees[aid]["components"]
+                    # Instruction-simulated: no tree, original skill mounted; not a
+                    # materialized Provenance (no hashes/components).
+                    abl_meta = {"id": aid, "mode": "instruction_simulated", "population": population}
             for run_number in range(1, runs_per_variant + 1):
                 run_dir = f"{case['id']}/{variant}" if runs_per_variant == 1 else f"{case['id']}/{variant}/run-{run_number}"
                 task = {
@@ -3292,54 +3292,44 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
     return out
 
 
-def _component_fingerprint(comp: dict[str, Any], skill_paths: list[str]) -> dict[str, Any]:
-    """Comparable identity of one declared component: class, mechanism, resolved
-    skill_root, and the full target. Computed identically for the manifest-declared
-    component and the runner-recorded one, so the report can require an EXACT match."""
-    root = comp.get("target", {}).get("skill_root")
-    if root is None and comp.get("skill_root") is not None:
-        root = comp["skill_root"]   # already-resolved (recorded) form
-    if root is None:
-        root = skill_paths[0] if skill_paths else None
-    cls = comp.get("class") or component_class(comp)
-    return {"class": cls, "mechanism": comp.get("mechanism"), "skill_root": root, "target": comp.get("target", {})}
+def _expected_component(comp: dict[str, Any], skill_paths: list[str]) -> Component:
+    """A manifest-declared component as a Component with a resolved skill_root, so
+    its fingerprint can be compared against the runner-recorded one."""
+    root = comp.get("target", {}).get("skill_root") or (skill_paths[0] if skill_paths else None)
+    return Component(cls=(comp.get("class") or component_class(comp)), mechanism=comp.get("mechanism"),
+                     skill_root=root, target=comp.get("target", {}))
 
 
-def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], measured_count: int, expected: dict[str, Any], ws_tree_hashes: list[Any]) -> tuple[bool, str]:
+def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], measured_count: int, expected: Provenance, ws_tree_hashes: list[Any]) -> tuple[bool, str]:
     """Confirm only when the provenance the RUNNERS actually recorded proves, for
     EVERY measured run, that the declared materialized ablation was mounted against
-    the same skill revision as the with_skill arm:
-
-      - every measured ablation run recorded provenance (no unprovenanced run can
-        be silently driving the regression rate);
-      - id / mode / population / full component definitions exactly match the
-        manifest (not just the class), and skill_hash + parent_skill_hash present;
-      - all ablation runs agree on the ablated tree (skill_hash) and its parent;
-      - every measured with_skill run recorded the canonical parent hash, and it
-        equals the ablation arm's parent — so the two arms share a skill revision.
+    the same skill revision as the with_skill arm. Each recorded record is parsed
+    into a Provenance and checked against the expected Provenance; revision
+    agreement is a TreeIdentity comparison.
     """
     if not provs:
         return False, "no run recorded ablation provenance (cannot prove a materialized tree was mounted)"
     if len(provs) != measured_count:
         return False, f"{measured_count - len(provs)} of {measured_count} measured ablation run(s) recorded no provenance"
-    parent_hashes: set[str] = set()
-    ablated_hashes: set[str] = set()
-    for p in provs:
-        if p.get("id") != expected["id"]:
-            return False, f"recorded ablation id {p.get('id')!r} != {expected['id']!r}"
-        if p.get("mode") != expected["mode"]:
-            return False, f"recorded mode {p.get('mode')!r} != expected {expected['mode']!r} (run may not have mounted a materialized ablation)"
-        if p.get("population") != expected["population"]:
-            return False, f"recorded population {p.get('population')!r} != manifest-derived {expected['population']!r}"
-        if not p.get("skill_hash"):
+    exp_fp = [c.fingerprint() for c in expected.components]
+    identities: list[TreeIdentity] = []
+    for d in provs:
+        p = Provenance.from_dict(d)
+        if p.id != expected.id:
+            return False, f"recorded ablation id {p.id!r} != {expected.id!r}"
+        if p.mode != expected.mode:
+            return False, f"recorded mode {p.mode!r} != expected {expected.mode!r} (run may not have mounted a materialized ablation)"
+        if p.population != expected.population:
+            return False, f"recorded population {p.population!r} != manifest-derived {expected.population!r}"
+        if not p.identity.edited:
             return False, "recorded provenance is missing skill_hash"
-        if not p.get("parent_skill_hash"):
+        if not p.identity.canonical:
             return False, "recorded provenance is missing parent_skill_hash (canonical tree)"
-        rec = [_component_fingerprint(c, []) for c in (p.get("components") or [])]
-        if rec != expected["components"]:
-            return False, f"recorded components {rec} != declared {expected['components']}"
-        ablated_hashes.add(str(p.get("skill_hash")))
-        parent_hashes.add(str(p.get("parent_skill_hash")))
+        if [c.fingerprint() for c in p.components] != exp_fp:
+            return False, f"recorded components {[c.fingerprint() for c in p.components]} != declared {exp_fp}"
+        identities.append(p.identity)
+    ablated_hashes = {i.edited for i in identities}
+    parent_hashes = {i.canonical for i in identities}
     if len(ablated_hashes) > 1:
         return False, f"ablation runs disagree on the ablated tree (skill_hash mismatch: {sorted(ablated_hashes)})"
     if len(parent_hashes) > 1:
@@ -3348,7 +3338,9 @@ def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], measured_c
         return False, "no with_skill run recorded a canonical skill_tree_hash to pair against"
     if any(h is None for h in ws_tree_hashes):
         return False, "a measured with_skill run recorded no canonical skill_tree_hash"
-    if {str(h) for h in ws_tree_hashes} != parent_hashes:
+    ablation_identity = identities[0]
+    # Every with_skill canonical hash must name the same revision as the ablation's parent.
+    if not all(TreeIdentity(canonical=str(h), edited=str(h)).same_revision_as(ablation_identity) for h in ws_tree_hashes):
         return False, f"with_skill canonical hash {sorted({str(h) for h in ws_tree_hashes})} != ablation parent hash {sorted(parent_hashes)} (arms built from different skill revisions)"
     return True, ""
 
@@ -3450,12 +3442,15 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         # Verify the provenance the runners RECORDED, not just the manifest + dirname:
         # every measured run must carry an exact match, and the with_skill arm must
         # have recorded the same canonical parent hash.
-        expected_prov = {
-            "id": aid,
-            "mode": "invalid_skill" if invalid else "materialized",
-            "population": expected_pop,
-            "components": [_component_fingerprint(c, manifest.get("skill_paths", [])) for c in ablation_components(ablation)],
-        }
+        # The expected provenance built from the manifest (hashes are unknown to the
+        # report and ignored by matches(); they are compared as a TreeIdentity).
+        expected_prov = Provenance(
+            id=aid,
+            mode="invalid_skill" if invalid else "materialized",
+            population=expected_pop,
+            identity=TreeIdentity(canonical="", edited=""),
+            components=tuple(_expected_component(c, manifest.get("skill_paths", [])) for c in ablation_components(ablation)),
+        )
         prov_ok, prov_note = _verify_recorded_ablation_provenance(
             recorded_prov.get(variant, []), measured_runs.get(variant, 0), expected_prov, recorded_tree_hash.get("with_skill", []))
         entry["provenance_verified"] = prov_ok
@@ -3494,22 +3489,21 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             # rests on missing output and must not be reported as confirmed/refuted.
             measured_pairs = [cid for cid in cases if (cid, "with_skill") in measured_cv and (cid, variant) in measured_cv]
             reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence, "measured_cases": measured_pairs, "confirmed_cases": confirmed_cases}
-            if not prov_ok:
-                # Without verified recorded provenance we cannot prove the graded runs
-                # actually mounted the materialized ablation — never confirm on that.
-                reg["expected_regression_confirmed"] = None
-                reg["note"] = f"provenance unverified: {prov_note}"
-            elif invalid:
-                # An invalid-skill experiment's failure may be a parser/validation
-                # rejection — never report it as a behavioral-hypothesis confirmation.
-                reg["expected_regression_confirmed"] = None
+            # The verdict goes through the EvidenceClass guard: CONFIRMED_CAUSAL is
+            # reachable only with verified provenance, coverage, and an observed
+            # regression (a cited case with BOTH a named flip and a same-case score
+            # drop). An invalid-skill experiment is never a behavioral confirmation.
+            if invalid:
+                evidence_class = EvidenceClass.INDETERMINATE
                 reg["note"] = "invalid-skill experiment: a parser/validation rejection is not evidence of a behavioral regression"
-            elif not measured_pairs:
-                reg["expected_regression_confirmed"] = None
-                reg["note"] = "insufficient coverage: no cited case has a graded run in both with_skill and the ablation arm (missing output?)"
             else:
-                # Confirmed iff some cited case had BOTH a named flip and a combined-score drop.
-                reg["expected_regression_confirmed"] = bool(confirmed_cases)
+                evidence_class = causal_confirmation(provenance_verified=prov_ok, has_coverage=bool(measured_pairs), regression_observed=bool(confirmed_cases))
+                if not prov_ok:
+                    reg["note"] = f"provenance unverified: {prov_note}"
+                elif not measured_pairs:
+                    reg["note"] = "insufficient coverage: no cited case has a graded run in both with_skill and the ablation arm (missing output?)"
+            reg["evidence_class"] = evidence_class.value
+            reg["expected_regression_confirmed"] = {EvidenceClass.CONFIRMED_CAUSAL: True, EvidenceClass.REFUTED: False, EvidenceClass.INDETERMINATE: None}[evidence_class]
             regressions.append(reg)
         entry["regressions"] = regressions
         out.append(entry)
