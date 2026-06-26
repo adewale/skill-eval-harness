@@ -111,5 +111,31 @@ class D3_TriggerPolarityTests(unittest.TestCase):
             self.assertEqual(c["trigger_negative"], 1)
 
 
+class D1_FailureMarkerOwnerTests(unittest.TestCase):
+    """The failure-body prefixes that runners WRITE are the same constants the
+    detector READS — so a renamed marker can't slip a crashed run past scoring."""
+
+    def test_writer_constants_are_exactly_the_detector_markers(self):
+        import ablation_model as am
+        self.assertEqual((am.CODEX_FAILURE, am.JETTY_FAILURE, am.TIMEOUT_FAILURE), am.RUNNER_FAILURE_MARKERS)
+
+    def test_each_formatted_failure_body_is_non_executable(self):
+        import ablation_model as am
+        for marker in am.RUNNER_FAILURE_MARKERS:
+            self.assertFalse(am.execution_valid({}, f"{marker}: something broke]\n"))
+
+
+class R3_WithoutSkillCarriesNoSkillTests(unittest.TestCase):
+    """The no-skill arm's row carries no skill files at the source, so a future
+    runner that mounts skill_paths unconditionally still cannot leak the skill."""
+
+    def test_without_skill_row_has_empty_skill_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); rp = root / "repo"; _skill(rp)
+            p = _manifest(rp, [CASE])
+            row = next(r for r in sb.prepared_task_rows(p, sb.validate_manifest(p)) if r["variant"] == "without_skill")
+            self.assertEqual(row["skill_paths"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

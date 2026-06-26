@@ -38,7 +38,14 @@ from typing import Any, Iterable, Optional, Union
 # Scoring predicate — one definition, imported everywhere a rate is computed.
 # --------------------------------------------------------------------------- #
 
-RUNNER_FAILURE_MARKERS = ("[CODEX FAILURE", "[JETTY FAILURE", "[TIMEOUT")
+# Synthetic-failure body prefixes a runner writes when it never produced a real
+# answer. These names are the SINGLE source: writers format their failure bodies
+# from them and execution_valid() detects them, so a renamed marker cannot silently
+# slip a crashed run past the scorable filter.
+CODEX_FAILURE = "[CODEX FAILURE"
+JETTY_FAILURE = "[JETTY FAILURE"
+TIMEOUT_FAILURE = "[TIMEOUT"
+RUNNER_FAILURE_MARKERS = (CODEX_FAILURE, JETTY_FAILURE, TIMEOUT_FAILURE)
 
 
 def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:

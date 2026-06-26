@@ -32,9 +32,11 @@ import yaml
 from ablation_model import (
     AblationRecord,
     Arm,
+    CODEX_FAILURE,
     Component,
     EvidenceClass,
     InstructionSimulated,
+    JETTY_FAILURE,
     MaterializedArm,
     PreparedTask,
     Provenance,
@@ -413,7 +415,9 @@ def prepared_task_rows(
         for variant in variants:
             record: AblationRecord | None = None
             skill_paths = real_skill_paths
-            if variant == "old_skill":
+            if variant == "without_skill":
+                skill_paths = []   # the no-skill arm carries NO skill files at the source (defense in depth)
+            elif variant == "old_skill":
                 skill_paths = old_skill_paths   # the OLD tree, carried on the row for both runners
             elif variant.startswith("ablation:"):
                 population = ablation_variant_population(manifest, variant)
@@ -561,6 +565,25 @@ def component_class(comp: dict[str, Any]) -> str | None:
     return None
 
 
+def resolve_skill_root(comp: dict[str, Any], skill_paths: list[str]) -> str | None:
+    """The ONE default for a component's skill_root: the declared target.skill_root,
+    else the first skill path. Used by both materialize() (which records the
+    fingerprint) and _expected_component() (which rebuilds the expected fingerprint),
+    so the recorded and expected skill_root cannot drift and silently downgrade every
+    confirmation to INDETERMINATE."""
+    r = (comp.get("target") or {}).get("skill_root")
+    return r if r is not None else (skill_paths[0] if skill_paths else None)
+
+
+def _skill_root_key(rel: str) -> str:
+    """Sanitized directory name for a skill root inside a built tree. The SAME
+    function must name the canonical (with_skill) tree and the materialized pre-edit
+    tree, because _hash_tree includes this directory name — any divergence would make
+    canonical_skill_tree_hash != the ablation's parent_skill_hash and break
+    TreeIdentity.same_revision_as."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", rel)
+
+
 def derived_population(components: list[dict[str, Any]]) -> str:
     """trigger if every component is discovery, else answer. Mixing the two is a
     cohesion error (different case populations, unattributable regression)."""
@@ -598,9 +621,10 @@ def frontmatter_value(text: str, field: str) -> Any:
 
 
 def required_fields_present(text: str) -> bool:
+    # REQUIRED_FRONTMATTER_FIELDS is the single owner of which fields are required;
+    # this predicate iterates it rather than hardcoding name/description.
     data = parse_frontmatter(text)
-    name, desc = data.get("name"), data.get("description")
-    return isinstance(name, str) and bool(name.strip()) and isinstance(desc, str) and bool(desc.strip())
+    return all(isinstance(data.get(f), str) and bool(data.get(f).strip()) for f in REQUIRED_FRONTMATTER_FIELDS)
 
 
 def _line_starts(text: str) -> tuple[list[str], list[int]]:
@@ -1118,7 +1142,7 @@ def validate_ablation_removal(ablation: dict[str, Any], manifest: dict[str, Any]
         if comp.get("class") and comp["class"] not in MECHANISM_CLASSES.get(mech, COMPONENT_CLASSES):
             raise AblationError(f"mechanism {mech!r} is incompatible with declared class {comp['class']!r} (allowed: {sorted(MECHANISM_CLASSES.get(mech, []))})")
         if mech == "frontmatter_field":
-            inferred = "discovery" if tgt.get("field") in DISCOVERY_FIELDS else "runtime"
+            inferred = component_class({**comp, "class": None})   # the one inference owner
             if comp.get("class") and comp["class"] != inferred:
                 raise AblationError(f"frontmatter_field {tgt.get('field')!r} is class {inferred}, not {comp['class']!r}")
         if mech in ("reference", "script", "asset") and Path(str(tgt.get("path", ""))).name == "SKILL.md":
@@ -1211,10 +1235,7 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
     skill_paths = manifest.get("skill_paths", [])
 
     def root_for(comp: dict[str, Any]) -> str:
-        r = comp.get("target", {}).get("skill_root")
-        if r is None:
-            r = skill_paths[0]
-        return r
+        return resolve_skill_root(comp, skill_paths)
 
     dest = out_root / aid
     if dest.exists():
@@ -1229,7 +1250,7 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
         for r in (skill_paths or list(dict.fromkeys(root_for(c) for c in comps))):
             src = _safe_under(repo_root, repo_root / r)
             src_dir = src if src.is_dir() else src.parent
-            key = re.sub(r"[^A-Za-z0-9_.-]", "_", r)
+            key = _skill_root_key(r)
             dst_dir = tmp / key
             _copy_skill_root(src_dir, dst_dir)
             main = dst_dir / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dst_dir / src.name
@@ -1353,7 +1374,7 @@ def build_canonical_skill_tree(repo_root: Path, manifest: dict[str, Any], dest_d
     for r in manifest.get("skill_paths", []):
         src = _safe_under(repo_root, repo_root / r)
         src_dir = src if src.is_dir() else src.parent
-        _copy_skill_root(src_dir, dest_dir / re.sub(r"[^A-Za-z0-9_.-]", "_", r))
+        _copy_skill_root(src_dir, dest_dir / _skill_root_key(r))
     return dest_dir
 
 
@@ -1529,7 +1550,7 @@ def safe_task_json(task: dict[str, Any], manifest: dict[str, Any], *, task_name:
             # simulate, via the ONE typed instruction-sim record (no hand-built dict).
             safe["ablation"] = InstructionSimulated(
                 id=aid,
-                population="answer",
+                population=(pt.ablation.population if pt.ablation else "answer"),   # from the row, not hardcoded
                 removed_component=ablation.get("removed_component"),
                 expected_regressions=tuple(expected_regression_summaries(ablation)),
             ).as_dict()
@@ -2114,7 +2135,7 @@ def import_jetty_results(args: argparse.Namespace) -> int:
             for artifact in artifacts:
                 write_artifact(base, artifact)
         else:
-            (base / "output.md").write_text("[JETTY FAILURE: trajectory failed before producing output]\n", encoding="utf-8")
+            (base / "output.md").write_text(f"{JETTY_FAILURE}: trajectory failed before producing output]\n", encoding="utf-8")
         meta = artifact_metadata(artifacts)
         meta.update(normalized_jetty_metadata(record, success=success))
         # Persist the harness-only ablation provenance into the run metadata so the
@@ -2770,11 +2791,11 @@ def run_codex(args: argparse.Namespace) -> int:
                     write_json(base / "metadata.json", {"provider": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode, "stderr": proc.stderr[:4000] if proc.stderr else "", "trace_source": "codex", **prov_extra})
                 answer = final_answer_from_events(events) or proc.stdout.strip()
                 if proc.returncode != 0:
-                    answer = f"[CODEX FAILURE: returncode={proc.returncode}]\n\n{answer}\n\nstderr:\n{proc.stderr[:4000]}"
-                (base / "output.md").write_text(answer or "[CODEX FAILURE: no output produced]\n", encoding="utf-8")
+                    answer = f"{CODEX_FAILURE}: returncode={proc.returncode}]\n\n{answer}\n\nstderr:\n{proc.stderr[:4000]}"
+                (base / "output.md").write_text(answer or f"{CODEX_FAILURE}: no output produced]\n", encoding="utf-8")
             except subprocess.TimeoutExpired as exc:
                 elapsed_ms = int((time.time() - started) * 1000)
-                (base / "output.md").write_text(f"[CODEX FAILURE: timed out after {timeout}s]\n", encoding="utf-8")
+                (base / "output.md").write_text(f"{CODEX_FAILURE}: timed out after {timeout}s]\n", encoding="utf-8")
                 write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timeout": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **prov_extra})
     return 0
 
@@ -3337,7 +3358,7 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
 def _expected_component(comp: dict[str, Any], skill_paths: list[str]) -> Component:
     """A manifest-declared component as a Component with a resolved skill_root, so
     its fingerprint can be compared against the runner-recorded one."""
-    root = comp.get("target", {}).get("skill_root") or (skill_paths[0] if skill_paths else None)
+    root = resolve_skill_root(comp, skill_paths)
     return Component(cls=(comp.get("class") or component_class(comp)), mechanism=comp.get("mechanism"),
                      skill_root=root, target=comp.get("target", {}))
 
