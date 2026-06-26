@@ -226,5 +226,64 @@ class R2_InstructionSimSurfaceTests(unittest.TestCase):
             self.assertTrue(any(h.endswith("references/g.md") for h in hints("ablation:sim")))
 
 
+class P1_BomFrontmatterTests(unittest.TestCase):
+    """A UTF-8 BOM (common from Windows editors) must not defeat frontmatter parsing
+    and make a skill silently un-ablatable with a misleading 'required field' error."""
+
+    def test_bom_prefixed_skill_is_ablatable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); rp = root / "repo"; sd = rp / "skills" / "good-pr"; sd.mkdir(parents=True)
+            body = "---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# G\n\n## Drop\n\ngone\n\n## Keep\n\nkeep\n"
+            (sd / "SKILL.md").write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))   # UTF-8 BOM prefix
+            (rp / "evals").mkdir()
+            abl = {"id": "d", "removed_component": "drop", "mechanism": "section", "class": "instructions", "target": {"heading": "## Drop"}}
+            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
+                 "variants": ["with_skill", "without_skill"],
+                 "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
+                 "ablations": [abl]}
+            p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
+            arm = sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, abl), root / "abl")   # must not raise
+            txt = Path(arm.skill_files["skills/good-pr/SKILL.md"]).read_text(encoding="utf-8-sig")
+            self.assertNotIn("## Drop", txt)
+            self.assertIn("## Keep", txt)
+
+
+class P3_KeyCollisionTests(unittest.TestCase):
+    """Two distinct skill roots whose sanitized tree-key collides are rejected as an
+    AblationError, not an unwrapped FileExistsError mid-materialization."""
+
+    def test_colliding_sanitized_roots_raise_ablation_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); rp = root / "repo"
+            for name in ("skill+x", "skill_x"):   # both sanitize to skill_x_SKILL.md
+                d = rp / name; d.mkdir(parents=True)
+                (d / "SKILL.md").write_text("---\nname: s\ndescription: d. Use it.\n---\n\n# A\n\n## S\n\nx\n", encoding="utf-8")
+            (rp / "evals").mkdir()
+            abl = {"id": "a", "removed_component": "s", "mechanism": "section", "class": "instructions",
+                   "target": {"skill_root": "skill+x/SKILL.md", "heading": "## S"}}
+            m = {"version": 1, "skill_name": "s", "skill_paths": ["skill+x/SKILL.md", "skill_x/SKILL.md"],
+                 "variants": ["with_skill", "without_skill"],
+                 "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
+                 "ablations": [abl]}
+            p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
+            with self.assertRaises(sb.AblationError):
+                sb.ValidatedAblation.validate(repo_root, manifest, abl)
+
+
+class P5_PreprocessFenceTests(unittest.TestCase):
+    """A ```! block closed by a LONGER fence is removed whole — no stray backtick
+    survives from a 3-tick closer matching a prefix of the real fence."""
+
+    def test_longer_closing_fence_removes_whole_block(self):
+        text = "intro\n\n```!\necho secret\n````\n\nafter\n"   # opener ```! , closer ````
+        ops = sb.preprocess_ops(text, ["echo"])
+        self.assertEqual(len(ops), 1)
+        s, e, _ = ops[0]
+        self.assertIn("echo secret", text[s:e])
+        self.assertNotIn("`", text[:s] + text[e:])   # nothing left dangling outside the removed span
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -861,7 +861,7 @@ def preprocess_ops(text: str, contains: list[str]) -> list[tuple[int, int, str]]
     def matches(s: str) -> bool:
         return any(c.lower() in s.lower() for c in contains)
     ops: list[tuple[int, int, str]] = []
-    for m in re.finditer(r"(?ms)^[ \t]*```!.*?\n[ \t]*```[ \t]*\n?", text):
+    for m in re.finditer(r"(?ms)^[ \t]*```!.*?\n[ \t]*`{3,}[ \t]*\n?", text):
         if matches(m.group(0)):
             ops.append((m.start(), m.end(), ""))
     covered = [(s, e) for s, e, _ in ops] + _fenced_char_spans(text) + _inline_code_spans(text)
@@ -1099,6 +1099,14 @@ def _reject_overlapping_skill_roots(repo_root: Path, manifest: dict[str, Any]) -
                 raise AblationError(f"skill roots {ri!r} and {rj!r} are copied from the same directory {di}; the ablated copy and an unablated copy would coexist — declare a single root")
             if di in dj.parents:
                 raise AblationError(f"skill root {ri!r} (dir {di}) is an ancestor of skill root {rj!r}; copying it would include an unablated duplicate of {rj!r} — declare non-overlapping roots")
+    # Distinct roots whose sanitized tree-key collides would overwrite each other in
+    # the built tree (an otherwise-unwrapped FileExistsError); reject as an AblationError.
+    seen_keys: dict[str, str] = {}
+    for r in manifest.get("skill_paths", []):
+        k = _skill_root_key(r)
+        if k in seen_keys:
+            raise AblationError(f"skill roots {seen_keys[k]!r} and {r!r} both map to tree key {k!r}; rename one so their built directories do not collide")
+        seen_keys[k] = r
 
 
 def _copy_skill_root(src_dir: Path, dst_dir: Path) -> None:
@@ -1196,7 +1204,7 @@ def validate_ablation_removal(ablation: dict[str, Any], manifest: dict[str, Any]
 def _resolve_component_ops(comp: dict[str, Any], main_file: Path, root_dir: Path, repo_root: Path, aid: str) -> tuple[dict[Path, list[tuple[int, int, str]]], set[Path]]:
     mech = comp.get("mechanism")
     tgt = comp.get("target", {})
-    text = main_file.read_text(encoding="utf-8")
+    text = main_file.read_text(encoding="utf-8-sig")   # tolerate a UTF-8 BOM (Windows editors)
     ops: dict[Path, list[tuple[int, int, str]]] = {}
     deletes: set[Path] = set()
     if mech == "frontmatter_field":
@@ -1313,7 +1321,7 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
             ops, deletes = _resolve_component_ops(comp, main, rdir, repo_root, aid)
             removed = 0
             for f, edits in ops.items():
-                file_text.setdefault(f, f.read_text(encoding="utf-8"))
+                file_text.setdefault(f, f.read_text(encoding="utf-8-sig"))   # BOM-consistent with span computation
                 file_ops.setdefault(f, []).extend(edits)
                 edit_removed = sum((e - s) - len(rep) for s, e, rep in edits)
                 removed += edit_removed
@@ -1347,7 +1355,7 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
             for main, _ in roots.values():
                 if not (main.exists() and main.is_file()):
                     raise AblationError(f'ablation removed the skill main file {main.name!r}; set "invalid_skill": true to run that as an invalid-skill experiment')
-                if not required_fields_present(main.read_text(encoding="utf-8")):
+                if not required_fields_present(main.read_text(encoding="utf-8-sig")):
                     raise AblationError('required frontmatter field (name/description) became empty or missing; set "invalid_skill": true to run that as an invalid-skill experiment')
 
         # Strip the authoring markers from the shipped tree before hashing it, so the
