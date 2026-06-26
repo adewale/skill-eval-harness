@@ -50,6 +50,63 @@ class ProvenanceSchemaTests(unittest.TestCase):
         self.assertTrue(a.matches(self.prov()))                              # but ignored for matching
 
 
+class StrictFromDictTests(unittest.TestCase):
+    """from_dict is the constructor at the JSON boundary where RUNNER metadata
+    actually returns. It must enforce the same required-field guarantee the direct
+    constructor does (test_cannot_construct_partial_provenance) — a missing, null, or
+    wrong-typed id/mode/hash/component is rejected at parse, not silently turned into
+    a None-filled record the verifier has to catch much later."""
+
+    GOOD = {"id": "x", "mode": "materialized", "population": "answer",
+            "skill_hash": "E", "parent_skill_hash": "C",
+            "components": [{"class": "instructions", "mechanism": "section",
+                            "skill_root": "skills/x/SKILL.md", "target": {"heading": "## H"}}]}
+
+    def test_good_record_round_trips(self):
+        p = am.Provenance.from_dict(self.GOOD)
+        self.assertEqual((p.id, p.mode, p.population), ("x", "materialized", "answer"))
+        self.assertEqual((p.identity.edited, p.identity.canonical), ("E", "C"))
+        self.assertEqual(p.components[0].mechanism, "section")
+
+    def test_missing_required_field_raises(self):
+        for key in ("id", "mode", "population", "skill_hash", "parent_skill_hash", "components"):
+            d = {k: v for k, v in self.GOOD.items() if k != key}
+            with self.assertRaises(ValueError, msg=f"missing {key!r} must raise"):
+                am.Provenance.from_dict(d)
+
+    def test_null_required_field_raises(self):
+        for key in ("id", "mode", "population", "skill_hash", "parent_skill_hash"):
+            d = dict(self.GOOD, **{key: None})
+            with self.assertRaises(ValueError, msg=f"null {key!r} must raise"):
+                am.Provenance.from_dict(d)
+
+    def test_wrong_typed_field_raises(self):
+        with self.assertRaises(ValueError):
+            am.Provenance.from_dict(dict(self.GOOD, id=123))          # id not a str
+        with self.assertRaises(ValueError):
+            am.Provenance.from_dict(dict(self.GOOD, components="nope"))  # components not a list
+
+    def test_malformed_component_raises(self):
+        bad = dict(self.GOOD, components=[{"mechanism": "section"}])   # missing class/skill_root/target
+        with self.assertRaises(ValueError):
+            am.Provenance.from_dict(bad)
+        with self.assertRaises(ValueError):                            # target wrong type
+            am.Component.from_dict({"class": "instructions", "mechanism": "section",
+                                    "skill_root": "s", "target": "not-a-dict"})
+
+    def test_empty_components_is_allowed(self):
+        # Present and correctly typed; non-emptiness is a semantic concern for the
+        # materializer/verifier, not the parse (a recorded record may legitimately
+        # carry an empty component list — see the closed-set test in test_cbc).
+        self.assertEqual(am.Provenance.from_dict(dict(self.GOOD, components=[])).components, ())
+
+    def test_instruction_simulated_requires_id_and_population(self):
+        self.assertEqual(am.InstructionSimulated.from_dict({"id": "a", "population": "answer"}).id, "a")
+        for key in ("id", "population"):
+            with self.assertRaises(ValueError):
+                am.InstructionSimulated.from_dict({k: v for k, v in {"id": "a", "population": "answer"}.items() if k != key})
+
+
 class TreeIdentityTests(unittest.TestCase):
     def test_same_revision_compares_canonical_only(self):
         base = am.TreeIdentity(canonical="C", edited="E1")

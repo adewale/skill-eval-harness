@@ -34,6 +34,23 @@ from enum import Enum
 from typing import Any, Iterable, Optional, Union
 
 
+def _require(d: dict[str, Any], key: str, types: "type | tuple[type, ...]", ctx: str) -> Any:
+    """Strict field extraction for the from_dict parsers at the JSON boundary where
+    runner metadata returns: the field must be present, non-null, and of the right
+    type, else ValueError. This is what makes 'the minimum schema is enforced by
+    construction' true at the boundary too — not only for in-process direct
+    construction, which raises TypeError but is bypassed by dict.get() defaults."""
+    if not isinstance(d, dict):
+        raise ValueError(f"{ctx}: expected an object, got {type(d).__name__}")
+    v = d.get(key)
+    if v is None:
+        raise ValueError(f"{ctx}: missing required field {key!r}")
+    if not isinstance(v, types):
+        names = types.__name__ if isinstance(types, type) else "/".join(t.__name__ for t in types)
+        raise ValueError(f"{ctx}: field {key!r} must be {names}, got {type(v).__name__}")
+    return v
+
+
 # --------------------------------------------------------------------------- #
 # Scoring predicate — one definition, imported everywhere a rate is computed.
 # --------------------------------------------------------------------------- #
@@ -145,8 +162,14 @@ class Component:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Component":
-        return cls(cls=d.get("class"), mechanism=d.get("mechanism"), skill_root=d.get("skill_root"),
-                   target=d.get("target", {}), removed_bytes=d.get("removed_bytes"))
+        rb = d.get("removed_bytes") if isinstance(d, dict) else None
+        if rb is not None and not isinstance(rb, int):
+            raise ValueError(f"Component: field 'removed_bytes' must be int, got {type(rb).__name__}")
+        return cls(cls=_require(d, "class", str, "Component"),
+                   mechanism=_require(d, "mechanism", str, "Component"),
+                   skill_root=_require(d, "skill_root", str, "Component"),
+                   target=_require(d, "target", dict, "Component"),
+                   removed_bytes=rb)
 
 
 @dataclass(frozen=True)
@@ -174,12 +197,18 @@ class Provenance:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Provenance":
+        # Strict at the JSON boundary: a runner that drops id/mode/population/either
+        # hash, or records a malformed component, is rejected here instead of yielding
+        # a None-filled Provenance the verifier has to special-case. (An empty-but-
+        # present components list is allowed — non-emptiness is a semantic concern.)
+        comps = _require(d, "components", list, "Provenance")
         return cls(
-            id=d.get("id"),
-            mode=d.get("mode"),
-            population=d.get("population"),
-            identity=TreeIdentity(canonical=d.get("parent_skill_hash"), edited=d.get("skill_hash")),
-            components=tuple(Component.from_dict(c) for c in (d.get("components") or [])),
+            id=_require(d, "id", str, "Provenance"),
+            mode=_require(d, "mode", str, "Provenance"),
+            population=_require(d, "population", str, "Provenance"),
+            identity=TreeIdentity(canonical=_require(d, "parent_skill_hash", str, "Provenance"),
+                                  edited=_require(d, "skill_hash", str, "Provenance")),
+            components=tuple(Component.from_dict(c) for c in comps),
         )
 
     def matches(self, expected: "Provenance") -> bool:
@@ -220,9 +249,10 @@ class InstructionSimulated:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "InstructionSimulated":
-        return cls(id=d.get("id"), population=d.get("population"),
-                   removed_component=d.get("removed_component"),
-                   expected_regressions=tuple(d.get("expected_regressions") or ()))
+        return cls(id=_require(d, "id", str, "InstructionSimulated"),
+                   population=_require(d, "population", str, "InstructionSimulated"),
+                   removed_component=(d.get("removed_component") if isinstance(d, dict) else None),
+                   expected_regressions=tuple((d.get("expected_regressions") if isinstance(d, dict) else None) or ()))
 
 
 # The CLOSED set of records that can describe an ablation on a prepared row.

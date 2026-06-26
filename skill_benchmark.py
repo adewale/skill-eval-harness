@@ -3447,7 +3447,13 @@ def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], measured_c
     exp_fp = [c.fingerprint() for c in expected.components]
     identities: list[TreeIdentity] = []
     for d in provs:
-        p = Provenance.from_dict(d)
+        # from_dict is strict at this JSON boundary: a runner that recorded a
+        # malformed provenance fails THIS confirmation gracefully, rather than
+        # crashing the whole report with an unhandled parse error.
+        try:
+            p = Provenance.from_dict(d)
+        except ValueError as exc:
+            return False, f"recorded ablation provenance is malformed: {exc}"
         if p.id != expected.id:
             return False, f"recorded ablation id {p.id!r} != {expected.id!r}"
         if p.mode != expected.mode:

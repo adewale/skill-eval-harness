@@ -1796,6 +1796,19 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertIn("mode", entry["provenance_note"])
         self.assertIsNone(entry["regressions"][0]["expected_regression_confirmed"])
 
+    def test_confirmation_blocked_when_recorded_provenance_is_malformed(self):
+        # A runner recorded an ablation provenance missing skill_hash. The strict
+        # JSON-boundary parser rejects it, but the report must DEGRADE (block the
+        # confirmation with a note) rather than crash with an unhandled parse error.
+        results = [
+            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
+            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(skill_hash=None)},
+        ]
+        entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
+        self.assertFalse(entry["provenance_verified"])
+        self.assertIn("malformed", entry["provenance_note"])
+        self.assertIsNone(entry["regressions"][0]["expected_regression_confirmed"])
+
     def test_confirmation_blocked_when_with_skill_revision_differs(self):
         # The with_skill arm recorded a DIFFERENT canonical hash than the ablation's
         # parent: the two arms were built from different skill revisions.
@@ -2222,7 +2235,7 @@ class AblationReviewFixesTests(unittest.TestCase):
         # MUST carry the directive to drop the component — otherwise it's just with_skill.
         sim = {
             "variant": "ablation:no-rp", "prompt": "Review.",
-            "ablation": {"id": "no-rp", "mode": "instruction_simulated", "removed_component": "regression-proof"},
+            "ablation": {"id": "no-rp", "mode": "instruction_simulated", "population": "answer", "removed_component": "regression-proof"},
             "instruction": "Use the good-pr skill, but simulate this ablation: remove/ignore regression-proof. Expected regression to watch for: accepts weak tests.",
         }
         sim_prompt = sb.codex_task_prompt(sim, skills, [])
@@ -2231,7 +2244,9 @@ class AblationReviewFixesTests(unittest.TestCase):
         # materialized: the on-disk skill is already altered -> blind, no hypothesis text.
         mat = {
             "variant": "ablation:no-rp", "prompt": "Review.",
-            "ablation": {"id": "no-rp", "mode": "materialized"},
+            "ablation": {"id": "no-rp", "mode": "materialized", "population": "answer",
+                         "skill_hash": "E", "parent_skill_hash": "C",
+                         "components": [{"class": "instructions", "mechanism": "section", "skill_root": "skills/root-0/SKILL.md", "target": {"heading": "## H"}}]},
             "instruction": "Use the skill under test (good-pr). Its files are provided in your workspace ...",
         }
         mat_prompt = sb.codex_task_prompt(mat, skills, [])
