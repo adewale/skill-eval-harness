@@ -2334,7 +2334,7 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
         # still a subsequence of the original. Pin the EXACT removed bytes with an
         # independent slice of the known fixture (the oracle), so a parser that
         # deleted a different span would be caught.
-        end_marker = "<!-- ablation:no-scope:end -->"
+        start_marker, end_marker = "<!-- ablation:no-scope:start -->\n", "<!-- ablation:no-scope:end -->"
         cases = {
             "section": (
                 {"mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}},
@@ -2342,7 +2342,10 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
             ),
             "anchor": (
                 {"mechanism": "anchor", "class": "instructions", "target": {"anchor": "no-scope"}},
-                self.SKILL[self.SKILL.index("<!-- ablation:no-scope:start -->"):self.SKILL.index(end_marker) + len(end_marker) + 1],
+                # The <!-- ablation:* --> markers are stripped from BOTH shipped arms
+                # (they must never reach the model), so the arms differ by exactly the
+                # anchored CONTENT, not the marker block.
+                self.SKILL[self.SKILL.index(start_marker) + len(start_marker):self.SKILL.index(end_marker)],
             ),
             "frontmatter_field": (
                 {"mechanism": "frontmatter_field", "class": "runtime", "target": {"field": "allowed-tools"}},

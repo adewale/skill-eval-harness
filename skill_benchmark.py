@@ -1000,6 +1000,48 @@ def _write_text_preserving_newlines(path: Path, text_lf: str) -> None:
     path.write_bytes(out.encode("utf-8"))
 
 
+_ABLATION_MARKER_LINE_RE = re.compile(
+    r"(?m)^[ \t]*<!--[ \t]*ablation:[A-Za-z0-9_-]+:(?:start|end)[ \t]*-->[ \t]*\r?\n?")
+
+
+def _strip_ablation_markers(text_lf: str) -> str:
+    """Remove whole-line ``<!-- ablation:<id>:start/end -->`` anchor markers. THE one
+    definition of what an authoring marker is. The markers are an internal convention
+    used to locate anchor ablations; the literal ``ablation:`` must never reach the
+    model, so every model-visible tree is stripped of them."""
+    return _ABLATION_MARKER_LINE_RE.sub("", text_lf)
+
+
+def _strip_markers_in_tree(root: Path) -> None:
+    """Strip ablation anchor markers from every markdown file in a built tree,
+    preserving each file's newline style. Called wherever a model-visible skill tree
+    is finalized (materialized arm, canonical with_skill tree, codex mount), so the
+    markers ship to no runner."""
+    if not root.exists():
+        return
+    for p in sorted(root.rglob("*.md")):
+        if not p.is_file():
+            continue
+        text_lf = p.read_text(encoding="utf-8")
+        stripped = _strip_ablation_markers(text_lf)
+        if stripped != text_lf:
+            _write_text_preserving_newlines(p, stripped)
+
+
+def _hash_shipped(root: Path) -> str:
+    """Hash a tree as it will SHIP — authoring markers stripped — WITHOUT mutating
+    ``root``, so anchor ablations can still locate their on-disk markers while the
+    canonical hash matches the stripped tree the model actually receives. Both arms
+    hash the shipped form, so TreeIdentity.same_revision_as is unaffected."""
+    snap = Path(tempfile.mkdtemp(prefix=".ship-"))
+    try:
+        shutil.copytree(root, snap, dirs_exist_ok=True)
+        _strip_markers_in_tree(snap)
+        return _hash_tree(snap)
+    finally:
+        shutil.rmtree(snap, ignore_errors=True)
+
+
 def _hash_tree(root: Path) -> str:
     """Stable content hash of a directory tree: sorted posix relpaths plus bytes.
     Identical inputs (same files, same content, same relative layout) hash equal,
@@ -1256,9 +1298,10 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
             main = dst_dir / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dst_dir / src.name
             roots[r] = (main, dst_dir)
 
-        # Hash the canonical (pre-edit) tree: the with_skill arm's oracle. Both
-        # arms record this so the report can prove they share a skill revision.
-        parent_skill_hash = _hash_tree(tmp)
+        # Hash the canonical (pre-edit) tree as it will SHIP (authoring markers
+        # stripped): the with_skill arm's oracle. Both arms record this so the report
+        # can prove they share a skill revision.
+        parent_skill_hash = _hash_shipped(tmp)
 
         file_text: dict[Path, str] = {}
         file_ops: dict[Path, list[tuple[int, int, str]]] = {}
@@ -1307,6 +1350,9 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
                 if not required_fields_present(main.read_text(encoding="utf-8")):
                     raise AblationError('required frontmatter field (name/description) became empty or missing; set "invalid_skill": true to run that as an invalid-skill experiment')
 
+        # Strip the authoring markers from the shipped tree before hashing it, so the
+        # model never receives an `ablation:` marker and skill_hash reflects what ships.
+        _strip_markers_in_tree(tmp)
         skill_hash = _hash_tree(tmp)
         tmp.rename(dest)
     except BaseException:
@@ -1375,6 +1421,9 @@ def build_canonical_skill_tree(repo_root: Path, manifest: dict[str, Any], dest_d
         src = _safe_under(repo_root, repo_root / r)
         src_dir = src if src.is_dir() else src.parent
         _copy_skill_root(src_dir, dest_dir / _skill_root_key(r))
+    # The canonical surface ships to the model (with_skill upload / hash); strip the
+    # authoring markers so it carries none, matching the materialized arm.
+    _strip_markers_in_tree(dest_dir)
     return dest_dir
 
 
@@ -1627,6 +1676,19 @@ def build_jetty_payload(
             # Materialized: upload the whole altered tree, preserving relative paths
             # (no basename flattening, so duplicate SKILL.md names cannot collide).
             for i, (abs_path, rel) in enumerate(enumerate_tree(Path(tree.dir)), 1):
+                files.append({
+                    "role": "skill",
+                    "placeholder": placeholder(task_name, "skill", i),
+                    "local_path": str(abs_path),
+                    "remote_path_hint": f"skills/{task['skill_name']}/{rel}",
+                    "private": False,
+                })
+        elif with_skill_tree_dir is not None:
+            # Instruction-simulated: the ORIGINAL skill is mounted intact, so it must
+            # present the SAME recursive surface as with_skill (reference files
+            # included) — not a flattened SKILL.md that drops references and lets a
+            # regression be mis-attributed to a missing file.
+            for i, (abs_path, rel) in enumerate(enumerate_tree(Path(with_skill_tree_dir)), 1):
                 files.append({
                     "role": "skill",
                     "placeholder": placeholder(task_name, "skill", i),
@@ -2718,6 +2780,9 @@ def codex_skill_workspace(task: dict[str, Any], ws: Path) -> tuple[list[str], li
             _copy_skill_root(src_dir, dest)
             main = dest / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dest / src.name
             skill_rel.append(str((main if main.exists() else dest).relative_to(ws)))
+        # The mounted skill is model-visible; strip authoring markers (a no-op for a
+        # materialized arm, whose source tree was already stripped).
+        _strip_markers_in_tree(ws / "skills")
     input_rel: list[str] = []
     for raw in task.get("input_files", []):
         src = Path(raw)
