@@ -519,13 +519,13 @@ JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
 
 ABLATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 COMPONENT_CLASSES = {"discovery", "runtime", "instructions", "resource", "preprocess"}
-SKILL_MECHANISMS = {"frontmatter_field", "section", "anchor", "list_item", "patch", "reference", "script", "asset", "preprocess"}
+SKILL_MECHANISMS = {"frontmatter_field", "section", "list_item", "patch", "reference", "script", "asset", "preprocess"}
 # Which component classes each mechanism is allowed to declare (a declared class
 # is not trusted blindly — a section may not claim class: discovery to route to
 # trigger cases).
 MECHANISM_CLASSES = {
     "frontmatter_field": {"discovery", "runtime"},
-    "section": {"instructions"}, "anchor": {"instructions"}, "list_item": {"instructions"},
+    "section": {"instructions"}, "list_item": {"instructions"},
     "patch": {"instructions", "discovery", "runtime"},
     "reference": {"resource"}, "script": {"resource"}, "asset": {"resource"},
     "preprocess": {"preprocess"},
@@ -559,7 +559,7 @@ def component_class(comp: dict[str, Any]) -> str | None:
     mech, tgt = comp.get("mechanism"), comp.get("target", {})
     if mech == "frontmatter_field":
         return "discovery" if tgt.get("field") in DISCOVERY_FIELDS else "runtime"
-    if mech in {"section", "anchor", "list_item", "patch"}:
+    if mech in {"section", "list_item", "patch"}:
         return "instructions"
     if mech in {"reference", "script", "asset"}:
         return "resource"
@@ -765,32 +765,6 @@ def section_span(text: str, heading: str) -> tuple[int, int]:
             end_i = j
             break
     return (base + starts[start_i], base + starts[end_i])
-
-
-def anchor_span(text: str, anchor_id: str) -> tuple[int, int]:
-    start_marker = f"<!-- ablation:{anchor_id}:start -->"
-    end_marker = f"<!-- ablation:{anchor_id}:end -->"
-    # Ignore markers shown inside code (fenced or inline) — those are examples, not
-    # the real anchors that wrap live guidance.
-    code = _fenced_char_spans(text) + _inline_code_spans(text)
-
-    def find_outside(marker: str, frm: int) -> int:
-        i = text.find(marker, frm)
-        while i != -1 and _in_spans(i, code):
-            i = text.find(marker, i + 1)
-        return i
-
-    si = find_outside(start_marker, 0)
-    if si == -1:
-        raise AblationError(f"anchor start not found outside code: {anchor_id!r}")
-    ei = find_outside(end_marker, si)
-    if ei == -1:
-        raise AblationError(f"anchor end not found outside code: {anchor_id!r}")
-    end = text.find("\n", ei + len(end_marker))
-    end = end + 1 if end != -1 else len(text)
-    line_start = text.rfind("\n", 0, si)
-    start = line_start + 1 if line_start != -1 else 0
-    return (start, end)
 
 
 def list_item_ops(text: str, section: str, contains: list[str]) -> list[tuple[int, int, str]]:
@@ -1003,48 +977,6 @@ def _write_text_preserving_newlines(path: Path, text_lf: str) -> None:
     path.write_bytes(out.encode("utf-8"))
 
 
-_ABLATION_MARKER_LINE_RE = re.compile(
-    r"(?m)^[ \t]*<!--[ \t]*ablation:[A-Za-z0-9_-]+:(?:start|end)[ \t]*-->[ \t]*\r?\n?")
-
-
-def _strip_ablation_markers(text_lf: str) -> str:
-    """Remove whole-line ``<!-- ablation:<id>:start/end -->`` anchor markers. THE one
-    definition of what an authoring marker is. The markers are an internal convention
-    used to locate anchor ablations; the literal ``ablation:`` must never reach the
-    model, so every model-visible tree is stripped of them."""
-    return _ABLATION_MARKER_LINE_RE.sub("", text_lf)
-
-
-def _strip_markers_in_tree(root: Path) -> None:
-    """Strip ablation anchor markers from every markdown file in a built tree,
-    preserving each file's newline style. Called wherever a model-visible skill tree
-    is finalized (materialized arm, canonical with_skill tree, codex mount), so the
-    markers ship to no runner."""
-    if not root.exists():
-        return
-    for p in sorted(root.rglob("*.md")):
-        if not p.is_file():
-            continue
-        text_lf = p.read_text(encoding="utf-8")
-        stripped = _strip_ablation_markers(text_lf)
-        if stripped != text_lf:
-            _write_text_preserving_newlines(p, stripped)
-
-
-def _hash_shipped(root: Path) -> str:
-    """Hash a tree as it will SHIP — authoring markers stripped — WITHOUT mutating
-    ``root``, so anchor ablations can still locate their on-disk markers while the
-    canonical hash matches the stripped tree the model actually receives. Both arms
-    hash the shipped form, so TreeIdentity.same_revision_as is unaffected."""
-    snap = Path(tempfile.mkdtemp(prefix=".ship-"))
-    try:
-        shutil.copytree(root, snap, dirs_exist_ok=True)
-        _strip_markers_in_tree(snap)
-        return _hash_tree(snap)
-    finally:
-        shutil.rmtree(snap, ignore_errors=True)
-
-
 def _hash_tree(root: Path) -> str:
     """Stable content hash of a directory tree: sorted posix relpaths plus bytes.
     Identical inputs (same files, same content, same relative layout) hash equal,
@@ -1153,7 +1085,7 @@ def _ensure_ablation_dir(path: Path) -> Path:
 
 def _required_target_keys(mech: str) -> list[str]:
     return {
-        "frontmatter_field": ["field"], "section": ["heading"], "anchor": ["anchor"],
+        "frontmatter_field": ["field"], "section": ["heading"],
         "list_item": ["section"], "patch": ["patch"], "reference": ["path"],
         "script": ["path"], "asset": ["path"], "preprocess": ["contains"],
     }.get(mech, [])
@@ -1199,7 +1131,7 @@ def validate_ablation_removal(ablation: dict[str, Any], manifest: dict[str, Any]
             if comp.get("class") and comp["class"] != inferred:
                 raise AblationError(f"frontmatter_field {tgt.get('field')!r} is class {inferred}, not {comp['class']!r}")
         if mech in ("reference", "script", "asset") and Path(str(tgt.get("path", ""))).name == "SKILL.md":
-            raise AblationError(f"{mech} may not target the skill's SKILL.md (use a frontmatter/section/anchor/patch mechanism)")
+            raise AblationError(f"{mech} may not target the skill's SKILL.md (use a frontmatter/section/patch mechanism)")
     if "discovery" in classes and classes - {"discovery"}:
         raise AblationError("layer cohesion: discovery cannot mix with answer-population components")
 
@@ -1217,9 +1149,6 @@ def _resolve_component_ops(comp: dict[str, Any], main_file: Path, root_dir: Path
         ops[main_file] = [(span[0], span[1], "")]
     elif mech == "section":
         s, e = section_span(text, tgt["heading"])
-        ops[main_file] = [(s, e, "")]
-    elif mech == "anchor":
-        s, e = anchor_span(text, tgt["anchor"])
         ops[main_file] = [(s, e, "")]
     elif mech == "list_item":
         ops[main_file] = list_item_ops(text, tgt["section"], tgt.get("contains", []))
@@ -1309,10 +1238,9 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
             main = dst_dir / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dst_dir / src.name
             roots[r] = (main, dst_dir)
 
-        # Hash the canonical (pre-edit) tree as it will SHIP (authoring markers
-        # stripped): the with_skill arm's oracle. Both arms record this so the report
-        # can prove they share a skill revision.
-        parent_skill_hash = _hash_shipped(tmp)
+        # Hash the canonical (pre-edit) tree: the with_skill arm's oracle. Both arms
+        # record this so the report can prove they share a skill revision.
+        parent_skill_hash = _hash_tree(tmp)
 
         file_text: dict[Path, str] = {}
         file_ops: dict[Path, list[tuple[int, int, str]]] = {}
@@ -1361,9 +1289,6 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
                 if not required_fields_present(main.read_text(encoding="utf-8-sig")):
                     raise AblationError('required frontmatter field (name/description) became empty or missing; set "invalid_skill": true to run that as an invalid-skill experiment')
 
-        # Strip the authoring markers from the shipped tree before hashing it, so the
-        # model never receives an `ablation:` marker and skill_hash reflects what ships.
-        _strip_markers_in_tree(tmp)
         skill_hash = _hash_tree(tmp)
         tmp.rename(dest)
     except BaseException:
@@ -1432,9 +1357,6 @@ def build_canonical_skill_tree(repo_root: Path, manifest: dict[str, Any], dest_d
         src = _safe_under(repo_root, repo_root / r)
         src_dir = src if src.is_dir() else src.parent
         _copy_skill_root(src_dir, dest_dir / _skill_root_key(r))
-    # The canonical surface ships to the model (with_skill upload / hash); strip the
-    # authoring markers so it carries none, matching the materialized arm.
-    _strip_markers_in_tree(dest_dir)
     return dest_dir
 
 
@@ -2829,9 +2751,6 @@ def codex_skill_workspace(task: dict[str, Any], ws: Path) -> tuple[list[str], li
             _copy_skill_root(src_dir, dest)
             main = dest / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dest / src.name
             skill_rel.append(str((main if main.exists() else dest).relative_to(ws)))
-        # The mounted skill is model-visible; strip authoring markers (a no-op for a
-        # materialized arm, whose source tree was already stripped).
-        _strip_markers_in_tree(ws / "skills")
     input_rel: list[str] = []
     for raw in task.get("input_files", []):
         src = Path(raw)

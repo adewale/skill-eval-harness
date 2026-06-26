@@ -72,12 +72,11 @@ mechanism and the integrity rules.
 The parsers target the CommonMark + YAML subset that real skills use, and are
 intentionally bounded — the contract is this subset, not all of CommonMark.
 A target that relies on a form outside it should be expressed with a different
-mechanism (e.g. an explicit `anchor` or a `patch`).
+mechanism (e.g. a deletion-only `patch`).
 
 Supported: YAML frontmatter via PyYAML (incl. `>`/`|` block scalars; field
 removal by parsed span); ATX headings (`#`–`######` + space), fence-aware and
-length-tracked (` ``` `/`~~~`), heading-level honored; `<!-- ablation:ID:start/end -->`
-anchors outside code; `-`/`*`/`+`/`N.` list items within a section, fence-aware,
+length-tracked (` ``` `/`~~~`), heading-level honored; `-`/`*`/`+`/`N.` list items within a section, fence-aware,
 consuming indented continuation incl. nested code blocks; inline links
 `[text](path)` outside fenced **and** inline code; inline `` !`cmd` `` /
 ```` ```! ```` preprocess blocks outside ordinary code; deletion-only unified-diff
@@ -145,7 +144,6 @@ Every component names a `skill_root` and carries a `class`.
 |---|---|---|---|
 | `frontmatter_field` | discovery / runtime | `{ "field": "allowed-tools" }` | delete one key |
 | `section` | instructions | `{ "heading": "## …" }` | delete heading + body + nested subheadings |
-| `anchor` | instructions | `{ "anchor": "no-scope-check" }` | delete span between `<!-- ablation:ID:start/end -->` |
 | `list_item` | instructions | `{ "section": "## …", "contains": ["…"] }` | delete matching list items |
 | `patch` | instructions / discovery | `{ "patch": "evals/ablations/<id>.patch" }` | **deletion-only** unified diff (no `+` lines) |
 | `reference` | resource | `{ "path": "references/x.md", "remove": "pointer\|content\|both" }` | unlink (drop target, keep visible text) / delete file / both |
@@ -244,7 +242,7 @@ Rules:
 
 Requirements: **parse, do not regex** (YAML frontmatter incl. multi-line
 scalars; a CommonMark sectioner — a `##` inside a ``` fence is code, not a
-heading; anchors are HTML blocks; pointers are link nodes; the patch applier is a
+heading; pointers are link nodes; the patch applier is a
 strict pure-python deletion-only unified-diff applier whose exact-context match
 *is* the drift detector). **Deterministic / idempotent** (no clocks/randomness;
 re-run is byte-identical). **Generic over frontmatter** (data-driven class map,
@@ -382,7 +380,7 @@ Opt in with `"invalid_skill": true` on the ablation: the run is tagged
 2. **Full-root copy.** Replace the collapsing copiers with a complete-tree,
    multi-root, atomic-rename copy; tests for arbitrary files and two roots not
    overwriting.
-3. **Materializer — instruction mechanisms.** `section` (fence-aware), `anchor`,
+3. **Materializer — instruction mechanisms.** `section` (fence-aware),
    `list_item`, deletion-only `patch`, with all gates. Meta-fixtures.
 4. **Materializer — frontmatter / resource / preprocess.** `frontmatter_field`,
    `reference` (pointer-unlink/content/both), `script`/`asset`, inline command;
@@ -402,7 +400,7 @@ Opt in with `"invalid_skill": true` on the ablation: the run is tagged
 
 A self-contained fixture skill with **two skill roots**, multi-field frontmatter
 (discovery + runtime), nested headings, a fenced code block with a heading-shaped
-line (the fence trap), an anchored span, a body-linked reference, a script, and
+line (the fence trap), a body-linked reference, a script, and
 an arbitrary extra file outside the three whitelisted dirs. Each mechanism gets a
 should-materialize fixture (plus a multi-component cluster). Should-refuse
 fixtures: empty/no-op component, overlapping components, discovery+answer mix, a

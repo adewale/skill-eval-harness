@@ -137,62 +137,6 @@ class R3_WithoutSkillCarriesNoSkillTests(unittest.TestCase):
             self.assertEqual(row["skill_paths"], [])
 
 
-class R1_AnchorMarkerStripTests(unittest.TestCase):
-    """`<!-- ablation:<id>:start/end -->` authoring markers must never ship to the
-    model, on any runner — and stripping them must NOT break the canonical/parent
-    hash parity that gates a confirmed causal effect."""
-
-    SKILL = ("---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# G\n\n"
-             "<!-- ablation:no-scope:start -->\n## Scope\n\nCheck scope.\n<!-- ablation:no-scope:end -->\n\n## Keep\n\nkeep me\n")
-    ABL = {"id": "no-scope", "removed_component": "scope", "mechanism": "anchor", "class": "instructions", "target": {"anchor": "no-scope"}}
-
-    def _repo(self, root: Path):
-        rp = root / "repo"; sd = rp / "skills" / "good-pr"; sd.mkdir(parents=True)
-        (sd / "SKILL.md").write_text(self.SKILL, encoding="utf-8")
-        (rp / "evals").mkdir()
-        m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
-             "variants": ["with_skill", "without_skill"],
-             "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-             "ablations": [self.ABL]}
-        p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
-        return p
-
-    def test_canonical_with_skill_tree_has_no_markers(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td); p = self._repo(root)
-            manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
-            tdir = sb.build_canonical_skill_tree(repo_root, manifest, root / "canon")
-            txt = next(tdir.rglob("SKILL.md")).read_text(encoding="utf-8")
-            self.assertNotIn("ablation:", txt)        # scaffolding stripped
-            self.assertIn("Check scope", txt)         # with_skill keeps the guidance itself
-
-    def test_materialized_arm_has_no_markers(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td); p = self._repo(root)
-            manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
-            arm = sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, self.ABL), root / "abl")
-            txt = Path(arm.skill_files["skills/good-pr/SKILL.md"]).read_text(encoding="utf-8")
-            self.assertNotIn("ablation:", txt)
-            self.assertNotIn("Check scope", txt)      # the targeted anchor block is removed
-
-    def test_codex_with_skill_mount_has_no_markers(self):
-        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as ws:
-            root = Path(td); p = self._repo(root)
-            manifest = sb.validate_manifest(p)
-            wrow = next(r for r in sb.prepared_task_rows(p, manifest) if r["variant"] == "with_skill")
-            skill_rel, _ = sb.codex_skill_workspace(wrow, Path(ws))
-            self.assertNotIn("ablation:", (Path(ws) / skill_rel[0]).read_text(encoding="utf-8"))
-
-    def test_hash_parity_survives_stripping(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td); p = self._repo(root)
-            manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
-            arm = sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, self.ABL), root / "abl")
-            # with_skill canonical hash still equals the ablation's parent hash...
-            self.assertEqual(sb.canonical_skill_tree_hash(repo_root, manifest), arm.arm.provenance.identity.canonical)
-            self.assertTrue(arm.arm.identity.is_edited)   # ...and a real edit is still detected
-
-
 class R2_InstructionSimSurfaceTests(unittest.TestCase):
     """The instruction-simulated arm mounts the original skill intact, so it must
     present the SAME file surface as with_skill (reference files included), not a

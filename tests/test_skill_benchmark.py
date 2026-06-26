@@ -888,14 +888,6 @@ class SkillAblationTests(unittest.TestCase):
             self.assertIn("name: good-pr", text)
             self.assertIn("description:", text)
 
-    def test_anchor_removal(self):
-        with tempfile.TemporaryDirectory() as td:
-            res = self.materialize_one(Path(td), {"id": "no-scope", "removed_component": "scope check", "mechanism": "anchor", "target": {"anchor": "no-scope"}})
-            text = self.skill_text(res)
-            self.assertNotIn("flag unrelated changes", text)
-            self.assertNotIn("ablation:no-scope", text)
-            self.assertIn("Naming: match", text)
-
     def test_list_item_removal(self):
         with tempfile.TemporaryDirectory() as td:
             res = self.materialize_one(Path(td), {"id": "no-test-bullet", "removed_component": "test bullet", "mechanism": "list_item", "target": {"section": "## Review checklist", "contains": ["pre-change code"]}})
@@ -2299,7 +2291,6 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
     def test_edit_mechanisms_are_pure_deletions_vs_with_skill(self):
         edit_cases = {
             "section": {"mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}},
-            "anchor": {"mechanism": "anchor", "class": "instructions", "target": {"anchor": "no-scope"}},
             "list_item": {"mechanism": "list_item", "class": "instructions", "target": {"section": "## Review checklist", "contains": ["pre-change code"]}},
             "frontmatter_field": {"mechanism": "frontmatter_field", "class": "runtime", "target": {"field": "allowed-tools"}},
             "preprocess": {"mechanism": "preprocess", "class": "preprocess", "target": {"contains": ["git diff"]}},
@@ -2339,13 +2330,6 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
             "section": (
                 {"mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}},
                 self.SKILL[self.SKILL.index("## Regression-proof"):self.SKILL.index("## Severity")],
-            ),
-            "anchor": (
-                {"mechanism": "anchor", "class": "instructions", "target": {"anchor": "no-scope"}},
-                # The <!-- ablation:* --> markers are stripped from BOTH shipped arms
-                # (they must never reach the model), so the arms differ by exactly the
-                # anchored CONTENT, not the marker block.
-                self.SKILL[self.SKILL.index(start_marker) + len(start_marker):self.SKILL.index(end_marker)],
             ),
             "frontmatter_field": (
                 {"mechanism": "frontmatter_field", "class": "runtime", "target": {"field": "allowed-tools"}},
@@ -2457,19 +2441,6 @@ class AblationParserExactnessTests(unittest.TestCase):
         self.assertEqual(rep, "guide")
         self.assertLess(s, text.index("`"))    # the matched link precedes the inline-code span
 
-    def test_anchor_span_ignores_markers_inside_code(self):
-        # The same anchor markers appear first inside a fenced example; the real
-        # anchor (outside code) must be the one removed.
-        text = (
-            "# T\n\n```\n<!-- ablation:x:start -->\nEXAMPLE\n<!-- ablation:x:end -->\n```\n\n"
-            "<!-- ablation:x:start -->\nREAL guidance.\n<!-- ablation:x:end -->\n\nkeep.\n"
-        )
-        s, e = sb.anchor_span(text, "x")
-        removed = text[s:e]
-        self.assertIn("REAL guidance.", removed)
-        self.assertNotIn("EXAMPLE", removed)
-        self.assertNotIn("```", removed)
-
     def test_list_item_continuation_includes_indented_code_block(self):
         # The targeted item contains an indented fenced code block; removing the
         # item must take the whole block, not stop at the fence.
@@ -2520,9 +2491,6 @@ class AblationParserExactnessTests(unittest.TestCase):
             ("section",
              "# T\n\n```\n## Target\nDECOY\n```\n\n## Target\n\nLIVE body.\n\n## Next\n",
              lambda t: sb.section_span(t, "## Target")),
-            ("anchor",
-             "# T\n\n```\n<!-- ablation:a:start -->\nDECOY\n<!-- ablation:a:end -->\n```\n\n<!-- ablation:a:start -->\nLIVE\n<!-- ablation:a:end -->\n",
-             lambda t: sb.anchor_span(t, "a")),
             ("list_item",
              "# T\n\n## S\n\n```\n- hit DECOY\n```\n- hit LIVE\n- keep\n",
              lambda t: sb.list_item_ops(t, "## S", ["hit"])),
