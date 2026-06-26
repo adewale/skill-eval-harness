@@ -21,7 +21,7 @@ from typing import Any
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
-from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, variant_instruction, _copy_skill_root, ablation_variant_population, canonical_skill_tree_hash  # noqa: E402
+from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, variant_instruction, _copy_skill_root, ablation_variant_population, canonical_skill_tree_hash, detect_trigger  # noqa: E402
 from ablation_model import Provenance, TreeIdentity, TIMEOUT_FAILURE  # noqa: E402
 
 # Workspace-specific example: by default this assumes the harness directory is a
@@ -267,8 +267,13 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
     text, meta = output_from_events(stdout)
     if timed_out and not text:
         text = f"{TIMEOUT_FAILURE}: no final assistant message captured]"
-    runner_skill_invoked = variant != "without_skill"
-    copied_skill_evidence = [str(p) for p in locals().get("copied_skill_paths", [])]
+    # Derive skill_invoked from the trace exactly as pi-trigger does — scan the
+    # model's event stream for evidence it ACTUALLY read a mounted skill file —
+    # rather than asserting "mounted => invoked" by fiat (the two-contract bug).
+    if variant == "without_skill":
+        runner_skill_invoked, copied_skill_evidence = False, []
+    else:
+        runner_skill_invoked, copied_skill_evidence = detect_trigger(stdout, manifest["skill_name"], list(locals().get("copied_skill_paths", [])))
     meta.update({
         "elapsed_ms": elapsed_ms,
         "returncode": returncode,

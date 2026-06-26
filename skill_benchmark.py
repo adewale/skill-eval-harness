@@ -1787,16 +1787,19 @@ def export_jetty(args: argparse.Namespace) -> int:
     # prepare-or-fail guard in prepared_task_rows tripping because export-jetty
     # forgot to thread the ablation dir through.
     ablation_trees: dict[str, Any] = {}
-    with_skill_tree_dir: Path | None = None
     abl_root: Path | None = None
+    repo_root = repo_root_for_manifest(path)
     if getattr(args, "include_ablations", False):
-        repo_root = repo_root_for_manifest(path)
         declared = [a for a in manifest.get("ablations", []) if ablation_components(a)]
         if declared:
             abl_root = _ensure_ablation_dir(Path(getattr(args, "ablation_dir", None) or (str(args.out) + ".ablations" if getattr(args, "out", None) else "jetty-ablations")))
             ablation_trees = materialize_declared_ablations(repo_root, manifest, abl_root)
-            # Build the with_skill canonical tree so its arm matches the ablation arm.
-            with_skill_tree_dir = build_canonical_skill_tree(repo_root, manifest, abl_root / "_with_skill")
+    # ALWAYS upload the with_skill (and instruction-simulated) arm as the full
+    # recursive skill tree — reference files included — so the model can follow the
+    # skill's references and the surface matches codex and any materialized arm. A
+    # flat SKILL.md-only upload silently dropped references/ for those arms.
+    wst_root = abl_root or _ensure_ablation_dir(Path((str(args.out) + ".with-skill") if getattr(args, "out", None) else "jetty-with-skill"))
+    with_skill_tree_dir = build_canonical_skill_tree(repo_root, manifest, wst_root / "_with_skill")
     rows = prepared_task_rows(
         path,
         manifest,
@@ -2368,6 +2371,41 @@ def command_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def event_mentions_skill_file(event: dict[str, Any]) -> bool:
     hay = " ".join(str(event.get(key, "")) for key in ["input_summary", "output_summary", "name"])
     return "SKILL.md" in hay or "/skills/" in hay or "\\skills\\" in hay
+
+
+def event_texts_for_tool_input(obj: Any) -> list[str]:
+    """Recursively collect file-path-ish strings from a runner event (tool inputs),
+    used to detect whether the model actually opened a mounted skill file."""
+    out: list[str] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in {"file_path", "path", "skill", "input", "partial_json"} and isinstance(value, str):
+                out.append(value)
+            out.extend(event_texts_for_tool_input(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(event_texts_for_tool_input(item))
+    return out
+
+
+def detect_trigger(stdout: str, skill_name: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
+    """THE shared skill-invocation detector: scan a model's JSON event stream for
+    evidence it actually read one of the mounted skill files. Returns (invoked,
+    evidence). Used by both the autonomous-trigger eval (run_pi_trigger_eval) and the
+    pi-smoke runner, so skill_invoked is derived the same way everywhere instead of
+    one runner asserting it by fiat. Matches on the copied temp skill paths (not the
+    bare skill name) so unrelated repo files can't look like skill-load evidence."""
+    needles = [str(p) for p in copied_paths] + [str(p.parent) for p in copied_paths]
+    evidence: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for text in event_texts_for_tool_input(event):
+            if any(n and n in text for n in needles):
+                evidence.append(text[:500])
+    return bool(evidence), evidence[:5]
 
 
 def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:

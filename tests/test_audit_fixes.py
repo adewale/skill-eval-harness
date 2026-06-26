@@ -285,5 +285,48 @@ class P5_PreprocessFenceTests(unittest.TestCase):
         self.assertNotIn("`", text[:s] + text[e:])   # nothing left dangling outside the removed span
 
 
+class SharedSkillInvokedTests(unittest.TestCase):
+    """skill_invoked is derived the SAME way for every runner: one detect_trigger
+    owner in skill_benchmark that scans the model's event stream for a real skill
+    read — not a 'mounted => invoked' fiat."""
+
+    def test_detect_trigger_is_evidence_based(self):
+        sp = Path("/ws/skills/root-0/SKILL.md")
+        read_it = json.dumps({"type": "tool_use", "name": "Read", "input": {"file_path": "/ws/skills/root-0/SKILL.md"}})
+        invoked, evidence = sb.detect_trigger(read_it, "good-pr", [sp])
+        self.assertTrue(invoked)
+        self.assertTrue(evidence)
+        never = json.dumps({"type": "tool_use", "name": "Read", "input": {"file_path": "/ws/inputs/data.csv"}})
+        self.assertEqual(sb.detect_trigger(never, "good-pr", [sp]), (False, []))   # mounted but unread => False
+
+    def test_trigger_eval_uses_the_one_owner(self):
+        import run_pi_trigger_eval as tr
+        self.assertIs(tr.detect_trigger, sb.detect_trigger)
+
+
+class JettyReferencesUploadTests(unittest.TestCase):
+    """with_skill uploads the full recursive skill surface (reference files included)
+    even with no materialized ablations, so Jetty matches codex's dir mount."""
+
+    def test_with_skill_uploads_references_without_ablations(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); rp = root / "repo"; sd = rp / "skills" / "good-pr"; (sd / "references").mkdir(parents=True)
+            (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: d. Use it.\n---\n\n# B\n\nSee [g](references/g.md).\n", encoding="utf-8")
+            (sd / "references" / "g.md").write_text("guide\n", encoding="utf-8")
+            (rp / "evals").mkdir()
+            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
+                 "variants": ["with_skill", "without_skill"],
+                 "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
+                 "ablations": []}
+            p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            out = root / "jetty.jsonl"
+            sb.export_jetty(argparse.Namespace(manifest=str(p), out=str(out)))
+            payloads = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
+            ws = next(pl for pl in payloads if pl["harness"]["variant"] == "with_skill")
+            hints = [f["remote_path_hint"] for f in ws["upload_plan"]["files"] if f["role"] == "skill"]
+            self.assertTrue(any(h.endswith("references/g.md") for h in hints))   # the reference file is uploaded
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population, canonical_skill_tree_hash, expected_trigger_polarity
+from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population, canonical_skill_tree_hash, expected_trigger_polarity, detect_trigger, event_texts_for_tool_input
 from ablation_model import EvidenceClass, Provenance
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,36 +87,6 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
     # ablation.parent_skill_hash).
     tree = build_canonical_skill_tree(repo_root, manifest, config_dir / "_canonical")
     return _mount_tree_into_config(Path(tree), skills_dir), {"mode": "baseline", "skill_tree_hash": canonical_skill_tree_hash(repo_root, manifest)}
-
-
-def event_texts_for_tool_input(obj: Any) -> list[str]:
-    out = []
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key in {"file_path", "path", "skill", "input", "partial_json"} and isinstance(value, str):
-                out.append(value)
-            out.extend(event_texts_for_tool_input(value))
-    elif isinstance(obj, list):
-        for item in obj:
-            out.extend(event_texts_for_tool_input(item))
-    return out
-
-
-def detect_trigger(stdout: str, skill_name: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
-    # Use copied temp skill paths, not the bare skill name: repo file paths such as
-    # good-readme/README.md can otherwise look like skill-load evidence.
-    needles = [str(p) for p in copied_paths] + [str(p.parent) for p in copied_paths]
-    evidence = []
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        haystacks = event_texts_for_tool_input(event)
-        for text in haystacks:
-            if any(n and n in text for n in needles):
-                evidence.append(text[:500])
-    return bool(evidence), evidence[:5]
 
 
 def _text(value: Any) -> str:
