@@ -1083,6 +1083,43 @@ class SkillAblationTests(unittest.TestCase):
             res = sb.materialize_ablation(repo_root, manifest, ab, root / "safe-out")
             self.assertEqual(res["mode"], "materialized")
 
+    def test_bad_ablation_dir_does_not_mutate_source_tree_before_rejecting(self):
+        # An --ablation-dir INSIDE a source skill root is rejected, but the rejection
+        # must happen BEFORE _ensure_ablation_dir creates/marks anything — otherwise
+        # the command writes a .skill-ablation-dir marker into the live skill tree.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ab = {"id": "x", "removed_component": "sev", "mechanism": "section", "target": {"heading": "## Severity"}}
+            path = self.build(root, ablations=[ab])
+            manifest = sb.validate_manifest(path)
+            repo_root = sb.repo_root_for_manifest(path)
+            skill_dir = repo_root / "skills" / "good-pr"
+            before = {p.relative_to(skill_dir).as_posix() for p in skill_dir.rglob("*")}
+            bad_out = skill_dir / "_ablations"                 # inside a source skill root
+            with self.assertRaises(SystemExit):
+                sb.materialize_declared_ablations(repo_root, manifest, bad_out)
+            self.assertFalse(bad_out.exists())                 # never created
+            self.assertEqual({p.relative_to(skill_dir).as_posix() for p in skill_dir.rglob("*")}, before)
+
+    def test_bad_ablation_dir_does_not_clear_owned_dir_before_rejecting(self):
+        # A harness-owned dir (has the marker) passed as --out-dir but sitting inside a
+        # skill root must NOT be cleared before the containment gate rejects it.
+        import argparse
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ab = {"id": "x", "removed_component": "sev", "mechanism": "section", "target": {"heading": "## Severity"}}
+            path = self.build(root, ablations=[ab])
+            repo_root = sb.repo_root_for_manifest(path)
+            bad_out = repo_root / "skills" / "good-pr" / "_ablations"   # inside a skill root
+            bad_out.mkdir()
+            (bad_out / sb._ABLATION_MARKER).write_text("owned\n", encoding="utf-8")
+            sentinel = bad_out / "keep.txt"
+            sentinel.write_text("precious", encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                sb.materialize_ablations(argparse.Namespace(manifest=str(path), out_dir=str(bad_out), out=None))
+            self.assertTrue(sentinel.exists())                 # not cleared before reject
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "precious")
+
     def test_overlapping_ancestor_skill_roots_rejected(self):
         # A root-level SKILL.md (copy-dir = repo root) alongside skills/audit/SKILL.md:
         # copying the ancestor would include an UNABLATED duplicate of the audit skill.

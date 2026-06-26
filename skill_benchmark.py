@@ -363,14 +363,25 @@ def materialize_declared_ablations(repo_root: Path, manifest: dict[str, Any], ab
     are not materialized and do not appear. ``AblationError`` from a gate is reported
     through ``die`` so every caller fails the same way.
     """
-    ablation_dir = _ensure_ablation_dir(ablation_dir)
-    trees: dict[str, MaterializedArm] = {}
+    # Validate EVERY declared ablation and the output-dir containment BEFORE touching
+    # the output dir. _ensure_ablation_dir creates/clears/marks the dir, so ensuring it
+    # first would let a bad ablation_dir (inside a skill root, or a harness dir we'd
+    # clear) mutate the filesystem before a gate rejects it — and a shape error in a
+    # later ablation would land after earlier trees were already written.
+    validated: list[ValidatedAblation] = []
     for ablation in manifest.get("ablations", []):
         if ablation_components(ablation):
             try:
-                trees[ablation["id"]] = materialize(ValidatedAblation.validate(repo_root, manifest, ablation), ablation_dir)
+                validated.append(ValidatedAblation.validate(repo_root, manifest, ablation))
             except AblationError as exc:
                 die(f"ablation {ablation.get('id')}: {exc}")
+    ablation_dir = _ensure_ablation_dir_guarded(ablation_dir, repo_root, manifest)
+    trees: dict[str, MaterializedArm] = {}
+    for v in validated:
+        try:
+            trees[v.ablation["id"]] = materialize(v, ablation_dir)
+        except AblationError as exc:
+            die(f"ablation {v.ablation.get('id')}: {exc}")
     return trees
 
 
@@ -1083,6 +1094,22 @@ def _ensure_ablation_dir(path: Path) -> Path:
     return path
 
 
+def _ensure_ablation_dir_guarded(out_dir: Path | str, repo_root: Path, manifest: dict[str, Any]) -> Path:
+    """Single owner of 'create a harness output dir for a materialized arm'. Runs the
+    NON-MUTATING containment gates (no nested skill roots; out_dir is not equal to,
+    inside, or containing a source skill root) BEFORE _ensure_ablation_dir creates,
+    clears, or marks anything — so a bad --ablation-dir cannot write into a source
+    skill tree or wipe a harness-owned dir before the gate rejects it. AblationError
+    is reported through die so the message matches the other apply-time gates."""
+    out = Path(out_dir)
+    try:
+        _reject_overlapping_skill_roots(repo_root, manifest)
+        _reject_output_root_overlap(out, repo_root, manifest)
+    except AblationError as exc:
+        die(str(exc))
+    return _ensure_ablation_dir(out)
+
+
 def _required_target_keys(mech: str) -> list[str]:
     return {
         "frontmatter_field": ["field"], "section": ["heading"],
@@ -1391,7 +1418,15 @@ def materialize_ablations(args: argparse.Namespace) -> int:
     path = Path(args.manifest)
     manifest = validate_manifest(path)
     repo_root = repo_root_for_manifest(path)
-    out_root = _ensure_ablation_dir(Path(args.out_dir))
+    # Pre-validate every declared ablation and the output-dir containment BEFORE the
+    # output dir is created/cleared (see materialize_declared_ablations).
+    for ablation in manifest.get("ablations", []):
+        if ablation_components(ablation):
+            try:
+                ValidatedAblation.validate(repo_root, manifest, ablation)
+            except AblationError as exc:
+                die(f"ablation {ablation.get('id')}: {exc}")
+    out_root = _ensure_ablation_dir_guarded(Path(args.out_dir), repo_root, manifest)
     results = []
     for ablation in manifest.get("ablations", []):
         if not ablation_components(ablation):
@@ -1714,13 +1749,15 @@ def export_jetty(args: argparse.Namespace) -> int:
     if getattr(args, "include_ablations", False):
         declared = [a for a in manifest.get("ablations", []) if ablation_components(a)]
         if declared:
-            abl_root = _ensure_ablation_dir(Path(getattr(args, "ablation_dir", None) or (str(args.out) + ".ablations" if getattr(args, "out", None) else "jetty-ablations")))
+            # Don't create the dir here — materialize_declared_ablations guards the
+            # containment gate before it creates/clears anything.
+            abl_root = Path(getattr(args, "ablation_dir", None) or (str(args.out) + ".ablations" if getattr(args, "out", None) else "jetty-ablations"))
             ablation_trees = materialize_declared_ablations(repo_root, manifest, abl_root)
     # ALWAYS upload the with_skill (and instruction-simulated) arm as the full
     # recursive skill tree — reference files included — so the model can follow the
     # skill's references and the surface matches codex and any materialized arm. A
     # flat SKILL.md-only upload silently dropped references/ for those arms.
-    wst_root = abl_root or _ensure_ablation_dir(Path((str(args.out) + ".with-skill") if getattr(args, "out", None) else "jetty-with-skill"))
+    wst_root = abl_root or _ensure_ablation_dir_guarded(Path((str(args.out) + ".with-skill") if getattr(args, "out", None) else "jetty-with-skill"), repo_root, manifest)
     with_skill_tree_dir = build_canonical_skill_tree(repo_root, manifest, wst_root / "_with_skill")
     rows = prepared_task_rows(
         path,
