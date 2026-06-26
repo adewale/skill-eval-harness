@@ -1227,7 +1227,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             repo_root = sb.repo_root_for_manifest(p)
             with tempfile.TemporaryDirectory() as wd:
                 instr, skill_args, _, _, _ = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:sim", Path(wd))
-                self.assertIn("instruction-simulated", instr)
+                self.assertIn("simulate this ablation", instr)   # the directive from variant_instruction (the owner)
                 self.assertIn("Regression-proof requirement", Path(skill_args[skill_args.index("--skill") + 1]).read_text(encoding="utf-8"))
 
     def test_pi_smoke_materialized_arm_is_blind_no_path_leak(self):

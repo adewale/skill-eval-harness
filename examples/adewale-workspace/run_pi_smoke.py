@@ -21,7 +21,7 @@ from typing import Any
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
-from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, expected_regression_summaries, _copy_skill_root, ablation_variant_population, canonical_skill_tree_hash  # noqa: E402
+from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, variant_instruction, _copy_skill_root, ablation_variant_population, canonical_skill_tree_hash  # noqa: E402
 from ablation_model import Provenance, TreeIdentity, TIMEOUT_FAILURE  # noqa: E402
 
 # Workspace-specific example: by default this assumes the harness directory is a
@@ -189,34 +189,17 @@ def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, cas
     # ablation (both are skills/root-N/SKILL.md). An absolute path would embed the
     # temp dir and could differ between arms.
     skill_list = ", ".join(str(Path(sp).relative_to(workspace)) for sp in copied_skill_paths)
+    # The model-facing instruction is OWNED by skill_benchmark.variant_instruction: it
+    # blinds a materialized ablation to the with_skill instruction and emits the
+    # simulate-this-component directive for an instruction-simulated one — the same
+    # blind/transparent decision every other runner uses. The smoke runner only
+    # appends its workspace-relative skill paths, which are byte-identical across arms
+    # and so cannot leak the variant.
+    core = variant_instruction(variant, manifest)
     if variant == "without_skill":
-        instruction = (
-            f"Do not use or read the {manifest['skill_name']} skill or its references. "
-            "Use only general assistant ability. The skill files are intentionally not present in this workspace."
-        )
-    elif variant == "with_skill" or materialized is not None:
-        # A materialized ablation is run exactly like with_skill: the skill itself
-        # is altered, so the model just uses the loaded (ablated) skill as-is.
-        instruction = (
-            f"Use the loaded {manifest['skill_name']} skill where it applies. "
-            f"Read and follow these skill path(s), including referenced files when relevant: {skill_list}. "
-            "If the skill defines a required output contract, follow it exactly rather than giving a shortcut answer."
-        )
-    elif variant.startswith("ablation:"):
-        aid = variant.split(":", 1)[1]
-        ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
-        if not ablation:
-            raise RuntimeError(f"unknown ablation variant: {variant}")
-        expected = "; ".join(expected_regression_summaries(ablation))
-        instruction = (
-            f"Use the loaded {manifest['skill_name']} skill where it applies. "
-            f"Read and follow these skill path(s), including referenced files when relevant: {skill_list}. "
-            f"Ablation mode for this empirical run: ignore/remove this component from the skill guidance: {ablation.get('removed_component')}. "
-            f"Expected regression to watch for: {expected}. "
-            "This is an instruction-simulated ablation, not a materialized alternate skill file."
-        )
+        instruction = f"{core} The skill files are intentionally not present in this workspace."
     else:
-        raise RuntimeError(f"unsupported variant: {variant}")
+        instruction = f"{core} Read and follow these skill path(s) in your workspace, including referenced files when relevant: {skill_list}."
     return instruction, skill_args, copied_inputs, copied_skill_paths, materialized
 
 
