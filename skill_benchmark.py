@@ -462,7 +462,10 @@ def prepared_task_rows(
                     ablation=record,
                     # Canonical-tree hash on every skill-bearing arm so the report can
                     # confirm with_skill and the ablation share a skill revision.
-                    skill_tree_hash=(canonical_hash if (canonical_hash and variant != "without_skill") else None),
+                    # Only the arms that derive from the CURRENT canonical tree record
+                    # its hash; old_skill mounts the old tree, so stamping the current
+                    # canonical hash on it would be an internally false record.
+                    skill_tree_hash=(canonical_hash if (canonical_hash and (variant == "with_skill" or variant.startswith("ablation:"))) else None),
                     answer_key=({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else None),
                 )
                 rows.append(task.harness_record())
@@ -2869,7 +2872,7 @@ def run_codex(args: argparse.Namespace) -> int:
             except subprocess.TimeoutExpired as exc:
                 elapsed_ms = int((time.time() - started) * 1000)
                 (base / "output.md").write_text(f"{CODEX_FAILURE}: timed out after {timeout}s]\n", encoding="utf-8")
-                write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timeout": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **prov_extra})
+                write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timed_out": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **prov_extra})
     return 0
 
 

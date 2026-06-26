@@ -60,7 +60,7 @@ def main() -> int:
 
     summary = {}
     for repo, rows in by_repo.items():
-        rates = [r["objective_pass_rate"] for r in rows if r["objective_pass_rate"] is not None and not r["missing_output"]]
+        rates = [r["objective_pass_rate"] for r in rows if r["objective_pass_rate"] is not None and hb.scorable_run(r)]
         tokens = [r["metadata"].get("total_tokens") for r in rows if isinstance(r["metadata"].get("total_tokens"), (int, float))]
         elapsed = [r["metadata"].get("elapsed_ms") for r in rows if isinstance(r["metadata"].get("elapsed_ms"), (int, float))]
         summary[repo] = {
@@ -73,7 +73,7 @@ def main() -> int:
         }
         for variant in ["with_skill", "without_skill"]:
             vr = [r for r in rows if r["variant"] == variant]
-            vrates = [r["objective_pass_rate"] for r in vr if r["objective_pass_rate"] is not None]
+            vrates = [r["objective_pass_rate"] for r in vr if r["objective_pass_rate"] is not None and hb.scorable_run(r)]
             vtoks = [r["metadata"].get("total_tokens") for r in vr if isinstance(r["metadata"].get("total_tokens"), (int, float))]
             velapsed = [r["metadata"].get("elapsed_ms") for r in vr if isinstance(r["metadata"].get("elapsed_ms"), (int, float))]
             summary[repo]["by_variant"][variant] = {
@@ -87,8 +87,8 @@ def main() -> int:
         for cid in sorted({r["case_id"] for r in rows}):
             wr = next((r for r in rows if r["case_id"] == cid and r["variant"] == "with_skill"), None)
             nr = next((r for r in rows if r["case_id"] == cid and r["variant"] == "without_skill"), None)
-            if not wr or not nr:
-                continue
+            if not wr or not nr or not hb.scorable_run(wr) or not hb.scorable_run(nr):
+                continue   # exclude infra failures, same predicate the harness report uses
             w = wr["objective_pass_rate"]
             n = nr["objective_pass_rate"]
             case_flags = []

@@ -223,7 +223,7 @@ Rules:
 
 ## Materialization engine
 
-`materialize_ablation(manifest, repo_root, ablation, out_root) -> dict[skill_root, Path]`:
+`materialize_ablation(repo_root, manifest, ablation, out_root) -> dict` (the legacy provenance dict; the typed core is `materialize(ValidatedAblation.validate(...), out_root) -> MaterializedArm`):
 
 1. For each `skill_root` referenced by the ablation, copy that root's **complete
    directory** into a fresh temp dir — the whole tree, not a `SKILL.md` plus a
