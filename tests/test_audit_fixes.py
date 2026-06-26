@@ -272,5 +272,36 @@ class JettyReferencesUploadTests(unittest.TestCase):
             self.assertTrue(any(h.endswith("references/g.md") for h in hints))   # the reference file is uploaded
 
 
+class InstructionSimulatedAblationAuditTests(unittest.TestCase):
+    """The migration lever: audit-manifest flags every label-only
+    (instruction-simulated) ablation so its non-blind, raw-measurement-only status
+    is visible per-manifest, and names how to materialize it. A materialized
+    ablation (mechanism+target) is silent — it is already the blind,
+    confirmation-gradeable form the migration targets."""
+
+    def test_label_only_ablation_is_flagged_with_remediation(self):
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"; _skill(rp)
+            p = _manifest(rp, [CASE], ablations=[
+                {"id": "no-sev", "removed_component": "severity rules",
+                 "expected_regressions": ["loses Clean/Minor/Blocking calibration"]}])
+            rep = sb.audit_manifest_report(p)
+            f = next((f for f in rep["findings"] if f["kind"] == "ablation-instruction-simulated"), None)
+            self.assertIsNotNone(f, "label-only ablation must be flagged for migration")
+            self.assertIn("no-sev", f["message"])
+            self.assertIn("mechanism", f["message"])   # remediation names how to materialize
+
+    def test_materialized_ablation_is_not_flagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"; _skill(rp)
+            p = _manifest(rp, [CASE], ablations=[
+                {"id": "no-sev", "removed_component": "severity",
+                 "mechanism": "section", "target": {"heading": "## Sev"},
+                 "expected_regressions": [{"summary": "x", "cases": ["c"], "assertions": ["a"]}]}])
+            rep = sb.audit_manifest_report(p)
+            kinds = {f["kind"] for f in rep["findings"]}
+            self.assertNotIn("ablation-instruction-simulated", kinds)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4437,9 +4437,10 @@ def audit_manifest_report(
     ablation_case_ids = {c.get("id") for c in cases}
     ablation_assertion_names = {a.get("name") for c in cases for a in c.get("assertions", []) if a.get("name")}
     for ablation in manifest.get("ablations", []):
-        if not ablation_components(ablation):
-            continue
         aid = ablation.get("id")
+        if not ablation_components(ablation):
+            finding("ablation-instruction-simulated", "recommended", f"ablation {aid!r} is instruction-simulated (label-only): the full skill is mounted with a prompt directive to ignore the component, so the arm is non-blind and yields a raw measurement only (it cannot be confirmation-graded). Declare a mechanism+target (section/list_item/frontmatter_field/reference/patch) to materialize it as a blind, removal-based ablation.")
+            continue
         if not ablation.get("expected_regressions"):
             finding("ablation-no-expected-regression", "recommended", f"ablation {aid!r} declares a removal but no expected_regressions; without a discriminating case it cannot become evidence.")
         for comp in ablation_components(ablation):
