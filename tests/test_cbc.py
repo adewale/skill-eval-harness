@@ -193,6 +193,50 @@ class PreparedTaskTests(unittest.TestCase):
             self.assertEqual(back.harness_record(), pt.harness_record())      # serialization is stable
 
 
+class ConsumersTakeAPreparedTaskTests(unittest.TestCase):
+    """After the JSONL boundary the runner adapters consume a PreparedTask, so the
+    model-facing variant, upload token, and skill paths are owned by ONE object
+    rather than re-derived from a raw row in each adapter. A blind materialized arm
+    presents as with_skill through every adapter; instruction-simulated stays
+    transparent. These call the adapters with a PreparedTask (not a dict), which is
+    the structural point — the dict island is gone."""
+
+    MANIFEST = {"skill_name": "good-pr", "skill_paths": ["skills/x/SKILL.md"],
+                "ablations": [{"id": "no-rp", "removed_component": "regression-proof",
+                               "expected_regressions": ["accepts weak tests"]}]}
+
+    def mat_pt(self):
+        prov = am.Provenance(id="no-rp", mode="materialized", population="answer",
+                             identity=am.TreeIdentity(canonical="C", edited="E"),
+                             components=(am.Component("instructions", "section", "skills/x/SKILL.md", {"heading": "## H"}),))
+        return am.PreparedTask(case_id="c1", split="tune", kind="behavior", variant_truth="ablation:no-rp",
+                               run_number=1, skill_name="good-pr", repo_root="/r", skill_paths=("skills/root-0/SKILL.md",),
+                               input_files=(), run_dir="c1/ablation:no-rp", instruction="Use the skill under test.",
+                               prompt="Review.", tags=(), ablation=prov, skill_tree_hash="C")
+
+    def sim_pt(self):
+        sim = am.InstructionSimulated(id="no-rp", population="answer", removed_component="rp")
+        return am.PreparedTask(case_id="c1", split="tune", kind="behavior", variant_truth="ablation:no-rp",
+                               run_number=1, skill_name="good-pr", repo_root="/r", skill_paths=("skills/root-0/SKILL.md",),
+                               input_files=(), run_dir="c1/ablation:no-rp",
+                               instruction="Use the good-pr skill, but simulate this ablation: drop rp.",
+                               prompt="Review.", tags=(), ablation=sim)
+
+    def test_codex_prompt_consumes_preparedtask_and_blinds_materialized(self):
+        mat = sb.codex_task_prompt(self.mat_pt(), ["skills/root-0/SKILL.md"], [])
+        self.assertNotIn("simulate", mat)                  # materialized arm is blind: no hypothesis text
+        sim = sb.codex_task_prompt(self.sim_pt(), ["skills/root-0/SKILL.md"], [])
+        self.assertIn("simulate this ablation", sim)       # instruction-simulated is told what to do
+
+    def test_safe_task_json_model_visible_variant_is_owned_by_the_object(self):
+        mat = sb.safe_task_json(self.mat_pt(), self.MANIFEST, task_name="t", upload_files=[])
+        self.assertEqual(mat["variant"], "with_skill")     # blinded via pt.model_facing_variant()
+        self.assertNotIn("ablation", mat)                  # no hypothesis leaked to the model
+        sim = sb.safe_task_json(self.sim_pt(), self.MANIFEST, task_name="t", upload_files=[])
+        self.assertEqual(sim["variant"], "ablation:no-rp")                          # non-blind: true variant shown
+        self.assertEqual(sim["ablation"]["removed_component"], "regression-proof")  # directive from the manifest
+
+
 class MaterializeCarriesTypedArmTests(unittest.TestCase):
     """Move A: materialize_declared_ablations carries MaterializedArm objects, not
     re-parsed dicts, so prepare reads typed provenance instead of indexing string
@@ -264,7 +308,7 @@ class OldSkillParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as ws:
             p = self.repo(Path(td))
             _, row = self.old_row(p)
-            skill_rel, _ = sb.codex_skill_workspace(row, Path(ws))
+            skill_rel, _ = sb.codex_skill_workspace(sb.PreparedTask.from_row(row), Path(ws))
             mounted = (Path(ws) / skill_rel[0]).read_text(encoding="utf-8")
             self.assertIn("OLD-MARKER", mounted)
             self.assertNotIn("CURRENT-MARKER", mounted)   # the silent bug: used to mount the current skill
@@ -275,7 +319,7 @@ class OldSkillParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             p = self.repo(Path(td))
             manifest, row = self.old_row(p)
-            payload = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None,
+            payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None,
                                              agent="claude-code", model="m", model_provider="anthropic", snapshot="s")
             old_files = [f for f in payload["upload_plan"]["files"] if f["role"] == "old_skill"]
             self.assertTrue(old_files)

@@ -1471,14 +1471,13 @@ def slugify(value: str) -> str:
     return slug or "task"
 
 
-def jetty_task_name(task: dict[str, Any], prefix: str | None = None) -> str:
-    base = prefix or task.get("skill_name") or "skill-eval"
+def jetty_task_name(pt: PreparedTask, prefix: str | None = None) -> str:
+    base = prefix or pt.skill_name or "skill-eval"
     # The task filename and upload placeholders are MODEL-VISIBLE (the runbook
     # directs the agent to read the task JSON by that path). The PreparedTask owns
     # the rule that a blind (ablation) arm never exposes "ablation:<id>" — its
     # upload_token() is opaque and deterministic. The truth stays harness-only.
-    token = PreparedTask.from_row(task).upload_token()
-    return "-".join(slugify(str(part)) for part in [base, task["case_id"], token, str(task.get("run_number", 1))])
+    return "-".join(slugify(str(part)) for part in [base, pt.case_id, pt.upload_token(), str(pt.run_number)])
 
 
 def canonical_jetty_runbook(agent: str, model: str, model_provider: str, snapshot: str) -> str:
@@ -1533,38 +1532,37 @@ def placeholder(task_name: str, role: str, index: int | str) -> str:
     return f"upload://{task_name}/{role}/{index}"
 
 
-def safe_task_json(task: dict[str, Any], manifest: dict[str, Any], *, task_name: str, upload_files: list[dict[str, Any]]) -> dict[str, Any]:
-    variant = str(task["variant"])
+def safe_task_json(pt: PreparedTask, manifest: dict[str, Any], *, task_name: str, upload_files: list[dict[str, Any]]) -> dict[str, Any]:
+    variant = pt.variant_truth
     safe = {
-        "case_id": task["case_id"],
-        "split": task["split"],
-        "kind": task.get("kind", "behavior"),
-        "variant": variant,
-        "run_number": task.get("run_number", 1),
-        "skill_name": task["skill_name"],
-        "instruction": task.get("instruction", ""),
-        "prompt": task.get("prompt", ""),
+        "case_id": pt.case_id,
+        "split": pt.split,
+        "kind": pt.kind,
+        # The model-visible variant is OWNED by the PreparedTask: model_facing_variant()
+        # presents a blind (materialized) arm as with_skill and leaves every other arm
+        # as its true variant — one authority, no per-branch override that could drift.
+        "variant": pt.model_facing_variant(),
+        "run_number": pt.run_number,
+        "skill_name": pt.skill_name,
+        "instruction": pt.instruction,
+        "prompt": pt.prompt,
         "input_files": [item["placeholder"] for item in upload_files if item.get("role") == "fixture"],
         "skill_files": [],
-        "tags": task.get("tags", []),
+        "tags": list(pt.tags),
     }
     if variant == "with_skill":
         safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
     elif variant == "old_skill":
         safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "old_skill"]
-    elif variant.startswith("ablation:"):
-        aid = variant.split(":", 1)[1]
-        ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
+    elif pt.is_ablation:
         safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
-        pt = PreparedTask.from_row(task)
-        if pt.is_materialized_ablation:
-            # Materialized: the model-visible task must be indistinguishable from
-            # with_skill. The PreparedTask OWNS blinding — model_facing_variant()
-            # presents as with_skill; the true variant + provenance stay harness-only.
-            safe["variant"] = pt.model_facing_variant()
-        else:
+        if not pt.is_materialized_ablation:
             # Instruction-simulated is non-blind by design: the model is told what to
-            # simulate, via the ONE typed instruction-sim record (no hand-built dict).
+            # simulate, via the ONE typed instruction-sim record. removed_component /
+            # expected_regressions come from the manifest (the prepared row carries
+            # only id/mode/population).
+            aid = variant.split(":", 1)[1]
+            ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
             safe["ablation"] = InstructionSimulated(
                 id=aid,
                 population=(pt.ablation.population if pt.ablation else "answer"),   # from the row, not hardcoded
@@ -1577,7 +1575,7 @@ def safe_task_json(task: dict[str, Any], manifest: dict[str, Any], *, task_name:
 
 
 def build_jetty_payload(
-    task: dict[str, Any],
+    pt: PreparedTask,
     manifest: dict[str, Any],
     *,
     collection: str,
@@ -1590,10 +1588,13 @@ def build_jetty_payload(
     ablation_trees: dict[str, MaterializedArm] | None = None,
     with_skill_tree_dir: Path | None = None,
 ) -> dict[str, Any]:
-    variant = str(task["variant"])
-    task_name = jetty_task_name(task, task_prefix)
+    # The PreparedTask is the sole authority after the JSONL boundary: the true
+    # variant, skill paths, model-facing surface, upload token, and harness truth all
+    # come from it — not from a raw row re-indexed key by key.
+    variant = pt.variant_truth
+    task_name = jetty_task_name(pt, task_prefix)
     files: list[dict[str, Any]] = []
-    for i, local in enumerate(task.get("input_files", []), 1):
+    for i, local in enumerate(pt.input_files, 1):
         files.append({
             "role": "fixture",
             "placeholder": placeholder(task_name, "fixture", i),
@@ -1610,23 +1611,23 @@ def build_jetty_payload(
                     "role": "skill",
                     "placeholder": placeholder(task_name, "skill", i),
                     "local_path": str(abs_path),
-                    "remote_path_hint": f"skills/{task['skill_name']}/{rel}",
+                    "remote_path_hint": f"skills/{pt.skill_name}/{rel}",
                     "private": False,
                 })
         else:
-            for i, local in enumerate(task.get("skill_paths", []), 1):
+            for i, local in enumerate(pt.skill_paths, 1):
                 files.append({
                     "role": "skill",
                     "placeholder": placeholder(task_name, "skill", i),
                     "local_path": str(Path(local).resolve()),
-                    "remote_path_hint": f"skills/{task['skill_name']}/{Path(local).name}",
+                    "remote_path_hint": f"skills/{pt.skill_name}/{Path(local).name}",
                     "private": False,
                 })
     elif variant == "old_skill":
-        # Consume the row's already-resolved old-skill paths (the SINGLE source);
-        # no manifest re-resolution, so the Jetty upload cannot diverge from what
-        # Codex mounts for the same arm.
-        old_paths = task.get("skill_paths") or []
+        # Consume the PreparedTask's already-resolved old-skill paths (the SINGLE
+        # source); no manifest re-resolution, so the Jetty upload cannot diverge from
+        # what Codex mounts for the same arm.
+        old_paths = list(pt.skill_paths)
         if not old_paths:
             die("old_skill export requires manifest.old_skill_paths to be populated")
         for i, local in enumerate(old_paths, 1):
@@ -1634,7 +1635,7 @@ def build_jetty_payload(
                 "role": "old_skill",
                 "placeholder": placeholder(task_name, "old-skill", i),
                 "local_path": str(Path(local).resolve()),
-                "remote_path_hint": f"old-skills/{task['skill_name']}/{Path(local).name}",
+                "remote_path_hint": f"old-skills/{pt.skill_name}/{Path(local).name}",
                 "private": False,
             })
     elif variant.startswith("ablation:"):
@@ -1648,7 +1649,7 @@ def build_jetty_payload(
                     "role": "skill",
                     "placeholder": placeholder(task_name, "skill", i),
                     "local_path": str(abs_path),
-                    "remote_path_hint": f"skills/{task['skill_name']}/{rel}",
+                    "remote_path_hint": f"skills/{pt.skill_name}/{rel}",
                     "private": False,
                 })
         elif with_skill_tree_dir is not None:
@@ -1661,19 +1662,19 @@ def build_jetty_payload(
                     "role": "skill",
                     "placeholder": placeholder(task_name, "skill", i),
                     "local_path": str(abs_path),
-                    "remote_path_hint": f"skills/{task['skill_name']}/{rel}",
+                    "remote_path_hint": f"skills/{pt.skill_name}/{rel}",
                     "private": False,
                 })
         else:
-            for i, local in enumerate(task.get("skill_paths", []), 1):
+            for i, local in enumerate(pt.skill_paths, 1):
                 files.append({
                     "role": "skill",
                     "placeholder": placeholder(task_name, "skill", i),
                     "local_path": str(Path(local).resolve()),
-                    "remote_path_hint": f"skills/{task['skill_name']}/{Path(local).name}",
+                    "remote_path_hint": f"skills/{pt.skill_name}/{Path(local).name}",
                     "private": False,
                 })
-    task_json = safe_task_json(task, manifest, task_name=task_name, upload_files=files)
+    task_json = safe_task_json(pt, manifest, task_name=task_name, upload_files=files)
     task_placeholder = placeholder(task_name, "task", "json")
     task_item = {
         "role": "task",
@@ -1684,9 +1685,9 @@ def build_jetty_payload(
     }
     all_files = [task_item] + files
     if variant == "without_skill" and any(item.get("role") in {"skill", "old_skill", "ablation_skill"} for item in all_files):
-        die(f"{task['case_id']}: without_skill payload attempted to mount skill files")
+        die(f"{pt.case_id}: without_skill payload attempted to mount skill files")
     if variant == "with_skill" and not any(item.get("role") == "skill" for item in all_files):
-        die(f"{task['case_id']}: with_skill payload has no skill files")
+        die(f"{pt.case_id}: with_skill payload has no skill files")
     jetty_block = {
         "runbook": True,
         "collection": collection,
@@ -1704,15 +1705,15 @@ def build_jetty_payload(
         jetty_block["use_trial_keys"] = True
     return {
         "harness": {
-            "skill_name": task["skill_name"],
-            "case_id": task["case_id"],
+            "skill_name": pt.skill_name,
+            "case_id": pt.case_id,
             "variant": variant,
-            "run_number": task.get("run_number", 1),
-            "split": task["split"],
-            "run_dir": task["run_dir"],
-            "executable": not str(task.get("prompt", "")).startswith("<hidden prompt:"),
-            **({"ablation": task["ablation"]} if task.get("ablation") else {}),
-            **({"skill_tree_hash": task["skill_tree_hash"]} if task.get("skill_tree_hash") else {}),
+            "run_number": pt.run_number,
+            "split": pt.split,
+            "run_dir": pt.run_dir,
+            "executable": not str(pt.prompt or "").startswith("<hidden prompt:"),
+            **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
+            **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {}),
         },
         "jetty_request": {
             "model": model,
@@ -1772,7 +1773,7 @@ def export_jetty(args: argparse.Namespace) -> int:
         trees=ablation_trees or None,
     )
     payloads = [build_jetty_payload(
-        row,
+        PreparedTask.from_row(row),
         manifest,
         collection=collection,
         task_prefix=task_prefix,
@@ -2771,17 +2772,18 @@ def safe_child_path(root: Path, relative: str) -> Path:
     return dest
 
 
-def codex_skill_workspace(task: dict[str, Any], ws: Path) -> tuple[list[str], list[str]]:
-    """Build an isolated workspace holding ONLY the row's selected skill tree (per
+def codex_skill_workspace(pt: PreparedTask, ws: Path) -> tuple[list[str], list[str]]:
+    """Build an isolated workspace holding ONLY the task's selected skill tree (per
     variant) and fixtures, so executing with cwd here cannot reach the original
-    repo skill. For an ablation the row's skill_paths are the materialized tree;
-    for without_skill nothing is mounted. with_skill and ablation use the same
-    copier, so their file surfaces are identical apart from the declared edit."""
+    repo skill. For an ablation the PreparedTask's skill_paths are the materialized
+    tree; for without_skill nothing is mounted. with_skill and ablation use the same
+    copier, so their file surfaces are identical apart from the declared edit. The
+    PreparedTask is the sole authority — variant and skill paths are read off it, not
+    re-derived from a raw row."""
     ws.mkdir(parents=True, exist_ok=True)
-    variant = str(task.get("variant"))
     skill_rel: list[str] = []
-    if variant != "without_skill":
-        for i, sp in enumerate(task.get("skill_paths", [])):
+    if pt.variant_truth != "without_skill":
+        for i, sp in enumerate(pt.skill_paths):
             src = Path(sp)
             src_dir = src if src.is_dir() else src.parent
             dest = ws / "skills" / f"root-{i}"
@@ -2789,7 +2791,7 @@ def codex_skill_workspace(task: dict[str, Any], ws: Path) -> tuple[list[str], li
             main = dest / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dest / src.name
             skill_rel.append(str((main if main.exists() else dest).relative_to(ws)))
     input_rel: list[str] = []
-    for raw in task.get("input_files", []):
+    for raw in pt.input_files:
         src = Path(raw)
         dest = ws / "inputs" / src.name
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -2798,11 +2800,9 @@ def codex_skill_workspace(task: dict[str, Any], ws: Path) -> tuple[list[str], li
     return skill_rel, input_rel
 
 
-def codex_task_prompt(task: dict[str, Any], skill_paths: list[str] | None = None, input_files: list[str] | None = None) -> str:
-    variant = str(task.get("variant"))
-    abl = task.get("ablation") or {}
+def codex_task_prompt(pt: PreparedTask, skill_paths: list[str] | None = None, input_files: list[str] | None = None) -> str:
     file_note = "\n".join(f"- {p}" for p in (input_files or [])) if input_files else "- none"
-    if variant == "without_skill":
+    if pt.variant_truth == "without_skill":
         skill_note = "Do not use any skill. No skill files are present in this workspace."
     else:
         listed = "\n".join(f"- {p}" for p in (skill_paths or [])) if skill_paths else "- none"
@@ -2811,13 +2811,13 @@ def codex_task_prompt(task: dict[str, Any], skill_paths: list[str] | None = None
         # skill on disk is already altered, so the prompt stays byte-identical to
         # with_skill); an instruction_simulated arm is NOT blind (the full skill is on
         # disk, so the regression occurs only if we explicitly add the directive).
-        pt = PreparedTask.from_row(task)
         if pt.is_ablation and not pt.is_blind:
-            directive = task.get("instruction") or f"Ablation for this run: ignore/remove the component '{abl.get('removed_component', '')}' from the skill guidance."
+            rc = pt.ablation.removed_component if isinstance(pt.ablation, InstructionSimulated) and pt.ablation.removed_component else ""
+            directive = pt.instruction or f"Ablation for this run: ignore/remove the component '{rc}' from the skill guidance."
             skill_note += f"\n\n{directive}"
     return (
         f"{skill_note}\n\n"
-        f"Task prompt:\n{task.get('prompt', '')}\n\n"
+        f"Task prompt:\n{pt.prompt}\n\n"
         f"Input files available to inspect:\n{file_note}\n\n"
         "Return the final answer for this eval task. Do not include hidden answer keys or rubrics."
     )
@@ -2829,17 +2829,20 @@ def run_codex(args: argparse.Namespace) -> int:
     cmd = getattr(args, "codex_cmd", None) or "codex exec --json"
     timeout = int(getattr(args, "timeout", 1800))
     for task in tasks:
-        base = safe_child_path(runs, str(task.get("run_dir", f"{task.get('case_id','case')}/{task.get('variant','variant')}")))
+        # Cross the JSONL boundary ONCE: from here down the typed PreparedTask is the
+        # authority for variant, skill paths, ablation record, and tree hash — the
+        # runner no longer threads a raw row through dict-based helpers.
+        pt = PreparedTask.from_row(task)
+        base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
         base.mkdir(parents=True, exist_ok=True)
-        abl = task.get("ablation")
         # Provenance persisted on every run so the report can verify the ablation
         # arm and the with_skill arm share a skill revision (skill_tree_hash).
-        prov_extra = {**({"ablation": abl} if abl else {}), **({"skill_tree_hash": task["skill_tree_hash"]} if task.get("skill_tree_hash") else {})}
+        prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
         started = time.time()
         with tempfile.TemporaryDirectory(prefix="codex-ws-") as wd:
             ws = Path(wd)
-            skill_rel, input_rel = codex_skill_workspace(task, ws)
-            prompt = codex_task_prompt(task, skill_paths=skill_rel, input_files=input_rel)
+            skill_rel, input_rel = codex_skill_workspace(pt, ws)
+            prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             try:
                 proc = subprocess.run(cmd, shell=True, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=str(ws))
                 elapsed_ms = int((time.time() - started) * 1000)
@@ -2851,7 +2854,7 @@ def run_codex(args: argparse.Namespace) -> int:
                         source="codex",
                         metadata={"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else "", **prov_extra},
                         extra_metrics={"elapsed_ms": elapsed_ms, "returncode": proc.returncode},
-                        environment={"runner": "codex", "command": cmd, "cwd": "<isolated workspace>", "variant": task.get("variant")},
+                        environment={"runner": "codex", "command": cmd, "cwd": "<isolated workspace>", "variant": pt.variant_truth},
                         write_metadata=True,
                     )
                 else:

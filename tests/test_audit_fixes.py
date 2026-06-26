@@ -161,7 +161,7 @@ class R2_InstructionSimSurfaceTests(unittest.TestCase):
 
             def hints(variant):
                 row = next(r for r in rows if r["variant"] == variant)
-                pl = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None, agent="claude-code",
+                pl = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code",
                                             model="m", model_provider="anthropic", snapshot="s",
                                             ablation_trees=trees, with_skill_tree_dir=wsdir)
                 return sorted(f["remote_path_hint"] for f in pl["upload_plan"]["files"] if f["role"] == "skill")

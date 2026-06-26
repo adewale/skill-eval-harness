@@ -1372,10 +1372,11 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             rows = sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl")
             arow = next(r for r in rows if r["variant"] == "ablation:no-rp")
             wrow = next(r for r in rows if r["variant"] == "with_skill")
+            apt, wpt = sb.PreparedTask.from_row(arow), sb.PreparedTask.from_row(wrow)
             with tempfile.TemporaryDirectory() as ca, tempfile.TemporaryDirectory() as cb:
-                sa, ia = sb.codex_skill_workspace(arow, Path(ca))
-                sw, iw = sb.codex_skill_workspace(wrow, Path(cb))
-                cpa, cpw = sb.codex_task_prompt(arow, sa, ia), sb.codex_task_prompt(wrow, sw, iw)
+                sa, ia = sb.codex_skill_workspace(apt, Path(ca))
+                sw, iw = sb.codex_skill_workspace(wpt, Path(cb))
+                cpa, cpw = sb.codex_task_prompt(apt, sa, ia), sb.codex_task_prompt(wpt, sw, iw)
                 self.assertEqual(cpa, cpw)
                 self.assertEqual(sa, sw)                   # identical relative mounts
                 leaks["codex_prompt"] = cpa
@@ -1383,7 +1384,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
 
             # 4) Jetty: the jetty request (runbook + jetty block) + upload names
             trees = {"no-rp": sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, self.SECTION_ABL), root / "jabl")}
-            payload = sb.build_jetty_payload(arow, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
+            payload = sb.build_jetty_payload(apt, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
             leaks["jetty_request"] = json.dumps(payload["jetty_request"])
             leaks["jetty_upload_names"] = json.dumps([{"p": f.get("placeholder"), "h": f.get("remote_path_hint")} for f in payload["upload_plan"]["files"]])
 
@@ -1418,7 +1419,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
 
             # Jetty harness record carries the same ablation provenance + canonical hash.
             arm = sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, self.SECTION_ABL), root / "jabl")
-            payload = sb.build_jetty_payload(arow, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees={"no-rp": arm})
+            payload = sb.build_jetty_payload(sb.PreparedTask.from_row(arow), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees={"no-rp": arm})
             self.assertTrue(REQUIRED.issubset(payload["harness"]["ablation"]))
             self.assertIn("skill_tree_hash", payload["harness"])
 
@@ -1504,7 +1505,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             manifest = sb.validate_manifest(p)
             row = [r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "rabl") if r["variant"] == "ablation:no-rp"][0]
             trees = {"no-rp": sb.materialize(sb.ValidatedAblation.validate(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL), root / "jabl")}
-            payload = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
+            payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
             skill_files = [f for f in payload["upload_plan"]["files"] if f["role"] == "skill"]
             hints = [f["remote_path_hint"] for f in skill_files]
             self.assertTrue(any(h.endswith("references/severity.md") for h in hints))  # structure preserved, not flattened
@@ -1523,7 +1524,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             manifest = sb.validate_manifest(p)
             row = [r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl") if r["variant"] == "ablation:no-rp"][0]
             trees = {"no-rp": sb.materialize(sb.ValidatedAblation.validate(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL), root / "jabl")}
-            payload = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
+            payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
             # What the model actually sees: the jetty request (runbook + jetty block,
             # incl. file_paths and template_variables) and each upload's remote path.
             model_visible = json.dumps(payload["jetty_request"]) + json.dumps(
@@ -2219,13 +2220,13 @@ class AblationReviewFixesTests(unittest.TestCase):
             base = {"skill_paths": [str(skill / "SKILL.md")], "input_files": [], "prompt": "x"}
             with tempfile.TemporaryDirectory() as w1:
                 ws = Path(w1)
-                sk, _ = sb.codex_skill_workspace({**base, "variant": "without_skill"}, ws)
+                sk, _ = sb.codex_skill_workspace(sb.PreparedTask.from_row({**base, "variant": "without_skill"}), ws)
                 self.assertEqual(sk, [])                       # without_skill mounts no skill
                 self.assertFalse((ws / "skills").exists())
-                self.assertIn("Do not use any skill", sb.codex_task_prompt({"variant": "without_skill", "prompt": "x"}, sk, []))
+                self.assertIn("Do not use any skill", sb.codex_task_prompt(sb.PreparedTask.from_row({"variant": "without_skill", "prompt": "x"}), sk, []))
             with tempfile.TemporaryDirectory() as w2:
                 ws = Path(w2)
-                sk, _ = sb.codex_skill_workspace({**base, "variant": "with_skill"}, ws)
+                sk, _ = sb.codex_skill_workspace(sb.PreparedTask.from_row({**base, "variant": "with_skill"}), ws)
                 self.assertTrue(sk and (ws / sk[0]).exists())  # skill mounted inside the isolated workspace
                 self.assertTrue(sk[0].startswith("skills/"))   # workspace-relative, not the original repo path
 
@@ -2238,7 +2239,7 @@ class AblationReviewFixesTests(unittest.TestCase):
             "ablation": {"id": "no-rp", "mode": "instruction_simulated", "population": "answer", "removed_component": "regression-proof"},
             "instruction": "Use the good-pr skill, but simulate this ablation: remove/ignore regression-proof. Expected regression to watch for: accepts weak tests.",
         }
-        sim_prompt = sb.codex_task_prompt(sim, skills, [])
+        sim_prompt = sb.codex_task_prompt(sb.PreparedTask.from_row(sim), skills, [])
         self.assertIn("simulate this ablation", sim_prompt)
         self.assertIn("regression-proof", sim_prompt)
         # materialized: the on-disk skill is already altered -> blind, no hypothesis text.
@@ -2249,8 +2250,8 @@ class AblationReviewFixesTests(unittest.TestCase):
                          "components": [{"class": "instructions", "mechanism": "section", "skill_root": "skills/root-0/SKILL.md", "target": {"heading": "## H"}}]},
             "instruction": "Use the skill under test (good-pr). Its files are provided in your workspace ...",
         }
-        mat_prompt = sb.codex_task_prompt(mat, skills, [])
-        with_prompt = sb.codex_task_prompt({"variant": "with_skill", "prompt": "Review.", "instruction": "x"}, skills, [])
+        mat_prompt = sb.codex_task_prompt(sb.PreparedTask.from_row(mat), skills, [])
+        with_prompt = sb.codex_task_prompt(sb.PreparedTask.from_row({"variant": "with_skill", "prompt": "Review.", "instruction": "x"}), skills, [])
         self.assertNotIn("simulate", mat_prompt)
         self.assertNotIn("ignore/remove", mat_prompt)
         self.assertNotIn("regression-proof", mat_prompt)
@@ -2273,7 +2274,7 @@ class AblationReviewFixesTests(unittest.TestCase):
             manifest = sb.validate_manifest(p)
             row = [r for r in sb.prepared_task_rows(p, manifest) if r["variant"] == "with_skill"][0]
             tree_dir = sb.build_canonical_skill_tree(sb.repo_root_for_manifest(p), manifest, root / "wst")
-            payload = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", with_skill_tree_dir=tree_dir)
+            payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", with_skill_tree_dir=tree_dir)
             hints = [f["remote_path_hint"] for f in payload["upload_plan"]["files"] if f["role"] == "skill"]
             self.assertTrue(any(h.endswith("references/g.md") for h in hints))  # recursive, matching the ablation arm
 
