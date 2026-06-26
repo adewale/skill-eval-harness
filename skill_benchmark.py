@@ -3583,8 +3583,11 @@ def build_benchmark_report(
         combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
         process_rates = [r["process_pass_rate"] for r in scorable_rows if r.get("process_pass_rate") is not None]
         efficiency_rates = [r["efficiency_pass_rate"] for r in scorable_rows if r.get("efficiency_pass_rate") is not None]
+        # Timing/token/command central tendencies describe SCORABLE runs, matching
+        # the pass-rate block above — a timed-out run's full duration must not drag
+        # the mean (the failure count is disclosed separately as execution_errors).
         merged_metrics = []
-        for r in rows:
+        for r in scorable_rows:
             merged = dict(r.get("metadata", {}) or {})
             merged.update(read_metrics_base(Path(r.get("run_base", ""))))
             merged_metrics.append(merged)
@@ -4040,8 +4043,14 @@ def paired_token_overhead_report(
                 without_metrics = read_metrics_base(without_base)
                 with_text, with_output_path = read_output_base(with_base)
                 without_text, without_output_path = read_output_base(without_base)
-                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, {}, run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
-                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, {}, run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
+                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, read_metadata_base(with_base), run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
+                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, read_metadata_base(without_base), run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
+                # A crashed/timed-out or output-less arm is an infrastructure failure,
+                # not evidence of token cost or accuracy; exclude the pair via the same
+                # scorable predicate every report view uses (was: graded raw, so a
+                # crashed with_skill arm differenced to a false -1.0 "skill regression").
+                if not (scorable_run(with_grade) and scorable_run(without_grade)):
+                    continue
                 wt = metric_number(with_metrics, "total_tokens")
                 nt = metric_number(without_metrics, "total_tokens")
                 wi = metric_number(with_metrics, "input_tokens")
@@ -4183,15 +4192,21 @@ def profile_skill(args: argparse.Namespace) -> int:
     return 0
 
 
-def trigger_expectation(case: dict[str, Any]) -> str | None:
+TRIGGER_NEGATION_RE = re.compile(r"NO_TRIGGER|not trigger|should not", re.I)
+
+
+def expected_trigger_polarity(case: dict[str, Any]) -> str:
+    """THE one resolver for 'does this trigger case expect the skill to fire?'.
+    Reads expected_behavior + assertion patterns; a negation marker (NO_TRIGGER,
+    'not trigger', 'should not') means NO_TRIGGER, otherwise TRIGGER (the default the
+    autonomous-trigger eval uses). Both the eval (run_pi_trigger_eval) and the
+    manifest audit consume this, so they cannot disagree on a case's polarity — the
+    prior token-only audit resolver returned None for prose like 'should trigger',
+    silently dropping the case from both the positive and negative tallies."""
     text = " ".join(str(x) for x in case.get("expected_behavior", []))
     for assertion in case.get("assertions", []):
         text += " " + str(assertion.get("pattern", assertion.get("value", "")))
-    if "NO_TRIGGER" in text:
-        return "NO_TRIGGER"
-    if "TRIGGER" in text:
-        return "TRIGGER"
-    return None
+    return "NO_TRIGGER" if TRIGGER_NEGATION_RE.search(text) else "TRIGGER"
 
 
 def case_polarity(case: dict[str, Any]) -> str:
@@ -4263,8 +4278,8 @@ def audit_manifest_report(
         "holdout": sum(1 for c in cases if c.get("split") == "holdout"),
         "holdback": sum(1 for c in cases if c.get("split") == "holdback"),
         "trigger": sum(1 for c in cases if c.get("kind") == "trigger"),
-        "trigger_positive": sum(1 for c in cases if c.get("kind") == "trigger" and trigger_expectation(c) == "TRIGGER"),
-        "trigger_negative": sum(1 for c in cases if c.get("kind") == "trigger" and trigger_expectation(c) == "NO_TRIGGER"),
+        "trigger_positive": sum(1 for c in cases if c.get("kind") == "trigger" and expected_trigger_polarity(c) == "TRIGGER"),
+        "trigger_negative": sum(1 for c in cases if c.get("kind") == "trigger" and expected_trigger_polarity(c) == "NO_TRIGGER"),
         "ablations": len(manifest.get("ablations", [])),
         "objective_assertions": sum(1 for c in cases for a in c.get("assertions", []) if a.get("type") not in QUALITATIVE_ASSERTIONS),
         "process_assertions": sum(1 for c in cases for a in c.get("assertions", []) if a.get("type") in PROCESS_ASSERTIONS),

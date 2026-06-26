@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population, canonical_skill_tree_hash
+from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population, canonical_skill_tree_hash, expected_trigger_polarity
 from ablation_model import EvidenceClass, Provenance
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -230,7 +230,9 @@ def cases_from_manifest(manifest: dict[str, Any], split: str | None) -> list[dic
             continue
         if c.get("kind") == "trigger":
             prompt = trigger_query_from_case(c)
-            should = not re.search(r"NO_TRIGGER|not trigger|should not", " ".join(map(str, c.get("expected_behavior", []))), re.I)
+            # Single shared resolver with the manifest audit (skill_benchmark), so the
+            # eval and the audit cannot disagree on a case's expected polarity.
+            should = expected_trigger_polarity(c) == "TRIGGER"
             out.append({"query": prompt, "should_trigger": should})
     return out
 
