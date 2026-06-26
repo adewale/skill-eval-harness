@@ -390,6 +390,10 @@ def prepared_task_rows(
     cases = iter_cases(manifest, split)
     repo_root = repo_root_for_manifest(manifest_path)
     real_skill_paths = [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])]
+    # The old/baseline arm's files, resolved ONCE here so every runner reads the
+    # same row field instead of each re-deriving them (the divergence that let
+    # Codex mount the current skill for an old_skill arm while Jetty mounted the old).
+    old_skill_paths = [str((repo_root / p).resolve()) for p in manifest.get("old_skill_paths", [])]
     # When an ablation directory is provided, materialize each declared-removal
     # ablation once and point its rows at the altered tree. A caller that has
     # already materialized (e.g. export-jetty, which also needs the trees for
@@ -409,7 +413,9 @@ def prepared_task_rows(
         for variant in variants:
             record: AblationRecord | None = None
             skill_paths = real_skill_paths
-            if variant.startswith("ablation:"):
+            if variant == "old_skill":
+                skill_paths = old_skill_paths   # the OLD tree, carried on the row for both runners
+            elif variant.startswith("ablation:"):
                 population = ablation_variant_population(manifest, variant)
                 # Discovery (trigger-population) ablations measure AUTONOMOUS skill
                 # loading, which these generic forced-load runners (codex/Jetty)
@@ -1579,19 +1585,18 @@ def build_jetty_payload(
                     "private": False,
                 })
     elif variant == "old_skill":
-        old_paths = manifest.get("old_skill_paths") or []
+        # Consume the row's already-resolved old-skill paths (the SINGLE source);
+        # no manifest re-resolution, so the Jetty upload cannot diverge from what
+        # Codex mounts for the same arm.
+        old_paths = task.get("skill_paths") or []
         if not old_paths:
             die("old_skill export requires manifest.old_skill_paths to be populated")
-        repo_root = Path(task["repo_root"])
-        for i, raw in enumerate(old_paths, 1):
-            local = Path(raw)
-            if not local.is_absolute():
-                local = repo_root / local
+        for i, local in enumerate(old_paths, 1):
             files.append({
                 "role": "old_skill",
                 "placeholder": placeholder(task_name, "old-skill", i),
-                "local_path": str(local.resolve()),
-                "remote_path_hint": f"old-skills/{task['skill_name']}/{local.name}",
+                "local_path": str(Path(local).resolve()),
+                "remote_path_hint": f"old-skills/{task['skill_name']}/{Path(local).name}",
                 "private": False,
             })
     elif variant.startswith("ablation:"):

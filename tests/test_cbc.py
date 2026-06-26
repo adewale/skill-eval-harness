@@ -222,5 +222,65 @@ class MaterializeCarriesTypedArmTests(unittest.TestCase):
             self.assertEqual(wrow["skill_tree_hash"], arow["ablation"]["parent_skill_hash"])   # both arms, same revision
 
 
+class OldSkillParityTests(unittest.TestCase):
+    """The old_skill arm must mount the OLD skill under EVERY runner — resolved ONCE
+    on the row (prepared_task_rows) and consumed by both Codex and Jetty, the same
+    A-shape as MaterializedArm. Before the fix the row carried the CURRENT skill, so
+    only Jetty (which re-resolved from the manifest) was right; Codex silently
+    measured with_skill mislabeled as old_skill."""
+
+    CUR = "---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# Current\n\nCURRENT-MARKER\n"
+    OLD = "---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# Old\n\nOLD-MARKER\n"
+
+    def repo(self, root: Path):
+        rp = root / "repo"
+        cur = rp / "skills" / "good-pr"; cur.mkdir(parents=True)
+        (cur / "SKILL.md").write_text(self.CUR, encoding="utf-8")
+        old = rp / "old-skills" / "good-pr"; old.mkdir(parents=True)
+        (old / "SKILL.md").write_text(self.OLD, encoding="utf-8")
+        (rp / "evals").mkdir()
+        m = {"version": 1, "skill_name": "good-pr",
+             "skill_paths": ["skills/good-pr/SKILL.md"],
+             "old_skill_paths": ["old-skills/good-pr/SKILL.md"],
+             "variants": ["with_skill", "without_skill"],
+             "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
+             "ablations": []}
+        p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+        return p
+
+    def old_row(self, p):
+        manifest = sb.validate_manifest(p)
+        rows = sb.prepared_task_rows(p, manifest, include_old_skill=True)
+        return manifest, next(r for r in rows if r["variant"] == "old_skill")
+
+    def test_row_skill_paths_point_at_the_old_skill(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self.repo(Path(td))
+            _, row = self.old_row(p)
+            self.assertTrue(all("old-skills" in sp for sp in row["skill_paths"]))   # not the current tree
+            self.assertIn("OLD-MARKER", Path(row["skill_paths"][0]).read_text(encoding="utf-8"))
+
+    def test_codex_mounts_the_old_skill_not_the_current(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as ws:
+            p = self.repo(Path(td))
+            _, row = self.old_row(p)
+            skill_rel, _ = sb.codex_skill_workspace(row, Path(ws))
+            mounted = (Path(ws) / skill_rel[0]).read_text(encoding="utf-8")
+            self.assertIn("OLD-MARKER", mounted)
+            self.assertNotIn("CURRENT-MARKER", mounted)   # the silent bug: used to mount the current skill
+
+    def test_jetty_uploads_the_old_skill(self):
+        # Guard: build_jetty_payload now consumes the row's resolved paths; it must
+        # still upload the OLD files (it was already correct via manifest re-resolution).
+        with tempfile.TemporaryDirectory() as td:
+            p = self.repo(Path(td))
+            manifest, row = self.old_row(p)
+            payload = sb.build_jetty_payload(row, manifest, collection="c", task_prefix=None,
+                                             agent="claude-code", model="m", model_provider="anthropic", snapshot="s")
+            old_files = [f for f in payload["upload_plan"]["files"] if f["role"] == "old_skill"]
+            self.assertTrue(old_files)
+            self.assertIn("OLD-MARKER", Path(old_files[0]["local_path"]).read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
