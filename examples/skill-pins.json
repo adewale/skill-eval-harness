@@ -1,0 +1,117 @@
+{
+  "_about": "Pinned versions of the skills evaluated in docs/ablation-study-walkthrough.md. This file stores ONLY pointers (repo + commit SHA) and the harness's canonical skill-tree hash \u2014 no skill content is vendored. To reproduce, fetch each repo at its sha and recompute skill_benchmark.canonical_skill_tree_hash(repo_root, manifest): it must equal tree_hash, proving you ran the eval against the exact tree that was evaluated here.",
+  "harness_commit": "see git log of this repo",
+  "skills": {
+    "anti-slop-writing": {
+      "repo": "adewale/anti-slop-writing",
+      "ref": "main",
+      "sha": "891f6ff40b97e808feb4862a9433cc3febaec36a",
+      "commit_date": "2026-06-15T17:01:07Z",
+      "skill_paths": [
+        "skills/anti-slop-writing/SKILL.md"
+      ],
+      "tree_hash": "a706f93bcc13d7c8ffaeebb1d567c924d83819dbe071a616239839e973417ed0",
+      "verified": true
+    },
+    "audit-skill": {
+      "repo": "adewale/audit-skill",
+      "ref": "main",
+      "sha": "49cb1bb389aeef8721109d294185d3c58685a372",
+      "commit_date": "2026-06-15T17:01:12Z",
+      "skill_paths": [
+        "skills/audit/SKILL.md"
+      ],
+      "tree_hash": "437779bbef4d38c8df83a338d14dceaeeddb0061837294e85dcbf9561923a54e",
+      "verified": true
+    },
+    "cfdoctor": {
+      "repo": "adewale/cfdoctor",
+      "ref": "main",
+      "sha": "39b1db6fff73918d79ec070b7ec71f000e673eeb",
+      "commit_date": "2026-06-15T17:01:51Z",
+      "skill_paths": [
+        "skills/cloudflare-doctor/SKILL.md"
+      ],
+      "tree_hash": "d285b437b7d83df62a2871a689eaaa39d22767d2814ecf027121216b2452b445",
+      "verified": true
+    },
+    "good-pr": {
+      "repo": "adewale/good-pr",
+      "ref": "main",
+      "sha": "06a2b9973c48fc43012d25f844a9e0060afdcf03",
+      "commit_date": "2026-06-15T17:01:16Z",
+      "skill_paths": [
+        "skills/good-pr/SKILL.md"
+      ],
+      "tree_hash": "e6db327cbacb0b9f810183d89d41bd09bbc9d6dc3e78418430ee110bf2e3be41",
+      "verified": true
+    },
+    "good-readme": {
+      "repo": "adewale/good-readme",
+      "ref": "main",
+      "sha": "837e0d292224e1718ed6335b36019e6527ddf024",
+      "commit_date": "2026-06-15T17:01:20Z",
+      "skill_paths": [
+        "skills/good-readme/SKILL.md"
+      ],
+      "tree_hash": "fc3b08304b6bb6daf43e53ff261f044d22ecc58d54213420d9404846e4dd25c7",
+      "verified": true
+    },
+    "good-repo": {
+      "repo": "adewale/good-repo",
+      "ref": "main",
+      "sha": "0aacc79275dd39046cf097d45b4a29a6fc8fbba3",
+      "commit_date": "2026-06-15T17:01:25Z",
+      "skill_paths": [
+        "skills/good-repo/SKILL.md"
+      ],
+      "tree_hash": "46727dedf81bc56a4140aab17479fe3820175d5f3c095bdb7da5846c56e62fc4",
+      "verified": true
+    },
+    "guardrails-skill": {
+      "repo": "adewale/guardrails-skill",
+      "ref": "main",
+      "sha": "7eeeba921867d3fb55fd5aadbdde8cc64a7cc87b",
+      "commit_date": "2026-06-15T17:01:47Z",
+      "skill_paths": [
+        "skills/guardrails/SKILL.md"
+      ],
+      "tree_hash": "193c293e805797c51076f139f80f63d0b1c17f7afb04ca71c3fbab3820a448a9",
+      "verified": true
+    },
+    "slide-maker": {
+      "repo": "adewale/slide-maker",
+      "ref": "main",
+      "sha": "b144fb7391c15fee920fe29eb1d3b0fdb52ba640",
+      "commit_date": "2026-06-27T10:06:40Z",
+      "skill_paths": [
+        "skills/slide-maker/SKILL.md"
+      ],
+      "tree_hash": "1743f508d6b71139039d6e52be34b67571816a344fb712eac12ba8616403ed79",
+      "verified": true,
+      "note": "pinned to the commit matching the tested tree (HEAD advanced after the run)"
+    },
+    "swiss-poster-skill": {
+      "repo": "adewale/swiss-poster-skill",
+      "ref": "main",
+      "sha": "5ec0cb1476081029ed27e4e9036c211988da58ba",
+      "commit_date": "2026-06-16T14:10:02Z",
+      "skill_paths": [
+        "swiss-poster/SKILL.md"
+      ],
+      "tree_hash": "ea1b4952f2896bfd0c841def23c711dee88c3c17ac0775d465d1ee4e5ba5f8b8",
+      "verified": true
+    },
+    "testing-best-practices": {
+      "repo": "adewale/testing-best-practices",
+      "ref": "main",
+      "sha": "b883b57de29b952942fcde362fb011c1ae645325",
+      "commit_date": "2026-06-15T17:01:42Z",
+      "skill_paths": [
+        "testing-best-practices/SKILL.md"
+      ],
+      "tree_hash": "d6339ae9c6cd4840792164e88e5210a9b0c5291f0d11872b6cf8763cd6690d24",
+      "verified": true
+    }
+  }
+}
