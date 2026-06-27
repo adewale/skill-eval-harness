@@ -324,6 +324,18 @@ class EvalReadinessTests(unittest.TestCase):
             self.assertTrue(any("leak-saturated" in b for b in r["blockers"]))
             self.assertTrue(any("adversarial" in b for b in r["blockers"]))
 
+    def test_unverifiable_positive_assertion_blocks_leak_saturation(self):
+        # A case with a leaked `contains` AND a `regex` (whose leakage the lint cannot
+        # verify) must NOT be reported leak-saturated — leak-checkability is defined by
+        # the leakage lint, so we never over-report a case as non-discriminating.
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"; _skill(rp)
+            cases = [{"id": "c1", "split": "tune", "kind": "positive", "prompt": "please label Blocking here",
+                      "assertions": [{"name": "sev", "type": "contains", "value": "Blocking"},
+                                     {"name": "shape", "type": "regex", "pattern": "^Severity:"}]}]
+            r = sb.audit_manifest_report(_manifest(rp, cases, ablations=[]))["readiness"]
+            self.assertEqual(r["leak_saturated_cases"], [])
+
     def _audit_ns(self, manifest_path, **over):
         import argparse
         base = dict(manifest=str(manifest_path), skill_path=None, runs=None, split=None,

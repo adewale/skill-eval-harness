@@ -4354,7 +4354,7 @@ def fixture_recommendations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return recs[:6]
 
 
-LEAKABLE_POSITIVE_TYPES = {"contains", "contains_any", "contains_all", "regex"}
+POSITIVE_OBJECTIVE_TYPES = {"contains", "contains_any", "contains_all", "regex"}
 
 
 def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str | None = None, leakage_min_chars: int = 4) -> dict[str, Any]:
@@ -4379,11 +4379,16 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
         asserts = case.get("assertions", []) or []
         if asserts and all(a.get("type") == "judge" for a in asserts):
             judge_only += 1
-        positive = [a for a in asserts if a.get("type") in LEAKABLE_POSITIVE_TYPES]
-        # A case is leak-saturated when EVERY positive objective assertion's value is
-        # already in the prompt — it can be passed by echoing the prompt, so it cannot
-        # tell a skill from no skill no matter how good the runner is.
-        if positive and all(assertion_label(a) in leaked.get(case.get("id"), set()) for a in positive):
+        positive = [a for a in asserts if a.get("type") in POSITIVE_OBJECTIVE_TYPES]
+        # A case is leak-saturated when EVERY positive objective assertion can be passed
+        # by echoing the prompt. "Leak-checkable" is defined by the leakage lint itself
+        # (assertion_values_for_leakage returns the values it can match) — so a regex or
+        # other positive check the lint cannot verify conservatively blocks the claim,
+        # and the two never drift out of a single source of truth.
+        if positive and all(
+            assertion_values_for_leakage(a) and assertion_label(a) in leaked.get(case.get("id"), set())
+            for a in positive
+        ):
             leak_saturated.append(case.get("id"))
     blockers: list[str] = []
     if instr_sim:
