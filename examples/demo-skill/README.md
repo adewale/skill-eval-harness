@@ -53,3 +53,7 @@ edited tree, blind, with verified provenance). Swap the stub for a real runner
   only ever be a raw measurement. `audit-manifest` flags the latter.
 - Read `expected_regression_confirmed` (a named assertion flipped, provenance
   verified) as the signal — not a raw aggregate score drop.
+- Run `skill-benchmark audit-manifest evals/shared-benchmark.json` on this manifest:
+  the **readiness** block reports `ready: no blockers` (ablations materialized, no
+  leak-saturated cases). `--fail-on-blockers` turns that into a CI gate — this demo
+  is what a ready manifest looks like.

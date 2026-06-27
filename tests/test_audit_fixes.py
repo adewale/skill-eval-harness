@@ -324,6 +324,28 @@ class EvalReadinessTests(unittest.TestCase):
             self.assertTrue(any("leak-saturated" in b for b in r["blockers"]))
             self.assertTrue(any("adversarial" in b for b in r["blockers"]))
 
+    def _audit_ns(self, manifest_path, **over):
+        import argparse
+        base = dict(manifest=str(manifest_path), skill_path=None, runs=None, split=None,
+                    format="json", out=None, min_positive=5, min_negative=3, min_adversarial=3,
+                    min_trigger_pos=2, min_trigger_neg=2, leakage_min_chars=4, fail_on_blockers=False)
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def test_fail_on_blockers_gates_on_readiness(self):
+        with tempfile.TemporaryDirectory() as td:
+            rb = Path(td) / "bad"; _skill(rb)
+            bad = _manifest(rb, [CASE], ablations=[{"id": "x", "removed_component": "x", "expected_regressions": ["y"]}])
+            self.assertEqual(sb.audit_manifest(self._audit_ns(bad, out=str(rb / "o.json"), fail_on_blockers=True)), 1)
+            self.assertEqual(sb.audit_manifest(self._audit_ns(bad, out=str(rb / "o.json"))), 0)   # off by default
+            rc = Path(td) / "clean"; _skill(rc)
+            cases = [{"id": "a1", "split": "tune", "kind": "adversarial", "prompt": "a tricky near-miss to handle with care",
+                      "assertions": [{"name": "k", "type": "contains", "value": "token-not-in-the-prompt"}]}]
+            ab = {"id": "no-sev", "removed_component": "sev", "mechanism": "section", "class": "instructions",
+                  "target": {"heading": "## Sev"}, "expected_regressions": [{"summary": "x", "cases": ["a1"], "assertions": ["k"]}]}
+            clean = _manifest(rc, cases, ablations=[ab])
+            self.assertEqual(sb.audit_manifest(self._audit_ns(clean, out=str(rc / "o.json"), fail_on_blockers=True)), 0)
+
     def test_clean_manifest_has_no_blockers(self):
         with tempfile.TemporaryDirectory() as td:
             rp = Path(td) / "repo"; _skill(rp)   # SKILL.md has a '## Sev' section

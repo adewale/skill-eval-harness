@@ -435,14 +435,24 @@ Add `--runs ../repo/eval-runs/latest` to include saturated-case, no-lift, flaky 
 
 The audit reports:
 
+- a **readiness** verdict — "is this eval worth paying to run?" — collapsing the three things that decide whether a measured number will mean anything: ablations materialized vs instruction-simulated, **leak-saturated cases** (every positive objective assertion's value already appears in the prompt, so `with_skill == without_skill` by construction), and adversarial coverage — with an explicit `blockers` punch list;
 - missing positive, negative, and adversarial eval coverage,
 - missing holdout/holdback split coverage,
 - missing trigger/no-trigger coverage,
 - missing domain/difficulty/success-goal taxonomy for slice summaries,
 - ablation-plan suggestions from major skill sections,
+- the instruction-simulated ablations that should be materialized (and dangling/unknown ablation references),
 - saturated and no-lift cases when run data is available,
 - assertions with identical with/without pass rates, and
 - recommended fixture repos/files.
+
+**Gate it in CI.** `--fail-on-blockers` makes `audit-manifest` exit non-zero when the readiness block has any blockers, so a skill repo can keep its eval suite at "worth paying to run" the same way it keeps tests green:
+
+```bash
+skill-benchmark audit-manifest evals/shared-benchmark.json --fail-on-blockers
+```
+
+The systematic way to upgrade a suite is to drive those blockers to empty, repo by repo: materialize the ablations (`materialize-ablations` / declare a `mechanism`+`target`), de-leak the leak-saturated cases (move the answer out of the prompt, or assert a downstream consequence), and add adversarial cases where missing — then the gate goes green.
 
 ### Profile skill size and references
 

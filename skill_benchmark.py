@@ -4617,6 +4617,15 @@ def audit_manifest(args: argparse.Namespace) -> int:
             write_json(Path(args.out), report)
         else:
             print(json.dumps(report, indent=2, ensure_ascii=False))
+    # CI gate: non-zero exit when the readiness blockers are non-empty, so a skill
+    # repo can keep its eval suite at "worth paying to run" the same way it keeps
+    # tests green. Off by default — the audit stays a report unless asked to gate.
+    blockers = report.get("readiness", {}).get("blockers", [])
+    if getattr(args, "fail_on_blockers", False) and blockers:
+        for b in blockers:
+            print(f"readiness blocker: {b}", file=sys.stderr)
+        print(f"audit-manifest: {len(blockers)} readiness blocker(s) for {report.get('skill_name')!r}", file=sys.stderr)
+        return 1
     return 0
 
 def main() -> int:
@@ -4778,6 +4787,7 @@ def main() -> int:
     p.add_argument("--min-trigger-pos", type=int, default=2)
     p.add_argument("--min-trigger-neg", type=int, default=2)
     p.add_argument("--leakage-min-chars", type=int, default=4)
+    p.add_argument("--fail-on-blockers", action="store_true", help="exit non-zero if the readiness block has any blockers (for CI gating of an eval suite)")
 
     p = sub.add_parser("materialize-ablations", help="Write real, ablated skill trees for declared materialized ablations")
     p.add_argument("manifest")
