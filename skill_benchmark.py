@@ -4354,6 +4354,53 @@ def fixture_recommendations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return recs[:6]
 
 
+LEAKABLE_POSITIVE_TYPES = {"contains", "contains_any", "contains_all", "regex"}
+
+
+def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str | None = None, leakage_min_chars: int = 4) -> dict[str, Any]:
+    """A compact, offline 'is this eval worth paying to run?' verdict. It collapses
+    the three things that decide whether a measured number will MEAN anything:
+    are the ablations real (materialized, not instruction-simulated), does any case
+    leak its whole answer into the prompt (so with_skill==without_skill by
+    construction), and is there adversarial coverage (the discriminating cases for a
+    robust skill). `blockers` is the punch list to drive to empty before spending
+    model budget."""
+    ablations = manifest.get("ablations", [])
+    materialized = sum(1 for a in ablations if ablation_components(a))
+    instr_sim = len(ablations) - materialized
+    leaked: dict[Any, set] = {}
+    for f in prompt_assertion_leakage_findings(manifest, manifest_path, min_chars=leakage_min_chars, split=split):
+        leaked.setdefault(f["case_id"], set()).add(f["assertion"])
+    leak_saturated: list[Any] = []
+    adversarial = judge_only = 0
+    for case in iter_cases(manifest, split):
+        if case.get("kind") == "adversarial":
+            adversarial += 1
+        asserts = case.get("assertions", []) or []
+        if asserts and all(a.get("type") == "judge" for a in asserts):
+            judge_only += 1
+        positive = [a for a in asserts if a.get("type") in LEAKABLE_POSITIVE_TYPES]
+        # A case is leak-saturated when EVERY positive objective assertion's value is
+        # already in the prompt — it can be passed by echoing the prompt, so it cannot
+        # tell a skill from no skill no matter how good the runner is.
+        if positive and all(assertion_label(a) in leaked.get(case.get("id"), set()) for a in positive):
+            leak_saturated.append(case.get("id"))
+    blockers: list[str] = []
+    if instr_sim:
+        blockers.append(f"{instr_sim}/{len(ablations)} ablation(s) are instruction-simulated (not blind / confirmation-gradeable) — materialize them")
+    if leak_saturated:
+        blockers.append(f"{len(leak_saturated)} case(s) are leak-saturated (every positive assertion value appears in the prompt) — they cannot discriminate skill from no-skill")
+    if adversarial == 0:
+        blockers.append("no adversarial cases (kind: adversarial) — add the near-miss/under-pressure cases where the skill must hold")
+    return {
+        "ablations": {"total": len(ablations), "materialized": materialized, "instruction_simulated": instr_sim},
+        "leak_saturated_cases": leak_saturated,
+        "adversarial_cases": adversarial,
+        "judge_only_cases": judge_only,
+        "blockers": blockers,
+    }
+
+
 def audit_manifest_report(
     manifest_path: Path,
     *,
@@ -4513,6 +4560,7 @@ def audit_manifest_report(
         "findings": findings,
         "recommendations": recommendations,
         "recommended_fixture_repos_files": fixtures,
+        "readiness": eval_readiness(manifest, manifest_path, split=split, leakage_min_chars=leakage_min_chars),
         "benchmark": benchmark_summary,
     }
 
@@ -4534,6 +4582,18 @@ def audit_manifest(args: argparse.Namespace) -> int:
         lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "", "| Metric | Value |", "|---|---:|"]
         for k, v in report["counts"].items():
             lines.append(f"| {k} | {v} |")
+        rd = report.get("readiness", {})
+        lines += ["", "## Readiness", "",
+                  f"- ablations materialized: {rd.get('ablations',{}).get('materialized',0)}/{rd.get('ablations',{}).get('total',0)} "
+                  f"(instruction-simulated: {rd.get('ablations',{}).get('instruction_simulated',0)})",
+                  f"- leak-saturated cases: {len(rd.get('leak_saturated_cases',[]))}",
+                  f"- adversarial cases: {rd.get('adversarial_cases',0)}   judge-only cases: {rd.get('judge_only_cases',0)}"]
+        if rd.get("blockers"):
+            lines.append("- **blockers before a paid run:**")
+            for b in rd["blockers"]:
+                lines.append(f"    - {b}")
+        else:
+            lines.append("- **ready**: no blockers ✓")
         lines += ["", "## Findings", ""]
         if report["findings"]:
             for f in report["findings"]:

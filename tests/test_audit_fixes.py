@@ -303,5 +303,41 @@ class InstructionSimulatedAblationAuditTests(unittest.TestCase):
             self.assertNotIn("ablation-instruction-simulated", kinds)
 
 
+class EvalReadinessTests(unittest.TestCase):
+    """audit-manifest emits a compact 'is this eval worth paying to run' verdict:
+    are the ablations real (materialized), does any case leak its whole answer into
+    the prompt, is there adversarial coverage. It turns the scattered findings into a
+    gate you can drive to green before spending model budget."""
+
+    def test_blockers_flag_instruction_simulated_leak_and_no_adversarial(self):
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"; _skill(rp)
+            cases = [{"id": "c1", "split": "tune", "kind": "positive",
+                      "prompt": "Please label this Blocking and move on.",
+                      "assertions": [{"name": "sev", "type": "contains", "value": "Blocking"}]}]
+            p = _manifest(rp, cases, ablations=[{"id": "no-x", "removed_component": "x", "expected_regressions": ["y"]}])
+            r = sb.audit_manifest_report(p)["readiness"]
+            self.assertEqual(r["ablations"]["instruction_simulated"], 1)
+            self.assertIn("c1", r["leak_saturated_cases"])         # the only positive assertion's value is in the prompt
+            self.assertEqual(r["adversarial_cases"], 0)
+            self.assertTrue(any("instruction-simulated" in b for b in r["blockers"]))
+            self.assertTrue(any("leak-saturated" in b for b in r["blockers"]))
+            self.assertTrue(any("adversarial" in b for b in r["blockers"]))
+
+    def test_clean_manifest_has_no_blockers(self):
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"; _skill(rp)   # SKILL.md has a '## Sev' section
+            cases = [{"id": "a1", "split": "tune", "kind": "adversarial",
+                      "prompt": "A tricky near-miss that should be handled with care.",
+                      "assertions": [{"name": "k", "type": "contains", "value": "token-not-in-the-prompt"}]}]
+            ab = {"id": "no-sev", "removed_component": "sev", "mechanism": "section", "class": "instructions",
+                  "target": {"heading": "## Sev"}, "expected_regressions": [{"summary": "x", "cases": ["a1"], "assertions": ["k"]}]}
+            r = sb.audit_manifest_report(_manifest(rp, cases, ablations=[ab]))["readiness"]
+            self.assertEqual(r["ablations"]["instruction_simulated"], 0)
+            self.assertEqual(r["leak_saturated_cases"], [])
+            self.assertGreaterEqual(r["adversarial_cases"], 1)
+            self.assertEqual(r["blockers"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
