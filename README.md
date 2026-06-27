@@ -128,6 +128,7 @@ skill-benchmark --help
 | `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
 | `TODO.md` | Remaining Jetty work: streaming/concurrency, live API validation, materialized ablations, judge export, and per-variant overrides. |
+| `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two materialized ablations, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per ablation; exercised by `tests/test_example_demo.py`. Start here. |
 | `examples/adewale-workspace/` | Adewale-specific runners for Pi smoke, trigger, ablation, and aggregate reports. |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
 

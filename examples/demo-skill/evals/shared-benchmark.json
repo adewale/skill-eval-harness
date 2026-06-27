@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "skill_name": "demo-reviewer",
+  "skill_paths": ["skills/demo/SKILL.md"],
+  "variants": ["with_skill", "without_skill"],
+  "notes": "Self-contained harness demo. Runs fully offline with examples/demo-skill/stub_runner.py as the 'model'. The two ablations each remove one load-bearing piece of the skill and confirm a regression on a distinct assertion.",
+  "cases": [
+    {
+      "id": "c-review",
+      "split": "tune",
+      "kind": "review",
+      "prompt": "Review this change: it adds a new HTTP endpoint with no test. Give me your review.",
+      "expected_behavior": [
+        "Label the finding's severity (Blocking / Minor / Clean).",
+        "Follow the review checklist and cite the file and line."
+      ],
+      "assertions": [
+        {"name": "severity-label", "type": "contains_any", "values": ["Blocking", "Minor", "Clean"]},
+        {"name": "cite-checklist", "type": "contains_any", "values": ["file and line"]}
+      ],
+      "tags": ["demo"]
+    }
+  ],
+  "ablations": [
+    {
+      "id": "no-severity",
+      "removed_component": "severity labeling rule",
+      "mechanism": "section",
+      "class": "instructions",
+      "target": {"heading": "## Severity rules"},
+      "expected_regressions": [
+        {"summary": "without the severity rule the reviewer stops labeling findings", "cases": ["c-review"], "assertions": ["severity-label"]}
+      ]
+    },
+    {
+      "id": "no-checklist",
+      "removed_component": "review checklist reference",
+      "mechanism": "reference",
+      "class": "resource",
+      "target": {"path": "references/checklist.md", "remove": "content"},
+      "expected_regressions": [
+        {"summary": "with the checklist content gone the reviewer stops citing file/line", "cases": ["c-review"], "assertions": ["cite-checklist"]}
+      ]
+    }
+  ]
+}
