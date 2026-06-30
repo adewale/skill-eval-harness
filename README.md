@@ -483,6 +483,27 @@ skill-benchmark token-overhead \
 
 If a repo has no paired trace metrics, the report still includes the static footprint and shows `0` runtime pairs.
 
+### Suite preflight / allowlisted multi-skill tiers
+
+Use `suite-run` before expensive model calls. It reads only an explicit suite file, rejects unrelated top-level manifests under the workspace root, verifies optional tree-hash pins, prints row estimates, and writes `RUN_SCOPE.json`.
+
+```bash
+skill-benchmark suite-run examples/adewale-workspace/all-manifests.txt \
+  --workspace-root ../updating_all_of_my_skills \
+  --pins examples/skill-pins.json \
+  --tier preflight \
+  --out-dir suite-runs/preflight
+
+skill-benchmark suite-run examples/adewale-workspace/all-manifests.txt \
+  --workspace-root ../updating_all_of_my_skills \
+  --pins examples/skill-pins.json \
+  --tier prepare \
+  --include-ablations \
+  --out-dir suite-runs/prepare
+```
+
+Non-model tiers are `preflight`, `static`, `prepare`, and `jetty-dry-run`. By default, a stray manifest such as `beautiful-mermaid/evals/shared-benchmark.json` fails the run instead of silently entering the matrix; pass `--allow-extra-manifests` only for exploratory audits.
+
 ### Aggregate many skills
 
 ```bash
