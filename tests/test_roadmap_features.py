@@ -1097,6 +1097,148 @@ class IterationWorkflowTests(unittest.TestCase):
         self.assertIn("resolved_flags", html_text)
 
 
+def report_fixture(case_rates: dict[str, tuple[float, float]], *, failures: list[dict] | None = None) -> dict:
+    """A minimal benchmark-report shape: {case: (with_rate, without_rate)}."""
+    results = []
+    for case_id, (w, n) in case_rates.items():
+        for variant, rate in [("with_skill", w), ("without_skill", n)]:
+            results.append({
+                "case_id": case_id, "variant": variant, "run_number": 1, "missing_output": False,
+                "execution_valid": True, "objective_pass_rate": rate, "metadata": {},
+                "assertions": [], "qualitative_assertions": [],
+            })
+    for f in failures or []:
+        results.append(f)
+    flags = []
+    for case_id, (w, n) in case_rates.items():
+        fl = []
+        if w == 1 and n == 1:
+            fl.append("saturated/non-discriminating")
+        if w <= n:
+            fl.append("no objective lift")
+        if fl:
+            flags.append({"case_id": case_id, "flags": fl, "with_skill": w, "without_skill": n})
+    paired = {
+        "with_skill_objective_pass_rate": statistics_mean([w for w, _ in case_rates.values()]),
+        "without_skill_objective_pass_rate": statistics_mean([n for _, n in case_rates.values()]),
+    }
+    paired["absolute_delta"] = paired["with_skill_objective_pass_rate"] - paired["without_skill_objective_pass_rate"]
+    return {"generated_at": 1, "summary": {}, "paired_summary": paired, "case_flags": flags, "results": results}
+
+
+def statistics_mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+class TrendTrackingTests(unittest.TestCase):
+    """2.6 — history store, series, diffs, severity-weighted ranking."""
+
+    def test_history_append_and_ordering(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            history = root / "history"
+            for i, rates in enumerate([{"c1": (0.5, 0.5)}, {"c1": (1.0, 0.5)}], 1):
+                report_path = root / f"b{i}.json"
+                report_path.write_text(json.dumps(report_fixture(rates)), encoding="utf-8")
+                sb.append_history_report(history, report_path)
+            entries = sb.load_history_reports(history)
+            self.assertEqual([label for label, _ in entries], ["run-001.json", "run-002.json"])
+            trend_report = sb.build_trend_report(entries)
+        self.assertEqual(trend_report["runs"], 2)
+        self.assertEqual(trend_report["series"][0]["lift"], 0.0)
+        self.assertEqual(trend_report["series"][1]["lift"], 0.5)
+        self.assertEqual(len(trend_report["diffs"]), 1)
+        self.assertTrue(trend_report["diffs"][0]["diff"]["case_deltas"])
+
+    def test_severity_weighted_ranking(self):
+        # A critical failure in 1 of 2 runs (0.5 x 3 = 1.5) outranks a soft
+        # failure in 2 of 2 runs (1.0 x 1 = 1.0).
+        fail_critical = {"case_id": "c-crit", "variant": "with_skill", "missing_output": False, "execution_valid": True,
+                         "objective_pass_rate": 0.0, "metadata": {},
+                         "assertions": [{"name": "guard", "passed": False, "severity": "critical"}], "qualitative_assertions": []}
+        fail_soft = {"case_id": "c-soft", "variant": "with_skill", "missing_output": False, "execution_valid": True,
+                     "objective_pass_rate": 1.0, "metadata": {},
+                     "assertions": [{"name": "styling", "passed": False, "severity": "soft"}], "qualitative_assertions": []}
+        run1 = {"results": [fail_critical, fail_soft]}
+        run2 = {"results": [fail_soft]}
+        ranked = sb.severity_weighted_failures([run1, run2])
+        self.assertEqual(ranked[0]["assertion"], "guard")
+        self.assertEqual(ranked[0]["rank"], 1.5)
+        self.assertEqual(ranked[1]["assertion"], "styling")
+        self.assertEqual(ranked[1]["rank"], 1.0)
+
+
+class StalenessPruneTests(unittest.TestCase):
+    """1.9 — flat-forever cases become prune candidates; one run never flags."""
+
+    def test_always_flat_case_is_flagged_and_discriminating_case_is_not(self):
+        flat_then_flat = [report_fixture({"c-flat": (1.0, 1.0), "c-live": (1.0, 0.0)}),
+                          report_fixture({"c-flat": (1.0, 1.0), "c-live": (1.0, 1.0)})]
+        candidates = sb.stale_case_candidates(flat_then_flat)
+        self.assertEqual([c["case_id"] for c in candidates], ["c-flat"])
+        self.assertEqual(candidates[0]["runs_observed"], 2)
+
+    def test_single_run_never_flags(self):
+        self.assertEqual(sb.stale_case_candidates([report_fixture({"c-flat": (1.0, 1.0)})]), [])
+
+    def test_trend_report_carries_prune_candidates(self):
+        entries = [("run-001.json", report_fixture({"c-flat": (1.0, 1.0)})),
+                   ("run-002.json", report_fixture({"c-flat": (1.0, 1.0)}))]
+        self.assertEqual(sb.build_trend_report(entries)["prune_candidates"][0]["case_id"], "c-flat")
+
+
+class LivingEvalLoopTests(unittest.TestCase):
+    """2.10 — flags become candidate seeds; generation is opt-in and mocked;
+    a candidate never enters a manifest on its own."""
+
+    def setup_repo(self, root: Path) -> tuple[Path, Path]:
+        manifest = base_manifest()
+        path = write_manifest(root, manifest)
+        report = report_fixture({"case-1": (1.0, 1.0)})
+        report_path = root / "benchmark.json"
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        return path, report_path
+
+    def test_flag_to_candidate_selection_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as td:
+            path, report_path = self.setup_repo(Path(td))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            manifest = sb.validate_manifest(path)
+            seeds = sb.suggest_case_candidates(report, manifest)
+        self.assertEqual(len(seeds), 1)
+        self.assertEqual(seeds[0]["case_id"], "case-1")
+        self.assertIn("saturated/non-discriminating", seeds[0]["flags"])
+        self.assertEqual(seeds[0]["prompt"], "Do the task.")
+
+    def test_generation_is_mocked_and_manifest_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path, report_path = self.setup_repo(root)
+            manifest_bytes = path.read_bytes()
+            out = root / "candidates.json"
+            args = SimpleNamespace(
+                benchmark=str(report_path), manifest=str(path),
+                generate_cmd="python3 -c \"import sys,json; json.load(sys.stdin); print(json.dumps({'prompt': 'harder variant', 'rationale': 'raise difficulty'}))\"",
+                timeout=30, out=str(out))
+            rc = sb.suggest_cases(args)
+            self.assertEqual(rc, 0)
+            doc = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(doc["candidates"][0]["generated"]["prompt"], "harder variant")
+            self.assertIn("never edits", doc["note"])
+            self.assertEqual(path.read_bytes(), manifest_bytes)   # manifest untouched
+
+    def test_without_generate_cmd_candidates_are_seeds_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path, report_path = self.setup_repo(root)
+            out = root / "candidates.json"
+            args = SimpleNamespace(benchmark=str(report_path), manifest=str(path), generate_cmd=None, timeout=30, out=str(out))
+            sb.suggest_cases(args)
+            doc = json.loads(out.read_text(encoding="utf-8"))
+        self.assertNotIn("generated", doc["candidates"][0])
+        self.assertIn("instruction", doc["candidates"][0])
+
+
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 

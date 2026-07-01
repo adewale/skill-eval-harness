@@ -5547,6 +5547,191 @@ def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
         server.server_close()
 
 
+SEVERITY_WEIGHT = {"critical": 3.0, "gate": 2.0, "soft": 1.0}
+
+
+def load_history_reports(history: Path) -> list[tuple[str, dict[str, Any]]]:
+    """The append-only history store (roadmap 2.6): run-<seq>.json files under
+    one directory, ordered by sequence number."""
+    entries = []
+    if history.is_dir():
+        for child in history.iterdir():
+            m = re.fullmatch(r"run-(\d+)\.json", child.name)
+            if child.is_file() and m:
+                entries.append((int(m.group(1)), child.name, load_json(child)))
+    return [(name, report) for _, name, report in sorted(entries)]
+
+
+def append_history_report(history: Path, report_path: Path) -> Path:
+    existing = load_history_reports(history)
+    seq = 1
+    if existing:
+        seq = max(int(re.fullmatch(r"run-(\d+)\.json", name).group(1)) for name, _ in existing) + 1
+    history.mkdir(parents=True, exist_ok=True)
+    dest = history / f"run-{seq:03d}.json"
+    dest.write_text(Path(report_path).read_text(encoding="utf-8"), encoding="utf-8")
+    return dest
+
+
+def trend_entry(label: str, report: dict[str, Any]) -> dict[str, Any]:
+    paired = report.get("paired_summary", {}) or {}
+    flags = report.get("case_flags", []) or []
+    return {
+        "label": label,
+        "generated_at": report.get("generated_at"),
+        "with_skill": paired.get("with_skill_objective_pass_rate"),
+        "without_skill": paired.get("without_skill_objective_pass_rate"),
+        "lift": paired.get("absolute_delta"),
+        "saturated_cases": sum(1 for f in flags for x in f.get("flags", []) if "saturated" in x),
+        "flagged_cases": len(flags),
+        "median_total_tokens": {v: block.get("median_total_tokens") for v, block in (report.get("summary") or {}).items()},
+    }
+
+
+def severity_weighted_failures(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Recurring failures ranked by prevalence x severity (roadmap 2.6): a rare
+    critical failure outranks a common trivial one — the floor-raising
+    principle made quantitative."""
+    appearances: dict[tuple, int] = {}
+    for report in reports:
+        seen: set[tuple] = set()
+        for r in report.get("results", []):
+            for a in r.get("assertions", []) + r.get("qualitative_assertions", []):
+                if a.get("passed"):
+                    continue
+                key = (r.get("case_id"), str(a.get("name")), a.get("severity", "gate"))
+                seen.add(key)
+        for key in seen:
+            appearances[key] = appearances.get(key, 0) + 1
+    total_runs = max(1, len(reports))
+    ranked = []
+    for (case_id, name, severity), count in appearances.items():
+        prevalence = count / total_runs
+        weight = SEVERITY_WEIGHT.get(str(severity), 1.0)
+        ranked.append({
+            "case_id": case_id,
+            "assertion": name,
+            "severity": severity,
+            "prevalence": round(prevalence, 4),
+            "rank": round(prevalence * weight, 4),
+        })
+    return sorted(ranked, key=lambda row: (-row["rank"], str(row["case_id"]), row["assertion"]))
+
+
+def stale_case_candidates(reports: list[dict[str, Any]], *, min_runs: int = 2) -> list[dict[str, Any]]:
+    """Staleness hygiene (roadmap 1.9), the inverse of the saturation flag: a
+    case that across the whole history never failed and never discriminated
+    (with == without == 1.0 every time) is a prune CANDIDATE. The harness
+    suggests, never deletes — and a single run never flags anything."""
+    observations: dict[str, list[tuple[float, float]]] = {}
+    for report in reports:
+        by_case: dict[str, dict[str, list[float]]] = {}
+        for r in report.get("results", []):
+            rate = r.get("objective_pass_rate")
+            if rate is None or r.get("variant") not in {"with_skill", "without_skill"}:
+                continue
+            by_case.setdefault(r["case_id"], {}).setdefault(r["variant"], []).append(rate)
+        for case_id, arms in by_case.items():
+            if "with_skill" in arms and "without_skill" in arms:
+                observations.setdefault(case_id, []).append(
+                    (statistics.mean(arms["with_skill"]), statistics.mean(arms["without_skill"])))
+    candidates = []
+    for case_id, pairs in sorted(observations.items()):
+        if len(pairs) < min_runs:
+            continue
+        if all(w == 1.0 and n == 1.0 for w, n in pairs):
+            candidates.append({"case_id": case_id, "runs_observed": len(pairs), "reason": "never failed and never showed lift across the history"})
+    return candidates
+
+
+def build_trend_report(history_entries: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    series = [trend_entry(label, report) for label, report in history_entries]
+    diffs = []
+    for (prev_label, prev), (curr_label, curr) in zip(history_entries, history_entries[1:]):
+        diffs.append({"from": prev_label, "to": curr_label, "diff": benchmark_report_diff(prev, curr)})
+    reports = [report for _, report in history_entries]
+    return {
+        "runs": len(series),
+        "series": series,
+        "diffs": diffs,
+        "recurring_failures": severity_weighted_failures(reports)[:50],
+        "prune_candidates": stale_case_candidates(reports),
+    }
+
+
+def trend(args: argparse.Namespace) -> int:
+    history = Path(args.history)
+    if getattr(args, "add", None):
+        dest = append_history_report(history, Path(args.add))
+        print(f"appended {dest}")
+    entries = load_history_reports(history)
+    report = build_trend_report(entries)
+    if args.out:
+        write_json(Path(args.out), report)
+    else:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0
+
+
+def suggest_case_candidates(report: dict[str, Any], manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """The deterministic half of the living-eval loop (roadmap 2.10): saturated
+    and no-lift flags select the cases that stopped discriminating; each yields
+    a candidate SEED for a harder variant. Generation is a separate, opt-in,
+    model-backed step — and a candidate never enters a manifest on its own."""
+    cases = case_by_id(manifest)
+    seeds = []
+    for flag in report.get("case_flags", []):
+        reasons = [f for f in flag.get("flags", []) if "saturated" in f or "no objective lift" in f]
+        if not reasons:
+            continue
+        case = cases.get(flag.get("case_id"), {})
+        seeds.append({
+            "case_id": flag.get("case_id"),
+            "flags": reasons,
+            "prompt": case.get("prompt"),
+            "assertions": [assertion_label(a) for a in case.get("assertions", [])],
+            "instruction": (
+                "Propose ONE harder variant of this case: same domain and oracle style, "
+                "solvable with the skill but likely to fail without it. Do not leak assertion "
+                "values into the prompt. Return JSON {\"prompt\": ..., \"rationale\": ...}."
+            ),
+        })
+    return seeds
+
+
+def suggest_cases(args: argparse.Namespace) -> int:
+    report = load_json(Path(args.benchmark))
+    manifest = validate_manifest(Path(args.manifest))
+    seeds = suggest_case_candidates(report, manifest)
+    generate_cmd = getattr(args, "generate_cmd", None)
+    candidates = []
+    for seed in seeds:
+        candidate = dict(seed)
+        if generate_cmd:
+            proc = subprocess.run(generate_cmd, shell=True, input=json.dumps(seed), text=True, capture_output=True, timeout=float(getattr(args, "timeout", 120)))
+            if proc.returncode == 0:
+                try:
+                    candidate["generated"] = extract_json_object(proc.stdout)
+                except ValueError:
+                    candidate["generation_error"] = "generator emitted no JSON object"
+            else:
+                candidate["generation_error"] = f"generator exit {proc.returncode}"
+        candidates.append(candidate)
+    output = {
+        "candidates": candidates,
+        "note": (
+            "Candidates are proposals, never additions: a case earns its place by "
+            "discriminating (representativeness guard). Review before adding to a manifest; "
+            "this command never edits one."
+        ),
+    }
+    if args.out:
+        write_json(Path(args.out), output)
+    else:
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+    return 0
+
+
 def render_viewer(args: argparse.Namespace) -> int:
     report = load_json(Path(args.benchmark))
     runs_root = Path(args.runs) if args.runs else None
@@ -6804,6 +6989,18 @@ def main() -> int:
     p.add_argument("--results", required=True)
     p.add_argument("--out")
 
+    p = sub.add_parser("trend", help="append-only history of benchmark reports: series, successive diffs, severity-weighted recurring failures, prune candidates")
+    p.add_argument("--history", required=True, help="history directory of run-<seq>.json reports")
+    p.add_argument("--add", help="append this benchmark.json to the history before reporting")
+    p.add_argument("--out")
+
+    p = sub.add_parser("suggest-cases", help="living-eval loop: turn saturated/no-lift flags into harder-case candidates (generation opt-in via --generate-cmd; never edits a manifest)")
+    p.add_argument("--benchmark", required=True, help="benchmark.json with case_flags")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--generate-cmd", help="shell command: candidate seed JSON on stdin, {prompt, rationale} JSON on stdout (model-backed, opt-in)")
+    p.add_argument("--timeout", type=float, default=120)
+    p.add_argument("--out")
+
     p = sub.add_parser("render-viewer")
     p.add_argument("--benchmark", required=True)
     p.add_argument("--runs")
@@ -6922,6 +7119,10 @@ def main() -> int:
         return compare_tasks(args)
     if args.cmd == "compare-results":
         return compare_results(args)
+    if args.cmd == "trend":
+        return trend(args)
+    if args.cmd == "suggest-cases":
+        return suggest_cases(args)
     if args.cmd == "render-viewer":
         return render_viewer(args)
     if args.cmd == "profile-skill":
