@@ -346,6 +346,185 @@ class MultiModelFanOutTests(unittest.TestCase):
         self.assertEqual(report["paired_summary"]["absolute_delta"], 1.0)
 
 
+class GradedScoringSeverityTests(unittest.TestCase):
+    """2.2 — graded scoring, three-tier severity, veto, and statistical lift."""
+
+    def grade(self, case: dict, output: str, judge_results: dict | None = None, strict: bool = False) -> dict:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text(output, encoding="utf-8")
+            result, _ = sb.grade_case_variant(
+                case, "with_skill", output, base / "output.md", {},
+                run_base=base, judge_results=judge_results or {}, strict=strict)
+        return result
+
+    def behavior_case(self, assertions: list[dict], **extra) -> dict:
+        return {"id": "case-x", "split": "tune", "kind": "behavior", "prompt": "p", "assertions": assertions, **extra}
+
+    def test_default_severities_keep_binary_behavior(self):
+        case = self.behavior_case([
+            {"name": "a", "type": "contains", "value": "alpha"},
+            {"name": "b", "type": "contains", "value": "beta"},
+        ])
+        result = self.grade(case, "alpha only")
+        self.assertEqual(result["objective_total"], 2)
+        self.assertEqual(result["objective_pass_rate"], 0.5)
+        self.assertFalse(result["vetoed"])
+        self.assertEqual([a["severity"] for a in result["assertions"]], ["gate", "gate"])
+
+    def test_soft_assertion_leaves_pass_rate_and_fills_scored_bucket(self):
+        case = self.behavior_case([
+            {"name": "hard", "type": "contains", "value": "alpha"},
+            {"name": "nice", "type": "contains", "value": "beta", "severity": "soft"},
+        ])
+        result = self.grade(case, "alpha only")
+        self.assertEqual(result["objective_total"], 1)   # soft left the denominator
+        self.assertEqual(result["objective_pass_rate"], 1.0)
+        self.assertEqual(result["soft_total"], 1)
+        self.assertEqual(result["graded_score"], 0.0)    # the miss shows up as a low score
+
+    def test_strict_promotes_soft_to_gate(self):
+        case = self.behavior_case([
+            {"name": "hard", "type": "contains", "value": "alpha"},
+            {"name": "nice", "type": "contains", "value": "beta", "severity": "soft"},
+        ])
+        result = self.grade(case, "alpha only", strict=True)
+        self.assertEqual(result["objective_total"], 2)
+        self.assertEqual(result["objective_pass_rate"], 0.5)
+
+    def test_critical_failure_vetoes_case_and_withholds_graded_score(self):
+        case = self.behavior_case([
+            {"name": "no-stray-writes", "type": "excludes_any", "values": ["WROTE OUTSIDE RESULTS"], "severity": "critical"},
+            {"name": "drama", "type": "contains", "value": "drama", "severity": "soft"},
+            {"name": "core", "type": "contains", "value": "alpha"},
+        ])
+        result = self.grade(case, "alpha drama WROTE OUTSIDE RESULTS")
+        self.assertTrue(result["vetoed"])
+        self.assertEqual(result["critical_failures"], ["no-stray-writes"])
+        self.assertEqual(result["objective_pass_rate"], 0.0)   # veto, despite core+drama passing
+        self.assertEqual(result["combined_pass_rate"], 0.0)
+        self.assertIsNone(result["graded_score"])              # no graded mean absorbs a catastrophe
+
+    def test_passing_critical_assertion_counts_normally(self):
+        case = self.behavior_case([
+            {"name": "no-stray-writes", "type": "excludes_any", "values": ["WROTE OUTSIDE RESULTS"], "severity": "critical"},
+            {"name": "core", "type": "contains", "value": "alpha"},
+        ])
+        result = self.grade(case, "alpha, clean run")
+        self.assertFalse(result["vetoed"])
+        self.assertEqual(result["objective_pass_rate"], 1.0)
+
+    def test_at_least_floor_decides_scored_assertion(self):
+        case = self.behavior_case([{"name": "scored", "type": "contains", "value": "alpha", "atLeast": 0.5}])
+        result = self.grade(case, "no match")
+        self.assertEqual(result["assertions"][0]["severity"], "soft")   # atLeast implies soft
+        self.assertFalse(result["assertions"][0]["passed"])             # 0.0 < 0.5
+
+    def test_graded_dimensions_judge_merge(self):
+        assertion = {
+            "name": "poster-quality", "type": "judge",
+            "graded_dimensions": [
+                {"name": "drama", "scale": "1-5", "rubric": "5 = one dominant element; 1 = uniform grid"},
+                {"name": "hierarchy", "scale": "1-5", "rubric": "5 = obvious reading order; 1 = flat"},
+            ],
+        }
+        case = self.behavior_case([assertion])
+        jid = sb.judge_task_id("case-x", "with_skill", 1, assertion)
+        judged = {jid: {"judge_task_id": jid, "dimension_scores": {"drama": 5, "hierarchy": 4}, "rationale": "strong"}}
+        result = self.grade(case, "poster text", judge_results=judged)
+        entry = result["qualitative_assertions"][0]
+        self.assertEqual(entry["dimension_scores"], {"drama": 5.0, "hierarchy": 4.0})
+        self.assertAlmostEqual(entry["score"], 0.875)   # mean of (5→1.0, 4→0.75)
+        self.assertTrue(entry["passed"])                # >= default threshold 4 (0.75)
+        self.assertIn("dimension scores", entry["evidence"])
+        self.assertEqual(result["graded_score"], 0.875)
+
+    def test_graded_dimensions_below_threshold_fail(self):
+        assertion = {"name": "q", "type": "judge", "graded_dimensions": [{"name": "d", "rubric": "anchored"}]}
+        case = self.behavior_case([assertion])
+        jid = sb.judge_task_id("case-x", "with_skill", 1, assertion)
+        judged = {jid: {"judge_task_id": jid, "dimension_scores": {"d": 2}}}
+        result = self.grade(case, "text", judge_results=judged)
+        self.assertFalse(result["qualitative_assertions"][0]["passed"])
+
+    def test_dynamic_rubric_minimum_criteria_cutoff(self):
+        assertion = {"name": "dyn", "type": "judge", "dynamic_rubric": {"instruction": "draft criteria", "minimum_criteria": 3}}
+        case = self.behavior_case([assertion])
+        jid = sb.judge_task_id("case-x", "with_skill", 1, assertion)
+        met3 = {jid: {"criteria": [{"name": "a", "met": True}, {"name": "b", "met": True}, {"name": "c", "met": True}, {"name": "d", "met": False}]}}
+        met2 = {jid: {"criteria": [{"name": "a", "met": True}, {"name": "b", "met": True}, {"name": "c", "met": False}, {"name": "d", "met": False}]}}
+        self.assertTrue(self.grade(case, "t", judge_results=met3)["qualitative_assertions"][0]["passed"])
+        self.assertFalse(self.grade(case, "t", judge_results=met2)["qualitative_assertions"][0]["passed"])
+
+    def test_reference_floor_flags_low_dimension(self):
+        assertion = {"name": "q", "type": "judge", "graded_dimensions": [{"name": "drama", "rubric": "anchored"}, {"name": "craft", "rubric": "anchored"}]}
+        case = self.behavior_case([assertion], reference_graded_score=4)
+        jid = sb.judge_task_id("case-x", "with_skill", 1, assertion)
+        judged = {jid: {"dimension_scores": {"drama": 5, "craft": 2}}}
+        result = self.grade(case, "t", judge_results=judged)
+        self.assertIn("q:craft", result["below_reference_floor"])
+
+    def test_sign_flip_significance_known_pairs(self):
+        significant = sb.sign_flip_significance([1.0] * 8)
+        flat = sb.sign_flip_significance([0.0] * 8)
+        mixed = sb.sign_flip_significance([0.5, -0.5, 0.25, -0.25])
+        self.assertEqual(significant["method"], "sign-flip-exact")
+        self.assertLessEqual(significant["p_value"], 0.05)
+        self.assertTrue(significant["significant_at_0_05"])
+        self.assertEqual(flat["p_value"], 1.0)
+        self.assertGreater(mixed["p_value"], 0.05)
+
+    def test_sign_flip_sampled_is_deterministic(self):
+        deltas = [0.1 * (1 if i % 3 else -1) for i in range(20)]
+        self.assertEqual(sb.sign_flip_significance(deltas), sb.sign_flip_significance(deltas))
+        self.assertEqual(sb.sign_flip_significance(deltas)["method"], "sign-flip-sampled")
+
+    def test_paired_summary_carries_significance_and_graded_channel(self):
+        results = []
+        for case_id in ["c1", "c2", "c3"]:
+            for variant, rate, graded in [("with_skill", 1.0, 0.9), ("without_skill", 0.0, 0.3)]:
+                results.append({
+                    "case_id": case_id, "variant": variant, "run_number": 1, "missing_output": False,
+                    "execution_valid": True, "objective_pass_rate": rate, "graded_score": graded, "metadata": {},
+                })
+        paired = sb.build_paired_summary(results)
+        self.assertEqual(paired["absolute_delta"], 1.0)
+        self.assertIn("significance", paired)
+        self.assertEqual(paired["significance"]["n"], 3)
+        self.assertAlmostEqual(paired["graded"]["delta"], 0.6)
+        self.assertIn("significance", paired["graded"])
+
+    def test_validation_rejects_bad_shapes(self):
+        bad_shapes = [
+            {"assertions": [{"type": "contains", "value": "x", "severity": "fatal"}]},
+            {"assertions": [{"type": "judge", "graded_dimensions": []}]},
+            {"assertions": [{"type": "judge", "graded_dimensions": [{"name": "d"}]}]},
+            {"assertions": [{"type": "judge", "dynamic_rubric": {"minimum_criteria": 3}}]},
+            {"assertions": [{"type": "contains", "value": "x"}], "reference_score": 2},
+        ]
+        for shape in bad_shapes:
+            manifest = base_manifest()
+            manifest["cases"][0].update(shape)
+            with tempfile.TemporaryDirectory() as td:
+                path = write_manifest(Path(td), manifest)
+                with self.assertRaises(SystemExit, msg=json.dumps(shape)):
+                    sb.validate_manifest(path)
+
+    def test_unchanged_binary_manifest_grades_identically(self):
+        # The regression the spec requires: a version-1 manifest with no
+        # severity/score fields must produce the same pass rates as before 2.2.
+        case = self.behavior_case([
+            {"name": "a", "type": "contains", "value": "alpha"},
+            {"name": "q", "type": "judge", "rubric": ["complete"]},
+        ])
+        result = self.grade(case, "alpha")
+        self.assertEqual(result["objective_passed"], 1)
+        self.assertEqual(result["objective_total"], 1)
+        self.assertEqual(result["objective_pass_rate"], 1.0)
+        self.assertEqual(result["combined_pass_rate"], 1.0)
+        self.assertEqual(result["deferred_judge_tasks"], 1)
+
+
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 

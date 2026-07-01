@@ -83,6 +83,32 @@ EFFICIENCY_ASSERTIONS = {
 }
 OBJECTIVE_ASSERTIONS = TEXT_ASSERTIONS | PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS
 QUALITATIVE_ASSERTIONS = {"judge", "rubric"}
+SEVERITIES = {"critical", "gate", "soft"}
+# Below this graded mean, an objectively saturated case is flagged
+# structurally-pass-but-forgettable (roadmap 2.2): competent, but low-scoring.
+FORGETTABLE_GRADED_THRESHOLD = 0.75
+
+
+def assertion_severity(assertion: dict[str, Any], *, strict: bool = False) -> str:
+    """Three-tier severity (roadmap 2.2). Explicit `severity` (or the
+    `critical`/`gate`/`soft` boolean shorthands, or an `atLeast` score floor)
+    wins; the default keeps current behavior — objective assertions are gates,
+    qualitative and scored kinds are soft. `strict` promotes soft to gate."""
+    severity = assertion.get("severity")
+    if severity not in SEVERITIES:
+        if assertion.get("critical") is True:
+            severity = "critical"
+        elif assertion.get("gate") is True:
+            severity = "gate"
+        elif assertion.get("soft") is True or "atLeast" in assertion:
+            severity = "soft"
+        elif assertion.get("type") in QUALITATIVE_ASSERTIONS or assertion.get("type") == "similarity":
+            severity = "soft"
+        else:
+            severity = "gate"
+    if strict and severity == "soft":
+        severity = "gate"
+    return severity
 
 
 def die(msg: str) -> None:
@@ -274,6 +300,12 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             assertions = []
         if not isinstance(assertions, list):
             die(f"{cid}: assertions must be a list")
+        floor = case.get("reference_score")
+        if floor is not None and (not isinstance(floor, (int, float)) or not 0 <= float(floor) <= 1):
+            die(f"{cid}: reference_score must be a number in [0, 1]")
+        graded_floor = case.get("reference_graded_score")
+        if graded_floor is not None and (not isinstance(graded_floor, (int, float)) or not 1 <= float(graded_floor) <= 5):
+            die(f"{cid}: reference_graded_score must be a number on the 1-5 scale")
         for j, assertion in enumerate(assertions):
             if not isinstance(assertion, dict):
                 die(f"{cid}: assertion #{j} must be an object")
@@ -281,6 +313,27 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             atype = assertion.get("type")
             if atype not in OBJECTIVE_ASSERTIONS | QUALITATIVE_ASSERTIONS:
                 die(f"{cid}: assertion #{j} has unsupported type {atype!r}")
+            severity = assertion.get("severity")
+            if severity is not None and severity not in SEVERITIES:
+                die(f"{cid}: assertion #{j} severity must be one of {sorted(SEVERITIES)}")
+            if "atLeast" in assertion and not isinstance(assertion.get("atLeast"), (int, float)):
+                die(f"{cid}: assertion #{j} atLeast must be a number")
+            dims = assertion.get("graded_dimensions")
+            if dims is not None:
+                if not isinstance(dims, list) or not dims:
+                    die(f"{cid}: assertion #{j} graded_dimensions must be a non-empty list")
+                for k, dim in enumerate(dims):
+                    if not isinstance(dim, dict) or not isinstance(dim.get("name"), str) or not dim.get("name"):
+                        die(f"{cid}: assertion #{j} graded_dimensions[{k}] needs a string name")
+                    if not isinstance(dim.get("rubric"), str) or not dim.get("rubric"):
+                        die(f"{cid}: assertion #{j} graded_dimensions[{k}] needs an anchored string rubric")
+            dyn = assertion.get("dynamic_rubric")
+            if dyn is not None:
+                if not isinstance(dyn, dict) or not isinstance(dyn.get("instruction"), str) or not dyn.get("instruction"):
+                    die(f"{cid}: assertion #{j} dynamic_rubric needs a string instruction")
+                minimum = dyn.get("minimum_criteria", 3)
+                if not isinstance(minimum, int) or minimum < 1:
+                    die(f"{cid}: assertion #{j} dynamic_rubric.minimum_criteria must be a positive integer")
             if atype in {"regex", "not_regex"}:
                 pattern = str(assertion.get("pattern", assertion.get("value", "")))
                 try:
@@ -3182,6 +3235,7 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
 
     passed = False
     evidence = ""
+    score: float | None = None   # scored detectors set a real value; binary ones mirror passed
     if atype in PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS:
         passed, evidence = process_or_efficiency_assertion_result(assertion, run_base, {})
     elif atype == "contains":
@@ -3242,7 +3296,11 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
             passed, evidence = run_script_assertion(assertion, run_base or output_path.parent, manifest_dir)
     else:
         evidence = "qualitative/deferred"
-    return {"name": name, "type": atype, "passed": passed, "evidence": evidence}
+    if score is not None and isinstance(assertion.get("atLeast"), (int, float)):
+        # A scored assertion with an explicit floor: the floor decides passed.
+        passed = score >= float(assertion["atLeast"])
+        evidence += f" (score={score:g}, atLeast={assertion['atLeast']:g})"
+    return {"name": name, "type": atype, "passed": passed, "evidence": evidence, "score": score if score is not None else (1.0 if passed else 0.0)}
 
 
 def assertion_label(assertion: dict[str, Any]) -> str:
@@ -3312,6 +3370,23 @@ def judge_prompt(task: dict[str, Any], output_text: str) -> str:
         "assertion": assertion,
         "candidate_output": output_text,
     }
+    if assertion.get("graded_dimensions"):
+        return (
+            "You are grading one Skill Eval Harness judge assertion with ANCHORED graded dimensions.\n"
+            "Score each dimension on its stated scale (default 1-5) strictly against its anchored rubric —\n"
+            "the anchors name what each score level looks like; score against the criteria, not a vibe.\n"
+            "Return only JSON with keys: dimension_scores (object mapping each dimension name to a number), rationale (string).\n\n"
+            + json.dumps(payload, indent=2, ensure_ascii=False)
+        )
+    if assertion.get("dynamic_rubric"):
+        minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
+        return (
+            "You are grading one Skill Eval Harness judge assertion with a DYNAMIC rubric.\n"
+            f"First draft 3-5 case-specific criteria per the assertion's instruction (at least {minimum}),\n"
+            "then grade the candidate output against each criterion you drafted.\n"
+            "Return only JSON with keys: criteria (list of {name (string), met (boolean)}), rationale (string).\n\n"
+            + json.dumps(payload, indent=2, ensure_ascii=False)
+        )
     return (
         "You are grading one Skill Eval Harness judge assertion.\n"
         "Return only JSON with keys: passed (boolean), score (number optional), rationale (string).\n\n"
@@ -3324,12 +3399,13 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
     selected_variants = variants or manifest.get("variants", DEFAULT_VARIANTS)
     tasks: list[dict[str, Any]] = []
     for case in iter_cases(manifest, split):
-        for variant in selected_variants:
-            for run_number, base in discover_run_bases(runs, case["id"], variant):
-                text, output_path = read_output_base(base)
-                meta = read_metadata_base(base)
-                _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={})
-                tasks.extend(judge_tasks)
+        for _model_name, model_root in discover_case_model_roots(runs, case["id"], selected_variants):
+            for variant in selected_variants:
+                for run_number, base in discover_run_bases_under(model_root / variant):
+                    text, output_path = read_output_base(base)
+                    meta = read_metadata_base(base)
+                    _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={})
+                    tasks.extend(judge_tasks)
     return tasks
 
 
@@ -3504,6 +3580,67 @@ def compare_judges(args: argparse.Namespace) -> int:
     return 0
 
 
+def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], jid: str) -> dict[str, Any]:
+    """Single owner for merging one judge verdict into a graded result row.
+    Three judge shapes (roadmap 2.2): plain verdict (passed/score+threshold),
+    anchored graded_dimensions (per-dimension 1-5 scores, normalized 0-1, pass
+    at the assertion threshold, default >= 4), and dynamic_rubric (the judge
+    drafts case-specific criteria and must meet at least minimum_criteria)."""
+    entry: dict[str, Any] = {
+        "name": assertion_label(assertion),
+        "type": assertion.get("type"),
+        "judge_task_id": jid,
+    }
+    evidence = judged.get("evidence", judged.get("rationale", judged.get("reasoning", "judge result supplied")))
+    dims = assertion.get("graded_dimensions")
+    dyn = assertion.get("dynamic_rubric")
+    if dims and isinstance(judged.get("dimension_scores"), dict):
+        raw = {str(k): float(v) for k, v in judged["dimension_scores"].items() if isinstance(v, (int, float))}
+        normalized = {k: max(0.0, min(1.0, (v - 1.0) / 4.0)) for k, v in raw.items()}
+        score = round(statistics.mean(normalized.values()), 4) if normalized else None
+        threshold_raw = assertion.get("threshold", 4)
+        threshold = max(0.0, min(1.0, (float(threshold_raw) - 1.0) / 4.0))
+        entry.update({
+            "passed": score is not None and score >= threshold,
+            "score": score,
+            "threshold": threshold,
+            "dimension_scores": raw,   # per-dimension scores stay in the row (and evidence)
+            "evidence": f"dimension scores (1-5): {json.dumps(raw, sort_keys=True)}; {evidence}",
+        })
+        return entry
+    if dyn and isinstance(judged.get("criteria"), list):
+        criteria = [c for c in judged["criteria"] if isinstance(c, dict)]
+        met = sum(1 for c in criteria if c.get("met"))
+        total = len(criteria)
+        minimum = max(1, int(dyn.get("minimum_criteria", 3)))
+        entry.update({
+            "passed": total >= minimum and met >= minimum,
+            "score": round(met / total, 4) if total else None,
+            "criteria_met": met,
+            "criteria_total": total,
+            "evidence": f"{met}/{total} dynamic criteria met (minimum {minimum}); {evidence}",
+        })
+        return entry
+    entry.update({
+        "passed": judge_verdict_passed(judged),
+        "score": judged.get("score"),
+        "evidence": evidence,
+    })
+    return entry
+
+
+def reference_floor(case: dict[str, Any]) -> float | None:
+    """Reference-anchor floor (roadmap 2.2), normalized to 0-1: an explicit
+    reference_score is already 0-1; reference_graded_score is on the 1-5 scale."""
+    value = case.get("reference_score")
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    value = case.get("reference_graded_score")
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, (float(value) - 1.0) / 4.0))
+    return None
+
+
 def grade_case_variant(
     case: dict[str, Any],
     variant: str,
@@ -3517,6 +3654,7 @@ def grade_case_variant(
     allow_scripts: bool = False,
     manifest_dir: Path | None = None,
     model: str | None = None,
+    strict: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     objective = []
     qualitative = []
@@ -3529,6 +3667,7 @@ def grade_case_variant(
         if not assertion_applies_to_variant(assertion, variant):
             continue
         atype = assertion.get("type")
+        severity = assertion_severity(assertion, strict=strict)
         if atype in QUALITATIVE_ASSERTIONS:
             # Judge-task emission honors THE scorable_run predicate, like every
             # other report view: a missing/infra-failed run is excluded from
@@ -3539,15 +3678,9 @@ def grade_case_variant(
             jid = judge_task_id(case["id"], variant, run_number, assertion)
             judged = judge_results.get(jid)
             if judged:
-                passed = judge_verdict_passed(judged)
-                qualitative.append({
-                    "name": assertion_label(assertion),
-                    "type": atype,
-                    "passed": passed,
-                    "score": judged.get("score"),
-                    "evidence": judged.get("evidence", judged.get("reasoning", "judge result supplied")),
-                    "judge_task_id": jid,
-                })
+                entry = merged_qualitative_entry(assertion, judged, jid)
+                entry["severity"] = severity
+                qualitative.append(entry)
             else:
                 judge_tasks.append({
                     "judge_task_id": jid,
@@ -3563,17 +3696,41 @@ def grade_case_variant(
                     "review_rubric": case.get("review_rubric", []),
                 })
         else:
-            objective.append(assertion_result(assertion, text, output_path, run_base=run_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir))
-    objective_passed = sum(1 for r in objective if r["passed"])
-    objective_total = len(objective)
-    process_rows = [r for r in objective if r.get("type") in PROCESS_ASSERTIONS]
-    efficiency_rows = [r for r in objective if r.get("type") in EFFICIENCY_ASSERTIONS]
+            entry = assertion_result(assertion, text, output_path, run_base=run_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir)
+            entry["severity"] = severity
+            objective.append(entry)
+    # Severity split (roadmap 2.2). The pass-rate channel is carried by gate and
+    # critical results (the default for every objective assertion, so binary
+    # manifests grade identically); soft results leave the denominator and fill
+    # the graded `scored` bucket instead. A failing critical assertion is the
+    # absorbing barrier: it VETOES the run — every rate collapses to 0.0 and the
+    # graded score is withheld, so no mean can average the catastrophe away.
+    gate_objective = [r for r in objective if r.get("severity") in {"gate", "critical"}]
+    soft_rows = [r for r in objective + qualitative if r.get("severity") == "soft"]
+    critical_rows = [r for r in objective + qualitative if r.get("severity") == "critical"]
+    critical_failures = [r["name"] for r in critical_rows if not r["passed"]]
+    vetoed = bool(critical_failures)
+    objective_passed = sum(1 for r in gate_objective if r["passed"])
+    objective_total = len(gate_objective)
+    process_rows = [r for r in gate_objective if r.get("type") in PROCESS_ASSERTIONS]
+    efficiency_rows = [r for r in gate_objective if r.get("type") in EFFICIENCY_ASSERTIONS]
     process_passed = sum(1 for r in process_rows if r["passed"])
     efficiency_passed = sum(1 for r in efficiency_rows if r["passed"])
     qualitative_passed = sum(1 for r in qualitative if r["passed"])
     qualitative_total = len(qualitative)
     combined_passed = objective_passed + qualitative_passed
     combined_total = objective_total + qualitative_total
+    soft_scores = [r["score"] for r in soft_rows if isinstance(r.get("score"), (int, float))]
+    graded_score = round(statistics.mean(soft_scores), 4) if soft_scores and not vetoed else None
+    floor = reference_floor(case)
+    below_floor: list[str] = []
+    if floor is not None:
+        for r in soft_rows:
+            if isinstance(r.get("score"), (int, float)) and r["score"] < floor:
+                below_floor.append(str(r["name"]))
+            for dim, raw in (r.get("dimension_scores") or {}).items():
+                if isinstance(raw, (int, float)) and (raw - 1.0) / 4.0 < floor:
+                    below_floor.append(f"{r['name']}:{dim}")
     result = {
         "case_id": case["id"],
         "split": case["split"],
@@ -3592,19 +3749,26 @@ def grade_case_variant(
         "execution_valid": exec_valid,
         "objective_passed": objective_passed,
         "objective_total": objective_total,
-        "objective_pass_rate": (objective_passed / objective_total) if objective_total else None,
+        "objective_pass_rate": (0.0 if vetoed else objective_passed / objective_total) if objective_total else (0.0 if vetoed else None),
         "process_passed": process_passed,
         "process_total": len(process_rows),
-        "process_pass_rate": (process_passed / len(process_rows)) if process_rows else None,
+        "process_pass_rate": (0.0 if vetoed else process_passed / len(process_rows)) if process_rows else None,
         "efficiency_passed": efficiency_passed,
         "efficiency_total": len(efficiency_rows),
-        "efficiency_pass_rate": (efficiency_passed / len(efficiency_rows)) if efficiency_rows else None,
+        "efficiency_pass_rate": (0.0 if vetoed else efficiency_passed / len(efficiency_rows)) if efficiency_rows else None,
         "qualitative_passed": qualitative_passed,
         "qualitative_total": qualitative_total,
-        "qualitative_pass_rate": (qualitative_passed / qualitative_total) if qualitative_total else None,
+        "qualitative_pass_rate": (0.0 if vetoed else qualitative_passed / qualitative_total) if qualitative_total else None,
         "combined_passed": combined_passed,
         "combined_total": combined_total,
-        "combined_pass_rate": (combined_passed / combined_total) if combined_total else None,
+        "combined_pass_rate": (0.0 if vetoed else combined_passed / combined_total) if combined_total else None,
+        "critical_total": len(critical_rows),
+        "critical_failures": critical_failures,
+        "vetoed": vetoed,
+        "soft_total": len(soft_rows),
+        "soft_passed": sum(1 for r in soft_rows if r["passed"]),
+        "graded_score": graded_score,
+        "below_reference_floor": below_floor,
         "assertions": objective,
         "qualitative_assertions": qualitative,
         "deferred_judge_tasks": len(judge_tasks),
@@ -3676,7 +3840,7 @@ def grade(args: argparse.Namespace) -> int:
                 for run_number, base in discover_run_bases_under(model_root / variant):
                     text, output_path = read_output_base(base)
                     meta = read_metadata_base(base)
-                    result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent, model=model_name)
+                    result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent, model=model_name, strict=getattr(args, "strict", False))
                     all_results.append(result)
                     all_judge_tasks.extend(judge_tasks)
     report = {
@@ -3759,7 +3923,41 @@ def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> f
     return ResultSet(rows).mean_rate(key)
 
 
-def paired_case_rates(results: list[dict[str, Any]]) -> tuple[list[float], list[float], list[dict[str, Any]]]:
+def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, samples: int = 4096) -> dict[str, Any]:
+    """Two-sided sign-flip permutation test over per-case paired deltas
+    (roadmap 2.2): under H0 (the skill does nothing) each case's delta is a
+    coin-flip of sign, so p = share of sign patterns whose |mean| reaches the
+    observed |mean|. Exact enumeration up to max_exact_n cases, then a SEEDED
+    sample — deterministic, so re-grading stays byte-identical (CF.3)."""
+    n = len(deltas)
+    if n == 0:
+        return {"method": "sign-flip", "n": 0, "observed_mean_delta": None, "p_value": None, "significant_at_0_05": False}
+    observed = statistics.mean(deltas)
+    if all(abs(d) < 1e-12 for d in deltas):
+        return {"method": "sign-flip", "n": n, "observed_mean_delta": 0.0, "p_value": 1.0, "significant_at_0_05": False}
+    target = abs(observed) - 1e-12
+    if n <= max_exact_n:
+        total = 1 << n
+        hits = 0
+        for mask in range(total):
+            s = sum(-d if (mask >> i) & 1 else d for i, d in enumerate(deltas))
+            if abs(s / n) >= target:
+                hits += 1
+        method = "sign-flip-exact"
+    else:
+        rng = random.Random(0)
+        total = samples
+        hits = 0
+        for _ in range(samples):
+            s = sum(-d if rng.random() < 0.5 else d for d in deltas)
+            if abs(s / n) >= target:
+                hits += 1
+        method = "sign-flip-sampled"
+    p = hits / total
+    return {"method": method, "n": n, "observed_mean_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
+
+
+def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pass_rate") -> tuple[list[float], list[float], list[dict[str, Any]]]:
     """Per-case paired with/without rates over one pairing population.
     ResultSet.by_case_variant() applies the scorable predicate and the grouping
     for us — the view cannot forget to exclude infra failures."""
@@ -3768,8 +3966,8 @@ def paired_case_rates(results: list[dict[str, Any]]) -> tuple[list[float], list[
     paired_without_rates: list[float] = []
     negative_cases: list[dict[str, Any]] = []
     for case_id, by_variant in sorted(by_case_variant.items()):
-        w = mean_rate(by_variant.get("with_skill", []))
-        n = mean_rate(by_variant.get("without_skill", []))
+        w = mean_rate(by_variant.get("with_skill", []), key)
+        n = mean_rate(by_variant.get("without_skill", []), key)
         if w is None or n is None:
             continue
         paired_with_rates.append(w)
@@ -3788,11 +3986,15 @@ def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates
         absolute_delta = with_rate - without_rate
         if with_rate >= without_rate and without_rate < 1:
             normalized_gain = (with_rate - without_rate) / (1 - without_rate)
+    deltas = [w - n for w, n in zip(paired_with_rates, paired_without_rates)]
     return {
         "with_skill_objective_pass_rate": with_rate,
         "without_skill_objective_pass_rate": without_rate,
         "absolute_delta": absolute_delta,
         "normalized_gain": normalized_gain,
+        # Lift is tested, not eyeballed (roadmap 2.2): the sign-flip permutation
+        # p-value over the per-(case, model) deltas rides beside the raw delta.
+        "significance": sign_flip_significance(deltas),
         "negative_delta_cases": negative_cases,
     }
 
@@ -3808,6 +4010,8 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     all_with: list[float] = []
     all_without: list[float] = []
     all_negative: list[dict[str, Any]] = []
+    graded_with: list[float] = []
+    graded_without: list[float] = []
     by_model: dict[str, dict[str, Any]] = {}
     for model in models:
         rows = [r for r in results if str(r.get("model")) == model]
@@ -3816,12 +4020,30 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         all_without.extend(n)
         all_negative.extend({**item, "model": model} for item in neg)
         by_model[model] = paired_block_from_rates(w, n, neg)
+        gw, gn, _ = paired_case_rates(rows, key="graded_score")
+        graded_with.extend(gw)
+        graded_without.extend(gn)
     if unlabeled or not models:
-        w, n, neg = paired_case_rates(unlabeled if models else results)
+        pool = unlabeled if models else results
+        w, n, neg = paired_case_rates(pool)
         all_with.extend(w)
         all_without.extend(n)
         all_negative.extend(neg)
+        gw, gn, _ = paired_case_rates(pool, key="graded_score")
+        graded_with.extend(gw)
+        graded_without.extend(gn)
     out = paired_block_from_rates(all_with, all_without, all_negative)
+    if graded_with:
+        # The graded channel (roadmap 2.2): how much better, after the binary
+        # ceiling. Vetoed runs carry no graded_score, so a critical failure can
+        # never be averaged into this mean.
+        graded_deltas = [w - n for w, n in zip(graded_with, graded_without)]
+        out["graded"] = {
+            "with_skill_mean_score": round(statistics.mean(graded_with), 4),
+            "without_skill_mean_score": round(statistics.mean(graded_without), 4),
+            "delta": round(statistics.mean(graded_deltas), 4),
+            "significance": sign_flip_significance(graded_deltas),
+        }
     if by_model:
         out["by_model"] = by_model
     return out
@@ -4133,6 +4355,7 @@ def build_benchmark_report(
     variants_arg: list[str] | None = None,
     judge_results_path: str | None = None,
     allow_scripts: bool = False,
+    strict: bool = False,
 ) -> dict[str, Any]:
     manifest = validate_manifest(path)
     variants = variants_arg or manifest.get("variants", DEFAULT_VARIANTS)
@@ -4155,7 +4378,7 @@ def build_benchmark_report(
                 for run_number, base in discover_run_bases_under(model_root / variant):
                     text, output_path = read_output_base(base)
                     meta = read_metadata_base(base)
-                    result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name)
+                    result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name, strict=strict)
                     results.append(result)
 
     by_variant: dict[str, list[dict[str, Any]]] = {v: [] for v in variants}
@@ -4193,6 +4416,12 @@ def build_benchmark_report(
         flags = []
         if w_rate == 1 and n_rate == 1:
             flags.append("saturated/non-discriminating")
+            # 2.2: saturation's next move. Objectively perfect but scoring low on
+            # the graded channel is competent-but-forgettable work — the report
+            # points at graded dimensions instead of stopping at the flag.
+            graded_ws = [r["graded_score"] for r in ws_rows if isinstance(r.get("graded_score"), (int, float))]
+            if graded_ws and statistics.mean(graded_ws) < FORGETTABLE_GRADED_THRESHOLD:
+                flags.append("structurally-pass-but-forgettable")
         if w_rate is not None and n_rate is not None and w_rate <= n_rate:
             flags.append("no objective lift")
         if w_rate is not None and w_rate < 1:
@@ -4201,6 +4430,14 @@ def build_benchmark_report(
             rr = [r["objective_pass_rate"] for r in vrows if r["objective_pass_rate"] is not None]
             if len(rr) > 1 and len(set(rr)) > 1:
                 flags.append(f"flaky repeated pass rates: {variant}")
+            # A critical (absorbing-barrier) failure is surfaced on its own,
+            # never only inside an averaged rate.
+            veto_names = sorted({name for r in vrows if r.get("vetoed") for name in r.get("critical_failures", [])})
+            if veto_names:
+                flags.append(f"critical-failure: {variant} ({', '.join(veto_names)})")
+        floor_hits = sorted({name for r in ws_rows for name in r.get("below_reference_floor", [])})
+        if floor_hits:
+            flags.append(f"below-reference-floor: {', '.join(floor_hits)}")
         if flags:
             case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate, "without_skill": n_rate})
 
@@ -4228,7 +4465,7 @@ def build_benchmark_report(
 
 
 def benchmark(args: argparse.Namespace) -> int:
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False))
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False))
     if args.out:
         write_json(Path(args.out), report)
     else:
@@ -5719,6 +5956,7 @@ def main() -> int:
     p.add_argument("--judge-tasks")
     p.add_argument("--judge-results", help="JSONL/JSON results keyed by judge_task_id; merges qualitative scoring")
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
+    p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
     p.add_argument("--write-grading-files", action="store_true", help="write Anthropic-compatible grading.json files into each run directory")
 
     p = sub.add_parser("judge")
@@ -5740,6 +5978,7 @@ def main() -> int:
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-results", help="merge qualitative judge scoring into combined pass rates")
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
+    p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
     p.add_argument("--out")
 
     p = sub.add_parser("report", help="serialize a benchmark.json for CI: JUnit XML or GitHub job-summary markdown + annotations")
