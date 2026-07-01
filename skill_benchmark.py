@@ -3165,6 +3165,12 @@ def grade_case_variant(
             continue
         atype = assertion.get("type")
         if atype in QUALITATIVE_ASSERTIONS:
+            # Judge-task emission honors THE scorable_run predicate, like every
+            # other report view: a missing/infra-failed run is excluded from
+            # scoring downstream, so never spend a judge model call grading its
+            # empty/failed candidate (the verdict would only be discarded).
+            if not scorable_run({"missing_output": missing_output, "execution_valid": exec_valid}):
+                continue
             jid = judge_task_id(case["id"], variant, run_number, assertion)
             judged = judge_results.get(jid)
             if judged:

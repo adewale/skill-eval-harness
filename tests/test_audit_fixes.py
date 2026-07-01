@@ -410,5 +410,34 @@ class JudgeVerdictPassedTests(unittest.TestCase):
             self.assertEqual(result["qualitative_total"], 1)
 
 
+class JudgeTaskScorabilityTests(unittest.TestCase):
+    """Judge-task emission must honor THE scorable_run predicate, like every other
+    report view. A run with no output (or an infra failure) is excluded from
+    scoring downstream anyway, so emitting a judge task for it only spends a model
+    call to grade an empty/failed candidate whose verdict is then discarded. The
+    live multi-model run wasted ~$2 grading missing outputs this way."""
+
+    Q_CASE = {"id": "c", "split": "tune", "prompt": "x",
+              "assertions": [{"name": "quality", "type": "judge", "prompt": "is it good?"}]}
+
+    def _tasks(self, text, metadata):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            base.mkdir(parents=True)
+            _, tasks = sb.grade_case_variant(
+                self.Q_CASE, "with_skill", text, base / "output.md", metadata,
+                run_number=1, run_base=base, judge_results={})
+            return tasks
+
+    def test_scorable_run_emits_judge_task(self):
+        self.assertEqual(len(self._tasks("a real candidate answer", {})), 1)
+
+    def test_missing_output_emits_no_judge_task(self):
+        self.assertEqual(self._tasks(None, {}), [])
+
+    def test_infra_failure_emits_no_judge_task(self):
+        self.assertEqual(self._tasks("[CODEX FAILURE: returncode=1]\ndied", {"returncode": 1}), [])
+
+
 if __name__ == "__main__":
     unittest.main()
