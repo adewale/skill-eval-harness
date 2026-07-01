@@ -245,6 +245,107 @@ class JudgeConfigSlotTests(unittest.TestCase):
             self.assertEqual(sb.audit_manifest(args), 0)
 
 
+class MultiModelFanOutTests(unittest.TestCase):
+    """2.1 — model as a third fan-out axis beside variant and run_number."""
+
+    def two_case_manifest(self) -> dict:
+        manifest = base_manifest()
+        manifest["cases"].append({
+            "id": "case-2",
+            "split": "tune",
+            "kind": "behavior",
+            "prompt": "Do the other task.",
+            "assertions": [{"name": "has-beta", "type": "contains", "value": "beta"}],
+        })
+        return manifest
+
+    def test_row_count_is_cases_by_variants_by_runs_by_models(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), self.two_case_manifest())
+            manifest = sb.validate_manifest(path)
+            rows = sb.prepared_task_rows(path, manifest, split="tune", runs_per_variant=2, models=["m1", "m2"])
+        self.assertEqual(len(rows), 2 * 2 * 2 * 2)
+        run_dirs = {r["run_dir"] for r in rows}
+        self.assertIn("case-1/m1/with_skill/run-1", run_dirs)
+        self.assertIn("case-2/m2/without_skill/run-2", run_dirs)
+        self.assertEqual({r["model"] for r in rows}, {"m1", "m2"})
+
+    def test_single_model_keeps_legacy_run_dir_but_carries_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), base_manifest())
+            manifest = sb.validate_manifest(path)
+            rows = sb.prepared_task_rows(path, manifest, split="tune", models=["only-model"])
+        self.assertEqual({r["run_dir"] for r in rows}, {"case-1/with_skill", "case-1/without_skill"})
+        self.assertTrue(all(r["model"] == "only-model" for r in rows))
+
+    def test_no_models_is_byte_identical_to_legacy_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), base_manifest())
+            manifest = sb.validate_manifest(path)
+            legacy = sb.prepared_task_rows(path, manifest, split="tune")
+            explicit = sb.prepared_task_rows(path, manifest, split="tune", models=[])
+        self.assertEqual(json.dumps(legacy), json.dumps(explicit))
+        self.assertTrue(all("model" not in r for r in legacy))
+
+    def test_model_root_discovery_handles_both_layouts(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td)
+            (runs / "case-1" / "with_skill").mkdir(parents=True)
+            (runs / "case-1" / "m1" / "with_skill").mkdir(parents=True)
+            (runs / "case-1" / "m2" / "without_skill").mkdir(parents=True)
+            roots = sb.discover_case_model_roots(runs, "case-1", ["with_skill", "without_skill"])
+        labels = [m for m, _ in roots]
+        self.assertEqual(labels, [None, "m1", "m2"])
+
+    def make_two_model_runs(self, root: Path) -> tuple[Path, Path]:
+        path = write_manifest(root, base_manifest())
+        runs = root / "runs"
+        # m1: the skill lifts (with passes, without fails); m2: flat (both fail).
+        outputs = {
+            ("m1", "with_skill"): "alpha",
+            ("m1", "without_skill"): "nope",
+            ("m2", "with_skill"): "nope",
+            ("m2", "without_skill"): "nope",
+        }
+        for (model, variant), text in outputs.items():
+            base = runs / "case-1" / model / variant
+            base.mkdir(parents=True)
+            (base / "output.md").write_text(text, encoding="utf-8")
+            (base / "metadata.json").write_text(json.dumps({"model": model, "total_tokens": 10}), encoding="utf-8")
+        return path, runs
+
+    def test_report_groups_by_model_and_pairs_lift_per_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            path, runs = self.make_two_model_runs(Path(td))
+            report = sb.build_benchmark_report(path, runs)
+        self.assertEqual(set(report["by_model"]), {"m1", "m2"})
+        self.assertEqual(report["by_model"]["m1"]["with_skill"]["mean_objective_pass_rate"], 1.0)
+        self.assertEqual(report["by_model"]["m2"]["with_skill"]["mean_objective_pass_rate"], 0.0)
+        paired = report["paired_summary"]
+        self.assertEqual(paired["by_model"]["m1"]["absolute_delta"], 1.0)
+        self.assertEqual(paired["by_model"]["m2"]["absolute_delta"], 0.0)
+        # Headline pools the per-(case, model) pairs: (1.0 + 0.0) / 2 vs 0.0.
+        self.assertEqual(paired["with_skill_objective_pass_rate"], 0.5)
+        self.assertEqual(paired["without_skill_objective_pass_rate"], 0.0)
+        self.assertEqual(paired["absolute_delta"], 0.5)
+        models_on_results = {r["model"] for r in report["results"]}
+        self.assertEqual(models_on_results, {"m1", "m2"})
+
+    def test_legacy_single_layout_report_shape_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, base_manifest())
+            runs = root / "runs"
+            for variant, text in [("with_skill", "alpha"), ("without_skill", "nope")]:
+                base = runs / "case-1" / variant
+                base.mkdir(parents=True)
+                (base / "output.md").write_text(text, encoding="utf-8")
+            report = sb.build_benchmark_report(path, runs)
+        self.assertEqual(report["by_model"], {})
+        self.assertNotIn("by_model", report["paired_summary"])
+        self.assertEqual(report["paired_summary"]["absolute_delta"], 1.0)
+
+
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 

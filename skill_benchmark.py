@@ -411,9 +411,16 @@ def prepared_task_rows(
     include_answer_key: bool = False,
     ablation_dir: Path | str | None = None,
     trees: dict[str, Any] | None = None,
+    models: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     variants = task_variants(manifest, include_old_skill=include_old_skill, include_ablations=include_ablations)
     runs_per_variant = max(1, int(runs_per_variant))
+    # Model is a third fan-out axis beside variant and run_number (roadmap 2.1):
+    # each row carries its target model, and with two or more models the run_dir
+    # gains a model segment. A single (or absent) model keeps today's layout, so
+    # existing manifests and run dirs are untouched.
+    model_list: list[str | None] = [m.strip() for m in (models or []) if isinstance(m, str) and m.strip()] or [None]
+    multi_model = len(model_list) > 1
     cases = iter_cases(manifest, split)
     repo_root = repo_root_for_manifest(manifest_path)
     real_skill_paths = [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])]
@@ -470,33 +477,40 @@ def prepared_task_rows(
                     # record is the sibling InstructionSimulated, not a Provenance.
                     record = InstructionSimulated(id=aid, population=population)
             for run_number in range(1, runs_per_variant + 1):
-                run_dir = f"{case['id']}/{variant}" if runs_per_variant == 1 else f"{case['id']}/{variant}/run-{run_number}"
-                # The PreparedTask is the typed owner; harness_record() serializes the
-                # exact JSONL row shape at the prepare boundary.
-                task = PreparedTask(
-                    case_id=case["id"],
-                    split=case["split"],
-                    kind=case.get("kind", "behavior"),
-                    variant_truth=variant,
-                    run_number=run_number,
-                    skill_name=manifest["skill_name"],
-                    repo_root=str(repo_root),
-                    skill_paths=tuple(skill_paths),
-                    input_files=tuple(str((manifest_path.parent / f).resolve()) for f in case.get("files", [])),
-                    run_dir=run_dir,
-                    instruction=variant_instruction(variant, manifest, repo_root),
-                    prompt=case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
-                    tags=tuple(case.get("tags", [])),
-                    ablation=record,
-                    # Canonical-tree hash on every skill-bearing arm so the report can
-                    # confirm with_skill and the ablation share a skill revision.
-                    # Only the arms that derive from the CURRENT canonical tree record
-                    # its hash; old_skill mounts the old tree, so stamping the current
-                    # canonical hash on it would be an internally false record.
-                    skill_tree_hash=(canonical_hash if (canonical_hash and (variant == "with_skill" or variant.startswith("ablation:"))) else None),
-                    answer_key=({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else None),
-                )
-                rows.append(task.harness_record())
+                for model in model_list:
+                    prefix = f"{case['id']}/{model}" if (model and multi_model) else case["id"]
+                    run_dir = f"{prefix}/{variant}" if runs_per_variant == 1 else f"{prefix}/{variant}/run-{run_number}"
+                    # The PreparedTask is the typed owner; harness_record() serializes the
+                    # exact JSONL row shape at the prepare boundary.
+                    task = PreparedTask(
+                        case_id=case["id"],
+                        split=case["split"],
+                        kind=case.get("kind", "behavior"),
+                        variant_truth=variant,
+                        run_number=run_number,
+                        skill_name=manifest["skill_name"],
+                        repo_root=str(repo_root),
+                        skill_paths=tuple(skill_paths),
+                        input_files=tuple(str((manifest_path.parent / f).resolve()) for f in case.get("files", [])),
+                        run_dir=run_dir,
+                        instruction=variant_instruction(variant, manifest, repo_root),
+                        prompt=case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
+                        tags=tuple(case.get("tags", [])),
+                        ablation=record,
+                        # Canonical-tree hash on every skill-bearing arm so the report can
+                        # confirm with_skill and the ablation share a skill revision.
+                        # Only the arms that derive from the CURRENT canonical tree record
+                        # its hash; old_skill mounts the old tree, so stamping the current
+                        # canonical hash on it would be an internally false record.
+                        skill_tree_hash=(canonical_hash if (canonical_hash and (variant == "with_skill" or variant.startswith("ablation:"))) else None),
+                        answer_key=({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else None),
+                    )
+                    row = task.harness_record()
+                    if model:
+                        # The target model rides the row (PreparedTask.from_row ignores
+                        # it); runners pass it through and stamp it into metadata.
+                        row["model"] = model
+                    rows.append(row)
     return rows
 
 
@@ -513,6 +527,7 @@ def prepare(args: argparse.Namespace) -> int:
         allow_missing_prompts=args.allow_missing_prompts,
         include_answer_key=args.include_answer_key,
         ablation_dir=getattr(args, "ablation_dir", None),
+        models=[m.strip() for m in (getattr(args, "models", None) or "").split(",") if m.strip()],
     )
     out = Path(args.out) if args.out else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
@@ -2211,16 +2226,27 @@ def import_jetty_results(args: argparse.Namespace) -> int:
     return 0
 
 
-def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int, Path]]:
-    """Return run instances for a case/variant.
+def discover_case_model_roots(runs: Path, case_id: str, variants: list[str]) -> list[tuple[str | None, Path]]:
+    """Model-axis discovery (roadmap 2.1). The legacy layout
+    runs/<case>/<variant> maps to model=None; the fanned layout
+    runs/<case>/<model>/<variant> maps each model directory. Both can coexist
+    under one case (e.g. a legacy arm graded beside fanned models)."""
+    base = runs / case_id
+    if not base.exists():
+        return [(None, base)]
+    variant_set = set(variants)
+    roots: list[tuple[str | None, Path]] = []
+    if any((base / v).exists() for v in variant_set):
+        roots.append((None, base))
+    for child in sorted(base.iterdir()):
+        if child.is_dir() and child.name not in variant_set and any((child / v).exists() for v in variant_set):
+            roots.append((child.name, child))
+    return roots or [(None, base)]
 
-    Supports the original layout:
-      runs/<case>/<variant>/output.md
-    and repeated-run layout:
-      runs/<case>/<variant>/run-1/output.md
-      runs/<case>/<variant>/run-2/outputs/...
-    """
-    base = runs / case_id / variant
+
+def discover_run_bases_under(base: Path) -> list[tuple[int, Path]]:
+    """Run-instance discovery for one case/variant directory (either
+    <case>/<variant> or <case>/<model>/<variant>)."""
     if not base.exists():
         return [(1, base)]
     run_dirs = []
@@ -2234,6 +2260,15 @@ def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int
     if run_dirs:
         return sorted(run_dirs, key=lambda x: x[0])
     return [(1, base)]
+
+
+def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int, Path]]:
+    """Return run instances for a case/variant in the legacy (model-less) layout:
+      runs/<case>/<variant>/output.md
+      runs/<case>/<variant>/run-<n>/output.md
+    Model-aware callers combine discover_case_model_roots with
+    discover_run_bases_under instead."""
+    return discover_run_bases_under(runs / case_id / variant)
 
 
 def text_files_under(directory: Path) -> list[Path]:
@@ -3038,6 +3073,9 @@ def run_claude(args: argparse.Namespace) -> int:
     timeout = int(getattr(args, "timeout", 1800))
     for task in tasks:
         pt = PreparedTask.from_row(task)
+        # The row's model (multi-model fan-out, roadmap 2.1) beats the CLI-wide
+        # default, so one prepared JSONL can drive several models in one pass.
+        row_model = task.get("model") or model
         base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
         base.mkdir(parents=True, exist_ok=True)
         prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
@@ -3045,11 +3083,11 @@ def run_claude(args: argparse.Namespace) -> int:
             ws = Path(wd)
             skill_rel, input_rel = codex_skill_workspace(pt, ws)
             prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
-            result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
+            result = claude_cli_invoke(prompt, model=row_model, claude_bin=claude_bin, timeout=timeout)
             metrics = claude_run_metrics(result)
             write_json(base / "metrics.json", metrics)
             write_json(base / "metadata.json", {
-                "provider": "claude", "model": model, "returncode": result.get("returncode"),
+                "provider": "claude", "model": row_model, "returncode": result.get("returncode"),
                 "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
                 "cost_usd": metrics.get("cost_usd"), "stderr": result.get("stderr", ""),
                 "trace_source": "claude", **prov_extra})
@@ -3478,6 +3516,7 @@ def grade_case_variant(
     judge_results: dict[str, dict[str, Any]] | None = None,
     allow_scripts: bool = False,
     manifest_dir: Path | None = None,
+    model: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     objective = []
     qualitative = []
@@ -3545,6 +3584,9 @@ def grade_case_variant(
         "success_goals": case.get("success_goals", []),
         "variant": variant,
         "run_number": run_number,
+        # The model axis (roadmap 2.1): the run-layout model segment wins;
+        # otherwise the model the runner recorded in metadata labels the run.
+        "model": model or (str(metadata.get("model")) if isinstance(metadata.get("model"), str) and metadata.get("model") else None),
         "run_base": str(run_base or output_path.parent),
         "missing_output": missing_output,
         "execution_valid": exec_valid,
@@ -3629,13 +3671,14 @@ def grade(args: argparse.Namespace) -> int:
     all_results = []
     all_judge_tasks = []
     for case in iter_cases(manifest, args.split):
-        for variant in variants:
-            for run_number, base in discover_run_bases(runs, case["id"], variant):
-                text, output_path = read_output_base(base)
-                meta = read_metadata_base(base)
-                result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent)
-                all_results.append(result)
-                all_judge_tasks.extend(judge_tasks)
+        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
+            for variant in variants:
+                for run_number, base in discover_run_bases_under(model_root / variant):
+                    text, output_path = read_output_base(base)
+                    meta = read_metadata_base(base)
+                    result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent, model=model_name)
+                    all_results.append(result)
+                    all_judge_tasks.extend(judge_tasks)
     report = {
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
@@ -3716,18 +3759,27 @@ def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> f
     return ResultSet(rows).mean_rate(key)
 
 
-def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
-    # ResultSet.by_case_variant() applies the scorable predicate and the grouping
-    # for us — the view cannot forget to exclude infra failures.
+def paired_case_rates(results: list[dict[str, Any]]) -> tuple[list[float], list[float], list[dict[str, Any]]]:
+    """Per-case paired with/without rates over one pairing population.
+    ResultSet.by_case_variant() applies the scorable predicate and the grouping
+    for us — the view cannot forget to exclude infra failures."""
     by_case_variant = ResultSet(results).by_case_variant()
     paired_with_rates: list[float] = []
     paired_without_rates: list[float] = []
-    for by_variant in by_case_variant.values():
+    negative_cases: list[dict[str, Any]] = []
+    for case_id, by_variant in sorted(by_case_variant.items()):
         w = mean_rate(by_variant.get("with_skill", []))
         n = mean_rate(by_variant.get("without_skill", []))
-        if w is not None and n is not None:
-            paired_with_rates.append(w)
-            paired_without_rates.append(n)
+        if w is None or n is None:
+            continue
+        paired_with_rates.append(w)
+        paired_without_rates.append(n)
+        if w < n:
+            negative_cases.append({"case_id": case_id, "with_skill": w, "without_skill": n, "delta": w - n})
+    return paired_with_rates, paired_without_rates, negative_cases
+
+
+def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates: list[float], negative_cases: list[dict[str, Any]]) -> dict[str, Any]:
     with_rate = statistics.mean(paired_with_rates) if paired_with_rates else None
     without_rate = statistics.mean(paired_without_rates) if paired_without_rates else None
     absolute_delta = None
@@ -3736,12 +3788,6 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         absolute_delta = with_rate - without_rate
         if with_rate >= without_rate and without_rate < 1:
             normalized_gain = (with_rate - without_rate) / (1 - without_rate)
-    negative_cases = []
-    for case_id, by_variant in sorted(by_case_variant.items()):
-        w = mean_rate(by_variant.get("with_skill", []))
-        n = mean_rate(by_variant.get("without_skill", []))
-        if w is not None and n is not None and w < n:
-            negative_cases.append({"case_id": case_id, "with_skill": w, "without_skill": n, "delta": w - n})
     return {
         "with_skill_objective_pass_rate": with_rate,
         "without_skill_objective_pass_rate": without_rate,
@@ -3749,6 +3795,36 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "normalized_gain": normalized_gain,
         "negative_delta_cases": negative_cases,
     }
+
+
+def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    # The pairing key is (case, model) — roadmap 2.1. Each model's rows pair
+    # with_skill against without_skill within that model only; the headline
+    # block pools the per-(case, model) pairs, and by_model carries each
+    # model's own lift. With no model axis this is exactly the per-case
+    # pairing the harness always did.
+    models = sorted({str(r.get("model")) for r in results if r.get("model")})
+    unlabeled = [r for r in results if not r.get("model")]
+    all_with: list[float] = []
+    all_without: list[float] = []
+    all_negative: list[dict[str, Any]] = []
+    by_model: dict[str, dict[str, Any]] = {}
+    for model in models:
+        rows = [r for r in results if str(r.get("model")) == model]
+        w, n, neg = paired_case_rates(rows)
+        all_with.extend(w)
+        all_without.extend(n)
+        all_negative.extend({**item, "model": model} for item in neg)
+        by_model[model] = paired_block_from_rates(w, n, neg)
+    if unlabeled or not models:
+        w, n, neg = paired_case_rates(unlabeled if models else results)
+        all_with.extend(w)
+        all_without.extend(n)
+        all_negative.extend(neg)
+    out = paired_block_from_rates(all_with, all_without, all_negative)
+    if by_model:
+        out["by_model"] = by_model
+    return out
 
 
 def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> dict[str, Any]:
@@ -4001,6 +4077,55 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     return out
 
 
+def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    scorable_rows = ResultSet(rows).scorable().all   # the scorable predicate, once
+    objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
+    combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
+    process_rates = [r["process_pass_rate"] for r in scorable_rows if r.get("process_pass_rate") is not None]
+    efficiency_rates = [r["efficiency_pass_rate"] for r in scorable_rows if r.get("efficiency_pass_rate") is not None]
+    # Timing/token/command central tendencies describe SCORABLE runs, matching
+    # the pass-rate block above — a timed-out run's full duration must not drag
+    # the mean (the failure count is disclosed separately as execution_errors).
+    merged_metrics = []
+    for r in scorable_rows:
+        merged = dict(r.get("metadata", {}) or {})
+        merged.update(read_metrics_base(Path(r.get("run_base", ""))))
+        merged_metrics.append(merged)
+    elapsed = [metric_number(m, "elapsed_ms") for m in merged_metrics]
+    tokens = [metric_number(m, "total_tokens") for m in merged_metrics]
+    commands = [metric_number(m, "commands", "command_count") for m in merged_metrics]
+    costs = [metric_number(m, "cost_usd") for m in merged_metrics]
+    elapsed = [x for x in elapsed if x is not None]
+    tokens = [x for x in tokens if x is not None]
+    commands = [x for x in commands if x is not None]
+    costs = [x for x in costs if x is not None]
+    return {
+        "cases": len({r["case_id"] for r in rows}),
+        "runs": len(rows),
+        "missing_outputs": sum(1 for r in rows if r["missing_output"]),
+        "execution_errors": sum(1 for r in rows if not r["missing_output"] and not r.get("execution_valid", True)),
+        "mean_objective_pass_rate": statistics.mean(objective_rates) if objective_rates else None,
+        "mean_combined_pass_rate": statistics.mean(combined_rates) if combined_rates else None,
+        "mean_process_pass_rate": statistics.mean(process_rates) if process_rates else None,
+        "mean_efficiency_pass_rate": statistics.mean(efficiency_rates) if efficiency_rates else None,
+        "objective_pass_rate": stats(objective_rates),
+        "combined_pass_rate": stats(combined_rates),
+        "process_pass_rate": stats(process_rates),
+        "efficiency_pass_rate": stats(efficiency_rates),
+        "elapsed_ms": stats(elapsed),
+        "total_tokens": stats(tokens),
+        "command_count": stats(commands),
+        # Real dollar cost, when a runner recorded it (the Claude adapter does).
+        # Sum, not mean: "what did this arm cost to run" — over scorable runs only.
+        "cost_usd_total": round(sum(costs), 6) if costs else None,
+        "cost_usd": stats(costs),
+        "telemetry_availability": telemetry_summary(rows),
+        # Backward-compatible fields used by smoke_report.py callers.
+        "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
+        "median_total_tokens": statistics.median(tokens) if tokens else None,
+    }
+
+
 def build_benchmark_report(
     path: Path,
     runs: Path,
@@ -4025,12 +4150,13 @@ def build_benchmark_report(
         if case.get("kind") == "trigger":
             skipped_trigger_cases.append(case["id"])
             continue
-        for variant in variants:
-            for run_number, base in discover_run_bases(runs, case["id"], variant):
-                text, output_path = read_output_base(base)
-                meta = read_metadata_base(base)
-                result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent)
-                results.append(result)
+        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
+            for variant in variants:
+                for run_number, base in discover_run_bases_under(model_root / variant):
+                    text, output_path = read_output_base(base)
+                    meta = read_metadata_base(base)
+                    result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name)
+                    results.append(result)
 
     by_variant: dict[str, list[dict[str, Any]]] = {v: [] for v in variants}
     for r in results:
@@ -4038,51 +4164,17 @@ def build_benchmark_report(
 
     summary: dict[str, Any] = {}
     for variant, rows in by_variant.items():
-        scorable_rows = ResultSet(rows).scorable().all   # the scorable predicate, once
-        objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
-        combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
-        process_rates = [r["process_pass_rate"] for r in scorable_rows if r.get("process_pass_rate") is not None]
-        efficiency_rates = [r["efficiency_pass_rate"] for r in scorable_rows if r.get("efficiency_pass_rate") is not None]
-        # Timing/token/command central tendencies describe SCORABLE runs, matching
-        # the pass-rate block above — a timed-out run's full duration must not drag
-        # the mean (the failure count is disclosed separately as execution_errors).
-        merged_metrics = []
-        for r in scorable_rows:
-            merged = dict(r.get("metadata", {}) or {})
-            merged.update(read_metrics_base(Path(r.get("run_base", ""))))
-            merged_metrics.append(merged)
-        elapsed = [metric_number(m, "elapsed_ms") for m in merged_metrics]
-        tokens = [metric_number(m, "total_tokens") for m in merged_metrics]
-        commands = [metric_number(m, "commands", "command_count") for m in merged_metrics]
-        costs = [metric_number(m, "cost_usd") for m in merged_metrics]
-        elapsed = [x for x in elapsed if x is not None]
-        tokens = [x for x in tokens if x is not None]
-        commands = [x for x in commands if x is not None]
-        costs = [x for x in costs if x is not None]
-        summary[variant] = {
-            "cases": len({r["case_id"] for r in rows}),
-            "runs": len(rows),
-            "missing_outputs": sum(1 for r in rows if r["missing_output"]),
-            "execution_errors": sum(1 for r in rows if not r["missing_output"] and not r.get("execution_valid", True)),
-            "mean_objective_pass_rate": statistics.mean(objective_rates) if objective_rates else None,
-            "mean_combined_pass_rate": statistics.mean(combined_rates) if combined_rates else None,
-            "mean_process_pass_rate": statistics.mean(process_rates) if process_rates else None,
-            "mean_efficiency_pass_rate": statistics.mean(efficiency_rates) if efficiency_rates else None,
-            "objective_pass_rate": stats(objective_rates),
-            "combined_pass_rate": stats(combined_rates),
-            "process_pass_rate": stats(process_rates),
-            "efficiency_pass_rate": stats(efficiency_rates),
-            "elapsed_ms": stats(elapsed),
-            "total_tokens": stats(tokens),
-            "command_count": stats(commands),
-            # Real dollar cost, when a runner recorded it (the Claude adapter does).
-            # Sum, not mean: "what did this arm cost to run" — over scorable runs only.
-            "cost_usd_total": round(sum(costs), 6) if costs else None,
-            "cost_usd": stats(costs),
-            "telemetry_availability": telemetry_summary(rows),
-            # Backward-compatible fields used by smoke_report.py callers.
-            "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
-            "median_total_tokens": statistics.median(tokens) if tokens else None,
+        summary[variant] = variant_summary_block(rows)
+
+    # by_variant within by_model (roadmap 2.1): the same per-variant block,
+    # computed per model, so a multi-model run reads as a model-by-variant grid.
+    by_model_summary: dict[str, Any] = {}
+    for model in sorted({str(r.get("model")) for r in results if r.get("model")}):
+        m_rows = [r for r in results if str(r.get("model")) == model]
+        by_model_summary[model] = {
+            variant: variant_summary_block([r for r in m_rows if r["variant"] == variant])
+            for variant in variants
+            if any(r["variant"] == variant for r in m_rows)
         }
 
     case_flags = []
@@ -4126,6 +4218,7 @@ def build_benchmark_report(
         "population": "answer",
         "skipped_trigger_cases": skipped_trigger_cases,
         "summary": summary,
+        "by_model": by_model_summary,
         "paired_summary": build_paired_summary(results),
         "slice_summary": build_slice_summary(results, variants),
         "ablation_regressions": build_ablation_regression_report(manifest, results),
@@ -5563,6 +5656,7 @@ def main() -> int:
     p.add_argument("--allow-missing-prompts", action="store_true", help="dry-run hidden prompt_ref cases even when private files are absent")
     p.add_argument("--include-answer-key", action="store_true", help="include expected_behavior/review_rubric in prepared tasks; use only for judge/debug tasks, not generation")
     p.add_argument("--ablation-dir", default=None, help="materialize declared-removal ablations into this dir and point their rows at the altered tree")
+    p.add_argument("--models", help="comma-separated target models; fans rows out per model (third axis beside variant and run), with run_dir gaining a model segment when two or more are given")
 
     p = sub.add_parser("export-jetty")
     p.add_argument("manifest")
