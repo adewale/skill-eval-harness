@@ -2844,7 +2844,43 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
             token_doc["total_tokens"] = int(normalized_total)
         event["tokens"] = token_doc
     event["source"] = source
+    event["otel"] = otel_attributes_for_event(event)
     return event
+
+
+def otel_attributes_for_event(event: dict[str, Any]) -> dict[str, Any]:
+    """OTel GenAI semantic-convention attributes for one normalized event
+    (roadmap 2.4). Additive: the harness's own keys stay authoritative for
+    grading; these make the trace boundary a standard target instead of a
+    bespoke schema. Events schema_version 2 carries them; version-1 files
+    still grade unchanged."""
+    attrs: dict[str, Any] = {}
+    event_type = event.get("type")
+    if event_type in {"command", "tool_call"}:
+        attrs["gen_ai.operation.name"] = "execute_tool"
+        attrs["gen_ai.tool.name"] = str(event.get("name") or "bash")
+        if event.get("input_summary"):
+            attrs["gen_ai.tool.call.arguments"] = event["input_summary"]
+        if event.get("output_summary"):
+            attrs["gen_ai.tool.call.result"] = event["output_summary"]
+    elif event_type == "message":
+        attrs["gen_ai.operation.name"] = "chat"
+        if event.get("role"):
+            attrs["gen_ai.message.role"] = event["role"]
+    elif event_type == "error":
+        attrs["error.type"] = str(event.get("name") or event.get("input_summary") or "error")[:120]
+    elif event_type in {"file_read", "file_write", "skill_load"}:
+        if event.get("input_summary"):
+            attrs["file.path"] = event["input_summary"][:500]
+    tokens = event.get("tokens")
+    if isinstance(tokens, dict):
+        if isinstance(tokens.get("input_tokens"), (int, float)):
+            attrs["gen_ai.usage.input_tokens"] = int(tokens["input_tokens"])
+        if isinstance(tokens.get("output_tokens"), (int, float)):
+            attrs["gen_ai.usage.output_tokens"] = int(tokens["output_tokens"])
+    if isinstance(event.get("exit_code"), int):
+        attrs["process.exit_code"] = event["exit_code"]
+    return attrs
 
 
 def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "generic") -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2874,7 +2910,7 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
                     token_totals[key] += value
     skill_events = [e for e in events if e.get("type") == "skill_load" or event_mentions_skill_file(e)]
     metrics: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": source,
         "tool_calls": sum(1 for e in events if e.get("type") == "tool_call") + len(command_events(events)),
         "commands": len(commands),
@@ -2891,7 +2927,14 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
     for key, value in token_totals.items():
         if value:
             metrics[key] = int(value)
-    event_doc = {"schema_version": 1, "source": source, "events": events}
+    otel_usage = {}
+    if token_totals["input_tokens"]:
+        otel_usage["gen_ai.usage.input_tokens"] = int(token_totals["input_tokens"])
+    if token_totals["output_tokens"]:
+        otel_usage["gen_ai.usage.output_tokens"] = int(token_totals["output_tokens"])
+    if otel_usage:
+        metrics["otel"] = otel_usage
+    event_doc = {"schema_version": 2, "source": source, "events": events}
     return event_doc, metrics
 
 
@@ -3706,6 +3749,175 @@ def effective_judge_model(manifest: dict[str, Any], cli_model: str | None) -> st
     return str(configured) if configured else None
 
 
+TOOL_REPLAY_ENV = "SKILL_BENCHMARK_TOOL_REPLAY"
+TOOL_REPLAY_MODES = {"auto", "record", "replay", "off", "strict"}
+
+
+class ToolReplayMiss(Exception):
+    """A replayed run requested a tool call that was never recorded."""
+
+
+class ToolReplayStore:
+    """Record/replay for tool I/O (roadmap 2.3). Recording writes
+    tool-replay.json beside the run outputs — keyed, versioned, FIFO per
+    (tool, payload) so repeated identical calls replay in order. Replay makes
+    the AGENT run reproducible; grading was already reproducible from disk.
+    Modes: record (live calls captured), replay (recorded answers only,
+    missing key falls through to live), strict (replay; missing key raises),
+    auto (replay when a recording exists, else record), off (no store)."""
+
+    VERSION = 1
+
+    def __init__(self, path: Path, mode: str = "auto"):
+        if mode not in TOOL_REPLAY_MODES:
+            raise ValueError(f"unknown tool-replay mode {mode!r}; expected one of {sorted(TOOL_REPLAY_MODES)}")
+        self.path = path
+        self.recorded: dict[str, list[Any]] = {}
+        had_recording = path.is_file()
+        if had_recording:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            for row in doc.get("records", []):
+                self.recorded.setdefault(str(row.get("key")), []).append(row.get("output"))
+        self.mode = ("replay" if had_recording else "record") if mode == "auto" else mode
+        self.new_records: list[dict[str, Any]] = []
+
+    @staticmethod
+    def call_key(tool: str, payload: Any) -> str:
+        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(f"{tool}\n{canonical}".encode("utf-8")).hexdigest()[:32]
+
+    def resolve(self, tool: str, payload: Any, live: Any = None) -> Any:
+        key = self.call_key(tool, payload)
+        if self.mode in {"replay", "strict"}:
+            queue = self.recorded.get(key)
+            if queue:
+                return queue.pop(0)
+            if self.mode == "strict":
+                raise ToolReplayMiss(f"unrecorded tool call in strict replay: {tool} (key {key})")
+        if live is None:
+            raise ToolReplayMiss(f"no live executor for tool {tool!r} (mode {self.mode})")
+        output = live(payload)
+        if self.mode == "record":
+            self.new_records.append({"tool": tool, "key": key, "output": output})
+        return output
+
+    def save(self) -> None:
+        if self.mode != "record" or not self.new_records:
+            return
+        write_json(self.path, {"version": self.VERSION, "sanitize": [], "records": self.new_records})
+
+
+def tool_replay_mode(default: str = "off") -> str:
+    mode = os.environ.get(TOOL_REPLAY_ENV, default).strip().casefold() or default
+    return mode if mode in TOOL_REPLAY_MODES else default
+
+
+def run_subagent_tasks(
+    tasks: list[dict[str, Any]],
+    runs: Path,
+    agent_fn: Any,
+    *,
+    model: str | None = None,
+    live_tools: dict[str, Any] | None = None,
+    replay_mode: str | None = None,
+) -> int:
+    """The built-in subagent runner (roadmap 2.7): no external CLI required —
+    `agent_fn(prompt, workspace, model, tool_executor)` is the seam (a Claude
+    Code / Agent SDK dispatch in production, a plain function in tests). The
+    difference from an in-process eval harness is the boundary: the typed
+    return is adapted onto the run-output contract (output.md, metadata.json,
+    events.json, metrics.json), so grading stays file-based and re-runnable.
+    Tool replay (2.3) wraps the tool executor per run."""
+    mode = replay_mode or tool_replay_mode()
+    for task in tasks:
+        pt = PreparedTask.from_row(task)
+        row_model = task.get("model") or model
+        base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
+        base.mkdir(parents=True, exist_ok=True)
+        prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
+        store = ToolReplayStore(base / "tool-replay.json", mode) if mode != "off" else None
+
+        def tool_executor(tool: str, payload: Any) -> Any:
+            live = (live_tools or {}).get(tool)
+            if store is None:
+                if live is None:
+                    raise ToolReplayMiss(f"no live executor for tool {tool!r}")
+                return live(payload)
+            return store.resolve(tool, payload, live=live)
+
+        with tempfile.TemporaryDirectory(prefix="subagent-ws-") as wd:
+            ws = Path(wd)
+            skill_rel, input_rel = codex_skill_workspace(pt, ws)
+            prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
+            started = time.time()
+            try:
+                outcome = agent_fn(prompt=prompt, workspace=ws, model=row_model, tool_executor=tool_executor) or {}
+                error = None
+            except ToolReplayMiss as exc:
+                outcome, error = {}, f"tool replay miss: {exc}"
+            except Exception as exc:
+                outcome, error = {}, f"subagent error: {exc}"
+            elapsed_ms = outcome.get("elapsed_ms")
+            if not isinstance(elapsed_ms, (int, float)):
+                elapsed_ms = int((time.time() - started) * 1000)
+        if store is not None:
+            store.save()
+        trace_records = outcome.get("trace") if isinstance(outcome.get("trace"), list) else []
+        events_doc, metrics = normalize_trace_records(trace_records, source="subagent")
+        metrics.update({k: v for k, v in (outcome.get("usage") or {}).items() if isinstance(v, (int, float))})
+        metrics["elapsed_ms"] = int(elapsed_ms)
+        write_json(base / "events.json", events_doc)
+        write_json(base / "metrics.json", metrics)
+        write_json(base / "metadata.json", {
+            "provider": "subagent", "model": row_model, "returncode": 1 if error else outcome.get("returncode", 0),
+            "timed_out": bool(outcome.get("timed_out", False)), "elapsed_ms": int(elapsed_ms),
+            "tool_replay_mode": mode, "trace_source": "subagent", **prov_extra})
+        answer = str(outcome.get("answer") or "")
+        if error:
+            answer = f"{CLAUDE_FAILURE}: {error}]\n"
+        elif not answer:
+            answer = f"{CLAUDE_FAILURE}: no output produced]\n"
+        (base / "output.md").write_text(answer, encoding="utf-8")
+    return 0
+
+
+def shell_agent_backend(agent_cmd: str, timeout: int = 1800) -> Any:
+    """Adapt a shell command into the subagent seam: the prompt arrives as JSON
+    on stdin, the reply is JSON on stdout ({answer, trace?, usage?})."""
+    def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any) -> dict[str, Any]:
+        proc = subprocess.run(agent_cmd, shell=True, input=json.dumps({"prompt": prompt, "model": model, "workspace": str(workspace)}),
+                              text=True, capture_output=True, timeout=timeout)
+        if proc.returncode != 0:
+            return {"answer": "", "returncode": proc.returncode}
+        try:
+            return extract_json_object(proc.stdout)
+        except ValueError:
+            return {"answer": proc.stdout}
+    return backend
+
+
+def run_subagent(args: argparse.Namespace) -> int:
+    tasks = load_jsonl(Path(args.tasks))
+    runs = Path(args.runs)
+    agent_cmd = getattr(args, "agent_cmd", None)
+    if agent_cmd:
+        backend = shell_agent_backend(agent_cmd, timeout=int(getattr(args, "timeout", 1800)))
+    else:
+        claude_bin = getattr(args, "claude_bin", None) or "claude"
+        timeout = int(getattr(args, "timeout", 1800))
+
+        def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any) -> dict[str, Any]:
+            result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
+            return {"answer": result.get("answer"), "returncode": result.get("returncode"),
+                    "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
+                    "usage": claude_run_metrics(result)}
+    return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
+                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode())
+
+
+register_workspace_builder("subagent", codex_skill_workspace)   # run-subagent inherits CF.2
+
+
 def judge_command(args: argparse.Namespace) -> int:
     judge_cmd = getattr(args, "judge_cmd", None)
     manifest_for_judge = validate_manifest(Path(args.manifest))
@@ -4503,6 +4715,24 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     return out
 
 
+def qualitative_by_visibility(results: list[dict[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    scorable_rows = ResultSet(results).scorable().all
+    for label, splits in [("held_out", {"holdout", "holdback"}), ("tune_visible", None)]:
+        rows = [r for r in scorable_rows if r.get("qualitative_total")
+                and ((r.get("split") in splits) if splits else (r.get("split") not in {"holdout", "holdback"}))]
+        if not rows:
+            continue
+        rates = [r["qualitative_pass_rate"] for r in rows if r.get("qualitative_pass_rate") is not None]
+        graded = [r["graded_score"] for r in rows if isinstance(r.get("graded_score"), (int, float))]
+        out[label] = {
+            "runs": len(rows),
+            "mean_qualitative_pass_rate": statistics.mean(rates) if rates else None,
+            "mean_graded_score": round(statistics.mean(graded), 4) if graded else None,
+        }
+    return out
+
+
 def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     scorable_rows = ResultSet(rows).scorable().all   # the scorable predicate, once
     objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
@@ -4683,6 +4913,9 @@ def build_benchmark_report(
         "summary": summary,
         "by_model": by_model_summary,
         "oracle_strength": oracle_strength,
+        # 2.7b: held-out rubric scores reported apart from tune-visible ones,
+        # so a rubric the skill could see never inflates the held-out number.
+        "qualitative_by_visibility": qualitative_by_visibility(results),
         "paired_summary": build_paired_summary(results),
         "slice_summary": build_slice_summary(results, variants),
         "ablation_regressions": build_ablation_regression_report(manifest, results),
@@ -5641,6 +5874,31 @@ def audit_manifest_report(
     if weak_only:
         finding("weak-oracle-only", "recommended", f"{len(weak_only)} case(s) are graded only by demo/live oracles (no strong deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
 
+    # 2.7b: a held-out case's grading criteria must stay out of the skill and
+    # the public eval text — a skill must not teach to the rubric it will be
+    # graded on ("criteria deliberately absent from generation rules").
+    held_out_leaks = []
+    public_prompts = [str(c.get("prompt")).casefold() for c in cases if c.get("split") == "tune" and c.get("prompt")]
+    skill_text_folded = skill_text.casefold()
+    for c in cases:
+        if c.get("split") not in {"holdout", "holdback"}:
+            continue
+        rubric_texts = [str(x) for x in (c.get("review_rubric") or [])]
+        for a in c.get("assertions", []) or []:
+            if a.get("type") in QUALITATIVE_ASSERTIONS:
+                rubric_texts.extend(str(x) for x in (a.get("rubric") or []))
+                rubric_texts.extend(str(d.get("rubric", "")) for d in (a.get("graded_dimensions") or []))
+        for rubric_text in rubric_texts:
+            t = rubric_text.strip()
+            if len(t) < 12:
+                continue
+            if t.casefold() in skill_text_folded:
+                held_out_leaks.append({"case_id": c.get("id"), "where": "skill", "rubric": t[:80]})
+            elif any(t.casefold() in p for p in public_prompts):
+                held_out_leaks.append({"case_id": c.get("id"), "where": "public prompt", "rubric": t[:80]})
+    if held_out_leaks:
+        finding("held-out-rubric-leak", "required", f"{len(held_out_leaks)} held-out rubric string(s) appear in the skill or public eval text; held-out grading criteria must stay invisible to generation.", held_out_leaks[:10])
+
     # 1.3: the judge must not be the model under test. Compare the declared
     # judge model against the manifest's jetty.model and, when run data is
     # supplied, every model recorded in run metadata.
@@ -6184,6 +6442,15 @@ def main() -> int:
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
     p.add_argument("--timeout", type=int, default=1800)
 
+    p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")
+    p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
+    p.add_argument("--runs", required=True, help="output runs directory")
+    p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
+    p.add_argument("--agent-cmd", help="shell command reading {prompt, model, workspace} JSON on stdin and emitting {answer, trace?, usage?} JSON on stdout")
+    p.add_argument("--claude-bin", default="claude", help="path to the claude executable for the default backend")
+    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--tool-replay", choices=sorted(TOOL_REPLAY_MODES), help=f"tool replay mode; defaults from ${TOOL_REPLAY_ENV} (off)")
+
     p = sub.add_parser("grade")
     p.add_argument("manifest")
     p.add_argument("--runs", required=True)
@@ -6348,6 +6615,8 @@ def main() -> int:
         return import_trace(args)
     if args.cmd == "run-codex":
         return run_codex(args)
+    if args.cmd == "run-subagent":
+        return run_subagent(args)
     if args.cmd == "run-claude":
         return run_claude(args)
     if args.cmd == "grade":

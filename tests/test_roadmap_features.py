@@ -685,6 +685,207 @@ class OracleTierTests(unittest.TestCase):
             self.assertNotIn("weak-oracle-only", kinds)
 
 
+class OTelNormalizationTests(unittest.TestCase):
+    """2.4 — OTel GenAI semantic-convention attributes on normalized traces."""
+
+    def test_command_event_carries_execute_tool_attributes(self):
+        records = [{"type": "command", "command": "python -m pytest", "exit_code": 0}]
+        events_doc, metrics = sb.normalize_trace_records(records, source="codex")
+        self.assertEqual(events_doc["schema_version"], 2)
+        self.assertEqual(metrics["schema_version"], 2)
+        otel = events_doc["events"][0]["otel"]
+        self.assertEqual(otel["gen_ai.operation.name"], "execute_tool")
+        self.assertEqual(otel["gen_ai.tool.name"], "bash")
+        self.assertIn("pytest", otel["gen_ai.tool.call.arguments"])
+        self.assertEqual(otel["process.exit_code"], 0)
+
+    def test_usage_lands_in_otel_metrics(self):
+        records = [{"type": "usage", "usage": {"input_tokens": 100, "output_tokens": 40}}]
+        events_doc, metrics = sb.normalize_trace_records(records, source="pi")
+        self.assertEqual(metrics["otel"], {"gen_ai.usage.input_tokens": 100, "gen_ai.usage.output_tokens": 40})
+        self.assertEqual(events_doc["events"][0]["otel"]["gen_ai.usage.input_tokens"], 100)
+
+    def test_message_and_error_attributes(self):
+        records = [{"type": "agent_message", "content": "hello"}, {"type": "error", "message": "boom"}]
+        events_doc, _ = sb.normalize_trace_records(records, source="generic")
+        self.assertEqual(events_doc["events"][0]["otel"].get("gen_ai.operation.name"), "chat")
+        self.assertIn("error.type", events_doc["events"][1]["otel"])
+
+    def test_pre_bump_events_json_still_grades(self):
+        # Backward compatibility: a version-1 events.json (no otel keys) grades.
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text("done", encoding="utf-8")
+            (base / "events.json").write_text(json.dumps({
+                "schema_version": 1, "source": "old",
+                "events": [{"type": "command", "command": "python -m pytest -q", "status": "completed"}],
+            }), encoding="utf-8")
+            r = sb.assertion_result({"type": "command_ran", "pattern": "pytest"}, "done", base / "output.md", run_base=base)
+        self.assertTrue(r["passed"])
+
+
+class SubagentRunnerTests(unittest.TestCase):
+    """2.7 — the built-in subagent runner writes the run-output contract."""
+
+    def make_tasks(self, root: Path) -> list[dict]:
+        path = write_manifest(root, base_manifest())
+        manifest = sb.validate_manifest(path)
+        return sb.prepared_task_rows(path, manifest, split="tune")
+
+    def test_mock_subagent_writes_the_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = self.make_tasks(root)
+            runs = root / "runs"
+            seen_prompts: list[str] = []
+
+            def agent(*, prompt, workspace, model, tool_executor):
+                seen_prompts.append(prompt)
+                return {"answer": "alpha response", "usage": {"total_tokens": 42},
+                        "trace": [{"type": "command", "command": "ls", "status": "completed"}]}
+
+            rc = sb.run_subagent_tasks(tasks, runs, agent, model="sub-model")
+            self.assertEqual(rc, 0)
+            for variant in ["with_skill", "without_skill"]:
+                base = runs / "case-1" / variant
+                self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "alpha response")
+                meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+                self.assertEqual(meta["provider"], "subagent")
+                self.assertEqual(meta["model"], "sub-model")
+                events = json.loads((base / "events.json").read_text(encoding="utf-8"))
+                self.assertEqual(events["source"], "subagent")
+                metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+                self.assertEqual(metrics["total_tokens"], 42)
+        without_prompt = next(p for p in seen_prompts if "Do not use any skill" in p)
+        self.assertNotIn("skills/", without_prompt)
+
+    def test_subagent_failure_writes_failure_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = self.make_tasks(root)[:1]
+
+            def exploding(*, prompt, workspace, model, tool_executor):
+                raise RuntimeError("backend down")
+
+            sb.run_subagent_tasks(tasks, root / "runs", exploding)
+            base = root / "runs" / "case-1" / "with_skill"
+            self.assertIn(str(sb.CLAUDE_FAILURE), (base / "output.md").read_text(encoding="utf-8"))
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["returncode"], 1)
+
+    def test_subagent_is_a_registered_workspace_builder(self):
+        self.assertIn("subagent", sb.WORKSPACE_BUILDERS)
+
+
+class ToolReplayTests(unittest.TestCase):
+    """2.3 — record/replay of tool I/O for deterministic re-runs."""
+
+    def agent_using_tools(self, replies: list):
+        def agent(*, prompt, workspace, model, tool_executor):
+            a = tool_executor("search", {"q": "alpha"})
+            b = tool_executor("search", {"q": "beta"})
+            replies.append((a, b))
+            return {"answer": f"{a} then {b}"}
+        return agent
+
+    def test_record_then_replay_round_trip_is_identical(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = SubagentRunnerTests().make_tasks(root)[:1]
+            runs = root / "runs"
+            live_calls = {"n": 0}
+
+            def live(payload):
+                live_calls["n"] += 1
+                return f"live-{payload['q']}-{live_calls['n']}"
+
+            sb.run_subagent_tasks(tasks, runs, self.agent_using_tools([]), live_tools={"search": live}, replay_mode="record")
+            base = runs / "case-1" / "with_skill"
+            first = (base / "output.md").read_text(encoding="utf-8")
+            self.assertTrue((base / "tool-replay.json").is_file())
+            self.assertEqual(live_calls["n"], 2)
+
+            def poisoned(payload):
+                raise AssertionError("replay must not hit the live tool")
+
+            sb.run_subagent_tasks(tasks, runs, self.agent_using_tools([]), live_tools={"search": poisoned}, replay_mode="replay")
+            second = (base / "output.md").read_text(encoding="utf-8")
+        self.assertEqual(first, second)
+        self.assertEqual(first, "live-alpha-1 then live-beta-2")
+
+    def test_strict_errors_on_unrecorded_tool_call(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = SubagentRunnerTests().make_tasks(root)[:1]
+            runs = root / "runs"
+            sb.run_subagent_tasks(tasks, runs, self.agent_using_tools([]), replay_mode="strict")
+            output = (runs / "case-1" / "with_skill" / "output.md").read_text(encoding="utf-8")
+        self.assertIn("tool replay miss", output)
+
+    def test_auto_mode_records_then_replays(self):
+        with tempfile.TemporaryDirectory() as td:
+            store_path = Path(td) / "tool-replay.json"
+            store = sb.ToolReplayStore(store_path, "auto")
+            self.assertEqual(store.mode, "record")
+            store.resolve("t", {"x": 1}, live=lambda p: "out")
+            store.save()
+            replayer = sb.ToolReplayStore(store_path, "auto")
+            self.assertEqual(replayer.mode, "replay")
+            self.assertEqual(replayer.resolve("t", {"x": 1}), "out")
+
+
+class HeldOutRubricTests(unittest.TestCase):
+    """2.7b — held-out grading criteria stay invisible to generation."""
+
+    RUBRIC = "Uses a concrete counter-example when rejecting a design"
+
+    def manifest_with_holdout(self, leak_into_skill: bool = False) -> dict:
+        manifest = base_manifest()
+        manifest["cases"].append({
+            "id": "held-1", "split": "holdout", "kind": "behavior", "prompt": "Review the design.",
+            "review_rubric": [self.RUBRIC],
+            "assertions": [{"name": "quality", "type": "judge", "rubric": [self.RUBRIC]}],
+        })
+        return manifest
+
+    def test_audit_flags_rubric_leaked_into_skill(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, self.manifest_with_holdout())
+            skill = path.parent.parent / "skill" / "SKILL.md"
+            skill.write_text(f"---\nname: demo\ndescription: Demo\n---\nAlways: {self.RUBRIC}\n", encoding="utf-8")
+            report = sb.audit_manifest_report(path)
+        kinds = [f["kind"] for f in report["findings"]]
+        self.assertIn("held-out-rubric-leak", kinds)
+
+    def test_audit_silent_when_rubric_stays_hidden(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), self.manifest_with_holdout())
+            report = sb.audit_manifest_report(path)
+        kinds = [f["kind"] for f in report["findings"]]
+        self.assertNotIn("held-out-rubric-leak", kinds)
+
+    def test_generation_payload_never_carries_held_out_rubric(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), self.manifest_with_holdout())
+            manifest = sb.validate_manifest(path)
+            rows = sb.prepared_task_rows(path, manifest)
+        for row in rows:
+            self.assertNotIn(self.RUBRIC, json.dumps(row))
+
+    def test_report_separates_held_out_from_tune_visible(self):
+        results = [
+            {"case_id": "t", "variant": "with_skill", "split": "tune", "missing_output": False, "execution_valid": True,
+             "qualitative_total": 1, "qualitative_pass_rate": 1.0, "graded_score": 0.9, "metadata": {}},
+            {"case_id": "h", "variant": "with_skill", "split": "holdout", "missing_output": False, "execution_valid": True,
+             "qualitative_total": 1, "qualitative_pass_rate": 0.0, "graded_score": 0.4, "metadata": {}},
+        ]
+        visibility = sb.qualitative_by_visibility(results)
+        self.assertEqual(visibility["tune_visible"]["mean_qualitative_pass_rate"], 1.0)
+        self.assertEqual(visibility["held_out"]["mean_qualitative_pass_rate"], 0.0)
+        self.assertEqual(visibility["held_out"]["mean_graded_score"], 0.4)
+
+
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 
