@@ -21,7 +21,8 @@ from typing import Any
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
-from skill_benchmark import write_trace_artifacts  # noqa: E402
+from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, variant_instruction, _copy_skill_root, ablation_variant_population, canonical_skill_tree_hash, detect_trigger  # noqa: E402
+from ablation_model import Provenance, TreeIdentity, TIMEOUT_FAILURE  # noqa: E402
 
 # Workspace-specific example: by default this assumes the harness directory is a
 # sibling of the skill repos. Override with SKILL_EVAL_WORKSPACE_ROOT.
@@ -116,7 +117,7 @@ def copy_skill_source(src: Path, dest_root: Path, skill_name: str) -> Path:
     return dest / "SKILL.md"
 
 
-def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, case: dict[str, Any], variant: str, workspace: Path) -> tuple[str, list[str], list[Path], list[Path]]:
+def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, case: dict[str, Any], variant: str, workspace: Path) -> tuple[str, list[str], list[Path], list[Path], dict[str, Any] | None]:
     """Return instruction, Pi skill args, copied input files, copied skill paths.
 
     The smoke runner intentionally does not execute from the source repo. It
@@ -127,16 +128,53 @@ def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, cas
     workspace.mkdir(parents=True, exist_ok=True)
     copied_skill_paths: list[Path] = []
     skill_args: list[str] = []
-    skill_sources = [(repo_root / p).resolve() for p in manifest.get("skill_paths", [])]
-    if variant != "without_skill":
-        skill_dest_root = workspace / "skills"
-        skill_dest_root.mkdir(parents=True, exist_ok=True)
-        for src in skill_sources:
-            copied = copy_skill_source(src, skill_dest_root, str(manifest.get("skill_name", "skill")))
-            copied_skill_paths.append(copied)
-            skill_args.extend(["--skill", str(copied)])
-    else:
-        skill_args = ["--no-skills"]
+    # A materialized ablation mounts a real, altered skill tree instead of the
+    # original skill; instruction-simulated ablations (no declared removal) fall
+    # through to the with_skill path plus an "ignore X" instruction. Materialize
+    # into a staging dir OUTSIDE the model-visible workspace: the altered tree's
+    # top-level directory is named after the ablation id, and we must never let
+    # that id appear inside cwd where `ls`/`find` could surface the hypothesis.
+    staging: Path | None = None
+    materialized = None
+    if variant.startswith("ablation:"):
+        # The Pi smoke runner force-loads the skill, so it can only measure
+        # ANSWER-population (behavioral) ablations. A discovery ablation must run
+        # through run_pi_trigger_eval.py --ablation, which observes autonomous loading.
+        if ablation_variant_population(manifest, variant) == "trigger":
+            raise RuntimeError(f"{variant} is a discovery (trigger-population) ablation; run it through run_pi_trigger_eval.py --ablation. The Pi smoke runner force-loads the skill and cannot measure autonomous triggering.")
+        staging = Path(tempfile.mkdtemp(prefix="skill-abl-stage-"))
+        materialized = materialized_tree_for_variant(repo_root, manifest, variant, staging)
+
+    try:
+        if variant == "without_skill":
+            skill_args = ["--no-skills"]
+        else:
+            # with_skill, materialized ablation, AND instruction-simulated ablation all
+            # mount under IDENTICAL workspace-relative names (skills/root-N) via the
+            # same canonical copier, so the arms differ only by the bytes of the
+            # (possibly altered) skill — never by a path that could leak the variant.
+            # Materialized sources each root from the altered staging tree; the others
+            # source from the repo.
+            skill_dest_root = workspace / "skills"
+            skill_dest_root.mkdir(parents=True, exist_ok=True)
+            for i, p in enumerate(manifest.get("skill_paths", [])):
+                if materialized is not None:
+                    main_src = Path(materialized["skill_files"][p])
+                    src_dir, main_name = main_src.parent, main_src.name
+                else:
+                    src = (repo_root / p).resolve()
+                    src_dir = src if src.is_dir() else src.parent
+                    main_name = "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else src.name
+                dest = skill_dest_root / f"root-{i}"
+                _copy_skill_root(src_dir, dest)
+                main = dest / main_name
+                copied = main if main.exists() else dest
+                copied_skill_paths.append(copied)
+                skill_args.extend(["--skill", str(copied)])
+    finally:
+        # The neutral copies under skills/root-N persist; drop the id-named staging tree.
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
 
     copied_inputs: list[Path] = []
     for rel in case.get("files", []) or []:
@@ -146,35 +184,23 @@ def materialize_runtime_workspace(manifest: dict[str, Any], repo_root: Path, cas
         shutil.copy2(src, dest)
         copied_inputs.append(dest.resolve())
 
-    if variant == "with_skill":
-        skill_list = ", ".join(str(sp) for sp in copied_skill_paths)
-        instruction = (
-            f"Use the loaded {manifest['skill_name']} skill where it applies. "
-            f"Read and follow these skill path(s), including referenced files when relevant: {skill_list}. "
-            "If the skill defines a required output contract, follow it exactly rather than giving a shortcut answer."
-        )
-    elif variant == "without_skill":
-        instruction = (
-            f"Do not use or read the {manifest['skill_name']} skill or its references. "
-            "Use only general assistant ability. The skill files are intentionally not present in this workspace."
-        )
-    elif variant.startswith("ablation:"):
-        aid = variant.split(":", 1)[1]
-        ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
-        if not ablation:
-            raise RuntimeError(f"unknown ablation variant: {variant}")
-        skill_list = ", ".join(str(sp) for sp in copied_skill_paths)
-        expected = "; ".join(ablation.get("expected_regressions", []))
-        instruction = (
-            f"Use the loaded {manifest['skill_name']} skill where it applies. "
-            f"Read and follow these skill path(s), including referenced files when relevant: {skill_list}. "
-            f"Ablation mode for this empirical run: ignore/remove this component from the skill guidance: {ablation.get('removed_component')}. "
-            f"Expected regression to watch for: {expected}. "
-            "This is an instruction-simulated ablation, not a materialized alternate skill file."
-        )
+    # Workspace-RELATIVE paths only: the model runs with cwd=workspace, so these
+    # resolve correctly and are byte-identical between with_skill and a materialized
+    # ablation (both are skills/root-N/SKILL.md). An absolute path would embed the
+    # temp dir and could differ between arms.
+    skill_list = ", ".join(str(Path(sp).relative_to(workspace)) for sp in copied_skill_paths)
+    # The model-facing instruction is OWNED by skill_benchmark.variant_instruction: it
+    # blinds a materialized ablation to the with_skill instruction and emits the
+    # simulate-this-component directive for an instruction-simulated one — the same
+    # blind/transparent decision every other runner uses. The smoke runner only
+    # appends its workspace-relative skill paths, which are byte-identical across arms
+    # and so cannot leak the variant.
+    core = variant_instruction(variant, manifest)
+    if variant == "without_skill":
+        instruction = f"{core} The skill files are intentionally not present in this workspace."
     else:
-        raise RuntimeError(f"unsupported variant: {variant}")
-    return instruction, skill_args, copied_inputs, copied_skill_paths
+        instruction = f"{core} Read and follow these skill path(s) in your workspace, including referenced files when relevant: {skill_list}."
+    return instruction, skill_args, copied_inputs, copied_skill_paths, materialized
 
 
 def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant: str, run_name: str, timeout: int) -> dict[str, Any]:
@@ -186,9 +212,11 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
     if not prompt:
         raise RuntimeError(f"{repo}/{case['id']} has no inline prompt; smoke runner only handles tune inline prompts")
 
-    with tempfile.TemporaryDirectory(prefix=f"skill-smoke-{repo}-{case['id']}-{variant.replace(':', '-')}-") as td:
+    # The temp dir name must not encode the variant: the model's cwd IS this dir,
+    # so an "ablation-no-rp" suffix would leak the hypothesis to any `pwd`/abs path.
+    with tempfile.TemporaryDirectory(prefix=f"skill-smoke-{repo}-{case['id']}-") as td:
         workspace = Path(td)
-        instruction, skill_args, input_files, copied_skill_paths = materialize_runtime_workspace(manifest, repo_root, case, variant, workspace)
+        instruction, skill_args, input_files, copied_skill_paths, ablation_provenance = materialize_runtime_workspace(manifest, repo_root, case, variant, workspace)
         fixture_note = ""
         if input_files:
             fixture_lines = []
@@ -238,9 +266,14 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
     elapsed_ms = int((time.time() - start) * 1000)
     text, meta = output_from_events(stdout)
     if timed_out and not text:
-        text = "[TIMEOUT: no final assistant message captured]"
-    runner_skill_invoked = variant != "without_skill"
-    copied_skill_evidence = [str(p) for p in locals().get("copied_skill_paths", [])]
+        text = f"{TIMEOUT_FAILURE}: no final assistant message captured]"
+    # Derive skill_invoked from the trace exactly as pi-trigger does — scan the
+    # model's event stream for evidence it ACTUALLY read a mounted skill file —
+    # rather than asserting "mounted => invoked" by fiat (the two-contract bug).
+    if variant == "without_skill":
+        runner_skill_invoked, copied_skill_evidence = False, []
+    else:
+        runner_skill_invoked, copied_skill_evidence = detect_trigger(stdout, manifest["skill_name"], list(locals().get("copied_skill_paths", [])))
     meta.update({
         "elapsed_ms": elapsed_ms,
         "returncode": returncode,
@@ -253,6 +286,15 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
         "skill_invoked": runner_skill_invoked,
         "skill_invocation_evidence": copied_skill_evidence if runner_skill_invoked else [],
     })
+    if ablation_provenance:
+        # One provenance schema, via Provenance — not a hand-picked key subset.
+        prov = Provenance.from_dict(ablation_provenance)
+        meta["ablation"] = prov.as_dict()
+        # Record the canonical (pre-edit) tree hash so the report can pair this
+        # ablation run with a with_skill run from the same skill revision.
+        meta["skill_tree_hash"] = prov.identity.canonical
+    elif variant == "with_skill":
+        meta["skill_tree_hash"] = canonical_skill_tree_hash(repo_root, manifest)
     (out_dir / "output.md").write_text(text, encoding="utf-8")
     trace_metrics = {
         "elapsed_ms": elapsed_ms,

@@ -1,28 +1,57 @@
 #!/usr/bin/env python3
 """Shared benchmark harness for agent skill evals.
 
-This intentionally does not call a model. It prepares paired tasks, grades saved
-outputs with deterministic assertions, emits judge tasks for subjective checks,
-and aggregates timing/token/pass-rate data.
+The grading and aggregation path intentionally does not call a model: it prepares
+paired tasks, grades saved outputs with deterministic assertions, emits judge
+tasks for subjective checks, and aggregates timing/token/cost/pass-rate data. The
+explicit runner and judge commands DO call a model — `run-codex`/`run-claude`
+(and `run-jetty`) to generate outputs, and `judge` (via `--judge-cmd` or, natively,
+`--judge-model`) to grade them. Everything from `grade`/`benchmark` onward is
+model-free and reproducible from saved artifacts.
 """
 from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import html
 import json
 import os
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+import yaml
+
+from ablation_model import (
+    AblationRecord,
+    Arm,
+    CLAUDE_FAILURE,
+    CODEX_FAILURE,
+    Component,
+    EvidenceClass,
+    InstructionSimulated,
+    JETTY_FAILURE,
+    MaterializedArm,
+    PreparedTask,
+    Provenance,
+    ResultSet,
+    TreeIdentity,
+    causal_confirmation,
+    execution_valid,
+    scorable_run,
+)
+from dataclasses import dataclass as _dataclass
 
 VALID_SPLITS = {"tune", "holdout", "holdback"}
 DEFAULT_VARIANTS = ["with_skill", "without_skill"]
@@ -252,49 +281,66 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             if atype == "script":
                 validate_script_assertion(assertion, path, cid, j)
 
+    seen_ablation_ids: set[str] = set()
     for i, ablation in enumerate(manifest.get("ablations", [])):
         if not isinstance(ablation, dict):
             die(f"ablation #{i} must be an object")
-        if not ablation.get("id"):
+        aid = ablation.get("id")
+        if not aid:
             die(f"ablation #{i} missing id")
+        if not ABLATION_ID_RE.match(str(aid)):
+            die(f"ablation {aid!r}: id must be a slug matching {ABLATION_ID_RE.pattern}")
+        if aid in seen_ablation_ids:
+            die(f"ablation id {aid!r} is not unique")
+        seen_ablation_ids.add(aid)
         if not ablation.get("removed_component"):
-            die(f"ablation {ablation.get('id')}: missing removed_component")
+            die(f"ablation {aid}: missing removed_component")
+        try:
+            validate_ablation_removal(ablation, manifest)
+        except AblationError as exc:
+            die(f"ablation {aid}: {exc}")
     return manifest
 
 
 def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path | None = None) -> str:
-    raw_paths = manifest.get("skill_paths", [])
-    if repo_root:
-        skill_paths = ", ".join(str((repo_root / p).resolve()) for p in raw_paths)
-    else:
-        skill_paths = ", ".join(raw_paths)
+    # Path-neutral by design: the instruction must NOT embed absolute repo paths.
+    # Each runner mounts the correct (possibly altered) skill files at its own
+    # workspace-relative location and points the model at them; embedding the
+    # original repo path here would tell a repo-aware runner to read the ORIGINAL
+    # skill — silently defeating a materialized ablation — and would also make the
+    # two arms distinguishable. (repo_root is accepted for call-site compatibility
+    # but intentionally unused.)
+    name = manifest["skill_name"]
     if variant == "with_skill":
         return (
-            f"Use the skill under test ({manifest['skill_name']}). Read and follow: {skill_paths}. "
-            "Load only references relevant to the task."
+            f"Use the skill under test ({name}). Its files are provided in your workspace — "
+            "read and follow them, loading only the references relevant to the task. "
+            "If the skill defines a required output contract, follow it exactly."
         )
     if variant == "without_skill":
         return (
-            f"Do not read or use the {manifest['skill_name']} skill or its references. "
+            f"Do not read or use the {name} skill or its references. "
             "Use only your general capabilities and the task context."
         )
     if variant == "old_skill":
-        old = manifest.get("old_skill_paths") or []
-        if repo_root and old:
-            old = [str((repo_root / p).resolve()) for p in old]
         return (
-            "Use the old/baseline version of the skill only. "
-            f"Old skill paths: {', '.join(old) if old else '<provide old_skill_paths or inject externally>'}."
+            "Use the old/baseline version of the skill only. Its files are provided in your "
+            "workspace — read and follow them."
         )
     if variant.startswith("ablation:"):
         aid = variant.split(":", 1)[1]
         ab = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
         if not ab:
             return f"Use an ablated skill variant {aid}; ablation metadata was not found."
+        # The Arm owns the blind/transparent decision: a materialized ablation is
+        # blind, so the model sees exactly the with_skill instruction.
+        arm = Arm(variant_truth=variant, blind=bool(ablation_components(ab)))
+        if arm.blind:
+            return variant_instruction(arm.model_visible_variant(), manifest, repo_root)
         return (
-            f"Use the {manifest['skill_name']} skill, but simulate this ablation: remove/ignore "
+            f"Use the {name} skill, but simulate this ablation: remove/ignore "
             f"{ab['removed_component']}. Expected regression to watch for: "
-            f"{'; '.join(ab.get('expected_regressions', []))}."
+            f"{'; '.join(expected_regression_summaries(ab))}."
         )
     return f"Run variant {variant}."
 
@@ -311,6 +357,39 @@ def task_variants(manifest: dict[str, Any], *, include_old_skill: bool = False, 
     return variants
 
 
+def materialize_declared_ablations(repo_root: Path, manifest: dict[str, Any], ablation_dir: Path | str) -> dict[str, MaterializedArm]:
+    """Materialize every declared-removal ablation once into ``ablation_dir``,
+    carrying the TYPED ``MaterializedArm`` (not its serialized dict) so callers read
+    ``.arm.provenance`` / ``.skill_files`` / ``.arm.identity`` instead of indexing
+    string keys — the construct-then-immediately-reparse seam is gone.
+
+    Returns ``{ablation_id: MaterializedArm}`` for each ablation that declares a
+    removal (``ablation_components`` is non-empty). Instruction-simulated ablations
+    are not materialized and do not appear. ``AblationError`` from a gate is reported
+    through ``die`` so every caller fails the same way.
+    """
+    # Validate EVERY declared ablation and the output-dir containment BEFORE touching
+    # the output dir. _ensure_ablation_dir creates/clears/marks the dir, so ensuring it
+    # first would let a bad ablation_dir (inside a skill root, or a harness dir we'd
+    # clear) mutate the filesystem before a gate rejects it — and a shape error in a
+    # later ablation would land after earlier trees were already written.
+    validated: list[ValidatedAblation] = []
+    for ablation in manifest.get("ablations", []):
+        if ablation_components(ablation):
+            try:
+                validated.append(ValidatedAblation.validate(repo_root, manifest, ablation))
+            except AblationError as exc:
+                die(f"ablation {ablation.get('id')}: {exc}")
+    ablation_dir = _ensure_ablation_dir_guarded(ablation_dir, repo_root, manifest)
+    trees: dict[str, MaterializedArm] = {}
+    for v in validated:
+        try:
+            trees[v.ablation["id"]] = materialize(v, ablation_dir)
+        except AblationError as exc:
+            die(f"ablation {v.ablation.get('id')}: {exc}")
+    return trees
+
+
 def prepared_task_rows(
     manifest_path: Path,
     manifest: dict[str, Any],
@@ -321,35 +400,94 @@ def prepared_task_rows(
     runs_per_variant: int = 1,
     allow_missing_prompts: bool = False,
     include_answer_key: bool = False,
+    ablation_dir: Path | str | None = None,
+    trees: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     variants = task_variants(manifest, include_old_skill=include_old_skill, include_ablations=include_ablations)
     runs_per_variant = max(1, int(runs_per_variant))
     cases = iter_cases(manifest, split)
     repo_root = repo_root_for_manifest(manifest_path)
+    real_skill_paths = [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])]
+    # The old/baseline arm's files, resolved ONCE here so every runner reads the
+    # same row field instead of each re-deriving them (the divergence that let
+    # Codex mount the current skill for an old_skill arm while Jetty mounted the old).
+    old_skill_paths = [str((repo_root / p).resolve()) for p in manifest.get("old_skill_paths", [])]
+    # When an ablation directory is provided, materialize each declared-removal
+    # ablation once and point its rows at the altered tree. A caller that has
+    # already materialized (e.g. export-jetty, which also needs the trees for
+    # upload) passes ``trees`` so we never materialize the same ablation twice.
+    trees = dict(trees) if trees else {}
+    declared_materialized = [a for a in manifest.get("ablations", []) if ablation_components(a)]
+    if include_ablations and declared_materialized and not trees:
+        if ablation_dir is None:
+            die("materialized ablations require --ablation-dir so prepared rows point at the altered tree (a declared-removal ablation must be materialized, never labelled materialized while the original skill is mounted)")
+        trees = materialize_declared_ablations(repo_root, manifest, ablation_dir)
+    # Every materialized ablation derives from the same canonical (unedited) tree,
+    # so its parent_skill_hash is the canonical hash recorded on the with_skill arm.
+    canonical_hash = next(iter(trees.values())).arm.identity.canonical if trees else None
     rows: list[dict[str, Any]] = []
     for case in cases:
+        # Trigger cases are the DISCOVERY population: "does the skill load on its
+        # own?", measured by the autonomous-trigger adapter (run_pi_trigger_eval.py,
+        # which reads cases directly). This is the answer-path preparer — the
+        # forced-load runners (codex/claude/Jetty) tell the model to read the mounted
+        # skill, so they cannot measure discovery. Emit no runner tasks for a trigger
+        # case here, so an answer runner never spends a call on one (build_benchmark_report
+        # re-checks this as defense in depth).
+        if case.get("kind") == "trigger":
+            continue
         for variant in variants:
-            if variant.startswith("ablation:") and case.get("kind") == "trigger":
-                continue
+            record: AblationRecord | None = None
+            skill_paths = real_skill_paths
+            if variant == "without_skill":
+                skill_paths = []   # the no-skill arm carries NO skill files at the source (defense in depth)
+            elif variant == "old_skill":
+                skill_paths = old_skill_paths   # the OLD tree, carried on the row for both runners
+            elif variant.startswith("ablation:"):
+                population = ablation_variant_population(manifest, variant)
+                # Discovery (trigger-population) ablations measure AUTONOMOUS skill
+                # loading; they are emitted ONLY by the autonomous-trigger adapter
+                # (run_pi_trigger_eval.py --ablation), never by this answer-path preparer.
+                if population == "trigger":
+                    continue
+                aid = variant.split(":", 1)[1]
+                if aid in trees:
+                    # Materialized: carry the arm's TYPED provenance straight through —
+                    # no dict round-trip, no re-parse (the drop-then-reparse is gone).
+                    skill_paths = list(trees[aid].skill_files.values())   # mounted files == ablated tree
+                    record = trees[aid].arm.provenance
+                else:
+                    # Instruction-simulated: no tree, original skill mounted; its typed
+                    # record is the sibling InstructionSimulated, not a Provenance.
+                    record = InstructionSimulated(id=aid, population=population)
             for run_number in range(1, runs_per_variant + 1):
                 run_dir = f"{case['id']}/{variant}" if runs_per_variant == 1 else f"{case['id']}/{variant}/run-{run_number}"
-                task = {
-                    "case_id": case["id"],
-                    "split": case["split"],
-                    "kind": case.get("kind", "behavior"),
-                    "variant": variant,
-                    "run_number": run_number,
-                    "skill_name": manifest["skill_name"],
-                    "repo_root": str(repo_root),
-                    "skill_paths": [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])],
-                    "input_files": [str((manifest_path.parent / f).resolve()) for f in case.get("files", [])],
-                    "run_dir": run_dir,
-                    "instruction": variant_instruction(variant, manifest, repo_root),
-                    "prompt": case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
-                    **({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else {}),
-                    "tags": case.get("tags", []),
-                }
-                rows.append(task)
+                # The PreparedTask is the typed owner; harness_record() serializes the
+                # exact JSONL row shape at the prepare boundary.
+                task = PreparedTask(
+                    case_id=case["id"],
+                    split=case["split"],
+                    kind=case.get("kind", "behavior"),
+                    variant_truth=variant,
+                    run_number=run_number,
+                    skill_name=manifest["skill_name"],
+                    repo_root=str(repo_root),
+                    skill_paths=tuple(skill_paths),
+                    input_files=tuple(str((manifest_path.parent / f).resolve()) for f in case.get("files", [])),
+                    run_dir=run_dir,
+                    instruction=variant_instruction(variant, manifest, repo_root),
+                    prompt=case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
+                    tags=tuple(case.get("tags", [])),
+                    ablation=record,
+                    # Canonical-tree hash on every skill-bearing arm so the report can
+                    # confirm with_skill and the ablation share a skill revision.
+                    # Only the arms that derive from the CURRENT canonical tree record
+                    # its hash; old_skill mounts the old tree, so stamping the current
+                    # canonical hash on it would be an internally false record.
+                    skill_tree_hash=(canonical_hash if (canonical_hash and (variant == "with_skill" or variant.startswith("ablation:"))) else None),
+                    answer_key=({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else None),
+                )
+                rows.append(task.harness_record())
     return rows
 
 
@@ -365,6 +503,7 @@ def prepare(args: argparse.Namespace) -> int:
         runs_per_variant=getattr(args, "runs_per_variant", 1),
         allow_missing_prompts=args.allow_missing_prompts,
         include_answer_key=args.include_answer_key,
+        ablation_dir=getattr(args, "ablation_dir", None),
     )
     out = Path(args.out) if args.out else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
@@ -387,14 +526,966 @@ JETTY_TERMINAL_FAILURE = {"failed", "failure", "error", "errored", "canceled", "
 JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
 
 
+# ---------------------------------------------------------------------------
+# Skill ablation materialization (docs/skill-ablation-spec.md)
+#
+# An ablation:<id> produces a real, altered copy of the skill tree by removing
+# one or more components. Ablation is removal-only; replacement-bearing edits
+# are a separate swap:<id> feature (not implemented). All edits resolve against
+# the ORIGINAL copy, must be pairwise disjoint, and apply back-to-front so the
+# result is order-independent and byte-deterministic.
+# ---------------------------------------------------------------------------
+
+ABLATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+COMPONENT_CLASSES = {"discovery", "runtime", "instructions", "resource", "preprocess"}
+SKILL_MECHANISMS = {"frontmatter_field", "section", "list_item", "patch", "reference", "script", "asset", "preprocess"}
+# Which component classes each mechanism is allowed to declare (a declared class
+# is not trusted blindly — a section may not claim class: discovery to route to
+# trigger cases).
+MECHANISM_CLASSES = {
+    "frontmatter_field": {"discovery", "runtime"},
+    "section": {"instructions"}, "list_item": {"instructions"},
+    "patch": {"instructions", "discovery", "runtime"},
+    "reference": {"resource"}, "script": {"resource"}, "asset": {"resource"},
+    "preprocess": {"preprocess"},
+}
+# Frontmatter fields that govern activation/discovery; everything else a
+# frontmatter_field ablation can touch is treated as runtime configuration.
+DISCOVERY_FIELDS = {"name", "description", "when_to_use", "paths", "disable-model-invocation", "user-invocable"}
+REQUIRED_FRONTMATTER_FIELDS = ("name", "description")
+_COPY_EXCLUDE = {"evals", ".git"}
+_ABLATION_MARKER = ".skill-ablation-dir"
+
+
+class AblationError(Exception):
+    """Raised when an ablation cannot be validated or materialized."""
+
+
+def ablation_components(ablation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize an ablation entry to a list of components. Returns [] when the
+    entry declares no removal — that absence IS the instruction-simulated mode."""
+    if ablation.get("components"):
+        return list(ablation["components"])
+    if ablation.get("mechanism"):
+        return [{"mechanism": ablation["mechanism"], "class": ablation.get("class"), "target": ablation.get("target", {})}]
+    return []
+
+
+def component_class(comp: dict[str, Any]) -> str | None:
+    """The declared class, or one inferred from the mechanism/field."""
+    if comp.get("class"):
+        return comp["class"]
+    mech, tgt = comp.get("mechanism"), comp.get("target", {})
+    if mech == "frontmatter_field":
+        return "discovery" if tgt.get("field") in DISCOVERY_FIELDS else "runtime"
+    if mech in {"section", "list_item", "patch"}:
+        return "instructions"
+    if mech in {"reference", "script", "asset"}:
+        return "resource"
+    if mech == "preprocess":
+        return "preprocess"
+    return None
+
+
+def resolve_skill_root(comp: dict[str, Any], skill_paths: list[str]) -> str | None:
+    """The ONE default for a component's skill_root: the declared target.skill_root,
+    else the first skill path. Used by both materialize() (which records the
+    fingerprint) and _expected_component() (which rebuilds the expected fingerprint),
+    so the recorded and expected skill_root cannot drift and silently downgrade every
+    confirmation to INDETERMINATE."""
+    r = (comp.get("target") or {}).get("skill_root")
+    return r if r is not None else (skill_paths[0] if skill_paths else None)
+
+
+def _skill_root_key(rel: str) -> str:
+    """Sanitized directory name for a skill root inside a built tree. The SAME
+    function must name the canonical (with_skill) tree and the materialized pre-edit
+    tree, because _hash_tree includes this directory name — any divergence would make
+    canonical_skill_tree_hash != the ablation's parent_skill_hash and break
+    TreeIdentity.same_revision_as."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", rel)
+
+
+def derived_population(components: list[dict[str, Any]]) -> str:
+    """trigger if every component is discovery, else answer. Mixing the two is a
+    cohesion error (different case populations, unattributable regression)."""
+    classes = {component_class(c) for c in components}
+    if "discovery" in classes and classes - {"discovery"}:
+        raise AblationError("layer cohesion: discovery components cannot mix with answer-population components")
+    return "trigger" if classes == {"discovery"} else "answer"
+
+
+def split_frontmatter(text: str) -> tuple[str, str]:
+    """Return (frontmatter_block_including_fences, body)."""
+    if text.startswith("---\n"):
+        i = text.find("\n---\n", 3)
+        if i != -1:
+            return text[: i + 5], text[i + 5:]
+    return "", text
+
+
+def parse_frontmatter(text: str) -> dict[str, Any]:
+    """Parse the YAML frontmatter mapping with a real YAML parser, so block
+    scalars, folded values, and empty values are handled correctly. {} if
+    absent or not a mapping."""
+    fm, _ = split_frontmatter(text)
+    if not fm:
+        return {}
+    try:
+        data = yaml.safe_load(fm[4:-5])
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def frontmatter_value(text: str, field: str) -> Any:
+    return parse_frontmatter(text).get(field)
+
+
+def required_fields_present(text: str) -> bool:
+    # REQUIRED_FRONTMATTER_FIELDS is the single owner of which fields are required;
+    # this predicate iterates it rather than hardcoding name/description.
+    data = parse_frontmatter(text)
+    return all(isinstance(data.get(f), str) and bool(data.get(f).strip()) for f in REQUIRED_FRONTMATTER_FIELDS)
+
+
+def _line_starts(text: str) -> tuple[list[str], list[int]]:
+    lines = text.splitlines(keepends=True)
+    starts, pos = [], 0
+    for ln in lines:
+        starts.append(pos)
+        pos += len(ln)
+    starts.append(pos)  # sentinel: end of text
+    return lines, starts
+
+
+def _fenced_mask(lines: list[str]) -> list[bool]:
+    """True for lines inside a fenced code block (``` or ~~~), delimiters
+    included. Per CommonMark, a fence is closed only by a fence of the SAME
+    character that is at least as long as the opener and has nothing but
+    whitespace after it — so a ```` (4-tick) block is not closed by ``` (3)."""
+    mask: list[bool] = []
+    open_fence: tuple[str, int] | None = None   # (char, length)
+    for ln in lines:
+        if open_fence is None:
+            m = re.match(r"^\s*(`{3,}|~{3,})", ln)   # opener may carry an info string
+            mask.append(bool(m))
+            if m:
+                open_fence = (m.group(1)[0], len(m.group(1)))
+        else:
+            mask.append(True)
+            c = re.match(r"^\s*(`{3,}|~{3,})\s*$", ln)   # closer: only whitespace after
+            if c and c.group(1)[0] == open_fence[0] and len(c.group(1)) >= open_fence[1]:
+                open_fence = None
+    return mask
+
+
+def _fenced_char_spans(text: str) -> list[tuple[int, int]]:
+    lines, starts = _line_starts(text)
+    return [(starts[i], starts[i + 1]) for i, masked in enumerate(_fenced_mask(lines)) if masked]
+
+
+def _in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(s <= pos < e for s, e in spans)
+
+
+def _inline_code_spans(text: str) -> list[tuple[int, int]]:
+    """Char spans of inline code: a run of N backticks closed by the next run of
+    exactly N backticks (CommonMark). Lets link/reference parsing ignore code
+    samples like `` `[x](path)` `` so they are never treated as real links."""
+    spans: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "`":
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] == "`":
+            j += 1
+        ticks = j - i
+        k, closed = j, False
+        while k < n:
+            if text[k] == "`":
+                m = k
+                while m < n and text[m] == "`":
+                    m += 1
+                if m - k == ticks:
+                    spans.append((i, m))
+                    i, closed = m, True
+                    break
+                k = m
+            else:
+                k += 1
+        if not closed:
+            i = j   # unterminated run: not inline code, skip past the run
+    return spans
+
+
+def frontmatter_field_span(text: str, field: str) -> tuple[int, int] | None:
+    """Char span of a top-level frontmatter field line plus any indented
+    block-scalar continuation lines."""
+    if not text.startswith("---\n"):
+        return None
+    lines, starts = _line_starts(text)
+    field_re = re.compile(rf"^{re.escape(field)}:")
+    start_i = None
+    for idx in range(1, len(lines)):
+        if lines[idx].rstrip("\n") == "---":
+            break
+        if field_re.match(lines[idx]):
+            start_i = idx
+            break
+    if start_i is None:
+        return None
+    # Consume continuation lines: blanks and indented lines (a block scalar body
+    # may contain internal blank lines), stopping only at the closing fence or
+    # the next top-level key.
+    end_i = start_i + 1
+    while end_i < len(lines):
+        ln = lines[end_i]
+        if ln.rstrip("\n") == "---":
+            break
+        if ln.strip() == "" or re.match(r"^[ \t]", ln):
+            end_i += 1
+        else:
+            break
+    return (starts[start_i], starts[end_i])
+
+
+def section_span(text: str, heading: str) -> tuple[int, int]:
+    """Char span of a markdown section: heading line through the next heading of
+    equal-or-higher level. Fence-aware: a '##' inside a ``` block is code."""
+    fm, body = split_frontmatter(text)
+    base = len(fm)
+    lines, starts = _line_starts(body)
+    mask = _fenced_mask(lines)
+    h = heading.strip()
+    # If the target carries '#' markers, require that exact heading LEVEL — so a
+    # '## Foo' target does not accidentally match a '### Foo' subheading with the
+    # same text. A bare-text target (no '#') still matches any level.
+    want_level = (len(h) - len(h.lstrip("#"))) if h.startswith("#") else None
+    want = h.lstrip("#").strip().lower()
+    start_i = level = None
+    for i, ln in enumerate(lines):
+        if mask[i]:
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", ln)
+        if m and m.group(2).strip().lower() == want and (want_level is None or len(m.group(1)) == want_level):
+            start_i, level = i, len(m.group(1))
+            break
+    if start_i is None:
+        raise AblationError(f"section not found: {heading!r}")
+    end_i = len(lines)
+    for j in range(start_i + 1, len(lines)):
+        if mask[j]:
+            continue
+        m = re.match(r"^(#{1,6})\s+", lines[j])
+        if m and len(m.group(1)) <= level:
+            end_i = j
+            break
+    return (base + starts[start_i], base + starts[end_i])
+
+
+def list_item_ops(text: str, section: str, contains: list[str]) -> list[tuple[int, int, str]]:
+    fm, body = split_frontmatter(text)
+    base = len(fm)
+    lines, starts = _line_starts(body)
+    mask = _fenced_mask(lines)
+    h = section.strip()
+    want_level = (len(h) - len(h.lstrip("#"))) if h.startswith("#") else None
+    want = h.lstrip("#").strip().lower()
+    body_start = level = None
+    for i, ln in enumerate(lines):
+        if mask[i]:
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", ln)
+        if m and m.group(2).strip().lower() == want and (want_level is None or len(m.group(1)) == want_level):
+            body_start, level = i + 1, len(m.group(1))
+            break
+    if body_start is None:
+        raise AblationError(f"section not found for list_item: {section!r}")
+    section_end = len(lines)
+    for j in range(body_start, len(lines)):
+        if mask[j]:
+            continue
+        m = re.match(r"^(#{1,6})\s+", lines[j])
+        if m and len(m.group(1)) <= level:
+            section_end = j
+            break
+    ops = []
+    k = body_start
+    while k < section_end:
+        if mask[k]:
+            k += 1
+            continue
+        stripped = lines[k].lstrip()
+        indent = len(lines[k]) - len(stripped)
+        is_bullet = stripped.startswith(("- ", "* ", "+ ")) or re.match(r"^\d+\.\s", stripped)
+        if is_bullet and any(c.lower() in lines[k].lower() for c in contains):
+            j = k + 1
+            while j < section_end:
+                if mask[j]:
+                    # A fenced code block belongs to the item only if its opening
+                    # fence is indented under the bullet; consume the whole block so
+                    # the item is removed in full, not truncated at the fence.
+                    open_indent = len(lines[j]) - len(lines[j].lstrip())
+                    if open_indent > indent:
+                        j += 1
+                        while j < section_end and mask[j]:
+                            j += 1
+                        continue
+                    break
+                nstripped = lines[j].lstrip()
+                nindent = len(lines[j]) - len(nstripped)
+                if nstripped == "" or nindent > indent:
+                    j += 1
+                else:
+                    break
+            ops.append((base + starts[k], base + starts[j], ""))
+            k = j
+        else:
+            k += 1
+    if not ops:
+        raise AblationError(f"no matching list items in {section!r}")
+    return ops
+
+
+def preprocess_ops(text: str, contains: list[str]) -> list[tuple[int, int, str]]:
+    """Remove inline `` !`command` `` spans and ```! fenced blocks whose command
+    text matches any of `contains`. These preprocessing commands execute before
+    the skill body reaches the model."""
+    def matches(s: str) -> bool:
+        return any(c.lower() in s.lower() for c in contains)
+    ops: list[tuple[int, int, str]] = []
+    for m in re.finditer(r"(?ms)^[ \t]*```!.*?\n[ \t]*`{3,}[ \t]*\n?", text):
+        if matches(m.group(0)):
+            ops.append((m.start(), m.end(), ""))
+    covered = [(s, e) for s, e, _ in ops] + _fenced_char_spans(text) + _inline_code_spans(text)
+    for m in re.finditer(r"!`[^`]*`", text):
+        if _in_spans(m.start(), covered) or not matches(m.group(0)):
+            continue  # skip inline commands inside ordinary code (fenced or inline examples)
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        line_end = line_end + 1 if line_end != -1 else len(text)
+        if text[line_start:m.start()].strip() == "" and text[m.end():line_end].strip() == "":
+            ops.append((line_start, line_end, ""))   # command is alone on its line
+        else:
+            ops.append((m.start(), m.end(), ""))
+    if not ops:
+        raise AblationError(f"no preprocess command matched: {contains!r}")
+    return ops
+
+
+def reference_pointer_ops(text: str, relpath: str) -> list[tuple[int, int, str]]:
+    """Unlink markdown links whose target is relpath: [text](relpath) -> text.
+    Keeps the existing visible text, so no new prose is introduced (removal,
+    not substitution)."""
+    # Exclude both fenced blocks and inline code, so a link literal shown as a
+    # code sample is never silently unlinked.
+    spans = _fenced_char_spans(text) + _inline_code_spans(text)
+    ops = [(m.start(), m.end(), m.group(1)) for m in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text)
+           if m.group(2).strip() == relpath and not _in_spans(m.start(), spans)]
+    if not ops:
+        raise AblationError(f"reference pointer not found outside code: {relpath!r}")
+    return ops
+
+
+def patch_delete_ops(text: str, patch: str) -> list[tuple[int, int, str]]:
+    """Resolve a deletion-only unified diff to char-span deletions. A '+' line
+    means the patch adds content — that is a swap, not an ablation."""
+    lines, starts = _line_starts(text)
+    ops, idx, saw = [], 0, False
+    plines = patch.split("\n")
+    k = 0
+    while k < len(plines):
+        h = re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", plines[k])
+        if not h:
+            k += 1
+            continue
+        idx = int(h.group(1)) - 1
+        k += 1
+        while k < len(plines) and plines[k][:1] in (" ", "-", "+"):
+            tag, content = plines[k][0], plines[k][1:]
+            if tag == "+":
+                raise AblationError("ablation patch is deletion-only; '+' lines indicate a swap (use swap:<id>)")
+            cur = lines[idx].rstrip("\n") if idx < len(lines) else None
+            if cur != content:
+                raise AblationError(f"patch context mismatch at line {idx + 1}: {content!r}")
+            if tag == "-":
+                ops.append((starts[idx], starts[idx + 1], ""))
+                saw = True
+            idx += 1
+            k += 1
+    if not saw:
+        raise AblationError("patch removed nothing")
+    return ops
+
+
+def _verify_hunks_match_class(text: str, spans: list[tuple[int, int, str]], declared_class: str) -> None:
+    """A patch may delete from the frontmatter (a discovery edit) or the body (an
+    instructions edit). Verify every hunk lands in the region the declared class
+    names, so a frontmatter edit can't be mislabeled `instructions` (or a body
+    edit `discovery`) and routed to the wrong case population. A hunk that
+    straddles the boundary, or a set of hunks split across both regions, is
+    rejected — declare two single-region patch components instead."""
+    fm, _ = split_frontmatter(text)
+    fm_end = len(fm)
+    # Spans are whole-line deletions and fm_end is a line boundary, so each hunk
+    # is wholly inside the frontmatter (e <= fm_end) or wholly in the body.
+    in_fm = any(e <= fm_end for s, e, _ in spans)
+    in_body = any(s >= fm_end for s, e, _ in spans)
+    if in_fm and in_body:
+        raise AblationError("patch deletes from both the frontmatter and the body; split it into separate frontmatter and instructions patch components")
+    if declared_class in ("discovery", "runtime"):
+        # A frontmatter patch. It must stay in the frontmatter AND only touch fields
+        # of the right kind: discovery patches route to trigger cases, so they must
+        # not silently delete a RUNTIME field (allowed-tools/model/effort/...) — and
+        # vice versa — which would change the wrong behavior for the wrong population.
+        if in_body:
+            raise AblationError(f"patch declares class {declared_class!r} (a frontmatter edit) but a hunk deletes body content")
+        # STRUCTURAL ownership, not a regex on the deleted text: map each deleted
+        # line to the parsed top-level field whose span CONTAINS it. A block-scalar
+        # body line that merely looks like `key:` is correctly attributed to its
+        # enclosing field, and gutting a discovery field's multi-line value can no
+        # longer slip through as a runtime edit. Every deleted byte must belong to a
+        # field of the declared kind.
+        field_spans = []
+        for name in parse_frontmatter(text):
+            fsp = frontmatter_field_span(text, str(name))
+            if fsp is not None:
+                field_spans.append((str(name), fsp[0], fsp[1]))
+        for s, e, _ in spans:
+            owner = next((nm for nm, fs, fe in field_spans if fs <= s and e <= fe), None)
+            if owner is None:
+                raise AblationError("patch deletes frontmatter content outside any field (a fence or blank line); patch a specific field instead")
+            owner_is_discovery = owner in DISCOVERY_FIELDS
+            if declared_class == "discovery" and not owner_is_discovery:
+                raise AblationError(f"discovery patch deletes non-discovery field {owner!r}; use class 'runtime' for runtime fields or split the patch")
+            if declared_class == "runtime" and owner_is_discovery:
+                raise AblationError(f"runtime patch deletes discovery frontmatter field {owner!r}; use class 'discovery' for discovery fields")
+    elif in_fm:
+        raise AblationError(f"patch declares class {declared_class!r} but a hunk deletes frontmatter content")
+
+
+def _check_disjoint(ops: list[tuple[int, int, str]]) -> None:
+    spans = sorted((s, e) for s, e, _ in ops)
+    for i in range(1, len(spans)):
+        if spans[i][0] < spans[i - 1][1]:
+            raise AblationError(f"components overlap near char {spans[i][0]}")
+
+
+def _apply_edits(text: str, ops: list[tuple[int, int, str]]) -> str:
+    for s, e, r in sorted(ops, key=lambda o: o[0], reverse=True):
+        text = text[:s] + r + text[e:]
+    return text
+
+
+def _detect_newline(raw: bytes) -> str:
+    """The line ending to write back with: CRLF if the file's bytes contain any
+    CRLF, else LF. Parsing/editing happens on LF-normalized text (what read_text
+    returns), so a removal-only edit must restore the original EOL on write —
+    otherwise a CRLF skill file would be silently rewritten LF on every line."""
+    return "\r\n" if b"\r\n" in raw else "\n"
+
+
+def _write_text_preserving_newlines(path: Path, text_lf: str) -> None:
+    """Write LF-normalized text back to `path`, restoring the EOL style the file
+    on disk currently uses (read before this call, so it reflects the original)."""
+    nl = _detect_newline(path.read_bytes()) if path.exists() else "\n"
+    out = text_lf.replace("\n", nl) if nl != "\n" else text_lf
+    path.write_bytes(out.encode("utf-8"))
+
+
+def _hash_tree(root: Path) -> str:
+    """Stable content hash of a directory tree: sorted posix relpaths plus bytes.
+    Identical inputs (same files, same content, same relative layout) hash equal,
+    so a materialized ablation's pre-edit tree and the canonical with_skill tree —
+    built by the same copier with the same key naming — produce the same hash."""
+    digest = hashlib.sha256()
+    for f in sorted(root.rglob("*")):
+        if f.is_file():
+            digest.update(f.relative_to(root).as_posix().encode("utf-8") + b"\0")
+            digest.update(f.read_bytes())
+    return digest.hexdigest()
+
+
+def _safe_under(base: Path, path: Path) -> Path:
+    base_r = base.resolve()
+    p = path.resolve()
+    if p != base_r and base_r not in p.parents:
+        raise AblationError(f"path escapes {base_r}: {path}")
+    return p
+
+
+def _reject_output_root_overlap(out_root: Path, repo_root: Path, manifest: dict[str, Any]) -> None:
+    """Refuse an output directory that equals, sits inside, or contains any source
+    skill root. Writing the materialized tree into (or around) a source root could
+    clobber the original skill or recursively copy our own output, corrupting both
+    the with_skill oracle and the ablated arm."""
+    out = out_root.resolve()
+    for r in manifest.get("skill_paths", []):
+        src = (repo_root / r).resolve()
+        src_dir = src if src.is_dir() else src.parent
+        if out == src_dir:
+            raise AblationError(f"output dir {out} is a source skill root; choose a directory outside the skill")
+        if src_dir in out.parents:
+            raise AblationError(f"output dir {out} is inside source skill root {src_dir}; choose a directory outside the skill")
+        if out in src_dir.parents:
+            raise AblationError(f"output dir {out} contains source skill root {src_dir}; choose a directory outside the skill tree")
+
+
+def _reject_overlapping_skill_roots(repo_root: Path, manifest: dict[str, Any]) -> None:
+    """Refuse a manifest whose skill_paths roots nest. Each root's parent directory
+    is copied wholesale, so if one root's copy-dir is an ancestor of (or identical
+    to) another's, the ancestor copy contains an UNABLATED duplicate of the
+    descendant — a runner could read that duplicate and the ablation would not
+    actually be removed. Declare non-overlapping roots (point at each skill's own
+    directory, not a shared ancestor such as the repo root)."""
+    dirs: list[tuple[str, Path]] = []
+    for r in manifest.get("skill_paths", []):
+        src = (repo_root / r).resolve()
+        dirs.append((r, src if src.is_dir() else src.parent))
+    for i, (ri, di) in enumerate(dirs):
+        for j, (rj, dj) in enumerate(dirs):
+            if i == j:
+                continue
+            if di == dj:
+                raise AblationError(f"skill roots {ri!r} and {rj!r} are copied from the same directory {di}; the ablated copy and an unablated copy would coexist — declare a single root")
+            if di in dj.parents:
+                raise AblationError(f"skill root {ri!r} (dir {di}) is an ancestor of skill root {rj!r}; copying it would include an unablated duplicate of {rj!r} — declare non-overlapping roots")
+    # Distinct roots whose sanitized tree-key collides would overwrite each other in
+    # the built tree (an otherwise-unwrapped FileExistsError); reject as an AblationError.
+    seen_keys: dict[str, str] = {}
+    for r in manifest.get("skill_paths", []):
+        k = _skill_root_key(r)
+        if k in seen_keys:
+            raise AblationError(f"skill roots {seen_keys[k]!r} and {r!r} both map to tree key {k!r}; rename one so their built directories do not collide")
+        seen_keys[k] = r
+
+
+def _copy_skill_root(src_dir: Path, dst_dir: Path) -> None:
+    """Copy a skill's complete directory (arbitrary files, not a 3-dir
+    whitelist), excluding eval answers, VCS, and dotfiles. Reject any symlink
+    that resolves outside the root — copytree would otherwise pull external
+    (possibly private) content into the materialized tree."""
+    src_real = src_dir.resolve()
+    for root, dirs, files in os.walk(src_dir):
+        dirs[:] = [d for d in dirs if d not in _COPY_EXCLUDE and not d.startswith(".")]
+        for name in [*dirs, *files]:
+            p = Path(root) / name
+            if p.is_symlink():
+                target = p.resolve()
+                if target != src_real and src_real not in target.parents:
+                    raise AblationError(f"skill root contains a symlink escaping the root: {p}")
+    def ignore(_dir: str, names: list[str]) -> list[str]:
+        return [n for n in names if n in _COPY_EXCLUDE or n.startswith(".")]
+    shutil.copytree(src_dir, dst_dir, ignore=ignore)
+
+
+def _ensure_ablation_dir(path: Path) -> Path:
+    """Create/clear a harness-owned ablation output dir. Refuses to touch a
+    non-empty directory that lacks the harness ownership marker, so a wrong
+    --ablation-dir can never erase user data."""
+    path = Path(path)
+    if path.exists():
+        if not path.is_dir():
+            die(f"--ablation-dir {path} exists and is not a directory")
+        if any(path.iterdir()) and not (path / _ABLATION_MARKER).exists():
+            die(f"--ablation-dir {path} is non-empty and not a harness-created ablation dir; refusing to clear it")
+        for child in path.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    path.mkdir(parents=True, exist_ok=True)
+    (path / _ABLATION_MARKER).write_text("skill-eval-harness ablation output\n", encoding="utf-8")
+    return path
+
+
+def _ensure_ablation_dir_guarded(out_dir: Path | str, repo_root: Path, manifest: dict[str, Any]) -> Path:
+    """Single owner of 'create a harness output dir for a materialized arm'. Runs the
+    NON-MUTATING containment gates (no nested skill roots; out_dir is not equal to,
+    inside, or containing a source skill root) BEFORE _ensure_ablation_dir creates,
+    clears, or marks anything — so a bad --ablation-dir cannot write into a source
+    skill tree or wipe a harness-owned dir before the gate rejects it. AblationError
+    is reported through die so the message matches the other apply-time gates."""
+    out = Path(out_dir)
+    try:
+        _reject_overlapping_skill_roots(repo_root, manifest)
+        _reject_output_root_overlap(out, repo_root, manifest)
+    except AblationError as exc:
+        die(str(exc))
+    return _ensure_ablation_dir(out)
+
+
+def _required_target_keys(mech: str) -> list[str]:
+    return {
+        "frontmatter_field": ["field"], "section": ["heading"],
+        "list_item": ["section"], "patch": ["patch"], "reference": ["path"],
+        "script": ["path"], "asset": ["path"], "preprocess": ["contains"],
+    }.get(mech, [])
+
+
+def validate_ablation_removal(ablation: dict[str, Any], manifest: dict[str, Any]) -> None:
+    """Shape + safety validation for a declared removal. Apply-time gates
+    (effect, disjointness, required-field preservation) run at materialize time."""
+    if ablation.get("components") and ablation.get("mechanism"):
+        raise AblationError("declare either mechanism+target or components, not both")
+    comps = ablation_components(ablation)
+    if not comps:
+        return  # instruction-simulated
+    skill_paths = manifest.get("skill_paths", [])
+    classes: set[str | None] = set()
+    for comp in comps:
+        mech = comp.get("mechanism")
+        if mech not in SKILL_MECHANISMS:
+            raise AblationError(f"unknown mechanism {mech!r}")
+        cls = component_class(comp)
+        if cls not in COMPONENT_CLASSES:
+            raise AblationError(f"invalid component class {cls!r}")
+        classes.add(cls)
+        tgt = comp.get("target", {})
+        if not isinstance(tgt, dict):
+            raise AblationError("target must be an object")
+        root = tgt.get("skill_root")
+        if root is None and len(skill_paths) != 1:
+            raise AblationError(f"component target missing skill_root (manifest has {len(skill_paths)} skill_paths)")
+        if root is not None and root not in skill_paths:
+            raise AblationError(f"skill_root {root!r} is not in manifest.skill_paths")
+        for key in _required_target_keys(mech):
+            if not tgt.get(key):
+                raise AblationError(f"{mech} target missing {key!r}")
+        for key in ("path", "patch"):
+            v = tgt.get(key)
+            if v and (Path(v).is_absolute() or ".." in Path(v).parts):
+                raise AblationError(f"unsafe path (absolute or traversal): {v!r}")
+        if comp.get("class") and comp["class"] not in MECHANISM_CLASSES.get(mech, COMPONENT_CLASSES):
+            raise AblationError(f"mechanism {mech!r} is incompatible with declared class {comp['class']!r} (allowed: {sorted(MECHANISM_CLASSES.get(mech, []))})")
+        if mech == "frontmatter_field":
+            inferred = component_class({**comp, "class": None})   # the one inference owner
+            if comp.get("class") and comp["class"] != inferred:
+                raise AblationError(f"frontmatter_field {tgt.get('field')!r} is class {inferred}, not {comp['class']!r}")
+        if mech in ("reference", "script", "asset") and Path(str(tgt.get("path", ""))).name == "SKILL.md":
+            raise AblationError(f"{mech} may not target the skill's SKILL.md (use a frontmatter/section/patch mechanism)")
+    if "discovery" in classes and classes - {"discovery"}:
+        raise AblationError("layer cohesion: discovery cannot mix with answer-population components")
+
+
+def _resolve_component_ops(comp: dict[str, Any], main_file: Path, root_dir: Path, repo_root: Path, aid: str) -> tuple[dict[Path, list[tuple[int, int, str]]], set[Path]]:
+    mech = comp.get("mechanism")
+    tgt = comp.get("target", {})
+    text = main_file.read_text(encoding="utf-8-sig")   # tolerate a UTF-8 BOM (Windows editors)
+    ops: dict[Path, list[tuple[int, int, str]]] = {}
+    deletes: set[Path] = set()
+    if mech == "frontmatter_field":
+        span = frontmatter_field_span(text, tgt["field"])
+        if span is None:
+            raise AblationError(f"frontmatter field not found: {tgt['field']!r}")
+        ops[main_file] = [(span[0], span[1], "")]
+    elif mech == "section":
+        s, e = section_span(text, tgt["heading"])
+        ops[main_file] = [(s, e, "")]
+    elif mech == "list_item":
+        ops[main_file] = list_item_ops(text, tgt["section"], tgt.get("contains", []))
+    elif mech == "preprocess":
+        ops[main_file] = preprocess_ops(text, tgt["contains"])
+    elif mech == "patch":
+        patch_file = _safe_under(repo_root, repo_root / tgt["patch"])
+        spans = patch_delete_ops(text, patch_file.read_text(encoding="utf-8"))
+        _verify_hunks_match_class(text, spans, component_class(comp))
+        ops[main_file] = spans
+    elif mech == "reference":
+        mode = tgt.get("remove", "both")
+        if mode in ("pointer", "both"):
+            ops[main_file] = reference_pointer_ops(text, tgt["path"])
+        if mode in ("content", "both"):
+            deletes.add(_safe_under(root_dir, root_dir / tgt["path"]))
+    elif mech in ("script", "asset"):
+        deletes.add(_safe_under(root_dir, root_dir / tgt["path"]))
+    else:
+        raise AblationError(f"unknown mechanism {mech!r}")
+    return ops, deletes
+
+
+@_dataclass(frozen=True)
+class ValidatedAblation:
+    """The gate pile as a SMART CONSTRUCTOR. The only way to obtain one is
+    ValidatedAblation.validate(), which runs every declaration-time gate
+    (removal declared, mechanism/class/field consistency, path safety,
+    non-overlapping skill roots, layer cohesion). Its existence is therefore proof
+    the ablation is well-formed, so materialize() can take a ValidatedAblation
+    instead of a raw dict — you cannot materialize an unvalidated ablation."""
+
+    repo_root: Path
+    manifest: dict[str, Any]
+    ablation: dict[str, Any]
+    components: tuple[dict[str, Any], ...]
+    population: str
+
+    @classmethod
+    def validate(cls, repo_root: Path, manifest: dict[str, Any], ablation: dict[str, Any]) -> "ValidatedAblation":
+        comps = ablation_components(ablation)
+        if not comps:
+            raise AblationError(f"ablation {ablation.get('id')!r} declares no removal (instruction-simulated)")
+        validate_ablation_removal(ablation, manifest)
+        _reject_overlapping_skill_roots(repo_root, manifest)
+        population = derived_population(comps)   # runs the layer-cohesion gate
+        return cls(repo_root=repo_root, manifest=manifest, ablation=ablation, components=tuple(comps), population=population)
+
+
+def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: dict[str, Any], out_root: Path) -> dict[str, Any]:
+    """Backward-compatible dict facade over the typed core: validate, materialize,
+    serialize. New code should use ValidatedAblation.validate() + materialize()."""
+    return materialize(ValidatedAblation.validate(repo_root, manifest, ablation), out_root).as_legacy_dict()
+
+
+def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm:
+    """Produce out_root/<id>/ holding the altered skill tree for a VALIDATED
+    ablation, and return a MaterializedArm (which itself cannot exist without an
+    edited tree + provenance). Runs the apply-time gates (output containment,
+    net-deletion, disjointness, required-field). Raises AblationError on any gate."""
+    repo_root, manifest, ablation = validated.repo_root, validated.manifest, validated.ablation
+    comps = list(validated.components)
+    population = validated.population
+    _reject_output_root_overlap(out_root, repo_root, manifest)
+    aid = ablation["id"]
+    skill_paths = manifest.get("skill_paths", [])
+
+    def root_for(comp: dict[str, Any]) -> str:
+        return resolve_skill_root(comp, skill_paths)
+
+    dest = out_root / aid
+    if dest.exists():
+        raise AblationError(f"output already exists: {dest}")
+    out_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=f".ablation-{aid}-", dir=out_root))
+    try:
+        roots: dict[str, tuple[Path, Path]] = {}
+        # Copy EVERY manifest root (not just the ones a component touches) so the
+        # ablated arm has the same file surface as with_skill, differing only by
+        # the declared edits.
+        for r in (skill_paths or list(dict.fromkeys(root_for(c) for c in comps))):
+            src = _safe_under(repo_root, repo_root / r)
+            src_dir = src if src.is_dir() else src.parent
+            key = _skill_root_key(r)
+            dst_dir = tmp / key
+            _copy_skill_root(src_dir, dst_dir)
+            main = dst_dir / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dst_dir / src.name
+            roots[r] = (main, dst_dir)
+
+        # Hash the canonical (pre-edit) tree: the with_skill arm's oracle. Both arms
+        # record this so the report can prove they share a skill revision.
+        parent_skill_hash = _hash_tree(tmp)
+
+        file_text: dict[Path, str] = {}
+        file_ops: dict[Path, list[tuple[int, int, str]]] = {}
+        delete_owner: dict[Path, int] = {}
+        removed_by_component: list[int] = []
+        isolation_warnings: list[str] = []
+        for ci, comp in enumerate(comps):
+            main, rdir = roots[root_for(comp)]
+            ops, deletes = _resolve_component_ops(comp, main, rdir, repo_root, aid)
+            removed = 0
+            for f, edits in ops.items():
+                file_text.setdefault(f, f.read_text(encoding="utf-8-sig"))   # BOM-consistent with span computation
+                file_ops.setdefault(f, []).extend(edits)
+                edit_removed = sum((e - s) - len(rep) for s, e, rep in edits)
+                removed += edit_removed
+                orig_len = len(file_text[f])
+                if orig_len and edit_removed / orig_len > 0.6:
+                    isolation_warnings.append(f"component #{ci} ({comp.get('mechanism')}) removed {edit_removed}/{orig_len} bytes ({edit_removed / orig_len:.0%}) of {f.name} — large for one declared component")
+            for d in deletes:
+                if not d.exists():
+                    raise AblationError(f"component #{ci}: file to remove not found: {d}")
+                if d in delete_owner:
+                    raise AblationError(f"components #{delete_owner[d]} and #{ci} both delete {d.name} (overlap)")
+                delete_owner[d] = ci
+                removed += d.stat().st_size
+            if removed <= 0:
+                raise AblationError(f"component #{ci} ({comp.get('mechanism')}) removed nothing (net-deletion gate)")
+            removed_by_component.append(removed)
+
+        for d in delete_owner:
+            if d in file_ops:
+                raise AblationError(f"{d.name} is both edited and deleted by the ablation (overlap)")
+        for f, edits in file_ops.items():
+            _check_disjoint(edits)
+            # Detect the EOL from the still-original copied file, then restore it.
+            _write_text_preserving_newlines(f, _apply_edits(file_text[f], edits))
+        for d in delete_owner:
+            d.unlink()
+
+        # Every root must keep a regular SKILL.md with required fields, unless this
+        # is an explicit invalid-skill experiment.
+        if not ablation.get("invalid_skill"):
+            for main, _ in roots.values():
+                if not (main.exists() and main.is_file()):
+                    raise AblationError(f'ablation removed the skill main file {main.name!r}; set "invalid_skill": true to run that as an invalid-skill experiment')
+                if not required_fields_present(main.read_text(encoding="utf-8-sig")):
+                    raise AblationError('required frontmatter field (name/description) became empty or missing; set "invalid_skill": true to run that as an invalid-skill experiment')
+
+        skill_hash = _hash_tree(tmp)
+        tmp.rename(dest)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+    for w in isolation_warnings:
+        print(f"WARN ablation {aid}: {w}", file=sys.stderr)
+    # The recorded provenance schema is defined ONCE, by Provenance.as_dict() — not
+    # re-spelled here. The materialize-only fields (where the tree lives, isolation
+    # warnings) are merged on top.
+    prov = Provenance(
+        id=aid,
+        mode="invalid_skill" if ablation.get("invalid_skill") else "materialized",
+        population=population,
+        identity=TreeIdentity(canonical=parent_skill_hash, edited=skill_hash),
+        components=tuple(
+            Component(cls=component_class(c), mechanism=c.get("mechanism"), skill_root=root_for(c), target=c.get("target", {}), removed_bytes=removed_by_component[i])
+            for i, c in enumerate(comps)
+        ),
+    )
+    # A blind Arm carrying the provenance + edited identity, wrapped in a
+    # MaterializedArm — whose constructor refuses anything that isn't a real edit.
+    arm = Arm(variant_truth=f"ablation:{aid}", blind=True, identity=prov.identity, provenance=prov)
+    return MaterializedArm(
+        arm=arm,
+        dir=str(dest),
+        skill_files={r: str(dest / main.relative_to(tmp)) for r, (main, _) in roots.items()},
+        isolation_warnings=tuple(isolation_warnings),
+    )
+
+
+def expected_regression_summaries(ablation: dict[str, Any]) -> list[str]:
+    """Human summaries of an ablation's expected regressions, accepting both the
+    legacy list[str] form and the structured list[{summary, cases, assertions}]."""
+    out = []
+    for r in ablation.get("expected_regressions", []):
+        out.append(r.get("summary", "") if isinstance(r, dict) else str(r))
+    return [s for s in out if s]
+
+
+def materialized_tree_for_variant(repo_root: Path, manifest: dict[str, Any], variant: str, out_root: Path) -> dict[str, Any] | None:
+    """For an ablation:<id> variant that declares a removal, materialize the tree
+    and return its provenance (with skill_files). Returns None for non-ablation
+    variants and for instruction-simulated ablations (no removal declared)."""
+    if not str(variant).startswith("ablation:"):
+        return None
+    aid = str(variant).split(":", 1)[1]
+    ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+    if ablation is None:
+        raise AblationError(f"unknown ablation variant: {variant}")
+    if not ablation_components(ablation):
+        return None
+    return materialize_ablation(repo_root, manifest, ablation, out_root)
+
+
+def build_canonical_skill_tree(repo_root: Path, manifest: dict[str, Any], dest_dir: Path) -> Path:
+    """Copy every manifest skill root into dest_dir/<key> with no edits — the
+    canonical surface for with_skill, so it matches a materialized ablation arm
+    file-for-file (the only difference being the ablation's declared edit)."""
+    dest_dir = Path(dest_dir)
+    _reject_overlapping_skill_roots(repo_root, manifest)
+    _reject_output_root_overlap(dest_dir, repo_root, manifest)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for r in manifest.get("skill_paths", []):
+        src = _safe_under(repo_root, repo_root / r)
+        src_dir = src if src.is_dir() else src.parent
+        _copy_skill_root(src_dir, dest_dir / _skill_root_key(r))
+    return dest_dir
+
+
+def canonical_skill_tree_hash(repo_root: Path, manifest: dict[str, Any]) -> str:
+    """Hash of the canonical (unedited) skill tree — the with_skill oracle. Built by
+    the same copier and key-naming as materialize_ablation's pre-edit tree, so it
+    equals a materialized ablation's parent_skill_hash. Both arms record it so the
+    report can prove they were derived from the same skill revision."""
+    tmp = Path(tempfile.mkdtemp(prefix=".canon-hash-"))
+    try:
+        build_canonical_skill_tree(repo_root, manifest, tmp / "tree")
+        return _hash_tree(tmp / "tree")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def enumerate_tree(root_dir: Path) -> list[tuple[Path, str]]:
+    """All files under root_dir as (absolute_path, posix_relpath), sorted."""
+    return [(p, p.relative_to(root_dir).as_posix()) for p in sorted(root_dir.rglob("*")) if p.is_file()]
+
+
+def ablation_variant_population(manifest: dict[str, Any], variant: str) -> str:
+    """Case population for an ablation:<id> variant: trigger (discovery ablation)
+    or answer (everything else, including instruction-simulated)."""
+    aid = str(variant).split(":", 1)[1]
+    ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+    comps = ablation_components(ablation) if ablation else []
+    return derived_population(comps) if comps else "answer"
+
+
+def materialize_ablations(args: argparse.Namespace) -> int:
+    path = Path(args.manifest)
+    manifest = validate_manifest(path)
+    repo_root = repo_root_for_manifest(path)
+    # Pre-validate every declared ablation and the output-dir containment BEFORE the
+    # output dir is created/cleared (see materialize_declared_ablations).
+    for ablation in manifest.get("ablations", []):
+        if ablation_components(ablation):
+            try:
+                ValidatedAblation.validate(repo_root, manifest, ablation)
+            except AblationError as exc:
+                die(f"ablation {ablation.get('id')}: {exc}")
+    out_root = _ensure_ablation_dir_guarded(Path(args.out_dir), repo_root, manifest)
+    results = []
+    for ablation in manifest.get("ablations", []):
+        if not ablation_components(ablation):
+            print(f"skip ablation:{ablation.get('id')} (instruction-simulated; nothing to materialize)")
+            continue
+        try:
+            res = materialize_ablation(repo_root, manifest, ablation, out_root)
+        except AblationError as exc:
+            die(f"ablation {ablation.get('id')}: {exc}")
+        results.append(res)
+        print(f"materialized ablation:{res['id']} -> {res['dir']} ({res['population']}, {len(res['components'])} component(s))")
+    if args.out:
+        write_json(Path(args.out), {"ablations": results})
+    if not results:
+        print("no materialized ablations declared")
+    return 0
+
+
+def check_ablations_dry_run(manifest_path: Path, manifest: dict[str, Any]) -> int:
+    """Apply-time gate dry run: materialize each declared-removal ablation into a
+    throwaway temp dir so every gate fires, writing no output. Returns the number
+    of ablations that failed."""
+    repo_root = repo_root_for_manifest(manifest_path)
+    declared = [a for a in manifest.get("ablations", []) if ablation_components(a)]
+    if not declared:
+        print("check-ablations: no declared-removal ablations to check", file=sys.stderr)
+        return 0
+    failures = 0
+    for ablation in declared:
+        with tempfile.TemporaryDirectory(prefix="check-ablations-") as td:
+            try:
+                materialize_ablation(repo_root, manifest, ablation, Path(td))
+                print(f"check-ablations: ablation:{ablation['id']} OK", file=sys.stderr)
+            except AblationError as exc:
+                failures += 1
+                print(f"check-ablations: ablation:{ablation['id']} FAIL — {exc}", file=sys.stderr)
+    return failures
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "task"
 
 
-def jetty_task_name(task: dict[str, Any], prefix: str | None = None) -> str:
-    base = prefix or task.get("skill_name") or "skill-eval"
-    return "-".join(slugify(str(part)) for part in [base, task["case_id"], task["variant"], str(task.get("run_number", 1))])
+def jetty_task_name(pt: PreparedTask, prefix: str | None = None) -> str:
+    base = prefix or pt.skill_name or "skill-eval"
+    # The task filename and upload placeholders are MODEL-VISIBLE (the runbook
+    # directs the agent to read the task JSON by that path). The PreparedTask owns
+    # the rule that a blind (ablation) arm never exposes "ablation:<id>" — its
+    # upload_token() is opaque and deterministic. The truth stays harness-only.
+    return "-".join(slugify(str(part)) for part in [base, pt.case_id, pt.upload_token(), str(pt.run_number)])
 
 
 def canonical_jetty_runbook(agent: str, model: str, model_provider: str, snapshot: str) -> str:
@@ -432,8 +1523,8 @@ Execute one Skill Eval Harness task exactly once. Write the final assistant answ
 
 1. Read `{{{{task_json}}}}`.
 2. Read every fixture listed in `task_json.input_files`.
-3. If `task_json.variant` is `with_skill`, read and follow the mounted skill files.
-4. If `task_json.variant` is `without_skill`, do not use a skill. No skill files should be mounted.
+3. If `task_json.skill_files` is non-empty, read and follow the mounted skill files.
+4. If `task_json.skill_files` is empty, do not use a skill. No skill files are mounted.
 5. Answer the user task directly.
 6. Write `{{{{results_dir}}}}/output.md`.
 7. Write `{{{{results_dir}}}}/metadata.json`.
@@ -449,42 +1540,50 @@ def placeholder(task_name: str, role: str, index: int | str) -> str:
     return f"upload://{task_name}/{role}/{index}"
 
 
-def safe_task_json(task: dict[str, Any], manifest: dict[str, Any], *, task_name: str, upload_files: list[dict[str, Any]]) -> dict[str, Any]:
-    variant = str(task["variant"])
+def safe_task_json(pt: PreparedTask, manifest: dict[str, Any], *, task_name: str, upload_files: list[dict[str, Any]]) -> dict[str, Any]:
+    variant = pt.variant_truth
     safe = {
-        "case_id": task["case_id"],
-        "split": task["split"],
-        "kind": task.get("kind", "behavior"),
-        "variant": variant,
-        "run_number": task.get("run_number", 1),
-        "skill_name": task["skill_name"],
-        "instruction": task.get("instruction", ""),
-        "prompt": task.get("prompt", ""),
+        "case_id": pt.case_id,
+        "split": pt.split,
+        "kind": pt.kind,
+        # The model-visible variant is OWNED by the PreparedTask: model_facing_variant()
+        # presents a blind (materialized) arm as with_skill and leaves every other arm
+        # as its true variant — one authority, no per-branch override that could drift.
+        "variant": pt.model_facing_variant(),
+        "run_number": pt.run_number,
+        "skill_name": pt.skill_name,
+        "instruction": pt.instruction,
+        "prompt": pt.prompt,
         "input_files": [item["placeholder"] for item in upload_files if item.get("role") == "fixture"],
         "skill_files": [],
-        "tags": task.get("tags", []),
+        "tags": list(pt.tags),
     }
     if variant == "with_skill":
         safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
     elif variant == "old_skill":
         safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "old_skill"]
-    elif variant.startswith("ablation:"):
-        aid = variant.split(":", 1)[1]
-        ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
+    elif pt.is_ablation:
         safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
-        safe["ablation"] = {
-            "id": aid,
-            "mode": "instruction_simulated",
-            "removed_component": ablation.get("removed_component"),
-            "expected_regressions": ablation.get("expected_regressions", []),
-        }
+        if not pt.is_materialized_ablation:
+            # Instruction-simulated is non-blind by design: the model is told what to
+            # simulate, via the ONE typed instruction-sim record. removed_component /
+            # expected_regressions come from the manifest (the prepared row carries
+            # only id/mode/population).
+            aid = variant.split(":", 1)[1]
+            ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
+            safe["ablation"] = InstructionSimulated(
+                id=aid,
+                population=(pt.ablation.population if pt.ablation else "answer"),   # from the row, not hardcoded
+                removed_component=ablation.get("removed_component"),
+                expected_regressions=tuple(expected_regression_summaries(ablation)),
+            ).as_dict()
     else:
         safe["skill_files"] = []
     return safe
 
 
 def build_jetty_payload(
-    task: dict[str, Any],
+    pt: PreparedTask,
     manifest: dict[str, Any],
     *,
     collection: str,
@@ -494,11 +1593,16 @@ def build_jetty_payload(
     model_provider: str,
     snapshot: str,
     use_trial_keys: bool = False,
+    ablation_trees: dict[str, MaterializedArm] | None = None,
+    with_skill_tree_dir: Path | None = None,
 ) -> dict[str, Any]:
-    variant = str(task["variant"])
-    task_name = jetty_task_name(task, task_prefix)
+    # The PreparedTask is the sole authority after the JSONL boundary: the true
+    # variant, skill paths, model-facing surface, upload token, and harness truth all
+    # come from it — not from a raw row re-indexed key by key.
+    variant = pt.variant_truth
+    task_name = jetty_task_name(pt, task_prefix)
     files: list[dict[str, Any]] = []
-    for i, local in enumerate(task.get("input_files", []), 1):
+    for i, local in enumerate(pt.input_files, 1):
         files.append({
             "role": "fixture",
             "placeholder": placeholder(task_name, "fixture", i),
@@ -507,40 +1611,78 @@ def build_jetty_payload(
             "private": False,
         })
     if variant == "with_skill":
-        for i, local in enumerate(task.get("skill_paths", []), 1):
-            files.append({
-                "role": "skill",
-                "placeholder": placeholder(task_name, "skill", i),
-                "local_path": str(Path(local).resolve()),
-                "remote_path_hint": f"skills/{task['skill_name']}/{Path(local).name}",
-                "private": False,
-            })
+        if with_skill_tree_dir is not None:
+            # Upload the canonical tree recursively, same as the ablation arm, so
+            # the two arms have an identical remote file surface.
+            for i, (abs_path, rel) in enumerate(enumerate_tree(Path(with_skill_tree_dir)), 1):
+                files.append({
+                    "role": "skill",
+                    "placeholder": placeholder(task_name, "skill", i),
+                    "local_path": str(abs_path),
+                    "remote_path_hint": f"skills/{pt.skill_name}/{rel}",
+                    "private": False,
+                })
+        else:
+            for i, local in enumerate(pt.skill_paths, 1):
+                files.append({
+                    "role": "skill",
+                    "placeholder": placeholder(task_name, "skill", i),
+                    "local_path": str(Path(local).resolve()),
+                    "remote_path_hint": f"skills/{pt.skill_name}/{Path(local).name}",
+                    "private": False,
+                })
     elif variant == "old_skill":
-        old_paths = manifest.get("old_skill_paths") or []
+        # Consume the PreparedTask's already-resolved old-skill paths (the SINGLE
+        # source); no manifest re-resolution, so the Jetty upload cannot diverge from
+        # what Codex mounts for the same arm.
+        old_paths = list(pt.skill_paths)
         if not old_paths:
             die("old_skill export requires manifest.old_skill_paths to be populated")
-        repo_root = Path(task["repo_root"])
-        for i, raw in enumerate(old_paths, 1):
-            local = Path(raw)
-            if not local.is_absolute():
-                local = repo_root / local
+        for i, local in enumerate(old_paths, 1):
             files.append({
                 "role": "old_skill",
                 "placeholder": placeholder(task_name, "old-skill", i),
-                "local_path": str(local.resolve()),
-                "remote_path_hint": f"old-skills/{task['skill_name']}/{local.name}",
+                "local_path": str(Path(local).resolve()),
+                "remote_path_hint": f"old-skills/{pt.skill_name}/{Path(local).name}",
                 "private": False,
             })
     elif variant.startswith("ablation:"):
-        for i, local in enumerate(task.get("skill_paths", []), 1):
-            files.append({
-                "role": "skill",
-                "placeholder": placeholder(task_name, "skill", i),
-                "local_path": str(Path(local).resolve()),
-                "remote_path_hint": f"skills/{task['skill_name']}/{Path(local).name}",
-                "private": False,
-            })
-    task_json = safe_task_json(task, manifest, task_name=task_name, upload_files=files)
+        aid = variant.split(":", 1)[1]
+        tree = (ablation_trees or {}).get(aid)
+        if tree:
+            # Materialized: upload the whole altered tree, preserving relative paths
+            # (no basename flattening, so duplicate SKILL.md names cannot collide).
+            for i, (abs_path, rel) in enumerate(enumerate_tree(Path(tree.dir)), 1):
+                files.append({
+                    "role": "skill",
+                    "placeholder": placeholder(task_name, "skill", i),
+                    "local_path": str(abs_path),
+                    "remote_path_hint": f"skills/{pt.skill_name}/{rel}",
+                    "private": False,
+                })
+        elif with_skill_tree_dir is not None:
+            # Instruction-simulated: the ORIGINAL skill is mounted intact, so it must
+            # present the SAME recursive surface as with_skill (reference files
+            # included) — not a flattened SKILL.md that drops references and lets a
+            # regression be mis-attributed to a missing file.
+            for i, (abs_path, rel) in enumerate(enumerate_tree(Path(with_skill_tree_dir)), 1):
+                files.append({
+                    "role": "skill",
+                    "placeholder": placeholder(task_name, "skill", i),
+                    "local_path": str(abs_path),
+                    "remote_path_hint": f"skills/{pt.skill_name}/{rel}",
+                    "private": False,
+                })
+        else:
+            for i, local in enumerate(pt.skill_paths, 1):
+                files.append({
+                    "role": "skill",
+                    "placeholder": placeholder(task_name, "skill", i),
+                    "local_path": str(Path(local).resolve()),
+                    "remote_path_hint": f"skills/{pt.skill_name}/{Path(local).name}",
+                    "private": False,
+                })
+    task_json = safe_task_json(pt, manifest, task_name=task_name, upload_files=files)
     task_placeholder = placeholder(task_name, "task", "json")
     task_item = {
         "role": "task",
@@ -551,9 +1693,9 @@ def build_jetty_payload(
     }
     all_files = [task_item] + files
     if variant == "without_skill" and any(item.get("role") in {"skill", "old_skill", "ablation_skill"} for item in all_files):
-        die(f"{task['case_id']}: without_skill payload attempted to mount skill files")
+        die(f"{pt.case_id}: without_skill payload attempted to mount skill files")
     if variant == "with_skill" and not any(item.get("role") == "skill" for item in all_files):
-        die(f"{task['case_id']}: with_skill payload has no skill files")
+        die(f"{pt.case_id}: with_skill payload has no skill files")
     jetty_block = {
         "runbook": True,
         "collection": collection,
@@ -571,13 +1713,15 @@ def build_jetty_payload(
         jetty_block["use_trial_keys"] = True
     return {
         "harness": {
-            "skill_name": task["skill_name"],
-            "case_id": task["case_id"],
+            "skill_name": pt.skill_name,
+            "case_id": pt.case_id,
             "variant": variant,
-            "run_number": task.get("run_number", 1),
-            "split": task["split"],
-            "run_dir": task["run_dir"],
-            "executable": not str(task.get("prompt", "")).startswith("<hidden prompt:"),
+            "run_number": pt.run_number,
+            "split": pt.split,
+            "run_dir": pt.run_dir,
+            "executable": not str(pt.prompt or "").startswith("<hidden prompt:"),
+            **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
+            **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {}),
         },
         "jetty_request": {
             "model": model,
@@ -603,6 +1747,27 @@ def export_jetty(args: argparse.Namespace) -> int:
     snapshot = getattr(args, "jetty_snapshot", None) or manifest.get("jetty", {}).get("snapshot") or JETTY_DEFAULT_SNAPSHOT
     collection = getattr(args, "jetty_collection", None) or manifest.get("jetty", {}).get("collection") or "skill-evals"
     task_prefix = getattr(args, "jetty_task_prefix", None) or manifest.get("jetty", {}).get("task_prefix")
+    # Materialize declared-removal ablations ONCE, before building rows, and
+    # reuse the trees for both the prepared rows (which must point at the
+    # altered tree) and the upload payloads. Materializing here also avoids the
+    # prepare-or-fail guard in prepared_task_rows tripping because export-jetty
+    # forgot to thread the ablation dir through.
+    ablation_trees: dict[str, Any] = {}
+    abl_root: Path | None = None
+    repo_root = repo_root_for_manifest(path)
+    if getattr(args, "include_ablations", False):
+        declared = [a for a in manifest.get("ablations", []) if ablation_components(a)]
+        if declared:
+            # Don't create the dir here — materialize_declared_ablations guards the
+            # containment gate before it creates/clears anything.
+            abl_root = Path(getattr(args, "ablation_dir", None) or (str(args.out) + ".ablations" if getattr(args, "out", None) else "jetty-ablations"))
+            ablation_trees = materialize_declared_ablations(repo_root, manifest, abl_root)
+    # ALWAYS upload the with_skill (and instruction-simulated) arm as the full
+    # recursive skill tree — reference files included — so the model can follow the
+    # skill's references and the surface matches codex and any materialized arm. A
+    # flat SKILL.md-only upload silently dropped references/ for those arms.
+    wst_root = abl_root or _ensure_ablation_dir_guarded(Path((str(args.out) + ".with-skill") if getattr(args, "out", None) else "jetty-with-skill"), repo_root, manifest)
+    with_skill_tree_dir = build_canonical_skill_tree(repo_root, manifest, wst_root / "_with_skill")
     rows = prepared_task_rows(
         path,
         manifest,
@@ -612,9 +1777,11 @@ def export_jetty(args: argparse.Namespace) -> int:
         runs_per_variant=getattr(args, "runs_per_variant", 1),
         allow_missing_prompts=getattr(args, "allow_missing_prompts", False),
         include_answer_key=False,
+        ablation_dir=str(abl_root) if abl_root is not None else None,
+        trees=ablation_trees or None,
     )
     payloads = [build_jetty_payload(
-        row,
+        PreparedTask.from_row(row),
         manifest,
         collection=collection,
         task_prefix=task_prefix,
@@ -623,6 +1790,8 @@ def export_jetty(args: argparse.Namespace) -> int:
         model_provider=model_provider,
         snapshot=snapshot,
         use_trial_keys=bool(getattr(args, "use_trial_keys", False) or manifest.get("jetty", {}).get("use_trial_keys", False)),
+        ablation_trees=ablation_trees,
+        with_skill_tree_dir=with_skill_tree_dir,
     ) for row in rows]
     out = Path(args.out) if getattr(args, "out", None) else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
@@ -1010,9 +2179,17 @@ def import_jetty_results(args: argparse.Namespace) -> int:
             for artifact in artifacts:
                 write_artifact(base, artifact)
         else:
-            (base / "output.md").write_text("[JETTY FAILURE: trajectory failed before producing output]\n", encoding="utf-8")
+            (base / "output.md").write_text(f"{JETTY_FAILURE}: trajectory failed before producing output]\n", encoding="utf-8")
         meta = artifact_metadata(artifacts)
         meta.update(normalized_jetty_metadata(record, success=success))
+        # Persist the harness-only ablation provenance into the run metadata so the
+        # benchmark report can VERIFY (mode/population/skill_hash/components) that a
+        # materialized ablation was actually mounted — never trusting the manifest
+        # and the run-dir name alone.
+        if isinstance(harness.get("ablation"), dict):
+            meta["ablation"] = harness["ablation"]
+        if harness.get("skill_tree_hash"):
+            meta["skill_tree_hash"] = harness["skill_tree_hash"]
         trace_records = jetty_trace_records(record, artifacts, success=success)
         write_trace_artifacts(
             base,
@@ -1162,6 +2339,41 @@ def command_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def event_mentions_skill_file(event: dict[str, Any]) -> bool:
     hay = " ".join(str(event.get(key, "")) for key in ["input_summary", "output_summary", "name"])
     return "SKILL.md" in hay or "/skills/" in hay or "\\skills\\" in hay
+
+
+def event_texts_for_tool_input(obj: Any) -> list[str]:
+    """Recursively collect file-path-ish strings from a runner event (tool inputs),
+    used to detect whether the model actually opened a mounted skill file."""
+    out: list[str] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in {"file_path", "path", "skill", "input", "partial_json"} and isinstance(value, str):
+                out.append(value)
+            out.extend(event_texts_for_tool_input(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(event_texts_for_tool_input(item))
+    return out
+
+
+def detect_trigger(stdout: str, skill_name: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
+    """THE shared skill-invocation detector: scan a model's JSON event stream for
+    evidence it actually read one of the mounted skill files. Returns (invoked,
+    evidence). Used by both the autonomous-trigger eval (run_pi_trigger_eval) and the
+    pi-smoke runner, so skill_invoked is derived the same way everywhere instead of
+    one runner asserting it by fiat. Matches on the copied temp skill paths (not the
+    bare skill name) so unrelated repo files can't look like skill-load evidence."""
+    needles = [str(p) for p in copied_paths] + [str(p.parent) for p in copied_paths]
+    evidence: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for text in event_texts_for_tool_input(event):
+            if any(n and n in text for n in needles):
+                evidence.append(text[:500])
+    return bool(evidence), evidence[:5]
 
 
 def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:
@@ -1568,12 +2780,52 @@ def safe_child_path(root: Path, relative: str) -> Path:
     return dest
 
 
-def codex_task_prompt(task: dict[str, Any]) -> str:
-    files = task.get("input_files") or []
-    file_note = "\n".join(f"- {p}" for p in files) if files else "- none"
+def codex_skill_workspace(pt: PreparedTask, ws: Path) -> tuple[list[str], list[str]]:
+    """Build an isolated workspace holding ONLY the task's selected skill tree (per
+    variant) and fixtures, so executing with cwd here cannot reach the original
+    repo skill. For an ablation the PreparedTask's skill_paths are the materialized
+    tree; for without_skill nothing is mounted. with_skill and ablation use the same
+    copier, so their file surfaces are identical apart from the declared edit. The
+    PreparedTask is the sole authority — variant and skill paths are read off it, not
+    re-derived from a raw row."""
+    ws.mkdir(parents=True, exist_ok=True)
+    skill_rel: list[str] = []
+    if pt.variant_truth != "without_skill":
+        for i, sp in enumerate(pt.skill_paths):
+            src = Path(sp)
+            src_dir = src if src.is_dir() else src.parent
+            dest = ws / "skills" / f"root-{i}"
+            _copy_skill_root(src_dir, dest)
+            main = dest / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dest / src.name
+            skill_rel.append(str((main if main.exists() else dest).relative_to(ws)))
+    input_rel: list[str] = []
+    for raw in pt.input_files:
+        src = Path(raw)
+        dest = ws / "inputs" / src.name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        input_rel.append(str(dest.relative_to(ws)))
+    return skill_rel, input_rel
+
+
+def codex_task_prompt(pt: PreparedTask, skill_paths: list[str] | None = None, input_files: list[str] | None = None) -> str:
+    file_note = "\n".join(f"- {p}" for p in (input_files or [])) if input_files else "- none"
+    if pt.variant_truth == "without_skill":
+        skill_note = "Do not use any skill. No skill files are present in this workspace."
+    else:
+        listed = "\n".join(f"- {p}" for p in (skill_paths or [])) if skill_paths else "- none"
+        skill_note = f"Read and follow the skill file(s) below (including referenced files when relevant), then do the task:\n{listed}"
+        # The PreparedTask owns the blind decision: a materialized arm is blind (the
+        # skill on disk is already altered, so the prompt stays byte-identical to
+        # with_skill); an instruction_simulated arm is NOT blind (the full skill is on
+        # disk, so the regression occurs only if we explicitly add the directive).
+        if pt.is_ablation and not pt.is_blind:
+            rc = pt.ablation.removed_component if isinstance(pt.ablation, InstructionSimulated) and pt.ablation.removed_component else ""
+            directive = pt.instruction or f"Ablation for this run: ignore/remove the component '{rc}' from the skill guidance."
+            skill_note += f"\n\n{directive}"
     return (
-        f"{task.get('instruction', '')}\n\n"
-        f"Task prompt:\n{task.get('prompt', '')}\n\n"
+        f"{skill_note}\n\n"
+        f"Task prompt:\n{pt.prompt}\n\n"
         f"Input files available to inspect:\n{file_note}\n\n"
         "Return the final answer for this eval task. Do not include hidden answer keys or rubrics."
     )
@@ -1585,36 +2837,177 @@ def run_codex(args: argparse.Namespace) -> int:
     cmd = getattr(args, "codex_cmd", None) or "codex exec --json"
     timeout = int(getattr(args, "timeout", 1800))
     for task in tasks:
-        base = safe_child_path(runs, str(task.get("run_dir", f"{task.get('case_id','case')}/{task.get('variant','variant')}")))
+        # Cross the JSONL boundary ONCE: from here down the typed PreparedTask is the
+        # authority for variant, skill paths, ablation record, and tree hash — the
+        # runner no longer threads a raw row through dict-based helpers.
+        pt = PreparedTask.from_row(task)
+        base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
         base.mkdir(parents=True, exist_ok=True)
+        # Provenance persisted on every run so the report can verify the ablation
+        # arm and the with_skill arm share a skill revision (skill_tree_hash).
+        prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
         started = time.time()
-        try:
-            proc = subprocess.run(cmd, shell=True, input=codex_task_prompt(task), text=True, capture_output=True, timeout=timeout, cwd=task.get("repo_root") or None)
-            elapsed_ms = int((time.time() - started) * 1000)
-            trace_text = proc.stdout if proc.stdout.strip() else ""
-            if trace_text:
-                events, metrics = write_trace_artifacts(
-                    base,
-                    trace_text,
-                    source="codex",
-                    metadata={"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else ""},
-                    extra_metrics={"elapsed_ms": elapsed_ms, "returncode": proc.returncode},
-                    environment={"runner": "codex", "command": cmd, "cwd": task.get("repo_root")},
-                    write_metadata=True,
-                )
-            else:
-                events, metrics = {"schema_version": 1, "source": "codex", "events": []}, {"schema_version": 1, "source": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode}
-                write_json(base / "events.json", events)
-                write_json(base / "metrics.json", metrics)
-                write_json(base / "metadata.json", {"provider": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode, "stderr": proc.stderr[:4000] if proc.stderr else "", "trace_source": "codex"})
-            answer = final_answer_from_events(events) or proc.stdout.strip()
-            if proc.returncode != 0:
-                answer = f"[CODEX FAILURE: returncode={proc.returncode}]\n\n{answer}\n\nstderr:\n{proc.stderr[:4000]}"
-            (base / "output.md").write_text(answer or "[CODEX FAILURE: no output produced]\n", encoding="utf-8")
-        except subprocess.TimeoutExpired as exc:
-            elapsed_ms = int((time.time() - started) * 1000)
-            (base / "output.md").write_text(f"[CODEX FAILURE: timed out after {timeout}s]\n", encoding="utf-8")
-            write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timeout": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000]})
+        with tempfile.TemporaryDirectory(prefix="codex-ws-") as wd:
+            ws = Path(wd)
+            skill_rel, input_rel = codex_skill_workspace(pt, ws)
+            prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
+            try:
+                proc = subprocess.run(cmd, shell=True, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=str(ws))
+                elapsed_ms = int((time.time() - started) * 1000)
+                trace_text = proc.stdout if proc.stdout.strip() else ""
+                if trace_text:
+                    events, metrics = write_trace_artifacts(
+                        base,
+                        trace_text,
+                        source="codex",
+                        metadata={"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else "", **prov_extra},
+                        extra_metrics={"elapsed_ms": elapsed_ms, "returncode": proc.returncode},
+                        environment={"runner": "codex", "command": cmd, "cwd": "<isolated workspace>", "variant": pt.variant_truth},
+                        write_metadata=True,
+                    )
+                else:
+                    events, metrics = {"schema_version": 1, "source": "codex", "events": []}, {"schema_version": 1, "source": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode}
+                    write_json(base / "events.json", events)
+                    write_json(base / "metrics.json", metrics)
+                    write_json(base / "metadata.json", {"provider": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode, "stderr": proc.stderr[:4000] if proc.stderr else "", "trace_source": "codex", **prov_extra})
+                answer = final_answer_from_events(events) or proc.stdout.strip()
+                if proc.returncode != 0:
+                    answer = f"{CODEX_FAILURE}: returncode={proc.returncode}]\n\n{answer}\n\nstderr:\n{proc.stderr[:4000]}"
+                (base / "output.md").write_text(answer or f"{CODEX_FAILURE}: no output produced]\n", encoding="utf-8")
+            except subprocess.TimeoutExpired as exc:
+                elapsed_ms = int((time.time() - started) * 1000)
+                (base / "output.md").write_text(f"{CODEX_FAILURE}: timed out after {timeout}s]\n", encoding="utf-8")
+                write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timed_out": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **prov_extra})
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# First-class Claude adapter — `claude -p --output-format json`.
+#
+# The Codex/Jetty/Pi runners each own their provider's wire format; Claude's is
+# an envelope `{result, total_cost_usd, usage}`. Parsing it in ONE place lets the
+# runner AND the judge capture the same cost/usage fields, and lets those land in
+# the run's metrics.json so the benchmark report can total real dollars — the
+# thing every other adapter leaves the caller to reconstruct out of band.
+# --------------------------------------------------------------------------- #
+
+CLAUDE_USAGE_KEYS = {
+    "input_tokens": ("input_tokens", "prompt_tokens"),
+    "output_tokens": ("output_tokens", "completion_tokens"),
+    "cache_read_tokens": ("cache_read_input_tokens", "cache_read_tokens"),
+    "cache_creation_tokens": ("cache_creation_input_tokens", "cache_creation_tokens"),
+}
+
+
+def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
+    """Pure parser for the `claude -p --output-format json` envelope. Returns
+    {answer, cost_usd, usage, parse_error}. Tolerant: if the envelope isn't JSON
+    (e.g. --output-format text slipped through), the raw stdout IS the answer and
+    cost/usage are absent — never raises, so a runner never crashes on a verdict."""
+    text = stdout if isinstance(stdout, str) else ""
+    try:
+        env = extract_json_object(text)
+    except Exception as exc:  # noqa: BLE001
+        return {"answer": text, "cost_usd": None, "usage": {}, "parse_error": str(exc)}
+    if not isinstance(env, dict) or "result" not in env:
+        # Valid JSON but not the -p envelope; treat the whole thing as the answer.
+        return {"answer": text, "cost_usd": None, "usage": {}, "parse_error": "not a claude -p json envelope"}
+    raw_usage = env.get("usage") if isinstance(env.get("usage"), dict) else {}
+    usage: dict[str, int] = {}
+    for norm, aliases in CLAUDE_USAGE_KEYS.items():
+        for a in aliases:
+            v = raw_usage.get(a)
+            if isinstance(v, (int, float)):
+                usage[norm] = int(v)
+                break
+    if "input_tokens" in usage and "output_tokens" in usage:
+        usage.setdefault("total_tokens", usage["input_tokens"] + usage["output_tokens"])
+    cost = env.get("total_cost_usd")
+    return {
+        "answer": env.get("result") or "",
+        "cost_usd": cost if isinstance(cost, (int, float)) else None,
+        "usage": usage,
+        "parse_error": None,
+    }
+
+
+def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str = "claude",
+                      timeout: int = 1800, extra_args: list[str] | None = None) -> dict[str, Any]:
+    """Single owner for invoking Claude via `claude -p`. Returns the parsed
+    envelope plus returncode/elapsed_ms/stderr. `claude_bin` is an executable path
+    (tests inject a stub that emits a canned envelope), NOT a shell string — so
+    there is no shell-quoting seam between the harness and the model."""
+    argv = [claude_bin, "-p", "--output-format", "json"]
+    if model:
+        argv += ["--model", model]
+    if extra_args:
+        argv += list(extra_args)
+    started = time.time()
+    try:
+        proc = subprocess.run(argv, input=prompt, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return {"answer": "", "cost_usd": None, "usage": {}, "parse_error": None,
+                "returncode": None, "timed_out": True, "elapsed_ms": int((time.time() - started) * 1000),
+                "stderr": str(exc)[:4000]}
+    parsed = parse_claude_cli_json(proc.stdout)
+    parsed.update({
+        "returncode": proc.returncode,
+        "timed_out": False,
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "stderr": (proc.stderr or "")[:4000],
+    })
+    return parsed
+
+
+def claude_run_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    """The metrics.json body for one Claude run: the token usage, the real dollar
+    cost, and timing — the fields the benchmark report aggregates."""
+    usage = result.get("usage") or {}
+    metrics: dict[str, Any] = {"schema_version": 1, "source": "claude"}
+    for k in ("input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_creation_tokens"):
+        if isinstance(usage.get(k), (int, float)):
+            metrics[k] = int(usage[k])
+    if isinstance(result.get("cost_usd"), (int, float)):
+        metrics["cost_usd"] = float(result["cost_usd"])
+    if isinstance(result.get("elapsed_ms"), (int, float)):
+        metrics["elapsed_ms"] = int(result["elapsed_ms"])
+    if result.get("returncode") is not None:
+        metrics["returncode"] = result["returncode"]
+    return metrics
+
+
+def run_claude(args: argparse.Namespace) -> int:
+    tasks = load_jsonl(Path(args.tasks))
+    runs = Path(args.runs)
+    model = getattr(args, "model", None)
+    claude_bin = getattr(args, "claude_bin", None) or "claude"
+    timeout = int(getattr(args, "timeout", 1800))
+    for task in tasks:
+        pt = PreparedTask.from_row(task)
+        base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
+        base.mkdir(parents=True, exist_ok=True)
+        prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
+        with tempfile.TemporaryDirectory(prefix="claude-ws-") as wd:
+            ws = Path(wd)
+            skill_rel, input_rel = codex_skill_workspace(pt, ws)
+            prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
+            result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
+            metrics = claude_run_metrics(result)
+            write_json(base / "metrics.json", metrics)
+            write_json(base / "metadata.json", {
+                "provider": "claude", "model": model, "returncode": result.get("returncode"),
+                "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
+                "cost_usd": metrics.get("cost_usd"), "stderr": result.get("stderr", ""),
+                "trace_source": "claude", **prov_extra})
+            write_json(base / "events.json", {"schema_version": 1, "source": "claude", "events": []})
+            answer = result.get("answer") or ""
+            if result.get("timed_out"):
+                answer = f"{CLAUDE_FAILURE}: timed out after {timeout}s]\n"
+            elif result.get("returncode") not in (0, None):
+                answer = f"{CLAUDE_FAILURE}: returncode={result.get('returncode')}]\n\n{answer}\n\nstderr:\n{result.get('stderr','')}"
+            elif not answer:
+                answer = f"{CLAUDE_FAILURE}: no output produced]\n"
+            (base / "output.md").write_text(answer, encoding="utf-8")
     return 0
 
 
@@ -1798,48 +3191,76 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
     return tasks
 
 
-def run_one_judge_task(task: dict[str, Any], judge_cmd: str, transcripts_dir: Path | None = None, repeat_index: int = 1) -> dict[str, Any]:
+def judge_verdict_passed(verdict: dict[str, Any], *, default_threshold: float = 1) -> bool:
+    """Single owner for 'did this judge verdict pass'. A verdict may state a
+    boolean `passed` (with no numeric `score`, so `score` can be null), or only a
+    numeric `score` to compare against a `threshold`. Reading `passed` first and
+    guarding the score against None keeps a null score from ever reaching a
+    `>=` comparison — the bug that crashed the merge when the eager default of
+    `dict.get("passed", score >= threshold)` was evaluated on `score is None`."""
+    if "passed" in verdict:
+        return bool(verdict.get("passed"))
+    score = verdict.get("score")
+    threshold = verdict.get("threshold", default_threshold)
+    if isinstance(score, (int, float)) and isinstance(threshold, (int, float)):
+        return score >= threshold
+    return False
+
+
+def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, transcripts_dir: Path | None = None,
+                       repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude") -> dict[str, Any]:
     output_path = Path(task.get("output_path", ""))
     output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
     prompt = judge_prompt(task, output_text)
-    proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
+    # Two judge backends, one verdict shape. A shell `judge_cmd` (any provider), OR
+    # the native Claude adapter when only `--judge-model` is given — the native path
+    # captures the real dollar cost of judging, which a shell cmd can't report back.
+    cost_usd = None
+    if judge_cmd:
+        proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
+        stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
+    elif judge_model:
+        res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin)
+        stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
+        cost_usd = res.get("cost_usd")
+    else:
+        raise ValueError("run_one_judge_task needs a judge_cmd or a judge_model")
     parsed: dict[str, Any]
     parse_error = None
     try:
-        parsed = extract_json_object(proc.stdout)
+        parsed = extract_json_object(stdout)
     except Exception as exc:
         parsed = {}
         parse_error = str(exc)
     assertion = task.get("assertion", {})
     threshold = assertion.get("threshold", parsed.get("threshold", 1))
     score = parsed.get("score")
-    if "passed" in parsed:
-        passed = bool(parsed.get("passed"))
-    elif isinstance(score, (int, float)):
-        passed = score >= threshold
-    else:
-        passed = False
+    passed = judge_verdict_passed({**parsed, "threshold": threshold})
     evidence = parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or parse_error or "judge command completed"
     row = {
         "judge_task_id": task["judge_task_id"],
         "case_id": task.get("case_id"),
         "variant": task.get("variant"),
         "run_number": task.get("run_number"),
-        "passed": passed and proc.returncode == 0 and parse_error is None,
+        # The judge is a variable, not a constant: which model produced this verdict
+        # is recorded so a panel can measure whether the answer depends on the judge.
+        "judge_model": judge_model,
+        "cost_usd": cost_usd,
+        "passed": passed and returncode == 0 and parse_error is None,
         "score": score,
         "threshold": threshold,
         "evidence": evidence,
-        "returncode": proc.returncode,
-        "stderr": proc.stderr[:4000] if proc.stderr else "",
+        "returncode": returncode,
+        "stderr": stderr[:4000] if stderr else "",
     }
     if transcripts_dir:
         safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", task["judge_task_id"])
         dest = transcripts_dir / safe / f"run-{repeat_index}"
         dest.mkdir(parents=True, exist_ok=True)
         (dest / "prompt.md").write_text(prompt, encoding="utf-8")
-        (dest / "stdout.txt").write_text(proc.stdout, encoding="utf-8")
-        if proc.stderr:
-            (dest / "stderr.txt").write_text(proc.stderr, encoding="utf-8")
+        (dest / "stdout.txt").write_text(stdout, encoding="utf-8")
+        if stderr:
+            (dest / "stderr.txt").write_text(stderr, encoding="utf-8")
         write_json(dest / "result.json", row)
     return row
 
@@ -1859,6 +3280,11 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def judge_command(args: argparse.Namespace) -> int:
+    judge_cmd = getattr(args, "judge_cmd", None)
+    judge_model = getattr(args, "judge_model", None)
+    claude_bin = getattr(args, "claude_bin", None) or "claude"
+    if not judge_cmd and not judge_model:
+        die("judge needs --judge-cmd (any provider) or --judge-model (native Claude)")
     tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
     transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
     repeat = max(1, int(getattr(args, "judge_runs", 1)))
@@ -1866,11 +3292,63 @@ def judge_command(args: argparse.Namespace) -> int:
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
     try:
         for task in tasks:
-            rows = [run_one_judge_task(task, args.judge_cmd, transcripts, i) for i in range(1, repeat + 1)]
+            rows = [run_one_judge_task(task, judge_cmd, transcripts, i, judge_model=judge_model, claude_bin=claude_bin)
+                    for i in range(1, repeat + 1)]
             fh.write(json.dumps(merge_repeated_judge_rows(rows), ensure_ascii=False) + "\n")
     finally:
         if out:
             fh.close()
+    return 0
+
+
+def judge_panel_sensitivity(reports_by_judge: dict[str, dict[str, Any]], *, magnitude_eps: float = 0.1) -> dict[str, Any]:
+    """Given {judge_model: judged_benchmark_report}, measure whether the skill's
+    MEASURED value depends on which judge graded it. Per judge, the combined
+    with_skill − without_skill lift; then:
+      sign_sensitive      — judges disagree on whether the skill even helps (the
+                            sign of the lift is not unanimous).
+      magnitude_sensitive — the spread between judges' lifts exceeds magnitude_eps
+                            (they agree on direction but not on how much).
+    `judge_sensitive` is either. This is the good-pr finding made first-class: a
+    single judge number is not reproducible across judge choice for a subtle skill."""
+    per_judge: dict[str, float | None] = {}
+    for jm, rep in reports_by_judge.items():
+        summ = (rep or {}).get("summary", {}) or {}
+        w = (summ.get("with_skill", {}) or {}).get("mean_combined_pass_rate")
+        wo = (summ.get("without_skill", {}) or {}).get("mean_combined_pass_rate")
+        per_judge[jm] = (w - wo) if isinstance(w, (int, float)) and isinstance(wo, (int, float)) else None
+    lifts = [v for v in per_judge.values() if v is not None]
+    signs = {(1 if v > 1e-9 else -1 if v < -1e-9 else 0) for v in lifts}
+    spread = (max(lifts) - min(lifts)) if len(lifts) >= 2 else 0.0
+    sign_sensitive = len(signs) > 1
+    magnitude_sensitive = spread > magnitude_eps
+    return {
+        "judges": sorted(reports_by_judge),
+        "lift_by_judge": {k: (round(v, 6) if isinstance(v, (int, float)) else None) for k, v in per_judge.items()},
+        "sign_sensitive": sign_sensitive,
+        "magnitude_spread": round(spread, 6),
+        "magnitude_sensitive": magnitude_sensitive,
+        "judge_sensitive": sign_sensitive or magnitude_sensitive,
+    }
+
+
+def compare_judges(args: argparse.Namespace) -> int:
+    """Compare judged benchmark reports produced by different judge models and flag
+    judge-sensitivity. Each --report is `name=path` where path is a benchmark report
+    JSON that was merged with that judge's results (`benchmark --judge-results`)."""
+    reports_by_judge: dict[str, dict[str, Any]] = {}
+    for spec in args.report or []:
+        if "=" not in spec:
+            die(f"--report expects name=path, got {spec!r}")
+        name, path = spec.split("=", 1)
+        reports_by_judge[name] = load_json(Path(path))
+    if len(reports_by_judge) < 2:
+        die("compare-judges needs at least two --report name=path entries (a panel)")
+    result = judge_panel_sensitivity(reports_by_judge, magnitude_eps=float(getattr(args, "magnitude_eps", 0.1)))
+    if getattr(args, "out", None):
+        write_json(Path(args.out), result)
+    else:
+        print(json.dumps(result, indent=2))
     return 0
 
 
@@ -1891,6 +3369,7 @@ def grade_case_variant(
     qualitative = []
     judge_tasks = []
     missing_output = text is None
+    exec_valid = execution_valid(metadata, text)
     text = text or ""
     judge_results = judge_results or {}
     for assertion in case.get("assertions", []):
@@ -1898,10 +3377,16 @@ def grade_case_variant(
             continue
         atype = assertion.get("type")
         if atype in QUALITATIVE_ASSERTIONS:
+            # Judge-task emission honors THE scorable_run predicate, like every
+            # other report view: a missing/infra-failed run is excluded from
+            # scoring downstream, so never spend a judge model call grading its
+            # empty/failed candidate (the verdict would only be discarded).
+            if not scorable_run({"missing_output": missing_output, "execution_valid": exec_valid}):
+                continue
             jid = judge_task_id(case["id"], variant, run_number, assertion)
             judged = judge_results.get(jid)
             if judged:
-                passed = bool(judged.get("passed", judged.get("score", 0) >= judged.get("threshold", 1)))
+                passed = judge_verdict_passed(judged)
                 qualitative.append({
                     "name": assertion_label(assertion),
                     "type": atype,
@@ -1948,6 +3433,7 @@ def grade_case_variant(
         "run_number": run_number,
         "run_base": str(run_base or output_path.parent),
         "missing_output": missing_output,
+        "execution_valid": exec_valid,
         "objective_passed": objective_passed,
         "objective_total": objective_total,
         "objective_pass_rate": (objective_passed / objective_total) if objective_total else None,
@@ -2112,16 +3598,14 @@ def telemetry_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> float | None:
-    vals = [r.get(key) for r in rows if r.get(key) is not None and not r.get("missing_output")]
-    return statistics.mean(vals) if vals else None
+    # Single scorable+mean path: ResultSet owns the predicate.
+    return ResultSet(rows).mean_rate(key)
 
 
 def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
-    by_case_variant: dict[str, dict[str, list[dict[str, Any]]]] = {}
-    for row in results:
-        if row.get("missing_output"):
-            continue
-        by_case_variant.setdefault(row["case_id"], {}).setdefault(row["variant"], []).append(row)
+    # ResultSet.by_case_variant() applies the scorable predicate and the grouping
+    # for us — the view cannot forget to exclude infra failures.
+    by_case_variant = ResultSet(results).by_case_variant()
     paired_with_rates: list[float] = []
     paired_without_rates: list[float] = []
     for by_variant in by_case_variant.values():
@@ -2155,27 +3639,251 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> dict[str, Any]:
     out: dict[str, Any] = {"domain": {}, "difficulty": {}, "trigger_type": {}, "success_goals": {}}
+    # Each slice routes through ResultSet so the scorable predicate is never
+    # re-rolled inline; the value enumeration is over all rows (it lists which
+    # slices exist), the scoring is over the scorable subset.
+    def slice_stats(rs: ResultSet) -> dict[str, Any]:
+        s = rs.scorable()
+        return {"runs": len(s), "mean_objective_pass_rate": s.mean_rate("objective_pass_rate"), "mean_combined_pass_rate": s.mean_rate("combined_pass_rate")}
+
+    everything = ResultSet(results)
     for field in ["domain", "difficulty", "trigger_type"]:
-        values = sorted({str(r.get(field)) for r in results if r.get(field)})
-        for value in values:
-            out[field][value] = {}
-            for variant in variants:
-                rows = [r for r in results if r.get(field) == value and r.get("variant") == variant and not r.get("missing_output")]
-                out[field][value][variant] = {
-                    "runs": len(rows),
-                    "mean_objective_pass_rate": mean_rate(rows, "objective_pass_rate"),
-                    "mean_combined_pass_rate": mean_rate(rows, "combined_pass_rate"),
-                }
+        for value in sorted({str(r.get(field)) for r in results if r.get(field)}):
+            out[field][value] = {v: slice_stats(everything.where(**{field: value, "variant": v})) for v in variants}
     goals = sorted({str(goal) for r in results for goal in (r.get("success_goals") or [])})
     for goal in goals:
-        out["success_goals"][goal] = {}
-        for variant in variants:
-            rows = [r for r in results if goal in (r.get("success_goals") or []) and r.get("variant") == variant and not r.get("missing_output")]
-            out["success_goals"][goal][variant] = {
-                "runs": len(rows),
-                "mean_objective_pass_rate": mean_rate(rows, "objective_pass_rate"),
-                "mean_combined_pass_rate": mean_rate(rows, "combined_pass_rate"),
-            }
+        in_goal = everything.matching(lambda r, g=goal: g in (r.get("success_goals") or []))
+        out["success_goals"][goal] = {v: slice_stats(in_goal.where(variant=v)) for v in variants}
+    return out
+
+
+def _expected_component(comp: dict[str, Any], skill_paths: list[str]) -> Component:
+    """A manifest-declared component as a Component with a resolved skill_root, so
+    its fingerprint can be compared against the runner-recorded one."""
+    root = resolve_skill_root(comp, skill_paths)
+    return Component(cls=(comp.get("class") or component_class(comp)), mechanism=comp.get("mechanism"),
+                     skill_root=root, target=comp.get("target", {}))
+
+
+def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], measured_count: int, expected: Provenance, ws_tree_hashes: list[Any]) -> tuple[bool, str]:
+    """Confirm only when the provenance the RUNNERS actually recorded proves, for
+    EVERY measured run, that the declared materialized ablation was mounted against
+    the same skill revision as the with_skill arm. Each recorded record is parsed
+    into a Provenance and checked against the expected Provenance; revision
+    agreement is a TreeIdentity comparison.
+    """
+    if not provs:
+        return False, "no run recorded ablation provenance (cannot prove a materialized tree was mounted)"
+    if len(provs) != measured_count:
+        return False, f"{measured_count - len(provs)} of {measured_count} measured ablation run(s) recorded no provenance"
+    exp_fp = [c.fingerprint() for c in expected.components]
+    identities: list[TreeIdentity] = []
+    for d in provs:
+        # from_dict is strict at this JSON boundary: a runner that recorded a
+        # malformed provenance fails THIS confirmation gracefully, rather than
+        # crashing the whole report with an unhandled parse error.
+        try:
+            p = Provenance.from_dict(d)
+        except ValueError as exc:
+            return False, f"recorded ablation provenance is malformed: {exc}"
+        if p.id != expected.id:
+            return False, f"recorded ablation id {p.id!r} != {expected.id!r}"
+        if p.mode != expected.mode:
+            return False, f"recorded mode {p.mode!r} != expected {expected.mode!r} (run may not have mounted a materialized ablation)"
+        if p.population != expected.population:
+            return False, f"recorded population {p.population!r} != manifest-derived {expected.population!r}"
+        if not p.identity.edited:
+            return False, "recorded provenance is missing skill_hash"
+        if not p.identity.canonical:
+            return False, "recorded provenance is missing parent_skill_hash (canonical tree)"
+        if [c.fingerprint() for c in p.components] != exp_fp:
+            return False, f"recorded components {[c.fingerprint() for c in p.components]} != declared {exp_fp}"
+        identities.append(p.identity)
+    ablated_hashes = {i.edited for i in identities}
+    parent_hashes = {i.canonical for i in identities}
+    if len(ablated_hashes) > 1:
+        return False, f"ablation runs disagree on the ablated tree (skill_hash mismatch: {sorted(ablated_hashes)})"
+    if len(parent_hashes) > 1:
+        return False, f"ablation runs disagree on the parent tree (parent_skill_hash mismatch: {sorted(parent_hashes)})"
+    if not ws_tree_hashes:
+        return False, "no with_skill run recorded a canonical skill_tree_hash to pair against"
+    if any(h is None for h in ws_tree_hashes):
+        return False, "a measured with_skill run recorded no canonical skill_tree_hash"
+    ablation_identity = identities[0]
+    # Every with_skill canonical hash must name the same revision as the ablation's parent.
+    if not all(TreeIdentity(canonical=str(h), edited=str(h)).same_revision_as(ablation_identity) for h in ws_tree_hashes):
+        return False, f"with_skill canonical hash {sorted({str(h) for h in ws_tree_hashes})} != ablation parent hash {sorted(parent_hashes)} (arms built from different skill revisions)"
+    return True, ""
+
+
+def build_ablation_regression_report(manifest: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-ablation regression evidence. Distinguishes 'score regressed' (the
+    ablation arm's aggregate objective pass rate dropped vs with_skill on the
+    named cases) from 'expected regression confirmed' (a *named* assertion flips
+    pass->fail in the ablation arm). A score drop is necessary, not sufficient."""
+    # Repeated runs are collapsed symmetrically into per-(case, variant) pass
+    # RATES for each assertion and for the objective score — so with_skill and
+    # the ablation arm are treated identically (no all-pass-vs-one-fail asymmetry).
+    assertion_runs: dict[tuple[str, str], dict[str, list[bool]]] = {}
+    rate_runs: dict[tuple[str, str], list[float]] = {}
+    combined_rate_runs: dict[tuple[str, str], list[float]] = {}
+    measured_variants: set[str] = set()
+    measured_cv: set[tuple[str, str]] = set()
+    coverage: dict[str, dict[str, int]] = {}
+    recorded_prov: dict[str, list[dict[str, Any]]] = {}
+    measured_runs: dict[str, int] = {}
+    recorded_tree_hash: dict[str, list[Any]] = {}
+    for r in results:
+        variant = str(r.get("variant"))
+        cov = coverage.setdefault(variant, {"runs": 0, "missing": 0, "errored": 0})
+        cov["runs"] += 1
+        # A run that produced no output, or that was an infrastructure failure
+        # (nonzero exit / timeout / synthetic failure body), is NOT measured
+        # evidence: its assertions failed for reasons unrelated to the skill, which
+        # would otherwise masquerade as a regression. Exclude it from variant
+        # detection, rates, and per-(case,variant) coverage, and count it so the
+        # report shows how thin the evidence is.
+        if r.get("missing_output"):
+            cov["missing"] += 1
+            continue
+        if not r.get("execution_valid", True):
+            cov["errored"] += 1
+            continue
+        meta = r.get("metadata") or {}
+        prov = meta.get("ablation")
+        if isinstance(prov, dict):
+            recorded_prov.setdefault(variant, []).append(prov)
+        # Every measured run is counted; the with_skill arm's canonical tree hash is
+        # collected so the ablation's parent hash can be paired against it.
+        measured_runs[variant] = measured_runs.get(variant, 0) + 1
+        recorded_tree_hash.setdefault(variant, []).append(meta.get("skill_tree_hash"))
+        key = (r.get("case_id"), variant)
+        measured_variants.add(variant)
+        measured_cv.add(key)
+        amap = assertion_runs.setdefault(key, {})
+        for a in list(r.get("assertions", [])) + list(r.get("qualitative_assertions", [])):
+            name = a.get("name")
+            if name is not None:
+                amap.setdefault(name, []).append(bool(a.get("passed")))
+        rate = r.get("objective_pass_rate")
+        if rate is not None:
+            rate_runs.setdefault(key, []).append(rate)
+        # Combined rate (objective + qualitative) so a judge/rubric regression also
+        # counts as a score drop; fall back to the objective rate when absent.
+        crate = r.get("combined_pass_rate")
+        if crate is None:
+            crate = r.get("objective_pass_rate")
+        if crate is not None:
+            combined_rate_runs.setdefault(key, []).append(crate)
+
+    def pass_rate(case_id: str, variant: str, name: str) -> float | None:
+        vals = assertion_runs.get((case_id, variant), {}).get(name)
+        return (sum(vals) / len(vals)) if vals else None
+
+    def mean_rate_cv(case_id: str, variant: str) -> float | None:
+        vals = rate_runs.get((case_id, variant))
+        return (sum(vals) / len(vals)) if vals else None
+
+    def combined_rate(case_id: str, variant: str) -> float | None:
+        vals = combined_rate_runs.get((case_id, variant))
+        return (sum(vals) / len(vals)) if vals else None
+
+    out = []
+    for ablation in manifest.get("ablations", []):
+        if not ablation_components(ablation):
+            continue
+        aid = ablation["id"]
+        variant = f"ablation:{aid}"
+        invalid = bool(ablation.get("invalid_skill"))
+        expected_pop = ablation_variant_population(manifest, variant)
+        # NB: a discovery (trigger-population) ablation IS enumerated here — with its
+        # own per-entry "population": "trigger" label and, absent answer-path runs, an
+        # unmeasured status — rather than dropped, so the report never silently omits
+        # a declared ablation. The per-entry population label is what keeps it from
+        # being read as an answer result (the report-level population:"answer"
+        # describes the paired summary, not this per-ablation enumeration).
+        entry: dict[str, Any] = {"id": aid, "population": expected_pop, "invalid_skill": invalid}
+        abl_cov = coverage.get(variant, {"runs": 0, "missing": 0, "errored": 0})
+        ws_cov = coverage.get("with_skill", {"runs": 0, "missing": 0, "errored": 0})
+        entry["coverage"] = {"ablation": abl_cov, "with_skill": ws_cov}
+        if variant not in measured_variants:
+            # No graded ablation rows — absence of evidence, not evidence of absence.
+            # Distinguish "no rows at all" from "rows present but none produced a
+            # usable, non-errored output".
+            entry["status"] = "unmeasured"
+            if abl_cov["runs"] > 0:
+                entry["note"] = f"all {abl_cov['runs']} ablation run(s) had missing output or were infrastructure failures; nothing was graded"
+            out.append(entry)
+            continue
+        entry["status"] = "measured"
+        # Verify the provenance the runners RECORDED, not just the manifest + dirname:
+        # every measured run must carry an exact match, and the with_skill arm must
+        # have recorded the same canonical parent hash.
+        # The expected provenance built from the manifest (hashes are unknown to the
+        # report and ignored by matches(); they are compared as a TreeIdentity).
+        expected_prov = Provenance(
+            id=aid,
+            mode="invalid_skill" if invalid else "materialized",
+            population=expected_pop,
+            identity=TreeIdentity(canonical="", edited=""),
+            components=tuple(_expected_component(c, manifest.get("skill_paths", [])) for c in ablation_components(ablation)),
+        )
+        prov_ok, prov_note = _verify_recorded_ablation_provenance(
+            recorded_prov.get(variant, []), measured_runs.get(variant, 0), expected_prov, recorded_tree_hash.get("with_skill", []))
+        entry["provenance_verified"] = prov_ok
+        if not prov_ok:
+            entry["provenance_note"] = prov_note
+        regressions = []
+        for spec in ablation.get("expected_regressions", []):
+            if not isinstance(spec, dict):
+                regressions.append({"summary": str(spec), "expected_regression_confirmed": None, "note": "unstructured expected_regression; add cases+assertions to confirm at assertion level"})
+                continue
+            cases, names = spec.get("cases", []), spec.get("assertions", [])
+            # Confirmation is evaluated PER CASE and tied together: a case confirms
+            # only if a named assertion flips AND that SAME case's combined score
+            # (objective + qualitative) drops. Evidence on case A must not borrow a
+            # score drop from case B, and a qualitative-only regression still counts
+            # because the score is the combined rate, not objective-only.
+            evidence = []
+            confirmed_cases = []
+            score_regressed = None
+            for cid in cases:
+                case_flips = []
+                for name in names:
+                    w, a = pass_rate(cid, "with_skill", name), pass_rate(cid, variant, name)
+                    if w is not None and a is not None and a < w:   # symmetric paired rate drop
+                        ev = {"case": cid, "assertion": name, "with_skill_rate": w, "ablation_rate": a}
+                        evidence.append(ev)
+                        case_flips.append(ev)
+                wr, ar = combined_rate(cid, "with_skill"), combined_rate(cid, variant)
+                case_score_dropped = wr is not None and ar is not None and ar < wr
+                if wr is not None and ar is not None:
+                    score_regressed = bool(score_regressed) or (ar < wr)
+                if case_flips and case_score_dropped:
+                    confirmed_cases.append(cid)
+            # A confirmation is only meaningful if BOTH arms actually produced a
+            # graded run for at least one cited case. Otherwise the comparison
+            # rests on missing output and must not be reported as confirmed/refuted.
+            measured_pairs = [cid for cid in cases if (cid, "with_skill") in measured_cv and (cid, variant) in measured_cv]
+            reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence, "measured_cases": measured_pairs, "confirmed_cases": confirmed_cases}
+            # The verdict goes through the EvidenceClass guard: CONFIRMED_CAUSAL is
+            # reachable only with verified provenance, coverage, and an observed
+            # regression (a cited case with BOTH a named flip and a same-case score
+            # drop). An invalid-skill experiment is never a behavioral confirmation.
+            if invalid:
+                evidence_class = EvidenceClass.INDETERMINATE
+                reg["note"] = "invalid-skill experiment: a parser/validation rejection is not evidence of a behavioral regression"
+            else:
+                evidence_class = causal_confirmation(provenance_verified=prov_ok, has_coverage=bool(measured_pairs), regression_observed=bool(confirmed_cases))
+                if not prov_ok:
+                    reg["note"] = f"provenance unverified: {prov_note}"
+                elif not measured_pairs:
+                    reg["note"] = "insufficient coverage: no cited case has a graded run in both with_skill and the ablation arm (missing output?)"
+            reg["evidence_class"] = evidence_class.value
+            reg["expected_regression_confirmed"] = {EvidenceClass.CONFIRMED_CAUSAL: True, EvidenceClass.REFUTED: False, EvidenceClass.INDETERMINATE: None}[evidence_class]
+            regressions.append(reg)
+        entry["regressions"] = regressions
+        out.append(entry)
     return out
 
 
@@ -2191,7 +3899,18 @@ def build_benchmark_report(
     variants = variants_arg or manifest.get("variants", DEFAULT_VARIANTS)
     judge_lookup = load_judge_results(judge_results_path)
     results = []
+    skipped_trigger_cases = []
     for case in iter_cases(manifest, split):
+        # Trigger/discovery cases belong to the autonomous-trigger adapter, whose
+        # output is a raw_autonomous_trigger_measurement. Grading their content here
+        # would fold a discovery measurement into the paired ANSWER pass-rate under
+        # no evidence label — the cross-population conflation the spec warns against.
+        # prepared_task_rows already withholds trigger cases from the answer runners,
+        # so normally no such runs exist; the grader enforces the same boundary as
+        # defense in depth (e.g. hand-placed outputs) rather than trusting upstream.
+        if case.get("kind") == "trigger":
+            skipped_trigger_cases.append(case["id"])
+            continue
         for variant in variants:
             for run_number, base in discover_run_bases(runs, case["id"], variant):
                 text, output_path = read_output_base(base)
@@ -2205,25 +3924,32 @@ def build_benchmark_report(
 
     summary: dict[str, Any] = {}
     for variant, rows in by_variant.items():
-        objective_rates = [r["objective_pass_rate"] for r in rows if r["objective_pass_rate"] is not None and not r["missing_output"]]
-        combined_rates = [r["combined_pass_rate"] for r in rows if r.get("combined_pass_rate") is not None and not r["missing_output"]]
-        process_rates = [r["process_pass_rate"] for r in rows if r.get("process_pass_rate") is not None and not r["missing_output"]]
-        efficiency_rates = [r["efficiency_pass_rate"] for r in rows if r.get("efficiency_pass_rate") is not None and not r["missing_output"]]
+        scorable_rows = ResultSet(rows).scorable().all   # the scorable predicate, once
+        objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
+        combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
+        process_rates = [r["process_pass_rate"] for r in scorable_rows if r.get("process_pass_rate") is not None]
+        efficiency_rates = [r["efficiency_pass_rate"] for r in scorable_rows if r.get("efficiency_pass_rate") is not None]
+        # Timing/token/command central tendencies describe SCORABLE runs, matching
+        # the pass-rate block above — a timed-out run's full duration must not drag
+        # the mean (the failure count is disclosed separately as execution_errors).
         merged_metrics = []
-        for r in rows:
+        for r in scorable_rows:
             merged = dict(r.get("metadata", {}) or {})
             merged.update(read_metrics_base(Path(r.get("run_base", ""))))
             merged_metrics.append(merged)
         elapsed = [metric_number(m, "elapsed_ms") for m in merged_metrics]
         tokens = [metric_number(m, "total_tokens") for m in merged_metrics]
         commands = [metric_number(m, "commands", "command_count") for m in merged_metrics]
+        costs = [metric_number(m, "cost_usd") for m in merged_metrics]
         elapsed = [x for x in elapsed if x is not None]
         tokens = [x for x in tokens if x is not None]
         commands = [x for x in commands if x is not None]
+        costs = [x for x in costs if x is not None]
         summary[variant] = {
             "cases": len({r["case_id"] for r in rows}),
             "runs": len(rows),
             "missing_outputs": sum(1 for r in rows if r["missing_output"]),
+            "execution_errors": sum(1 for r in rows if not r["missing_output"] and not r.get("execution_valid", True)),
             "mean_objective_pass_rate": statistics.mean(objective_rates) if objective_rates else None,
             "mean_combined_pass_rate": statistics.mean(combined_rates) if combined_rates else None,
             "mean_process_pass_rate": statistics.mean(process_rates) if process_rates else None,
@@ -2235,6 +3961,10 @@ def build_benchmark_report(
             "elapsed_ms": stats(elapsed),
             "total_tokens": stats(tokens),
             "command_count": stats(commands),
+            # Real dollar cost, when a runner recorded it (the Claude adapter does).
+            # Sum, not mean: "what did this arm cost to run" — over scorable runs only.
+            "cost_usd_total": round(sum(costs), 6) if costs else None,
+            "cost_usd": stats(costs),
             "telemetry_availability": telemetry_summary(rows),
             # Backward-compatible fields used by smoke_report.py callers.
             "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
@@ -2243,13 +3973,9 @@ def build_benchmark_report(
 
     case_flags = []
     case_ids = sorted({r["case_id"] for r in results})
+    everything = ResultSet(results)
     for cid in case_ids:
-        rows = [r for r in results if r["case_id"] == cid]
-        by_var_case: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
-            if row.get("missing_output"):
-                continue
-            by_var_case.setdefault(row["variant"], []).append(row)
+        by_var_case = everything.where(case_id=cid).by_variant()   # scorable + grouped, never hand-rolled
         ws_rows = by_var_case.get("with_skill", [])
         ns_rows = by_var_case.get("without_skill", [])
         if not ws_rows or not ns_rows:
@@ -2276,9 +4002,19 @@ def build_benchmark_report(
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
         "generated_at": int(time.time()),
+        # This is the ANSWER population: a paired with_skill/without_skill
+        # comparison. Stamped so a consumer can never line these pass-rates up
+        # next to a trigger report's raw_autonomous_trigger_measurement as if they
+        # were the same metric — the distinguishing label lives in the JSON, not
+        # only in prose. (We deliberately do NOT stamp evidence_class here:
+        # CONFIRMED_CAUSAL is reserved for the per-ablation causal_confirmation
+        # door and lives on ablation_regressions, not on a with/without summary.)
+        "population": "answer",
+        "skipped_trigger_cases": skipped_trigger_cases,
         "summary": summary,
         "paired_summary": build_paired_summary(results),
         "slice_summary": build_slice_summary(results, variants),
+        "ablation_regressions": build_ablation_regression_report(manifest, results),
         "case_flags": case_flags,
         "results": results,
     }
@@ -2668,8 +4404,14 @@ def paired_token_overhead_report(
                 without_metrics = read_metrics_base(without_base)
                 with_text, with_output_path = read_output_base(with_base)
                 without_text, without_output_path = read_output_base(without_base)
-                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, {}, run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
-                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, {}, run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
+                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, read_metadata_base(with_base), run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
+                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, read_metadata_base(without_base), run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
+                # A crashed/timed-out or output-less arm is an infrastructure failure,
+                # not evidence of token cost or accuracy; exclude the pair via the same
+                # scorable predicate every report view uses (was: graded raw, so a
+                # crashed with_skill arm differenced to a false -1.0 "skill regression").
+                if not (scorable_run(with_grade) and scorable_run(without_grade)):
+                    continue
                 wt = metric_number(with_metrics, "total_tokens")
                 nt = metric_number(without_metrics, "total_tokens")
                 wi = metric_number(with_metrics, "input_tokens")
@@ -2811,15 +4553,21 @@ def profile_skill(args: argparse.Namespace) -> int:
     return 0
 
 
-def trigger_expectation(case: dict[str, Any]) -> str | None:
+TRIGGER_NEGATION_RE = re.compile(r"NO_TRIGGER|not trigger|should not", re.I)
+
+
+def expected_trigger_polarity(case: dict[str, Any]) -> str:
+    """THE one resolver for 'does this trigger case expect the skill to fire?'.
+    Reads expected_behavior + assertion patterns; a negation marker (NO_TRIGGER,
+    'not trigger', 'should not') means NO_TRIGGER, otherwise TRIGGER (the default the
+    autonomous-trigger eval uses). Both the eval (run_pi_trigger_eval) and the
+    manifest audit consume this, so they cannot disagree on a case's polarity — the
+    prior token-only audit resolver returned None for prose like 'should trigger',
+    silently dropping the case from both the positive and negative tallies."""
     text = " ".join(str(x) for x in case.get("expected_behavior", []))
     for assertion in case.get("assertions", []):
         text += " " + str(assertion.get("pattern", assertion.get("value", "")))
-    if "NO_TRIGGER" in text:
-        return "NO_TRIGGER"
-    if "TRIGGER" in text:
-        return "TRIGGER"
-    return None
+    return "NO_TRIGGER" if TRIGGER_NEGATION_RE.search(text) else "TRIGGER"
 
 
 def case_polarity(case: dict[str, Any]) -> str:
@@ -2867,6 +4615,123 @@ def fixture_recommendations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return recs[:6]
 
 
+POSITIVE_OBJECTIVE_TYPES = {"contains", "contains_any", "contains_all", "regex"}
+
+
+def _mean_or_none(xs: list[float] | None) -> float | None:
+    xs = [x for x in (xs or []) if isinstance(x, (int, float))]
+    return statistics.mean(xs) if xs else None
+
+
+def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9) -> dict[str, list]:
+    """From a benchmark report's per-case scorable results, surface the cases a
+    static manifest audit CANNOT see — the ones where the *measured* numbers say
+    the case can't discriminate the skill:
+
+      base_saturated   — combined with_skill == without_skill: the case measures
+                         nothing (the base model does it with or without the skill).
+      qualitative_only — objective with == without (the deterministic assertions
+                         don't move) yet combined with > without: the whole signal
+                         is carried by the judge. An objective-only eval would call
+                         this skill useless (the anti-slop case)."""
+    obj: dict[Any, dict[str, list]] = {}
+    comb: dict[Any, dict[str, list]] = {}
+    for r in benchmark_report.get("results", []) or []:
+        if not scorable_run(r):
+            continue
+        cid, v = r.get("case_id"), r.get("variant")
+        if r.get("objective_pass_rate") is not None:
+            obj.setdefault(cid, {}).setdefault(v, []).append(r["objective_pass_rate"])
+        cr = r.get("combined_pass_rate")
+        if cr is None:
+            cr = r.get("objective_pass_rate")
+        if cr is not None:
+            comb.setdefault(cid, {}).setdefault(v, []).append(cr)
+    base_saturated, qualitative_only = [], []
+    for cid, cv in comb.items():
+        cw, cn = _mean_or_none(cv.get("with_skill")), _mean_or_none(cv.get("without_skill"))
+        if cw is None or cn is None:
+            continue
+        if abs(cw - cn) <= eps:
+            base_saturated.append(cid)
+            continue
+        ow = _mean_or_none(obj.get(cid, {}).get("with_skill"))
+        on = _mean_or_none(obj.get(cid, {}).get("without_skill"))
+        if ow is not None and on is not None and abs(ow - on) <= eps and cw > cn + eps:
+            qualitative_only.append(cid)
+    return {"base_saturated_cases": sorted(base_saturated, key=str),
+            "qualitative_only_cases": sorted(qualitative_only, key=str)}
+
+
+def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str | None = None, leakage_min_chars: int = 4, benchmark_report: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A compact, offline 'is this eval worth paying to run?' verdict. It collapses
+    the three things that decide whether a measured number will MEAN anything:
+    are the ablations real (materialized, not instruction-simulated), does any case
+    leak its whole answer into the prompt (so with_skill==without_skill by
+    construction), and is there adversarial coverage (the discriminating cases for a
+    robust skill). `blockers` is the punch list to drive to empty before spending
+    model budget."""
+    ablations = manifest.get("ablations", [])
+    materialized = sum(1 for a in ablations if ablation_components(a))
+    instr_sim = len(ablations) - materialized
+    leaked: dict[Any, set] = {}
+    for f in prompt_assertion_leakage_findings(manifest, manifest_path, min_chars=leakage_min_chars, split=split):
+        leaked.setdefault(f["case_id"], set()).add(f["assertion"])
+    leak_saturated: list[Any] = []
+    objective_only: list[Any] = []
+    adversarial = judge_only = 0
+    for case in iter_cases(manifest, split):
+        kind = case.get("kind")
+        if kind == "adversarial":
+            adversarial += 1
+        asserts = case.get("assertions", []) or []
+        if asserts and all(a.get("type") == "judge" for a in asserts):
+            judge_only += 1
+        # A behaviour case (not a trigger/adversarial probe) with assertions but NO
+        # qualitative (judge/rubric) check can only ever measure objective compliance
+        # — if the skill's value is voice/judgement it will read as zero lift here
+        # (the anti-slop lesson, statically). Not a blocker (some skills are purely
+        # objective), but the place to add a judge assertion if the run shows no lift.
+        if kind not in ("trigger", "adversarial") and asserts and not any(a.get("type") in QUALITATIVE_ASSERTIONS for a in asserts):
+            objective_only.append(case.get("id"))
+        positive = [a for a in asserts if a.get("type") in POSITIVE_OBJECTIVE_TYPES]
+        # A case is leak-saturated when EVERY positive objective assertion can be passed
+        # by echoing the prompt. "Leak-checkable" is defined by the leakage lint itself
+        # (assertion_values_for_leakage returns the values it can match) — so a regex or
+        # other positive check the lint cannot verify conservatively blocks the claim,
+        # and the two never drift out of a single source of truth.
+        if positive and all(
+            assertion_values_for_leakage(a) and assertion_label(a) in leaked.get(case.get("id"), set())
+            for a in positive
+        ):
+            leak_saturated.append(case.get("id"))
+    blockers: list[str] = []
+    if instr_sim:
+        blockers.append(f"{instr_sim}/{len(ablations)} ablation(s) are instruction-simulated (not blind / confirmation-gradeable) — materialize them")
+    if leak_saturated:
+        blockers.append(f"{len(leak_saturated)} case(s) are leak-saturated (every positive assertion value appears in the prompt) — they cannot discriminate skill from no-skill")
+    if adversarial == 0:
+        blockers.append("no adversarial cases (kind: adversarial) — add the near-miss/under-pressure cases where the skill must hold")
+    # Run-measured signals (only when a benchmark report is supplied): cases whose
+    # MEASURED numbers say they can't discriminate the skill. base_saturated is a
+    # blocker (a case that measures nothing is wasted budget); qualitative_only is a
+    # warning that the case's signal lives entirely in the judge, so an
+    # objective-only reading would miss it.
+    run = readiness_run_signals(benchmark_report) if benchmark_report else {"base_saturated_cases": [], "qualitative_only_cases": []}
+    if run["base_saturated_cases"]:
+        blockers.append(f"{len(run['base_saturated_cases'])} case(s) are base-saturated (measured with_skill == without_skill) — they cannot measure the skill; cut or harden them")
+    return {
+        "ablations": {"total": len(ablations), "materialized": materialized, "instruction_simulated": instr_sim},
+        "leak_saturated_cases": leak_saturated,
+        "objective_only_cases": objective_only,
+        "adversarial_cases": adversarial,
+        "judge_only_cases": judge_only,
+        "base_saturated_cases": run["base_saturated_cases"],
+        "qualitative_only_cases": run["qualitative_only_cases"],
+        "blockers": blockers,
+    }
+
+
 def audit_manifest_report(
     manifest_path: Path,
     *,
@@ -2891,8 +4756,8 @@ def audit_manifest_report(
         "holdout": sum(1 for c in cases if c.get("split") == "holdout"),
         "holdback": sum(1 for c in cases if c.get("split") == "holdback"),
         "trigger": sum(1 for c in cases if c.get("kind") == "trigger"),
-        "trigger_positive": sum(1 for c in cases if c.get("kind") == "trigger" and trigger_expectation(c) == "TRIGGER"),
-        "trigger_negative": sum(1 for c in cases if c.get("kind") == "trigger" and trigger_expectation(c) == "NO_TRIGGER"),
+        "trigger_positive": sum(1 for c in cases if c.get("kind") == "trigger" and expected_trigger_polarity(c) == "TRIGGER"),
+        "trigger_negative": sum(1 for c in cases if c.get("kind") == "trigger" and expected_trigger_polarity(c) == "NO_TRIGGER"),
         "ablations": len(manifest.get("ablations", [])),
         "objective_assertions": sum(1 for c in cases for a in c.get("assertions", []) if a.get("type") not in QUALITATIVE_ASSERTIONS),
         "process_assertions": sum(1 for c in cases for a in c.get("assertions", []) if a.get("type") in PROCESS_ASSERTIONS),
@@ -2961,8 +4826,10 @@ def audit_manifest_report(
         rec("trigger-cases", "Add both TRIGGER and NO_TRIGGER cases with anchored expected-trigger-label regex assertions.")
 
     benchmark_summary = None
+    bench_report = None
     if runs:
         report = build_benchmark_report(manifest_path, Path(runs), split)
+        bench_report = report
         benchmark_summary = {"summary": report["summary"], "case_flags": report["case_flags"]}
         for flag in report["case_flags"]:
             for f in flag.get("flags", []):
@@ -2973,11 +4840,7 @@ def audit_manifest_report(
                 elif "flaky" in f:
                     finding("flaky-eval", "required", f"Case {flag['case_id']} has repeated-run variance.", flag)
         assertion_rows = []
-        by_case: dict[str, dict[str, list[dict[str, Any]]]] = {}
-        for row in report["results"]:
-            if row.get("missing_output"):
-                continue
-            by_case.setdefault(row["case_id"], {}).setdefault(row["variant"], []).append(row)
+        by_case = ResultSet(report["results"]).by_case_variant()   # scorable + grouped, once
         for case_id, by_variant in by_case.items():
             names = sorted({a.get("name") for rows in by_variant.values() for r in rows for a in r.get("assertions", [])})
             for name in names:
@@ -2996,6 +4859,31 @@ def audit_manifest_report(
     if fixtures:
         rec("fixture-repos-files", "Add fixture-backed evals to reduce keyword gaming and verify artifacts/source evidence.", fixtures)
 
+    # Ablation hygiene (docs/skill-ablation-spec.md).
+    ablation_case_ids = {c.get("id") for c in cases}
+    ablation_assertion_names = {a.get("name") for c in cases for a in c.get("assertions", []) if a.get("name")}
+    for ablation in manifest.get("ablations", []):
+        aid = ablation.get("id")
+        if not ablation_components(ablation):
+            finding("ablation-instruction-simulated", "recommended", f"ablation {aid!r} is instruction-simulated (label-only): the full skill is mounted with a prompt directive to ignore the component, so the arm is non-blind and yields a raw measurement only (it cannot be confirmation-graded). Declare a mechanism+target (section/list_item/frontmatter_field/reference/patch) to materialize it as a blind, removal-based ablation.")
+            continue
+        if not ablation.get("expected_regressions"):
+            finding("ablation-no-expected-regression", "recommended", f"ablation {aid!r} declares a removal but no expected_regressions; without a discriminating case it cannot become evidence.")
+        for comp in ablation_components(ablation):
+            if comp.get("mechanism") == "reference":
+                rpath = comp.get("target", {}).get("path")
+                if rpath and f"]({rpath})" not in skill_text:
+                    finding("ablation-dangling-reference", "recommended", f"ablation {aid!r}: reference {rpath!r} is not linked from the skill body; its pointer removal may be a no-op.")
+        for spec in ablation.get("expected_regressions", []):
+            if not isinstance(spec, dict):
+                continue
+            for cid in spec.get("cases", []):
+                if cid not in ablation_case_ids:
+                    finding("ablation-unknown-case", "recommended", f"ablation {aid!r}: expected_regression names unknown case {cid!r}.")
+            for an in spec.get("assertions", []):
+                if an not in ablation_assertion_names:
+                    finding("ablation-unknown-assertion", "recommended", f"ablation {aid!r}: expected_regression names unknown assertion {an!r}.")
+
     return {
         "generated_at": int(time.time()),
         "manifest": str(manifest_path),
@@ -3005,6 +4893,7 @@ def audit_manifest_report(
         "findings": findings,
         "recommendations": recommendations,
         "recommended_fixture_repos_files": fixtures,
+        "readiness": eval_readiness(manifest, manifest_path, split=split, leakage_min_chars=leakage_min_chars, benchmark_report=bench_report),
         "benchmark": benchmark_summary,
     }
 
@@ -3026,6 +4915,22 @@ def audit_manifest(args: argparse.Namespace) -> int:
         lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "", "| Metric | Value |", "|---|---:|"]
         for k, v in report["counts"].items():
             lines.append(f"| {k} | {v} |")
+        rd = report.get("readiness", {})
+        lines += ["", "## Readiness", "",
+                  f"- ablations materialized: {rd.get('ablations',{}).get('materialized',0)}/{rd.get('ablations',{}).get('total',0)} "
+                  f"(instruction-simulated: {rd.get('ablations',{}).get('instruction_simulated',0)})",
+                  f"- leak-saturated cases: {len(rd.get('leak_saturated_cases',[]))}",
+                  f"- objective-only cases (no judge assertion): {len(rd.get('objective_only_cases',[]))}",
+                  f"- adversarial cases: {rd.get('adversarial_cases',0)}   judge-only cases: {rd.get('judge_only_cases',0)}"]
+        if rd.get("base_saturated_cases") or rd.get("qualitative_only_cases"):
+            lines.append(f"- measured signals: base-saturated (with==without): {len(rd.get('base_saturated_cases',[]))}   "
+                         f"qualitative-only (judge carries the lift): {len(rd.get('qualitative_only_cases',[]))}")
+        if rd.get("blockers"):
+            lines.append("- **blockers before a paid run:**")
+            for b in rd["blockers"]:
+                lines.append(f"    - {b}")
+        else:
+            lines.append("- **ready**: no blockers ✓")
         lines += ["", "## Findings", ""]
         if report["findings"]:
             for f in report["findings"]:
@@ -3049,7 +4954,344 @@ def audit_manifest(args: argparse.Namespace) -> int:
             write_json(Path(args.out), report)
         else:
             print(json.dumps(report, indent=2, ensure_ascii=False))
+    # CI gate: non-zero exit when the readiness blockers are non-empty, so a skill
+    # repo can keep its eval suite at "worth paying to run" the same way it keeps
+    # tests green. Off by default — the audit stays a report unless asked to gate.
+    blockers = report.get("readiness", {}).get("blockers", [])
+    if getattr(args, "fail_on_blockers", False) and blockers:
+        for b in blockers:
+            print(f"readiness blocker: {b}", file=sys.stderr)
+        print(f"audit-manifest: {len(blockers)} readiness blocker(s) for {report.get('skill_name')!r}", file=sys.stderr)
+        return 1
     return 0
+
+
+SUITE_TIERS = {"preflight", "static", "prepare", "jetty-dry-run"}
+
+
+def _suite_manifest_lines(suite_file: Path) -> list[str]:
+    rows: list[str] = []
+    for raw in suite_file.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = Path(line)
+        if p.is_absolute() or ".." in p.parts:
+            die(f"suite manifest entry must be a safe relative path: {line!r}")
+        rows.append(line)
+    if not rows:
+        die(f"suite file has no manifest entries: {suite_file}")
+    if len(set(rows)) != len(rows):
+        dupes = sorted({r for r in rows if rows.count(r) > 1})
+        die(f"suite file has duplicate manifest entries: {dupes}")
+    return rows
+
+
+def _discover_top_level_manifests(workspace_root: Path) -> set[str]:
+    """Discover only the repo-shaped manifests this suite contract owns.
+
+    The goal is to prevent accidental broad globs (for example pulling in an
+    unrelated top-level tool with its own evals/shared-benchmark.json) without
+    recursively scanning arbitrary fixture trees.
+    """
+    found: set[str] = set()
+    for path in workspace_root.glob("*/evals/shared-benchmark.json"):
+        if path.is_file():
+            found.add(path.relative_to(workspace_root).as_posix())
+    return found
+
+
+def _load_suite_pins(pins_file: Path | None) -> dict[str, Any]:
+    if not pins_file:
+        return {}
+    if not pins_file.exists():
+        die(f"pins file not found: {pins_file}")
+    data = json.loads(pins_file.read_text(encoding="utf-8"))
+    skills = data.get("skills")
+    if not isinstance(skills, dict):
+        die(f"pins file must contain a skills object: {pins_file}")
+    return skills
+
+
+def _suite_pin_for(skills: dict[str, Any], manifest_rel: str, manifest: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    repo_key = Path(manifest_rel).parts[0]
+    for key in (str(manifest.get("skill_name", "")), repo_key):
+        pin = skills.get(key)
+        if isinstance(pin, dict):
+            return key, pin
+    return None, None
+
+
+def _suite_case_counts(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    splits: dict[str, int] = {}
+    kinds: dict[str, int] = {}
+    for case in cases:
+        splits[str(case.get("split", ""))] = splits.get(str(case.get("split", "")), 0) + 1
+        kinds[str(case.get("kind", ""))] = kinds.get(str(case.get("kind", "")), 0) + 1
+    tune = [c for c in cases if c.get("split") == "tune"]
+    tune_trigger = [c for c in tune if c.get("kind") == "trigger"]
+    tune_answer = [c for c in tune if c.get("kind") != "trigger"]
+    return {
+        "total": len(cases),
+        "splits": splits,
+        "kinds": kinds,
+        "tune": len(tune),
+        "tune_answer": len(tune_answer),
+        "tune_trigger": len(tune_trigger),
+    }
+
+
+def _suite_ablation_counts(ablations: list[dict[str, Any]]) -> dict[str, int]:
+    materialized = sum(1 for a in ablations if ablation_components(a))
+    return {
+        "total": len(ablations),
+        "instruction_simulated": len(ablations) - materialized,
+        "declared_removal": materialized,
+    }
+
+
+def build_suite_scope(
+    suite_file: Path,
+    workspace_root: Path,
+    *,
+    pins_file: Path | None = None,
+    tier: str = "preflight",
+    split: str = "tune",
+    runs_per_variant: int = 1,
+    include_ablations: bool = False,
+    allow_extra_manifests: bool = False,
+    skip_pin_check: bool = False,
+) -> dict[str, Any]:
+    if tier not in SUITE_TIERS:
+        die(f"unknown suite tier {tier!r}; expected one of {sorted(SUITE_TIERS)}")
+    suite_file = suite_file.resolve()
+    workspace_root = workspace_root.resolve()
+    pins_file = pins_file.resolve() if pins_file else None
+    rels = _suite_manifest_lines(suite_file)
+    allowed = set(rels)
+    discovered = _discover_top_level_manifests(workspace_root)
+    extra = sorted(discovered - allowed)
+    missing_from_discovery = sorted(allowed - discovered)
+    blockers: list[str] = []
+    if extra and not allow_extra_manifests:
+        blockers.append("extra top-level manifests not in suite allowlist: " + ", ".join(extra))
+    pins = _load_suite_pins(pins_file) if (pins_file and not skip_pin_check) else {}
+
+    manifests: list[dict[str, Any]] = []
+    totals = {
+        "skills": 0,
+        "cases": 0,
+        "tune_cases": 0,
+        "tune_answer_cases": 0,
+        "tune_trigger_cases": 0,
+        "ablations": 0,
+        "instruction_simulated_ablations": 0,
+        "declared_removal_ablations": 0,
+        "baseline_rows": 0,
+        "ablation_rows": 0,
+        "selected_tier_rows": 0,
+        "judge_assertions_tune_pair": 0,
+        "script_assertions_tune_pair": 0,
+    }
+    for rel in rels:
+        manifest_path = workspace_root / rel
+        if not manifest_path.exists():
+            blockers.append(f"allowlisted manifest is missing: {rel}")
+            manifests.append({"manifest": rel, "status": "missing"})
+            continue
+        try:
+            manifest = validate_manifest(manifest_path, allow_missing_holdback=True)
+        except SystemExit as exc:
+            blockers.append(f"manifest validation failed for {rel}: {exc}")
+            manifests.append({"manifest": rel, "status": "invalid", "error": str(exc)})
+            continue
+        repo_root = repo_root_for_manifest(manifest_path)
+        cases = list(iter_cases(manifest))
+        counts = _suite_case_counts(cases)
+        ab_counts = _suite_ablation_counts(list(manifest.get("ablations", [])))
+        variants = list(manifest.get("variants", DEFAULT_VARIANTS))
+        split_cases = [c for c in cases if c.get("split") == split]
+        baseline_rows = len(split_cases) * len(variants) * runs_per_variant
+        split_answer_cases = [c for c in split_cases if c.get("kind") != "trigger"]
+        ablation_rows = baseline_rows
+        if include_ablations:
+            ablation_rows += len(split_answer_cases) * ab_counts["total"] * runs_per_variant
+        judge_pair = sum(sum(1 for a in c.get("assertions", []) if a.get("type") in QUALITATIVE_ASSERTIONS) for c in split_cases) * len(variants) * runs_per_variant
+        script_pair = sum(sum(1 for a in c.get("assertions", []) if a.get("type") == "script") for c in split_cases) * len(variants) * runs_per_variant
+
+        pin_key, pin = _suite_pin_for(pins, rel, manifest) if pins else (None, None)
+        tree_hash = canonical_skill_tree_hash(repo_root, manifest)
+        pin_status = "not_checked"
+        if pins and pin is None:
+            blockers.append(f"missing pin for {manifest['skill_name']} ({rel})")
+            pin_status = "missing"
+        elif pin is not None:
+            expected = pin.get("tree_hash")
+            pin_status = "verified" if expected == tree_hash else "mismatch"
+            if expected != tree_hash:
+                blockers.append(f"pin hash mismatch for {manifest['skill_name']} ({rel}): expected {expected}, got {tree_hash}")
+
+        row = {
+            "manifest": rel,
+            "status": "ok",
+            "repo": Path(rel).parts[0],
+            "repo_root": str(repo_root),
+            "skill_name": manifest.get("skill_name"),
+            "skill_paths": manifest.get("skill_paths", []),
+            "variants": variants,
+            "optional_variants": manifest.get("optional_variants", []),
+            "old_skill_available": bool(manifest.get("old_skill_paths")),
+            "cases": counts,
+            "ablations": ab_counts,
+            "tree_hash": tree_hash,
+            "pin": {"key": pin_key, "status": pin_status, "expected_tree_hash": (pin or {}).get("tree_hash") if pin else None},
+            "estimated_rows": {
+                "baseline": baseline_rows,
+                "with_ablations": ablation_rows,
+                "selected_tier": ablation_rows if include_ablations else baseline_rows,
+                "judge_assertions_pair": judge_pair,
+                "script_assertions_pair": script_pair,
+            },
+        }
+        manifests.append(row)
+        totals["skills"] += 1
+        totals["cases"] += counts["total"]
+        totals["tune_cases"] += counts["tune"]
+        totals["tune_answer_cases"] += counts["tune_answer"]
+        totals["tune_trigger_cases"] += counts["tune_trigger"]
+        totals["ablations"] += ab_counts["total"]
+        totals["instruction_simulated_ablations"] += ab_counts["instruction_simulated"]
+        totals["declared_removal_ablations"] += ab_counts["declared_removal"]
+        totals["baseline_rows"] += baseline_rows
+        totals["ablation_rows"] += ablation_rows
+        totals["selected_tier_rows"] += ablation_rows if include_ablations else baseline_rows
+        totals["judge_assertions_tune_pair"] += judge_pair
+        totals["script_assertions_tune_pair"] += script_pair
+
+    return {
+        "generated_at": int(time.time()),
+        "suite_file": str(suite_file),
+        "workspace_root": str(workspace_root),
+        "pins_file": str(pins_file) if pins_file else None,
+        "tier": tier,
+        "split": split,
+        "runs_per_variant": runs_per_variant,
+        "include_ablations": include_ablations,
+        "allow_extra_manifests": allow_extra_manifests,
+        "skip_pin_check": skip_pin_check,
+        "manifests": manifests,
+        "allowed_manifests": rels,
+        "discovered_manifests": sorted(discovered),
+        "extra_manifests": extra,
+        "missing_from_discovery": missing_from_discovery,
+        "totals": totals,
+        "blockers": blockers,
+        "commands_run": [],
+        "status": "blocked" if blockers else "preflight_ok",
+    }
+
+
+def _suite_python_command() -> list[str]:
+    return [sys.executable, str(Path(__file__).resolve())]
+
+
+def _run_suite_command(cmd: list[str], *, cwd: Path, log_path: Path) -> dict[str, Any]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    start = time.time()
+    with log_path.open("w", encoding="utf-8") as log:
+        log.write("$ " + " ".join(cmd) + "\n")
+        log.flush()
+        proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=log, stderr=subprocess.STDOUT)
+    return {"cmd": cmd, "cwd": str(cwd), "log": str(log_path), "returncode": proc.returncode, "elapsed_ms": int((time.time() - start) * 1000)}
+
+
+def _run_suite_tier(scope: dict[str, Any], out_dir: Path) -> list[dict[str, Any]]:
+    tier = scope["tier"]
+    if tier == "preflight":
+        return []
+    root = Path(scope["workspace_root"])
+    split = scope["split"]
+    runs = str(scope["runs_per_variant"])
+    include_ablations = bool(scope["include_ablations"])
+    commands: list[dict[str, Any]] = []
+    for item in scope["manifests"]:
+        if item.get("status") != "ok":
+            continue
+        rel = item["manifest"]
+        repo = item["repo"]
+        base_cmd = _suite_python_command()
+        if tier == "static":
+            (out_dir / "reports").mkdir(parents=True, exist_ok=True)
+            static_cmds = [
+                [*base_cmd, "validate", rel],
+                [*base_cmd, "validate", rel, "--check-ablations"],
+                [*base_cmd, "audit-manifest", rel, "--format", "markdown", "--out", str(out_dir / "reports" / f"{repo}.audit.md")],
+                [*base_cmd, "profile-skill", rel, "--format", "markdown", "--out", str(out_dir / "reports" / f"{repo}.profile.md")],
+            ]
+            for i, cmd in enumerate(static_cmds, start=1):
+                commands.append(_run_suite_command(cmd, cwd=root, log_path=out_dir / "logs" / f"{repo}.static.{i}.log"))
+        elif tier == "prepare":
+            (out_dir / "tasks").mkdir(parents=True, exist_ok=True)
+            cmd = [*base_cmd, "prepare", rel, "--split", split, "--runs-per-variant", runs, "--out", str(out_dir / "tasks" / f"{repo}.tasks.jsonl")]
+            if include_ablations:
+                cmd.extend(["--include-ablations", "--ablation-dir", str(out_dir / "ablated" / repo)])
+            commands.append(_run_suite_command(cmd, cwd=root, log_path=out_dir / "logs" / f"{repo}.prepare.log"))
+        elif tier == "jetty-dry-run":
+            (out_dir / "jetty").mkdir(parents=True, exist_ok=True)
+            payloads = out_dir / "jetty" / f"{repo}.payloads.jsonl"
+            export_cmd = [*base_cmd, "export-jetty", rel, "--split", split, "--runs-per-variant", runs, "--out", str(payloads)]
+            if include_ablations:
+                export_cmd.extend(["--include-ablations", "--ablation-dir", str(out_dir / "jetty-ablated" / repo)])
+            commands.append(_run_suite_command(export_cmd, cwd=root, log_path=out_dir / "logs" / f"{repo}.export-jetty.log"))
+            if commands[-1]["returncode"] == 0:
+                dry_cmd = [*base_cmd, "run-jetty", "--payloads", str(payloads), "--dry-run", "--out", str(out_dir / "jetty" / f"{repo}.dry-run.jsonl")]
+                commands.append(_run_suite_command(dry_cmd, cwd=root, log_path=out_dir / "logs" / f"{repo}.run-jetty-dry-run.log"))
+    return commands
+
+
+def suite_run(args: argparse.Namespace) -> int:
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scope = build_suite_scope(
+        Path(args.suite_file),
+        Path(args.workspace_root),
+        pins_file=Path(args.pins) if args.pins else None,
+        tier=args.tier,
+        split=args.split,
+        runs_per_variant=args.runs_per_variant,
+        include_ablations=args.include_ablations,
+        allow_extra_manifests=args.allow_extra_manifests,
+        skip_pin_check=args.skip_pin_check,
+    )
+    scope_path = out_dir / "RUN_SCOPE.json"
+    write_json(scope_path, scope)
+    totals = scope["totals"]
+    print(f"suite: {scope['suite_file']}")
+    print(f"workspace: {scope['workspace_root']}")
+    print(f"tier: {scope['tier']} split={scope['split']} runs_per_variant={scope['runs_per_variant']} include_ablations={scope['include_ablations']}")
+    print(f"scope: {totals['skills']} skills, {totals['tune_cases']} tune cases ({totals['tune_answer_cases']} answer / {totals['tune_trigger_cases']} trigger), {totals['ablations']} ablations")
+    print(f"estimated rows: baseline={totals['baseline_rows']} selected={totals['selected_tier_rows']} with_ablations={totals['ablation_rows']}")
+    if scope["extra_manifests"]:
+        print("extra manifests not in suite allowlist: " + ", ".join(scope["extra_manifests"]), file=sys.stderr)
+    if scope["blockers"]:
+        for blocker in scope["blockers"]:
+            print(f"FAIL: {blocker}", file=sys.stderr)
+        print(f"wrote {scope_path}")
+        return 2
+    commands = _run_suite_tier(scope, out_dir)
+    scope["commands_run"] = commands
+    failed = [c for c in commands if c.get("returncode") != 0]
+    scope["status"] = "failed" if failed else "completed"
+    write_json(scope_path, scope)
+    print(f"wrote {scope_path}")
+    if failed:
+        for row in failed:
+            print(f"FAIL: command exited {row['returncode']}; see {row['log']}", file=sys.stderr)
+        return 1
+    if commands:
+        print(f"ran {len(commands)} command(s); logs under {out_dir / 'logs'}")
+    return 0
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -3060,6 +5302,7 @@ def main() -> int:
     p.add_argument("--strict-holdback", action="store_true", help="require holdout/holdback prompt_ref files to exist")
     p.add_argument("--strict-leakage", action="store_true", help="fail if contains-style assertion values appear literally in prompts")
     p.add_argument("--leakage-min-chars", type=int, default=4, help="minimum assertion value length for prompt leakage lint")
+    p.add_argument("--check-ablations", action="store_true", help="dry-run apply-time gates for declared-removal ablations (materializes to a temp dir, writes nothing)")
 
     p = sub.add_parser("prepare")
     p.add_argument("manifest")
@@ -3070,6 +5313,7 @@ def main() -> int:
     p.add_argument("--runs-per-variant", type=int, default=1, help="emit repeated run tasks as <case>/<variant>/run-N")
     p.add_argument("--allow-missing-prompts", action="store_true", help="dry-run hidden prompt_ref cases even when private files are absent")
     p.add_argument("--include-answer-key", action="store_true", help="include expected_behavior/review_rubric in prepared tasks; use only for judge/debug tasks, not generation")
+    p.add_argument("--ablation-dir", default=None, help="materialize declared-removal ablations into this dir and point their rows at the altered tree")
 
     p = sub.add_parser("export-jetty")
     p.add_argument("manifest")
@@ -3079,6 +5323,7 @@ def main() -> int:
     p.add_argument("--include-old-skill", action="store_true")
     p.add_argument("--runs-per-variant", type=int, default=1)
     p.add_argument("--allow-missing-prompts", action="store_true")
+    p.add_argument("--ablation-dir", default=None, help="materialize declared-removal ablations into this dir and upload the altered trees")
     p.add_argument("--jetty-collection", default=None)
     p.add_argument("--jetty-task-prefix", default=None)
     p.add_argument("--jetty-agent", default=None)
@@ -3115,6 +5360,13 @@ def main() -> int:
     p.add_argument("--codex-cmd", default="codex exec --json", help="shell command that reads prompt on stdin and emits Codex JSONL")
     p.add_argument("--timeout", type=int, default=1800)
 
+    p = sub.add_parser("run-claude", help="run prepared tasks through `claude -p --output-format json`, capturing cost/usage")
+    p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
+    p.add_argument("--runs", required=True, help="output runs directory")
+    p.add_argument("--model", help="claude model id (e.g. claude-haiku-4-5-20251001); omit for the CLI default")
+    p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
+    p.add_argument("--timeout", type=int, default=1800)
+
     p = sub.add_parser("grade")
     p.add_argument("manifest")
     p.add_argument("--runs", required=True)
@@ -3131,7 +5383,9 @@ def main() -> int:
     p.add_argument("--runs", required=True)
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
-    p.add_argument("--judge-cmd", required=True, help="shell command that reads a judge prompt on stdin and emits JSON on stdout")
+    p.add_argument("--judge-cmd", help="shell command that reads a judge prompt on stdin and emits JSON on stdout (any provider)")
+    p.add_argument("--judge-model", help="judge natively with `claude -p <model>` (captures cost); stamped on every verdict")
+    p.add_argument("--claude-bin", default="claude", help="path to the claude executable when using --judge-model")
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
     p.add_argument("--transcripts", help="directory for per-task prompt/stdout/stderr/result audit transcripts")
     p.add_argument("--out")
@@ -3143,6 +5397,11 @@ def main() -> int:
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-results", help="merge qualitative judge scoring into combined pass rates")
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
+    p.add_argument("--out")
+
+    p = sub.add_parser("compare-judges", help="flag judge-sensitivity across judged benchmark reports")
+    p.add_argument("--report", action="append", metavar="NAME=PATH", help="judge label = judged benchmark report JSON (repeatable)")
+    p.add_argument("--magnitude-eps", type=float, default=0.1, help="lift-spread above which the skill is judge-magnitude-sensitive")
     p.add_argument("--out")
 
     p = sub.add_parser("export-anthropic")
@@ -3207,6 +5466,12 @@ def main() -> int:
     p.add_argument("--min-trigger-pos", type=int, default=2)
     p.add_argument("--min-trigger-neg", type=int, default=2)
     p.add_argument("--leakage-min-chars", type=int, default=4)
+    p.add_argument("--fail-on-blockers", action="store_true", help="exit non-zero if the readiness block has any blockers (for CI gating of an eval suite)")
+
+    p = sub.add_parser("materialize-ablations", help="Write real, ablated skill trees for declared materialized ablations")
+    p.add_argument("manifest")
+    p.add_argument("--out-dir", required=True, help="Directory to write <id>/ ablated skill trees into")
+    p.add_argument("--out", help="Optional JSON file recording materialized ablation provenance")
 
     p = sub.add_parser("aggregate")
     p.add_argument("manifests", nargs="+")
@@ -3219,6 +5484,18 @@ def main() -> int:
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from manifests while aggregating")
     p.add_argument("--out")
 
+    p = sub.add_parser("suite-run", help="Run an explicit allowlisted suite preflight/tier and write RUN_SCOPE.json")
+    p.add_argument("suite_file", help="newline-delimited allowlist of manifest paths relative to --workspace-root")
+    p.add_argument("--workspace-root", default=".", help="root containing the allowlisted skill repos")
+    p.add_argument("--pins", help="optional examples/skill-pins.json-style tree-hash pins to verify")
+    p.add_argument("--out-dir", required=True, help="directory for RUN_SCOPE.json, logs, and tier artifacts")
+    p.add_argument("--tier", choices=sorted(SUITE_TIERS), default="preflight", help="preflight only, or run a non-model artifact tier")
+    p.add_argument("--split", choices=sorted(VALID_SPLITS), default="tune")
+    p.add_argument("--runs-per-variant", type=int, default=1)
+    p.add_argument("--include-ablations", action="store_true", help="include ablation rows/payloads for prepare and jetty-dry-run tiers")
+    p.add_argument("--allow-extra-manifests", action="store_true", help="do not fail when --workspace-root has top-level manifests outside the suite allowlist")
+    p.add_argument("--skip-pin-check", action="store_true", help="load the suite without verifying --pins tree hashes")
+
     args = parser.parse_args()
     if args.cmd == "validate":
         manifest_path = Path(args.manifest)
@@ -3228,6 +5505,10 @@ def main() -> int:
             print(f"WARN {finding['case_id']}: assertion {finding['assertion']!r} value {finding['value']!r} appears in prompt (leakage; case may saturate)", file=sys.stderr)
         if leakage and args.strict_leakage:
             die(f"prompt/assertion leakage found in {len(leakage)} assertion value(s)")
+        if getattr(args, "check_ablations", False):
+            failures = check_ablations_dry_run(manifest_path, manifest)
+            if failures:
+                die(f"{failures} ablation(s) failed --check-ablations")
         print(f"OK: {manifest['skill_name']} — {len(iter_cases(manifest))} cases, {len(manifest.get('ablations', []))} ablations")
         return 0
     if args.cmd == "prepare":
@@ -3242,12 +5523,16 @@ def main() -> int:
         return import_trace(args)
     if args.cmd == "run-codex":
         return run_codex(args)
+    if args.cmd == "run-claude":
+        return run_claude(args)
     if args.cmd == "grade":
         return grade(args)
     if args.cmd == "judge":
         return judge_command(args)
     if args.cmd == "benchmark":
         return benchmark(args)
+    if args.cmd == "compare-judges":
+        return compare_judges(args)
     if args.cmd == "export-anthropic":
         return export_anthropic(args)
     if args.cmd == "compare-tasks":
@@ -3264,6 +5549,10 @@ def main() -> int:
         return audit_manifest(args)
     if args.cmd == "aggregate":
         return aggregate(args)
+    if args.cmd == "suite-run":
+        return suite_run(args)
+    if args.cmd == "materialize-ablations":
+        return materialize_ablations(args)
     return 1
 
 

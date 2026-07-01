@@ -22,7 +22,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from skill_benchmark import write_trace_artifacts
+from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population, canonical_skill_tree_hash, expected_trigger_polarity, detect_trigger, event_texts_for_tool_input
+from ablation_model import EvidenceClass, Provenance
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -44,64 +45,48 @@ def seed_config_dir(config_dir: Path) -> None:
             shutil.copy2(src, config_dir / name)
 
 
-def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_dir: Path) -> list[Path]:
-    repo_root = manifest_path.parent.parent if manifest_path.name == "shared-benchmark.json" else manifest_path.parent
-    skills_dir = config_dir / "skills"
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    copied = []
-    for rel in manifest.get("skill_paths", []):
-        src = (repo_root / rel).resolve()
-        if src.is_dir():
-            dest = skills_dir / src.name
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(src, dest)
-        else:
-            # Preserve directory structure when the skill path is SKILL.md.
-            dest_dir = skills_dir / skill_name_from_manifest(manifest)
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / "SKILL.md"
-            shutil.copy2(src, dest)
-            # Copy sibling references/scripts if available.
-            for sibling in ["references", "scripts", "assets"]:
-                s = src.parent / sibling
-                if s.exists() and s.is_dir():
-                    d = dest_dir / sibling
-                    if d.exists():
-                        shutil.rmtree(d)
-                    shutil.copytree(s, d)
-        copied.append(dest)
+def _mount_tree_into_config(tree_dir: Path, skills_dir: Path) -> list[Path]:
+    """Copy each per-root subdir of a canonical/materialized tree into skills_dir.
+
+    Both the baseline and ablation arms route through here, so they mount under
+    IDENTICAL names and expose an identical file surface — the only difference is
+    the bytes the ablation's declared edit removed. Returns the copied SKILL.md
+    (or root dir) paths used as skill-load detection needles.
+    """
+    copied: list[Path] = []
+    for root_dir in sorted(p for p in tree_dir.iterdir() if p.is_dir()):
+        dest = skills_dir / root_dir.name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(root_dir, dest)
+        copied.append(dest / "SKILL.md" if (dest / "SKILL.md").exists() else dest)
     return copied
 
 
-def event_texts_for_tool_input(obj: Any) -> list[str]:
-    out = []
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key in {"file_path", "path", "skill", "input", "partial_json"} and isinstance(value, str):
-                out.append(value)
-            out.extend(event_texts_for_tool_input(value))
-    elif isinstance(obj, list):
-        for item in obj:
-            out.extend(event_texts_for_tool_input(item))
-    return out
-
-
-def detect_trigger(stdout: str, skill_name: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
-    # Use copied temp skill paths, not the bare skill name: repo file paths such as
-    # good-readme/README.md can otherwise look like skill-load evidence.
-    needles = [str(p) for p in copied_paths] + [str(p.parent) for p in copied_paths]
-    evidence = []
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        haystacks = event_texts_for_tool_input(event)
-        for text in haystacks:
-            if any(n and n in text for n in needles):
-                evidence.append(text[:500])
-    return bool(evidence), evidence[:5]
+def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_dir: Path, ablation_id: str | None = None) -> tuple[list[Path], dict[str, Any] | None]:
+    repo_root = manifest_path.parent.parent if manifest_path.name == "shared-benchmark.json" else manifest_path.parent
+    skills_dir = config_dir / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    if ablation_id:
+        # Mount a real, altered skill (e.g. a weakened description) so the trigger
+        # test measures whether the ablated skill still autonomously loads.
+        ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == ablation_id), None)
+        if ablation is None:
+            raise RuntimeError(f"unknown ablation: {ablation_id}")
+        if not ablation_components(ablation):
+            raise RuntimeError(f"ablation {ablation_id} is instruction-simulated; a trigger ablation must declare a removal")
+        if derived_population(ablation_components(ablation)) != "trigger":
+            raise RuntimeError(f"ablation {ablation_id} is an answer-population ablation; the trigger eval only measures discovery (trigger-population) ablations. Run it through the benchmark / Pi-smoke path.")
+        res = materialize_ablation(repo_root, manifest, ablation, config_dir / "_materialized")
+        return _mount_tree_into_config(Path(res["dir"]), skills_dir), res
+    # Baseline (no ablation): build the SAME canonical tree the ablation arm starts
+    # from, so the two arms are file-for-file identical apart from the declared
+    # edit — never differing by an ad-hoc copier that dropped or renamed files.
+    # Record the canonical tree hash so a baseline run can be paired with an
+    # ablation run from the same skill revision (baseline.skill_tree_hash ==
+    # ablation.parent_skill_hash).
+    tree = build_canonical_skill_tree(repo_root, manifest, config_dir / "_canonical")
+    return _mount_tree_into_config(Path(tree), skills_dir), {"mode": "baseline", "skill_tree_hash": canonical_skill_tree_hash(repo_root, manifest)}
 
 
 def _text(value: Any) -> str:
@@ -130,12 +115,12 @@ def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, 
     )
 
 
-def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int, model: str | None, trace_dir: Path | None = None) -> dict[str, Any]:
+def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int, model: str | None, trace_dir: Path | None = None, ablation: str | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     with tempfile.TemporaryDirectory(prefix="pi-trigger-") as td:
         config_dir = Path(td)
         seed_config_dir(config_dir)
-        copied = copy_skill_to_config(manifest_path, manifest, config_dir)
+        copied, abl_prov = copy_skill_to_config(manifest_path, manifest, config_dir, ablation_id=ablation)
         cmd = [
             "pi", "--no-session", "--mode", "json", "--no-context-files", "--no-prompt-templates", "--no-extensions",
             "--thinking", "minimal", "--tools", "read,grep,find,ls", "-p", query,
@@ -161,15 +146,34 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             returncode = 124
         elapsed_ms = int((time.time() - start) * 1000)
         triggered, evidence = detect_trigger(stdout, skill_name_from_manifest(manifest), copied)
+        is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
+        # The materialized ablation's provenance goes through Provenance (one
+        # schema); the canonical (parent) tree hash is recorded on BOTH arms under
+        # the same field the answer path uses, so a baseline and an ablation run can
+        # be checked for the same skill revision.
+        if is_ablation:
+            prov = Provenance.from_dict(abl_prov)
+            ablation_field = prov.as_dict()
+            skill_tree_hash = prov.identity.canonical
+        else:
+            ablation_field = ablation
+            skill_tree_hash = (abl_prov or {}).get("skill_tree_hash")
         result = {
             "query": query,
             "should_trigger": should_trigger,
             "triggered": triggered,
+            # RAW measurement, NOT a confirmed ablation effect: this is one arm's
+            # autonomous-trigger outcome. The harness does not yet pair baseline vs
+            # ablation here, so do not read a "pass" as a provenance-verified
+            # causal ablation result (unlike the answer-population path).
             "pass": returncode == 0 and triggered == should_trigger,
+            "measurement": EvidenceClass.RAW_MEASUREMENT.value,
             "elapsed_ms": elapsed_ms,
             "returncode": returncode,
             "timed_out": timed_out,
             "evidence": evidence,
+            "ablation": ablation_field,
+            "skill_tree_hash": skill_tree_hash,
             "stderr": stderr[-1000:] if stderr else "",
         }
         if trace_dir is not None:
@@ -196,7 +200,9 @@ def cases_from_manifest(manifest: dict[str, Any], split: str | None) -> list[dic
             continue
         if c.get("kind") == "trigger":
             prompt = trigger_query_from_case(c)
-            should = not re.search(r"NO_TRIGGER|not trigger|should not", " ".join(map(str, c.get("expected_behavior", []))), re.I)
+            # Single shared resolver with the manifest audit (skill_benchmark), so the
+            # eval and the audit cannot disagree on a case's expected polarity.
+            should = expected_trigger_polarity(c) == "TRIGGER"
             out.append({"query": prompt, "should_trigger": should})
     return out
 
@@ -212,6 +218,7 @@ def main() -> int:
     ap.add_argument("--model")
     ap.add_argument("--out", required=True)
     ap.add_argument("--trace-runs", help="optional directory for per-query trace.jsonl/events.json/metrics.json artifacts")
+    ap.add_argument("--ablation", help="materialize this (discovery-population) ablation id and trigger-test the altered skill")
     args = ap.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -231,13 +238,23 @@ def main() -> int:
                 if args.trace_runs:
                     label = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(row.get("query", f"query-{i}")))[:80].strip("-") or f"query-{i}"
                     trace_dir = Path(args.trace_runs) / f"query-{i:03d}-{label}" / f"run-{run_number}"
-                futures.append(ex.submit(run_query, manifest_path, str(row["query"]), bool(row["should_trigger"]), args.timeout, args.model, trace_dir))
+                futures.append(ex.submit(run_query, manifest_path, str(row["query"]), bool(row["should_trigger"]), args.timeout, args.model, trace_dir, args.ablation))
         for fut in as_completed(futures):
             results.append(fut.result())
     passed = sum(1 for r in results if r["pass"])
     output = {
         "skill_name": skill_name_from_manifest(manifest),
         "generated_at": int(time.time()),
+        # This report is a RAW autonomous-trigger measurement for a single arm —
+        # either the baseline skill or one --ablation. It is NOT a
+        # provenance-verified baseline-vs-ablation comparison: the harness does not
+        # yet pair the two arms or gate a confirmed trigger regression on recorded
+        # provenance the way the answer-population (benchmark) path does. Treat the
+        # pass_rate as a measurement, not a confirmed ablation effect. The recorded
+        # skill_tree_hash on each result lets a future pairing verify both arms ran
+        # the same skill revision.
+        "evidence_class": "raw_autonomous_trigger_measurement",
+        "ablation": args.ablation,
         "summary": {"total": len(results), "passed": passed, "failed": len(results) - passed, "pass_rate": (passed / len(results)) if results else None},
         "results": results,
     }

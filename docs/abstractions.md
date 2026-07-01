@@ -9,20 +9,20 @@ Symbols below point at `skill_benchmark.py` at the line where each abstraction i
 
 ## The objects, in pipeline order
 
-| Abstraction | Defined at | What it hands downstream |
+| Abstraction | Defined by | What it hands downstream |
 |---|---|---|
-| Manifest | `validate_manifest:193` | The full test definition for one skill. |
-| Case | `iter_cases:79` | One scenario with a prompt and graders. |
-| Variant | `task_variants:302` | The arm a case runs under; the lift axis. |
-| Split | `VALID_SPLITS:27` | Which cases are visible during iteration. |
-| Assertion | `assertion_result:1642` | A single pass/fail check over one run. |
-| Prepared task row | `prepared_task_rows:314` | A runner-neutral unit of work. |
-| Run-output contract | `discover_run_bases:1028` | The files a runner leaves on disk. |
-| Runner / adapter | `run_codex:1582` | Turns a task row into contract files. |
-| Trace normalization | `normalize_trace_records:1447` | Runner-specific events, made uniform. |
-| Judge plumbing | `collect_judge_tasks:1787` | Qualitative checks, deferred to a model you supply. |
-| Grade result row | `grade_case_variant:1877` | One scored row per case/variant/run. |
-| Benchmark report | `build_benchmark_report:2182` | Aggregates, lift, and flags. |
+| Manifest | `validate_manifest` | The full test definition for one skill. |
+| Case | `iter_cases` | One scenario with a prompt and graders. |
+| Variant | `task_variants` | The arm a case runs under; the lift axis. |
+| Split | `VALID_SPLITS` | Which cases are visible during iteration. |
+| Assertion | `assertion_result` | A single pass/fail check over one run. |
+| Prepared task row | `prepared_task_rows` | A runner-neutral unit of work. |
+| Run-output contract | `discover_run_bases` | The files a runner leaves on disk. |
+| Runner / adapter | `run_codex` | Turns a task row into contract files. |
+| Trace normalization | `normalize_trace_records` | Runner-specific events, made uniform. |
+| Judge plumbing | `collect_judge_tasks` | Qualitative checks, deferred to a model you supply. |
+| Grade result row | `grade_case_variant` | One scored row per case/variant/run. |
+| Benchmark report | `build_benchmark_report` | Aggregates, lift, and flags. |
 
 ## Manifest
 

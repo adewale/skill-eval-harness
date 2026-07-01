@@ -125,8 +125,11 @@ skill-benchmark --help
 | `docs/evals-are-not-tests.md` | Why a skill eval is not a unit test, and what that changes about reading results. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
 | `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
+| `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
+| `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
 | `TODO.md` | Remaining Jetty work: streaming/concurrency, live API validation, materialized ablations, judge export, and per-variant overrides. |
+| `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two materialized ablations, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per ablation; exercised by `tests/test_example_demo.py`. Start here. |
 | `examples/adewale-workspace/` | Adewale-specific runners for Pi smoke, trigger, ablation, and aggregate reports. |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
 
@@ -312,8 +315,10 @@ That warning means a weak answer can pass by echoing the task. Use `--strict-lea
 ```bash
 skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl
 skill-benchmark prepare ../repo/evals/shared-benchmark.json --runs-per-variant 5 --out tasks.jsonl
-skill-benchmark prepare ../repo/evals/shared-benchmark.json --include-ablations --out ablation-tasks.jsonl
+skill-benchmark prepare ../repo/evals/shared-benchmark.json --include-ablations --ablation-dir ablated-skills --out ablation-tasks.jsonl
 ```
+
+`--include-ablations` requires `--ablation-dir DIR` whenever any ablation declares a removal (a `mechanism`/`components` + `target`): the altered skill tree is materialized there and the prepared rows point at it. (A manifest with only instruction-simulated ablations does not need it.)
 
 Use `--include-answer-key` only for judge/debug tasks, never for generation runs.
 
@@ -346,6 +351,31 @@ skill-benchmark run-codex \
   --runs ../repo/eval-runs/codex-trace \
   --codex-cmd 'codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral'
 ```
+
+### Run Claude tasks (with cost capture)
+
+`run-claude` executes prepared rows through `claude -p --output-format json`, extracts the answer into `output.md`, and records real per-run `total_cost_usd` + token usage into `metrics.json`. The benchmark report then totals `cost_usd_total` per arm (over scorable runs), so a paired eval reports actual dollars:
+
+```bash
+skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl
+skill-benchmark run-claude --tasks tasks.jsonl --runs ../repo/eval-runs/claude-tune \
+  --model claude-haiku-4-5-20251001
+```
+
+`--model` is optional (omit for the CLI default); `--claude-bin` overrides the executable (a stub in tests). A nonzero exit/timeout is written as a `[CLAUDE FAILURE …]` body, which `execution_valid` treats as a non-scorable infra failure, exactly like the Codex/Jetty runners.
+
+### Compare judges (judge-sensitivity)
+
+A single judge number is not reproducible across judge choice for a subtle skill. Judge the same runs with two models (`benchmark --judge-results` merges each), then `compare-judges` flags whether the measured lift depends on the judge:
+
+```bash
+skill-benchmark compare-judges \
+  --report haiku=benchmark.haiku.json \
+  --report sonnet=benchmark.sonnet.json \
+  --out judge-panel.json
+```
+
+It reports each judge's `with_skill − without_skill` combined lift and sets `sign_sensitive` (judges disagree the skill helps), `magnitude_sensitive` (lift spread > `--magnitude-eps`, default 0.1), and `judge_sensitive` (either). Needs ≥2 `--report name=path`. Every verdict from `judge` carries its `judge_model`, so which model graded a run is always recoverable.
 
 ### Pi trace runners
 
@@ -430,14 +460,24 @@ Add `--runs ../repo/eval-runs/latest` to include saturated-case, no-lift, flaky 
 
 The audit reports:
 
+- a **readiness** verdict — "is this eval worth paying to run?" — collapsing the things that decide whether a measured number will mean anything: ablations materialized vs instruction-simulated, **leak-saturated cases** (every positive objective assertion's value already appears in the prompt, so `with_skill == without_skill` by construction), adversarial coverage, and **objective-only cases** (a behaviour case with no judge assertion can only ever measure objective compliance — if the skill's value is voice/judgement it will read as zero lift). With `--runs`, it also surfaces the signals a static manifest can't see: **base-saturated cases** (measured `with_skill == without_skill` — a blocker, the case measures nothing) and **qualitative-only cases** (objective flat but the combined/judge score lifts — the skill's value is qualitative). All with an explicit `blockers` punch list;
 - missing positive, negative, and adversarial eval coverage,
 - missing holdout/holdback split coverage,
 - missing trigger/no-trigger coverage,
 - missing domain/difficulty/success-goal taxonomy for slice summaries,
 - ablation-plan suggestions from major skill sections,
+- the instruction-simulated ablations that should be materialized (and dangling/unknown ablation references),
 - saturated and no-lift cases when run data is available,
 - assertions with identical with/without pass rates, and
 - recommended fixture repos/files.
+
+**Gate it in CI.** `--fail-on-blockers` makes `audit-manifest` exit non-zero when the readiness block has any blockers, so a skill repo can keep its eval suite at "worth paying to run" the same way it keeps tests green:
+
+```bash
+skill-benchmark audit-manifest evals/shared-benchmark.json --fail-on-blockers
+```
+
+The systematic way to upgrade a suite is to drive those blockers to empty, repo by repo: materialize the ablations (`materialize-ablations` / declare a `mechanism`+`target`), de-leak the leak-saturated cases (move the answer out of the prompt, or assert a downstream consequence), and add adversarial cases where missing — then the gate goes green.
 
 ### Profile skill size and references
 
@@ -467,6 +507,27 @@ skill-benchmark token-overhead \
 ```
 
 If a repo has no paired trace metrics, the report still includes the static footprint and shows `0` runtime pairs.
+
+### Suite preflight / allowlisted multi-skill tiers
+
+Use `suite-run` before expensive model calls. It reads only an explicit suite file, rejects unrelated top-level manifests under the workspace root, verifies optional tree-hash pins, prints row estimates, and writes `RUN_SCOPE.json`.
+
+```bash
+skill-benchmark suite-run examples/adewale-workspace/all-manifests.txt \
+  --workspace-root ../updating_all_of_my_skills \
+  --pins examples/skill-pins.json \
+  --tier preflight \
+  --out-dir suite-runs/preflight
+
+skill-benchmark suite-run examples/adewale-workspace/all-manifests.txt \
+  --workspace-root ../updating_all_of_my_skills \
+  --pins examples/skill-pins.json \
+  --tier prepare \
+  --include-ablations \
+  --out-dir suite-runs/prepare
+```
+
+Non-model tiers are `preflight`, `static`, `prepare`, and `jetty-dry-run`. By default, a stray manifest such as `beautiful-mermaid/evals/shared-benchmark.json` fails the run instead of silently entering the matrix; pass `--allow-extra-manifests` only for exploratory audits.
 
 ### Aggregate many skills
 
@@ -557,16 +618,35 @@ Defaults follow Jetty docs and `jettyio/jettyio-skills`: `claude-code`, `claude-
 
 ## Ablations
 
-Ablations are opt-in variants that simulate removing part of a skill. Add entries under `manifest.ablations`, then prepare with `--include-ablations`.
+Ablations are opt-in variants that remove part of a skill — by simulation, or by materializing a real altered skill (below). Add entries under `manifest.ablations`, then prepare with `--include-ablations`.
 
 ```bash
 skill-benchmark prepare ../repo/evals/shared-benchmark.json \
   --split tune \
   --include-ablations \
+  --ablation-dir ablated-skills \
   --out ablation-tasks.jsonl
 ```
 
-Ablation task variants are named `ablation:<id>`. Trigger cases are skipped for ablation tasks because trigger behavior depends on the description/frontmatter rather than the body component being ablated.
+Ablation task variants are named `ablation:<id>`. Routing is by case population: **answer-population** ablations (instructions/resource/runtime/preprocess) run on non-trigger cases through the generic runners. **Discovery-population** ablations (e.g. a weakened `description`/`when_to_use`) measure whether the skill still *autonomously loads*, which the forced-load generic runners cannot observe — so `prepare` does **not** emit rows for them; run them through `run_pi_trigger_eval.py --ablation <id>` instead.
+
+### Materialized ablations
+
+By default an ablation is *instruction-simulated*: the runner is told to ignore a component. To produce a real, altered skill instead, declare a removal `mechanism` (or a `components` list) and `target` on the ablation, then materialize the trees:
+
+```bash
+skill-benchmark materialize-ablations ../repo/evals/shared-benchmark.json \
+  --out-dir ablated --out ablated/provenance.json
+```
+
+Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree (every manifest root, identical surface to `with_skill`, differing only by the declared edit). Mechanisms are `frontmatter_field`, `section` (fence-aware), `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, `asset`, and `preprocess` (inline `` !`command` ``), composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`. Materialized arms are blind: the model-visible input is identical to `with_skill` (the hypothesis lives only in harness metadata).
+
+The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), `run_pi_trigger_eval.py --ablation <id>` trigger-tests a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the trigger adapter. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
+
+**Evidence asymmetry (discovery vs answer).** The two paths do not yet have equal evidentiary strength:
+
+- **Answer-population** ablations get *confirmed* causal evidence: a provenance-gated, paired with_skill-vs-ablation comparison where a confirmation requires verified provenance and a same-revision canonical hash on both arms.
+- **Discovery** ablations run through `run_pi_trigger_eval.py --ablation`, which currently emits a **raw autonomous-trigger measurement for a single arm** (`evidence_class: raw_autonomous_trigger_measurement`), not a paired, provenance-verified baseline-vs-ablation comparison. Each result records a `skill_tree_hash` (baseline = canonical tree; ablation = parent tree) so a future pairing can verify both arms ran the same revision, but until that pairing exists, **read a trigger pass-rate as a measurement, not a confirmed ablation effect.**
 
 ## Compatibility notes
 
@@ -588,8 +668,8 @@ For manifest or grading changes, add or update `tests/test_skill_benchmark.py`. 
 
 ## Non-goals
 
-- Local grading does not call a model. Model execution happens outside the harness, except for explicit runner commands such as `run-jetty`.
-- The harness does not decide qualitative truth by itself; it emits judge prompts, runs an opt-in judge command, and merges the returned JSON.
+- Grading and aggregation do not call a model. Model execution happens outside that path, except for the explicit runner/judge commands that exist to call one: `run-codex`, `run-claude`, `run-jetty`, and `judge` (via `--judge-cmd` or, natively, `--judge-model`).
+- The harness does not decide qualitative truth by itself; it emits judge prompts, runs a judge (an opt-in `--judge-cmd`, or `--judge-model` for the native Claude judge), and merges the returned JSON — recording which `judge_model` produced each verdict.
 - Hidden prompts are not protected if you pass `--include-answer-key` to generation jobs.
 - A passing answer benchmark does not prove autonomous skill loading; run `skill-pi-trigger-eval` for that.
 

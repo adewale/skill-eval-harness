@@ -28,9 +28,11 @@ flowchart LR
     J --> B
 ```
 
-The dotted line marks the rule that shapes the rest of the design: from `grade` onward,
-nothing calls a model. A judge runs only when you ask for it, through a command you supply,
-and its results merge back at report time.
+The dotted line marks the rule that shapes the rest of the design: the `grade`/`benchmark`
+scoring path never calls a model. The one exception is the judge, which runs only when you
+ask for it — through a `--judge-cmd` you supply, or natively via `--judge-model` (the Claude
+adapter) — and whose results merge back at report time, each stamped with the `judge_model`
+that produced it.
 
 ## Two axes, one grid
 
@@ -96,9 +98,10 @@ missing, the assertion fails rather than guessing from the answer text.
 
 ## How a judge defers
 
-A qualitative check cannot run at grade time, because the harness will not choose a model.
-Instead grading records a task and moves on. You run the judge separately, then merge its
-verdicts into the report.
+A qualitative check does not run inside `grade` itself: grading records a judge task and
+moves on. You run the judge separately — with a `--judge-cmd` you supply, or `--judge-model`
+for the native Claude judge — then merge its verdicts (each carrying its `judge_model`) into
+the report.
 
 ```mermaid
 sequenceDiagram
