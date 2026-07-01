@@ -1386,6 +1386,53 @@ class PerModelAnalysisTests(unittest.TestCase):
         self.assertEqual(report["model_analysis"]["lift_losers"], ["m2"])
 
 
+class EmbeddingSimilarityTests(unittest.TestCase):
+    """4.1 — embedding-backed similarity, strictly opt-in via --embed-cmd."""
+
+    IDENTICAL_CMD = "python3 -c \"import sys,json; json.load(sys.stdin); print(json.dumps({'embeddings': [[1.0, 0.0], [1.0, 0.0]]}))\""
+    ORTHOGONAL_CMD = "python3 -c \"import sys,json; json.load(sys.stdin); print(json.dumps({'embeddings': [[1.0, 0.0], [0.0, 1.0]]}))\""
+
+    def result(self, embed_cmd: str | None, cmd_threshold: float = 0.8) -> dict:
+        assertion = {"type": "similarity", "mode": "embedding", "expected": "target text", "threshold": cmd_threshold}
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text("candidate text", encoding="utf-8")
+            return sb.assertion_result(assertion, "candidate text", base / "output.md", run_base=base, embed_cmd=embed_cmd)
+
+    def test_skips_without_opt_in(self):
+        r = self.result(None)
+        self.assertFalse(r["passed"])
+        self.assertIn("--embed-cmd", r["evidence"])
+
+    def test_mocked_identical_embeddings_pass(self):
+        r = self.result(self.IDENTICAL_CMD)
+        self.assertTrue(r["passed"], r["evidence"])
+        self.assertEqual(r["score"], 1.0)
+
+    def test_mocked_orthogonal_embeddings_fail(self):
+        r = self.result(self.ORTHOGONAL_CMD)
+        self.assertFalse(r["passed"])
+        self.assertEqual(r["score"], 0.0)
+
+    def test_malformed_embedder_fails_closed(self):
+        r = self.result("python3 -c \"print('not json at all')\"")
+        self.assertFalse(r["passed"])
+        self.assertIn("JSON", r["evidence"])
+
+    def test_cosine_similarity(self):
+        self.assertAlmostEqual(sb.cosine_similarity([1, 0], [1, 0]), 1.0)
+        self.assertAlmostEqual(sb.cosine_similarity([1, 0], [0, 1]), 0.0)
+        self.assertEqual(sb.cosine_similarity([0, 0], [1, 1]), 0.0)
+
+    def test_invalid_mode_dies(self):
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"] = [{"type": "similarity", "expected": "x", "mode": "vibes"}]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+
+
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 

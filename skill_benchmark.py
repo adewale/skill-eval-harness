@@ -475,6 +475,8 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                 die(f"{cid}: assertion #{j} oracle must be one of {sorted(ORACLE_TIERS)}")
             if atype == "similarity" and not str(assertion.get("expected", assertion.get("value", ""))):
                 die(f"{cid}: assertion #{j} similarity needs an expected string")
+            if atype == "similarity" and assertion.get("mode") not in (None, "ratio", "embedding"):
+                die(f"{cid}: assertion #{j} similarity mode must be ratio or embedding")
             if atype == "structured_output" and not isinstance(assertion.get("schema"), dict):
                 die(f"{cid}: assertion #{j} structured_output needs a schema object")
             if assertion.get("preset") is not None and str(assertion.get("preset")) not in JUDGE_PRESETS:
@@ -3505,6 +3507,38 @@ def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_d
         return False, f"script execution failed: {exc}", None
 
 
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if not norm_a or not norm_b:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def embedding_similarity(actual: str, expected: str, embed_cmd: str, timeout: float = 60) -> tuple[float | None, str]:
+    """4.1: embedding-backed similarity behind an explicit external command —
+    stdin {"texts": [actual, expected]}, stdout {"embeddings": [[...], [...]]}.
+    Kept out of core grading exactly like `script`: no --embed-cmd, no call."""
+    try:
+        proc = subprocess.run(embed_cmd, shell=True, input=json.dumps({"texts": [actual, expected]}),
+                              text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"embed command timed out after {timeout}s"
+    if proc.returncode != 0:
+        return None, f"embed command exit {proc.returncode}: {proc.stderr[:500]}"
+    try:
+        obj = extract_json_object(proc.stdout)
+    except ValueError:
+        return None, "embed command emitted no JSON object"
+    vectors = obj.get("embeddings")
+    if (not isinstance(vectors, list) or len(vectors) != 2
+            or not all(isinstance(v, list) and v and all(isinstance(x, (int, float)) for x in v) for v in vectors)
+            or len(vectors[0]) != len(vectors[1])):
+        return None, "embed command must return two equal-length numeric vectors under 'embeddings'"
+    return cosine_similarity([float(x) for x in vectors[0]], [float(x) for x in vectors[1]]), ""
+
+
 def normalize_golden(text: str, mode: str) -> str:
     """Normalization for golden_output is the whole game, so it is explicit and
     per-assertion, never implicit: exact bytes by default, `trim` strips outer
@@ -3553,7 +3587,7 @@ def golden_output_result(assertion: dict[str, Any], text: str, output_path: Path
     return False, f"differs from reference {reference_rel} (normalize={mode})\n{shown}"
 
 
-def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *, run_base: Path | None = None, allow_scripts: bool = False, manifest_dir: Path | None = None) -> dict[str, Any]:
+def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *, run_base: Path | None = None, allow_scripts: bool = False, manifest_dir: Path | None = None, embed_cmd: str | None = None) -> dict[str, Any]:
     atype = assertion.get("type")
     name = assertion.get("name") or assertion.get("description") or atype
     ci = assertion.get("ci", True)
@@ -3619,17 +3653,34 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
     elif atype == "similarity":
         # 1.4: the deterministic middle between regex and a judge — a difflib
         # ratio against an expected string, thresholded, emitting a score.
+        # 4.1: mode="embedding" swaps the ratio for cosine similarity behind an
+        # explicit --embed-cmd; absent the opt-in, it fails closed like script.
         expected = str(assertion.get("expected", assertion.get("value", "")))
         threshold = float(assertion.get("threshold", 0.8))
         compare = text
         if assertion.get("artifact"):
             candidate = (run_base or output_path.parent) / str(assertion["artifact"])
             compare = candidate.read_text(encoding="utf-8", errors="replace") if candidate.is_file() else ""
-        a, b = (norm(compare), norm(expected)) if ci else (compare, expected)
-        ratio = difflib.SequenceMatcher(None, a, b).ratio()
-        score = round(ratio, 4)
-        passed = ratio >= threshold
-        evidence = f"similarity={ratio:.4f} vs threshold={threshold:g} against expected[:60]={expected[:60]!r}"
+        mode = str(assertion.get("mode", "ratio"))
+        if mode == "embedding":
+            if not embed_cmd:
+                passed = False
+                evidence = "embedding similarity skipped; rerun grade/benchmark with --embed-cmd to call an external embedding command (kept out of core grading by design)"
+            else:
+                ratio, err = embedding_similarity(compare, expected, embed_cmd)
+                if ratio is None:
+                    passed = False
+                    evidence = err
+                else:
+                    score = round(ratio, 4)
+                    passed = ratio >= threshold
+                    evidence = f"embedding similarity={ratio:.4f} vs threshold={threshold:g}"
+        else:
+            a, b = (norm(compare), norm(expected)) if ci else (compare, expected)
+            ratio = difflib.SequenceMatcher(None, a, b).ratio()
+            score = round(ratio, 4)
+            passed = ratio >= threshold
+            evidence = f"similarity={ratio:.4f} vs threshold={threshold:g} against expected[:60]={expected[:60]!r}"
     elif atype == "structured_output":
         # 1.1: json_field_equals extended with (subset) JSON-Schema validation.
         schema = assertion.get("schema")
@@ -4213,6 +4264,7 @@ def grade_case_variant(
     manifest_dir: Path | None = None,
     model: str | None = None,
     strict: bool = False,
+    embed_cmd: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     objective = []
     qualitative = []
@@ -4285,7 +4337,7 @@ def grade_case_variant(
                 })
         else:
             labeled = {**assertion, "name": f"turn-{turn_n}: {assertion_label(assertion)}"} if turn_n is not None else assertion
-            entry = assertion_result(labeled, unit_text or "", unit_output_path, run_base=unit_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir)
+            entry = assertion_result(labeled, unit_text or "", unit_output_path, run_base=unit_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir, embed_cmd=embed_cmd)
             entry["severity"] = severity
             entry["oracle"] = tier
             if turn_n is not None:
@@ -4443,7 +4495,7 @@ def grade(args: argparse.Namespace) -> int:
                 for run_number, base in discover_run_bases_under(model_root / variant):
                     text, output_path = read_output_base(base)
                     meta = read_metadata_base(base)
-                    result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent, model=model_name, strict=getattr(args, "strict", False))
+                    result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent, model=model_name, strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
                     all_results.append(result)
                     all_judge_tasks.extend(judge_tasks)
     report = {
@@ -5019,6 +5071,7 @@ def build_benchmark_report(
     judge_results_path: str | None = None,
     allow_scripts: bool = False,
     strict: bool = False,
+    embed_cmd: str | None = None,
 ) -> dict[str, Any]:
     manifest = validate_manifest(path)
     variants = variants_arg or manifest.get("variants", DEFAULT_VARIANTS)
@@ -5041,7 +5094,7 @@ def build_benchmark_report(
                 for run_number, base in discover_run_bases_under(model_root / variant):
                     text, output_path = read_output_base(base)
                     meta = read_metadata_base(base)
-                    result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name, strict=strict)
+                    result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name, strict=strict, embed_cmd=embed_cmd)
                     results.append(result)
 
     by_variant: dict[str, list[dict[str, Any]]] = {v: [] for v in variants}
@@ -5156,7 +5209,7 @@ def build_benchmark_report(
 
 
 def benchmark(args: argparse.Namespace) -> int:
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False))
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
     if args.out:
         write_json(Path(args.out), report)
     else:
@@ -7066,6 +7119,7 @@ def main() -> int:
     p.add_argument("--judge-results", help="JSONL/JSON results keyed by judge_task_id; merges qualitative scoring")
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
     p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
+    p.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in; stdin {texts:[a,b]} -> stdout {embeddings:[[..],[..]]})")
     p.add_argument("--write-grading-files", action="store_true", help="write Anthropic-compatible grading.json files into each run directory")
 
     p = sub.add_parser("judge")
@@ -7088,6 +7142,7 @@ def main() -> int:
     p.add_argument("--judge-results", help="merge qualitative judge scoring into combined pass rates")
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
     p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
+    p.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in)")
     p.add_argument("--out")
 
     p = sub.add_parser("report", help="serialize a benchmark.json for CI: JUnit XML or GitHub job-summary markdown + annotations")
