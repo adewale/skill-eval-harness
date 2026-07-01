@@ -382,10 +382,16 @@ def load_manifest_source(path: Path) -> dict[str, Any]:
     return manifest
 
 
+SUPPORTED_MANIFEST_VERSIONS = {1, 2}
+
+
 def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[str, Any]:
     manifest = load_manifest_source(path)
-    if manifest.get("version") != 1:
-        die("manifest.version must be 1")
+    # Version 1 stays fully supported with behavior-preserving defaults
+    # (severity, oracle tiers); version 2 makes those defaults explicit. The
+    # `validate` CLI points version-1 manifests at `migrate`.
+    if manifest.get("version") not in SUPPORTED_MANIFEST_VERSIONS:
+        die(f"manifest.version must be one of {sorted(SUPPORTED_MANIFEST_VERSIONS)}")
     if not manifest.get("skill_name") or not isinstance(manifest.get("skill_name"), str):
         die("manifest.skill_name is required")
     if not isinstance(manifest.get("skill_paths", []), list) or not manifest.get("skill_paths") or not all(isinstance(p, str) for p in manifest.get("skill_paths", [])):
@@ -5737,6 +5743,91 @@ def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
         server.server_close()
 
 
+def migrate_manifest_data(manifest: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """The mechanical half of the 1 -> 2 migration (spec: Migration section).
+    Stamps what a machine can decide — version, default severity, default
+    oracle tier, a graded? marker beside binary judge rubrics — and returns
+    the checklist of judgment calls it deliberately did NOT make (anchored
+    graded_dimensions, reference floors, demo-seam marking), each with a spec
+    pointer. LangSmith-style additive defaults; pi.dev-style agent-run rest."""
+    migrated = copy.deepcopy(manifest)
+    checklist: list[dict[str, Any]] = []
+    migrated["version"] = 2
+    for case in migrated.get("cases", []):
+        if not isinstance(case, dict):
+            continue
+        case_has_judge = False
+        for assertion in case.get("assertions", []) or []:
+            if not isinstance(assertion, dict):
+                continue
+            atype = assertion.get("type")
+            if "severity" not in assertion and not any(key in assertion for key in ("critical", "gate", "soft", "atLeast")):
+                assertion["severity"] = assertion_severity(assertion)
+            if "oracle" not in assertion:
+                assertion["oracle"] = oracle_tier(assertion)
+            if atype in QUALITATIVE_ASSERTIONS:
+                case_has_judge = True
+                if not assertion.get("graded_dimensions") and not assertion.get("dynamic_rubric"):
+                    assertion.setdefault("_migrate_todo", "graded? a binary judge rubric can become anchored graded_dimensions — docs/eval-framework-roadmap-spec.md 2.2")
+                    checklist.append({
+                        "case_id": case.get("id"),
+                        "assertion": assertion_label(assertion),
+                        "decision": "graded dimensions",
+                        "note": "turn the flat rubric into anchored graded_dimensions ({name, scale, rubric with observable anchors}) or leave binary deliberately; see spec 2.2",
+                    })
+            if atype == "script":
+                checklist.append({
+                    "case_id": case.get("id"),
+                    "assertion": assertion_label(assertion),
+                    "decision": "oracle tier",
+                    "note": "script defaults to oracle:'demo'; mark oracle:'strong' only for a verified rendered-artifact oracle, oracle:'live' if it touches real resources; see spec 1.7",
+                })
+        if case_has_judge and case.get("reference_score") is None and case.get("reference_graded_score") is None:
+            checklist.append({
+                "case_id": case.get("id"),
+                "decision": "reference floor",
+                "note": "optionally set reference_score (0-1) or reference_graded_score (1-5) as a no-regression floor for graded scores; see spec 2.2",
+            })
+    return migrated, checklist
+
+
+def manifest_migration_diff(path: Path, before: dict[str, Any], after: dict[str, Any]) -> str:
+    return "\n".join(difflib.unified_diff(
+        json.dumps(before, indent=2, ensure_ascii=False).splitlines(),
+        json.dumps(after, indent=2, ensure_ascii=False).splitlines(),
+        fromfile=f"{path} (version 1)", tofile=f"{path} (version 2)", lineterm="",
+    ))
+
+
+def migrate_command(args: argparse.Namespace) -> int:
+    path = Path(args.manifest)
+    manifest = load_manifest_source(path)
+    if manifest.get("version") == 2:
+        print(f"{path} is already version 2; nothing to migrate")
+        return 0
+    if manifest.get("version") != 1:
+        die(f"can only migrate version-1 manifests (found {manifest.get('version')!r})")
+    migrated, checklist = migrate_manifest_data(manifest)
+    diff = manifest_migration_diff(path, manifest, migrated)
+    print(diff or "(no textual changes)")
+    if checklist:
+        print(f"\n{len(checklist)} judgment call(s) left for a human or agent (see docs/migrating-evals.md):")
+        for item in checklist:
+            label = f" / {item['assertion']}" if item.get("assertion") else ""
+            print(f"- [{item['decision']}] {item.get('case_id')}{label}: {item['note']}")
+    if getattr(args, "out_checklist", None):
+        write_json(Path(args.out_checklist), {"manifest": str(path), "checklist": checklist})
+    if getattr(args, "check", False):
+        print("\n--check: dry run, no files written")
+        return 0
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        die("migrate rewrites JSON manifests only; for a YAML manifest apply the printed diff by hand (YAML formatting/comments are yours, not the tool's)")
+    path.write_text(json.dumps(migrated, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    validate_manifest(path)
+    print(f"\nwrote version-2 manifest to {path} (re-validated)")
+    return 0
+
+
 SEVERITY_WEIGHT = {"critical": 3.0, "gate": 2.0, "soft": 1.0}
 
 
@@ -7181,6 +7272,11 @@ def main() -> int:
     p.add_argument("--results", required=True)
     p.add_argument("--out")
 
+    p = sub.add_parser("migrate", help="upgrade a version-1 manifest to version 2: stamp default severity/oracle tiers, mark binary judge rubrics, print the diff and the judgment-call checklist")
+    p.add_argument("manifest")
+    p.add_argument("--check", action="store_true", help="dry run: print the diff and checklist, write nothing")
+    p.add_argument("--out-checklist", help="also write the judgment-call checklist as JSON")
+
     p = sub.add_parser("trend", help="append-only history of benchmark reports: series, successive diffs, severity-weighted recurring failures, prune candidates")
     p.add_argument("--history", required=True, help="history directory of run-<seq>.json reports")
     p.add_argument("--add", help="append this benchmark.json to the history before reporting")
@@ -7277,6 +7373,8 @@ def main() -> int:
             failures = check_ablations_dry_run(manifest_path, manifest)
             if failures:
                 die(f"{failures} ablation(s) failed --check-ablations")
+        if manifest.get("version") == 1:
+            print("note: version-1 manifest grades with behavior-preserving defaults; `skill-benchmark migrate --check` shows the version-2 upgrade (severity + oracle tiers stamped, judgment calls listed)", file=sys.stderr)
         print(f"OK: {manifest['skill_name']} — {len(iter_cases(manifest))} cases, {len(manifest.get('ablations', []))} ablations")
         return 0
     if args.cmd == "prepare":
@@ -7311,6 +7409,8 @@ def main() -> int:
         return compare_tasks(args)
     if args.cmd == "compare-results":
         return compare_results(args)
+    if args.cmd == "migrate":
+        return migrate_command(args)
     if args.cmd == "trend":
         return trend(args)
     if args.cmd == "suggest-cases":

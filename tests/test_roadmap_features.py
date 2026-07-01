@@ -1433,6 +1433,116 @@ class EmbeddingSimilarityTests(unittest.TestCase):
                 sb.validate_manifest(path)
 
 
+class MigrationTests(unittest.TestCase):
+    """Migration section — migrate 1 -> 2: mechanical stamps, checklist, --check."""
+
+    def v1_manifest(self) -> dict:
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"] = [
+            {"name": "has-alpha", "type": "contains", "value": "alpha"},
+            {"name": "quality", "type": "judge", "rubric": ["complete", "clear"]},
+            {"name": "oracle", "type": "script", "command": ["python3", "-c", "raise SystemExit(0)"]},
+        ]
+        return manifest
+
+    def test_golden_round_trip_stamps_defaults(self):
+        migrated, checklist = sb.migrate_manifest_data(self.v1_manifest())
+        self.assertEqual(migrated["version"], 2)
+        by_name = {a["name"]: a for a in migrated["cases"][0]["assertions"]}
+        self.assertEqual(by_name["has-alpha"]["severity"], "gate")
+        self.assertEqual(by_name["has-alpha"]["oracle"], "strong")
+        self.assertEqual(by_name["quality"]["severity"], "soft")
+        self.assertEqual(by_name["quality"]["oracle"], "live")
+        self.assertIn("graded?", by_name["quality"]["_migrate_todo"])
+        self.assertEqual(by_name["oracle"]["oracle"], "demo")
+        decisions = {item["decision"] for item in checklist}
+        self.assertEqual(decisions, {"graded dimensions", "oracle tier", "reference floor"})
+
+    def test_checklist_lists_every_binary_judge_and_script(self):
+        manifest = self.v1_manifest()
+        manifest["cases"].append({
+            "id": "case-2", "split": "tune", "kind": "behavior", "prompt": "p2",
+            "assertions": [{"name": "q2", "type": "judge", "rubric": ["good"]},
+                           {"name": "s2", "type": "script", "command": ["python3", "-c", "raise SystemExit(0)"]}],
+        })
+        _, checklist = sb.migrate_manifest_data(manifest)
+        graded = [c for c in checklist if c["decision"] == "graded dimensions"]
+        scripts = [c for c in checklist if c["decision"] == "oracle tier"]
+        self.assertEqual({c["assertion"] for c in graded}, {"quality", "q2"})
+        self.assertEqual({c["assertion"] for c in scripts}, {"oracle", "s2"})
+
+    def test_graded_judge_gets_no_todo_marker(self):
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"] = [{"name": "g", "type": "judge",
+                                               "graded_dimensions": [{"name": "d", "rubric": "5 = anchored; 1 = flat"}]}]
+        migrated, checklist = sb.migrate_manifest_data(manifest)
+        self.assertNotIn("_migrate_todo", migrated["cases"][0]["assertions"][0])
+        self.assertFalse([c for c in checklist if c["decision"] == "graded dimensions"])
+
+    def test_check_is_dry_and_write_migrates_in_place(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), self.v1_manifest())
+            before = path.read_bytes()
+            args = SimpleNamespace(manifest=str(path), check=True, out_checklist=str(Path(td) / "checklist.json"))
+            self.assertEqual(sb.migrate_command(args), 0)
+            self.assertEqual(path.read_bytes(), before)   # --check writes nothing to the manifest
+            checklist = json.loads((Path(td) / "checklist.json").read_text(encoding="utf-8"))
+            self.assertTrue(checklist["checklist"])
+            args = SimpleNamespace(manifest=str(path), check=False, out_checklist=None)
+            self.assertEqual(sb.migrate_command(args), 0)
+            migrated = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["version"], 2)
+
+    def test_version_2_manifest_validates_and_grades(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = base_manifest()
+            manifest["version"] = 2
+            manifest["cases"][0]["assertions"] = [{"name": "a", "type": "contains", "value": "alpha", "severity": "gate", "oracle": "strong"}]
+            path = write_manifest(root, manifest)
+            loaded = sb.validate_manifest(path)
+            runs = root / "runs"
+            for variant, text in [("with_skill", "alpha"), ("without_skill", "nope")]:
+                base = runs / "case-1" / variant
+                base.mkdir(parents=True)
+                (base / "output.md").write_text(text, encoding="utf-8")
+            report = sb.build_benchmark_report(path, runs)
+        self.assertEqual(loaded["version"], 2)
+        self.assertEqual(report["paired_summary"]["absolute_delta"], 1.0)
+
+    def test_unsupported_version_dies(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = base_manifest()
+            manifest["version"] = 3
+            path = write_manifest(Path(td), manifest)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+
+    def test_migration_preserves_pass_rates(self):
+        # The back-compatibility contract: identical grading before and after.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, self.v1_manifest())
+            runs = root / "runs"
+            for variant, text in [("with_skill", "alpha"), ("without_skill", "beta")]:
+                base = runs / "case-1" / variant
+                base.mkdir(parents=True)
+                (base / "output.md").write_text(text, encoding="utf-8")
+            before = sb.build_benchmark_report(path, runs)
+            sb.migrate_command(SimpleNamespace(manifest=str(path), check=False, out_checklist=None))
+            after = sb.build_benchmark_report(path, runs)
+        for report in (before, after):
+            report.pop("generated_at")
+            report.pop("manifest")
+        # The graded channel may appear (judge severity is now explicit soft —
+        # same value it defaulted to), but every pass rate must be identical.
+        self.assertEqual(
+            [r["objective_pass_rate"] for r in before["results"]],
+            [r["objective_pass_rate"] for r in after["results"]],
+        )
+        self.assertEqual(before["paired_summary"]["absolute_delta"], after["paired_summary"]["absolute_delta"])
+
+
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 
