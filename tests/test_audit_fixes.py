@@ -373,5 +373,42 @@ class EvalReadinessTests(unittest.TestCase):
             self.assertEqual(r["blockers"], [])
 
 
+class JudgeVerdictPassedTests(unittest.TestCase):
+    """A stored judge verdict may carry `passed` with `score: null` (the judge
+    stated a boolean, no numeric score). The merge must read `passed` and never
+    evaluate a `score >= threshold` fallback against None — a `dict.get(k, expr)`
+    default is evaluated eagerly, so the buggy one-liner crashed on real judge
+    output. run_one_judge_task and grade_case_variant now share one owner."""
+
+    def test_passed_true_with_null_score_does_not_crash(self):
+        self.assertTrue(sb.judge_verdict_passed({"passed": True, "score": None}))
+        self.assertFalse(sb.judge_verdict_passed({"passed": False, "score": None}))
+
+    def test_score_only_paths(self):
+        self.assertTrue(sb.judge_verdict_passed({"score": 1, "threshold": 1}))
+        self.assertFalse(sb.judge_verdict_passed({"score": 0.4, "threshold": 1}))
+        # no passed and non-numeric score => not passed (never a TypeError)
+        self.assertFalse(sb.judge_verdict_passed({"score": None}))
+        self.assertFalse(sb.judge_verdict_passed({}))
+
+    def test_grade_case_variant_merges_null_score_verdict(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            _write_run(base, "some candidate answer", {}, {})
+            case = {"id": "c", "split": "tune", "prompt": "x",
+                    "assertions": [{"name": "quality", "type": "judge",
+                                    "prompt": "is it good?"}]}
+            jid = sb.judge_task_id("c", "with_skill", 1, case["assertions"][0])
+            judged = {jid: {"passed": True, "score": None, "threshold": 1,
+                            "evidence": "looks good"}}
+            result, tasks = sb.grade_case_variant(
+                case, "with_skill", "some candidate answer",
+                base / "output.md", {}, run_number=1, run_base=base,
+                judge_results=judged)
+            self.assertEqual(tasks, [])                      # verdict supplied, no new judge task
+            self.assertEqual(result["qualitative_passed"], 1)
+            self.assertEqual(result["qualitative_total"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

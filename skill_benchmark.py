@@ -3053,6 +3053,22 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
     return tasks
 
 
+def judge_verdict_passed(verdict: dict[str, Any], *, default_threshold: float = 1) -> bool:
+    """Single owner for 'did this judge verdict pass'. A verdict may state a
+    boolean `passed` (with no numeric `score`, so `score` can be null), or only a
+    numeric `score` to compare against a `threshold`. Reading `passed` first and
+    guarding the score against None keeps a null score from ever reaching a
+    `>=` comparison — the bug that crashed the merge when the eager default of
+    `dict.get("passed", score >= threshold)` was evaluated on `score is None`."""
+    if "passed" in verdict:
+        return bool(verdict.get("passed"))
+    score = verdict.get("score")
+    threshold = verdict.get("threshold", default_threshold)
+    if isinstance(score, (int, float)) and isinstance(threshold, (int, float)):
+        return score >= threshold
+    return False
+
+
 def run_one_judge_task(task: dict[str, Any], judge_cmd: str, transcripts_dir: Path | None = None, repeat_index: int = 1) -> dict[str, Any]:
     output_path = Path(task.get("output_path", ""))
     output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
@@ -3068,12 +3084,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str, transcripts_dir: Pa
     assertion = task.get("assertion", {})
     threshold = assertion.get("threshold", parsed.get("threshold", 1))
     score = parsed.get("score")
-    if "passed" in parsed:
-        passed = bool(parsed.get("passed"))
-    elif isinstance(score, (int, float)):
-        passed = score >= threshold
-    else:
-        passed = False
+    passed = judge_verdict_passed({**parsed, "threshold": threshold})
     evidence = parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or parse_error or "judge command completed"
     row = {
         "judge_task_id": task["judge_task_id"],
@@ -3157,7 +3168,7 @@ def grade_case_variant(
             jid = judge_task_id(case["id"], variant, run_number, assertion)
             judged = judge_results.get(jid)
             if judged:
-                passed = bool(judged.get("passed", judged.get("score", 0) >= judged.get("threshold", 1)))
+                passed = judge_verdict_passed(judged)
                 qualitative.append({
                     "name": assertion_label(assertion),
                     "type": atype,
