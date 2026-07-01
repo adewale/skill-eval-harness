@@ -1239,6 +1239,153 @@ class LivingEvalLoopTests(unittest.TestCase):
         self.assertIn("instruction", doc["candidates"][0])
 
 
+class MultiTurnCaseTests(unittest.TestCase):
+    """3.1 — scripted send/respond sequences with per-turn grading."""
+
+    def multi_turn_case(self) -> dict:
+        return {
+            "id": "conv-1", "split": "tune", "kind": "behavior",
+            "turns": [
+                {"prompt": "Ask a clarifying question about scope.",
+                 "assertions": [{"name": "asks-question", "type": "contains", "value": "?"}]},
+                {"prompt": "Now give the final plan mentioning alpha.",
+                 "assertions": [{"name": "mentions-alpha", "type": "contains", "value": "alpha"}]},
+            ],
+            "assertions": [{"name": "final-has-plan", "type": "contains", "value": "plan"}],
+        }
+
+    def write_turn_run(self, base: Path, turn_texts: list[str]) -> None:
+        for n, turn_text in enumerate(turn_texts, 1):
+            turn_dir = base / f"turn-{n}"
+            turn_dir.mkdir(parents=True, exist_ok=True)
+            (turn_dir / "output.md").write_text(turn_text, encoding="utf-8")
+
+    def test_per_turn_grading_and_aggregate(self):
+        case = self.multi_turn_case()
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            self.write_turn_run(base, ["What is the scope?", "The plan: use alpha."])
+            result, _ = sb.grade_case_variant(case, "with_skill", None, base / "output.md", {}, run_base=base)
+        self.assertFalse(result["missing_output"])   # final turn stands in for output.md
+        self.assertEqual(result["objective_total"], 3)
+        self.assertEqual(result["objective_pass_rate"], 1.0)
+        self.assertEqual(result["turns"], [
+            {"turn": 1, "missing_output": False, "passed": 1, "total": 1},
+            {"turn": 2, "missing_output": False, "passed": 1, "total": 1},
+        ])
+        names = [a["name"] for a in result["assertions"]]
+        self.assertIn("turn-1: asks-question", names)
+        self.assertIn("final-has-plan", names)
+
+    def test_failing_turn_lowers_aggregate(self):
+        case = self.multi_turn_case()
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            self.write_turn_run(base, ["I will just do it.", "The plan: use alpha."])
+            result, _ = sb.grade_case_variant(case, "with_skill", None, base / "output.md", {}, run_base=base)
+        self.assertAlmostEqual(result["objective_pass_rate"], 2 / 3)
+        self.assertEqual(result["turns"][0]["passed"], 0)
+
+    def test_missing_turn_fails_closed(self):
+        case = self.multi_turn_case()
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            self.write_turn_run(base, ["What is the scope?"])   # turn 2 never ran
+            result, _ = sb.grade_case_variant(case, "with_skill", None, base / "output.md", {}, run_base=base)
+        self.assertTrue(result["turns"][1]["missing_output"])
+        self.assertEqual(result["turns"][1]["passed"], 0)
+        by_name = {a["name"]: a for a in result["assertions"]}
+        self.assertFalse(by_name["turn-2: mentions-alpha"]["passed"])
+
+    def test_single_shot_case_is_untouched(self):
+        case = {"id": "c", "split": "tune", "kind": "behavior", "prompt": "p",
+                "assertions": [{"name": "a", "type": "contains", "value": "alpha"}]}
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text("alpha", encoding="utf-8")
+            result, _ = sb.grade_case_variant(case, "with_skill", "alpha", base / "output.md", {}, run_base=base)
+        self.assertNotIn("turns", result)
+        self.assertEqual(result["objective_pass_rate"], 1.0)
+
+    def test_validation_and_row_carry_turns(self):
+        manifest = base_manifest()
+        manifest["cases"] = [self.multi_turn_case()]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            loaded = sb.validate_manifest(path)   # no top-level prompt needed
+            rows = sb.prepared_task_rows(path, loaded, split="tune")
+        self.assertEqual(rows[0]["turns"], ["Ask a clarifying question about scope.", "Now give the final plan mentioning alpha."])
+        self.assertIn("clarifying question", rows[0]["prompt"])   # first turn is the prompt surface
+
+    def test_subagent_runner_drives_the_sequence(self):
+        manifest = base_manifest()
+        manifest["cases"] = [self.multi_turn_case()]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, manifest)
+            loaded = sb.validate_manifest(path)
+            tasks = sb.prepared_task_rows(path, loaded, split="tune")
+            runs = root / "runs"
+            transcripts: list[list] = []
+
+            def agent(*, prompt, workspace, model, tool_executor, history=None):
+                transcripts.append(list(history or []))
+                n = len(history or []) + 1
+                return {"answer": f"turn {n} answer? plan alpha"}
+
+            sb.run_subagent_tasks([t for t in tasks if t["variant"] == "with_skill"], runs, agent)
+            base = runs / "conv-1" / "with_skill"
+            self.assertEqual((base / "turn-1" / "output.md").read_text(encoding="utf-8"), "turn 1 answer? plan alpha")
+            self.assertEqual((base / "turn-2" / "output.md").read_text(encoding="utf-8"), "turn 2 answer? plan alpha")
+            self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "turn 2 answer? plan alpha")
+        self.assertEqual(transcripts[0], [])
+        self.assertEqual(len(transcripts[1]), 1)   # second turn saw the first exchange
+
+
+class PerModelAnalysisTests(unittest.TestCase):
+    """3.2 — model ranking, lift losers, slice-lift concentration."""
+
+    def test_model_ranking_and_losers(self):
+        paired = {
+            "absolute_delta": 0.4,
+            "by_model": {
+                "m-good": {"absolute_delta": 0.8, "with_skill_objective_pass_rate": 0.9, "without_skill_objective_pass_rate": 0.1,
+                           "significance": {"significant_at_0_05": True}},
+                "m-flat": {"absolute_delta": 0.0, "with_skill_objective_pass_rate": 0.5, "without_skill_objective_pass_rate": 0.5,
+                           "significance": {"significant_at_0_05": False}},
+            },
+        }
+        analysis = sb.model_analysis_from_paired(paired)
+        self.assertEqual([r["model"] for r in analysis["ranking"]], ["m-good", "m-flat"])
+        self.assertTrue(analysis["ranking"][0]["significant_at_0_05"])
+        self.assertEqual(analysis["lift_losers"], ["m-flat"])
+
+    def test_no_model_axis_yields_empty_analysis(self):
+        self.assertEqual(sb.model_analysis_from_paired({"absolute_delta": 0.5}), {})
+
+    def test_slice_lift_concentration(self):
+        results = []
+        for case_id, domain, w, n in [("c1", "docs", 1.0, 0.0), ("c2", "testing", 0.5, 0.5)]:
+            for variant, rate in [("with_skill", w), ("without_skill", n)]:
+                results.append({"case_id": case_id, "variant": variant, "domain": domain, "missing_output": False,
+                                "execution_valid": True, "objective_pass_rate": rate, "metadata": {}})
+        summary = sb.build_slice_summary(results, ["with_skill", "without_skill"])
+        docs = summary["domain"]["docs"]
+        testing = summary["domain"]["testing"]
+        self.assertEqual(docs["lift"], 1.0)
+        self.assertEqual(testing["lift"], 0.0)
+        # Overall lift = 0.5, so the docs slice concentrates it at 2x.
+        self.assertEqual(docs["lift_concentration"], 2.0)
+        self.assertEqual(testing["lift_concentration"], 0.0)
+
+    def test_benchmark_report_carries_model_analysis(self):
+        with tempfile.TemporaryDirectory() as td:
+            path, runs = MultiModelFanOutTests().make_two_model_runs(Path(td))
+            report = sb.build_benchmark_report(path, runs)
+        self.assertEqual([r["model"] for r in report["model_analysis"]["ranking"]], ["m1", "m2"])
+        self.assertEqual(report["model_analysis"]["lift_losers"], ["m2"])
+
+
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 

@@ -236,6 +236,10 @@ def iter_cases(manifest: dict[str, Any], split: str | None = None) -> list[dict[
 def case_prompt(case: dict[str, Any], manifest_path: Path, allow_missing: bool = False) -> str:
     if case.get("prompt"):
         return str(case["prompt"])
+    if case.get("turns"):
+        # Multi-turn case (roadmap 3.1): the opening turn is the prompt surface;
+        # runners that understand turns drive the full sequence from the row.
+        return str((case["turns"][0] or {}).get("prompt", ""))
     if case.get("prompt_ref"):
         p = (manifest_path.parent / str(case["prompt_ref"])).resolve()
         if p.exists():
@@ -425,8 +429,15 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         split = case.get("split")
         if split not in VALID_SPLITS:
             die(f"{cid}: split must be one of {sorted(VALID_SPLITS)}")
-        if not case.get("prompt") and not case.get("prompt_ref") and split == "tune":
-            die(f"{cid}: tune cases must include prompt or prompt_ref")
+        turns = case.get("turns")
+        if turns is not None:
+            if not isinstance(turns, list) or not turns:
+                die(f"{cid}: turns must be a non-empty list of turn objects")
+            for t, turn in enumerate(turns, 1):
+                if not isinstance(turn, dict) or not isinstance(turn.get("prompt"), str) or not turn.get("prompt"):
+                    die(f"{cid}: turn #{t} needs a string prompt")
+        if not case.get("prompt") and not case.get("prompt_ref") and not turns and split == "tune":
+            die(f"{cid}: tune cases must include prompt, prompt_ref, or turns")
         if case.get("prompt_ref"):
             ref = path.parent / str(case["prompt_ref"])
             if not ref.exists() and not (allow_missing_holdback and split in {"holdout", "holdback"}):
@@ -715,6 +726,10 @@ def prepared_task_rows(
                         # The target model rides the row (PreparedTask.from_row ignores
                         # it); runners pass it through and stamp it into metadata.
                         row["model"] = model
+                    if case.get("turns"):
+                        # The scripted send/respond sequence rides the row too
+                        # (roadmap 3.1); turn-aware runners drive it in order.
+                        row["turns"] = [str((t or {}).get("prompt", "")) for t in case["turns"]]
                     rows.append(row)
     return rows
 
@@ -2476,6 +2491,19 @@ def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int
     return discover_run_bases_under(runs / case_id / variant)
 
 
+def discover_turn_bases(base: Path) -> list[tuple[int, Path]]:
+    """Turn-indexed transcript layout for multi-turn cases (roadmap 3.1):
+    <run base>/turn-<n>/output.md. A single-shot run has no turn dirs."""
+    if not base.exists():
+        return []
+    found = []
+    for child in base.iterdir():
+        m = re.fullmatch(r"turn-(\d+)", child.name)
+        if child.is_dir() and m:
+            found.append((int(m.group(1)), child))
+    return sorted(found)
+
+
 def text_files_under(directory: Path) -> list[Path]:
     if not directory.exists() or not directory.is_dir():
         return []
@@ -3939,13 +3967,31 @@ def run_subagent_tasks(
                 return live(payload)
             return store.resolve(tool, payload, live=live)
 
+        turns = [str(t) for t in task.get("turns") or [] if str(t)]
         with tempfile.TemporaryDirectory(prefix="subagent-ws-") as wd:
             ws = Path(wd)
             skill_rel, input_rel = codex_skill_workspace(pt, ws)
             prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             started = time.time()
             try:
-                outcome = agent_fn(prompt=prompt, workspace=ws, model=row_model, tool_executor=tool_executor) or {}
+                if turns:
+                    # Scripted multi-turn sequence (roadmap 3.1): the first turn
+                    # carries the workspace/skill preamble; later turns get the
+                    # raw turn prompt plus the conversation so far. Each turn's
+                    # answer lands in turn-<n>/output.md; the final answer is
+                    # also the run's output.md, so single-output consumers work.
+                    outcome = {}
+                    history: list[dict[str, str]] = []
+                    for n, turn_prompt in enumerate(turns, 1):
+                        sent = prompt if n == 1 else turn_prompt
+                        outcome = agent_fn(prompt=sent, workspace=ws, model=row_model, tool_executor=tool_executor, history=list(history)) or {}
+                        turn_answer = str(outcome.get("answer") or "")
+                        turn_dir = base / f"turn-{n}"
+                        turn_dir.mkdir(parents=True, exist_ok=True)
+                        (turn_dir / "output.md").write_text(turn_answer, encoding="utf-8")
+                        history.append({"prompt": sent, "answer": turn_answer})
+                else:
+                    outcome = agent_fn(prompt=prompt, workspace=ws, model=row_model, tool_executor=tool_executor) or {}
                 error = None
             except ToolReplayMiss as exc:
                 outcome, error = {}, f"tool replay miss: {exc}"
@@ -3978,8 +4024,11 @@ def run_subagent_tasks(
 def shell_agent_backend(agent_cmd: str, timeout: int = 1800) -> Any:
     """Adapt a shell command into the subagent seam: the prompt arrives as JSON
     on stdin, the reply is JSON on stdout ({answer, trace?, usage?})."""
-    def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any) -> dict[str, Any]:
-        proc = subprocess.run(agent_cmd, shell=True, input=json.dumps({"prompt": prompt, "model": model, "workspace": str(workspace)}),
+    def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
+        payload = {"prompt": prompt, "model": model, "workspace": str(workspace)}
+        if history:
+            payload["history"] = history
+        proc = subprocess.run(agent_cmd, shell=True, input=json.dumps(payload),
                               text=True, capture_output=True, timeout=timeout)
         if proc.returncode != 0:
             return {"answer": "", "returncode": proc.returncode}
@@ -4000,7 +4049,10 @@ def run_subagent(args: argparse.Namespace) -> int:
         claude_bin = getattr(args, "claude_bin", None) or "claude"
         timeout = int(getattr(args, "timeout", 1800))
 
-        def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any) -> dict[str, Any]:
+        def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
+            if history:
+                transcript = "\n\n".join(f"[user]\n{h['prompt']}\n\n[assistant]\n{h['answer']}" for h in history)
+                prompt = f"Conversation so far:\n{transcript}\n\n[user]\n{prompt}"
             result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
             return {"answer": result.get("answer"), "returncode": result.get("returncode"),
                     "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
@@ -4165,13 +4217,36 @@ def grade_case_variant(
     objective = []
     qualitative = []
     judge_tasks = []
+    # Multi-turn transcript (roadmap 3.1): each turn's assertions grade that
+    # turn's output; case-level assertions grade the final answer. With no
+    # turns declared, everything below is exactly the single-shot path.
+    turn_specs = [t for t in (case.get("turns") or []) if isinstance(t, dict)]
+    turn_units: list[tuple[dict[str, Any], str | None, Path, Path | None, int]] = []
+    turn_summaries: list[dict[str, Any]] = []
+    if turn_specs and run_base is not None:
+        turn_bases = dict(discover_turn_bases(run_base))
+        last_text: str | None = None
+        for n, turn in enumerate(turn_specs, 1):
+            turn_base = turn_bases.get(n)
+            if turn_base is not None:
+                turn_text, turn_output_path = read_output_base(turn_base)
+            else:
+                turn_text, turn_output_path = None, run_base / f"turn-{n}" / "output.md"
+            turn_summaries.append({"turn": n, "missing_output": turn_text is None})
+            for assertion in turn.get("assertions", []) or []:
+                turn_units.append((assertion, turn_text, turn_output_path, turn_base or run_base, n))
+            if turn_text is not None:
+                last_text = turn_text
+        if text is None:
+            text = last_text   # the final turn is the answer of record
     missing_output = text is None
     exec_valid = execution_valid(metadata, text)
     text = text or ""
     judge_results = judge_results or {}
-    for assertion in case.get("assertions", []):
+
+    def grade_unit(assertion: dict[str, Any], unit_text: str | None, unit_output_path: Path, unit_base: Path | None, turn_n: int | None = None) -> None:
         if not assertion_applies_to_variant(assertion, variant):
-            continue
+            return
         atype = assertion.get("type")
         severity = assertion_severity(assertion, strict=strict)
         tier = oracle_tier(assertion)
@@ -4181,14 +4256,18 @@ def grade_case_variant(
             # scoring downstream, so never spend a judge model call grading its
             # empty/failed candidate (the verdict would only be discarded).
             if not scorable_run({"missing_output": missing_output, "execution_valid": exec_valid}):
-                continue
-            assertion = expand_judge_preset(assertion)
-            jid = judge_task_id(case["id"], variant, run_number, assertion)
+                return
+            expanded = expand_judge_preset(assertion)
+            if turn_n is not None:
+                expanded = {**expanded, "name": f"turn-{turn_n}: {assertion_label(expanded)}"}
+            jid = judge_task_id(case["id"], variant, run_number, expanded)
             judged = judge_results.get(jid)
             if judged:
-                entry = merged_qualitative_entry(assertion, judged, jid)
+                entry = merged_qualitative_entry(expanded, judged, jid)
                 entry["severity"] = severity
                 entry["oracle"] = tier
+                if turn_n is not None:
+                    entry["turn"] = turn_n
                 qualitative.append(entry)
             else:
                 judge_tasks.append({
@@ -4196,19 +4275,32 @@ def grade_case_variant(
                     "case_id": case["id"],
                     "variant": variant,
                     "run_number": run_number,
-                    "assertion": assertion,
-                    "output_path": str(output_path),
-                    "run_base": str(run_base or output_path.parent),
+                    "assertion": expanded,
+                    "output_path": str(unit_output_path),
+                    "run_base": str(unit_base or unit_output_path.parent),
                     "prompt": case.get("prompt"),
                     "prompt_ref": case.get("prompt_ref"),
                     "expected_behavior": case.get("expected_behavior", []),
                     "review_rubric": case.get("review_rubric", []),
                 })
         else:
-            entry = assertion_result(assertion, text, output_path, run_base=run_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir)
+            labeled = {**assertion, "name": f"turn-{turn_n}: {assertion_label(assertion)}"} if turn_n is not None else assertion
+            entry = assertion_result(labeled, unit_text or "", unit_output_path, run_base=unit_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir)
             entry["severity"] = severity
             entry["oracle"] = tier
+            if turn_n is not None:
+                entry["turn"] = turn_n
             objective.append(entry)
+
+    for assertion in case.get("assertions", []):
+        grade_unit(assertion, text, output_path, run_base)
+    for assertion, unit_text, unit_output_path, unit_base, turn_n in turn_units:
+        grade_unit(assertion, unit_text, unit_output_path, unit_base, turn_n)
+    for summary_row in turn_summaries:
+        n = summary_row["turn"]
+        rows_for_turn = [r for r in objective + qualitative if r.get("turn") == n]
+        summary_row["passed"] = sum(1 for r in rows_for_turn if r["passed"])
+        summary_row["total"] = len(rows_for_turn)
     # Severity split (roadmap 2.2). The pass-rate channel is carried by gate and
     # critical results (the default for every objective assertion, so binary
     # manifests grade identically); soft results leave the denominator and fill
@@ -4279,6 +4371,7 @@ def grade_case_variant(
         "soft_passed": sum(1 for r in soft_rows if r["passed"]),
         "graded_score": graded_score,
         "below_reference_floor": below_floor,
+        **({"turns": turn_summaries} if turn_specs else {}),
         "assertions": objective,
         "qualitative_assertions": qualitative,
         "deferred_judge_tasks": len(judge_tasks),
@@ -4559,6 +4652,21 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
+def slice_lift_fields(block: dict[str, Any], overall_lift: float | None) -> dict[str, Any]:
+    """Slice-lift concentration (roadmap 3.2, the macro-eval metric one level
+    up from per-case lift): slice lift ÷ overall lift. A failure or gain
+    confined to one slice scores a high ratio there."""
+    w = (block.get("with_skill") or {}).get("mean_objective_pass_rate")
+    n = (block.get("without_skill") or {}).get("mean_objective_pass_rate")
+    if w is None or n is None:
+        return {}
+    lift = w - n
+    fields: dict[str, Any] = {"lift": round(lift, 4)}
+    if overall_lift:
+        fields["lift_concentration"] = round(lift / overall_lift, 4)
+    return fields
+
+
 def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> dict[str, Any]:
     out: dict[str, Any] = {"domain": {}, "difficulty": {}, "trigger_type": {}, "success_goals": {}}
     # Each slice routes through ResultSet so the scorable predicate is never
@@ -4569,14 +4677,41 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
         return {"runs": len(s), "mean_objective_pass_rate": s.mean_rate("objective_pass_rate"), "mean_combined_pass_rate": s.mean_rate("combined_pass_rate")}
 
     everything = ResultSet(results)
+    overall_lift = (build_paired_summary(results) or {}).get("absolute_delta")
     for field in ["domain", "difficulty", "trigger_type"]:
         for value in sorted({str(r.get(field)) for r in results if r.get(field)}):
-            out[field][value] = {v: slice_stats(everything.where(**{field: value, "variant": v})) for v in variants}
+            block = {v: slice_stats(everything.where(**{field: value, "variant": v})) for v in variants}
+            block.update(slice_lift_fields(block, overall_lift))
+            out[field][value] = block
     goals = sorted({str(goal) for r in results for goal in (r.get("success_goals") or [])})
     for goal in goals:
         in_goal = everything.matching(lambda r, g=goal: g in (r.get("success_goals") or []))
-        out["success_goals"][goal] = {v: slice_stats(in_goal.where(variant=v)) for v in variants}
+        block = {v: slice_stats(in_goal.where(variant=v)) for v in variants}
+        block.update(slice_lift_fields(block, overall_lift))
+        out["success_goals"][goal] = block
     return out
+
+
+def model_analysis_from_paired(paired: dict[str, Any]) -> dict[str, Any]:
+    """Per-model lift ranking (roadmap 3.2): rank models by lift and name the
+    ones that lose it (non-positive lift while the pooled lift is positive)."""
+    by_model = paired.get("by_model") or {}
+    if not by_model:
+        return {}
+    ranking = []
+    for model, block in by_model.items():
+        ranking.append({
+            "model": model,
+            "lift": block.get("absolute_delta"),
+            "with_skill": block.get("with_skill_objective_pass_rate"),
+            "without_skill": block.get("without_skill_objective_pass_rate"),
+            "significant_at_0_05": (block.get("significance") or {}).get("significant_at_0_05", False),
+        })
+    ranking.sort(key=lambda row: (-(row["lift"] if isinstance(row["lift"], (int, float)) else float("-inf")), row["model"]))
+    overall = paired.get("absolute_delta")
+    losers = [row["model"] for row in ranking
+              if isinstance(row["lift"], (int, float)) and row["lift"] <= 0 and isinstance(overall, (int, float)) and overall > 0]
+    return {"ranking": ranking, "lift_losers": losers}
 
 
 def _expected_component(comp: dict[str, Any], skill_paths: list[str]) -> Component:
@@ -4991,6 +5126,7 @@ def build_benchmark_report(
             "total_by_tier": dict(sorted(total_by_tier.items())),
         }
 
+    paired_summary = build_paired_summary(results)
     return {
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
@@ -5010,7 +5146,8 @@ def build_benchmark_report(
         # 2.7b: held-out rubric scores reported apart from tune-visible ones,
         # so a rubric the skill could see never inflates the held-out number.
         "qualitative_by_visibility": qualitative_by_visibility(results),
-        "paired_summary": build_paired_summary(results),
+        "paired_summary": paired_summary,
+        "model_analysis": model_analysis_from_paired(paired_summary),
         "slice_summary": build_slice_summary(results, variants),
         "ablation_regressions": build_ablation_regression_report(manifest, results),
         "case_flags": case_flags,
