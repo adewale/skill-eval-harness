@@ -224,3 +224,59 @@ Examples from saturation work:
 - Separate shipped behavior from follow-on work in specs.
 - Keep live-validation caveats visible, especially for external adapters.
 - Record docs-only corrections in `CHANGELOG.md` under `Unreleased`.
+
+## 2026-06-30 — Multi-skill eval suites must be allowlisted and pinned
+
+**Problem:** A broad filesystem scan for `*/evals/shared-benchmark.json` pulled in an unrelated top-level tool (`beautiful-mermaid`) when the intended scope was the pinned 10-skill study. That silently changed the matrix, cost, and interpretation of the run.
+
+**Lesson:** Suite scope is part of the experiment contract. It must be explicit, reviewable, and reproducible before any model calls are made.
+
+**Rule:**
+- Use a suite allowlist (`examples/adewale-workspace/all-manifests.txt`) as the source of truth; never glob arbitrary repos for official runs.
+- Run `skill-benchmark suite-run ... --tier preflight` before expensive tiers.
+- Fail closed on top-level manifests not present in the allowlist unless the run is explicitly exploratory.
+- Verify skill tree hashes with `examples/skill-pins.json`; if a skill repo is intentionally updated, refresh pins as a conscious act and rerun preflight.
+- Save `RUN_SCOPE.json` with every suite run and treat it as the audit record for what was actually evaluated.
+
+## 2026-06-30 — Cost is an eval-quality signal, not just an invoice
+
+**Problem:** Per-run Pi metadata contained token and dollar cost, but the harness did not promote it into a suite-level artifact. The latest allowlisted full matrix had enough raw telemetry to show ~82.6M generation tokens and ~$175.21 in provider-reported Pi generation cost, but judge and trigger costs were not persisted.
+
+**Lesson:** Cost must be normalized and reported next to quality metrics so we can distinguish useful signal from expensive noise.
+
+**Rule:**
+- Preserve raw provider `usage`/`cost`, but also write normalized `usage_normalized` and `cost_normalized` blocks with source/provenance.
+- Report suite totals by skill, case, variant, runner, and ablation.
+- Track coverage: runs with token telemetry, runs with dollar telemetry, missing usage, and missing cost.
+- Add budget gates for PR smoke, nightly tune, and release/full-ablation tiers.
+- Use cost-quality findings: expensive saturated cases, expensive no-lift cases, judge-heavy cases that could be deterministic, and ablations with high spend but no confirmable expected regression.
+- Do not mix missing cost with zero cost; offline/stub runners should mark telemetry as `not_applicable`.
+
+Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`; excludes judge and trigger cost because those paths did not persist usage/cost):
+
+| Skill | Runs | Total tokens | Cost (USD) |
+|---|---:|---:|---:|
+| swiss-poster-skill | 1,272 | 44,808,350 | 124.34 |
+| cfdoctor | 176 | 9,625,548 | 12.83 |
+| testing-best-practices | 276 | 9,204,778 | 12.11 |
+| slide-maker | 118 | 3,199,560 | 5.10 |
+| good-readme | 117 | 3,933,828 | 4.15 |
+| guardrails-skill | 164 | 2,283,690 | 3.92 |
+| audit-skill | 138 | 4,270,346 | 3.79 |
+| good-pr | 124 | 1,659,912 | 3.65 |
+| good-repo | 107 | 2,647,480 | 3.55 |
+| anti-slop-writing | 76 | 1,005,364 | 1.75 |
+| **Total** | **2,568** | **82,638,856** | **175.21** |
+
+## 2026-06-30 — The full matrix is slow because ablations and judges multiply calls
+
+**Problem:** The full allowlisted suite took a long time because it was not one eval; it was thousands of model interactions. The matrix included 514 baseline Pi generation calls, 2,054 ablation generation calls, and 2,358 judge calls. Median Pi generation latency was about 27s, p90 about 42s, with some 180s timeouts.
+
+**Lesson:** Runtime is dominated by multiplicative design choices: answer cases × variants × ablations × repeats × judges. The ablation matrix is especially expensive when every ablation applies to every answer case.
+
+**Rule:**
+- Run tiers deliberately: preflight/static first, smoke subset second, full tune only when needed, holdout/release last.
+- Narrow ablation applicability to cases that can actually exercise the removed component.
+- Prefer materialized ablations with structured expected regressions over broad instruction-simulated ablations.
+- Keep judge assertions for properties deterministic checks cannot express; replace judge-heavy checks with script/artifact oracles when possible.
+- Use historical cost summaries to select a cheap high-signal smoke subset and reserve expensive cases for nightly or release runs.
