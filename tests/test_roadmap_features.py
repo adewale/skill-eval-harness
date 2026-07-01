@@ -1002,6 +1002,101 @@ class NoCodeRegistryTests(unittest.TestCase):
                 sb.validate_manifest(path)
 
 
+class ServedReportArtifactTests(unittest.TestCase):
+    """2.8 — artifact embedding/categorization and the feedback round trip."""
+
+    def test_artifact_categorization(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            png = root / "chart.png"
+            png.write_bytes(b"\x89PNG\r\n\x1a\nfakebytes")
+            pdf = root / "report.pdf"
+            pdf.write_bytes(b"%PDF-1.4 fake")
+            xlsx = root / "data.xlsx"
+            xlsx.write_bytes(b"PK fake")
+            note = root / "notes.md"
+            note.write_text("hello <world>", encoding="utf-8")
+            self.assertEqual(sb.encode_artifact(png)["kind"], "image")
+            self.assertIn("data:image/png;base64,", sb.encode_artifact(png)["html"])
+            self.assertEqual(sb.encode_artifact(pdf)["kind"], "pdf")
+            self.assertEqual(sb.encode_artifact(xlsx)["kind"], "spreadsheet")
+            text_artifact = sb.encode_artifact(note)
+            self.assertEqual(text_artifact["kind"], "text")
+            self.assertIn("&lt;world&gt;", text_artifact["html"])
+
+    def test_viewer_html_embeds_artifacts_and_landmarks(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "runs" / "case-1" / "with_skill"
+            (base / "outputs").mkdir(parents=True)
+            (base / "output.md").write_text("alpha", encoding="utf-8")
+            (base / "outputs" / "picture.png").write_bytes(b"tinypng")
+            report = {
+                "generated_at": 1, "summary": {"with_skill": {"runs": 1}},
+                "paired_summary": {"absolute_delta": 1.0},
+                "results": [{"case_id": "case-1", "variant": "with_skill", "run_number": 1,
+                             "objective_pass_rate": 1.0, "run_base": str(base), "assertions": [], "qualitative_assertions": []}],
+            }
+            html_text = sb.viewer_html(report)
+        self.assertIn("Skill Eval Review", html_text)
+        self.assertIn("Paired lift", html_text)
+        self.assertIn("data:image/png;base64,", html_text)
+
+    def test_serve_mode_adds_feedback_form_and_static_does_not(self):
+        report = {"generated_at": 1, "summary": {}, "results": []}
+        self.assertIn("/feedback", sb.viewer_html(report, serve_mode=True))
+        self.assertNotIn("/feedback", sb.viewer_html(report, serve_mode=False))
+
+    def test_feedback_round_trip_replaces_by_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            sb.persist_feedback(ws, {"case_id": "c1", "variant": "with_skill", "verdict": "bad", "note": "meh"})
+            sb.persist_feedback(ws, {"case_id": "c2", "variant": "with_skill", "verdict": "good"})
+            sb.persist_feedback(ws, {"case_id": "c1", "variant": "with_skill", "verdict": "good", "note": "fixed"})
+            doc = json.loads((ws / "feedback.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(doc["entries"]), 2)
+        c1 = next(e for e in doc["entries"] if e["case_id"] == "c1")
+        self.assertEqual(c1["verdict"], "good")
+
+
+class IterationWorkflowTests(unittest.TestCase):
+    """2.9 — iteration-N convention and the previous-workspace diff."""
+
+    def test_iteration_dir_helpers(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self.assertEqual(sb.next_iteration_dir(root).name, "iteration-1")
+            (root / "iteration-1").mkdir()
+            (root / "iteration-3").mkdir()
+            (root / "not-an-iteration").mkdir()
+            self.assertEqual([p.name for p in sb.iteration_dirs(root)], ["iteration-1", "iteration-3"])
+            self.assertEqual(sb.next_iteration_dir(root).name, "iteration-4")
+
+    def test_benchmark_report_diff(self):
+        previous = {
+            "summary": {"with_skill": {"mean_objective_pass_rate": 0.5, "mean_combined_pass_rate": 0.5}},
+            "results": [{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 0.5}],
+            "case_flags": [{"case_id": "c1", "flags": ["no objective lift"]}],
+        }
+        current = {
+            "summary": {"with_skill": {"mean_objective_pass_rate": 1.0, "mean_combined_pass_rate": 1.0}},
+            "results": [{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0},
+                        {"case_id": "c2", "variant": "with_skill", "objective_pass_rate": 0.0}],
+            "case_flags": [{"case_id": "c2", "flags": ["with-skill failure"]}],
+        }
+        diff = sb.benchmark_report_diff(previous, current)
+        self.assertEqual(diff["variant_deltas"]["with_skill"]["mean_objective_pass_rate"]["delta"], 0.5)
+        self.assertEqual(diff["case_deltas"], [{"case_id": "c1", "variant": "with_skill", "before": 0.5, "after": 1.0, "delta": 0.5}])
+        self.assertEqual(diff["new_flags"], ["c2::with-skill failure"])
+        self.assertEqual(diff["resolved_flags"], ["c1::no objective lift"])
+
+    def test_viewer_embeds_diff_for_previous_workspace(self):
+        report = {"generated_at": 1, "summary": {}, "results": []}
+        previous = {"summary": {}, "results": [], "case_flags": [{"case_id": "c", "flags": ["flaky repeated pass rates: with_skill"]}]}
+        html_text = sb.viewer_html(report, previous_report=previous)
+        self.assertIn("Diff vs previous workspace", html_text)
+        self.assertIn("resolved_flags", html_text)
+
+
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 

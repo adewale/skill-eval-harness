@@ -5342,17 +5342,118 @@ def compare_results(args: argparse.Namespace) -> int:
     return 0
 
 
-def render_viewer(args: argparse.Namespace) -> int:
-    report = load_json(Path(args.benchmark))
-    runs_root = Path(args.runs) if args.runs else None
+IMAGE_ARTIFACT_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
+DOCUMENT_ARTIFACT_EXTS = {".pdf": "pdf", ".xlsx": "spreadsheet", ".xls": "spreadsheet", ".csv": "spreadsheet"}
+MAX_EMBEDDED_ARTIFACT_BYTES = 2_000_000
+
+
+def encode_artifact(path: Path) -> dict[str, Any]:
+    """Categorize and render one run artifact for the viewer (roadmap 2.8):
+    images embed inline (base64, capped), pdf/xlsx get typed download links,
+    text renders in a <pre>, anything else is a labeled link."""
+    import base64
+
+    suffix = path.suffix.lower()
+    size = path.stat().st_size if path.exists() else 0
+    name = html.escape(path.name)
+    if suffix in IMAGE_ARTIFACT_EXTS:
+        if size <= MAX_EMBEDDED_ARTIFACT_BYTES:
+            mime = "image/svg+xml" if suffix == ".svg" else f"image/{suffix.lstrip('.').replace('jpg', 'jpeg')}"
+            data = base64.b64encode(path.read_bytes()).decode("ascii")
+            return {"kind": "image", "html": f"<figure><img alt='{name}' src='data:{mime};base64,{data}' style='max-width:100%'/><figcaption>{name}</figcaption></figure>"}
+        return {"kind": "image", "html": f"<p>image too large to embed ({size} bytes): <a href='{name}'>{name}</a></p>"}
+    if suffix in DOCUMENT_ARTIFACT_EXTS:
+        kind = DOCUMENT_ARTIFACT_EXTS[suffix]
+        return {"kind": kind, "html": f"<p>[{kind}] <a href='{name}'>{name}</a> ({size} bytes)</p>"}
+    try:
+        text = path.read_text(encoding="utf-8")
+        return {"kind": "text", "html": f"<details><summary>{name}</summary><pre>{html.escape(text[:20000])}</pre></details>"}
+    except (UnicodeDecodeError, OSError):
+        return {"kind": "binary", "html": f"<p>[binary] <a href='{name}'>{name}</a> ({size} bytes)</p>"}
+
+
+def benchmark_report_diff(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Iteration-over-time diff (roadmap 2.9): per-variant mean deltas, per-case
+    objective deltas, and flag churn between two benchmark reports."""
+    def case_rates(report: dict[str, Any]) -> dict[tuple, float]:
+        grouped: dict[tuple, list[float]] = {}
+        for r in report.get("results", []):
+            if r.get("objective_pass_rate") is None:
+                continue
+            grouped.setdefault((r.get("case_id"), r.get("variant")), []).append(r["objective_pass_rate"])
+        return {key: statistics.mean(values) for key, values in grouped.items()}
+
+    prev_rates = case_rates(previous)
+    curr_rates = case_rates(current)
+    case_deltas = []
+    for key in sorted(set(prev_rates) | set(curr_rates)):
+        before = prev_rates.get(key)
+        after = curr_rates.get(key)
+        if before is None or after is None or abs(after - before) < 1e-9:
+            continue
+        case_deltas.append({"case_id": key[0], "variant": key[1], "before": before, "after": after, "delta": round(after - before, 4)})
+    variant_deltas = {}
+    for variant, block in (current.get("summary") or {}).items():
+        prev_block = (previous.get("summary") or {}).get(variant) or {}
+        pairs = {}
+        for metric in ["mean_objective_pass_rate", "mean_combined_pass_rate"]:
+            before = prev_block.get(metric)
+            after = block.get(metric)
+            if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+                pairs[metric] = {"before": before, "after": after, "delta": round(after - before, 4)}
+        if pairs:
+            variant_deltas[variant] = pairs
+    flags = lambda report: {f"{flag.get('case_id')}::{f}" for flag in report.get("case_flags", []) for f in flag.get("flags", [])}
+    prev_flags, curr_flags = flags(previous), flags(current)
+    return {
+        "variant_deltas": variant_deltas,
+        "case_deltas": case_deltas,
+        "new_flags": sorted(curr_flags - prev_flags),
+        "resolved_flags": sorted(prev_flags - curr_flags),
+    }
+
+
+def persist_feedback(workspace: Path, entry: dict[str, Any]) -> Path:
+    """Feedback capture (roadmap 2.8, eval-viewer's feedback.json): entries are
+    keyed by case/variant/run — a re-submission replaces its prior entry."""
+    path = workspace / "feedback.json"
+    doc = {"entries": []}
+    if path.is_file():
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("entries"), list):
+            doc = loaded
+    key = (entry.get("case_id"), entry.get("variant"), entry.get("run_number", 1))
+    doc["entries"] = [e for e in doc["entries"] if (e.get("case_id"), e.get("variant"), e.get("run_number", 1)) != key]
+    doc["entries"].append(entry)
+    write_json(path, doc)
+    return path
+
+
+def viewer_html(report: dict[str, Any], runs_root: Path | None = None, *, previous_report: dict[str, Any] | None = None, serve_mode: bool = False) -> str:
     rows = report.get("results") or []
     if "reports" in report:
         rows = [row for child in report["reports"] for row in child.get("results", [])]
     parts = ["<!doctype html><meta charset='utf-8'><title>Skill Eval Review</title>"]
-    parts.append("<style>body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.4}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.4rem;vertical-align:top}pre{white-space:pre-wrap;background:#f7f7f7;padding:1rem;overflow:auto}details{margin:.5rem 0}.pass{color:#075}.fail{color:#a00}</style>")
+    parts.append("<style>body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.4}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.4rem;vertical-align:top}pre{white-space:pre-wrap;background:#f7f7f7;padding:1rem;overflow:auto}details{margin:.5rem 0}.pass{color:#075}.fail{color:#a00}figure{margin:.5rem 0}</style>")
     parts.append(f"<h1>Skill Eval Review</h1><p>Generated {html.escape(str(report.get('generated_at','')))}</p>")
     parts.append("<h2>Summary</h2><pre>" + html.escape(json.dumps(report.get("summary", {}), indent=2)) + "</pre>")
-    parts.append("<h2>Runs</h2><table><tr><th>Case</th><th>Variant</th><th>Run</th><th>Pass</th><th>Assertions</th><th>Output</th></tr>")
+    paired = report.get("paired_summary")
+    if paired:
+        parts.append("<h2>Paired lift</h2><pre>" + html.escape(json.dumps(paired, indent=2)) + "</pre>")
+    if previous_report is not None:
+        diff = benchmark_report_diff(previous_report, report)
+        parts.append("<h2>Diff vs previous workspace</h2><pre>" + html.escape(json.dumps(diff, indent=2)) + "</pre>")
+    if serve_mode:
+        parts.append(
+            "<h2>Feedback</h2><form id='fb'>"
+            "<input name='case_id' placeholder='case id'> <input name='variant' placeholder='variant'>"
+            " <select name='verdict'><option>good</option><option>bad</option><option>unsure</option></select>"
+            " <input name='note' placeholder='note' size='40'> <button>save</button> <span id='fb-status'></span></form>"
+            "<script>document.getElementById('fb').addEventListener('submit',async e=>{e.preventDefault();"
+            "const data=Object.fromEntries(new FormData(e.target));"
+            "const r=await fetch('/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});"
+            "document.getElementById('fb-status').textContent=r.ok?'saved':'error';});</script>")
+    parts.append("<h2>Runs</h2><table><tr><th>Case</th><th>Variant</th><th>Run</th><th>Pass</th><th>Assertions</th><th>Output</th><th>Artifacts</th></tr>")
     for r in rows:
         assertions = []
         for a in r.get("assertions", []) + r.get("qualitative_assertions", []):
@@ -5360,13 +5461,16 @@ def render_viewer(args: argparse.Namespace) -> int:
             assertions.append(f"<li class='{cls}'>{html.escape(str(a.get('name')))} — {html.escape(str(a.get('evidence','')))}</li>")
         output_html = ""
         base = Path(r.get("run_base", ""))
+        if not base.exists() and runs_root:
+            base = runs_root / r["case_id"] / r["variant"]
+        artifacts_html = ""
         if base.exists():
             text, _ = read_output_base(base)
             output_html = html.escape((text or "")[:20000])
-        elif runs_root:
-            base = runs_root / r["case_id"] / r["variant"]
-            text, _ = read_output_base(base)
-            output_html = html.escape((text or "")[:20000])
+            outputs_dir = base / "outputs"
+            if outputs_dir.is_dir():
+                rendered = [encode_artifact(p)["html"] for p in sorted(outputs_dir.iterdir()) if p.is_file()][:20]
+                artifacts_html = "".join(rendered)
         parts.append("<tr>" +
             f"<td>{html.escape(str(r.get('case_id')))}</td>" +
             f"<td>{html.escape(str(r.get('variant')))}</td>" +
@@ -5374,9 +5478,94 @@ def render_viewer(args: argparse.Namespace) -> int:
             f"<td>{html.escape(str(r.get('objective_pass_rate')))}</td>" +
             f"<td><ul>{''.join(assertions)}</ul></td>" +
             f"<td><details><summary>output</summary><pre>{output_html}</pre></details></td>" +
+            f"<td>{artifacts_html}</td>" +
             "</tr>")
     parts.append("</table>")
-    Path(args.out).write_text("\n".join(parts), encoding="utf-8")
+    return "\n".join(parts)
+
+
+def iteration_dirs(root: Path) -> list[Path]:
+    """The iteration-N convention (roadmap 2.9), sorted by iteration number."""
+    if not root.is_dir():
+        return []
+    found = []
+    for child in root.iterdir():
+        m = re.fullmatch(r"iteration-(\d+)", child.name)
+        if child.is_dir() and m:
+            found.append((int(m.group(1)), child))
+    return [p for _, p in sorted(found)]
+
+
+def next_iteration_dir(root: Path) -> Path:
+    existing = iteration_dirs(root)
+    if not existing:
+        return root / "iteration-1"
+    last = int(re.fullmatch(r"iteration-(\d+)", existing[-1].name).group(1))
+    return root / f"iteration-{last + 1}"
+
+
+def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
+    """The interactive served report (roadmap 2.8): GET / renders the review,
+    POST /feedback persists feedback.json into the workspace. Never touched by
+    unit tests (house rule: no network); the persistence logic they need is
+    persist_feedback."""
+    import http.server
+
+    class ViewerHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):   # noqa: N802 (stdlib naming)
+            body = html_text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):   # noqa: N802
+            if self.path != "/feedback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                entry = json.loads(self.rfile.read(length).decode("utf-8"))
+                persist_feedback(workspace, entry)
+                self.send_response(204)
+            except (json.JSONDecodeError, OSError):
+                self.send_response(400)
+            self.end_headers()
+
+        def log_message(self, fmt, *log_args):   # quiet server
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), ViewerHandler)
+    print(f"serving review on http://127.0.0.1:{port} (feedback -> {workspace / 'feedback.json'}); Ctrl-C to stop")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def render_viewer(args: argparse.Namespace) -> int:
+    report = load_json(Path(args.benchmark))
+    runs_root = Path(args.runs) if args.runs else None
+    previous_report = None
+    previous_workspace = getattr(args, "previous_workspace", None)
+    if previous_workspace:
+        previous_path = Path(previous_workspace) / "benchmark.json"
+        if not previous_path.is_file():
+            die(f"--previous-workspace has no benchmark.json: {previous_path}")
+        previous_report = load_json(previous_path)
+    serve_mode = bool(getattr(args, "serve", False))
+    text = viewer_html(report, runs_root, previous_report=previous_report, serve_mode=serve_mode)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+    if serve_mode:
+        workspace = Path(getattr(args, "workspace", None) or Path(args.benchmark).parent)
+        serve_viewer(text, workspace, int(getattr(args, "port", 8642)))
+    elif not args.out:
+        die("render-viewer needs --out (or --serve)")
     return 0
 
 
@@ -6618,7 +6807,11 @@ def main() -> int:
     p = sub.add_parser("render-viewer")
     p.add_argument("--benchmark", required=True)
     p.add_argument("--runs")
-    p.add_argument("--out", required=True)
+    p.add_argument("--out", help="write the static review HTML here (required unless --serve)")
+    p.add_argument("--previous-workspace", help="workspace holding the previous iteration's benchmark.json; embeds a diff panel (roadmap 2.9)")
+    p.add_argument("--serve", action="store_true", help="serve the review over HTTP with feedback capture into feedback.json (roadmap 2.8)")
+    p.add_argument("--port", type=int, default=8642)
+    p.add_argument("--workspace", help="where feedback.json is written when serving (default: the benchmark's directory)")
 
     p = sub.add_parser("profile-skill")
     p.add_argument("manifest")
