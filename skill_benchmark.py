@@ -66,6 +66,8 @@ TEXT_ASSERTIONS = {
     "file_exists",
     "json_field_equals",
     "golden_output",
+    "similarity",
+    "structured_output",
     "script",
 }
 PROCESS_ASSERTIONS = {
@@ -73,6 +75,7 @@ PROCESS_ASSERTIONS = {
     "command_ran",
     "command_not_ran",
     "command_order",
+    "tool_call",
     "tool_count_le",
     "no_repeated_command_loop",
 }
@@ -82,8 +85,37 @@ EFFICIENCY_ASSERTIONS = {
     "command_count_le",
 }
 OBJECTIVE_ASSERTIONS = TEXT_ASSERTIONS | PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS
-QUALITATIVE_ASSERTIONS = {"judge", "rubric"}
+QUALITATIVE_ASSERTIONS = {"judge", "rubric", "factuality"}
 SEVERITIES = {"critical", "gate", "soft"}
+ORACLE_TIERS = {"strong", "demo", "live"}
+# 1.1: the factuality preset is a named, anchored rubric — no new execution
+# path; it renders through judge_prompt and runs through --judge-cmd/--judge-model.
+JUDGE_PRESETS: dict[str, dict[str, Any]] = {
+    "factuality": {
+        "rubric": [
+            "Every factual claim in the candidate output is supported by the prompt, the provided input files, or common knowledge — no invented names, numbers, dates, APIs, or citations.",
+            "Claims that go beyond the provided material are explicitly marked as assumptions or uncertainty, not stated as fact.",
+            "Nothing in the candidate output contradicts the provided material.",
+            "5 = fully grounded; 3 = minor unsupported embellishment; 1 = fabricated specifics stated as fact.",
+        ],
+        "threshold": 4,
+    },
+}
+
+
+def expand_judge_preset(assertion: dict[str, Any]) -> dict[str, Any]:
+    """Expand a qualitative preset (type `factuality`, or an explicit `preset`
+    name on a judge assertion) into a judge assertion carrying the canned
+    rubric and threshold. Explicit fields on the assertion win."""
+    preset_name = assertion.get("preset") if assertion.get("type") in {"judge", "rubric"} else assertion.get("type")
+    preset = JUDGE_PRESETS.get(str(preset_name or ""))
+    if not preset:
+        return assertion
+    expanded = dict(assertion)
+    expanded.setdefault("name", str(preset_name))
+    for key, value in preset.items():
+        expanded.setdefault(key, value)
+    return expanded
 # Below this graded mean, an objectively saturated case is flagged
 # structurally-pass-but-forgettable (roadmap 2.2): competent, but low-scoring.
 FORGETTABLE_GRADED_THRESHOLD = 0.75
@@ -109,6 +141,23 @@ def assertion_severity(assertion: dict[str, Any], *, strict: bool = False) -> st
     if strict and severity == "soft":
         severity = "gate"
     return severity
+
+
+def oracle_tier(assertion: dict[str, Any]) -> str:
+    """Oracle-strength tier (roadmap 1.7), xampler's ladder made first-class:
+    `strong` (deterministic, no-lies — including a rendered-artifact script
+    oracle explicitly marked strong), `demo` (a marked stand-in; the default
+    for `script`, whose truthfulness the harness cannot see), `live` (judge or
+    other model-backed checks). Explicit `oracle` on the assertion wins."""
+    tier = assertion.get("oracle")
+    if tier in ORACLE_TIERS:
+        return str(tier)
+    atype = assertion.get("type")
+    if atype in QUALITATIVE_ASSERTIONS:
+        return "live"
+    if atype == "script":
+        return "demo"
+    return "strong"
 
 
 def die(msg: str) -> None:
@@ -316,6 +365,15 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             severity = assertion.get("severity")
             if severity is not None and severity not in SEVERITIES:
                 die(f"{cid}: assertion #{j} severity must be one of {sorted(SEVERITIES)}")
+            tier = assertion.get("oracle")
+            if tier is not None and tier not in ORACLE_TIERS:
+                die(f"{cid}: assertion #{j} oracle must be one of {sorted(ORACLE_TIERS)}")
+            if atype == "similarity" and not str(assertion.get("expected", assertion.get("value", ""))):
+                die(f"{cid}: assertion #{j} similarity needs an expected string")
+            if atype == "structured_output" and not isinstance(assertion.get("schema"), dict):
+                die(f"{cid}: assertion #{j} structured_output needs a schema object")
+            if assertion.get("preset") is not None and str(assertion.get("preset")) not in JUDGE_PRESETS:
+                die(f"{cid}: assertion #{j} unknown judge preset {assertion.get('preset')!r}; known: {sorted(JUDGE_PRESETS)}")
             if "atLeast" in assertion and not isinstance(assertion.get("atLeast"), (int, float)):
                 die(f"{cid}: assertion #{j} atLeast must be a number")
             dims = assertion.get("graded_dimensions")
@@ -2539,10 +2597,46 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
             return False, f"missing skill invocation evidence ({event_error})"
         return invoked == expected, f"skill_invoked={invoked}; expected={expected}; evidence={evidence[:5]}"
 
-    if atype in {"command_ran", "command_not_ran", "command_order", "tool_count_le", "no_repeated_command_loop"}:
+    if atype in {"command_ran", "command_not_ran", "command_order", "tool_call", "tool_count_le", "no_repeated_command_loop"}:
         if events is None:
             return False, event_error or "missing events.json"
         commands = [command_text(e) for e in command_events(events)]
+        if atype == "tool_call":
+            # 1.1 preset: assert a tool was actually called — optionally matching
+            # a pattern, in order, with count bounds. Reuses command_events (only
+            # completed calls count) and the command_order matching loop.
+            tool = assertion.get("tool")
+            if tool:
+                selected = [command_text(e) or str(e.get("name", "")) for e in command_events(events)
+                            if str(e.get("name", "")).casefold() == str(tool).casefold()
+                            or (str(tool).casefold() in {"bash", "shell", "command"} and e.get("type") == "command")]
+            else:
+                selected = commands
+            order = assertion.get("order")
+            if isinstance(order, list) and order:
+                cursor = 0
+                matched: list[str] = []
+                for pattern in [str(p) for p in order]:
+                    found = None
+                    for i in range(cursor, len(selected)):
+                        if regex_hit(pattern, selected[i], ci):
+                            found = i
+                            matched.append(selected[i])
+                            break
+                    if found is None:
+                        return False, f"missing ordered tool call /{pattern}/ after index {cursor}; matched={matched}"
+                    cursor = found + 1
+                return True, f"matched tool-call order: {matched}"
+            pattern = assertion.get("pattern")
+            hits = [c for c in selected if regex_hit(str(pattern), c, ci)] if pattern else selected
+            min_count = int(assertion.get("min_count", 1))
+            max_count = assertion.get("max_count")
+            if len(hits) < min_count:
+                return False, f"{len(hits)} matching tool call(s) < min_count {min_count} (tool={tool or '<any>'}, pattern={pattern or '<any>'})"
+            if isinstance(max_count, int) and len(hits) > max_count:
+                return False, f"{len(hits)} matching tool call(s) > max_count {max_count}"
+            detail = f"; first={hits[0]!r}" if hits else ""
+            return True, f"{len(hits)} matching tool call(s){detail}"
         if atype == "command_ran":
             pattern = str(assertion.get("pattern", assertion.get("value", "")))
             hit = next((cmd for cmd in commands if regex_hit(pattern, cmd, ci)), None)
@@ -3156,7 +3250,74 @@ def run_claude(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_dir: Path | None) -> tuple[bool, str]:
+def json_schema_errors(instance: Any, schema: dict[str, Any], path: str = "$") -> list[str]:
+    """Deterministic subset of JSON-Schema for structured_output (roadmap 1.1):
+    type, properties, required, items, enum, const, minItems/maxItems. Enough
+    to pin a tool-output contract without a new dependency."""
+    errors: list[str] = []
+    if "const" in schema and instance != schema["const"]:
+        errors.append(f"{path}: expected const {schema['const']!r}, got {instance!r}")
+    if "enum" in schema and instance not in schema["enum"]:
+        errors.append(f"{path}: {instance!r} not in enum {schema['enum']!r}")
+    expected_type = schema.get("type")
+    if expected_type:
+        checks = {
+            "object": lambda v: isinstance(v, dict),
+            "array": lambda v: isinstance(v, list),
+            "string": lambda v: isinstance(v, str),
+            "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+            "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+            "boolean": lambda v: isinstance(v, bool),
+            "null": lambda v: v is None,
+        }
+        allowed = expected_type if isinstance(expected_type, list) else [expected_type]
+        if not any(checks.get(t, lambda v: False)(instance) for t in allowed):
+            errors.append(f"{path}: expected type {expected_type}, got {type(instance).__name__}")
+            return errors   # type mismatch makes deeper checks noise
+    if isinstance(instance, dict):
+        for key in schema.get("required", []):
+            if key not in instance:
+                errors.append(f"{path}: missing required key {key!r}")
+        for key, sub in (schema.get("properties") or {}).items():
+            if key in instance and isinstance(sub, dict):
+                errors.extend(json_schema_errors(instance[key], sub, f"{path}.{key}"))
+    if isinstance(instance, list):
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and len(instance) < min_items:
+            errors.append(f"{path}: {len(instance)} items < minItems {min_items}")
+        max_items = schema.get("maxItems")
+        if isinstance(max_items, int) and len(instance) > max_items:
+            errors.append(f"{path}: {len(instance)} items > maxItems {max_items}")
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for i, element in enumerate(instance):
+                errors.extend(json_schema_errors(element, items, f"{path}[{i}]"))
+    return errors
+
+
+def parse_script_score_line(stdout: str) -> float | None:
+    """1.8: a graded script oracle may print a JSON line such as
+    {"score": 6, "max_score": 7}; the parsed value (normalized 0-1) feeds the
+    graded channel. No line, or a malformed one, keeps the oracle binary."""
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict) or not isinstance(obj.get("score"), (int, float)):
+            continue
+        score = float(obj["score"])
+        max_score = obj.get("max_score", 1)
+        if isinstance(max_score, (int, float)) and float(max_score) > 0:
+            score = score / float(max_score)
+        return max(0.0, min(1.0, score))
+    return None
+
+
+def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_dir: Path | None) -> tuple[bool, str, float | None]:
     command = script_command_list(assertion)
     command = [part.replace("{output_dir}", str(output_dir.resolve())).replace("{output_path}", str((output_dir / "output.md").resolve())) for part in command]
     timeout = float(assertion.get("timeout_s", 30))
@@ -3168,13 +3329,15 @@ def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_d
             evidence += f"\nstdout:\n{proc.stdout[:4000]}"
         if proc.stderr:
             evidence += f"\nstderr:\n{proc.stderr[:4000]}"
-        return proc.returncode == expected, evidence
+        # pass_exit_code still decides passed; the score line only feeds the
+        # graded channel, so a scoreless oracle keeps pure pass/fail behavior.
+        return proc.returncode == expected, evidence, parse_script_score_line(proc.stdout)
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or ""
         stderr = exc.stderr or ""
-        return False, f"script timed out after {timeout}s\nstdout:\n{stdout[:2000]}\nstderr:\n{stderr[:2000]}"
+        return False, f"script timed out after {timeout}s\nstdout:\n{stdout[:2000]}\nstderr:\n{stderr[:2000]}", None
     except Exception as exc:
-        return False, f"script execution failed: {exc}"
+        return False, f"script execution failed: {exc}", None
 
 
 def normalize_golden(text: str, mode: str) -> str:
@@ -3288,12 +3451,49 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
             evidence = f"json check failed: {exc}"
     elif atype == "golden_output":
         passed, evidence = golden_output_result(assertion, text, output_path, run_base, manifest_dir)
+    elif atype == "similarity":
+        # 1.4: the deterministic middle between regex and a judge — a difflib
+        # ratio against an expected string, thresholded, emitting a score.
+        expected = str(assertion.get("expected", assertion.get("value", "")))
+        threshold = float(assertion.get("threshold", 0.8))
+        compare = text
+        if assertion.get("artifact"):
+            candidate = (run_base or output_path.parent) / str(assertion["artifact"])
+            compare = candidate.read_text(encoding="utf-8", errors="replace") if candidate.is_file() else ""
+        a, b = (norm(compare), norm(expected)) if ci else (compare, expected)
+        ratio = difflib.SequenceMatcher(None, a, b).ratio()
+        score = round(ratio, 4)
+        passed = ratio >= threshold
+        evidence = f"similarity={ratio:.4f} vs threshold={threshold:g} against expected[:60]={expected[:60]!r}"
+    elif atype == "structured_output":
+        # 1.1: json_field_equals extended with (subset) JSON-Schema validation.
+        schema = assertion.get("schema")
+        rel = assertion.get("path")
+        instance: Any = None
+        errors: list[str] = []
+        if not isinstance(schema, dict):
+            errors = ["structured_output requires a schema object"]
+        else:
+            try:
+                if rel:
+                    p = (run_base or output_path.parent) / str(rel)
+                    instance = json.loads(p.read_text(encoding="utf-8"))
+                else:
+                    instance = extract_json_object(text)
+            except Exception as exc:
+                errors = [f"no parsable JSON candidate: {exc}"]
+            if not errors:
+                errors = json_schema_errors(instance, schema)
+        passed = not errors
+        evidence = "schema ok" if passed else "; ".join(errors[:5])
     elif atype == "script":
         if not allow_scripts:
             passed = False
             evidence = "script assertion skipped; rerun grade/benchmark with --allow-scripts to execute repo-owned oracle commands"
         else:
-            passed, evidence = run_script_assertion(assertion, run_base or output_path.parent, manifest_dir)
+            passed, evidence, script_score = run_script_assertion(assertion, run_base or output_path.parent, manifest_dir)
+            if script_score is not None:
+                score = script_score
     else:
         evidence = "qualitative/deferred"
     if score is not None and isinstance(assertion.get("atLeast"), (int, float)):
@@ -3668,6 +3868,7 @@ def grade_case_variant(
             continue
         atype = assertion.get("type")
         severity = assertion_severity(assertion, strict=strict)
+        tier = oracle_tier(assertion)
         if atype in QUALITATIVE_ASSERTIONS:
             # Judge-task emission honors THE scorable_run predicate, like every
             # other report view: a missing/infra-failed run is excluded from
@@ -3675,11 +3876,13 @@ def grade_case_variant(
             # empty/failed candidate (the verdict would only be discarded).
             if not scorable_run({"missing_output": missing_output, "execution_valid": exec_valid}):
                 continue
+            assertion = expand_judge_preset(assertion)
             jid = judge_task_id(case["id"], variant, run_number, assertion)
             judged = judge_results.get(jid)
             if judged:
                 entry = merged_qualitative_entry(assertion, judged, jid)
                 entry["severity"] = severity
+                entry["oracle"] = tier
                 qualitative.append(entry)
             else:
                 judge_tasks.append({
@@ -3698,6 +3901,7 @@ def grade_case_variant(
         else:
             entry = assertion_result(assertion, text, output_path, run_base=run_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir)
             entry["severity"] = severity
+            entry["oracle"] = tier
             objective.append(entry)
     # Severity split (roadmap 2.2). The pass-rate channel is carried by gate and
     # critical results (the default for every objective assertion, so binary
@@ -4441,6 +4645,28 @@ def build_benchmark_report(
         if flags:
             case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate, "without_skill": n_rate})
 
+    # 1.7: per case, how much of the pass rate rests on strong oracles. A case
+    # passing mostly on demo/live tiers looks solid while resting on weak checks.
+    oracle_strength: dict[str, Any] = {}
+    for cid in case_ids:
+        rows = everything.where(case_id=cid).scorable().all
+        entries = [a for r in rows for a in (r.get("assertions", []) + r.get("qualitative_assertions", []))]
+        if not entries:
+            continue
+        total_by_tier: dict[str, int] = {}
+        passed_by_tier: dict[str, int] = {}
+        for a in entries:
+            tier = a.get("oracle", "strong")
+            total_by_tier[tier] = total_by_tier.get(tier, 0) + 1
+            if a.get("passed"):
+                passed_by_tier[tier] = passed_by_tier.get(tier, 0) + 1
+        passed_total = sum(passed_by_tier.values())
+        oracle_strength[cid] = {
+            "strong_pass_share": round(passed_by_tier.get("strong", 0) / passed_total, 4) if passed_total else None,
+            "passed_by_tier": dict(sorted(passed_by_tier.items())),
+            "total_by_tier": dict(sorted(total_by_tier.items())),
+        }
+
     return {
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
@@ -4456,6 +4682,7 @@ def build_benchmark_report(
         "skipped_trigger_cases": skipped_trigger_cases,
         "summary": summary,
         "by_model": by_model_summary,
+        "oracle_strength": oracle_strength,
         "paired_summary": build_paired_summary(results),
         "slice_summary": build_slice_summary(results, variants),
         "ablation_regressions": build_ablation_regression_report(manifest, results),
@@ -5403,6 +5630,16 @@ def audit_manifest_report(
         if assertion_rows:
             finding("non-discriminating-assertions", "recommended", f"{len(assertion_rows)} assertions have identical with/without pass rates.", assertion_rows[:20])
             rec("assertion-design", "Replace keyword-only checks with source/artifact-backed assertions or stricter behavioral regexes for identical-rate assertions.")
+
+    # 1.7: a case whose checks are all demo/live tiers can look solid while
+    # resting on weak oracles — leakage lint extended from prompts to oracles.
+    weak_only = []
+    for case in cases:
+        case_assertions = case.get("assertions", []) or []
+        if case_assertions and all(oracle_tier(a) != "strong" for a in case_assertions):
+            weak_only.append(case.get("id"))
+    if weak_only:
+        finding("weak-oracle-only", "recommended", f"{len(weak_only)} case(s) are graded only by demo/live oracles (no strong deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
 
     # 1.3: the judge must not be the model under test. Compare the declared
     # judge model against the manifest's jetty.model and, when run data is

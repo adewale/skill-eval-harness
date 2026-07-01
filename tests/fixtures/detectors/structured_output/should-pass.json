@@ -1,0 +1,16 @@
+{
+  "detector": "structured_output",
+  "cases": [
+    {
+      "note": "artifact JSON satisfies the schema subset",
+      "assertion": {"type": "structured_output", "path": "outputs/result.json", "schema": {"type": "object", "required": ["name", "count"], "properties": {"name": {"type": "string"}, "count": {"type": "integer"}, "tags": {"type": "array", "items": {"type": "string"}}}}},
+      "output": "wrote outputs/result.json",
+      "files": {"outputs/result.json": {"name": "demo", "count": 2, "tags": ["a"]}}
+    },
+    {
+      "note": "JSON embedded in output.md validates when no path is given",
+      "assertion": {"type": "structured_output", "schema": {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}},
+      "output": "Result:\n{\"ok\": true}\ndone."
+    }
+  ]
+}

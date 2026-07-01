@@ -1,0 +1,15 @@
+{
+  "detector": "similarity",
+  "cases": [
+    {
+      "note": "near-identical text clears the default 0.8 threshold",
+      "assertion": {"type": "similarity", "expected": "The migration was rolled back cleanly and the schema was restored."},
+      "output": "The migration was rolled back cleanly and the schema was restored"
+    },
+    {
+      "note": "lowered threshold tolerates paraphrase",
+      "assertion": {"type": "similarity", "expected": "alpha beta gamma delta epsilon", "threshold": 0.5},
+      "output": "alpha beta gamma variant epsilon"
+    }
+  ]
+}

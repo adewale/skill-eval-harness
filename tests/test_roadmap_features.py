@@ -525,6 +525,166 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertEqual(result["deferred_judge_tasks"], 1)
 
 
+class SimilarityScorerTests(unittest.TestCase):
+    """1.4 — deterministic difflib similarity with a threshold and a score."""
+
+    def result(self, output: str, threshold: float | None = None) -> dict:
+        assertion = {"type": "similarity", "expected": "alpha beta gamma"}
+        if threshold is not None:
+            assertion["threshold"] = threshold
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text(output, encoding="utf-8")
+            return sb.assertion_result(assertion, output, base / "output.md", run_base=base)
+
+    def test_identical_scores_one(self):
+        r = self.result("alpha beta gamma")
+        self.assertTrue(r["passed"])
+        self.assertEqual(r["score"], 1.0)
+
+    def test_threshold_boundaries(self):
+        exact = self.result("alpha beta gamma", threshold=1.0)
+        self.assertTrue(exact["passed"])
+        near = self.result("alpha beta gamma!", threshold=1.0)
+        self.assertFalse(near["passed"])
+        self.assertGreater(near["score"], 0.9)
+        loose = self.result("alpha beta gamma!", threshold=0.9)
+        self.assertTrue(loose["passed"])
+
+    def test_default_severity_is_soft(self):
+        self.assertEqual(sb.assertion_severity({"type": "similarity"}), "soft")
+
+
+class GradedScriptOracleTests(unittest.TestCase):
+    """1.8 — a script oracle may print {"score", "max_score"}; exit code still
+    decides passed, the score only feeds the graded channel."""
+
+    def run_script(self, code: str) -> dict:
+        assertion = {"type": "script", "command": ["python3", "-c", code]}
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text("x", encoding="utf-8")
+            return sb.assertion_result(assertion, "x", base / "output.md", run_base=base, allow_scripts=True, manifest_dir=base)
+
+    def test_score_line_is_parsed_and_normalized(self):
+        r = self.run_script("print('{\"score\": 6, \"max_score\": 7}')")
+        self.assertTrue(r["passed"])
+        self.assertAlmostEqual(r["score"], 6 / 7, places=4)
+
+    def test_no_score_line_stays_binary(self):
+        r = self.run_script("print('all good')")
+        self.assertTrue(r["passed"])
+        self.assertEqual(r["score"], 1.0)   # binary mirror of passed
+
+    def test_malformed_score_line_falls_back_to_exit_code(self):
+        r = self.run_script("print('{\"score\": \"six\"}')")
+        self.assertTrue(r["passed"])
+        self.assertEqual(r["score"], 1.0)
+
+    def test_failing_exit_code_beats_perfect_score(self):
+        r = self.run_script("print('{\"score\": 7, \"max_score\": 7}'); raise SystemExit(1)")
+        self.assertFalse(r["passed"])
+        self.assertEqual(r["score"], 1.0)   # graded value preserved, passed decided by exit
+
+    def test_parse_helper_edge_cases(self):
+        self.assertIsNone(sb.parse_script_score_line(""))
+        self.assertIsNone(sb.parse_script_score_line("not json"))
+        self.assertEqual(sb.parse_script_score_line('{"score": 0.5}'), 0.5)
+        self.assertEqual(sb.parse_script_score_line('{"score": 9, "max_score": 3}'), 1.0)  # clamped
+
+
+class JudgePresetTests(unittest.TestCase):
+    """1.1 — factuality preset expands to a canned anchored rubric."""
+
+    def test_factuality_type_expands_with_rubric_and_threshold(self):
+        expanded = sb.expand_judge_preset({"type": "factuality"})
+        self.assertTrue(expanded["rubric"])
+        self.assertEqual(expanded["threshold"], 4)
+        self.assertEqual(expanded["name"], "factuality")
+
+    def test_explicit_fields_win_over_preset(self):
+        expanded = sb.expand_judge_preset({"type": "judge", "preset": "factuality", "threshold": 5, "name": "custom"})
+        self.assertEqual(expanded["threshold"], 5)
+        self.assertEqual(expanded["name"], "custom")
+        self.assertTrue(expanded["rubric"])
+
+    def test_factuality_emits_judge_task_with_rubric_and_merges_results(self):
+        case = {"id": "c", "split": "tune", "kind": "behavior", "prompt": "p",
+                "assertions": [{"type": "factuality"}]}
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text("claims", encoding="utf-8")
+            result, tasks = sb.grade_case_variant(case, "with_skill", "claims", base / "output.md", {}, run_base=base)
+            self.assertEqual(len(tasks), 1)
+            self.assertTrue(tasks[0]["assertion"]["rubric"])   # canned rubric rides the judge task
+            jid = tasks[0]["judge_task_id"]
+            merged, _ = sb.grade_case_variant(case, "with_skill", "claims", base / "output.md", {}, run_base=base,
+                                              judge_results={jid: {"passed": True, "score": 5, "rationale": "grounded"}})
+        self.assertEqual(merged["qualitative_passed"], 1)
+        self.assertEqual(merged["qualitative_assertions"][0]["oracle"], "live")
+
+    def test_unknown_preset_dies_in_validation(self):
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"] = [{"type": "judge", "preset": "vibes"}]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+
+
+class OracleTierTests(unittest.TestCase):
+    """1.7 — oracle-strength labeling, report share, and the weak-only warning."""
+
+    def test_tier_defaults_by_type(self):
+        self.assertEqual(sb.oracle_tier({"type": "contains"}), "strong")
+        self.assertEqual(sb.oracle_tier({"type": "command_ran"}), "strong")
+        self.assertEqual(sb.oracle_tier({"type": "script"}), "demo")
+        self.assertEqual(sb.oracle_tier({"type": "judge"}), "live")
+        self.assertEqual(sb.oracle_tier({"type": "factuality"}), "live")
+        self.assertEqual(sb.oracle_tier({"type": "script", "oracle": "strong"}), "strong")   # rendered-artifact oracle
+
+    def test_invalid_tier_dies(self):
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"][0]["oracle"] = "mighty"
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+
+    def test_report_carries_strong_pass_share(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = base_manifest()
+            manifest["cases"][0]["assertions"] = [
+                {"name": "strong-check", "type": "contains", "value": "alpha"},
+                {"name": "demo-check", "type": "script", "command": ["python3", "-c", "raise SystemExit(0)"]},
+            ]
+            path = write_manifest(root, manifest)
+            runs = root / "runs"
+            for variant in ["with_skill", "without_skill"]:
+                base = runs / "case-1" / variant
+                base.mkdir(parents=True)
+                (base / "output.md").write_text("alpha", encoding="utf-8")
+            report = sb.build_benchmark_report(path, runs, allow_scripts=True)
+        strength = report["oracle_strength"]["case-1"]
+        self.assertEqual(strength["strong_pass_share"], 0.5)
+        self.assertEqual(strength["passed_by_tier"], {"demo": 2, "strong": 2})
+
+    def test_weak_oracle_only_audit_finding(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = base_manifest()
+            manifest["cases"][0]["assertions"] = [{"type": "judge", "rubric": ["good"]}]
+            path = write_manifest(Path(td), manifest)
+            report = sb.audit_manifest_report(path)
+            kinds = [f["kind"] for f in report["findings"]]
+            self.assertIn("weak-oracle-only", kinds)
+            manifest["cases"][0]["assertions"].append({"type": "contains", "value": "alpha"})
+            path = write_manifest(Path(td), manifest)
+            report = sb.audit_manifest_report(path)
+            kinds = [f["kind"] for f in report["findings"]]
+            self.assertNotIn("weak-oracle-only", kinds)
+
+
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 
