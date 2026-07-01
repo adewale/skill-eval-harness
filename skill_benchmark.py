@@ -32,6 +32,7 @@ import yaml
 from ablation_model import (
     AblationRecord,
     Arm,
+    CLAUDE_FAILURE,
     CODEX_FAILURE,
     Component,
     EvidenceClass,
@@ -2873,6 +2874,136 @@ def run_codex(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# First-class Claude adapter — `claude -p --output-format json`.
+#
+# The Codex/Jetty/Pi runners each own their provider's wire format; Claude's is
+# an envelope `{result, total_cost_usd, usage}`. Parsing it in ONE place lets the
+# runner AND the judge capture the same cost/usage fields, and lets those land in
+# the run's metrics.json so the benchmark report can total real dollars — the
+# thing every other adapter leaves the caller to reconstruct out of band.
+# --------------------------------------------------------------------------- #
+
+CLAUDE_USAGE_KEYS = {
+    "input_tokens": ("input_tokens", "prompt_tokens"),
+    "output_tokens": ("output_tokens", "completion_tokens"),
+    "cache_read_tokens": ("cache_read_input_tokens", "cache_read_tokens"),
+    "cache_creation_tokens": ("cache_creation_input_tokens", "cache_creation_tokens"),
+}
+
+
+def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
+    """Pure parser for the `claude -p --output-format json` envelope. Returns
+    {answer, cost_usd, usage, parse_error}. Tolerant: if the envelope isn't JSON
+    (e.g. --output-format text slipped through), the raw stdout IS the answer and
+    cost/usage are absent — never raises, so a runner never crashes on a verdict."""
+    text = stdout if isinstance(stdout, str) else ""
+    try:
+        env = extract_json_object(text)
+    except Exception as exc:  # noqa: BLE001
+        return {"answer": text, "cost_usd": None, "usage": {}, "parse_error": str(exc)}
+    if not isinstance(env, dict) or "result" not in env:
+        # Valid JSON but not the -p envelope; treat the whole thing as the answer.
+        return {"answer": text, "cost_usd": None, "usage": {}, "parse_error": "not a claude -p json envelope"}
+    raw_usage = env.get("usage") if isinstance(env.get("usage"), dict) else {}
+    usage: dict[str, int] = {}
+    for norm, aliases in CLAUDE_USAGE_KEYS.items():
+        for a in aliases:
+            v = raw_usage.get(a)
+            if isinstance(v, (int, float)):
+                usage[norm] = int(v)
+                break
+    if "input_tokens" in usage and "output_tokens" in usage:
+        usage.setdefault("total_tokens", usage["input_tokens"] + usage["output_tokens"])
+    cost = env.get("total_cost_usd")
+    return {
+        "answer": env.get("result") or "",
+        "cost_usd": cost if isinstance(cost, (int, float)) else None,
+        "usage": usage,
+        "parse_error": None,
+    }
+
+
+def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str = "claude",
+                      timeout: int = 1800, extra_args: list[str] | None = None) -> dict[str, Any]:
+    """Single owner for invoking Claude via `claude -p`. Returns the parsed
+    envelope plus returncode/elapsed_ms/stderr. `claude_bin` is an executable path
+    (tests inject a stub that emits a canned envelope), NOT a shell string — so
+    there is no shell-quoting seam between the harness and the model."""
+    argv = [claude_bin, "-p", "--output-format", "json"]
+    if model:
+        argv += ["--model", model]
+    if extra_args:
+        argv += list(extra_args)
+    started = time.time()
+    try:
+        proc = subprocess.run(argv, input=prompt, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return {"answer": "", "cost_usd": None, "usage": {}, "parse_error": None,
+                "returncode": None, "timed_out": True, "elapsed_ms": int((time.time() - started) * 1000),
+                "stderr": str(exc)[:4000]}
+    parsed = parse_claude_cli_json(proc.stdout)
+    parsed.update({
+        "returncode": proc.returncode,
+        "timed_out": False,
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "stderr": (proc.stderr or "")[:4000],
+    })
+    return parsed
+
+
+def claude_run_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    """The metrics.json body for one Claude run: the token usage, the real dollar
+    cost, and timing — the fields the benchmark report aggregates."""
+    usage = result.get("usage") or {}
+    metrics: dict[str, Any] = {"schema_version": 1, "source": "claude"}
+    for k in ("input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_creation_tokens"):
+        if isinstance(usage.get(k), (int, float)):
+            metrics[k] = int(usage[k])
+    if isinstance(result.get("cost_usd"), (int, float)):
+        metrics["cost_usd"] = float(result["cost_usd"])
+    if isinstance(result.get("elapsed_ms"), (int, float)):
+        metrics["elapsed_ms"] = int(result["elapsed_ms"])
+    if result.get("returncode") is not None:
+        metrics["returncode"] = result["returncode"]
+    return metrics
+
+
+def run_claude(args: argparse.Namespace) -> int:
+    tasks = load_jsonl(Path(args.tasks))
+    runs = Path(args.runs)
+    model = getattr(args, "model", None)
+    claude_bin = getattr(args, "claude_bin", None) or "claude"
+    timeout = int(getattr(args, "timeout", 1800))
+    for task in tasks:
+        pt = PreparedTask.from_row(task)
+        base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
+        base.mkdir(parents=True, exist_ok=True)
+        prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
+        with tempfile.TemporaryDirectory(prefix="claude-ws-") as wd:
+            ws = Path(wd)
+            skill_rel, input_rel = codex_skill_workspace(pt, ws)
+            prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
+            result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
+            metrics = claude_run_metrics(result)
+            write_json(base / "metrics.json", metrics)
+            write_json(base / "metadata.json", {
+                "provider": "claude", "model": model, "returncode": result.get("returncode"),
+                "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
+                "cost_usd": metrics.get("cost_usd"), "stderr": result.get("stderr", ""),
+                "trace_source": "claude", **prov_extra})
+            write_json(base / "events.json", {"schema_version": 1, "source": "claude", "events": []})
+            answer = result.get("answer") or ""
+            if result.get("timed_out"):
+                answer = f"{CLAUDE_FAILURE}: timed out after {timeout}s]\n"
+            elif result.get("returncode") not in (0, None):
+                answer = f"{CLAUDE_FAILURE}: returncode={result.get('returncode')}]\n\n{answer}\n\nstderr:\n{result.get('stderr','')}"
+            elif not answer:
+                answer = f"{CLAUDE_FAILURE}: no output produced]\n"
+            (base / "output.md").write_text(answer, encoding="utf-8")
+    return 0
+
+
 def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_dir: Path | None) -> tuple[bool, str]:
     command = script_command_list(assertion)
     command = [part.replace("{output_dir}", str(output_dir.resolve())).replace("{output_path}", str((output_dir / "output.md").resolve())) for part in command]
@@ -3069,15 +3200,28 @@ def judge_verdict_passed(verdict: dict[str, Any], *, default_threshold: float = 
     return False
 
 
-def run_one_judge_task(task: dict[str, Any], judge_cmd: str, transcripts_dir: Path | None = None, repeat_index: int = 1) -> dict[str, Any]:
+def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, transcripts_dir: Path | None = None,
+                       repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude") -> dict[str, Any]:
     output_path = Path(task.get("output_path", ""))
     output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
     prompt = judge_prompt(task, output_text)
-    proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
+    # Two judge backends, one verdict shape. A shell `judge_cmd` (any provider), OR
+    # the native Claude adapter when only `--judge-model` is given — the native path
+    # captures the real dollar cost of judging, which a shell cmd can't report back.
+    cost_usd = None
+    if judge_cmd:
+        proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
+        stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
+    elif judge_model:
+        res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin)
+        stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
+        cost_usd = res.get("cost_usd")
+    else:
+        raise ValueError("run_one_judge_task needs a judge_cmd or a judge_model")
     parsed: dict[str, Any]
     parse_error = None
     try:
-        parsed = extract_json_object(proc.stdout)
+        parsed = extract_json_object(stdout)
     except Exception as exc:
         parsed = {}
         parse_error = str(exc)
@@ -3091,21 +3235,25 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str, transcripts_dir: Pa
         "case_id": task.get("case_id"),
         "variant": task.get("variant"),
         "run_number": task.get("run_number"),
-        "passed": passed and proc.returncode == 0 and parse_error is None,
+        # The judge is a variable, not a constant: which model produced this verdict
+        # is recorded so a panel can measure whether the answer depends on the judge.
+        "judge_model": judge_model,
+        "cost_usd": cost_usd,
+        "passed": passed and returncode == 0 and parse_error is None,
         "score": score,
         "threshold": threshold,
         "evidence": evidence,
-        "returncode": proc.returncode,
-        "stderr": proc.stderr[:4000] if proc.stderr else "",
+        "returncode": returncode,
+        "stderr": stderr[:4000] if stderr else "",
     }
     if transcripts_dir:
         safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", task["judge_task_id"])
         dest = transcripts_dir / safe / f"run-{repeat_index}"
         dest.mkdir(parents=True, exist_ok=True)
         (dest / "prompt.md").write_text(prompt, encoding="utf-8")
-        (dest / "stdout.txt").write_text(proc.stdout, encoding="utf-8")
-        if proc.stderr:
-            (dest / "stderr.txt").write_text(proc.stderr, encoding="utf-8")
+        (dest / "stdout.txt").write_text(stdout, encoding="utf-8")
+        if stderr:
+            (dest / "stderr.txt").write_text(stderr, encoding="utf-8")
         write_json(dest / "result.json", row)
     return row
 
@@ -3125,6 +3273,11 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def judge_command(args: argparse.Namespace) -> int:
+    judge_cmd = getattr(args, "judge_cmd", None)
+    judge_model = getattr(args, "judge_model", None)
+    claude_bin = getattr(args, "claude_bin", None) or "claude"
+    if not judge_cmd and not judge_model:
+        die("judge needs --judge-cmd (any provider) or --judge-model (native Claude)")
     tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
     transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
     repeat = max(1, int(getattr(args, "judge_runs", 1)))
@@ -3132,11 +3285,63 @@ def judge_command(args: argparse.Namespace) -> int:
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
     try:
         for task in tasks:
-            rows = [run_one_judge_task(task, args.judge_cmd, transcripts, i) for i in range(1, repeat + 1)]
+            rows = [run_one_judge_task(task, judge_cmd, transcripts, i, judge_model=judge_model, claude_bin=claude_bin)
+                    for i in range(1, repeat + 1)]
             fh.write(json.dumps(merge_repeated_judge_rows(rows), ensure_ascii=False) + "\n")
     finally:
         if out:
             fh.close()
+    return 0
+
+
+def judge_panel_sensitivity(reports_by_judge: dict[str, dict[str, Any]], *, magnitude_eps: float = 0.1) -> dict[str, Any]:
+    """Given {judge_model: judged_benchmark_report}, measure whether the skill's
+    MEASURED value depends on which judge graded it. Per judge, the combined
+    with_skill − without_skill lift; then:
+      sign_sensitive      — judges disagree on whether the skill even helps (the
+                            sign of the lift is not unanimous).
+      magnitude_sensitive — the spread between judges' lifts exceeds magnitude_eps
+                            (they agree on direction but not on how much).
+    `judge_sensitive` is either. This is the good-pr finding made first-class: a
+    single judge number is not reproducible across judge choice for a subtle skill."""
+    per_judge: dict[str, float | None] = {}
+    for jm, rep in reports_by_judge.items():
+        summ = (rep or {}).get("summary", {}) or {}
+        w = (summ.get("with_skill", {}) or {}).get("mean_combined_pass_rate")
+        wo = (summ.get("without_skill", {}) or {}).get("mean_combined_pass_rate")
+        per_judge[jm] = (w - wo) if isinstance(w, (int, float)) and isinstance(wo, (int, float)) else None
+    lifts = [v for v in per_judge.values() if v is not None]
+    signs = {(1 if v > 1e-9 else -1 if v < -1e-9 else 0) for v in lifts}
+    spread = (max(lifts) - min(lifts)) if len(lifts) >= 2 else 0.0
+    sign_sensitive = len(signs) > 1
+    magnitude_sensitive = spread > magnitude_eps
+    return {
+        "judges": sorted(reports_by_judge),
+        "lift_by_judge": {k: (round(v, 6) if isinstance(v, (int, float)) else None) for k, v in per_judge.items()},
+        "sign_sensitive": sign_sensitive,
+        "magnitude_spread": round(spread, 6),
+        "magnitude_sensitive": magnitude_sensitive,
+        "judge_sensitive": sign_sensitive or magnitude_sensitive,
+    }
+
+
+def compare_judges(args: argparse.Namespace) -> int:
+    """Compare judged benchmark reports produced by different judge models and flag
+    judge-sensitivity. Each --report is `name=path` where path is a benchmark report
+    JSON that was merged with that judge's results (`benchmark --judge-results`)."""
+    reports_by_judge: dict[str, dict[str, Any]] = {}
+    for spec in args.report or []:
+        if "=" not in spec:
+            die(f"--report expects name=path, got {spec!r}")
+        name, path = spec.split("=", 1)
+        reports_by_judge[name] = load_json(Path(path))
+    if len(reports_by_judge) < 2:
+        die("compare-judges needs at least two --report name=path entries (a panel)")
+    result = judge_panel_sensitivity(reports_by_judge, magnitude_eps=float(getattr(args, "magnitude_eps", 0.1)))
+    if getattr(args, "out", None):
+        write_json(Path(args.out), result)
+    else:
+        print(json.dumps(result, indent=2))
     return 0
 
 
@@ -3681,7 +3886,17 @@ def build_benchmark_report(
     variants = variants_arg or manifest.get("variants", DEFAULT_VARIANTS)
     judge_lookup = load_judge_results(judge_results_path)
     results = []
+    skipped_trigger_cases = []
     for case in iter_cases(manifest, split):
+        # Trigger/discovery cases belong to the autonomous-trigger adapter, whose
+        # output is a raw_autonomous_trigger_measurement. Grading their content here
+        # would fold a discovery measurement into the paired ANSWER pass-rate under
+        # no evidence label — the cross-population conflation the spec warns against.
+        # The prepare path already withholds trigger cases from answer runners; the
+        # grader enforces the same boundary rather than trusting that upstream.
+        if case.get("kind") == "trigger":
+            skipped_trigger_cases.append(case["id"])
+            continue
         for variant in variants:
             for run_number, base in discover_run_bases(runs, case["id"], variant):
                 text, output_path = read_output_base(base)
@@ -3711,9 +3926,11 @@ def build_benchmark_report(
         elapsed = [metric_number(m, "elapsed_ms") for m in merged_metrics]
         tokens = [metric_number(m, "total_tokens") for m in merged_metrics]
         commands = [metric_number(m, "commands", "command_count") for m in merged_metrics]
+        costs = [metric_number(m, "cost_usd") for m in merged_metrics]
         elapsed = [x for x in elapsed if x is not None]
         tokens = [x for x in tokens if x is not None]
         commands = [x for x in commands if x is not None]
+        costs = [x for x in costs if x is not None]
         summary[variant] = {
             "cases": len({r["case_id"] for r in rows}),
             "runs": len(rows),
@@ -3730,6 +3947,10 @@ def build_benchmark_report(
             "elapsed_ms": stats(elapsed),
             "total_tokens": stats(tokens),
             "command_count": stats(commands),
+            # Real dollar cost, when a runner recorded it (the Claude adapter does).
+            # Sum, not mean: "what did this arm cost to run" — over scorable runs only.
+            "cost_usd_total": round(sum(costs), 6) if costs else None,
+            "cost_usd": stats(costs),
             "telemetry_availability": telemetry_summary(rows),
             # Backward-compatible fields used by smoke_report.py callers.
             "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
@@ -3767,6 +3988,15 @@ def build_benchmark_report(
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
         "generated_at": int(time.time()),
+        # This is the ANSWER population: a paired with_skill/without_skill
+        # comparison. Stamped so a consumer can never line these pass-rates up
+        # next to a trigger report's raw_autonomous_trigger_measurement as if they
+        # were the same metric — the distinguishing label lives in the JSON, not
+        # only in prose. (We deliberately do NOT stamp evidence_class here:
+        # CONFIRMED_CAUSAL is reserved for the per-ablation causal_confirmation
+        # door and lives on ablation_regressions, not on a with/without summary.)
+        "population": "answer",
+        "skipped_trigger_cases": skipped_trigger_cases,
         "summary": summary,
         "paired_summary": build_paired_summary(results),
         "slice_summary": build_slice_summary(results, variants),
@@ -4374,7 +4604,52 @@ def fixture_recommendations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 POSITIVE_OBJECTIVE_TYPES = {"contains", "contains_any", "contains_all", "regex"}
 
 
-def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str | None = None, leakage_min_chars: int = 4) -> dict[str, Any]:
+def _mean_or_none(xs: list[float] | None) -> float | None:
+    xs = [x for x in (xs or []) if isinstance(x, (int, float))]
+    return statistics.mean(xs) if xs else None
+
+
+def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9) -> dict[str, list]:
+    """From a benchmark report's per-case scorable results, surface the cases a
+    static manifest audit CANNOT see — the ones where the *measured* numbers say
+    the case can't discriminate the skill:
+
+      base_saturated   — combined with_skill == without_skill: the case measures
+                         nothing (the base model does it with or without the skill).
+      qualitative_only — objective with == without (the deterministic assertions
+                         don't move) yet combined with > without: the whole signal
+                         is carried by the judge. An objective-only eval would call
+                         this skill useless (the anti-slop case)."""
+    obj: dict[Any, dict[str, list]] = {}
+    comb: dict[Any, dict[str, list]] = {}
+    for r in benchmark_report.get("results", []) or []:
+        if not scorable_run(r):
+            continue
+        cid, v = r.get("case_id"), r.get("variant")
+        if r.get("objective_pass_rate") is not None:
+            obj.setdefault(cid, {}).setdefault(v, []).append(r["objective_pass_rate"])
+        cr = r.get("combined_pass_rate")
+        if cr is None:
+            cr = r.get("objective_pass_rate")
+        if cr is not None:
+            comb.setdefault(cid, {}).setdefault(v, []).append(cr)
+    base_saturated, qualitative_only = [], []
+    for cid, cv in comb.items():
+        cw, cn = _mean_or_none(cv.get("with_skill")), _mean_or_none(cv.get("without_skill"))
+        if cw is None or cn is None:
+            continue
+        if abs(cw - cn) <= eps:
+            base_saturated.append(cid)
+            continue
+        ow = _mean_or_none(obj.get(cid, {}).get("with_skill"))
+        on = _mean_or_none(obj.get(cid, {}).get("without_skill"))
+        if ow is not None and on is not None and abs(ow - on) <= eps and cw > cn + eps:
+            qualitative_only.append(cid)
+    return {"base_saturated_cases": sorted(base_saturated, key=str),
+            "qualitative_only_cases": sorted(qualitative_only, key=str)}
+
+
+def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str | None = None, leakage_min_chars: int = 4, benchmark_report: dict[str, Any] | None = None) -> dict[str, Any]:
     """A compact, offline 'is this eval worth paying to run?' verdict. It collapses
     the three things that decide whether a measured number will MEAN anything:
     are the ablations real (materialized, not instruction-simulated), does any case
@@ -4389,13 +4664,22 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
     for f in prompt_assertion_leakage_findings(manifest, manifest_path, min_chars=leakage_min_chars, split=split):
         leaked.setdefault(f["case_id"], set()).add(f["assertion"])
     leak_saturated: list[Any] = []
+    objective_only: list[Any] = []
     adversarial = judge_only = 0
     for case in iter_cases(manifest, split):
-        if case.get("kind") == "adversarial":
+        kind = case.get("kind")
+        if kind == "adversarial":
             adversarial += 1
         asserts = case.get("assertions", []) or []
         if asserts and all(a.get("type") == "judge" for a in asserts):
             judge_only += 1
+        # A behaviour case (not a trigger/adversarial probe) with assertions but NO
+        # qualitative (judge/rubric) check can only ever measure objective compliance
+        # — if the skill's value is voice/judgement it will read as zero lift here
+        # (the anti-slop lesson, statically). Not a blocker (some skills are purely
+        # objective), but the place to add a judge assertion if the run shows no lift.
+        if kind not in ("trigger", "adversarial") and asserts and not any(a.get("type") in QUALITATIVE_ASSERTIONS for a in asserts):
+            objective_only.append(case.get("id"))
         positive = [a for a in asserts if a.get("type") in POSITIVE_OBJECTIVE_TYPES]
         # A case is leak-saturated when EVERY positive objective assertion can be passed
         # by echoing the prompt. "Leak-checkable" is defined by the leakage lint itself
@@ -4414,11 +4698,22 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
         blockers.append(f"{len(leak_saturated)} case(s) are leak-saturated (every positive assertion value appears in the prompt) — they cannot discriminate skill from no-skill")
     if adversarial == 0:
         blockers.append("no adversarial cases (kind: adversarial) — add the near-miss/under-pressure cases where the skill must hold")
+    # Run-measured signals (only when a benchmark report is supplied): cases whose
+    # MEASURED numbers say they can't discriminate the skill. base_saturated is a
+    # blocker (a case that measures nothing is wasted budget); qualitative_only is a
+    # warning that the case's signal lives entirely in the judge, so an
+    # objective-only reading would miss it.
+    run = readiness_run_signals(benchmark_report) if benchmark_report else {"base_saturated_cases": [], "qualitative_only_cases": []}
+    if run["base_saturated_cases"]:
+        blockers.append(f"{len(run['base_saturated_cases'])} case(s) are base-saturated (measured with_skill == without_skill) — they cannot measure the skill; cut or harden them")
     return {
         "ablations": {"total": len(ablations), "materialized": materialized, "instruction_simulated": instr_sim},
         "leak_saturated_cases": leak_saturated,
+        "objective_only_cases": objective_only,
         "adversarial_cases": adversarial,
         "judge_only_cases": judge_only,
+        "base_saturated_cases": run["base_saturated_cases"],
+        "qualitative_only_cases": run["qualitative_only_cases"],
         "blockers": blockers,
     }
 
@@ -4517,8 +4812,10 @@ def audit_manifest_report(
         rec("trigger-cases", "Add both TRIGGER and NO_TRIGGER cases with anchored expected-trigger-label regex assertions.")
 
     benchmark_summary = None
+    bench_report = None
     if runs:
         report = build_benchmark_report(manifest_path, Path(runs), split)
+        bench_report = report
         benchmark_summary = {"summary": report["summary"], "case_flags": report["case_flags"]}
         for flag in report["case_flags"]:
             for f in flag.get("flags", []):
@@ -4582,7 +4879,7 @@ def audit_manifest_report(
         "findings": findings,
         "recommendations": recommendations,
         "recommended_fixture_repos_files": fixtures,
-        "readiness": eval_readiness(manifest, manifest_path, split=split, leakage_min_chars=leakage_min_chars),
+        "readiness": eval_readiness(manifest, manifest_path, split=split, leakage_min_chars=leakage_min_chars, benchmark_report=bench_report),
         "benchmark": benchmark_summary,
     }
 
@@ -4609,7 +4906,11 @@ def audit_manifest(args: argparse.Namespace) -> int:
                   f"- ablations materialized: {rd.get('ablations',{}).get('materialized',0)}/{rd.get('ablations',{}).get('total',0)} "
                   f"(instruction-simulated: {rd.get('ablations',{}).get('instruction_simulated',0)})",
                   f"- leak-saturated cases: {len(rd.get('leak_saturated_cases',[]))}",
+                  f"- objective-only cases (no judge assertion): {len(rd.get('objective_only_cases',[]))}",
                   f"- adversarial cases: {rd.get('adversarial_cases',0)}   judge-only cases: {rd.get('judge_only_cases',0)}"]
+        if rd.get("base_saturated_cases") or rd.get("qualitative_only_cases"):
+            lines.append(f"- measured signals: base-saturated (with==without): {len(rd.get('base_saturated_cases',[]))}   "
+                         f"qualitative-only (judge carries the lift): {len(rd.get('qualitative_only_cases',[]))}")
         if rd.get("blockers"):
             lines.append("- **blockers before a paid run:**")
             for b in rd["blockers"]:
@@ -5045,6 +5346,13 @@ def main() -> int:
     p.add_argument("--codex-cmd", default="codex exec --json", help="shell command that reads prompt on stdin and emits Codex JSONL")
     p.add_argument("--timeout", type=int, default=1800)
 
+    p = sub.add_parser("run-claude", help="run prepared tasks through `claude -p --output-format json`, capturing cost/usage")
+    p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
+    p.add_argument("--runs", required=True, help="output runs directory")
+    p.add_argument("--model", help="claude model id (e.g. claude-haiku-4-5-20251001); omit for the CLI default")
+    p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
+    p.add_argument("--timeout", type=int, default=1800)
+
     p = sub.add_parser("grade")
     p.add_argument("manifest")
     p.add_argument("--runs", required=True)
@@ -5061,7 +5369,9 @@ def main() -> int:
     p.add_argument("--runs", required=True)
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
-    p.add_argument("--judge-cmd", required=True, help="shell command that reads a judge prompt on stdin and emits JSON on stdout")
+    p.add_argument("--judge-cmd", help="shell command that reads a judge prompt on stdin and emits JSON on stdout (any provider)")
+    p.add_argument("--judge-model", help="judge natively with `claude -p <model>` (captures cost); stamped on every verdict")
+    p.add_argument("--claude-bin", default="claude", help="path to the claude executable when using --judge-model")
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
     p.add_argument("--transcripts", help="directory for per-task prompt/stdout/stderr/result audit transcripts")
     p.add_argument("--out")
@@ -5073,6 +5383,11 @@ def main() -> int:
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-results", help="merge qualitative judge scoring into combined pass rates")
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
+    p.add_argument("--out")
+
+    p = sub.add_parser("compare-judges", help="flag judge-sensitivity across judged benchmark reports")
+    p.add_argument("--report", action="append", metavar="NAME=PATH", help="judge label = judged benchmark report JSON (repeatable)")
+    p.add_argument("--magnitude-eps", type=float, default=0.1, help="lift-spread above which the skill is judge-magnitude-sensitive")
     p.add_argument("--out")
 
     p = sub.add_parser("export-anthropic")
@@ -5194,12 +5509,16 @@ def main() -> int:
         return import_trace(args)
     if args.cmd == "run-codex":
         return run_codex(args)
+    if args.cmd == "run-claude":
+        return run_claude(args)
     if args.cmd == "grade":
         return grade(args)
     if args.cmd == "judge":
         return judge_command(args)
     if args.cmd == "benchmark":
         return benchmark(args)
+    if args.cmd == "compare-judges":
+        return compare_judges(args)
     if args.cmd == "export-anthropic":
         return export_anthropic(args)
     if args.cmd == "compare-tasks":

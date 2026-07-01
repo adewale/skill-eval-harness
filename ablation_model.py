@@ -61,8 +61,9 @@ def _require(d: dict[str, Any], key: str, types: "type | tuple[type, ...]", ctx:
 # slip a crashed run past the scorable filter.
 CODEX_FAILURE = "[CODEX FAILURE"
 JETTY_FAILURE = "[JETTY FAILURE"
+CLAUDE_FAILURE = "[CLAUDE FAILURE"
 TIMEOUT_FAILURE = "[TIMEOUT"
-RUNNER_FAILURE_MARKERS = (CODEX_FAILURE, JETTY_FAILURE, TIMEOUT_FAILURE)
+RUNNER_FAILURE_MARKERS = (CODEX_FAILURE, JETTY_FAILURE, CLAUDE_FAILURE, TIMEOUT_FAILURE)
 
 
 def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:

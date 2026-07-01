@@ -117,7 +117,7 @@ class D1_FailureMarkerOwnerTests(unittest.TestCase):
 
     def test_writer_constants_are_exactly_the_detector_markers(self):
         import ablation_model as am
-        self.assertEqual((am.CODEX_FAILURE, am.JETTY_FAILURE, am.TIMEOUT_FAILURE), am.RUNNER_FAILURE_MARKERS)
+        self.assertEqual((am.CODEX_FAILURE, am.JETTY_FAILURE, am.CLAUDE_FAILURE, am.TIMEOUT_FAILURE), am.RUNNER_FAILURE_MARKERS)
 
     def test_each_formatted_failure_body_is_non_executable(self):
         import ablation_model as am
@@ -408,6 +408,84 @@ class JudgeVerdictPassedTests(unittest.TestCase):
             self.assertEqual(tasks, [])                      # verdict supplied, no new judge task
             self.assertEqual(result["qualitative_passed"], 1)
             self.assertEqual(result["qualitative_total"], 1)
+
+
+class ReadinessRunSignalTests(unittest.TestCase):
+    """eval-readiness gains two MEASURED signals (need run data, not just the
+    manifest): base_saturated (with==without: measures nothing) and
+    qualitative_only (objective flat but combined lifts: the judge carries the whole
+    signal — the anti-slop case an objective-only eval would miss)."""
+
+    def _res(self, cid, variant, obj, comb):
+        return {"case_id": cid, "variant": variant, "objective_pass_rate": obj,
+                "combined_pass_rate": comb, "missing_output": False, "execution_valid": True}
+
+    def test_run_signals_classify_cases(self):
+        report = {"results": [
+            # base-saturated: combined identical across arms
+            self._res("base", "with_skill", 1.0, 1.0), self._res("base", "without_skill", 1.0, 1.0),
+            # qualitative-only: objective identical, combined lifts with_skill
+            self._res("qual", "with_skill", 0.5, 0.9), self._res("qual", "without_skill", 0.5, 0.6),
+            # genuine objective lift: neither flag
+            self._res("real", "with_skill", 1.0, 1.0), self._res("real", "without_skill", 0.5, 0.5),
+        ]}
+        sig = sb.readiness_run_signals(report)
+        self.assertEqual(sig["base_saturated_cases"], ["base"])
+        self.assertEqual(sig["qualitative_only_cases"], ["qual"])
+
+    def test_objective_only_is_static_and_base_saturated_blocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"; _skill(rp)
+            cases = [{"id": "obj", "split": "tune", "kind": "pr-review", "prompt": "review this",
+                      "assertions": [{"name": "k", "type": "contains", "value": "TOKEN-NOT-IN-PROMPT"}]},
+                     {"id": "adv", "split": "tune", "kind": "adversarial", "prompt": "tricky near-miss to hold",
+                      "assertions": [{"name": "q", "type": "judge", "prompt": "held?"}]}]
+            p = _manifest(rp, cases)
+            # static: the objective-only positive case is flagged, the judge case isn't
+            r = sb.eval_readiness(sb.validate_manifest(p), p)
+            self.assertIn("obj", r["objective_only_cases"])
+            self.assertNotIn("adv", r["objective_only_cases"])
+            self.assertEqual(r["base_saturated_cases"], [])            # no run data => empty
+            # with run data showing obj is base-saturated, it becomes a blocker
+            bench = {"results": [
+                {"case_id": "obj", "variant": "with_skill", "objective_pass_rate": 1.0,
+                 "combined_pass_rate": 1.0, "missing_output": False, "execution_valid": True},
+                {"case_id": "obj", "variant": "without_skill", "objective_pass_rate": 1.0,
+                 "combined_pass_rate": 1.0, "missing_output": False, "execution_valid": True}]}
+            r2 = sb.eval_readiness(sb.validate_manifest(p), p, benchmark_report=bench)
+            self.assertEqual(r2["base_saturated_cases"], ["obj"])
+            self.assertTrue(any("base-saturated" in b for b in r2["blockers"]))
+
+
+class TriggerNotGradedIntoAnswerTests(unittest.TestCase):
+    """The answer benchmark must not fold kind:'trigger' cases into its paired
+    pass-rate: a trigger case is a discovery (autonomous-load) measurement, a
+    different population from a with/without answer comparison. Grading its
+    content here would let a user compare that number to a Pi trigger pass-rate as
+    if they were the same metric — the exact cross-population conflation the spec
+    warns against. The report also stamps population='answer' so the two report
+    kinds can't be confused in the emitted JSON."""
+
+    def test_trigger_case_excluded_and_population_stamped(self):
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"; _skill(rp)
+            cases = [
+                {"id": "ans", "split": "tune", "kind": "pr-review", "prompt": "review",
+                 "assertions": [{"name": "k", "type": "contains", "value": "GOOD"}]},
+                {"id": "trg", "split": "tune", "kind": "trigger", "prompt": "would you load?",
+                 "assertions": [{"name": "k", "type": "contains", "value": "GOOD"}]},
+            ]
+            p = _manifest(rp, cases)
+            runs = Path(td) / "runs"
+            for cid in ("ans", "trg"):
+                for v in ("with_skill", "without_skill"):
+                    _write_run(runs / cid / v, "GOOD result", {}, {})
+            report = sb.build_benchmark_report(p, runs, split="tune",
+                                               variants_arg=["with_skill", "without_skill"])
+            self.assertEqual(report["population"], "answer")
+            self.assertEqual(report["skipped_trigger_cases"], ["trg"])
+            self.assertTrue(all(r["case_id"] != "trg" for r in report["results"]))
+            self.assertTrue(any(r["case_id"] == "ans" for r in report["results"]))
 
 
 class JudgeTaskScorabilityTests(unittest.TestCase):
