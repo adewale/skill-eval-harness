@@ -886,6 +886,122 @@ class HeldOutRubricTests(unittest.TestCase):
         self.assertEqual(visibility["held_out"]["mean_graded_score"], 0.4)
 
 
+class DatasetAbstractionTests(unittest.TestCase):
+    """2.5 — one case template fanned over a row set, materialized early."""
+
+    def dataset_manifest(self) -> dict:
+        manifest = base_manifest()
+        manifest["datasets"] = {
+            "cities": [
+                {"id": "paris", "city": "Paris", "river": "Seine"},
+                {"id": "cairo", "city": "Cairo", "river": "Nile"},
+                {"city": "Rome", "river": "Tiber"},
+            ],
+        }
+        manifest["cases"] = [{
+            "id": "river-of",
+            "split": "tune",
+            "kind": "behavior",
+            "template": "cities",
+            "prompt": "Name the river of {city}.",
+            "assertions": [{"name": "names-river", "type": "contains", "value": "{river}"}],
+        }]
+        return manifest
+
+    def test_rows_materialize_into_stable_case_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), self.dataset_manifest())
+            manifest = sb.validate_manifest(path)
+            cases = sb.iter_cases(manifest)
+        self.assertEqual([c["id"] for c in cases], ["river-of-paris", "river-of-cairo", "river-of-3"])
+        self.assertEqual(cases[0]["prompt"], "Name the river of Paris.")
+        self.assertEqual(cases[0]["assertions"][0]["value"], "Seine")
+        self.assertEqual(cases[1]["dataset"], "cities")
+        self.assertTrue(all("template" not in c for c in cases))
+
+    def test_materialized_cases_fan_out_and_grade(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), self.dataset_manifest())
+            manifest = sb.validate_manifest(path)
+            rows = sb.prepared_task_rows(path, manifest, split="tune")
+        self.assertEqual(len(rows), 3 * 2)   # 3 materialized cases x 2 variants
+        self.assertIn("river-of-cairo/with_skill", {r["run_dir"] for r in rows})
+
+    def test_unknown_dataset_dies(self):
+        manifest = self.dataset_manifest()
+        manifest["cases"][0]["template"] = "ghost"
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+
+    def test_leakage_lint_fires_per_materialized_case(self):
+        manifest = self.dataset_manifest()
+        manifest["cases"][0]["prompt"] = "Say {river} for {city}."   # leaks the asserted value
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            loaded = sb.validate_manifest(path)
+            findings = sb.prompt_assertion_leakage_findings(loaded, path)
+        self.assertEqual({f["case_id"] for f in findings}, {"river-of-paris", "river-of-cairo", "river-of-3"})
+
+    def test_regex_braces_survive_substitution(self):
+        row = {"city": "Paris"}
+        value = sb.apply_dataset_row("match {city} with \\d{2,4} and {output_dir}", row)
+        self.assertEqual(value, "match Paris with \\d{2,4} and {output_dir}")
+
+
+class NoCodeRegistryTests(unittest.TestCase):
+    """3.3 — YAML + JSONL definitions compile to a manifest before validation."""
+
+    def write_yaml_repo(self, root: Path, prompt: str = "Name the river of {city}.") -> Path:
+        repo = root / "repo"
+        (repo / "skill").mkdir(parents=True)
+        (repo / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8")
+        (repo / "evals").mkdir()
+        (repo / "evals" / "rows.jsonl").write_text(
+            '{"id": "paris", "city": "Paris", "river": "Seine"}\n{"id": "cairo", "city": "Cairo", "river": "Nile"}\n',
+            encoding="utf-8")
+        (repo / "evals" / "eval.yaml").write_text(
+            "version: 1\n"
+            "skill_name: demo\n"
+            "skill_paths: [skill/SKILL.md]\n"
+            "variants: [with_skill, without_skill]\n"
+            "dataset_files:\n"
+            "  cities: rows.jsonl\n"
+            "cases:\n"
+            "  - id: river-of\n"
+            "    split: tune\n"
+            "    kind: behavior\n"
+            "    template: cities\n"
+            f"    prompt: \"{prompt}\"\n"
+            "    assertions:\n"
+            "      - {name: names-river, type: contains, value: \"{river}\"}\n",
+            encoding="utf-8")
+        return repo / "evals" / "eval.yaml"
+
+    def test_yaml_plus_jsonl_compiles_and_validates(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self.write_yaml_repo(Path(td))
+            manifest = sb.validate_manifest(path)
+            cases = sb.iter_cases(manifest)
+        self.assertEqual([c["id"] for c in cases], ["river-of-paris", "river-of-cairo"])
+        self.assertEqual(cases[1]["assertions"][0]["value"], "Nile")
+
+    def test_leakage_lint_still_runs_on_compiled_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self.write_yaml_repo(Path(td), prompt="Say {river} of {city}.")
+            report = sb.audit_manifest_report(path)
+        kinds = [f["kind"] for f in report["findings"]]
+        self.assertIn("prompt-assertion-leakage", kinds)
+
+    def test_missing_dataset_file_dies(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self.write_yaml_repo(Path(td))
+            (path.parent / "rows.jsonl").unlink()
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+
+
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 

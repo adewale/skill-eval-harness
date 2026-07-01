@@ -182,10 +182,52 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def iter_cases(manifest: dict[str, Any], split: str | None = None) -> list[dict[str, Any]]:
+def apply_dataset_row(value: Any, row: dict[str, Any]) -> Any:
+    """Fill {key} placeholders from a dataset row throughout a case template.
+    Plain replace, not str.format — prompts and regex assertions legitimately
+    contain braces ({output_dir}, quantifiers) that format() would explode on."""
+    if isinstance(value, str):
+        out = value
+        for key, cell in row.items():
+            out = out.replace("{" + str(key) + "}", str(cell))
+        return out
+    if isinstance(value, list):
+        return [apply_dataset_row(item, row) for item in value]
+    if isinstance(value, dict):
+        return {key: apply_dataset_row(item, row) for key, item in value.items()}
+    return value
+
+
+def materialize_dataset_cases(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """The dataset abstraction (roadmap 2.5): a case with `template: <dataset>`
+    fans one template over the dataset's rows into concrete cases — stable ids
+    (`<case>-<row id or 1-based index>`), materialized EARLY so validation,
+    leakage lint, prepare, grade, and report all see ordinary cases."""
     cases = manifest.get("cases", [])
     if not isinstance(cases, list):
         die("manifest.cases must be a list")
+    datasets = manifest.get("datasets") or {}
+    out: list[dict[str, Any]] = []
+    for case in cases:
+        dataset_id = case.get("template") if isinstance(case, dict) else None
+        if not dataset_id:
+            out.append(case)
+            continue
+        rows = datasets.get(str(dataset_id))
+        if not isinstance(rows, list) or not rows:
+            die(f"case {case.get('id')!r}: template references unknown or empty dataset {dataset_id!r}")
+        for i, row in enumerate(rows, 1):
+            if not isinstance(row, dict):
+                die(f"dataset {dataset_id!r}: row #{i} must be an object")
+            materialized = {key: apply_dataset_row(value, row) for key, value in case.items() if key != "template"}
+            materialized["id"] = f"{case.get('id')}-{row.get('id', i)}"
+            materialized["dataset"] = str(dataset_id)
+            out.append(materialized)
+    return out
+
+
+def iter_cases(manifest: dict[str, Any], split: str | None = None) -> list[dict[str, Any]]:
+    cases = materialize_dataset_cases(manifest)
     if split:
         return [c for c in cases if c.get("split") == split]
     return cases
@@ -297,8 +339,47 @@ def prompt_assertion_leakage_findings(manifest: dict[str, Any], manifest_path: P
     return findings
 
 
+def load_manifest_source(path: Path) -> dict[str, Any]:
+    """The no-code registry loader (roadmap 3.3): a manifest may be authored in
+    YAML (compiled to the JSON manifest shape in memory), and `dataset_files`
+    may point at JSONL row files loaded into `datasets`. Everything downstream
+    of this loader — validation, leakage lint, prepare, grading — is unchanged."""
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        try:
+            manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            die(f"no such file: {path}")
+        except yaml.YAMLError as exc:
+            die(f"invalid YAML in {path}: {exc}")
+        if not isinstance(manifest, dict):
+            die(f"{path} must contain a YAML mapping")
+    else:
+        manifest = load_json(path)
+    dataset_files = manifest.pop("dataset_files", None)
+    if dataset_files is not None:
+        if not isinstance(dataset_files, dict):
+            die(f"{path}: dataset_files must map dataset ids to JSONL paths")
+        datasets = dict(manifest.get("datasets") or {})
+        for dataset_id, rel in dataset_files.items():
+            rows_path = path.parent / str(rel)
+            if not rows_path.is_file():
+                die(f"{path}: dataset_files[{dataset_id!r}] does not exist: {rows_path}")
+            rows = []
+            for n, line in enumerate(rows_path.read_text(encoding="utf-8").splitlines(), 1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    die(f"{rows_path}: line {n} is not valid JSON: {exc}")
+                rows.append(row)
+            datasets[str(dataset_id)] = rows
+        manifest["datasets"] = datasets
+    return manifest
+
+
 def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[str, Any]:
-    manifest = load_json(path)
+    manifest = load_manifest_source(path)
     if manifest.get("version") != 1:
         die("manifest.version must be 1")
     if not manifest.get("skill_name") or not isinstance(manifest.get("skill_name"), str):
@@ -317,6 +398,19 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             die("manifest.judge must be an object (e.g. {\"model\": \"...\"})")
         if "model" in judge_cfg and (not isinstance(judge_cfg.get("model"), str) or not judge_cfg.get("model")):
             die("manifest.judge.model must be a non-empty string")
+    datasets = manifest.get("datasets")
+    if datasets is not None:
+        if not isinstance(datasets, dict):
+            die("manifest.datasets must map dataset ids to lists of row objects")
+        for dataset_id, rows in datasets.items():
+            if not isinstance(rows, list) or not rows:
+                die(f"dataset {dataset_id!r} must be a non-empty list of row objects")
+            for i, row in enumerate(rows, 1):
+                if not isinstance(row, dict):
+                    die(f"dataset {dataset_id!r} row #{i} must be an object")
+                for key, value in row.items():
+                    if not isinstance(value, (str, int, float, bool)):
+                        die(f"dataset {dataset_id!r} row #{i} key {key!r} must be a scalar (placeholders substitute into strings)")
 
     seen: set[str] = set()
     for i, case in enumerate(iter_cases(manifest)):
