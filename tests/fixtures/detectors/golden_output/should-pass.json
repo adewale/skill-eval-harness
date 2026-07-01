@@ -1,0 +1,17 @@
+{
+  "detector": "golden_output",
+  "cases": [
+    {
+      "note": "exact byte match against the reference file",
+      "assertion": {"type": "golden_output", "reference": "golden/expected.md"},
+      "output": "# Result\n\nalpha beta\n",
+      "files": {"golden/expected.md": "# Result\n\nalpha beta\n"}
+    },
+    {
+      "note": "normalize=text tolerates whitespace-only differences",
+      "assertion": {"type": "golden_output", "reference": "golden/expected.md", "normalize": "text"},
+      "output": "# Result\n\n\n  alpha   beta",
+      "files": {"golden/expected.md": "# Result\n\nalpha beta\n"}
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "detector": "golden_output",
+  "cases": [
+    {
+      "note": "content differs beyond whitespace: must fail with a diff",
+      "assertion": {"type": "golden_output", "reference": "golden/expected.md", "normalize": "text"},
+      "output": "# Result\n\nalpha gamma\n",
+      "files": {"golden/expected.md": "# Result\n\nalpha beta\n"}
+    },
+    {
+      "note": "missing reference file fails closed",
+      "assertion": {"type": "golden_output", "reference": "golden/expected.md"},
+      "output": "# Result\n"
+    },
+    {
+      "note": "exact mode does NOT tolerate whitespace drift",
+      "assertion": {"type": "golden_output", "reference": "golden/expected.md"},
+      "output": "# Result\n\nalpha  beta\n",
+      "files": {"golden/expected.md": "# Result\n\nalpha beta\n"}
+    }
+  ]
+}

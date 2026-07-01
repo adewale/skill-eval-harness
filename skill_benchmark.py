@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import difflib
 import hashlib
 import html
 import json
@@ -64,6 +65,7 @@ TEXT_ASSERTIONS = {
     "not_regex",
     "file_exists",
     "json_field_equals",
+    "golden_output",
     "script",
 }
 PROCESS_ASSERTIONS = {
@@ -215,6 +217,7 @@ def prompt_assertion_leakage_findings(manifest: dict[str, Any], manifest_path: P
                         "type": assertion.get("type"),
                         "value": value,
                         "message": f"assertion value {value!r} appears in prompt",
+                        "guide": "docs/authoring-evals.md — Step 4: assert the behavior, not one spelling; a value echoed from the prompt cannot tell skill from no-skill",
                     })
     return findings
 
@@ -233,6 +236,12 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
     optional_variants = manifest.get("optional_variants", [])
     if optional_variants and (not isinstance(optional_variants, list) or not all(isinstance(v, str) for v in optional_variants)):
         die("manifest.optional_variants must be a list of strings")
+    judge_cfg = manifest.get("judge")
+    if judge_cfg is not None:
+        if not isinstance(judge_cfg, dict):
+            die("manifest.judge must be an object (e.g. {\"model\": \"...\"})")
+        if "model" in judge_cfg and (not isinstance(judge_cfg.get("model"), str) or not judge_cfg.get("model")):
+            die("manifest.judge.model must be a non-empty string")
 
     seen: set[str] = set()
     for i, case in enumerate(iter_cases(manifest)):
@@ -3077,6 +3086,54 @@ def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_d
         return False, f"script execution failed: {exc}"
 
 
+def normalize_golden(text: str, mode: str) -> str:
+    """Normalization for golden_output is the whole game, so it is explicit and
+    per-assertion, never implicit: exact bytes by default, `trim` strips outer
+    whitespace, `text` collapses every whitespace run to one space."""
+    if mode == "exact":
+        return text
+    if mode == "trim":
+        return text.strip()
+    if mode == "text":
+        return " ".join(text.split())
+    raise ValueError(f"unknown golden_output normalize mode {mode!r}; expected exact, trim, or text")
+
+
+def golden_output_result(assertion: dict[str, Any], text: str, output_path: Path, run_base: Path | None, manifest_dir: Path | None) -> tuple[bool, str]:
+    reference_rel = str(assertion.get("reference", assertion.get("value", "")) or "")
+    if manifest_dir is None or not reference_rel:
+        return False, "golden_output requires a `reference` file path relative to the manifest directory"
+    ref_path = Path(manifest_dir) / reference_rel
+    if not ref_path.is_file():
+        return False, f"missing reference file: {reference_rel}"
+    artifact_rel = assertion.get("artifact")
+    actual_text = text
+    actual_label = output_path.name
+    if artifact_rel:
+        candidate = (run_base or output_path.parent) / str(artifact_rel)
+        actual_label = str(artifact_rel)
+        if not candidate.is_file():
+            return False, f"missing artifact: {artifact_rel}"
+        actual_text = candidate.read_text(encoding="utf-8", errors="replace")
+    expected_text = ref_path.read_text(encoding="utf-8", errors="replace")
+    mode = str(assertion.get("normalize", "exact"))
+    try:
+        got = normalize_golden(actual_text, mode)
+        want = normalize_golden(expected_text, mode)
+    except ValueError as exc:
+        return False, str(exc)
+    if got == want:
+        return True, f"{actual_label} matches reference {reference_rel} (normalize={mode})"
+    diff = list(difflib.unified_diff(
+        expected_text.splitlines(), actual_text.splitlines(),
+        fromfile=f"reference/{reference_rel}", tofile=actual_label, lineterm="", n=2,
+    ))
+    shown = "\n".join(diff[:60])
+    if len(diff) > 60:
+        shown += f"\n... ({len(diff) - 60} more diff lines)"
+    return False, f"differs from reference {reference_rel} (normalize={mode})\n{shown}"
+
+
 def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *, run_base: Path | None = None, allow_scripts: bool = False, manifest_dir: Path | None = None) -> dict[str, Any]:
     atype = assertion.get("type")
     name = assertion.get("name") or assertion.get("description") or atype
@@ -3137,6 +3194,8 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
             evidence = f"{field}={actual!r}"
         except Exception as exc:
             evidence = f"json check failed: {exc}"
+    elif atype == "golden_output":
+        passed, evidence = golden_output_result(assertion, text, output_path, run_base, manifest_dir)
     elif atype == "script":
         if not allow_scripts:
             passed = False
@@ -3324,12 +3383,22 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return first
 
 
+def effective_judge_model(manifest: dict[str, Any], cli_model: str | None) -> str | None:
+    """The judge config slot (roadmap 1.3): an explicit --judge-model wins;
+    otherwise the manifest's judge.model is the declared default."""
+    if cli_model:
+        return cli_model
+    configured = (manifest.get("judge") or {}).get("model")
+    return str(configured) if configured else None
+
+
 def judge_command(args: argparse.Namespace) -> int:
     judge_cmd = getattr(args, "judge_cmd", None)
-    judge_model = getattr(args, "judge_model", None)
-    claude_bin = getattr(args, "claude_bin", None) or "claude"
+    manifest_for_judge = validate_manifest(Path(args.manifest))
+    judge_model = effective_judge_model(manifest_for_judge, getattr(args, "judge_model", None))
     if not judge_cmd and not judge_model:
-        die("judge needs --judge-cmd (any provider) or --judge-model (native Claude)")
+        die("judge needs --judge-cmd (any provider), --judge-model, or a manifest judge.model default")
+    claude_bin = getattr(args, "claude_bin", None) or "claude"
     tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
     transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
     repeat = max(1, int(getattr(args, "judge_runs", 1)))
@@ -4074,6 +4143,111 @@ def benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def result_failure_lines(result: dict[str, Any]) -> list[str]:
+    if result.get("missing_output"):
+        return [f"missing output under {result.get('run_base', '')}"]
+    if not result.get("execution_valid", True):
+        return [f"execution error (infra failure) under {result.get('run_base', '')}"]
+    return [
+        f"{a.get('name')}: {a.get('evidence', '')}"
+        for a in result.get("assertions", [])
+        if not a.get("passed")
+    ]
+
+
+def junit_xml_from_report(report: dict[str, Any]) -> str:
+    """One <testcase> per case/variant/run over a benchmark report, evidence on
+    failures, and the paired lift as suite properties — the CI-facing shape of
+    the report (roadmap 1.2). Grading is untouched; this only serializes."""
+    import xml.etree.ElementTree as ET
+
+    skill = str(report.get("skill_name") or "skill")
+    results = report.get("results", [])
+    suite = ET.Element("testsuite", {"name": f"skill-eval:{skill}"})
+    paired = report.get("paired_summary", {}) or {}
+    props = ET.SubElement(suite, "properties")
+    for key in ["with_skill_objective_pass_rate", "without_skill_objective_pass_rate", "absolute_delta", "normalized_gain"]:
+        value = paired.get(key)
+        ET.SubElement(props, "property", {"name": key, "value": "" if value is None else f"{value:.4f}"})
+    failures = 0
+    total_time = 0.0
+    for r in results:
+        elapsed_ms = metric_number(r.get("metadata", {}) or {}, "elapsed_ms") or 0.0
+        total_time += elapsed_ms / 1000.0
+        tc = ET.SubElement(suite, "testcase", {
+            "classname": f"{skill}.{r.get('case_id')}",
+            "name": f"{r.get('variant')}/run-{r.get('run_number', 1)}",
+            "time": f"{elapsed_ms / 1000.0:.3f}",
+        })
+        lines = result_failure_lines(r)
+        if lines:
+            failures += 1
+            failure = ET.SubElement(tc, "failure", {"message": f"{len(lines)} failing check(s)"})
+            failure.text = "\n".join(lines)
+    suite.set("tests", str(len(results)))
+    suite.set("failures", str(failures))
+    suite.set("errors", "0")
+    suite.set("time", f"{total_time:.3f}")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(suite, encoding="unicode")
+
+
+def fmt_rate(value: Any) -> str:
+    return "—" if value is None else f"{float(value):.2f}"
+
+
+def github_summary_from_report(report: dict[str, Any]) -> str:
+    """GitHub job-summary markdown plus ::warning annotations keyed to case_id.
+    Pipe to $GITHUB_STEP_SUMMARY; the annotation lines act on plain stdout."""
+    skill = str(report.get("skill_name") or "skill")
+    paired = report.get("paired_summary", {}) or {}
+    summary = report.get("summary", {}) or {}
+    lines = [f"# Skill eval — {skill}", ""]
+    delta = paired.get("absolute_delta")
+    lines.append(
+        f"**Lift (with − without, objective):** {fmt_rate(paired.get('with_skill_objective_pass_rate'))} − "
+        f"{fmt_rate(paired.get('without_skill_objective_pass_rate'))} = **{fmt_rate(delta)}**"
+    )
+    lines.extend(["", "| variant | cases | runs | mean objective | mean combined | missing | exec errors |", "|---|---|---|---|---|---|---|"])
+    for variant, block in summary.items():
+        lines.append(
+            f"| {variant} | {block.get('cases', 0)} | {block.get('runs', 0)} | "
+            f"{fmt_rate(block.get('mean_objective_pass_rate'))} | {fmt_rate(block.get('mean_combined_pass_rate'))} | "
+            f"{block.get('missing_outputs', 0)} | {block.get('execution_errors', 0)} |"
+        )
+    flags = report.get("case_flags", []) or []
+    if flags:
+        lines.extend(["", "## Case flags", ""])
+        for flag in flags:
+            lines.append(f"- `{flag.get('case_id')}`: {'; '.join(flag.get('flags', []))} (with={fmt_rate(flag.get('with_skill'))}, without={fmt_rate(flag.get('without_skill'))})")
+    negative = (paired.get("negative_delta_cases") or [])
+    if negative:
+        lines.extend(["", "## Negative-delta cases", ""])
+        for row in negative:
+            lines.append(f"- `{row.get('case_id')}`: with={fmt_rate(row.get('with_skill'))} < without={fmt_rate(row.get('without_skill'))}")
+    annotations = [
+        f"::warning title=skill-eval case {flag.get('case_id')}::{'; '.join(flag.get('flags', []))}"
+        for flag in flags
+    ]
+    if delta is not None and delta < 0:
+        annotations.append(f"::error title=skill-eval {skill}::negative overall lift ({delta:.3f}): the skill measures worse than baseline")
+    return "\n".join(lines + ([""] + annotations if annotations else [])) + "\n"
+
+
+def report_command(args: argparse.Namespace) -> int:
+    report = load_json(Path(args.benchmark))
+    if args.format == "junit":
+        rendered = junit_xml_from_report(report)
+    else:
+        rendered = github_summary_from_report(report)
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered, encoding="utf-8")
+    else:
+        print(rendered, end="")
+    return 0
+
+
 def aggregate(args: argparse.Namespace) -> int:
     reports = []
     for raw in args.manifests:
@@ -4644,7 +4818,7 @@ def fixture_recommendations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     has_input_fixture = any(c.get("files") for c in manifest.get("cases", []))
     recs = []
     def add(name: str, why: str, files: list[str]) -> None:
-        recs.append({"name": name, "why": why, "files": files})
+        recs.append({"name": name, "why": why, "files": files, "guide": "docs/authoring-evals.md — Step 4: fixture-backed cases beat keyword-only prompts; ground assertions in real files"})
     if not has_file_assert and not has_input_fixture:
         add("fixture-backed golden case", "Current deterministic checks are mostly text-output assertions; add a fixture with files/artifacts so wrong work cannot pass by saying the right words.", ["evals/fixtures/<case>/README.md", "evals/fixtures/<case>/expected.json"])
     if "readme" in kinds or "good-readme" in skill:
@@ -4900,6 +5074,28 @@ def audit_manifest_report(
             finding("non-discriminating-assertions", "recommended", f"{len(assertion_rows)} assertions have identical with/without pass rates.", assertion_rows[:20])
             rec("assertion-design", "Replace keyword-only checks with source/artifact-backed assertions or stricter behavioral regexes for identical-rate assertions.")
 
+    # 1.3: the judge must not be the model under test. Compare the declared
+    # judge model against the manifest's jetty.model and, when run data is
+    # supplied, every model recorded in run metadata.
+    judge_model = str((manifest.get("judge") or {}).get("model") or "").strip()
+    if judge_model:
+        under_test: set[str] = set()
+        jetty_model = str((manifest.get("jetty") or {}).get("model") or "").strip()
+        if jetty_model:
+            under_test.add(jetty_model)
+        if bench_report:
+            for r in bench_report.get("results", []):
+                meta_model = str((r.get("metadata") or {}).get("model") or "").strip()
+                if meta_model:
+                    under_test.add(meta_model)
+        if judge_model in under_test:
+            finding(
+                "judge-is-model-under-test",
+                "required",
+                f"manifest.judge.model {judge_model!r} is also a model under test; a model grading its own output inflates qualitative scores. Use a different judge model (or pass --strict-judge in CI to make this fatal).",
+                sorted(under_test),
+            )
+
     fixtures = fixture_recommendations(manifest)
     if fixtures:
         rec("fixture-repos-files", "Add fixture-backed evals to reduce keyword gaming and verify artifacts/source evidence.", fixtures)
@@ -5008,6 +5204,14 @@ def audit_manifest(args: argparse.Namespace) -> int:
             print(f"readiness blocker: {b}", file=sys.stderr)
         print(f"audit-manifest: {len(blockers)} readiness blocker(s) for {report.get('skill_name')!r}", file=sys.stderr)
         return 1
+    # 1.3 guard: warn by default (the finding is in the report), error under
+    # --strict-judge so CI can refuse a self-judging eval suite.
+    if getattr(args, "strict_judge", False):
+        offenders = [f for f in report.get("findings", []) if f.get("kind") == "judge-is-model-under-test"]
+        if offenders:
+            for f in offenders:
+                print(f"strict-judge: {f['message']}", file=sys.stderr)
+            return 1
     return 0
 
 
@@ -5444,6 +5648,11 @@ def main() -> int:
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
     p.add_argument("--out")
 
+    p = sub.add_parser("report", help="serialize a benchmark.json for CI: JUnit XML or GitHub job-summary markdown + annotations")
+    p.add_argument("--benchmark", required=True, help="benchmark.json produced by `skill-benchmark benchmark --out`")
+    p.add_argument("--format", choices=["junit", "github"], required=True)
+    p.add_argument("--out", help="output path (e.g. junit.xml, or a file appended to $GITHUB_STEP_SUMMARY)")
+
     p = sub.add_parser("compare-judges", help="flag judge-sensitivity across judged benchmark reports")
     p.add_argument("--report", action="append", metavar="NAME=PATH", help="judge label = judged benchmark report JSON (repeatable)")
     p.add_argument("--magnitude-eps", type=float, default=0.1, help="lift-spread above which the skill is judge-magnitude-sensitive")
@@ -5512,6 +5721,7 @@ def main() -> int:
     p.add_argument("--min-trigger-neg", type=int, default=2)
     p.add_argument("--leakage-min-chars", type=int, default=4)
     p.add_argument("--fail-on-blockers", action="store_true", help="exit non-zero if the readiness block has any blockers (for CI gating of an eval suite)")
+    p.add_argument("--strict-judge", action="store_true", help="exit non-zero when the declared judge model is also a model under test")
 
     p = sub.add_parser("materialize-ablations", help="Write real, ablated skill trees for declared materialized ablations")
     p.add_argument("manifest")
@@ -5576,6 +5786,8 @@ def main() -> int:
         return judge_command(args)
     if args.cmd == "benchmark":
         return benchmark(args)
+    if args.cmd == "report":
+        return report_command(args)
     if args.cmd == "compare-judges":
         return compare_judges(args)
     if args.cmd == "export-anthropic":
