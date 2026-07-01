@@ -35,10 +35,10 @@ list evolves, so handling is data-driven, never a hardcoded list):
 
 Internal — the contracts this builds on:
 
-- `validate_manifest` ablation block (`skill_benchmark.py:255`) — today checks only non-empty `id` + `removed_component`.
-- `variant_instruction` / `task_variants` / `prepared_task_rows` (`skill_benchmark.py:265`, `:302`, `:314`) — `skill_paths` is currently the manifest's, identical for every variant.
-- `safe_task_json` / `build_jetty_payload` (`skill_benchmark.py:452`, `:486`) — Jetty export; ablation reads `task["skill_paths"]`, uploads flat files via `JettyClient.upload` → `read_bytes` (`:706`) with a basename-only `remote_path_hint`.
-- `copy_skill_to_config` (`skill_benchmark.py:47`) and `copy_skill_source` (`run_pi_smoke.py:100`) — both collapse a file-valued path to `<dir>/SKILL.md`, `rmtree` the destination, and whitelist only `references`/`scripts`/`assets`.
+- `validate_manifest` ablation block (`skill_benchmark.py:388`) — today checks only non-empty `id` + `removed_component`.
+- `variant_instruction` (`skill_benchmark.py:538`) / `task_variants` (`:581`) / `prepared_task_rows` (`:626`) — `skill_paths` is currently the manifest's, identical for every variant.
+- `safe_task_json` (`skill_benchmark.py:1795`) / `build_jetty_payload` (`:1837`) — Jetty export; ablation reads `task["skill_paths"]`, uploads flat files via `JettyClient.upload` with a basename-only `remote_path_hint`.
+- `copy_skill_to_config` (`skill_benchmark.py:47`) and `copy_skill_source` (`run_pi_smoke.py:99`) — both collapse a file-valued path to `<dir>/SKILL.md`, `rmtree` the destination, and whitelist only `references`/`scripts`/`assets`.
 - `run_pi_trigger_eval.py` — the autonomous-trigger runner; copies from the manifest and takes no variant input.
 
 ## Current state: instruction-simulated ablations
@@ -358,7 +358,7 @@ Opt in with `"invalid_skill": true` on the ablation: the run is tagged
 
 ## Validation additions
 
-`validate_manifest` (`skill_benchmark.py:255`), per ablation:
+`validate_manifest` (`skill_benchmark.py:388`), per ablation:
 
 - `id` unique and slug-formatted; keep `removed_component`.
 - If a removal is declared: exactly one of `mechanism`+`target` or `components`;
