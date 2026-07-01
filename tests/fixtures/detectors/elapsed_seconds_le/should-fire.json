@@ -1,0 +1,18 @@
+{
+  "detector": "elapsed_seconds_le",
+  "cases": [
+    {
+      "note": "over the limit",
+      "assertion": {
+        "type": "elapsed_seconds_le",
+        "max": 60
+      },
+      "output": "done",
+      "files": {
+        "metadata.json": {
+          "elapsed_ms": 120000
+        }
+      }
+    }
+  ]
+}

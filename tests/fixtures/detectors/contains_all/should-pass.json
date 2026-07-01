@@ -1,0 +1,16 @@
+{
+  "detector": "contains_all",
+  "cases": [
+    {
+      "note": "every required value present",
+      "assertion": {
+        "type": "contains_all",
+        "values": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "output": "alpha first, then beta."
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "detector": "not_regex",
+  "cases": [
+    {
+      "note": "banned pattern absent",
+      "assertion": {
+        "type": "not_regex",
+        "pattern": "as an ai (language )?model"
+      },
+      "output": "Here is the review you asked for."
+    }
+  ]
+}

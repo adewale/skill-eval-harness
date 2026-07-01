@@ -1,0 +1,26 @@
+{
+  "detector": "command_ran",
+  "cases": [
+    {
+      "note": "a command input matches",
+      "assertion": {
+        "type": "command_ran",
+        "pattern": "pytest"
+      },
+      "output": "tests pass",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "python -m pytest -q",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

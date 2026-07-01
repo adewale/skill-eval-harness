@@ -1,0 +1,34 @@
+{
+  "detector": "command_order",
+  "cases": [
+    {
+      "note": "order reversed",
+      "assertion": {
+        "type": "command_order",
+        "patterns": [
+          "git add",
+          "git commit"
+        ]
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "git commit -m x",
+              "status": "completed"
+            },
+            {
+              "type": "command",
+              "command": "git add -A",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

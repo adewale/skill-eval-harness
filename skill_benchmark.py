@@ -2808,6 +2808,51 @@ def codex_skill_workspace(pt: PreparedTask, ws: Path) -> tuple[list[str], list[s
     return skill_rel, input_rel
 
 
+def jetty_upload_workspace(pt: PreparedTask, ws: Path) -> None:
+    """Materialize the Jetty upload plan as a plain directory: exactly the file
+    surface `export-jetty` would upload for this task (fixtures, plus the skill
+    tree only on skill-bearing arms), and the payload JSON itself (runbook,
+    instruction, task fields). This is the Jetty path's model-visible workspace,
+    so the cross-runner baseline-isolation invariant can walk and grep it like
+    any filesystem runner's workspace without a live payload."""
+    payload = build_jetty_payload(
+        pt,
+        {"skill_name": pt.skill_name, "ablations": []},
+        collection="isolation-check",
+        task_prefix=None,
+        agent=JETTY_DEFAULT_AGENT,
+        model=JETTY_DEFAULT_MODEL,
+        model_provider=JETTY_DEFAULT_MODEL_PROVIDER,
+        snapshot=JETTY_DEFAULT_SNAPSHOT,
+    )
+    ws.mkdir(parents=True, exist_ok=True)
+    for item in payload.get("upload_plan", {}).get("files", []):
+        src = Path(str(item.get("local_path", "")))
+        if not src.is_file():
+            continue   # placeholder-only items carry no local bytes to mount
+        dest = safe_child_path(ws, str(item.get("remote_path_hint") or src.name))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+    (ws / "payload.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# The registration contract behind CF.2 (docs/eval-framework-roadmap-spec.md):
+# every runner that builds a model-visible workspace registers its builder here,
+# and ONE parameterized invariant (tests/test_confidence_floor.py) proves the
+# without_skill baseline is skill-free by construction for all of them. A new
+# runner registers itself and inherits the check instead of hand-rolling one.
+WORKSPACE_BUILDERS: dict[str, Any] = {}
+
+
+def register_workspace_builder(name: str, builder: Any) -> None:
+    WORKSPACE_BUILDERS[name] = builder
+
+
+register_workspace_builder("codex", codex_skill_workspace)     # run-codex
+register_workspace_builder("claude", codex_skill_workspace)    # run-claude shares the workspace builder
+register_workspace_builder("jetty", jetty_upload_workspace)    # export-jetty upload surface
+
+
 def codex_task_prompt(pt: PreparedTask, skill_paths: list[str] | None = None, input_files: list[str] | None = None) -> str:
     file_note = "\n".join(f"- {p}" for p in (input_files or [])) if input_files else "- none"
     if pt.variant_truth == "without_skill":

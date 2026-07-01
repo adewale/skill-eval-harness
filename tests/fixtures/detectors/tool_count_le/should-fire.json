@@ -1,0 +1,36 @@
+{
+  "detector": "tool_count_le",
+  "cases": [
+    {
+      "note": "over the cap",
+      "assertion": {
+        "type": "tool_count_le",
+        "max": 2
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "ls",
+              "status": "completed"
+            },
+            {
+              "type": "command",
+              "command": "cat x",
+              "status": "completed"
+            },
+            {
+              "type": "command",
+              "command": "cat y",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

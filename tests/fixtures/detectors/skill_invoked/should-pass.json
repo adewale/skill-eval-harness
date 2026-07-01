@@ -1,0 +1,25 @@
+{
+  "detector": "skill_invoked",
+  "cases": [
+    {
+      "note": "skill_load event present",
+      "assertion": {
+        "type": "skill_invoked",
+        "expected": true
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "skill_load",
+              "path": "skills/demo/SKILL.md"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

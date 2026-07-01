@@ -1,0 +1,18 @@
+{
+  "detector": "script",
+  "cases": [
+    {
+      "note": "oracle exits 0",
+      "assertion": {
+        "type": "script",
+        "command": [
+          "python3",
+          "-c",
+          "raise SystemExit(0)"
+        ]
+      },
+      "output": "done",
+      "allow_scripts": true
+    }
+  ]
+}

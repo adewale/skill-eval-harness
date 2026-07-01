@@ -1,0 +1,13 @@
+{
+  "detector": "regex",
+  "cases": [
+    {
+      "note": "pattern matches",
+      "assertion": {
+        "type": "regex",
+        "pattern": "\\bv\\d+\\.\\d+\\.\\d+\\b"
+      },
+      "output": "Released v1.2.3 today."
+    }
+  ]
+}

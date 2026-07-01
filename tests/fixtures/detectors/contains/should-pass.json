@@ -1,0 +1,13 @@
+{
+  "detector": "contains",
+  "cases": [
+    {
+      "note": "required value present verbatim",
+      "assertion": {
+        "type": "contains",
+        "value": "BEGIN TRANSACTION"
+      },
+      "output": "Wrap the write in BEGIN TRANSACTION and COMMIT."
+    }
+  ]
+}

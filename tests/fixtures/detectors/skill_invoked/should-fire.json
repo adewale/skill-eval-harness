@@ -1,0 +1,26 @@
+{
+  "detector": "skill_invoked",
+  "cases": [
+    {
+      "note": "no skill evidence in events: claiming use in prose must not count",
+      "assertion": {
+        "type": "skill_invoked",
+        "expected": true
+      },
+      "output": "I used the demo skill heavily.",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "ls inputs",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

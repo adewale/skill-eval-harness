@@ -1,0 +1,26 @@
+{
+  "detector": "command_not_ran",
+  "cases": [
+    {
+      "note": "banned command ran",
+      "assertion": {
+        "type": "command_not_ran",
+        "pattern": "rm -rf"
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "rm -rf /tmp/scratch",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

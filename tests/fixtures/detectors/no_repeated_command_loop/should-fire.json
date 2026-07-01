@@ -1,0 +1,36 @@
+{
+  "detector": "no_repeated_command_loop",
+  "cases": [
+    {
+      "note": "three consecutive identical commands is a loop",
+      "assertion": {
+        "type": "no_repeated_command_loop",
+        "max_repeats": 1
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "pytest",
+              "status": "completed"
+            },
+            {
+              "type": "command",
+              "command": "pytest",
+              "status": "completed"
+            },
+            {
+              "type": "command",
+              "command": "pytest",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

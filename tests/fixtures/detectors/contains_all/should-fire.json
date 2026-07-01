@@ -1,0 +1,16 @@
+{
+  "detector": "contains_all",
+  "cases": [
+    {
+      "note": "one required value missing",
+      "assertion": {
+        "type": "contains_all",
+        "values": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "output": "alpha only."
+    }
+  ]
+}
