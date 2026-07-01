@@ -38,6 +38,10 @@ branch.
 - Runner: `claude -p` (headless) via `run-codex --codex-cmd`. cfdoctor + guardrails
   were scored on deterministic safety assertions; the other eight by an LLM judge
   (`claude -p` on the case rubric) on one behavioral case each.
+  - This study predates the native Claude adapter. Today, use `run-claude --model …`
+    (which captures real per-run cost into `metrics.json`) instead of the
+    `run-codex --codex-cmd "claude -p"` workaround, and `compare-judges` to check whether
+    the noisy judge verdicts below are judge-sensitive across two judge models.
 - Arms per skill: `with_skill`, `without_skill`, and one **materialized** component
   ablation (the largest/most-central component).
 - **This is a spot check.** Single behavioral case (or 3 safety cases) per skill,

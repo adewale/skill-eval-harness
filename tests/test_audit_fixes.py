@@ -466,6 +466,24 @@ class TriggerNotGradedIntoAnswerTests(unittest.TestCase):
     warns against. The report also stamps population='answer' so the two report
     kinds can't be confused in the emitted JSON."""
 
+    def test_prepare_emits_no_answer_runner_rows_for_trigger_cases(self):
+        # The answer-path preparer withholds trigger cases from the forced-load
+        # runners (they can't measure autonomous discovery) — so the guard in
+        # build_benchmark_report is defense-in-depth, not the sole enforcement.
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"; _skill(rp)
+            cases = [
+                {"id": "ans", "split": "tune", "kind": "pr-review", "prompt": "review",
+                 "assertions": [{"name": "k", "type": "contains", "value": "X"}]},
+                {"id": "trg", "split": "tune", "kind": "trigger", "prompt": "would you load?",
+                 "assertions": [{"name": "k", "type": "contains", "value": "X"}]},
+            ]
+            p = _manifest(rp, cases)
+            rows = sb.prepared_task_rows(p, sb.validate_manifest(p))
+            case_ids = {r["case_id"] for r in rows}
+            self.assertIn("ans", case_ids)
+            self.assertNotIn("trg", case_ids)          # no with_skill/without_skill row for a trigger case
+
     def test_trigger_case_excluded_and_population_stamped(self):
         with tempfile.TemporaryDirectory() as td:
             rp = Path(td) / "repo"; _skill(rp)

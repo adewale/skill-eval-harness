@@ -352,6 +352,31 @@ skill-benchmark run-codex \
   --codex-cmd 'codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral'
 ```
 
+### Run Claude tasks (with cost capture)
+
+`run-claude` executes prepared rows through `claude -p --output-format json`, extracts the answer into `output.md`, and records real per-run `total_cost_usd` + token usage into `metrics.json`. The benchmark report then totals `cost_usd_total` per arm (over scorable runs), so a paired eval reports actual dollars:
+
+```bash
+skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl
+skill-benchmark run-claude --tasks tasks.jsonl --runs ../repo/eval-runs/claude-tune \
+  --model claude-haiku-4-5-20251001
+```
+
+`--model` is optional (omit for the CLI default); `--claude-bin` overrides the executable (a stub in tests). A nonzero exit/timeout is written as a `[CLAUDE FAILURE …]` body, which `execution_valid` treats as a non-scorable infra failure, exactly like the Codex/Jetty runners.
+
+### Compare judges (judge-sensitivity)
+
+A single judge number is not reproducible across judge choice for a subtle skill. Judge the same runs with two models (`benchmark --judge-results` merges each), then `compare-judges` flags whether the measured lift depends on the judge:
+
+```bash
+skill-benchmark compare-judges \
+  --report haiku=benchmark.haiku.json \
+  --report sonnet=benchmark.sonnet.json \
+  --out judge-panel.json
+```
+
+It reports each judge's `with_skill − without_skill` combined lift and sets `sign_sensitive` (judges disagree the skill helps), `magnitude_sensitive` (lift spread > `--magnitude-eps`, default 0.1), and `judge_sensitive` (either). Needs ≥2 `--report name=path`. Every verdict from `judge` carries its `judge_model`, so which model graded a run is always recoverable.
+
 ### Pi trace runners
 
 The Adewale Pi smoke example writes the trace-aware run layout directly:
@@ -435,7 +460,7 @@ Add `--runs ../repo/eval-runs/latest` to include saturated-case, no-lift, flaky 
 
 The audit reports:
 
-- a **readiness** verdict — "is this eval worth paying to run?" — collapsing the three things that decide whether a measured number will mean anything: ablations materialized vs instruction-simulated, **leak-saturated cases** (every positive objective assertion's value already appears in the prompt, so `with_skill == without_skill` by construction), and adversarial coverage — with an explicit `blockers` punch list;
+- a **readiness** verdict — "is this eval worth paying to run?" — collapsing the things that decide whether a measured number will mean anything: ablations materialized vs instruction-simulated, **leak-saturated cases** (every positive objective assertion's value already appears in the prompt, so `with_skill == without_skill` by construction), adversarial coverage, and **objective-only cases** (a behaviour case with no judge assertion can only ever measure objective compliance — if the skill's value is voice/judgement it will read as zero lift). With `--runs`, it also surfaces the signals a static manifest can't see: **base-saturated cases** (measured `with_skill == without_skill` — a blocker, the case measures nothing) and **qualitative-only cases** (objective flat but the combined/judge score lifts — the skill's value is qualitative). All with an explicit `blockers` punch list;
 - missing positive, negative, and adversarial eval coverage,
 - missing holdout/holdback split coverage,
 - missing trigger/no-trigger coverage,
@@ -643,8 +668,8 @@ For manifest or grading changes, add or update `tests/test_skill_benchmark.py`. 
 
 ## Non-goals
 
-- Local grading does not call a model. Model execution happens outside the harness, except for explicit runner commands such as `run-jetty`.
-- The harness does not decide qualitative truth by itself; it emits judge prompts, runs an opt-in judge command, and merges the returned JSON.
+- Grading and aggregation do not call a model. Model execution happens outside that path, except for the explicit runner/judge commands that exist to call one: `run-codex`, `run-claude`, `run-jetty`, and `judge` (via `--judge-cmd` or, natively, `--judge-model`).
+- The harness does not decide qualitative truth by itself; it emits judge prompts, runs a judge (an opt-in `--judge-cmd`, or `--judge-model` for the native Claude judge), and merges the returned JSON — recording which `judge_model` produced each verdict.
 - Hidden prompts are not protected if you pass `--include-answer-key` to generation jobs.
 - A passing answer benchmark does not prove autonomous skill loading; run `skill-pi-trigger-eval` for that.
 

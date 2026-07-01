@@ -83,6 +83,20 @@ These are flags a `benchmark` report raises so you read pass rates correctly.
 
 **Token overhead** — the static `SKILL.md` and reference footprint combined with the paired `with_skill - without_skill` token delta, reported as objective lift per 1k extra tokens. It answers whether the lift was worth the context the skill consumed.
 
+**Cost** — real dollars a run spent, recorded by a runner that reports it (`run-claude` captures `total_cost_usd` into `metrics.json`). The benchmark report totals `cost_usd_total` per arm over scorable runs, so "what did this arm cost to run" sits next to "how much did it lift."
+
+**Base-saturated** — a case whose *measured* `with_skill` and `without_skill` combined pass rates are equal: the base model does it with or without the skill, so the case measures nothing. Surfaced by `eval-readiness` from run data as a blocker. (Contrast **leak-saturated**, which is a static property of the prompt.)
+
+**Qualitative-only** — a case whose objective pass rates are flat across arms but whose *combined* (judge-inclusive) score lifts with the skill: the skill's value is qualitative, and an objective-only reading would call it useless. Surfaced by `eval-readiness` from run data. **Objective-only** is the static cousin: a behaviour case with no judge assertion, so it can only ever measure objective compliance.
+
+## Populations and evidence
+
+**Population** — which axis a measurement is on. **Answer** population: given a task, does the output meet the assertions (a paired `with_skill` vs `without_skill` comparison; the benchmark report stamps `population: "answer"`). **Trigger / discovery** population: does the skill *load on its own* for a prompt (a single arm, measured by `run_pi_trigger_eval.py`). The two are graded differently (a NO_TRIGGER case *passes by the skill not firing*), so their pass-rates are not comparable — the benchmark report excludes trigger cases and lists them under `skipped_trigger_cases`.
+
+**Evidence class** — how much a number is worth. `EvidenceClass` has five members: `confirmed_causal` (a provenance-gated paired ablation comparison — `causal_confirmation` is the only door to it), `refuted`, `raw_measurement` (a single-arm measurement, no pairing), `indeterminate` (provenance didn't verify), and `unmeasured` (no scorable runs). The trigger report spells its report-level label `raw_autonomous_trigger_measurement` — read it as the trigger-path spelling of `raw_measurement` (its per-result `measurement` field uses the enum value directly).
+
+**Judge-sensitivity** — whether a skill's measured lift depends on *which* model judged it. `compare-judges` flags `sign_sensitive` (judges disagree the skill even helps) and `magnitude_sensitive` (the with−without lift spread across judges exceeds a threshold). Every verdict records its `judge_model`, so a single judge number is never mistaken for a judge-independent one.
+
 ## See also
 
 - [`evals-are-not-tests.md`](evals-are-not-tests.md) — why these terms exist and why a test-suite vocabulary does not cover them.

@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Shared benchmark harness for agent skill evals.
 
-This intentionally does not call a model. It prepares paired tasks, grades saved
-outputs with deterministic assertions, emits judge tasks for subjective checks,
-and aggregates timing/token/pass-rate data.
+The grading and aggregation path intentionally does not call a model: it prepares
+paired tasks, grades saved outputs with deterministic assertions, emits judge
+tasks for subjective checks, and aggregates timing/token/cost/pass-rate data. The
+explicit runner and judge commands DO call a model — `run-codex`/`run-claude`
+(and `run-jetty`) to generate outputs, and `judge` (via `--judge-cmd` or, natively,
+`--judge-model`) to grade them. Everything from `grade`/`benchmark` onward is
+model-free and reproducible from saved artifacts.
 """
 from __future__ import annotations
 
@@ -423,7 +427,15 @@ def prepared_task_rows(
     canonical_hash = next(iter(trees.values())).arm.identity.canonical if trees else None
     rows: list[dict[str, Any]] = []
     for case in cases:
-        is_trigger = case.get("kind") == "trigger"
+        # Trigger cases are the DISCOVERY population: "does the skill load on its
+        # own?", measured by the autonomous-trigger adapter (run_pi_trigger_eval.py,
+        # which reads cases directly). This is the answer-path preparer — the
+        # forced-load runners (codex/claude/Jetty) tell the model to read the mounted
+        # skill, so they cannot measure discovery. Emit no runner tasks for a trigger
+        # case here, so an answer runner never spends a call on one (build_benchmark_report
+        # re-checks this as defense in depth).
+        if case.get("kind") == "trigger":
+            continue
         for variant in variants:
             record: AblationRecord | None = None
             skill_paths = real_skill_paths
@@ -434,14 +446,9 @@ def prepared_task_rows(
             elif variant.startswith("ablation:"):
                 population = ablation_variant_population(manifest, variant)
                 # Discovery (trigger-population) ablations measure AUTONOMOUS skill
-                # loading, which these generic forced-load runners (codex/Jetty)
-                # cannot observe — they tell the model to read the mounted skill.
-                # They are emitted ONLY by the autonomous-trigger adapter
-                # (run_pi_trigger_eval.py --ablation), so skip them here.
+                # loading; they are emitted ONLY by the autonomous-trigger adapter
+                # (run_pi_trigger_eval.py --ablation), never by this answer-path preparer.
                 if population == "trigger":
-                    continue
-                # Answer-population ablations apply only to non-trigger cases.
-                if is_trigger:
                     continue
                 aid = variant.split(":", 1)[1]
                 if aid in trees:
@@ -3789,6 +3796,12 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         variant = f"ablation:{aid}"
         invalid = bool(ablation.get("invalid_skill"))
         expected_pop = ablation_variant_population(manifest, variant)
+        # NB: a discovery (trigger-population) ablation IS enumerated here — with its
+        # own per-entry "population": "trigger" label and, absent answer-path runs, an
+        # unmeasured status — rather than dropped, so the report never silently omits
+        # a declared ablation. The per-entry population label is what keeps it from
+        # being read as an answer result (the report-level population:"answer"
+        # describes the paired summary, not this per-ablation enumeration).
         entry: dict[str, Any] = {"id": aid, "population": expected_pop, "invalid_skill": invalid}
         abl_cov = coverage.get(variant, {"runs": 0, "missing": 0, "errored": 0})
         ws_cov = coverage.get("with_skill", {"runs": 0, "missing": 0, "errored": 0})
@@ -3892,8 +3905,9 @@ def build_benchmark_report(
         # output is a raw_autonomous_trigger_measurement. Grading their content here
         # would fold a discovery measurement into the paired ANSWER pass-rate under
         # no evidence label — the cross-population conflation the spec warns against.
-        # The prepare path already withholds trigger cases from answer runners; the
-        # grader enforces the same boundary rather than trusting that upstream.
+        # prepared_task_rows already withholds trigger cases from the answer runners,
+        # so normally no such runs exist; the grader enforces the same boundary as
+        # defense in depth (e.g. hand-placed outputs) rather than trusting upstream.
         if case.get("kind") == "trigger":
             skipped_trigger_cases.append(case["id"])
             continue
