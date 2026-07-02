@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import difflib
 import hashlib
 import html
 import json
@@ -64,6 +65,9 @@ TEXT_ASSERTIONS = {
     "not_regex",
     "file_exists",
     "json_field_equals",
+    "golden_output",
+    "similarity",
+    "structured_output",
     "script",
 }
 PROCESS_ASSERTIONS = {
@@ -71,6 +75,7 @@ PROCESS_ASSERTIONS = {
     "command_ran",
     "command_not_ran",
     "command_order",
+    "tool_call",
     "tool_count_le",
     "no_repeated_command_loop",
 }
@@ -80,7 +85,79 @@ EFFICIENCY_ASSERTIONS = {
     "command_count_le",
 }
 OBJECTIVE_ASSERTIONS = TEXT_ASSERTIONS | PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS
-QUALITATIVE_ASSERTIONS = {"judge", "rubric"}
+QUALITATIVE_ASSERTIONS = {"judge", "rubric", "factuality"}
+SEVERITIES = {"critical", "gate", "soft"}
+ORACLE_TIERS = {"strong", "demo", "live"}
+# 1.1: the factuality preset is a named, anchored rubric — no new execution
+# path; it renders through judge_prompt and runs through --judge-cmd/--judge-model.
+JUDGE_PRESETS: dict[str, dict[str, Any]] = {
+    "factuality": {
+        "rubric": [
+            "Every factual claim in the candidate output is supported by the prompt, the provided input files, or common knowledge — no invented names, numbers, dates, APIs, or citations.",
+            "Claims that go beyond the provided material are explicitly marked as assumptions or uncertainty, not stated as fact.",
+            "Nothing in the candidate output contradicts the provided material.",
+            "5 = fully grounded; 3 = minor unsupported embellishment; 1 = fabricated specifics stated as fact.",
+        ],
+        "threshold": 4,
+    },
+}
+
+
+def expand_judge_preset(assertion: dict[str, Any]) -> dict[str, Any]:
+    """Expand a qualitative preset (type `factuality`, or an explicit `preset`
+    name on a judge assertion) into a judge assertion carrying the canned
+    rubric and threshold. Explicit fields on the assertion win."""
+    preset_name = assertion.get("preset") if assertion.get("type") in {"judge", "rubric"} else assertion.get("type")
+    preset = JUDGE_PRESETS.get(str(preset_name or ""))
+    if not preset:
+        return assertion
+    expanded = dict(assertion)
+    expanded.setdefault("name", str(preset_name))
+    for key, value in preset.items():
+        expanded.setdefault(key, value)
+    return expanded
+# Below this graded mean, an objectively saturated case is flagged
+# structurally-pass-but-forgettable (roadmap 2.2): competent, but low-scoring.
+FORGETTABLE_GRADED_THRESHOLD = 0.75
+
+
+def assertion_severity(assertion: dict[str, Any], *, strict: bool = False) -> str:
+    """Three-tier severity (roadmap 2.2). Explicit `severity` (or the
+    `critical`/`gate`/`soft` boolean shorthands, or an `atLeast` score floor)
+    wins; the default keeps current behavior — objective assertions are gates,
+    qualitative and scored kinds are soft. `strict` promotes soft to gate."""
+    severity = assertion.get("severity")
+    if severity not in SEVERITIES:
+        if assertion.get("critical") is True:
+            severity = "critical"
+        elif assertion.get("gate") is True:
+            severity = "gate"
+        elif assertion.get("soft") is True or "atLeast" in assertion:
+            severity = "soft"
+        elif assertion.get("type") in QUALITATIVE_ASSERTIONS or assertion.get("type") == "similarity":
+            severity = "soft"
+        else:
+            severity = "gate"
+    if strict and severity == "soft":
+        severity = "gate"
+    return severity
+
+
+def oracle_tier(assertion: dict[str, Any]) -> str:
+    """Oracle-strength tier (roadmap 1.7), xampler's ladder made first-class:
+    `strong` (deterministic, no-lies — including a rendered-artifact script
+    oracle explicitly marked strong), `demo` (a marked stand-in; the default
+    for `script`, whose truthfulness the harness cannot see), `live` (judge or
+    other model-backed checks). Explicit `oracle` on the assertion wins."""
+    tier = assertion.get("oracle")
+    if tier in ORACLE_TIERS:
+        return str(tier)
+    atype = assertion.get("type")
+    if atype in QUALITATIVE_ASSERTIONS:
+        return "live"
+    if atype == "script":
+        return "demo"
+    return "strong"
 
 
 def die(msg: str) -> None:
@@ -105,10 +182,52 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def iter_cases(manifest: dict[str, Any], split: str | None = None) -> list[dict[str, Any]]:
+def apply_dataset_row(value: Any, row: dict[str, Any]) -> Any:
+    """Fill {key} placeholders from a dataset row throughout a case template.
+    Plain replace, not str.format — prompts and regex assertions legitimately
+    contain braces ({output_dir}, quantifiers) that format() would explode on."""
+    if isinstance(value, str):
+        out = value
+        for key, cell in row.items():
+            out = out.replace("{" + str(key) + "}", str(cell))
+        return out
+    if isinstance(value, list):
+        return [apply_dataset_row(item, row) for item in value]
+    if isinstance(value, dict):
+        return {key: apply_dataset_row(item, row) for key, item in value.items()}
+    return value
+
+
+def materialize_dataset_cases(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """The dataset abstraction (roadmap 2.5): a case with `template: <dataset>`
+    fans one template over the dataset's rows into concrete cases — stable ids
+    (`<case>-<row id or 1-based index>`), materialized EARLY so validation,
+    leakage lint, prepare, grade, and report all see ordinary cases."""
     cases = manifest.get("cases", [])
     if not isinstance(cases, list):
         die("manifest.cases must be a list")
+    datasets = manifest.get("datasets") or {}
+    out: list[dict[str, Any]] = []
+    for case in cases:
+        dataset_id = case.get("template") if isinstance(case, dict) else None
+        if not dataset_id:
+            out.append(case)
+            continue
+        rows = datasets.get(str(dataset_id))
+        if not isinstance(rows, list) or not rows:
+            die(f"case {case.get('id')!r}: template references unknown or empty dataset {dataset_id!r}")
+        for i, row in enumerate(rows, 1):
+            if not isinstance(row, dict):
+                die(f"dataset {dataset_id!r}: row #{i} must be an object")
+            materialized = {key: apply_dataset_row(value, row) for key, value in case.items() if key != "template"}
+            materialized["id"] = f"{case.get('id')}-{row.get('id', i)}"
+            materialized["dataset"] = str(dataset_id)
+            out.append(materialized)
+    return out
+
+
+def iter_cases(manifest: dict[str, Any], split: str | None = None) -> list[dict[str, Any]]:
+    cases = materialize_dataset_cases(manifest)
     if split:
         return [c for c in cases if c.get("split") == split]
     return cases
@@ -117,6 +236,10 @@ def iter_cases(manifest: dict[str, Any], split: str | None = None) -> list[dict[
 def case_prompt(case: dict[str, Any], manifest_path: Path, allow_missing: bool = False) -> str:
     if case.get("prompt"):
         return str(case["prompt"])
+    if case.get("turns"):
+        # Multi-turn case (roadmap 3.1): the opening turn is the prompt surface;
+        # runners that understand turns drive the full sequence from the row.
+        return str((case["turns"][0] or {}).get("prompt", ""))
     if case.get("prompt_ref"):
         p = (manifest_path.parent / str(case["prompt_ref"])).resolve()
         if p.exists():
@@ -215,14 +338,113 @@ def prompt_assertion_leakage_findings(manifest: dict[str, Any], manifest_path: P
                         "type": assertion.get("type"),
                         "value": value,
                         "message": f"assertion value {value!r} appears in prompt",
+                        "guide": "docs/authoring-evals.md — Step 4: assert the behavior, not one spelling; a value echoed from the prompt cannot tell skill from no-skill",
                     })
     return findings
 
 
+def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, path: Path) -> None:
+    """One validator for every assertion an eval can declare — case-level and
+    per-turn alike, so no assertion shape can dodge validate and fail later
+    inside grading."""
+    where = f"{cid}: {label}"
+    if not isinstance(assertion, dict):
+        die(f"{where} must be an object")
+    validate_variant_filter(assertion, cid, index)
+    atype = assertion.get("type")
+    if atype not in OBJECTIVE_ASSERTIONS | QUALITATIVE_ASSERTIONS:
+        die(f"{where} has unsupported type {atype!r}")
+    severity = assertion.get("severity")
+    if severity is not None and severity not in SEVERITIES:
+        die(f"{where} severity must be one of {sorted(SEVERITIES)}")
+    tier = assertion.get("oracle")
+    if tier is not None and tier not in ORACLE_TIERS:
+        die(f"{where} oracle must be one of {sorted(ORACLE_TIERS)}")
+    if atype == "similarity" and not str(assertion.get("expected", assertion.get("value", ""))):
+        die(f"{where} similarity needs an expected string")
+    if atype == "similarity" and assertion.get("mode") not in (None, "ratio", "embedding"):
+        die(f"{where} similarity mode must be ratio or embedding")
+    if atype == "structured_output" and not isinstance(assertion.get("schema"), dict):
+        die(f"{where} structured_output needs a schema object")
+    if assertion.get("preset") is not None and str(assertion.get("preset")) not in JUDGE_PRESETS:
+        die(f"{where} unknown judge preset {assertion.get('preset')!r}; known: {sorted(JUDGE_PRESETS)}")
+    if "atLeast" in assertion and not isinstance(assertion.get("atLeast"), (int, float)):
+        die(f"{where} atLeast must be a number")
+    dims = assertion.get("graded_dimensions")
+    if dims is not None:
+        if not isinstance(dims, list) or not dims:
+            die(f"{where} graded_dimensions must be a non-empty list")
+        for k, dim in enumerate(dims):
+            if not isinstance(dim, dict) or not isinstance(dim.get("name"), str) or not dim.get("name"):
+                die(f"{where} graded_dimensions[{k}] needs a string name")
+            if not isinstance(dim.get("rubric"), str) or not dim.get("rubric"):
+                die(f"{where} graded_dimensions[{k}] needs an anchored string rubric")
+    dyn = assertion.get("dynamic_rubric")
+    if dyn is not None:
+        if not isinstance(dyn, dict) or not isinstance(dyn.get("instruction"), str) or not dyn.get("instruction"):
+            die(f"{where} dynamic_rubric needs a string instruction")
+        minimum = dyn.get("minimum_criteria", 3)
+        if not isinstance(minimum, int) or minimum < 1:
+            die(f"{where} dynamic_rubric.minimum_criteria must be a positive integer")
+    if atype in {"regex", "not_regex"}:
+        pattern = str(assertion.get("pattern", assertion.get("value", "")))
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            die(f"{where} invalid regex {pattern!r}: {exc}")
+    if atype == "script":
+        validate_script_assertion(assertion, path, cid, index)
+
+
+def load_manifest_source(path: Path) -> dict[str, Any]:
+    """The no-code registry loader (roadmap 3.3): a manifest may be authored in
+    YAML (compiled to the JSON manifest shape in memory), and `dataset_files`
+    may point at JSONL row files loaded into `datasets`. Everything downstream
+    of this loader — validation, leakage lint, prepare, grading — is unchanged."""
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        try:
+            manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            die(f"no such file: {path}")
+        except yaml.YAMLError as exc:
+            die(f"invalid YAML in {path}: {exc}")
+        if not isinstance(manifest, dict):
+            die(f"{path} must contain a YAML mapping")
+    else:
+        manifest = load_json(path)
+    dataset_files = manifest.pop("dataset_files", None)
+    if dataset_files is not None:
+        if not isinstance(dataset_files, dict):
+            die(f"{path}: dataset_files must map dataset ids to JSONL paths")
+        datasets = dict(manifest.get("datasets") or {})
+        for dataset_id, rel in dataset_files.items():
+            rows_path = path.parent / str(rel)
+            if not rows_path.is_file():
+                die(f"{path}: dataset_files[{dataset_id!r}] does not exist: {rows_path}")
+            rows = []
+            for n, line in enumerate(rows_path.read_text(encoding="utf-8").splitlines(), 1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    die(f"{rows_path}: line {n} is not valid JSON: {exc}")
+                rows.append(row)
+            datasets[str(dataset_id)] = rows
+        manifest["datasets"] = datasets
+    return manifest
+
+
+SUPPORTED_MANIFEST_VERSIONS = {1, 2}
+
+
 def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[str, Any]:
-    manifest = load_json(path)
-    if manifest.get("version") != 1:
-        die("manifest.version must be 1")
+    manifest = load_manifest_source(path)
+    # Version 1 stays fully supported with behavior-preserving defaults
+    # (severity, oracle tiers); version 2 makes those defaults explicit. The
+    # `validate` CLI points version-1 manifests at `migrate`.
+    if manifest.get("version") not in SUPPORTED_MANIFEST_VERSIONS:
+        die(f"manifest.version must be one of {sorted(SUPPORTED_MANIFEST_VERSIONS)}")
     if not manifest.get("skill_name") or not isinstance(manifest.get("skill_name"), str):
         die("manifest.skill_name is required")
     if not isinstance(manifest.get("skill_paths", []), list) or not manifest.get("skill_paths") or not all(isinstance(p, str) for p in manifest.get("skill_paths", [])):
@@ -233,6 +455,25 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
     optional_variants = manifest.get("optional_variants", [])
     if optional_variants and (not isinstance(optional_variants, list) or not all(isinstance(v, str) for v in optional_variants)):
         die("manifest.optional_variants must be a list of strings")
+    judge_cfg = manifest.get("judge")
+    if judge_cfg is not None:
+        if not isinstance(judge_cfg, dict):
+            die("manifest.judge must be an object (e.g. {\"model\": \"...\"})")
+        if "model" in judge_cfg and (not isinstance(judge_cfg.get("model"), str) or not judge_cfg.get("model")):
+            die("manifest.judge.model must be a non-empty string")
+    datasets = manifest.get("datasets")
+    if datasets is not None:
+        if not isinstance(datasets, dict):
+            die("manifest.datasets must map dataset ids to lists of row objects")
+        for dataset_id, rows in datasets.items():
+            if not isinstance(rows, list) or not rows:
+                die(f"dataset {dataset_id!r} must be a non-empty list of row objects")
+            for i, row in enumerate(rows, 1):
+                if not isinstance(row, dict):
+                    die(f"dataset {dataset_id!r} row #{i} must be an object")
+                for key, value in row.items():
+                    if not isinstance(value, (str, int, float, bool)):
+                        die(f"dataset {dataset_id!r} row #{i} key {key!r} must be a scalar (placeholders substitute into strings)")
 
     seen: set[str] = set()
     for i, case in enumerate(iter_cases(manifest)):
@@ -247,8 +488,15 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         split = case.get("split")
         if split not in VALID_SPLITS:
             die(f"{cid}: split must be one of {sorted(VALID_SPLITS)}")
-        if not case.get("prompt") and not case.get("prompt_ref") and split == "tune":
-            die(f"{cid}: tune cases must include prompt or prompt_ref")
+        turns = case.get("turns")
+        if turns is not None:
+            if not isinstance(turns, list) or not turns:
+                die(f"{cid}: turns must be a non-empty list of turn objects")
+            for t, turn in enumerate(turns, 1):
+                if not isinstance(turn, dict) or not isinstance(turn.get("prompt"), str) or not turn.get("prompt"):
+                    die(f"{cid}: turn #{t} needs a string prompt")
+        if not case.get("prompt") and not case.get("prompt_ref") and not turns and split == "tune":
+            die(f"{cid}: tune cases must include prompt, prompt_ref, or turns")
         if case.get("prompt_ref"):
             ref = path.parent / str(case["prompt_ref"])
             if not ref.exists() and not (allow_missing_holdback and split in {"holdout", "holdback"}):
@@ -265,21 +513,24 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             assertions = []
         if not isinstance(assertions, list):
             die(f"{cid}: assertions must be a list")
+        floor = case.get("reference_score")
+        if floor is not None and (not isinstance(floor, (int, float)) or not 0 <= float(floor) <= 1):
+            die(f"{cid}: reference_score must be a number in [0, 1]")
+        graded_floor = case.get("reference_graded_score")
+        if graded_floor is not None and (not isinstance(graded_floor, (int, float)) or not 1 <= float(graded_floor) <= 5):
+            die(f"{cid}: reference_graded_score must be a number on the 1-5 scale")
         for j, assertion in enumerate(assertions):
-            if not isinstance(assertion, dict):
-                die(f"{cid}: assertion #{j} must be an object")
-            validate_variant_filter(assertion, cid, j)
-            atype = assertion.get("type")
-            if atype not in OBJECTIVE_ASSERTIONS | QUALITATIVE_ASSERTIONS:
-                die(f"{cid}: assertion #{j} has unsupported type {atype!r}")
-            if atype in {"regex", "not_regex"}:
-                pattern = str(assertion.get("pattern", assertion.get("value", "")))
-                try:
-                    re.compile(pattern)
-                except re.error as exc:
-                    die(f"{cid}: assertion #{j} invalid regex {pattern!r}: {exc}")
-            if atype == "script":
-                validate_script_assertion(assertion, path, cid, j)
+            validate_case_assertion(cid, f"assertion #{j}", j, assertion, path)
+        # Per-turn assertions go through the SAME validator as case-level ones
+        # (an unsupported type under a turn must fail validate, not grading).
+        for t, turn in enumerate(turns or [], 1):
+            turn_assertions = turn.get("assertions", [])
+            if turn_assertions is None:
+                turn_assertions = []
+            if not isinstance(turn_assertions, list):
+                die(f"{cid}: turn #{t} assertions must be a list")
+            for j, assertion in enumerate(turn_assertions):
+                validate_case_assertion(cid, f"turn #{t} assertion #{j}", j, assertion, path)
 
     seen_ablation_ids: set[str] = set()
     for i, ablation in enumerate(manifest.get("ablations", [])):
@@ -402,9 +653,16 @@ def prepared_task_rows(
     include_answer_key: bool = False,
     ablation_dir: Path | str | None = None,
     trees: dict[str, Any] | None = None,
+    models: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     variants = task_variants(manifest, include_old_skill=include_old_skill, include_ablations=include_ablations)
     runs_per_variant = max(1, int(runs_per_variant))
+    # Model is a third fan-out axis beside variant and run_number (roadmap 2.1):
+    # each row carries its target model, and with two or more models the run_dir
+    # gains a model segment. A single (or absent) model keeps today's layout, so
+    # existing manifests and run dirs are untouched.
+    model_list: list[str | None] = [m.strip() for m in (models or []) if isinstance(m, str) and m.strip()] or [None]
+    multi_model = len(model_list) > 1
     cases = iter_cases(manifest, split)
     repo_root = repo_root_for_manifest(manifest_path)
     real_skill_paths = [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])]
@@ -461,33 +719,44 @@ def prepared_task_rows(
                     # record is the sibling InstructionSimulated, not a Provenance.
                     record = InstructionSimulated(id=aid, population=population)
             for run_number in range(1, runs_per_variant + 1):
-                run_dir = f"{case['id']}/{variant}" if runs_per_variant == 1 else f"{case['id']}/{variant}/run-{run_number}"
-                # The PreparedTask is the typed owner; harness_record() serializes the
-                # exact JSONL row shape at the prepare boundary.
-                task = PreparedTask(
-                    case_id=case["id"],
-                    split=case["split"],
-                    kind=case.get("kind", "behavior"),
-                    variant_truth=variant,
-                    run_number=run_number,
-                    skill_name=manifest["skill_name"],
-                    repo_root=str(repo_root),
-                    skill_paths=tuple(skill_paths),
-                    input_files=tuple(str((manifest_path.parent / f).resolve()) for f in case.get("files", [])),
-                    run_dir=run_dir,
-                    instruction=variant_instruction(variant, manifest, repo_root),
-                    prompt=case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
-                    tags=tuple(case.get("tags", [])),
-                    ablation=record,
-                    # Canonical-tree hash on every skill-bearing arm so the report can
-                    # confirm with_skill and the ablation share a skill revision.
-                    # Only the arms that derive from the CURRENT canonical tree record
-                    # its hash; old_skill mounts the old tree, so stamping the current
-                    # canonical hash on it would be an internally false record.
-                    skill_tree_hash=(canonical_hash if (canonical_hash and (variant == "with_skill" or variant.startswith("ablation:"))) else None),
-                    answer_key=({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else None),
-                )
-                rows.append(task.harness_record())
+                for model in model_list:
+                    prefix = f"{case['id']}/{model}" if (model and multi_model) else case["id"]
+                    run_dir = f"{prefix}/{variant}" if runs_per_variant == 1 else f"{prefix}/{variant}/run-{run_number}"
+                    # The PreparedTask is the typed owner; harness_record() serializes the
+                    # exact JSONL row shape at the prepare boundary.
+                    task = PreparedTask(
+                        case_id=case["id"],
+                        split=case["split"],
+                        kind=case.get("kind", "behavior"),
+                        variant_truth=variant,
+                        run_number=run_number,
+                        skill_name=manifest["skill_name"],
+                        repo_root=str(repo_root),
+                        skill_paths=tuple(skill_paths),
+                        input_files=tuple(str((manifest_path.parent / f).resolve()) for f in case.get("files", [])),
+                        run_dir=run_dir,
+                        instruction=variant_instruction(variant, manifest, repo_root),
+                        prompt=case_prompt(case, manifest_path, allow_missing=allow_missing_prompts),
+                        tags=tuple(case.get("tags", [])),
+                        ablation=record,
+                        # Canonical-tree hash on every skill-bearing arm so the report can
+                        # confirm with_skill and the ablation share a skill revision.
+                        # Only the arms that derive from the CURRENT canonical tree record
+                        # its hash; old_skill mounts the old tree, so stamping the current
+                        # canonical hash on it would be an internally false record.
+                        skill_tree_hash=(canonical_hash if (canonical_hash and (variant == "with_skill" or variant.startswith("ablation:"))) else None),
+                        answer_key=({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else None),
+                    )
+                    row = task.harness_record()
+                    if model:
+                        # The target model rides the row (PreparedTask.from_row ignores
+                        # it); runners pass it through and stamp it into metadata.
+                        row["model"] = model
+                    if case.get("turns"):
+                        # The scripted send/respond sequence rides the row too
+                        # (roadmap 3.1); turn-aware runners drive it in order.
+                        row["turns"] = [str((t or {}).get("prompt", "")) for t in case["turns"]]
+                    rows.append(row)
     return rows
 
 
@@ -504,6 +773,7 @@ def prepare(args: argparse.Namespace) -> int:
         allow_missing_prompts=args.allow_missing_prompts,
         include_answer_key=args.include_answer_key,
         ablation_dir=getattr(args, "ablation_dir", None),
+        models=[m.strip() for m in (getattr(args, "models", None) or "").split(",") if m.strip()],
     )
     out = Path(args.out) if args.out else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
@@ -2150,6 +2420,10 @@ def normalized_jetty_metadata(record: dict[str, Any], *, success: bool) -> dict[
         "jetty_snapshot": jetty.get("snapshot"),
         "trace_url": f"https://jetty.io/{collection}/{task}/{trajectory_id}" if collection and task and trajectory_id else None,
         "jetty_raw_path": "jetty_raw.json",
+        # Normalized telemetry (issue #21): provider-reported when the
+        # trajectory carried numbers, explicit missing markers otherwise.
+        "usage_normalized": normalize_usage({**usage, **{k: meta_val for k, meta_val in [("input_tokens", trajectory.get("input_tokens")), ("output_tokens", trajectory.get("output_tokens")), ("total_tokens", total_tokens)] if meta_val is not None}}, source="provider_reported"),
+        "cost_normalized": normalize_cost(trajectory.get("cost", trajectory.get("cost_usd", usage.get("cost"))), source="provider_reported", pricing_model=jetty.get("model")),
     }
     return {k: v for k, v in meta.items() if v is not None}
 
@@ -2202,16 +2476,27 @@ def import_jetty_results(args: argparse.Namespace) -> int:
     return 0
 
 
-def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int, Path]]:
-    """Return run instances for a case/variant.
+def discover_case_model_roots(runs: Path, case_id: str, variants: list[str]) -> list[tuple[str | None, Path]]:
+    """Model-axis discovery (roadmap 2.1). The legacy layout
+    runs/<case>/<variant> maps to model=None; the fanned layout
+    runs/<case>/<model>/<variant> maps each model directory. Both can coexist
+    under one case (e.g. a legacy arm graded beside fanned models)."""
+    base = runs / case_id
+    if not base.exists():
+        return [(None, base)]
+    variant_set = set(variants)
+    roots: list[tuple[str | None, Path]] = []
+    if any((base / v).exists() for v in variant_set):
+        roots.append((None, base))
+    for child in sorted(base.iterdir()):
+        if child.is_dir() and child.name not in variant_set and any((child / v).exists() for v in variant_set):
+            roots.append((child.name, child))
+    return roots or [(None, base)]
 
-    Supports the original layout:
-      runs/<case>/<variant>/output.md
-    and repeated-run layout:
-      runs/<case>/<variant>/run-1/output.md
-      runs/<case>/<variant>/run-2/outputs/...
-    """
-    base = runs / case_id / variant
+
+def discover_run_bases_under(base: Path) -> list[tuple[int, Path]]:
+    """Run-instance discovery for one case/variant directory (either
+    <case>/<variant> or <case>/<model>/<variant>)."""
     if not base.exists():
         return [(1, base)]
     run_dirs = []
@@ -2225,6 +2510,28 @@ def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int
     if run_dirs:
         return sorted(run_dirs, key=lambda x: x[0])
     return [(1, base)]
+
+
+def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int, Path]]:
+    """Return run instances for a case/variant in the legacy (model-less) layout:
+      runs/<case>/<variant>/output.md
+      runs/<case>/<variant>/run-<n>/output.md
+    Model-aware callers combine discover_case_model_roots with
+    discover_run_bases_under instead."""
+    return discover_run_bases_under(runs / case_id / variant)
+
+
+def discover_turn_bases(base: Path) -> list[tuple[int, Path]]:
+    """Turn-indexed transcript layout for multi-turn cases (roadmap 3.1):
+    <run base>/turn-<n>/output.md. A single-shot run has no turn dirs."""
+    if not base.exists():
+        return []
+    found = []
+    for child in base.iterdir():
+        m = re.fullmatch(r"turn-(\d+)", child.name)
+        if child.is_dir() and m:
+            found.append((int(m.group(1)), child))
+    return sorted(found)
 
 
 def text_files_under(directory: Path) -> list[Path]:
@@ -2413,6 +2720,123 @@ def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+USAGE_SOURCES = {"provider_reported", "trace_normalized", "estimated", "missing", "not_applicable"}
+COST_SOURCES = {"provider_reported", "price_table_estimated", "missing", "not_applicable"}
+USAGE_ALIASES: dict[str, list[str]] = {
+    "input_tokens": ["input_tokens", "prompt_tokens", "input", "promptTokens", "inputTokens"],
+    "output_tokens": ["output_tokens", "completion_tokens", "output", "completionTokens", "outputTokens"],
+    "cache_read_tokens": ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cacheReadTokens"],
+    "cache_write_tokens": ["cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens", "cacheWriteTokens"],
+    "reasoning_tokens": ["reasoning_tokens", "thinking_tokens", "reasoningTokens"],
+    "total_tokens": ["total_tokens", "totalTokens", "total"],
+}
+COST_PART_ALIASES: dict[str, tuple[str, ...]] = {
+    "input_cost": ("input_cost", "prompt_cost"),
+    "output_cost": ("output_cost", "completion_cost"),
+    "cache_read_cost": ("cache_read_cost",),
+    "cache_write_cost": ("cache_write_cost", "cache_creation_cost"),
+    "reasoning_cost": ("reasoning_cost",),
+}
+
+
+def _num(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def normalize_usage(raw: Any, *, source: str = "provider_reported") -> dict[str, Any]:
+    """The per-run usage_normalized block (issue #21): alias-normalized token
+    counts with explicit provenance. No usable numbers means {"source":
+    "missing"} — missing telemetry is never silently zero."""
+    if source not in USAGE_SOURCES:
+        raise ValueError(f"unknown usage source {source!r}; expected one of {sorted(USAGE_SOURCES)}")
+    out: dict[str, Any] = {}
+    if isinstance(raw, dict):
+        for key, aliases in USAGE_ALIASES.items():
+            for alias in aliases:
+                value = _num(raw.get(alias))
+                if value is not None:
+                    out[key] = int(value)
+                    break
+    if source == "not_applicable":
+        return {"source": "not_applicable"}
+    if "total_tokens" not in out and ("input_tokens" in out or "output_tokens" in out):
+        out["total_tokens"] = out.get("input_tokens", 0) + out.get("output_tokens", 0)
+    if not out:
+        return {"source": "missing"}
+    out["source"] = source
+    return out
+
+
+def normalize_cost(raw: Any, *, source: str = "provider_reported", currency: str = "USD",
+                   pricing_model: str | None = None, pricing_table_version: str | None = None,
+                   pricing_notes: list[str] | None = None) -> dict[str, Any]:
+    """The per-run cost_normalized block (issue #21): a provider-reported number
+    or cost object, or a price-table estimate, with currency and provenance.
+    Missing cost is marked missing, never zero."""
+    if source not in COST_SOURCES:
+        raise ValueError(f"unknown cost source {source!r}; expected one of {sorted(COST_SOURCES)}")
+    if source == "not_applicable":
+        return {"source": "not_applicable"}
+    total = _num(raw)
+    parts: dict[str, float] = {}
+    if isinstance(raw, dict):
+        for key in ("total_cost", "total_cost_usd", "cost_usd", "total", "cost", "amount"):
+            total = _num(raw.get(key))
+            if total is not None:
+                break
+        for norm_key, aliases in COST_PART_ALIASES.items():
+            for alias in aliases:
+                value = _num(raw.get(alias))
+                if value is not None:
+                    parts[norm_key] = value
+                    break
+        if total is None and parts:
+            total = sum(parts.values())
+    if total is None:
+        return {"source": "missing"}
+    out: dict[str, Any] = {"currency": currency, **{k: round(v, 6) for k, v in parts.items()}, "total_cost": round(total, 6), "source": source}
+    if pricing_model:
+        out["pricing_model"] = pricing_model
+    if pricing_table_version:
+        out["pricing_table_version"] = pricing_table_version
+    if pricing_notes:
+        out["pricing_notes"] = list(pricing_notes)
+    return out
+
+
+def run_cost_facts(merged: dict[str, Any]) -> dict[str, Any]:
+    """ONE reader for a run's usage/cost facts. Prefers the normalized blocks;
+    pre-#21 runs fall back to the legacy flat fields, so old run dirs keep
+    reporting. Returns tokens (or None), cost_usd (or None), and each source."""
+    usage_block = merged.get("usage_normalized")
+    if isinstance(usage_block, dict) and usage_block.get("source") not in (None, "missing", "not_applicable"):
+        tokens = {key: usage_block.get(key) for key in USAGE_ALIASES if isinstance(usage_block.get(key), (int, float))}
+        usage_source = str(usage_block.get("source"))
+    else:
+        tokens = {}
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            value = metric_number(merged, key)
+            if value is not None:
+                tokens[key] = int(value)
+        usage_source = "legacy_fields" if tokens else str((usage_block or {}).get("source", "missing"))
+    cost_block = merged.get("cost_normalized")
+    if isinstance(cost_block, dict) and isinstance(cost_block.get("total_cost"), (int, float)):
+        cost_usd = float(cost_block["total_cost"])
+        cost_source = str(cost_block.get("source"))
+    else:
+        legacy = metric_number(merged, "cost_usd", "cost")
+        cost_usd = float(legacy) if legacy is not None else None
+        cost_source = "legacy_fields" if cost_usd is not None else str((cost_block or {}).get("source", "missing"))
+    return {
+        "input_tokens": tokens.get("input_tokens"),
+        "output_tokens": tokens.get("output_tokens"),
+        "total_tokens": tokens.get("total_tokens"),
+        "cost_usd": cost_usd,
+        "usage_source": usage_source,
+        "cost_source": cost_source,
+    }
+
+
 def missing_evidence(name: str) -> dict[str, Any]:
     return {"passed": False, "evidence": f"missing {name} evidence"}
 
@@ -2442,10 +2866,52 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
             return False, f"missing skill invocation evidence ({event_error})"
         return invoked == expected, f"skill_invoked={invoked}; expected={expected}; evidence={evidence[:5]}"
 
-    if atype in {"command_ran", "command_not_ran", "command_order", "tool_count_le", "no_repeated_command_loop"}:
+    if atype in {"command_ran", "command_not_ran", "command_order", "tool_call", "tool_count_le", "no_repeated_command_loop"}:
         if events is None:
             return False, event_error or "missing events.json"
         commands = [command_text(e) for e in command_events(events)]
+        if atype == "tool_call":
+            # 1.1 preset: assert a tool was actually called — optionally matching
+            # a pattern, in order, with count bounds. Completed calls only, over
+            # BOTH normalized shapes: command events and tool_call events (the
+            # normalizer emits type "tool_call" for non-shell tools, which
+            # command_events deliberately excludes).
+            completed_calls = [e for e in events
+                               if e.get("type") in {"command", "tool_call"}
+                               and str(e.get("status", "completed")).casefold() not in {"in_progress", "started", "running"}]
+            tool = assertion.get("tool")
+            if tool:
+                tool_folded = str(tool).casefold()
+                selected = [command_text(e) or str(e.get("name", "")) for e in completed_calls
+                            if str(e.get("name", "")).casefold() == tool_folded
+                            or (tool_folded in {"bash", "shell", "command"} and e.get("type") == "command")]
+            else:
+                selected = [command_text(e) or str(e.get("name", "")) for e in completed_calls]
+            order = assertion.get("order")
+            if isinstance(order, list) and order:
+                cursor = 0
+                matched: list[str] = []
+                for pattern in [str(p) for p in order]:
+                    found = None
+                    for i in range(cursor, len(selected)):
+                        if regex_hit(pattern, selected[i], ci):
+                            found = i
+                            matched.append(selected[i])
+                            break
+                    if found is None:
+                        return False, f"missing ordered tool call /{pattern}/ after index {cursor}; matched={matched}"
+                    cursor = found + 1
+                return True, f"matched tool-call order: {matched}"
+            pattern = assertion.get("pattern")
+            hits = [c for c in selected if regex_hit(str(pattern), c, ci)] if pattern else selected
+            min_count = int(assertion.get("min_count", 1))
+            max_count = assertion.get("max_count")
+            if len(hits) < min_count:
+                return False, f"{len(hits)} matching tool call(s) < min_count {min_count} (tool={tool or '<any>'}, pattern={pattern or '<any>'})"
+            if isinstance(max_count, int) and len(hits) > max_count:
+                return False, f"{len(hits)} matching tool call(s) > max_count {max_count}"
+            detail = f"; first={hits[0]!r}" if hits else ""
+            return True, f"{len(hits)} matching tool call(s){detail}"
         if atype == "command_ran":
             pattern = str(assertion.get("pattern", assertion.get("value", "")))
             hit = next((cmd for cmd in commands if regex_hit(pattern, cmd, ci)), None)
@@ -2653,7 +3119,43 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
             token_doc["total_tokens"] = int(normalized_total)
         event["tokens"] = token_doc
     event["source"] = source
+    event["otel"] = otel_attributes_for_event(event)
     return event
+
+
+def otel_attributes_for_event(event: dict[str, Any]) -> dict[str, Any]:
+    """OTel GenAI semantic-convention attributes for one normalized event
+    (roadmap 2.4). Additive: the harness's own keys stay authoritative for
+    grading; these make the trace boundary a standard target instead of a
+    bespoke schema. Events schema_version 2 carries them; version-1 files
+    still grade unchanged."""
+    attrs: dict[str, Any] = {}
+    event_type = event.get("type")
+    if event_type in {"command", "tool_call"}:
+        attrs["gen_ai.operation.name"] = "execute_tool"
+        attrs["gen_ai.tool.name"] = str(event.get("name") or "bash")
+        if event.get("input_summary"):
+            attrs["gen_ai.tool.call.arguments"] = event["input_summary"]
+        if event.get("output_summary"):
+            attrs["gen_ai.tool.call.result"] = event["output_summary"]
+    elif event_type == "message":
+        attrs["gen_ai.operation.name"] = "chat"
+        if event.get("role"):
+            attrs["gen_ai.message.role"] = event["role"]
+    elif event_type == "error":
+        attrs["error.type"] = str(event.get("name") or event.get("input_summary") or "error")[:120]
+    elif event_type in {"file_read", "file_write", "skill_load"}:
+        if event.get("input_summary"):
+            attrs["file.path"] = event["input_summary"][:500]
+    tokens = event.get("tokens")
+    if isinstance(tokens, dict):
+        if isinstance(tokens.get("input_tokens"), (int, float)):
+            attrs["gen_ai.usage.input_tokens"] = int(tokens["input_tokens"])
+        if isinstance(tokens.get("output_tokens"), (int, float)):
+            attrs["gen_ai.usage.output_tokens"] = int(tokens["output_tokens"])
+    if isinstance(event.get("exit_code"), int):
+        attrs["process.exit_code"] = event["exit_code"]
+    return attrs
 
 
 def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "generic") -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2683,7 +3185,7 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
                     token_totals[key] += value
     skill_events = [e for e in events if e.get("type") == "skill_load" or event_mentions_skill_file(e)]
     metrics: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": source,
         "tool_calls": sum(1 for e in events if e.get("type") == "tool_call") + len(command_events(events)),
         "commands": len(commands),
@@ -2700,8 +3202,59 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
     for key, value in token_totals.items():
         if value:
             metrics[key] = int(value)
-    event_doc = {"schema_version": 1, "source": source, "events": events}
+    if any(token_totals.values()):
+        # Trace-derived tokens get the normalized block (issue #21). Never a
+        # missing marker here — a provider-reported block in run metadata must
+        # not be shadowed by an empty trace.
+        metrics["usage_normalized"] = normalize_usage(token_totals, source="trace_normalized")
+    otel_usage = {}
+    if token_totals["input_tokens"]:
+        otel_usage["gen_ai.usage.input_tokens"] = int(token_totals["input_tokens"])
+    if token_totals["output_tokens"]:
+        otel_usage["gen_ai.usage.output_tokens"] = int(token_totals["output_tokens"])
+    if otel_usage:
+        metrics["otel"] = otel_usage
+    event_doc = {"schema_version": 2, "source": source, "events": events}
     return event_doc, metrics
+
+
+def stream_usage_and_cost(raw_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """usage_normalized/cost_normalized straight from a runner's raw JSONL
+    stream (issue #21): tokens via the trace normalizer (provider usage events
+    relayed verbatim), provider cost records summed. Missing stays marked."""
+    records = []
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped[0] != "{":
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            records.append(obj)
+    _, metrics = normalize_trace_records(records, source="stream")
+    has_tokens = any(isinstance(metrics.get(k), (int, float)) and metrics.get(k) for k in ("input_tokens", "output_tokens", "total_tokens"))
+    usage = normalize_usage(metrics if has_tokens else None, source="provider_reported")
+    cost_total = 0.0
+    cost_found = False
+    for record in records:
+        raw = raw_trace_value(record, "cost", "cost_usd", "total_cost_usd")
+        if raw is None:
+            # Pi relays cost inside the usage object ({"usage": {..., "cost": x}}).
+            usage_obj = raw_trace_value(record, "usage", "tokens")
+            if isinstance(usage_obj, dict):
+                raw = usage_obj.get("cost", usage_obj.get("cost_usd"))
+        value = None
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            value = float(raw)
+        elif isinstance(raw, dict):
+            value = normalize_cost(raw).get("total_cost")
+        if value is not None:
+            cost_total += value
+            cost_found = True
+    cost = normalize_cost(round(cost_total, 6) if cost_found else None, source="provider_reported")
+    return usage, cost
 
 
 def write_trace_artifacts(
@@ -2727,6 +3280,14 @@ def write_trace_artifacts(
         metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
     if extra_metrics:
         metrics.update(extra_metrics)
+    # Telemetry precedence (issue #21): a provider-reported (or explicit
+    # not_applicable) block handed in by the runner beats the trace-derived one
+    # in BOTH artifacts; and every metadata.json leaves here with explicit
+    # blocks — missing telemetry is marked, never silently absent or zero.
+    for key in ("usage_normalized", "cost_normalized"):
+        block = (metadata or {}).get(key)
+        if isinstance(block, dict) and block.get("source") in {"provider_reported", "price_table_estimated", "estimated", "not_applicable"}:
+            metrics[key] = block
     write_json(out_events or run_dir / "events.json", events)
     write_json(out_metrics or run_dir / "metrics.json", metrics)
     if environment:
@@ -2736,6 +3297,8 @@ def write_trace_artifacts(
         if metadata:
             existing.update(metadata)
         existing.update({k: v for k, v in metrics.items() if k not in {"schema_version", "source"}})
+        existing.setdefault("usage_normalized", {"source": "missing"})
+        existing.setdefault("cost_normalized", {"source": "missing"})
         existing["trace_source"] = source
         write_json(run_dir / "metadata.json", existing)
     return events, metrics
@@ -2806,6 +3369,51 @@ def codex_skill_workspace(pt: PreparedTask, ws: Path) -> tuple[list[str], list[s
         shutil.copy2(src, dest)
         input_rel.append(str(dest.relative_to(ws)))
     return skill_rel, input_rel
+
+
+def jetty_upload_workspace(pt: PreparedTask, ws: Path) -> None:
+    """Materialize the Jetty upload plan as a plain directory: exactly the file
+    surface `export-jetty` would upload for this task (fixtures, plus the skill
+    tree only on skill-bearing arms), and the payload JSON itself (runbook,
+    instruction, task fields). This is the Jetty path's model-visible workspace,
+    so the cross-runner baseline-isolation invariant can walk and grep it like
+    any filesystem runner's workspace without a live payload."""
+    payload = build_jetty_payload(
+        pt,
+        {"skill_name": pt.skill_name, "ablations": []},
+        collection="isolation-check",
+        task_prefix=None,
+        agent=JETTY_DEFAULT_AGENT,
+        model=JETTY_DEFAULT_MODEL,
+        model_provider=JETTY_DEFAULT_MODEL_PROVIDER,
+        snapshot=JETTY_DEFAULT_SNAPSHOT,
+    )
+    ws.mkdir(parents=True, exist_ok=True)
+    for item in payload.get("upload_plan", {}).get("files", []):
+        src = Path(str(item.get("local_path", "")))
+        if not src.is_file():
+            continue   # placeholder-only items carry no local bytes to mount
+        dest = safe_child_path(ws, str(item.get("remote_path_hint") or src.name))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+    (ws / "payload.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# The registration contract behind CF.2 (docs/eval-framework-roadmap-spec.md):
+# every runner that builds a model-visible workspace registers its builder here,
+# and ONE parameterized invariant (tests/test_confidence_floor.py) proves the
+# without_skill baseline is skill-free by construction for all of them. A new
+# runner registers itself and inherits the check instead of hand-rolling one.
+WORKSPACE_BUILDERS: dict[str, Any] = {}
+
+
+def register_workspace_builder(name: str, builder: Any) -> None:
+    WORKSPACE_BUILDERS[name] = builder
+
+
+register_workspace_builder("codex", codex_skill_workspace)     # run-codex
+register_workspace_builder("claude", codex_skill_workspace)    # run-claude shares the workspace builder
+register_workspace_builder("jetty", jetty_upload_workspace)    # export-jetty upload surface
 
 
 def codex_task_prompt(pt: PreparedTask, skill_paths: list[str] | None = None, input_files: list[str] | None = None) -> str:
@@ -2984,6 +3592,9 @@ def run_claude(args: argparse.Namespace) -> int:
     timeout = int(getattr(args, "timeout", 1800))
     for task in tasks:
         pt = PreparedTask.from_row(task)
+        # The row's model (multi-model fan-out, roadmap 2.1) beats the CLI-wide
+        # default, so one prepared JSONL can drive several models in one pass.
+        row_model = task.get("model") or model
         base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
         base.mkdir(parents=True, exist_ok=True)
         prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
@@ -2991,13 +3602,18 @@ def run_claude(args: argparse.Namespace) -> int:
             ws = Path(wd)
             skill_rel, input_rel = codex_skill_workspace(pt, ws)
             prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
-            result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
+            result = claude_cli_invoke(prompt, model=row_model, claude_bin=claude_bin, timeout=timeout)
             metrics = claude_run_metrics(result)
+            usage_block = normalize_usage(result.get("usage"), source="provider_reported")
+            cost_block = normalize_cost(result.get("cost_usd"), source="provider_reported", pricing_model=row_model)
+            metrics["usage_normalized"] = usage_block
+            metrics["cost_normalized"] = cost_block
             write_json(base / "metrics.json", metrics)
             write_json(base / "metadata.json", {
-                "provider": "claude", "model": model, "returncode": result.get("returncode"),
+                "provider": "claude", "model": row_model, "returncode": result.get("returncode"),
                 "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
                 "cost_usd": metrics.get("cost_usd"), "stderr": result.get("stderr", ""),
+                "usage_normalized": usage_block, "cost_normalized": cost_block,
                 "trace_source": "claude", **prov_extra})
             write_json(base / "events.json", {"schema_version": 1, "source": "claude", "events": []})
             answer = result.get("answer") or ""
@@ -3011,7 +3627,74 @@ def run_claude(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_dir: Path | None) -> tuple[bool, str]:
+def json_schema_errors(instance: Any, schema: dict[str, Any], path: str = "$") -> list[str]:
+    """Deterministic subset of JSON-Schema for structured_output (roadmap 1.1):
+    type, properties, required, items, enum, const, minItems/maxItems. Enough
+    to pin a tool-output contract without a new dependency."""
+    errors: list[str] = []
+    if "const" in schema and instance != schema["const"]:
+        errors.append(f"{path}: expected const {schema['const']!r}, got {instance!r}")
+    if "enum" in schema and instance not in schema["enum"]:
+        errors.append(f"{path}: {instance!r} not in enum {schema['enum']!r}")
+    expected_type = schema.get("type")
+    if expected_type:
+        checks = {
+            "object": lambda v: isinstance(v, dict),
+            "array": lambda v: isinstance(v, list),
+            "string": lambda v: isinstance(v, str),
+            "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+            "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+            "boolean": lambda v: isinstance(v, bool),
+            "null": lambda v: v is None,
+        }
+        allowed = expected_type if isinstance(expected_type, list) else [expected_type]
+        if not any(checks.get(t, lambda v: False)(instance) for t in allowed):
+            errors.append(f"{path}: expected type {expected_type}, got {type(instance).__name__}")
+            return errors   # type mismatch makes deeper checks noise
+    if isinstance(instance, dict):
+        for key in schema.get("required", []):
+            if key not in instance:
+                errors.append(f"{path}: missing required key {key!r}")
+        for key, sub in (schema.get("properties") or {}).items():
+            if key in instance and isinstance(sub, dict):
+                errors.extend(json_schema_errors(instance[key], sub, f"{path}.{key}"))
+    if isinstance(instance, list):
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and len(instance) < min_items:
+            errors.append(f"{path}: {len(instance)} items < minItems {min_items}")
+        max_items = schema.get("maxItems")
+        if isinstance(max_items, int) and len(instance) > max_items:
+            errors.append(f"{path}: {len(instance)} items > maxItems {max_items}")
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for i, element in enumerate(instance):
+                errors.extend(json_schema_errors(element, items, f"{path}[{i}]"))
+    return errors
+
+
+def parse_script_score_line(stdout: str) -> float | None:
+    """1.8: a graded script oracle may print a JSON line such as
+    {"score": 6, "max_score": 7}; the parsed value (normalized 0-1) feeds the
+    graded channel. No line, or a malformed one, keeps the oracle binary."""
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict) or not isinstance(obj.get("score"), (int, float)):
+            continue
+        score = float(obj["score"])
+        max_score = obj.get("max_score", 1)
+        if isinstance(max_score, (int, float)) and float(max_score) > 0:
+            score = score / float(max_score)
+        return max(0.0, min(1.0, score))
+    return None
+
+
+def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_dir: Path | None) -> tuple[bool, str, float | None]:
     command = script_command_list(assertion)
     command = [part.replace("{output_dir}", str(output_dir.resolve())).replace("{output_path}", str((output_dir / "output.md").resolve())) for part in command]
     timeout = float(assertion.get("timeout_s", 30))
@@ -3023,16 +3706,98 @@ def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_d
             evidence += f"\nstdout:\n{proc.stdout[:4000]}"
         if proc.stderr:
             evidence += f"\nstderr:\n{proc.stderr[:4000]}"
-        return proc.returncode == expected, evidence
+        # pass_exit_code still decides passed; the score line only feeds the
+        # graded channel, so a scoreless oracle keeps pure pass/fail behavior.
+        return proc.returncode == expected, evidence, parse_script_score_line(proc.stdout)
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or ""
         stderr = exc.stderr or ""
-        return False, f"script timed out after {timeout}s\nstdout:\n{stdout[:2000]}\nstderr:\n{stderr[:2000]}"
+        return False, f"script timed out after {timeout}s\nstdout:\n{stdout[:2000]}\nstderr:\n{stderr[:2000]}", None
     except Exception as exc:
-        return False, f"script execution failed: {exc}"
+        return False, f"script execution failed: {exc}", None
 
 
-def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *, run_base: Path | None = None, allow_scripts: bool = False, manifest_dir: Path | None = None) -> dict[str, Any]:
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if not norm_a or not norm_b:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def embedding_similarity(actual: str, expected: str, embed_cmd: str, timeout: float = 60) -> tuple[float | None, str]:
+    """4.1: embedding-backed similarity behind an explicit external command —
+    stdin {"texts": [actual, expected]}, stdout {"embeddings": [[...], [...]]}.
+    Kept out of core grading exactly like `script`: no --embed-cmd, no call."""
+    try:
+        proc = subprocess.run(embed_cmd, shell=True, input=json.dumps({"texts": [actual, expected]}),
+                              text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"embed command timed out after {timeout}s"
+    if proc.returncode != 0:
+        return None, f"embed command exit {proc.returncode}: {proc.stderr[:500]}"
+    try:
+        obj = extract_json_object(proc.stdout)
+    except ValueError:
+        return None, "embed command emitted no JSON object"
+    vectors = obj.get("embeddings")
+    if (not isinstance(vectors, list) or len(vectors) != 2
+            or not all(isinstance(v, list) and v and all(isinstance(x, (int, float)) for x in v) for v in vectors)
+            or len(vectors[0]) != len(vectors[1])):
+        return None, "embed command must return two equal-length numeric vectors under 'embeddings'"
+    return cosine_similarity([float(x) for x in vectors[0]], [float(x) for x in vectors[1]]), ""
+
+
+def normalize_golden(text: str, mode: str) -> str:
+    """Normalization for golden_output is the whole game, so it is explicit and
+    per-assertion, never implicit: exact bytes by default, `trim` strips outer
+    whitespace, `text` collapses every whitespace run to one space."""
+    if mode == "exact":
+        return text
+    if mode == "trim":
+        return text.strip()
+    if mode == "text":
+        return " ".join(text.split())
+    raise ValueError(f"unknown golden_output normalize mode {mode!r}; expected exact, trim, or text")
+
+
+def golden_output_result(assertion: dict[str, Any], text: str, output_path: Path, run_base: Path | None, manifest_dir: Path | None) -> tuple[bool, str]:
+    reference_rel = str(assertion.get("reference", assertion.get("value", "")) or "")
+    if manifest_dir is None or not reference_rel:
+        return False, "golden_output requires a `reference` file path relative to the manifest directory"
+    ref_path = Path(manifest_dir) / reference_rel
+    if not ref_path.is_file():
+        return False, f"missing reference file: {reference_rel}"
+    artifact_rel = assertion.get("artifact")
+    actual_text = text
+    actual_label = output_path.name
+    if artifact_rel:
+        candidate = (run_base or output_path.parent) / str(artifact_rel)
+        actual_label = str(artifact_rel)
+        if not candidate.is_file():
+            return False, f"missing artifact: {artifact_rel}"
+        actual_text = candidate.read_text(encoding="utf-8", errors="replace")
+    expected_text = ref_path.read_text(encoding="utf-8", errors="replace")
+    mode = str(assertion.get("normalize", "exact"))
+    try:
+        got = normalize_golden(actual_text, mode)
+        want = normalize_golden(expected_text, mode)
+    except ValueError as exc:
+        return False, str(exc)
+    if got == want:
+        return True, f"{actual_label} matches reference {reference_rel} (normalize={mode})"
+    diff = list(difflib.unified_diff(
+        expected_text.splitlines(), actual_text.splitlines(),
+        fromfile=f"reference/{reference_rel}", tofile=actual_label, lineterm="", n=2,
+    ))
+    shown = "\n".join(diff[:60])
+    if len(diff) > 60:
+        shown += f"\n... ({len(diff) - 60} more diff lines)"
+    return False, f"differs from reference {reference_rel} (normalize={mode})\n{shown}"
+
+
+def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *, run_base: Path | None = None, allow_scripts: bool = False, manifest_dir: Path | None = None, embed_cmd: str | None = None) -> dict[str, Any]:
     atype = assertion.get("type")
     name = assertion.get("name") or assertion.get("description") or atype
     ci = assertion.get("ci", True)
@@ -3042,6 +3807,7 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
 
     passed = False
     evidence = ""
+    score: float | None = None   # scored detectors set a real value; binary ones mirror passed
     if atype in PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS:
         passed, evidence = process_or_efficiency_assertion_result(assertion, run_base, {})
     elif atype == "contains":
@@ -3092,23 +3858,89 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
             evidence = f"{field}={actual!r}"
         except Exception as exc:
             evidence = f"json check failed: {exc}"
+    elif atype == "golden_output":
+        passed, evidence = golden_output_result(assertion, text, output_path, run_base, manifest_dir)
+    elif atype == "similarity":
+        # 1.4: the deterministic middle between regex and a judge — a difflib
+        # ratio against an expected string, thresholded, emitting a score.
+        # 4.1: mode="embedding" swaps the ratio for cosine similarity behind an
+        # explicit --embed-cmd; absent the opt-in, it fails closed like script.
+        expected = str(assertion.get("expected", assertion.get("value", "")))
+        threshold = float(assertion.get("threshold", 0.8))
+        compare = text
+        if assertion.get("artifact"):
+            candidate = (run_base or output_path.parent) / str(assertion["artifact"])
+            compare = candidate.read_text(encoding="utf-8", errors="replace") if candidate.is_file() else ""
+        mode = str(assertion.get("mode", "ratio"))
+        if mode == "embedding":
+            if not embed_cmd:
+                passed = False
+                evidence = "embedding similarity skipped; rerun grade/benchmark with --embed-cmd to call an external embedding command (kept out of core grading by design)"
+            else:
+                ratio, err = embedding_similarity(compare, expected, embed_cmd)
+                if ratio is None:
+                    passed = False
+                    evidence = err
+                else:
+                    score = round(ratio, 4)
+                    passed = ratio >= threshold
+                    evidence = f"embedding similarity={ratio:.4f} vs threshold={threshold:g}"
+        else:
+            a, b = (norm(compare), norm(expected)) if ci else (compare, expected)
+            ratio = difflib.SequenceMatcher(None, a, b).ratio()
+            score = round(ratio, 4)
+            passed = ratio >= threshold
+            evidence = f"similarity={ratio:.4f} vs threshold={threshold:g} against expected[:60]={expected[:60]!r}"
+    elif atype == "structured_output":
+        # 1.1: json_field_equals extended with (subset) JSON-Schema validation.
+        schema = assertion.get("schema")
+        rel = assertion.get("path")
+        instance: Any = None
+        errors: list[str] = []
+        if not isinstance(schema, dict):
+            errors = ["structured_output requires a schema object"]
+        else:
+            try:
+                if rel:
+                    p = (run_base or output_path.parent) / str(rel)
+                    instance = json.loads(p.read_text(encoding="utf-8"))
+                else:
+                    instance = extract_json_object(text)
+            except Exception as exc:
+                errors = [f"no parsable JSON candidate: {exc}"]
+            if not errors:
+                errors = json_schema_errors(instance, schema)
+        passed = not errors
+        evidence = "schema ok" if passed else "; ".join(errors[:5])
     elif atype == "script":
         if not allow_scripts:
             passed = False
             evidence = "script assertion skipped; rerun grade/benchmark with --allow-scripts to execute repo-owned oracle commands"
         else:
-            passed, evidence = run_script_assertion(assertion, run_base or output_path.parent, manifest_dir)
+            passed, evidence, script_score = run_script_assertion(assertion, run_base or output_path.parent, manifest_dir)
+            if script_score is not None:
+                score = script_score
     else:
         evidence = "qualitative/deferred"
-    return {"name": name, "type": atype, "passed": passed, "evidence": evidence}
+    if score is not None and isinstance(assertion.get("atLeast"), (int, float)):
+        # A scored assertion with an explicit floor: the floor decides passed.
+        passed = score >= float(assertion["atLeast"])
+        evidence += f" (score={score:g}, atLeast={assertion['atLeast']:g})"
+    return {"name": name, "type": atype, "passed": passed, "evidence": evidence, "score": score if score is not None else (1.0 if passed else 0.0)}
 
 
 def assertion_label(assertion: dict[str, Any]) -> str:
     return str(assertion.get("name") or assertion.get("description") or assertion.get("type") or "assertion")
 
 
-def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[str, Any]) -> str:
-    return f"{case_id}::{variant}::run-{run_number}::{assertion_label(assertion)}"
+def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[str, Any], model: str | None = None) -> str:
+    """One verdict key per (case, model, variant, run, assertion). The model
+    segment appears only on model-fanned runs (roadmap 2.1) — without it,
+    case-1/m1/with_skill and case-1/m2/with_skill would share an ID and the
+    last-loaded verdict would silently apply to both models. Single-model IDs
+    keep the historical shape."""
+    model_segment = f"{model}::" if model else ""
+    return f"{case_id}::{model_segment}{variant}::run-{run_number}::{assertion_label(assertion)}"
 
 
 def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
@@ -3170,6 +4002,23 @@ def judge_prompt(task: dict[str, Any], output_text: str) -> str:
         "assertion": assertion,
         "candidate_output": output_text,
     }
+    if assertion.get("graded_dimensions"):
+        return (
+            "You are grading one Skill Eval Harness judge assertion with ANCHORED graded dimensions.\n"
+            "Score each dimension on its stated scale (default 1-5) strictly against its anchored rubric —\n"
+            "the anchors name what each score level looks like; score against the criteria, not a vibe.\n"
+            "Return only JSON with keys: dimension_scores (object mapping each dimension name to a number), rationale (string).\n\n"
+            + json.dumps(payload, indent=2, ensure_ascii=False)
+        )
+    if assertion.get("dynamic_rubric"):
+        minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
+        return (
+            "You are grading one Skill Eval Harness judge assertion with a DYNAMIC rubric.\n"
+            f"First draft 3-5 case-specific criteria per the assertion's instruction (at least {minimum}),\n"
+            "then grade the candidate output against each criterion you drafted.\n"
+            "Return only JSON with keys: criteria (list of {name (string), met (boolean)}), rationale (string).\n\n"
+            + json.dumps(payload, indent=2, ensure_ascii=False)
+        )
     return (
         "You are grading one Skill Eval Harness judge assertion.\n"
         "Return only JSON with keys: passed (boolean), score (number optional), rationale (string).\n\n"
@@ -3182,12 +4031,15 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
     selected_variants = variants or manifest.get("variants", DEFAULT_VARIANTS)
     tasks: list[dict[str, Any]] = []
     for case in iter_cases(manifest, split):
-        for variant in selected_variants:
-            for run_number, base in discover_run_bases(runs, case["id"], variant):
-                text, output_path = read_output_base(base)
-                meta = read_metadata_base(base)
-                _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={})
-                tasks.extend(judge_tasks)
+        for model_name, model_root in discover_case_model_roots(runs, case["id"], selected_variants):
+            for variant in selected_variants:
+                for run_number, base in discover_run_bases_under(model_root / variant):
+                    text, output_path = read_output_base(base)
+                    meta = read_metadata_base(base)
+                    # The layout model rides into judge_task_id so a fanned run's
+                    # verdicts merge back onto the right model's rows.
+                    _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={}, model=model_name)
+                    tasks.extend(judge_tasks)
     return tasks
 
 
@@ -3216,6 +4068,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     # the native Claude adapter when only `--judge-model` is given — the native path
     # captures the real dollar cost of judging, which a shell cmd can't report back.
     cost_usd = None
+    judge_usage = None
     if judge_cmd:
         proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
         stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
@@ -3223,6 +4076,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin)
         stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
         cost_usd = res.get("cost_usd")
+        judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
     else:
         raise ValueError("run_one_judge_task needs a judge_cmd or a judge_model")
     parsed: dict[str, Any]
@@ -3235,9 +4089,24 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     assertion = task.get("assertion", {})
     threshold = assertion.get("threshold", parsed.get("threshold", 1))
     score = parsed.get("score")
-    passed = judge_verdict_passed({**parsed, "threshold": threshold})
+    graded_payload: dict[str, Any] = {}
+    if assertion.get("graded_dimensions") and isinstance(parsed.get("dimension_scores"), dict):
+        graded_payload["dimension_scores"] = parsed["dimension_scores"]
+    if assertion.get("dynamic_rubric") and isinstance(parsed.get("criteria"), list):
+        graded_payload["criteria"] = parsed["criteria"]
+    if graded_payload:
+        # Graded shapes (roadmap 2.2): the verdict comes from the SAME owner the
+        # merge uses (merged_qualitative_entry), and the graded payload rides
+        # the row so the merge can re-derive it — a graded response carries no
+        # top-level passed/score, so the plain path would file it as failed.
+        graded_entry = merged_qualitative_entry(assertion, parsed, task["judge_task_id"])
+        passed = bool(graded_entry.get("passed"))
+        score = graded_entry.get("score")
+    else:
+        passed = judge_verdict_passed({**parsed, "threshold": threshold})
     evidence = parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or parse_error or "judge command completed"
     row = {
+        **graded_payload,
         "judge_task_id": task["judge_task_id"],
         "case_id": task.get("case_id"),
         "variant": task.get("variant"),
@@ -3246,6 +4115,10 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         # is recorded so a panel can measure whether the answer depends on the judge.
         "judge_model": judge_model,
         "cost_usd": cost_usd,
+        # Judge-model spend is suite cost too, but a SEPARATE ledger line from
+        # the model under test (issue #21); normalized like every runner path.
+        "usage_normalized": normalize_usage(judge_usage, source="provider_reported"),
+        "cost_normalized": normalize_cost(cost_usd, source="provider_reported", pricing_model=judge_model),
         "passed": passed and returncode == 0 and parse_error is None,
         "score": score,
         "threshold": threshold,
@@ -3279,12 +4152,221 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return first
 
 
+def effective_judge_model(manifest: dict[str, Any], cli_model: str | None) -> str | None:
+    """The judge config slot (roadmap 1.3): an explicit --judge-model wins;
+    otherwise the manifest's judge.model is the declared default."""
+    if cli_model:
+        return cli_model
+    configured = (manifest.get("judge") or {}).get("model")
+    return str(configured) if configured else None
+
+
+TOOL_REPLAY_ENV = "SKILL_BENCHMARK_TOOL_REPLAY"
+TOOL_REPLAY_MODES = {"auto", "record", "replay", "off", "strict"}
+
+
+class ToolReplayMiss(Exception):
+    """A replayed run requested a tool call that was never recorded."""
+
+
+class ToolReplayStore:
+    """Record/replay for tool I/O (roadmap 2.3). Recording writes
+    tool-replay.json beside the run outputs — keyed, versioned, FIFO per
+    (tool, payload) so repeated identical calls replay in order. Replay makes
+    the AGENT run reproducible; grading was already reproducible from disk.
+    Modes: record (live calls captured), replay (recorded answers only,
+    missing key falls through to live), strict (replay; missing key raises),
+    auto (replay when a recording exists, else record), off (no store)."""
+
+    VERSION = 1
+
+    def __init__(self, path: Path, mode: str = "auto"):
+        if mode not in TOOL_REPLAY_MODES:
+            raise ValueError(f"unknown tool-replay mode {mode!r}; expected one of {sorted(TOOL_REPLAY_MODES)}")
+        self.path = path
+        self.recorded: dict[str, list[Any]] = {}
+        had_recording = path.is_file()
+        if had_recording:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            for row in doc.get("records", []):
+                self.recorded.setdefault(str(row.get("key")), []).append(row.get("output"))
+        self.mode = ("replay" if had_recording else "record") if mode == "auto" else mode
+        self.new_records: list[dict[str, Any]] = []
+
+    @staticmethod
+    def call_key(tool: str, payload: Any) -> str:
+        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(f"{tool}\n{canonical}".encode("utf-8")).hexdigest()[:32]
+
+    def resolve(self, tool: str, payload: Any, live: Any = None) -> Any:
+        key = self.call_key(tool, payload)
+        if self.mode in {"replay", "strict"}:
+            queue = self.recorded.get(key)
+            if queue:
+                return queue.pop(0)
+            if self.mode == "strict":
+                raise ToolReplayMiss(f"unrecorded tool call in strict replay: {tool} (key {key})")
+        if live is None:
+            raise ToolReplayMiss(f"no live executor for tool {tool!r} (mode {self.mode})")
+        output = live(payload)
+        if self.mode == "record":
+            self.new_records.append({"tool": tool, "key": key, "output": output})
+        return output
+
+    def save(self) -> None:
+        if self.mode != "record" or not self.new_records:
+            return
+        write_json(self.path, {"version": self.VERSION, "sanitize": [], "records": self.new_records})
+
+
+def tool_replay_mode(default: str = "off") -> str:
+    mode = os.environ.get(TOOL_REPLAY_ENV, default).strip().casefold() or default
+    return mode if mode in TOOL_REPLAY_MODES else default
+
+
+def run_subagent_tasks(
+    tasks: list[dict[str, Any]],
+    runs: Path,
+    agent_fn: Any,
+    *,
+    model: str | None = None,
+    live_tools: dict[str, Any] | None = None,
+    replay_mode: str | None = None,
+) -> int:
+    """The built-in subagent runner (roadmap 2.7): no external CLI required —
+    `agent_fn(prompt, workspace, model, tool_executor)` is the seam (a Claude
+    Code / Agent SDK dispatch in production, a plain function in tests). The
+    difference from an in-process eval harness is the boundary: the typed
+    return is adapted onto the run-output contract (output.md, metadata.json,
+    events.json, metrics.json), so grading stays file-based and re-runnable.
+    Tool replay (2.3) wraps the tool executor per run."""
+    mode = replay_mode or tool_replay_mode()
+    for task in tasks:
+        pt = PreparedTask.from_row(task)
+        row_model = task.get("model") or model
+        base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
+        base.mkdir(parents=True, exist_ok=True)
+        prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
+        store = ToolReplayStore(base / "tool-replay.json", mode) if mode != "off" else None
+
+        def tool_executor(tool: str, payload: Any) -> Any:
+            live = (live_tools or {}).get(tool)
+            if store is None:
+                if live is None:
+                    raise ToolReplayMiss(f"no live executor for tool {tool!r}")
+                return live(payload)
+            return store.resolve(tool, payload, live=live)
+
+        turns = [str(t) for t in task.get("turns") or [] if str(t)]
+        with tempfile.TemporaryDirectory(prefix="subagent-ws-") as wd:
+            ws = Path(wd)
+            skill_rel, input_rel = codex_skill_workspace(pt, ws)
+            prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
+            started = time.time()
+            try:
+                if turns:
+                    # Scripted multi-turn sequence (roadmap 3.1): the first turn
+                    # carries the workspace/skill preamble; later turns get the
+                    # raw turn prompt plus the conversation so far. Each turn's
+                    # answer lands in turn-<n>/output.md; the final answer is
+                    # also the run's output.md, so single-output consumers work.
+                    outcome = {}
+                    history: list[dict[str, str]] = []
+                    for n, turn_prompt in enumerate(turns, 1):
+                        sent = prompt if n == 1 else turn_prompt
+                        outcome = agent_fn(prompt=sent, workspace=ws, model=row_model, tool_executor=tool_executor, history=list(history)) or {}
+                        turn_answer = str(outcome.get("answer") or "")
+                        turn_dir = base / f"turn-{n}"
+                        turn_dir.mkdir(parents=True, exist_ok=True)
+                        (turn_dir / "output.md").write_text(turn_answer, encoding="utf-8")
+                        history.append({"prompt": sent, "answer": turn_answer})
+                else:
+                    outcome = agent_fn(prompt=prompt, workspace=ws, model=row_model, tool_executor=tool_executor) or {}
+                error = None
+            except ToolReplayMiss as exc:
+                outcome, error = {}, f"tool replay miss: {exc}"
+            except Exception as exc:
+                outcome, error = {}, f"subagent error: {exc}"
+            elapsed_ms = outcome.get("elapsed_ms")
+            if not isinstance(elapsed_ms, (int, float)):
+                elapsed_ms = int((time.time() - started) * 1000)
+        if store is not None:
+            store.save()
+        trace_records = outcome.get("trace") if isinstance(outcome.get("trace"), list) else []
+        events_doc, metrics = normalize_trace_records(trace_records, source="subagent")
+        metrics.update({k: v for k, v in (outcome.get("usage") or {}).items() if isinstance(v, (int, float))})
+        metrics["elapsed_ms"] = int(elapsed_ms)
+        raw_usage = outcome.get("usage") if isinstance(outcome.get("usage"), dict) else None
+        usage_block = normalize_usage(raw_usage, source="provider_reported") if raw_usage else metrics.get("usage_normalized", {"source": "missing"})
+        cost_block = normalize_cost((raw_usage or {}).get("cost_usd"), source="provider_reported", pricing_model=row_model)
+        metrics["usage_normalized"] = usage_block
+        metrics["cost_normalized"] = cost_block
+        write_json(base / "events.json", events_doc)
+        write_json(base / "metrics.json", metrics)
+        write_json(base / "metadata.json", {
+            "provider": "subagent", "model": row_model, "returncode": 1 if error else outcome.get("returncode", 0),
+            "timed_out": bool(outcome.get("timed_out", False)), "elapsed_ms": int(elapsed_ms),
+            "usage_normalized": usage_block, "cost_normalized": cost_block,
+            "tool_replay_mode": mode, "trace_source": "subagent", **prov_extra})
+        answer = str(outcome.get("answer") or "")
+        if error:
+            answer = f"{CLAUDE_FAILURE}: {error}]\n"
+        elif not answer:
+            answer = f"{CLAUDE_FAILURE}: no output produced]\n"
+        (base / "output.md").write_text(answer, encoding="utf-8")
+    return 0
+
+
+def shell_agent_backend(agent_cmd: str, timeout: int = 1800) -> Any:
+    """Adapt a shell command into the subagent seam: the prompt arrives as JSON
+    on stdin, the reply is JSON on stdout ({answer, trace?, usage?})."""
+    def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
+        payload = {"prompt": prompt, "model": model, "workspace": str(workspace)}
+        if history:
+            payload["history"] = history
+        proc = subprocess.run(agent_cmd, shell=True, input=json.dumps(payload),
+                              text=True, capture_output=True, timeout=timeout)
+        if proc.returncode != 0:
+            return {"answer": "", "returncode": proc.returncode}
+        try:
+            return extract_json_object(proc.stdout)
+        except ValueError:
+            return {"answer": proc.stdout}
+    return backend
+
+
+def run_subagent(args: argparse.Namespace) -> int:
+    tasks = load_jsonl(Path(args.tasks))
+    runs = Path(args.runs)
+    agent_cmd = getattr(args, "agent_cmd", None)
+    if agent_cmd:
+        backend = shell_agent_backend(agent_cmd, timeout=int(getattr(args, "timeout", 1800)))
+    else:
+        claude_bin = getattr(args, "claude_bin", None) or "claude"
+        timeout = int(getattr(args, "timeout", 1800))
+
+        def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
+            if history:
+                transcript = "\n\n".join(f"[user]\n{h['prompt']}\n\n[assistant]\n{h['answer']}" for h in history)
+                prompt = f"Conversation so far:\n{transcript}\n\n[user]\n{prompt}"
+            result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
+            return {"answer": result.get("answer"), "returncode": result.get("returncode"),
+                    "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
+                    "usage": claude_run_metrics(result)}
+    return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
+                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode())
+
+
+register_workspace_builder("subagent", codex_skill_workspace)   # run-subagent inherits CF.2
+
+
 def judge_command(args: argparse.Namespace) -> int:
     judge_cmd = getattr(args, "judge_cmd", None)
-    judge_model = getattr(args, "judge_model", None)
-    claude_bin = getattr(args, "claude_bin", None) or "claude"
+    manifest_for_judge = validate_manifest(Path(args.manifest))
+    judge_model = effective_judge_model(manifest_for_judge, getattr(args, "judge_model", None))
     if not judge_cmd and not judge_model:
-        die("judge needs --judge-cmd (any provider) or --judge-model (native Claude)")
+        die("judge needs --judge-cmd (any provider), --judge-model, or a manifest judge.model default")
+    claude_bin = getattr(args, "claude_bin", None) or "claude"
     tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
     transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
     repeat = max(1, int(getattr(args, "judge_runs", 1)))
@@ -3352,6 +4434,67 @@ def compare_judges(args: argparse.Namespace) -> int:
     return 0
 
 
+def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], jid: str) -> dict[str, Any]:
+    """Single owner for merging one judge verdict into a graded result row.
+    Three judge shapes (roadmap 2.2): plain verdict (passed/score+threshold),
+    anchored graded_dimensions (per-dimension 1-5 scores, normalized 0-1, pass
+    at the assertion threshold, default >= 4), and dynamic_rubric (the judge
+    drafts case-specific criteria and must meet at least minimum_criteria)."""
+    entry: dict[str, Any] = {
+        "name": assertion_label(assertion),
+        "type": assertion.get("type"),
+        "judge_task_id": jid,
+    }
+    evidence = judged.get("evidence", judged.get("rationale", judged.get("reasoning", "judge result supplied")))
+    dims = assertion.get("graded_dimensions")
+    dyn = assertion.get("dynamic_rubric")
+    if dims and isinstance(judged.get("dimension_scores"), dict):
+        raw = {str(k): float(v) for k, v in judged["dimension_scores"].items() if isinstance(v, (int, float))}
+        normalized = {k: max(0.0, min(1.0, (v - 1.0) / 4.0)) for k, v in raw.items()}
+        score = round(statistics.mean(normalized.values()), 4) if normalized else None
+        threshold_raw = assertion.get("threshold", 4)
+        threshold = max(0.0, min(1.0, (float(threshold_raw) - 1.0) / 4.0))
+        entry.update({
+            "passed": score is not None and score >= threshold,
+            "score": score,
+            "threshold": threshold,
+            "dimension_scores": raw,   # per-dimension scores stay in the row (and evidence)
+            "evidence": f"dimension scores (1-5): {json.dumps(raw, sort_keys=True)}; {evidence}",
+        })
+        return entry
+    if dyn and isinstance(judged.get("criteria"), list):
+        criteria = [c for c in judged["criteria"] if isinstance(c, dict)]
+        met = sum(1 for c in criteria if c.get("met"))
+        total = len(criteria)
+        minimum = max(1, int(dyn.get("minimum_criteria", 3)))
+        entry.update({
+            "passed": total >= minimum and met >= minimum,
+            "score": round(met / total, 4) if total else None,
+            "criteria_met": met,
+            "criteria_total": total,
+            "evidence": f"{met}/{total} dynamic criteria met (minimum {minimum}); {evidence}",
+        })
+        return entry
+    entry.update({
+        "passed": judge_verdict_passed(judged),
+        "score": judged.get("score"),
+        "evidence": evidence,
+    })
+    return entry
+
+
+def reference_floor(case: dict[str, Any]) -> float | None:
+    """Reference-anchor floor (roadmap 2.2), normalized to 0-1: an explicit
+    reference_score is already 0-1; reference_graded_score is on the 1-5 scale."""
+    value = case.get("reference_score")
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    value = case.get("reference_graded_score")
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, (float(value) - 1.0) / 4.0))
+    return None
+
+
 def grade_case_variant(
     case: dict[str, Any],
     variant: str,
@@ -3364,63 +4507,135 @@ def grade_case_variant(
     judge_results: dict[str, dict[str, Any]] | None = None,
     allow_scripts: bool = False,
     manifest_dir: Path | None = None,
+    model: str | None = None,
+    strict: bool = False,
+    embed_cmd: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     objective = []
     qualitative = []
     judge_tasks = []
+    # Multi-turn transcript (roadmap 3.1): each turn's assertions grade that
+    # turn's output; case-level assertions grade the final answer. With no
+    # turns declared, everything below is exactly the single-shot path.
+    turn_specs = [t for t in (case.get("turns") or []) if isinstance(t, dict)]
+    turn_units: list[tuple[dict[str, Any], str | None, Path, Path | None, int]] = []
+    turn_summaries: list[dict[str, Any]] = []
+    if turn_specs and run_base is not None:
+        turn_bases = dict(discover_turn_bases(run_base))
+        last_text: str | None = None
+        for n, turn in enumerate(turn_specs, 1):
+            turn_base = turn_bases.get(n)
+            if turn_base is not None:
+                turn_text, turn_output_path = read_output_base(turn_base)
+            else:
+                turn_text, turn_output_path = None, run_base / f"turn-{n}" / "output.md"
+            turn_summaries.append({"turn": n, "missing_output": turn_text is None})
+            for assertion in turn.get("assertions", []) or []:
+                turn_units.append((assertion, turn_text, turn_output_path, turn_base or run_base, n))
+            if turn_text is not None:
+                last_text = turn_text
+        if text is None:
+            text = last_text   # the final turn is the answer of record
     missing_output = text is None
     exec_valid = execution_valid(metadata, text)
     text = text or ""
     judge_results = judge_results or {}
-    for assertion in case.get("assertions", []):
+
+    def grade_unit(assertion: dict[str, Any], unit_text: str | None, unit_output_path: Path, unit_base: Path | None, turn_n: int | None = None) -> None:
         if not assertion_applies_to_variant(assertion, variant):
-            continue
+            return
         atype = assertion.get("type")
+        severity = assertion_severity(assertion, strict=strict)
+        tier = oracle_tier(assertion)
         if atype in QUALITATIVE_ASSERTIONS:
             # Judge-task emission honors THE scorable_run predicate, like every
             # other report view: a missing/infra-failed run is excluded from
             # scoring downstream, so never spend a judge model call grading its
             # empty/failed candidate (the verdict would only be discarded).
             if not scorable_run({"missing_output": missing_output, "execution_valid": exec_valid}):
-                continue
-            jid = judge_task_id(case["id"], variant, run_number, assertion)
+                return
+            expanded = expand_judge_preset(assertion)
+            if turn_n is not None:
+                expanded = {**expanded, "name": f"turn-{turn_n}: {assertion_label(expanded)}"}
+            jid = judge_task_id(case["id"], variant, run_number, expanded, model=model)
             judged = judge_results.get(jid)
             if judged:
-                passed = judge_verdict_passed(judged)
-                qualitative.append({
-                    "name": assertion_label(assertion),
-                    "type": atype,
-                    "passed": passed,
-                    "score": judged.get("score"),
-                    "evidence": judged.get("evidence", judged.get("reasoning", "judge result supplied")),
-                    "judge_task_id": jid,
-                })
+                entry = merged_qualitative_entry(expanded, judged, jid)
+                entry["severity"] = severity
+                entry["oracle"] = tier
+                if turn_n is not None:
+                    entry["turn"] = turn_n
+                qualitative.append(entry)
             else:
                 judge_tasks.append({
                     "judge_task_id": jid,
                     "case_id": case["id"],
+                    **({"model": model} if model else {}),
                     "variant": variant,
                     "run_number": run_number,
-                    "assertion": assertion,
-                    "output_path": str(output_path),
-                    "run_base": str(run_base or output_path.parent),
+                    "assertion": expanded,
+                    "output_path": str(unit_output_path),
+                    "run_base": str(unit_base or unit_output_path.parent),
                     "prompt": case.get("prompt"),
                     "prompt_ref": case.get("prompt_ref"),
                     "expected_behavior": case.get("expected_behavior", []),
                     "review_rubric": case.get("review_rubric", []),
                 })
         else:
-            objective.append(assertion_result(assertion, text, output_path, run_base=run_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir))
-    objective_passed = sum(1 for r in objective if r["passed"])
-    objective_total = len(objective)
-    process_rows = [r for r in objective if r.get("type") in PROCESS_ASSERTIONS]
-    efficiency_rows = [r for r in objective if r.get("type") in EFFICIENCY_ASSERTIONS]
+            labeled = {**assertion, "name": f"turn-{turn_n}: {assertion_label(assertion)}"} if turn_n is not None else assertion
+            entry = assertion_result(labeled, unit_text or "", unit_output_path, run_base=unit_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir, embed_cmd=embed_cmd)
+            entry["severity"] = severity
+            entry["oracle"] = tier
+            if turn_n is not None:
+                entry["turn"] = turn_n
+            objective.append(entry)
+
+    for assertion in case.get("assertions", []):
+        grade_unit(assertion, text, output_path, run_base)
+    for assertion, unit_text, unit_output_path, unit_base, turn_n in turn_units:
+        grade_unit(assertion, unit_text, unit_output_path, unit_base, turn_n)
+    for summary_row in turn_summaries:
+        n = summary_row["turn"]
+        rows_for_turn = [r for r in objective + qualitative if r.get("turn") == n]
+        summary_row["passed"] = sum(1 for r in rows_for_turn if r["passed"])
+        summary_row["total"] = len(rows_for_turn)
+    # Severity split (roadmap 2.2). The pass-rate channel is carried by gate and
+    # critical results (the default for every objective assertion, so binary
+    # manifests grade identically); soft results leave the denominator and fill
+    # the graded `scored` bucket instead. A failing critical assertion is the
+    # absorbing barrier: it VETOES the run — every rate collapses to 0.0 and the
+    # graded score is withheld, so no mean can average the catastrophe away.
+    gate_objective = [r for r in objective if r.get("severity") in {"gate", "critical"}]
+    soft_rows = [r for r in objective + qualitative if r.get("severity") == "soft"]
+    critical_rows = [r for r in objective + qualitative if r.get("severity") == "critical"]
+    critical_failures = [r["name"] for r in critical_rows if not r["passed"]]
+    vetoed = bool(critical_failures)
+    objective_passed = sum(1 for r in gate_objective if r["passed"])
+    objective_total = len(gate_objective)
+    process_rows = [r for r in gate_objective if r.get("type") in PROCESS_ASSERTIONS]
+    efficiency_rows = [r for r in gate_objective if r.get("type") in EFFICIENCY_ASSERTIONS]
     process_passed = sum(1 for r in process_rows if r["passed"])
     efficiency_passed = sum(1 for r in efficiency_rows if r["passed"])
-    qualitative_passed = sum(1 for r in qualitative if r["passed"])
-    qualitative_total = len(qualitative)
+    # Soft qualitative rows (the judge/rubric default) feed ONLY the graded
+    # channel; the qualitative/combined pass rates are carried by gate and
+    # critical qualitative rows, mirroring the objective split above. Declare
+    # severity: "gate" on a judge assertion to keep it in the pass rate.
+    gate_qualitative = [r for r in qualitative if r.get("severity") in {"gate", "critical"}]
+    qualitative_passed = sum(1 for r in gate_qualitative if r["passed"])
+    qualitative_total = len(gate_qualitative)
     combined_passed = objective_passed + qualitative_passed
     combined_total = objective_total + qualitative_total
+    soft_scores = [r["score"] for r in soft_rows if isinstance(r.get("score"), (int, float))]
+    graded_score = round(statistics.mean(soft_scores), 4) if soft_scores and not vetoed else None
+    floor = reference_floor(case)
+    below_floor: list[str] = []
+    if floor is not None:
+        for r in soft_rows:
+            if isinstance(r.get("score"), (int, float)) and r["score"] < floor:
+                below_floor.append(str(r["name"]))
+            for dim, raw in (r.get("dimension_scores") or {}).items():
+                if isinstance(raw, (int, float)) and (raw - 1.0) / 4.0 < floor:
+                    below_floor.append(f"{r['name']}:{dim}")
     result = {
         "case_id": case["id"],
         "split": case["split"],
@@ -3431,24 +4646,35 @@ def grade_case_variant(
         "success_goals": case.get("success_goals", []),
         "variant": variant,
         "run_number": run_number,
+        # The model axis (roadmap 2.1): the run-layout model segment wins;
+        # otherwise the model the runner recorded in metadata labels the run.
+        "model": model or (str(metadata.get("model")) if isinstance(metadata.get("model"), str) and metadata.get("model") else None),
         "run_base": str(run_base or output_path.parent),
         "missing_output": missing_output,
         "execution_valid": exec_valid,
         "objective_passed": objective_passed,
         "objective_total": objective_total,
-        "objective_pass_rate": (objective_passed / objective_total) if objective_total else None,
+        "objective_pass_rate": (0.0 if vetoed else objective_passed / objective_total) if objective_total else (0.0 if vetoed else None),
         "process_passed": process_passed,
         "process_total": len(process_rows),
-        "process_pass_rate": (process_passed / len(process_rows)) if process_rows else None,
+        "process_pass_rate": (0.0 if vetoed else process_passed / len(process_rows)) if process_rows else None,
         "efficiency_passed": efficiency_passed,
         "efficiency_total": len(efficiency_rows),
-        "efficiency_pass_rate": (efficiency_passed / len(efficiency_rows)) if efficiency_rows else None,
+        "efficiency_pass_rate": (0.0 if vetoed else efficiency_passed / len(efficiency_rows)) if efficiency_rows else None,
         "qualitative_passed": qualitative_passed,
         "qualitative_total": qualitative_total,
-        "qualitative_pass_rate": (qualitative_passed / qualitative_total) if qualitative_total else None,
+        "qualitative_pass_rate": (0.0 if vetoed else qualitative_passed / qualitative_total) if qualitative_total else None,
         "combined_passed": combined_passed,
         "combined_total": combined_total,
-        "combined_pass_rate": (combined_passed / combined_total) if combined_total else None,
+        "combined_pass_rate": (0.0 if vetoed else combined_passed / combined_total) if combined_total else None,
+        "critical_total": len(critical_rows),
+        "critical_failures": critical_failures,
+        "vetoed": vetoed,
+        "soft_total": len(soft_rows),
+        "soft_passed": sum(1 for r in soft_rows if r["passed"]),
+        "graded_score": graded_score,
+        "below_reference_floor": below_floor,
+        **({"turns": turn_summaries} if turn_specs else {}),
         "assertions": objective,
         "qualitative_assertions": qualitative,
         "deferred_judge_tasks": len(judge_tasks),
@@ -3515,13 +4741,14 @@ def grade(args: argparse.Namespace) -> int:
     all_results = []
     all_judge_tasks = []
     for case in iter_cases(manifest, args.split):
-        for variant in variants:
-            for run_number, base in discover_run_bases(runs, case["id"], variant):
-                text, output_path = read_output_base(base)
-                meta = read_metadata_base(base)
-                result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent)
-                all_results.append(result)
-                all_judge_tasks.extend(judge_tasks)
+        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
+            for variant in variants:
+                for run_number, base in discover_run_bases_under(model_root / variant):
+                    text, output_path = read_output_base(base)
+                    meta = read_metadata_base(base)
+                    result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent, model=model_name, strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
+                    all_results.append(result)
+                    all_judge_tasks.extend(judge_tasks)
     report = {
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
@@ -3602,18 +4829,61 @@ def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> f
     return ResultSet(rows).mean_rate(key)
 
 
-def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
-    # ResultSet.by_case_variant() applies the scorable predicate and the grouping
-    # for us — the view cannot forget to exclude infra failures.
+def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, samples: int = 4096) -> dict[str, Any]:
+    """Two-sided sign-flip permutation test over per-case paired deltas
+    (roadmap 2.2): under H0 (the skill does nothing) each case's delta is a
+    coin-flip of sign, so p = share of sign patterns whose |mean| reaches the
+    observed |mean|. Exact enumeration up to max_exact_n cases, then a SEEDED
+    sample — deterministic, so re-grading stays byte-identical (CF.3)."""
+    n = len(deltas)
+    if n == 0:
+        return {"method": "sign-flip", "n": 0, "observed_mean_delta": None, "p_value": None, "significant_at_0_05": False}
+    observed = statistics.mean(deltas)
+    if all(abs(d) < 1e-12 for d in deltas):
+        return {"method": "sign-flip", "n": n, "observed_mean_delta": 0.0, "p_value": 1.0, "significant_at_0_05": False}
+    target = abs(observed) - 1e-12
+    if n <= max_exact_n:
+        total = 1 << n
+        hits = 0
+        for mask in range(total):
+            s = sum(-d if (mask >> i) & 1 else d for i, d in enumerate(deltas))
+            if abs(s / n) >= target:
+                hits += 1
+        method = "sign-flip-exact"
+    else:
+        rng = random.Random(0)
+        total = samples
+        hits = 0
+        for _ in range(samples):
+            s = sum(-d if rng.random() < 0.5 else d for d in deltas)
+            if abs(s / n) >= target:
+                hits += 1
+        method = "sign-flip-sampled"
+    p = hits / total
+    return {"method": method, "n": n, "observed_mean_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
+
+
+def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pass_rate") -> tuple[list[float], list[float], list[dict[str, Any]]]:
+    """Per-case paired with/without rates over one pairing population.
+    ResultSet.by_case_variant() applies the scorable predicate and the grouping
+    for us — the view cannot forget to exclude infra failures."""
     by_case_variant = ResultSet(results).by_case_variant()
     paired_with_rates: list[float] = []
     paired_without_rates: list[float] = []
-    for by_variant in by_case_variant.values():
-        w = mean_rate(by_variant.get("with_skill", []))
-        n = mean_rate(by_variant.get("without_skill", []))
-        if w is not None and n is not None:
-            paired_with_rates.append(w)
-            paired_without_rates.append(n)
+    negative_cases: list[dict[str, Any]] = []
+    for case_id, by_variant in sorted(by_case_variant.items()):
+        w = mean_rate(by_variant.get("with_skill", []), key)
+        n = mean_rate(by_variant.get("without_skill", []), key)
+        if w is None or n is None:
+            continue
+        paired_with_rates.append(w)
+        paired_without_rates.append(n)
+        if w < n:
+            negative_cases.append({"case_id": case_id, "with_skill": w, "without_skill": n, "delta": w - n})
+    return paired_with_rates, paired_without_rates, negative_cases
+
+
+def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates: list[float], negative_cases: list[dict[str, Any]]) -> dict[str, Any]:
     with_rate = statistics.mean(paired_with_rates) if paired_with_rates else None
     without_rate = statistics.mean(paired_without_rates) if paired_without_rates else None
     absolute_delta = None
@@ -3622,19 +4892,82 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         absolute_delta = with_rate - without_rate
         if with_rate >= without_rate and without_rate < 1:
             normalized_gain = (with_rate - without_rate) / (1 - without_rate)
-    negative_cases = []
-    for case_id, by_variant in sorted(by_case_variant.items()):
-        w = mean_rate(by_variant.get("with_skill", []))
-        n = mean_rate(by_variant.get("without_skill", []))
-        if w is not None and n is not None and w < n:
-            negative_cases.append({"case_id": case_id, "with_skill": w, "without_skill": n, "delta": w - n})
+    deltas = [w - n for w, n in zip(paired_with_rates, paired_without_rates)]
     return {
         "with_skill_objective_pass_rate": with_rate,
         "without_skill_objective_pass_rate": without_rate,
         "absolute_delta": absolute_delta,
         "normalized_gain": normalized_gain,
+        # Lift is tested, not eyeballed (roadmap 2.2): the sign-flip permutation
+        # p-value over the per-(case, model) deltas rides beside the raw delta.
+        "significance": sign_flip_significance(deltas),
         "negative_delta_cases": negative_cases,
     }
+
+
+def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    # The pairing key is (case, model) — roadmap 2.1. Each model's rows pair
+    # with_skill against without_skill within that model only; the headline
+    # block pools the per-(case, model) pairs, and by_model carries each
+    # model's own lift. With no model axis this is exactly the per-case
+    # pairing the harness always did.
+    models = sorted({str(r.get("model")) for r in results if r.get("model")})
+    unlabeled = [r for r in results if not r.get("model")]
+    all_with: list[float] = []
+    all_without: list[float] = []
+    all_negative: list[dict[str, Any]] = []
+    graded_with: list[float] = []
+    graded_without: list[float] = []
+    by_model: dict[str, dict[str, Any]] = {}
+    for model in models:
+        rows = [r for r in results if str(r.get("model")) == model]
+        w, n, neg = paired_case_rates(rows)
+        all_with.extend(w)
+        all_without.extend(n)
+        all_negative.extend({**item, "model": model} for item in neg)
+        by_model[model] = paired_block_from_rates(w, n, neg)
+        gw, gn, _ = paired_case_rates(rows, key="graded_score")
+        graded_with.extend(gw)
+        graded_without.extend(gn)
+    if unlabeled or not models:
+        pool = unlabeled if models else results
+        w, n, neg = paired_case_rates(pool)
+        all_with.extend(w)
+        all_without.extend(n)
+        all_negative.extend(neg)
+        gw, gn, _ = paired_case_rates(pool, key="graded_score")
+        graded_with.extend(gw)
+        graded_without.extend(gn)
+    out = paired_block_from_rates(all_with, all_without, all_negative)
+    if graded_with:
+        # The graded channel (roadmap 2.2): how much better, after the binary
+        # ceiling. Vetoed runs carry no graded_score, so a critical failure can
+        # never be averaged into this mean.
+        graded_deltas = [w - n for w, n in zip(graded_with, graded_without)]
+        out["graded"] = {
+            "with_skill_mean_score": round(statistics.mean(graded_with), 4),
+            "without_skill_mean_score": round(statistics.mean(graded_without), 4),
+            "delta": round(statistics.mean(graded_deltas), 4),
+            "significance": sign_flip_significance(graded_deltas),
+        }
+    if by_model:
+        out["by_model"] = by_model
+    return out
+
+
+def slice_lift_fields(block: dict[str, Any], overall_lift: float | None) -> dict[str, Any]:
+    """Slice-lift concentration (roadmap 3.2, the macro-eval metric one level
+    up from per-case lift): slice lift ÷ overall lift. A failure or gain
+    confined to one slice scores a high ratio there."""
+    w = (block.get("with_skill") or {}).get("mean_objective_pass_rate")
+    n = (block.get("without_skill") or {}).get("mean_objective_pass_rate")
+    if w is None or n is None:
+        return {}
+    lift = w - n
+    fields: dict[str, Any] = {"lift": round(lift, 4)}
+    if overall_lift:
+        fields["lift_concentration"] = round(lift / overall_lift, 4)
+    return fields
 
 
 def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> dict[str, Any]:
@@ -3647,14 +4980,41 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
         return {"runs": len(s), "mean_objective_pass_rate": s.mean_rate("objective_pass_rate"), "mean_combined_pass_rate": s.mean_rate("combined_pass_rate")}
 
     everything = ResultSet(results)
+    overall_lift = (build_paired_summary(results) or {}).get("absolute_delta")
     for field in ["domain", "difficulty", "trigger_type"]:
         for value in sorted({str(r.get(field)) for r in results if r.get(field)}):
-            out[field][value] = {v: slice_stats(everything.where(**{field: value, "variant": v})) for v in variants}
+            block = {v: slice_stats(everything.where(**{field: value, "variant": v})) for v in variants}
+            block.update(slice_lift_fields(block, overall_lift))
+            out[field][value] = block
     goals = sorted({str(goal) for r in results for goal in (r.get("success_goals") or [])})
     for goal in goals:
         in_goal = everything.matching(lambda r, g=goal: g in (r.get("success_goals") or []))
-        out["success_goals"][goal] = {v: slice_stats(in_goal.where(variant=v)) for v in variants}
+        block = {v: slice_stats(in_goal.where(variant=v)) for v in variants}
+        block.update(slice_lift_fields(block, overall_lift))
+        out["success_goals"][goal] = block
     return out
+
+
+def model_analysis_from_paired(paired: dict[str, Any]) -> dict[str, Any]:
+    """Per-model lift ranking (roadmap 3.2): rank models by lift and name the
+    ones that lose it (non-positive lift while the pooled lift is positive)."""
+    by_model = paired.get("by_model") or {}
+    if not by_model:
+        return {}
+    ranking = []
+    for model, block in by_model.items():
+        ranking.append({
+            "model": model,
+            "lift": block.get("absolute_delta"),
+            "with_skill": block.get("with_skill_objective_pass_rate"),
+            "without_skill": block.get("without_skill_objective_pass_rate"),
+            "significant_at_0_05": (block.get("significance") or {}).get("significant_at_0_05", False),
+        })
+    ranking.sort(key=lambda row: (-(row["lift"] if isinstance(row["lift"], (int, float)) else float("-inf")), row["model"]))
+    overall = paired.get("absolute_delta")
+    losers = [row["model"] for row in ranking
+              if isinstance(row["lift"], (int, float)) and row["lift"] <= 0 and isinstance(overall, (int, float)) and overall > 0]
+    return {"ranking": ranking, "lift_losers": losers}
 
 
 def _expected_component(comp: dict[str, Any], skill_paths: list[str]) -> Component:
@@ -3887,6 +5247,206 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     return out
 
 
+def p90(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1)))))
+    return ordered[index]
+
+
+def cost_stats(values: list[float]) -> dict[str, Any]:
+    clean = [float(v) for v in values if v is not None]
+    if not clean:
+        return {"sum": None, "mean": None, "median": None, "p90": None, "n": 0}
+    return {
+        "sum": round(sum(clean), 6),
+        "mean": round(statistics.mean(clean), 6),
+        "median": round(statistics.median(clean), 6),
+        "p90": round(p90(clean), 6),
+        "n": len(clean),
+    }
+
+
+def result_cost_facts(result: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(result.get("metadata", {}) or {})
+    merged.update(read_metrics_base(Path(result.get("run_base", ""))))
+    facts = run_cost_facts(merged)
+    facts["elapsed_ms"] = metric_number(merged, "elapsed_ms")
+    return facts
+
+
+def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str, dict[str, Any]] | None = None, confirmed_regressions: int = 0) -> dict[str, Any]:
+    """The cost ledger inside a benchmark report (issue #21). Operational by
+    design: EVERY run counts here, including execution errors — a timed-out
+    run still cost money — while quality rates elsewhere keep excluding them.
+    Coverage separates missing telemetry from zero spend."""
+    facts = [(r, result_cost_facts(r)) for r in results]
+    runs_seen = len(facts)
+    with_usage = [f for _, f in facts if f.get("total_tokens") is not None]
+    with_cost = [f for _, f in facts if f.get("cost_usd") is not None]
+    totals = {
+        "input_tokens": int(sum(f["input_tokens"] for _, f in facts if f.get("input_tokens") is not None)),
+        "output_tokens": int(sum(f["output_tokens"] for _, f in facts if f.get("output_tokens") is not None)),
+        "total_tokens": int(sum(f["total_tokens"] for _, f in facts if f.get("total_tokens") is not None)),
+        "total_cost_usd": round(sum(f["cost_usd"] for _, f in facts if f.get("cost_usd") is not None), 6),
+        "elapsed_ms_sum": int(sum(f["elapsed_ms"] for _, f in facts if f.get("elapsed_ms") is not None)),
+        "execution_errors": sum(1 for r, _ in facts if not r.get("missing_output") and not r.get("execution_valid", True)),
+    }
+    by_variant: dict[str, Any] = {}
+    for variant in sorted({r["variant"] for r, _ in facts}):
+        rows = [(r, f) for r, f in facts if r["variant"] == variant]
+        by_variant[variant] = {
+            "runs": len(rows),
+            "tokens": cost_stats([f["total_tokens"] for _, f in rows if f.get("total_tokens") is not None]),
+            "cost_usd": cost_stats([f["cost_usd"] for _, f in rows if f.get("cost_usd") is not None]),
+        }
+    by_case: dict[str, Any] = {}
+    for case_id in sorted({r["case_id"] for r, _ in facts}):
+        rows = [f for r, f in facts if r["case_id"] == case_id]
+        by_case[case_id] = {
+            "runs": len(rows),
+            "total_tokens": int(sum(f["total_tokens"] for f in rows if f.get("total_tokens") is not None)),
+            "total_cost_usd": round(sum(f["cost_usd"] for f in rows if f.get("cost_usd") is not None), 6),
+        }
+    paired_cost_delta: dict[str, Any] = {}
+    deltas = []
+    for case_id in by_case:
+        with_costs = [f["cost_usd"] for r, f in facts if r["case_id"] == case_id and r["variant"] == "with_skill" and f.get("cost_usd") is not None]
+        without_costs = [f["cost_usd"] for r, f in facts if r["case_id"] == case_id and r["variant"] == "without_skill" and f.get("cost_usd") is not None]
+        if with_costs and without_costs:
+            delta = statistics.mean(with_costs) - statistics.mean(without_costs)
+            paired_cost_delta[case_id] = {"with_skill": round(statistics.mean(with_costs), 6), "without_skill": round(statistics.mean(without_costs), 6), "delta": round(delta, 6)}
+            deltas.append(delta)
+    ablation_rows = [(r, f) for r, f in facts if str(r.get("variant", "")).startswith("ablation:")]
+    ablation_cost = round(sum(f["cost_usd"] for _, f in ablation_rows if f.get("cost_usd") is not None), 6)
+    ablation_tokens = int(sum(f["total_tokens"] for _, f in ablation_rows if f.get("total_tokens") is not None))
+    out: dict[str, Any] = {
+        "coverage": {
+            "runs_seen": runs_seen,
+            "runs_with_token_usage": len(with_usage),
+            "runs_with_dollar_cost": len(with_cost),
+            "runs_missing_usage": runs_seen - len(with_usage),
+            "runs_missing_cost": runs_seen - len(with_cost),
+        },
+        "totals": totals,
+        "by_variant": by_variant,
+        "by_case": by_case,
+        "paired_cost_delta": paired_cost_delta,
+        "mean_paired_cost_delta": round(statistics.mean(deltas), 6) if deltas else None,
+        "ablations": {
+            "runs": len(ablation_rows),
+            "total_tokens": ablation_tokens,
+            "total_cost_usd": ablation_cost,
+            "confirmed_regressions": confirmed_regressions,
+            "cost_per_confirmed_regression": round(ablation_cost / confirmed_regressions, 6) if confirmed_regressions and ablation_cost else None,
+        },
+    }
+    if judge_results:
+        judge_costs = []
+        for row in judge_results.values():
+            block = row.get("cost_normalized")
+            if isinstance(block, dict) and isinstance(block.get("total_cost"), (int, float)):
+                judge_costs.append(float(block["total_cost"]))
+            elif isinstance(row.get("cost_usd"), (int, float)):
+                judge_costs.append(float(row["cost_usd"]))
+        # Judge spend is suite cost, but its own ledger line — never folded
+        # into the model-under-test totals.
+        out["judge"] = {
+            "verdicts": len(judge_results),
+            "verdicts_with_cost": len(judge_costs),
+            "total_cost_usd": round(sum(judge_costs), 6) if judge_costs else None,
+        }
+    return out
+
+
+def confirmed_regression_count(ablation_regressions: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for entry in ablation_regressions or []
+        for reg in entry.get("regressions", [])
+        if reg.get("expected_regression_confirmed") is True
+    )
+
+
+def qualitative_by_visibility(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """2.7b's report split is about JUDGE-carried signal only: a run belongs
+    here iff it holds merged judge/rubric verdicts (qualitative_assertions),
+    and the graded mean is computed from those verdicts' soft scores — never
+    from the run-level graded_score, whose soft bucket also blends soft
+    OBJECTIVE checks (e.g. similarity). Otherwise a manifest with no judges at
+    all could report deterministic scoring as held-out rubric signal."""
+    out: dict[str, Any] = {}
+    scorable_rows = ResultSet(results).scorable().all
+    for label, splits in [("held_out", {"holdout", "holdback"}), ("tune_visible", None)]:
+        rows = [r for r in scorable_rows if r.get("qualitative_assertions")
+                and ((r.get("split") in splits) if splits else (r.get("split") not in {"holdout", "holdback"}))]
+        if not rows:
+            continue
+        rates = [r["qualitative_pass_rate"] for r in rows if r.get("qualitative_pass_rate") is not None]
+        graded = []
+        for r in rows:
+            judge_scores = [a["score"] for a in r.get("qualitative_assertions", [])
+                            if a.get("severity") == "soft" and isinstance(a.get("score"), (int, float))]
+            if judge_scores:
+                graded.append(statistics.mean(judge_scores))
+        out[label] = {
+            "runs": len(rows),
+            "mean_qualitative_pass_rate": statistics.mean(rates) if rates else None,
+            "mean_graded_score": round(statistics.mean(graded), 4) if graded else None,
+        }
+    return out
+
+
+def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    scorable_rows = ResultSet(rows).scorable().all   # the scorable predicate, once
+    objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
+    combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
+    process_rates = [r["process_pass_rate"] for r in scorable_rows if r.get("process_pass_rate") is not None]
+    efficiency_rates = [r["efficiency_pass_rate"] for r in scorable_rows if r.get("efficiency_pass_rate") is not None]
+    # Timing/token/command central tendencies describe SCORABLE runs, matching
+    # the pass-rate block above — a timed-out run's full duration must not drag
+    # the mean (the failure count is disclosed separately as execution_errors).
+    merged_metrics = []
+    for r in scorable_rows:
+        merged = dict(r.get("metadata", {}) or {})
+        merged.update(read_metrics_base(Path(r.get("run_base", ""))))
+        merged_metrics.append(merged)
+    elapsed = [metric_number(m, "elapsed_ms") for m in merged_metrics]
+    tokens = [metric_number(m, "total_tokens") for m in merged_metrics]
+    commands = [metric_number(m, "commands", "command_count") for m in merged_metrics]
+    costs = [metric_number(m, "cost_usd") for m in merged_metrics]
+    elapsed = [x for x in elapsed if x is not None]
+    tokens = [x for x in tokens if x is not None]
+    commands = [x for x in commands if x is not None]
+    costs = [x for x in costs if x is not None]
+    return {
+        "cases": len({r["case_id"] for r in rows}),
+        "runs": len(rows),
+        "missing_outputs": sum(1 for r in rows if r["missing_output"]),
+        "execution_errors": sum(1 for r in rows if not r["missing_output"] and not r.get("execution_valid", True)),
+        "mean_objective_pass_rate": statistics.mean(objective_rates) if objective_rates else None,
+        "mean_combined_pass_rate": statistics.mean(combined_rates) if combined_rates else None,
+        "mean_process_pass_rate": statistics.mean(process_rates) if process_rates else None,
+        "mean_efficiency_pass_rate": statistics.mean(efficiency_rates) if efficiency_rates else None,
+        "objective_pass_rate": stats(objective_rates),
+        "combined_pass_rate": stats(combined_rates),
+        "process_pass_rate": stats(process_rates),
+        "efficiency_pass_rate": stats(efficiency_rates),
+        "elapsed_ms": stats(elapsed),
+        "total_tokens": stats(tokens),
+        "command_count": stats(commands),
+        # Real dollar cost, when a runner recorded it (the Claude adapter does).
+        # Sum, not mean: "what did this arm cost to run" — over scorable runs only.
+        "cost_usd_total": round(sum(costs), 6) if costs else None,
+        "cost_usd": stats(costs),
+        "telemetry_availability": telemetry_summary(rows),
+        # Backward-compatible fields used by smoke_report.py callers.
+        "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
+        "median_total_tokens": statistics.median(tokens) if tokens else None,
+    }
+
+
 def build_benchmark_report(
     path: Path,
     runs: Path,
@@ -3894,6 +5454,8 @@ def build_benchmark_report(
     variants_arg: list[str] | None = None,
     judge_results_path: str | None = None,
     allow_scripts: bool = False,
+    strict: bool = False,
+    embed_cmd: str | None = None,
 ) -> dict[str, Any]:
     manifest = validate_manifest(path)
     variants = variants_arg or manifest.get("variants", DEFAULT_VARIANTS)
@@ -3911,12 +5473,13 @@ def build_benchmark_report(
         if case.get("kind") == "trigger":
             skipped_trigger_cases.append(case["id"])
             continue
-        for variant in variants:
-            for run_number, base in discover_run_bases(runs, case["id"], variant):
-                text, output_path = read_output_base(base)
-                meta = read_metadata_base(base)
-                result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent)
-                results.append(result)
+        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
+            for variant in variants:
+                for run_number, base in discover_run_bases_under(model_root / variant):
+                    text, output_path = read_output_base(base)
+                    meta = read_metadata_base(base)
+                    result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name, strict=strict, embed_cmd=embed_cmd)
+                    results.append(result)
 
     by_variant: dict[str, list[dict[str, Any]]] = {v: [] for v in variants}
     for r in results:
@@ -3924,51 +5487,17 @@ def build_benchmark_report(
 
     summary: dict[str, Any] = {}
     for variant, rows in by_variant.items():
-        scorable_rows = ResultSet(rows).scorable().all   # the scorable predicate, once
-        objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
-        combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
-        process_rates = [r["process_pass_rate"] for r in scorable_rows if r.get("process_pass_rate") is not None]
-        efficiency_rates = [r["efficiency_pass_rate"] for r in scorable_rows if r.get("efficiency_pass_rate") is not None]
-        # Timing/token/command central tendencies describe SCORABLE runs, matching
-        # the pass-rate block above — a timed-out run's full duration must not drag
-        # the mean (the failure count is disclosed separately as execution_errors).
-        merged_metrics = []
-        for r in scorable_rows:
-            merged = dict(r.get("metadata", {}) or {})
-            merged.update(read_metrics_base(Path(r.get("run_base", ""))))
-            merged_metrics.append(merged)
-        elapsed = [metric_number(m, "elapsed_ms") for m in merged_metrics]
-        tokens = [metric_number(m, "total_tokens") for m in merged_metrics]
-        commands = [metric_number(m, "commands", "command_count") for m in merged_metrics]
-        costs = [metric_number(m, "cost_usd") for m in merged_metrics]
-        elapsed = [x for x in elapsed if x is not None]
-        tokens = [x for x in tokens if x is not None]
-        commands = [x for x in commands if x is not None]
-        costs = [x for x in costs if x is not None]
-        summary[variant] = {
-            "cases": len({r["case_id"] for r in rows}),
-            "runs": len(rows),
-            "missing_outputs": sum(1 for r in rows if r["missing_output"]),
-            "execution_errors": sum(1 for r in rows if not r["missing_output"] and not r.get("execution_valid", True)),
-            "mean_objective_pass_rate": statistics.mean(objective_rates) if objective_rates else None,
-            "mean_combined_pass_rate": statistics.mean(combined_rates) if combined_rates else None,
-            "mean_process_pass_rate": statistics.mean(process_rates) if process_rates else None,
-            "mean_efficiency_pass_rate": statistics.mean(efficiency_rates) if efficiency_rates else None,
-            "objective_pass_rate": stats(objective_rates),
-            "combined_pass_rate": stats(combined_rates),
-            "process_pass_rate": stats(process_rates),
-            "efficiency_pass_rate": stats(efficiency_rates),
-            "elapsed_ms": stats(elapsed),
-            "total_tokens": stats(tokens),
-            "command_count": stats(commands),
-            # Real dollar cost, when a runner recorded it (the Claude adapter does).
-            # Sum, not mean: "what did this arm cost to run" — over scorable runs only.
-            "cost_usd_total": round(sum(costs), 6) if costs else None,
-            "cost_usd": stats(costs),
-            "telemetry_availability": telemetry_summary(rows),
-            # Backward-compatible fields used by smoke_report.py callers.
-            "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
-            "median_total_tokens": statistics.median(tokens) if tokens else None,
+        summary[variant] = variant_summary_block(rows)
+
+    # by_variant within by_model (roadmap 2.1): the same per-variant block,
+    # computed per model, so a multi-model run reads as a model-by-variant grid.
+    by_model_summary: dict[str, Any] = {}
+    for model in sorted({str(r.get("model")) for r in results if r.get("model")}):
+        m_rows = [r for r in results if str(r.get("model")) == model]
+        by_model_summary[model] = {
+            variant: variant_summary_block([r for r in m_rows if r["variant"] == variant])
+            for variant in variants
+            if any(r["variant"] == variant for r in m_rows)
         }
 
     case_flags = []
@@ -3987,6 +5516,12 @@ def build_benchmark_report(
         flags = []
         if w_rate == 1 and n_rate == 1:
             flags.append("saturated/non-discriminating")
+            # 2.2: saturation's next move. Objectively perfect but scoring low on
+            # the graded channel is competent-but-forgettable work — the report
+            # points at graded dimensions instead of stopping at the flag.
+            graded_ws = [r["graded_score"] for r in ws_rows if isinstance(r.get("graded_score"), (int, float))]
+            if graded_ws and statistics.mean(graded_ws) < FORGETTABLE_GRADED_THRESHOLD:
+                flags.append("structurally-pass-but-forgettable")
         if w_rate is not None and n_rate is not None and w_rate <= n_rate:
             flags.append("no objective lift")
         if w_rate is not None and w_rate < 1:
@@ -3995,9 +5530,41 @@ def build_benchmark_report(
             rr = [r["objective_pass_rate"] for r in vrows if r["objective_pass_rate"] is not None]
             if len(rr) > 1 and len(set(rr)) > 1:
                 flags.append(f"flaky repeated pass rates: {variant}")
+            # A critical (absorbing-barrier) failure is surfaced on its own,
+            # never only inside an averaged rate.
+            veto_names = sorted({name for r in vrows if r.get("vetoed") for name in r.get("critical_failures", [])})
+            if veto_names:
+                flags.append(f"critical-failure: {variant} ({', '.join(veto_names)})")
+        floor_hits = sorted({name for r in ws_rows for name in r.get("below_reference_floor", [])})
+        if floor_hits:
+            flags.append(f"below-reference-floor: {', '.join(floor_hits)}")
         if flags:
             case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate, "without_skill": n_rate})
 
+    # 1.7: per case, how much of the pass rate rests on strong oracles. A case
+    # passing mostly on demo/live tiers looks solid while resting on weak checks.
+    oracle_strength: dict[str, Any] = {}
+    for cid in case_ids:
+        rows = everything.where(case_id=cid).scorable().all
+        entries = [a for r in rows for a in (r.get("assertions", []) + r.get("qualitative_assertions", []))]
+        if not entries:
+            continue
+        total_by_tier: dict[str, int] = {}
+        passed_by_tier: dict[str, int] = {}
+        for a in entries:
+            tier = a.get("oracle", "strong")
+            total_by_tier[tier] = total_by_tier.get(tier, 0) + 1
+            if a.get("passed"):
+                passed_by_tier[tier] = passed_by_tier.get(tier, 0) + 1
+        passed_total = sum(passed_by_tier.values())
+        oracle_strength[cid] = {
+            "strong_pass_share": round(passed_by_tier.get("strong", 0) / passed_total, 4) if passed_total else None,
+            "passed_by_tier": dict(sorted(passed_by_tier.items())),
+            "total_by_tier": dict(sorted(total_by_tier.items())),
+        }
+
+    paired_summary = build_paired_summary(results)
+    ablation_regressions = build_ablation_regression_report(manifest, results)
     return {
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
@@ -4012,20 +5579,137 @@ def build_benchmark_report(
         "population": "answer",
         "skipped_trigger_cases": skipped_trigger_cases,
         "summary": summary,
-        "paired_summary": build_paired_summary(results),
+        "by_model": by_model_summary,
+        "oracle_strength": oracle_strength,
+        # 2.7b: held-out rubric scores reported apart from tune-visible ones,
+        # so a rubric the skill could see never inflates the held-out number.
+        "qualitative_by_visibility": qualitative_by_visibility(results),
+        "paired_summary": paired_summary,
+        "model_analysis": model_analysis_from_paired(paired_summary),
         "slice_summary": build_slice_summary(results, variants),
-        "ablation_regressions": build_ablation_regression_report(manifest, results),
+        "ablation_regressions": ablation_regressions,
+        # Operational spend beside the quality numbers (issue #21): totals over
+        # ALL runs (failures included), per-variant/case stats, paired cost
+        # deltas, ablation marginal cost, and separated judge spend.
+        "cost_summary": build_cost_summary(results, judge_results=judge_lookup, confirmed_regressions=confirmed_regression_count(ablation_regressions)),
         "case_flags": case_flags,
         "results": results,
     }
 
 
 def benchmark(args: argparse.Namespace) -> int:
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False))
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
     if args.out:
         write_json(Path(args.out), report)
     else:
         print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0
+
+
+def result_failure_lines(result: dict[str, Any]) -> list[str]:
+    if result.get("missing_output"):
+        return [f"missing output under {result.get('run_base', '')}"]
+    if not result.get("execution_valid", True):
+        return [f"execution error (infra failure) under {result.get('run_base', '')}"]
+    # Objective AND qualitative failures fail the testcase; soft rows feed the
+    # graded channel only, so they never flip a JUnit verdict.
+    return [
+        f"{a.get('name')}: {a.get('evidence', '')}"
+        for a in result.get("assertions", []) + result.get("qualitative_assertions", [])
+        if not a.get("passed") and a.get("severity") != "soft"
+    ]
+
+
+def junit_xml_from_report(report: dict[str, Any]) -> str:
+    """One <testcase> per case/variant/run over a benchmark report, evidence on
+    failures, and the paired lift as suite properties — the CI-facing shape of
+    the report (roadmap 1.2). Grading is untouched; this only serializes."""
+    import xml.etree.ElementTree as ET
+
+    skill = str(report.get("skill_name") or "skill")
+    results = report.get("results", [])
+    suite = ET.Element("testsuite", {"name": f"skill-eval:{skill}"})
+    paired = report.get("paired_summary", {}) or {}
+    props = ET.SubElement(suite, "properties")
+    for key in ["with_skill_objective_pass_rate", "without_skill_objective_pass_rate", "absolute_delta", "normalized_gain"]:
+        value = paired.get(key)
+        ET.SubElement(props, "property", {"name": key, "value": "" if value is None else f"{value:.4f}"})
+    failures = 0
+    total_time = 0.0
+    for r in results:
+        elapsed_ms = metric_number(r.get("metadata", {}) or {}, "elapsed_ms") or 0.0
+        total_time += elapsed_ms / 1000.0
+        tc = ET.SubElement(suite, "testcase", {
+            "classname": f"{skill}.{r.get('case_id')}",
+            "name": f"{r.get('variant')}/run-{r.get('run_number', 1)}",
+            "time": f"{elapsed_ms / 1000.0:.3f}",
+        })
+        lines = result_failure_lines(r)
+        if lines:
+            failures += 1
+            failure = ET.SubElement(tc, "failure", {"message": f"{len(lines)} failing check(s)"})
+            failure.text = "\n".join(lines)
+    suite.set("tests", str(len(results)))
+    suite.set("failures", str(failures))
+    suite.set("errors", "0")
+    suite.set("time", f"{total_time:.3f}")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(suite, encoding="unicode")
+
+
+def fmt_rate(value: Any) -> str:
+    return "—" if value is None else f"{float(value):.2f}"
+
+
+def github_summary_from_report(report: dict[str, Any]) -> str:
+    """GitHub job-summary markdown plus ::warning annotations keyed to case_id.
+    Pipe to $GITHUB_STEP_SUMMARY; the annotation lines act on plain stdout."""
+    skill = str(report.get("skill_name") or "skill")
+    paired = report.get("paired_summary", {}) or {}
+    summary = report.get("summary", {}) or {}
+    lines = [f"# Skill eval — {skill}", ""]
+    delta = paired.get("absolute_delta")
+    lines.append(
+        f"**Lift (with − without, objective):** {fmt_rate(paired.get('with_skill_objective_pass_rate'))} − "
+        f"{fmt_rate(paired.get('without_skill_objective_pass_rate'))} = **{fmt_rate(delta)}**"
+    )
+    lines.extend(["", "| variant | cases | runs | mean objective | mean combined | missing | exec errors |", "|---|---|---|---|---|---|---|"])
+    for variant, block in summary.items():
+        lines.append(
+            f"| {variant} | {block.get('cases', 0)} | {block.get('runs', 0)} | "
+            f"{fmt_rate(block.get('mean_objective_pass_rate'))} | {fmt_rate(block.get('mean_combined_pass_rate'))} | "
+            f"{block.get('missing_outputs', 0)} | {block.get('execution_errors', 0)} |"
+        )
+    flags = report.get("case_flags", []) or []
+    if flags:
+        lines.extend(["", "## Case flags", ""])
+        for flag in flags:
+            lines.append(f"- `{flag.get('case_id')}`: {'; '.join(flag.get('flags', []))} (with={fmt_rate(flag.get('with_skill'))}, without={fmt_rate(flag.get('without_skill'))})")
+    negative = (paired.get("negative_delta_cases") or [])
+    if negative:
+        lines.extend(["", "## Negative-delta cases", ""])
+        for row in negative:
+            lines.append(f"- `{row.get('case_id')}`: with={fmt_rate(row.get('with_skill'))} < without={fmt_rate(row.get('without_skill'))}")
+    annotations = [
+        f"::warning title=skill-eval case {flag.get('case_id')}::{'; '.join(flag.get('flags', []))}"
+        for flag in flags
+    ]
+    if delta is not None and delta < 0:
+        annotations.append(f"::error title=skill-eval {skill}::negative overall lift ({delta:.3f}): the skill measures worse than baseline")
+    return "\n".join(lines + ([""] + annotations if annotations else [])) + "\n"
+
+
+def report_command(args: argparse.Namespace) -> int:
+    report = load_json(Path(args.benchmark))
+    if args.format == "junit":
+        rendered = junit_xml_from_report(report)
+    else:
+        rendered = github_summary_from_report(report)
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered, encoding="utf-8")
+    else:
+        print(rendered, end="")
     return 0
 
 
@@ -4039,11 +5723,21 @@ def aggregate(args: argparse.Namespace) -> int:
             runs = Path(args.runs)
         reports.append(build_benchmark_report(manifest_path, runs, args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False)))
 
+    cross_totals: dict[str, float] = {}
+    for r in reports:
+        for key, value in (r.get("cost_summary", {}).get("totals") or {}).items():
+            if isinstance(value, (int, float)):
+                cross_totals[key] = cross_totals.get(key, 0) + value
     aggregate_summary: dict[str, Any] = {
         "skills": len(reports),
         "case_variant_rows": sum(len(r["results"]) for r in reports),
         "unique_cases": sum(len({row["case_id"] for row in r["results"]}) for r in reports),
         "by_skill": {r["skill_name"]: r["summary"] for r in reports},
+        # Cross-skill spend ledger (issue #21): which skills dominate the bill.
+        "cost_summary": {
+            "totals": {k: (round(v, 6) if isinstance(v, float) else v) for k, v in cross_totals.items()},
+            "by_skill": {r["skill_name"]: (r.get("cost_summary", {}).get("totals") or {}) for r in reports},
+        },
         "flags": [
             {"skill_name": r["skill_name"], **flag}
             for r in reports
@@ -4239,17 +5933,118 @@ def compare_results(args: argparse.Namespace) -> int:
     return 0
 
 
-def render_viewer(args: argparse.Namespace) -> int:
-    report = load_json(Path(args.benchmark))
-    runs_root = Path(args.runs) if args.runs else None
+IMAGE_ARTIFACT_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
+DOCUMENT_ARTIFACT_EXTS = {".pdf": "pdf", ".xlsx": "spreadsheet", ".xls": "spreadsheet", ".csv": "spreadsheet"}
+MAX_EMBEDDED_ARTIFACT_BYTES = 2_000_000
+
+
+def encode_artifact(path: Path) -> dict[str, Any]:
+    """Categorize and render one run artifact for the viewer (roadmap 2.8):
+    images embed inline (base64, capped), pdf/xlsx get typed download links,
+    text renders in a <pre>, anything else is a labeled link."""
+    import base64
+
+    suffix = path.suffix.lower()
+    size = path.stat().st_size if path.exists() else 0
+    name = html.escape(path.name)
+    if suffix in IMAGE_ARTIFACT_EXTS:
+        if size <= MAX_EMBEDDED_ARTIFACT_BYTES:
+            mime = "image/svg+xml" if suffix == ".svg" else f"image/{suffix.lstrip('.').replace('jpg', 'jpeg')}"
+            data = base64.b64encode(path.read_bytes()).decode("ascii")
+            return {"kind": "image", "html": f"<figure><img alt='{name}' src='data:{mime};base64,{data}' style='max-width:100%'/><figcaption>{name}</figcaption></figure>"}
+        return {"kind": "image", "html": f"<p>image too large to embed ({size} bytes): <a href='{name}'>{name}</a></p>"}
+    if suffix in DOCUMENT_ARTIFACT_EXTS:
+        kind = DOCUMENT_ARTIFACT_EXTS[suffix]
+        return {"kind": kind, "html": f"<p>[{kind}] <a href='{name}'>{name}</a> ({size} bytes)</p>"}
+    try:
+        text = path.read_text(encoding="utf-8")
+        return {"kind": "text", "html": f"<details><summary>{name}</summary><pre>{html.escape(text[:20000])}</pre></details>"}
+    except (UnicodeDecodeError, OSError):
+        return {"kind": "binary", "html": f"<p>[binary] <a href='{name}'>{name}</a> ({size} bytes)</p>"}
+
+
+def benchmark_report_diff(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Iteration-over-time diff (roadmap 2.9): per-variant mean deltas, per-case
+    objective deltas, and flag churn between two benchmark reports."""
+    def case_rates(report: dict[str, Any]) -> dict[tuple, float]:
+        grouped: dict[tuple, list[float]] = {}
+        for r in report.get("results", []):
+            if r.get("objective_pass_rate") is None:
+                continue
+            grouped.setdefault((r.get("case_id"), r.get("variant")), []).append(r["objective_pass_rate"])
+        return {key: statistics.mean(values) for key, values in grouped.items()}
+
+    prev_rates = case_rates(previous)
+    curr_rates = case_rates(current)
+    case_deltas = []
+    for key in sorted(set(prev_rates) | set(curr_rates)):
+        before = prev_rates.get(key)
+        after = curr_rates.get(key)
+        if before is None or after is None or abs(after - before) < 1e-9:
+            continue
+        case_deltas.append({"case_id": key[0], "variant": key[1], "before": before, "after": after, "delta": round(after - before, 4)})
+    variant_deltas = {}
+    for variant, block in (current.get("summary") or {}).items():
+        prev_block = (previous.get("summary") or {}).get(variant) or {}
+        pairs = {}
+        for metric in ["mean_objective_pass_rate", "mean_combined_pass_rate"]:
+            before = prev_block.get(metric)
+            after = block.get(metric)
+            if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+                pairs[metric] = {"before": before, "after": after, "delta": round(after - before, 4)}
+        if pairs:
+            variant_deltas[variant] = pairs
+    flags = lambda report: {f"{flag.get('case_id')}::{f}" for flag in report.get("case_flags", []) for f in flag.get("flags", [])}
+    prev_flags, curr_flags = flags(previous), flags(current)
+    return {
+        "variant_deltas": variant_deltas,
+        "case_deltas": case_deltas,
+        "new_flags": sorted(curr_flags - prev_flags),
+        "resolved_flags": sorted(prev_flags - curr_flags),
+    }
+
+
+def persist_feedback(workspace: Path, entry: dict[str, Any]) -> Path:
+    """Feedback capture (roadmap 2.8, eval-viewer's feedback.json): entries are
+    keyed by case/variant/run — a re-submission replaces its prior entry."""
+    path = workspace / "feedback.json"
+    doc = {"entries": []}
+    if path.is_file():
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("entries"), list):
+            doc = loaded
+    key = (entry.get("case_id"), entry.get("variant"), entry.get("run_number", 1))
+    doc["entries"] = [e for e in doc["entries"] if (e.get("case_id"), e.get("variant"), e.get("run_number", 1)) != key]
+    doc["entries"].append(entry)
+    write_json(path, doc)
+    return path
+
+
+def viewer_html(report: dict[str, Any], runs_root: Path | None = None, *, previous_report: dict[str, Any] | None = None, serve_mode: bool = False) -> str:
     rows = report.get("results") or []
     if "reports" in report:
         rows = [row for child in report["reports"] for row in child.get("results", [])]
     parts = ["<!doctype html><meta charset='utf-8'><title>Skill Eval Review</title>"]
-    parts.append("<style>body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.4}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.4rem;vertical-align:top}pre{white-space:pre-wrap;background:#f7f7f7;padding:1rem;overflow:auto}details{margin:.5rem 0}.pass{color:#075}.fail{color:#a00}</style>")
+    parts.append("<style>body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.4}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.4rem;vertical-align:top}pre{white-space:pre-wrap;background:#f7f7f7;padding:1rem;overflow:auto}details{margin:.5rem 0}.pass{color:#075}.fail{color:#a00}figure{margin:.5rem 0}</style>")
     parts.append(f"<h1>Skill Eval Review</h1><p>Generated {html.escape(str(report.get('generated_at','')))}</p>")
     parts.append("<h2>Summary</h2><pre>" + html.escape(json.dumps(report.get("summary", {}), indent=2)) + "</pre>")
-    parts.append("<h2>Runs</h2><table><tr><th>Case</th><th>Variant</th><th>Run</th><th>Pass</th><th>Assertions</th><th>Output</th></tr>")
+    paired = report.get("paired_summary")
+    if paired:
+        parts.append("<h2>Paired lift</h2><pre>" + html.escape(json.dumps(paired, indent=2)) + "</pre>")
+    if previous_report is not None:
+        diff = benchmark_report_diff(previous_report, report)
+        parts.append("<h2>Diff vs previous workspace</h2><pre>" + html.escape(json.dumps(diff, indent=2)) + "</pre>")
+    if serve_mode:
+        parts.append(
+            "<h2>Feedback</h2><form id='fb'>"
+            "<input name='case_id' placeholder='case id'> <input name='variant' placeholder='variant'>"
+            " <select name='verdict'><option>good</option><option>bad</option><option>unsure</option></select>"
+            " <input name='note' placeholder='note' size='40'> <button>save</button> <span id='fb-status'></span></form>"
+            "<script>document.getElementById('fb').addEventListener('submit',async e=>{e.preventDefault();"
+            "const data=Object.fromEntries(new FormData(e.target));"
+            "const r=await fetch('/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});"
+            "document.getElementById('fb-status').textContent=r.ok?'saved':'error';});</script>")
+    parts.append("<h2>Runs</h2><table><tr><th>Case</th><th>Variant</th><th>Run</th><th>Pass</th><th>Assertions</th><th>Output</th><th>Artifacts</th></tr>")
     for r in rows:
         assertions = []
         for a in r.get("assertions", []) + r.get("qualitative_assertions", []):
@@ -4257,13 +6052,16 @@ def render_viewer(args: argparse.Namespace) -> int:
             assertions.append(f"<li class='{cls}'>{html.escape(str(a.get('name')))} — {html.escape(str(a.get('evidence','')))}</li>")
         output_html = ""
         base = Path(r.get("run_base", ""))
+        if not base.exists() and runs_root:
+            base = runs_root / r["case_id"] / r["variant"]
+        artifacts_html = ""
         if base.exists():
             text, _ = read_output_base(base)
             output_html = html.escape((text or "")[:20000])
-        elif runs_root:
-            base = runs_root / r["case_id"] / r["variant"]
-            text, _ = read_output_base(base)
-            output_html = html.escape((text or "")[:20000])
+            outputs_dir = base / "outputs"
+            if outputs_dir.is_dir():
+                rendered = [encode_artifact(p)["html"] for p in sorted(outputs_dir.iterdir()) if p.is_file()][:20]
+                artifacts_html = "".join(rendered)
         parts.append("<tr>" +
             f"<td>{html.escape(str(r.get('case_id')))}</td>" +
             f"<td>{html.escape(str(r.get('variant')))}</td>" +
@@ -4271,9 +6069,519 @@ def render_viewer(args: argparse.Namespace) -> int:
             f"<td>{html.escape(str(r.get('objective_pass_rate')))}</td>" +
             f"<td><ul>{''.join(assertions)}</ul></td>" +
             f"<td><details><summary>output</summary><pre>{output_html}</pre></details></td>" +
+            f"<td>{artifacts_html}</td>" +
             "</tr>")
     parts.append("</table>")
-    Path(args.out).write_text("\n".join(parts), encoding="utf-8")
+    return "\n".join(parts)
+
+
+def iteration_dirs(root: Path) -> list[Path]:
+    """The iteration-N convention (roadmap 2.9), sorted by iteration number."""
+    if not root.is_dir():
+        return []
+    found = []
+    for child in root.iterdir():
+        m = re.fullmatch(r"iteration-(\d+)", child.name)
+        if child.is_dir() and m:
+            found.append((int(m.group(1)), child))
+    return [p for _, p in sorted(found)]
+
+
+def next_iteration_dir(root: Path) -> Path:
+    existing = iteration_dirs(root)
+    if not existing:
+        return root / "iteration-1"
+    last = int(re.fullmatch(r"iteration-(\d+)", existing[-1].name).group(1))
+    return root / f"iteration-{last + 1}"
+
+
+def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
+    """The interactive served report (roadmap 2.8): GET / renders the review,
+    POST /feedback persists feedback.json into the workspace. Never touched by
+    unit tests (house rule: no network); the persistence logic they need is
+    persist_feedback."""
+    import http.server
+
+    class ViewerHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):   # noqa: N802 (stdlib naming)
+            body = html_text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):   # noqa: N802
+            if self.path != "/feedback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                entry = json.loads(self.rfile.read(length).decode("utf-8"))
+                persist_feedback(workspace, entry)
+                self.send_response(204)
+            except (json.JSONDecodeError, OSError):
+                self.send_response(400)
+            self.end_headers()
+
+        def log_message(self, fmt, *log_args):   # quiet server
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), ViewerHandler)
+    print(f"serving review on http://127.0.0.1:{port} (feedback -> {workspace / 'feedback.json'}); Ctrl-C to stop")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def migrate_manifest_data(manifest: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """The mechanical half of the 1 -> 2 migration (spec: Migration section).
+    Stamps what a machine can decide — version, default severity, default
+    oracle tier, a graded? marker beside binary judge rubrics — and returns
+    the checklist of judgment calls it deliberately did NOT make (anchored
+    graded_dimensions, reference floors, demo-seam marking), each with a spec
+    pointer. LangSmith-style additive defaults; pi.dev-style agent-run rest."""
+    migrated = copy.deepcopy(manifest)
+    checklist: list[dict[str, Any]] = []
+    migrated["version"] = 2
+    for case in migrated.get("cases", []):
+        if not isinstance(case, dict):
+            continue
+        case_has_judge = False
+        for assertion in case.get("assertions", []) or []:
+            if not isinstance(assertion, dict):
+                continue
+            atype = assertion.get("type")
+            if "severity" not in assertion and not any(key in assertion for key in ("critical", "gate", "soft", "atLeast")):
+                assertion["severity"] = assertion_severity(assertion)
+            if "oracle" not in assertion:
+                assertion["oracle"] = oracle_tier(assertion)
+            if atype in QUALITATIVE_ASSERTIONS:
+                case_has_judge = True
+                if not assertion.get("graded_dimensions") and not assertion.get("dynamic_rubric"):
+                    assertion.setdefault("_migrate_todo", "graded? a binary judge rubric can become anchored graded_dimensions — docs/eval-framework-roadmap-spec.md 2.2")
+                    checklist.append({
+                        "case_id": case.get("id"),
+                        "assertion": assertion_label(assertion),
+                        "decision": "graded dimensions",
+                        "note": "turn the flat rubric into anchored graded_dimensions ({name, scale, rubric with observable anchors}) or leave binary deliberately; see spec 2.2",
+                    })
+            if atype == "script":
+                checklist.append({
+                    "case_id": case.get("id"),
+                    "assertion": assertion_label(assertion),
+                    "decision": "oracle tier",
+                    "note": "script defaults to oracle:'demo'; mark oracle:'strong' only for a verified rendered-artifact oracle, oracle:'live' if it touches real resources; see spec 1.7",
+                })
+        if case_has_judge and case.get("reference_score") is None and case.get("reference_graded_score") is None:
+            checklist.append({
+                "case_id": case.get("id"),
+                "decision": "reference floor",
+                "note": "optionally set reference_score (0-1) or reference_graded_score (1-5) as a no-regression floor for graded scores; see spec 2.2",
+            })
+    return migrated, checklist
+
+
+def manifest_migration_diff(path: Path, before: dict[str, Any], after: dict[str, Any]) -> str:
+    return "\n".join(difflib.unified_diff(
+        json.dumps(before, indent=2, ensure_ascii=False).splitlines(),
+        json.dumps(after, indent=2, ensure_ascii=False).splitlines(),
+        fromfile=f"{path} (version 1)", tofile=f"{path} (version 2)", lineterm="",
+    ))
+
+
+def migrate_command(args: argparse.Namespace) -> int:
+    path = Path(args.manifest)
+    manifest = load_manifest_source(path)
+    if manifest.get("version") == 2:
+        print(f"{path} is already version 2; nothing to migrate")
+        return 0
+    if manifest.get("version") != 1:
+        die(f"can only migrate version-1 manifests (found {manifest.get('version')!r})")
+    migrated, checklist = migrate_manifest_data(manifest)
+    diff = manifest_migration_diff(path, manifest, migrated)
+    print(diff or "(no textual changes)")
+    if checklist:
+        print(f"\n{len(checklist)} judgment call(s) left for a human or agent (see docs/migrating-evals.md):")
+        for item in checklist:
+            label = f" / {item['assertion']}" if item.get("assertion") else ""
+            print(f"- [{item['decision']}] {item.get('case_id')}{label}: {item['note']}")
+    if getattr(args, "out_checklist", None):
+        write_json(Path(args.out_checklist), {"manifest": str(path), "checklist": checklist})
+    if getattr(args, "check", False):
+        print("\n--check: dry run, no files written")
+        return 0
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        die("migrate rewrites JSON manifests only; for a YAML manifest apply the printed diff by hand (YAML formatting/comments are yours, not the tool's)")
+    path.write_text(json.dumps(migrated, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    validate_manifest(path)
+    print(f"\nwrote version-2 manifest to {path} (re-validated)")
+    return 0
+
+
+def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict[str, Any] | None = None, judge_results: dict[str, dict[str, Any]] | None = None, top_n: int = 10) -> dict[str, Any]:
+    """The standalone suite cost ledger (issue #21's cost-summary.json): walks
+    the run tree per manifest case — every variant directory found on disk,
+    ablation arms included — and reads each run's normalized telemetry."""
+    manifest = validate_manifest(manifest_path)
+    rows: list[dict[str, Any]] = []
+    for case in iter_cases(manifest):
+        case_dir = runs / case["id"]
+        if not case_dir.is_dir():
+            continue
+        def run_bearing(d: Path) -> bool:
+            return ((d / "output.md").exists() or (d / "metadata.json").exists() or (d / "outputs").is_dir()
+                    or any(g.is_dir() and g.name.startswith(("run-", "turn-")) for g in d.iterdir()))
+
+        variant_dirs: list[tuple[str | None, str, Path]] = []
+        for child in sorted(case_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            if run_bearing(child):
+                variant_dirs.append((None, child.name, child))
+                continue
+            # No run evidence of its own but run-bearing subdirs: a model root
+            # from the multi-model layout (<case>/<model>/<variant>).
+            bearing_children = [g for g in sorted(child.iterdir()) if g.is_dir() and run_bearing(g)]
+            for g in bearing_children:
+                variant_dirs.append((child.name, g.name, g))
+        for model, variant, vdir in variant_dirs:
+            for run_number, base in discover_run_bases_under(vdir):
+                merged = read_metrics_base(base)
+                facts = run_cost_facts(merged)
+                facts["elapsed_ms"] = metric_number(merged, "elapsed_ms")
+                rows.append({
+                    "case_id": case["id"],
+                    "variant": variant,
+                    "model": model,
+                    "run_number": run_number,
+                    "runner": merged.get("provider") or merged.get("trace_source") or merged.get("source"),
+                    **facts,
+                })
+    runs_seen = len(rows)
+    with_usage = sum(1 for r in rows if r.get("total_tokens") is not None)
+    with_cost = sum(1 for r in rows if r.get("cost_usd") is not None)
+    by_variant: dict[str, Any] = {}
+    by_runner: dict[str, Any] = {}
+    by_case: dict[str, Any] = {}
+    for row in rows:
+        for bucket, key in [(by_variant, row["variant"]), (by_runner, str(row.get("runner") or "unknown")), (by_case, row["case_id"])]:
+            slot = bucket.setdefault(key, {"runs": 0, "total_tokens": 0, "total_cost_usd": 0.0})
+            slot["runs"] += 1
+            if row.get("total_tokens") is not None:
+                slot["total_tokens"] += int(row["total_tokens"])
+            if row.get("cost_usd") is not None:
+                slot["total_cost_usd"] = round(slot["total_cost_usd"] + float(row["cost_usd"]), 6)
+    expensive_cases = sorted(by_case.items(), key=lambda kv: (-(kv[1]["total_cost_usd"] or 0), -kv[1]["total_tokens"], kv[0]))[:top_n]
+    ablation_spend: dict[str, Any] = {}
+    for row in rows:
+        if str(row["variant"]).startswith("ablation:"):
+            slot = ablation_spend.setdefault(row["variant"], {"runs": 0, "total_tokens": 0, "total_cost_usd": 0.0})
+            slot["runs"] += 1
+            if row.get("total_tokens") is not None:
+                slot["total_tokens"] += int(row["total_tokens"])
+            if row.get("cost_usd") is not None:
+                slot["total_cost_usd"] = round(slot["total_cost_usd"] + float(row["cost_usd"]), 6)
+    top_ablations = sorted(ablation_spend.items(), key=lambda kv: (-(kv[1]["total_cost_usd"] or 0), -kv[1]["total_tokens"], kv[0]))[:top_n]
+    findings: list[dict[str, Any]] = []
+    if benchmark_report:
+        flagged = {flag.get("case_id"): flag.get("flags", []) for flag in benchmark_report.get("case_flags", [])}
+        for case_id, flags in flagged.items():
+            spend = by_case.get(case_id)
+            if not spend:
+                continue
+            waste_flags = [f for f in flags if "saturated" in f or "no objective lift" in f]
+            if waste_flags:
+                findings.append({
+                    "kind": "spend-on-non-discriminating-case",
+                    "case_id": case_id,
+                    "flags": waste_flags,
+                    "total_tokens": spend["total_tokens"],
+                    "total_cost_usd": spend["total_cost_usd"],
+                })
+        findings.sort(key=lambda f: (-(f.get("total_cost_usd") or 0), str(f.get("case_id"))))
+    ledger: dict[str, Any] = {
+        "generated_at": int(time.time()),
+        "manifest": str(manifest_path),
+        "skill_name": manifest.get("skill_name"),
+        "runs_root": str(runs),
+        "coverage": {
+            "runs_seen": runs_seen,
+            "runs_with_token_usage": with_usage,
+            "runs_with_dollar_cost": with_cost,
+            "runs_missing_usage": runs_seen - with_usage,
+            "runs_missing_cost": runs_seen - with_cost,
+        },
+        "totals": {
+            "input_tokens": int(sum(r["input_tokens"] for r in rows if r.get("input_tokens") is not None)),
+            "output_tokens": int(sum(r["output_tokens"] for r in rows if r.get("output_tokens") is not None)),
+            "total_tokens": int(sum(r["total_tokens"] for r in rows if r.get("total_tokens") is not None)),
+            "total_cost_usd": round(sum(r["cost_usd"] for r in rows if r.get("cost_usd") is not None), 6),
+            "elapsed_ms_sum": int(sum(r["elapsed_ms"] for r in rows if r.get("elapsed_ms") is not None)),
+        },
+        "by_variant": by_variant,
+        "by_runner": by_runner,
+        "by_case": by_case,
+        "top_expensive_cases": [{"case_id": k, **v} for k, v in expensive_cases],
+        "top_expensive_ablations": [{"variant": k, **v} for k, v in top_ablations],
+        "cost_quality_findings": findings[:top_n],
+    }
+    if judge_results:
+        judge_costs = [float(row.get("cost_usd")) for row in judge_results.values() if isinstance(row.get("cost_usd"), (int, float))]
+        ledger["judge"] = {"verdicts": len(judge_results), "verdicts_with_cost": len(judge_costs), "total_cost_usd": round(sum(judge_costs), 6) if judge_costs else None}
+    return ledger
+
+
+def cost_ledger_markdown(ledger: dict[str, Any]) -> str:
+    totals = ledger.get("totals", {})
+    coverage = ledger.get("coverage", {})
+    lines = [
+        f"# Cost summary — {ledger.get('skill_name')}",
+        "",
+        f"Runs: {coverage.get('runs_seen')} (usage on {coverage.get('runs_with_token_usage')}, dollars on {coverage.get('runs_with_dollar_cost')}; missing usage {coverage.get('runs_missing_usage')}, missing cost {coverage.get('runs_missing_cost')})",
+        "",
+        f"**Totals:** {totals.get('total_tokens'):,} tokens (in {totals.get('input_tokens'):,} / out {totals.get('output_tokens'):,}), ${totals.get('total_cost_usd')} provider-reported, {totals.get('elapsed_ms_sum')} ms summed",
+        "",
+        "| Variant | Runs | Tokens | Cost USD |",
+        "|---|---:|---:|---:|",
+    ]
+    for variant, slot in ledger.get("by_variant", {}).items():
+        lines.append(f"| {variant} | {slot['runs']} | {slot['total_tokens']:,} | {slot['total_cost_usd']} |")
+    if ledger.get("top_expensive_cases"):
+        lines += ["", "## Top expensive cases", "", "| Case | Runs | Tokens | Cost USD |", "|---|---:|---:|---:|"]
+        for row in ledger["top_expensive_cases"]:
+            lines.append(f"| {row['case_id']} | {row['runs']} | {row['total_tokens']:,} | {row['total_cost_usd']} |")
+    if ledger.get("cost_quality_findings"):
+        lines += ["", "## Cost-quality findings", ""]
+        for f in ledger["cost_quality_findings"]:
+            lines.append(f"- `{f.get('case_id')}`: {', '.join(f.get('flags', []))} — {f.get('total_tokens'):,} tokens, ${f.get('total_cost_usd')}")
+    if ledger.get("judge"):
+        j = ledger["judge"]
+        lines += ["", f"Judge spend (separate from model under test): {j.get('verdicts')} verdicts, ${j.get('total_cost_usd')}"]
+    return "\n".join(lines) + "\n"
+
+
+def cost_summary_command(args: argparse.Namespace) -> int:
+    benchmark_report = load_json(Path(args.benchmark)) if getattr(args, "benchmark", None) else None
+    judge_lookup = load_judge_results(getattr(args, "judge_results", None))
+    ledger = suite_cost_ledger(Path(args.manifest), Path(args.runs), benchmark_report=benchmark_report, judge_results=judge_lookup or None, top_n=int(getattr(args, "top", 10)))
+    if args.out:
+        write_json(Path(args.out), ledger)
+    else:
+        print(json.dumps(ledger, indent=2, ensure_ascii=False))
+    if getattr(args, "md", None):
+        Path(args.md).write_text(cost_ledger_markdown(ledger), encoding="utf-8")
+    return 0
+
+
+SEVERITY_WEIGHT = {"critical": 3.0, "gate": 2.0, "soft": 1.0}
+
+
+def load_history_reports(history: Path) -> list[tuple[str, dict[str, Any]]]:
+    """The append-only history store (roadmap 2.6): run-<seq>.json files under
+    one directory, ordered by sequence number."""
+    entries = []
+    if history.is_dir():
+        for child in history.iterdir():
+            m = re.fullmatch(r"run-(\d+)\.json", child.name)
+            if child.is_file() and m:
+                entries.append((int(m.group(1)), child.name, load_json(child)))
+    return [(name, report) for _, name, report in sorted(entries)]
+
+
+def append_history_report(history: Path, report_path: Path) -> Path:
+    existing = load_history_reports(history)
+    seq = 1
+    if existing:
+        seq = max(int(re.fullmatch(r"run-(\d+)\.json", name).group(1)) for name, _ in existing) + 1
+    history.mkdir(parents=True, exist_ok=True)
+    dest = history / f"run-{seq:03d}.json"
+    dest.write_text(Path(report_path).read_text(encoding="utf-8"), encoding="utf-8")
+    return dest
+
+
+def trend_entry(label: str, report: dict[str, Any]) -> dict[str, Any]:
+    paired = report.get("paired_summary", {}) or {}
+    flags = report.get("case_flags", []) or []
+    return {
+        "label": label,
+        "generated_at": report.get("generated_at"),
+        "with_skill": paired.get("with_skill_objective_pass_rate"),
+        "without_skill": paired.get("without_skill_objective_pass_rate"),
+        "lift": paired.get("absolute_delta"),
+        "saturated_cases": sum(1 for f in flags for x in f.get("flags", []) if "saturated" in x),
+        "flagged_cases": len(flags),
+        "median_total_tokens": {v: block.get("median_total_tokens") for v, block in (report.get("summary") or {}).items()},
+    }
+
+
+def severity_weighted_failures(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Recurring failures ranked by prevalence x severity (roadmap 2.6): a rare
+    critical failure outranks a common trivial one — the floor-raising
+    principle made quantitative."""
+    appearances: dict[tuple, int] = {}
+    for report in reports:
+        seen: set[tuple] = set()
+        for r in report.get("results", []):
+            for a in r.get("assertions", []) + r.get("qualitative_assertions", []):
+                if a.get("passed"):
+                    continue
+                key = (r.get("case_id"), str(a.get("name")), a.get("severity", "gate"))
+                seen.add(key)
+        for key in seen:
+            appearances[key] = appearances.get(key, 0) + 1
+    total_runs = max(1, len(reports))
+    ranked = []
+    for (case_id, name, severity), count in appearances.items():
+        prevalence = count / total_runs
+        weight = SEVERITY_WEIGHT.get(str(severity), 1.0)
+        ranked.append({
+            "case_id": case_id,
+            "assertion": name,
+            "severity": severity,
+            "prevalence": round(prevalence, 4),
+            "rank": round(prevalence * weight, 4),
+        })
+    return sorted(ranked, key=lambda row: (-row["rank"], str(row["case_id"]), row["assertion"]))
+
+
+def stale_case_candidates(reports: list[dict[str, Any]], *, min_runs: int = 2) -> list[dict[str, Any]]:
+    """Staleness hygiene (roadmap 1.9), the inverse of the saturation flag: a
+    case that across the whole history never failed and never discriminated
+    (with == without == 1.0 every time) is a prune CANDIDATE. The harness
+    suggests, never deletes — and a single run never flags anything."""
+    observations: dict[str, list[tuple[float, float]]] = {}
+    for report in reports:
+        by_case: dict[str, dict[str, list[float]]] = {}
+        for r in report.get("results", []):
+            rate = r.get("objective_pass_rate")
+            if rate is None or r.get("variant") not in {"with_skill", "without_skill"}:
+                continue
+            by_case.setdefault(r["case_id"], {}).setdefault(r["variant"], []).append(rate)
+        for case_id, arms in by_case.items():
+            if "with_skill" in arms and "without_skill" in arms:
+                observations.setdefault(case_id, []).append(
+                    (statistics.mean(arms["with_skill"]), statistics.mean(arms["without_skill"])))
+    candidates = []
+    for case_id, pairs in sorted(observations.items()):
+        if len(pairs) < min_runs:
+            continue
+        if all(w == 1.0 and n == 1.0 for w, n in pairs):
+            candidates.append({"case_id": case_id, "runs_observed": len(pairs), "reason": "never failed and never showed lift across the history"})
+    return candidates
+
+
+def build_trend_report(history_entries: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    series = [trend_entry(label, report) for label, report in history_entries]
+    diffs = []
+    for (prev_label, prev), (curr_label, curr) in zip(history_entries, history_entries[1:]):
+        diffs.append({"from": prev_label, "to": curr_label, "diff": benchmark_report_diff(prev, curr)})
+    reports = [report for _, report in history_entries]
+    return {
+        "runs": len(series),
+        "series": series,
+        "diffs": diffs,
+        "recurring_failures": severity_weighted_failures(reports)[:50],
+        "prune_candidates": stale_case_candidates(reports),
+    }
+
+
+def trend(args: argparse.Namespace) -> int:
+    history = Path(args.history)
+    if getattr(args, "add", None):
+        dest = append_history_report(history, Path(args.add))
+        print(f"appended {dest}")
+    entries = load_history_reports(history)
+    report = build_trend_report(entries)
+    if args.out:
+        write_json(Path(args.out), report)
+    else:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0
+
+
+def suggest_case_candidates(report: dict[str, Any], manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """The deterministic half of the living-eval loop (roadmap 2.10): saturated
+    and no-lift flags select the cases that stopped discriminating; each yields
+    a candidate SEED for a harder variant. Generation is a separate, opt-in,
+    model-backed step — and a candidate never enters a manifest on its own."""
+    cases = case_by_id(manifest)
+    seeds = []
+    for flag in report.get("case_flags", []):
+        reasons = [f for f in flag.get("flags", []) if "saturated" in f or "no objective lift" in f]
+        if not reasons:
+            continue
+        case = cases.get(flag.get("case_id"), {})
+        seeds.append({
+            "case_id": flag.get("case_id"),
+            "flags": reasons,
+            "prompt": case.get("prompt"),
+            "assertions": [assertion_label(a) for a in case.get("assertions", [])],
+            "instruction": (
+                "Propose ONE harder variant of this case: same domain and oracle style, "
+                "solvable with the skill but likely to fail without it. Do not leak assertion "
+                "values into the prompt. Return JSON {\"prompt\": ..., \"rationale\": ...}."
+            ),
+        })
+    return seeds
+
+
+def suggest_cases(args: argparse.Namespace) -> int:
+    report = load_json(Path(args.benchmark))
+    manifest = validate_manifest(Path(args.manifest))
+    seeds = suggest_case_candidates(report, manifest)
+    generate_cmd = getattr(args, "generate_cmd", None)
+    candidates = []
+    for seed in seeds:
+        candidate = dict(seed)
+        if generate_cmd:
+            proc = subprocess.run(generate_cmd, shell=True, input=json.dumps(seed), text=True, capture_output=True, timeout=float(getattr(args, "timeout", 120)))
+            if proc.returncode == 0:
+                try:
+                    candidate["generated"] = extract_json_object(proc.stdout)
+                except ValueError:
+                    candidate["generation_error"] = "generator emitted no JSON object"
+            else:
+                candidate["generation_error"] = f"generator exit {proc.returncode}"
+        candidates.append(candidate)
+    output = {
+        "candidates": candidates,
+        "note": (
+            "Candidates are proposals, never additions: a case earns its place by "
+            "discriminating (representativeness guard). Review before adding to a manifest; "
+            "this command never edits one."
+        ),
+    }
+    if args.out:
+        write_json(Path(args.out), output)
+    else:
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+    return 0
+
+
+def render_viewer(args: argparse.Namespace) -> int:
+    report = load_json(Path(args.benchmark))
+    runs_root = Path(args.runs) if args.runs else None
+    previous_report = None
+    previous_workspace = getattr(args, "previous_workspace", None)
+    if previous_workspace:
+        previous_path = Path(previous_workspace) / "benchmark.json"
+        if not previous_path.is_file():
+            die(f"--previous-workspace has no benchmark.json: {previous_path}")
+        previous_report = load_json(previous_path)
+    serve_mode = bool(getattr(args, "serve", False))
+    text = viewer_html(report, runs_root, previous_report=previous_report, serve_mode=serve_mode)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+    if serve_mode:
+        workspace = Path(getattr(args, "workspace", None) or Path(args.benchmark).parent)
+        serve_viewer(text, workspace, int(getattr(args, "port", 8642)))
+    elif not args.out:
+        die("render-viewer needs --out (or --serve)")
     return 0
 
 
@@ -4412,6 +6720,10 @@ def paired_token_overhead_report(
                 # crashed with_skill arm differenced to a false -1.0 "skill regression").
                 if not (scorable_run(with_grade) and scorable_run(without_grade)):
                     continue
+                with_facts = run_cost_facts(with_metrics)
+                without_facts = run_cost_facts(without_metrics)
+                wc = with_facts.get("cost_usd")
+                nc = without_facts.get("cost_usd")
                 wt = metric_number(with_metrics, "total_tokens")
                 nt = metric_number(without_metrics, "total_tokens")
                 wi = metric_number(with_metrics, "input_tokens")
@@ -4440,7 +6752,22 @@ def paired_token_overhead_report(
                     "without_objective_pass_rate": without_grade.get("objective_pass_rate"),
                     "objective_delta": (with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) if with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None,
                     "objective_lift_per_1k_total_tokens": ((with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) / ((wt - nt) / 1000)) if wt is not None and nt is not None and wt > nt and with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None,
+                    # Dollar channel (issue #21): what the skill costs, and what
+                    # a point of lift costs, in money rather than tokens.
+                    "with_cost_usd": wc,
+                    "without_cost_usd": nc,
+                    "cost_delta_usd": round(wc - nc, 6) if wc is not None and nc is not None else None,
+                    "objective_lift_per_dollar": (((with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) / (wc - nc)) if wc is not None and nc is not None and wc > nc and with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None),
                 })
+    cost_deltas = [p["cost_delta_usd"] for p in pairs if p.get("cost_delta_usd") is not None]
+    lift_per_dollar = [p["objective_lift_per_dollar"] for p in pairs if p.get("objective_lift_per_dollar") is not None]
+    # The money wasted on pairs that no longer discriminate: both arms perfect
+    # (saturated) or no lift at all.
+    waste_cost = round(sum((p.get("with_cost_usd") or 0) + (p.get("without_cost_usd") or 0)
+                           for p in pairs
+                           if p.get("objective_delta") is not None and (
+                               (p.get("objective_delta") <= 0)
+                               or (p.get("with_objective_pass_rate") == 1 and p.get("without_objective_pass_rate") == 1))), 6)
     total_deltas = [p["total_token_delta"] for p in pairs if p.get("total_token_delta") is not None]
     input_deltas = [p["input_token_delta"] for p in pairs if p.get("input_token_delta") is not None]
     output_deltas = [p["output_token_delta"] for p in pairs if p.get("output_token_delta") is not None]
@@ -4465,6 +6792,9 @@ def paired_token_overhead_report(
             "output_token_delta": stats(output_deltas),
             "objective_delta": stats(objective_deltas),
             "objective_lift_per_1k_total_tokens": stats(lift_per_1k),
+            "cost_delta_usd": stats(cost_deltas),
+            "objective_lift_per_dollar": stats(lift_per_dollar),
+            "saturated_or_no_lift_cost_usd": waste_cost,
             "mean_total_overhead_per_static_skill_token": (statistics.mean(total_deltas) / static_skill_tokens) if total_deltas and static_skill_tokens else None,
         },
         "profile": profile,
@@ -4492,14 +6822,16 @@ def token_overhead(args: argparse.Namespace) -> int:
         "reports": reports,
     }
     if args.format == "markdown":
-        lines = ["# Token overhead report", "", "| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | Median total delta | Mean input delta | Mean objective lift | Lift per 1k total tokens |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        lines = ["# Token overhead report", "", "| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | Median total delta | Mean input delta | Mean objective lift | Lift per 1k total tokens | Mean cost delta USD | Lift per $ | Saturated/no-lift cost USD |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for r in reports:
             s = r["summary"]
             td = s.get("total_token_delta") or {}
             idelta = s.get("input_token_delta") or {}
             odelta = s.get("objective_delta") or {}
             lift = s.get("objective_lift_per_1k_total_tokens") or {}
-            lines.append(f"| {r['skill_name']} | {s.get('static_skill_tokens')} | {s.get('static_reference_tokens')} | {s.get('paired_runtime_rows')} | {td.get('mean')} | {td.get('median')} | {idelta.get('mean')} | {odelta.get('mean')} | {lift.get('mean')} |")
+            cd = s.get("cost_delta_usd") or {}
+            lpd = s.get("objective_lift_per_dollar") or {}
+            lines.append(f"| {r['skill_name']} | {s.get('static_skill_tokens')} | {s.get('static_reference_tokens')} | {s.get('paired_runtime_rows')} | {td.get('mean')} | {td.get('median')} | {idelta.get('mean')} | {odelta.get('mean')} | {lift.get('mean')} | {cd.get('mean')} | {lpd.get('mean')} | {s.get('saturated_or_no_lift_cost_usd')} |")
         lines += ["", "## Per-case runtime pairs", ""]
         for r in reports:
             if not r.get("pairs"):
@@ -4599,7 +6931,7 @@ def fixture_recommendations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     has_input_fixture = any(c.get("files") for c in manifest.get("cases", []))
     recs = []
     def add(name: str, why: str, files: list[str]) -> None:
-        recs.append({"name": name, "why": why, "files": files})
+        recs.append({"name": name, "why": why, "files": files, "guide": "docs/authoring-evals.md — Step 4: fixture-backed cases beat keyword-only prompts; ground assertions in real files"})
     if not has_file_assert and not has_input_fixture:
         add("fixture-backed golden case", "Current deterministic checks are mostly text-output assertions; add a fixture with files/artifacts so wrong work cannot pass by saying the right words.", ["evals/fixtures/<case>/README.md", "evals/fixtures/<case>/expected.json"])
     if "readme" in kinds or "good-readme" in skill:
@@ -4643,8 +6975,11 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
         if r.get("objective_pass_rate") is not None:
             obj.setdefault(cid, {}).setdefault(v, []).append(r["objective_pass_rate"])
         cr = r.get("combined_pass_rate")
-        if cr is None:
-            cr = r.get("objective_pass_rate")
+        # Soft judges live in graded_score, not combined; the qualitative signal
+        # this function looks for rides whichever channel the judge fed.
+        if cr is None or (r.get("combined_total") == r.get("objective_total") and isinstance(r.get("graded_score"), (int, float))):
+            blended = [x for x in (cr, r.get("graded_score")) if isinstance(x, (int, float))]
+            cr = statistics.mean(blended) if blended else r.get("objective_pass_rate")
         if cr is not None:
             comb.setdefault(cid, {}).setdefault(v, []).append(cr)
     base_saturated, qualitative_only = [], []
@@ -4744,6 +7079,7 @@ def audit_manifest_report(
     min_trigger_pos: int = 2,
     min_trigger_neg: int = 2,
     leakage_min_chars: int = 4,
+    expensive_case_usd: float = 1.0,
 ) -> dict[str, Any]:
     manifest = validate_manifest(manifest_path)
     cases = iter_cases(manifest, split)
@@ -4855,6 +7191,98 @@ def audit_manifest_report(
             finding("non-discriminating-assertions", "recommended", f"{len(assertion_rows)} assertions have identical with/without pass rates.", assertion_rows[:20])
             rec("assertion-design", "Replace keyword-only checks with source/artifact-backed assertions or stricter behavioral regexes for identical-rate assertions.")
 
+    # 1.7: a case whose checks are all demo/live tiers can look solid while
+    # resting on weak oracles — leakage lint extended from prompts to oracles.
+    weak_only = []
+    for case in cases:
+        case_assertions = case.get("assertions", []) or []
+        if case_assertions and all(oracle_tier(a) != "strong" for a in case_assertions):
+            weak_only.append(case.get("id"))
+    if weak_only:
+        finding("weak-oracle-only", "recommended", f"{len(weak_only)} case(s) are graded only by demo/live oracles (no strong deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
+
+    # Cost-quality findings (issue #21): where money is being spent without
+    # buying signal. Only computable when run data is supplied.
+    if bench_report:
+        cost_by_case = (bench_report.get("cost_summary", {}) or {}).get("by_case", {})
+        flags_by_case = {flag.get("case_id"): flag.get("flags", []) for flag in bench_report.get("case_flags", [])}
+        for case_id, spend in sorted(cost_by_case.items()):
+            cost = spend.get("total_cost_usd") or 0
+            if cost < expensive_case_usd:
+                continue
+            case_flag_list = flags_by_case.get(case_id, [])
+            if any("saturated" in f for f in case_flag_list):
+                finding("expensive-saturated-case", "recommended", f"Case {case_id} cost ${cost} but is saturated/non-discriminating — spend without signal.", spend)
+            elif any("no objective lift" in f for f in case_flag_list):
+                finding("expensive-no-lift-case", "recommended", f"Case {case_id} cost ${cost} with no objective lift — spend without signal.", spend)
+        judge_only_ids = {c.get("id") for c in cases if c.get("assertions") and all(a.get("type") in QUALITATIVE_ASSERTIONS for a in c.get("assertions", []))}
+        for case_id in sorted(judge_only_ids):
+            cost = (cost_by_case.get(case_id) or {}).get("total_cost_usd") or 0
+            if cost >= expensive_case_usd:
+                finding("high-cost-judge-only-case", "recommended", f"Case {case_id} cost ${cost} and is graded only by judge assertions; a deterministic/script oracle would make the spend verifiable.", cost_by_case.get(case_id))
+        ablation_spend: dict[str, float] = {}
+        for r in bench_report.get("results", []):
+            variant = str(r.get("variant", ""))
+            if variant.startswith("ablation:"):
+                cost_value = result_cost_facts(r).get("cost_usd")
+                if cost_value is not None:
+                    ablation_spend[variant] = round(ablation_spend.get(variant, 0.0) + cost_value, 6)
+        structured = {f"ablation:{a.get('id')}" for a in manifest.get("ablations", []) if any(isinstance(spec, dict) and spec.get("cases") and spec.get("assertions") for spec in a.get("expected_regressions", []))}
+        for variant, spend_usd in sorted(ablation_spend.items()):
+            if spend_usd >= expensive_case_usd and variant not in structured:
+                finding("ablation-high-spend-no-structured-regression", "recommended", f"Ablation arm {variant} cost ${spend_usd} but declares no structured expected_regressions (cases+assertions) to confirm — the spend cannot become causal evidence.", {"variant": variant, "total_cost_usd": spend_usd})
+        overall_lift = (bench_report.get("paired_summary", {}) or {}).get("absolute_delta")
+        static_tokens = approximate_tokens(skill_text)
+        if static_tokens >= 3000 and isinstance(overall_lift, (int, float)) and overall_lift <= 0.05:
+            finding("high-footprint-low-lift-skill", "recommended", f"Skill carries ~{static_tokens} static tokens into every run but measured lift is {overall_lift:.3f}; the footprint is not buying signal.", {"static_tokens": static_tokens, "lift": overall_lift})
+
+    # 2.7b: a held-out case's grading criteria must stay out of the skill and
+    # the public eval text — a skill must not teach to the rubric it will be
+    # graded on ("criteria deliberately absent from generation rules").
+    held_out_leaks = []
+    public_prompts = [str(c.get("prompt")).casefold() for c in cases if c.get("split") == "tune" and c.get("prompt")]
+    skill_text_folded = skill_text.casefold()
+    for c in cases:
+        if c.get("split") not in {"holdout", "holdback"}:
+            continue
+        rubric_texts = [str(x) for x in (c.get("review_rubric") or [])]
+        for a in c.get("assertions", []) or []:
+            if a.get("type") in QUALITATIVE_ASSERTIONS:
+                rubric_texts.extend(str(x) for x in (a.get("rubric") or []))
+                rubric_texts.extend(str(d.get("rubric", "")) for d in (a.get("graded_dimensions") or []))
+        for rubric_text in rubric_texts:
+            t = rubric_text.strip()
+            if len(t) < 12:
+                continue
+            if t.casefold() in skill_text_folded:
+                held_out_leaks.append({"case_id": c.get("id"), "where": "skill", "rubric": t[:80]})
+            elif any(t.casefold() in p for p in public_prompts):
+                held_out_leaks.append({"case_id": c.get("id"), "where": "public prompt", "rubric": t[:80]})
+    if held_out_leaks:
+        finding("held-out-rubric-leak", "required", f"{len(held_out_leaks)} held-out rubric string(s) appear in the skill or public eval text; held-out grading criteria must stay invisible to generation.", held_out_leaks[:10])
+
+    # 1.3: the judge must not be the model under test. Compare the declared
+    # judge model against the manifest's jetty.model and, when run data is
+    # supplied, every model recorded in run metadata.
+    judge_model = str((manifest.get("judge") or {}).get("model") or "").strip()
+    if judge_model:
+        under_test: set[str] = set()
+        jetty_model = str((manifest.get("jetty") or {}).get("model") or "").strip()
+        if jetty_model:
+            under_test.add(jetty_model)
+        if bench_report:
+            for r in bench_report.get("results", []):
+                meta_model = str((r.get("metadata") or {}).get("model") or "").strip()
+                if meta_model:
+                    under_test.add(meta_model)
+        if judge_model in under_test:
+            finding(
+                "judge-is-model-under-test",
+                "required",
+                f"manifest.judge.model {judge_model!r} is also a model under test; a model grading its own output inflates qualitative scores. Use a different judge model (or pass --strict-judge in CI to make this fatal).",
+                sorted(under_test),
+            )
+
     fixtures = fixture_recommendations(manifest)
     if fixtures:
         rec("fixture-repos-files", "Add fixture-backed evals to reduce keyword gaming and verify artifacts/source evidence.", fixtures)
@@ -4910,6 +7338,7 @@ def audit_manifest(args: argparse.Namespace) -> int:
         min_trigger_pos=args.min_trigger_pos,
         min_trigger_neg=args.min_trigger_neg,
         leakage_min_chars=args.leakage_min_chars,
+        expensive_case_usd=getattr(args, "expensive_case_usd", 1.0),
     )
     if args.format == "markdown":
         lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "", "| Metric | Value |", "|---|---:|"]
@@ -4963,6 +7392,14 @@ def audit_manifest(args: argparse.Namespace) -> int:
             print(f"readiness blocker: {b}", file=sys.stderr)
         print(f"audit-manifest: {len(blockers)} readiness blocker(s) for {report.get('skill_name')!r}", file=sys.stderr)
         return 1
+    # 1.3 guard: warn by default (the finding is in the report), error under
+    # --strict-judge so CI can refuse a self-judging eval suite.
+    if getattr(args, "strict_judge", False):
+        offenders = [f for f in report.get("findings", []) if f.get("kind") == "judge-is-model-under-test"]
+        if offenders:
+            for f in offenders:
+                print(f"strict-judge: {f['message']}", file=sys.stderr)
+            return 1
     return 0
 
 
@@ -5249,6 +7686,54 @@ def _run_suite_tier(scope: dict[str, Any], out_dir: Path) -> list[dict[str, Any]
     return commands
 
 
+def suite_cost_estimate(scope: dict[str, Any], *, history_dir: Path | None = None, assumed_tokens_per_run: float = 30000.0, assumed_cost_per_run_usd: float | None = None) -> dict[str, Any]:
+    """Preflight cost projection (issue #21): historical per-run medians from
+    previous cost-summary ledgers when available, otherwise a static
+    assumption. Dollar projections exist only when history (or an explicit
+    assumed cost) provides them — the gate fails closed rather than guessing."""
+    totals = scope.get("totals", {}) or {}
+    rows_key = "ablation_rows" if scope.get("include_ablations") else "selected_tier_rows"
+    rows = int(totals.get(rows_key) or 0)
+    per_run_tokens: float | None = None
+    per_run_cost: float | None = None
+    basis = "static_assumption"
+    if history_dir and history_dir.is_dir():
+        token_rates: list[float] = []
+        cost_rates: list[float] = []
+        for f in sorted(history_dir.glob("*.json")):
+            try:
+                doc = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            coverage = doc.get("coverage") or {}
+            doc_totals = doc.get("totals") or {}
+            seen = coverage.get("runs_seen") or 0
+            if not seen:
+                continue
+            if isinstance(doc_totals.get("total_tokens"), (int, float)):
+                token_rates.append(doc_totals["total_tokens"] / seen)
+            costed = coverage.get("runs_with_dollar_cost") or 0
+            if costed and isinstance(doc_totals.get("total_cost_usd"), (int, float)):
+                cost_rates.append(doc_totals["total_cost_usd"] / costed)
+        if token_rates:
+            per_run_tokens = statistics.median(token_rates)
+            basis = "cost_history_median"
+        if cost_rates:
+            per_run_cost = statistics.median(cost_rates)
+    if per_run_tokens is None:
+        per_run_tokens = float(assumed_tokens_per_run)
+    if per_run_cost is None and assumed_cost_per_run_usd is not None:
+        per_run_cost = float(assumed_cost_per_run_usd)
+    return {
+        "rows": rows,
+        "per_run_tokens": round(per_run_tokens, 1),
+        "per_run_cost_usd": round(per_run_cost, 6) if per_run_cost is not None else None,
+        "estimated_tokens": int(rows * per_run_tokens),
+        "estimated_cost_usd": round(rows * per_run_cost, 2) if per_run_cost is not None else None,
+        "basis": basis,
+    }
+
+
 def suite_run(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -5273,6 +7758,35 @@ def suite_run(args: argparse.Namespace) -> int:
     print(f"estimated rows: baseline={totals['baseline_rows']} selected={totals['selected_tier_rows']} with_ablations={totals['ablation_rows']}")
     if scope["extra_manifests"]:
         print("extra manifests not in suite allowlist: " + ", ".join(scope["extra_manifests"]), file=sys.stderr)
+    # Budget gate (issue #21): project spend BEFORE any model call and refuse
+    # to start an over-budget run unless explicitly allowed.
+    estimate = suite_cost_estimate(
+        scope,
+        history_dir=Path(args.cost_history) if getattr(args, "cost_history", None) else None,
+        assumed_tokens_per_run=float(getattr(args, "assumed_tokens_per_run", 30000.0)),
+        assumed_cost_per_run_usd=getattr(args, "assumed_cost_per_run_usd", None),
+    )
+    scope["cost_estimate"] = estimate
+    dollar_note = f" ~${estimate['estimated_cost_usd']}" if estimate["estimated_cost_usd"] is not None else " (no dollar estimate: supply --cost-history or --assumed-cost-per-run-usd)"
+    print(f"projected spend: {estimate['rows']} rows x {estimate['per_run_tokens']} tokens/run = ~{estimate['estimated_tokens']:,} tokens{dollar_note} [basis: {estimate['basis']}]")
+    over_budget: list[str] = []
+    max_tokens = getattr(args, "max_estimated_tokens", None)
+    if max_tokens is not None and estimate["estimated_tokens"] > max_tokens:
+        over_budget.append(f"estimated tokens {estimate['estimated_tokens']:,} exceed --max-estimated-tokens {max_tokens:,}")
+    max_usd = getattr(args, "max_estimated_cost_usd", None)
+    if max_usd is not None:
+        if estimate["estimated_cost_usd"] is None:
+            over_budget.append("--max-estimated-cost-usd is set but no dollar estimate is available (no cost history / assumed cost); failing closed")
+        elif estimate["estimated_cost_usd"] > max_usd:
+            over_budget.append(f"estimated cost ${estimate['estimated_cost_usd']} exceeds --max-estimated-cost-usd {max_usd}")
+    if over_budget and not getattr(args, "allow_over_budget", False):
+        for message in over_budget:
+            print(f"FAIL: {message}", file=sys.stderr)
+        print("pass --allow-over-budget to run anyway", file=sys.stderr)
+        scope["status"] = "over_budget"
+        write_json(scope_path, scope)
+        print(f"wrote {scope_path}")
+        return 3
     if scope["blockers"]:
         for blocker in scope["blockers"]:
             print(f"FAIL: {blocker}", file=sys.stderr)
@@ -5314,6 +7828,7 @@ def main() -> int:
     p.add_argument("--allow-missing-prompts", action="store_true", help="dry-run hidden prompt_ref cases even when private files are absent")
     p.add_argument("--include-answer-key", action="store_true", help="include expected_behavior/review_rubric in prepared tasks; use only for judge/debug tasks, not generation")
     p.add_argument("--ablation-dir", default=None, help="materialize declared-removal ablations into this dir and point their rows at the altered tree")
+    p.add_argument("--models", help="comma-separated target models; fans rows out per model (third axis beside variant and run), with run_dir gaining a model segment when two or more are given")
 
     p = sub.add_parser("export-jetty")
     p.add_argument("manifest")
@@ -5367,6 +7882,15 @@ def main() -> int:
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
     p.add_argument("--timeout", type=int, default=1800)
 
+    p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")
+    p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
+    p.add_argument("--runs", required=True, help="output runs directory")
+    p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
+    p.add_argument("--agent-cmd", help="shell command reading {prompt, model, workspace} JSON on stdin and emitting {answer, trace?, usage?} JSON on stdout")
+    p.add_argument("--claude-bin", default="claude", help="path to the claude executable for the default backend")
+    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--tool-replay", choices=sorted(TOOL_REPLAY_MODES), help=f"tool replay mode; defaults from ${TOOL_REPLAY_ENV} (off)")
+
     p = sub.add_parser("grade")
     p.add_argument("manifest")
     p.add_argument("--runs", required=True)
@@ -5376,6 +7900,8 @@ def main() -> int:
     p.add_argument("--judge-tasks")
     p.add_argument("--judge-results", help="JSONL/JSON results keyed by judge_task_id; merges qualitative scoring")
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
+    p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
+    p.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in; stdin {texts:[a,b]} -> stdout {embeddings:[[..],[..]]})")
     p.add_argument("--write-grading-files", action="store_true", help="write Anthropic-compatible grading.json files into each run directory")
 
     p = sub.add_parser("judge")
@@ -5397,7 +7923,14 @@ def main() -> int:
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-results", help="merge qualitative judge scoring into combined pass rates")
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
+    p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
+    p.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in)")
     p.add_argument("--out")
+
+    p = sub.add_parser("report", help="serialize a benchmark.json for CI: JUnit XML or GitHub job-summary markdown + annotations")
+    p.add_argument("--benchmark", required=True, help="benchmark.json produced by `skill-benchmark benchmark --out`")
+    p.add_argument("--format", choices=["junit", "github"], required=True)
+    p.add_argument("--out", help="output path (e.g. junit.xml, or a file appended to $GITHUB_STEP_SUMMARY)")
 
     p = sub.add_parser("compare-judges", help="flag judge-sensitivity across judged benchmark reports")
     p.add_argument("--report", action="append", metavar="NAME=PATH", help="judge label = judged benchmark report JSON (repeatable)")
@@ -5430,10 +7963,40 @@ def main() -> int:
     p.add_argument("--results", required=True)
     p.add_argument("--out")
 
+    p = sub.add_parser("migrate", help="upgrade a version-1 manifest to version 2: stamp default severity/oracle tiers, mark binary judge rubrics, print the diff and the judgment-call checklist")
+    p.add_argument("manifest")
+    p.add_argument("--check", action="store_true", help="dry run: print the diff and checklist, write nothing")
+    p.add_argument("--out-checklist", help="also write the judgment-call checklist as JSON")
+
+    p = sub.add_parser("cost-summary", help="suite cost ledger over a runs tree: coverage, totals, by variant/case/runner, top spenders, cost-quality findings (issue #21)")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--runs", required=True)
+    p.add_argument("--benchmark", help="benchmark.json; joins case flags into cost_quality_findings")
+    p.add_argument("--judge-results", help="judge-results.jsonl; adds the separated judge spend line")
+    p.add_argument("--top", type=int, default=10)
+    p.add_argument("--out", help="write cost-summary.json here (stdout otherwise)")
+    p.add_argument("--md", help="also write a cost-summary.md rendering")
+
+    p = sub.add_parser("trend", help="append-only history of benchmark reports: series, successive diffs, severity-weighted recurring failures, prune candidates")
+    p.add_argument("--history", required=True, help="history directory of run-<seq>.json reports")
+    p.add_argument("--add", help="append this benchmark.json to the history before reporting")
+    p.add_argument("--out")
+
+    p = sub.add_parser("suggest-cases", help="living-eval loop: turn saturated/no-lift flags into harder-case candidates (generation opt-in via --generate-cmd; never edits a manifest)")
+    p.add_argument("--benchmark", required=True, help="benchmark.json with case_flags")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--generate-cmd", help="shell command: candidate seed JSON on stdin, {prompt, rationale} JSON on stdout (model-backed, opt-in)")
+    p.add_argument("--timeout", type=float, default=120)
+    p.add_argument("--out")
+
     p = sub.add_parser("render-viewer")
     p.add_argument("--benchmark", required=True)
     p.add_argument("--runs")
-    p.add_argument("--out", required=True)
+    p.add_argument("--out", help="write the static review HTML here (required unless --serve)")
+    p.add_argument("--previous-workspace", help="workspace holding the previous iteration's benchmark.json; embeds a diff panel (roadmap 2.9)")
+    p.add_argument("--serve", action="store_true", help="serve the review over HTTP with feedback capture into feedback.json (roadmap 2.8)")
+    p.add_argument("--port", type=int, default=8642)
+    p.add_argument("--workspace", help="where feedback.json is written when serving (default: the benchmark's directory)")
 
     p = sub.add_parser("profile-skill")
     p.add_argument("manifest")
@@ -5467,6 +8030,8 @@ def main() -> int:
     p.add_argument("--min-trigger-neg", type=int, default=2)
     p.add_argument("--leakage-min-chars", type=int, default=4)
     p.add_argument("--fail-on-blockers", action="store_true", help="exit non-zero if the readiness block has any blockers (for CI gating of an eval suite)")
+    p.add_argument("--strict-judge", action="store_true", help="exit non-zero when the declared judge model is also a model under test")
+    p.add_argument("--expensive-case-usd", type=float, default=1.0, help="dollar threshold above which cost-quality findings fire for saturated/no-lift/judge-only cases and unstructured ablation arms (issue #21)")
 
     p = sub.add_parser("materialize-ablations", help="Write real, ablated skill trees for declared materialized ablations")
     p.add_argument("manifest")
@@ -5485,6 +8050,12 @@ def main() -> int:
     p.add_argument("--out")
 
     p = sub.add_parser("suite-run", help="Run an explicit allowlisted suite preflight/tier and write RUN_SCOPE.json")
+    p.add_argument("--cost-history", help="directory of previous cost-summary.json ledgers; per-run medians drive the preflight spend projection (issue #21)")
+    p.add_argument("--max-estimated-tokens", type=int, help="refuse to start when the projected token spend exceeds this budget")
+    p.add_argument("--max-estimated-cost-usd", type=float, help="refuse to start when the projected dollar spend exceeds this budget (fails closed when no dollar estimate exists)")
+    p.add_argument("--allow-over-budget", action="store_true", help="run anyway when a budget gate trips")
+    p.add_argument("--assumed-tokens-per-run", type=float, default=30000.0, help="fallback per-run token estimate when no cost history is available")
+    p.add_argument("--assumed-cost-per-run-usd", type=float, help="fallback per-run dollar estimate when no cost history is available")
     p.add_argument("suite_file", help="newline-delimited allowlist of manifest paths relative to --workspace-root")
     p.add_argument("--workspace-root", default=".", help="root containing the allowlisted skill repos")
     p.add_argument("--pins", help="optional examples/skill-pins.json-style tree-hash pins to verify")
@@ -5509,6 +8080,8 @@ def main() -> int:
             failures = check_ablations_dry_run(manifest_path, manifest)
             if failures:
                 die(f"{failures} ablation(s) failed --check-ablations")
+        if manifest.get("version") == 1:
+            print("note: version-1 manifest grades with behavior-preserving defaults; `skill-benchmark migrate --check` shows the version-2 upgrade (severity + oracle tiers stamped, judgment calls listed)", file=sys.stderr)
         print(f"OK: {manifest['skill_name']} — {len(iter_cases(manifest))} cases, {len(manifest.get('ablations', []))} ablations")
         return 0
     if args.cmd == "prepare":
@@ -5523,6 +8096,8 @@ def main() -> int:
         return import_trace(args)
     if args.cmd == "run-codex":
         return run_codex(args)
+    if args.cmd == "run-subagent":
+        return run_subagent(args)
     if args.cmd == "run-claude":
         return run_claude(args)
     if args.cmd == "grade":
@@ -5531,6 +8106,8 @@ def main() -> int:
         return judge_command(args)
     if args.cmd == "benchmark":
         return benchmark(args)
+    if args.cmd == "report":
+        return report_command(args)
     if args.cmd == "compare-judges":
         return compare_judges(args)
     if args.cmd == "export-anthropic":
@@ -5539,6 +8116,14 @@ def main() -> int:
         return compare_tasks(args)
     if args.cmd == "compare-results":
         return compare_results(args)
+    if args.cmd == "migrate":
+        return migrate_command(args)
+    if args.cmd == "cost-summary":
+        return cost_summary_command(args)
+    if args.cmd == "trend":
+        return trend(args)
+    if args.cmd == "suggest-cases":
+        return suggest_cases(args)
     if args.cmd == "render-viewer":
         return render_viewer(args)
     if args.cmd == "profile-skill":

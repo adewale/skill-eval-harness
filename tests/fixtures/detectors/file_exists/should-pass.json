@@ -1,0 +1,16 @@
+{
+  "detector": "file_exists",
+  "cases": [
+    {
+      "note": "expected artifact exists next to output.md",
+      "assertion": {
+        "type": "file_exists",
+        "path": "outputs/report.md"
+      },
+      "output": "wrote the report",
+      "files": {
+        "outputs/report.md": "# report\n"
+      }
+    }
+  ]
+}

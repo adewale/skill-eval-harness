@@ -1,0 +1,20 @@
+{
+  "detector": "json_field_equals",
+  "cases": [
+    {
+      "note": "field equals expected value",
+      "assertion": {
+        "type": "json_field_equals",
+        "path": "metadata.json",
+        "field": "provider",
+        "equals": "pi"
+      },
+      "output": "done",
+      "files": {
+        "metadata.json": {
+          "provider": "pi"
+        }
+      }
+    }
+  ]
+}

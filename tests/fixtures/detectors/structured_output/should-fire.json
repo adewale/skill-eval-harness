@@ -1,0 +1,22 @@
+{
+  "detector": "structured_output",
+  "cases": [
+    {
+      "note": "wrong type: count as prose-number string",
+      "assertion": {"type": "structured_output", "path": "outputs/result.json", "schema": {"type": "object", "required": ["name", "count"], "properties": {"count": {"type": "integer"}}}},
+      "output": "wrote it",
+      "files": {"outputs/result.json": {"name": "demo", "count": "two"}}
+    },
+    {
+      "note": "missing required key",
+      "assertion": {"type": "structured_output", "path": "outputs/result.json", "schema": {"type": "object", "required": ["name", "count"]}},
+      "output": "wrote it",
+      "files": {"outputs/result.json": {"name": "demo"}}
+    },
+    {
+      "note": "no parsable JSON anywhere fails closed",
+      "assertion": {"type": "structured_output", "schema": {"type": "object"}},
+      "output": "I would have produced JSON but did not."
+    }
+  ]
+}

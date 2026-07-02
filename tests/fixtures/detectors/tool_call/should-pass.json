@@ -1,0 +1,84 @@
+{
+  "detector": "tool_call",
+  "cases": [
+    {
+      "note": "a completed bash command matches the pattern",
+      "assertion": {
+        "type": "tool_call",
+        "tool": "bash",
+        "pattern": "pytest"
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "python -m pytest -q",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "note": "ordered tool calls match with interleaved noise",
+      "assertion": {
+        "type": "tool_call",
+        "order": [
+          "git add",
+          "git commit"
+        ]
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "git add -A",
+              "status": "completed"
+            },
+            {
+              "type": "command",
+              "command": "git status",
+              "status": "completed"
+            },
+            {
+              "type": "command",
+              "command": "git commit -m x",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "note": "a completed normalized tool_call event (non-shell tool) counts",
+      "assertion": {
+        "type": "tool_call",
+        "tool": "Read",
+        "pattern": "refs"
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 2,
+          "source": "subagent",
+          "events": [
+            {
+              "type": "tool_call",
+              "name": "Read",
+              "input_summary": "skills/demo/refs.md",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

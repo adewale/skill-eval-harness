@@ -1,0 +1,21 @@
+{
+  "detector": "contains",
+  "cases": [
+    {
+      "note": "value absent: paraphrase must not satisfy a literal contains",
+      "assertion": {
+        "type": "contains",
+        "value": "BEGIN TRANSACTION"
+      },
+      "output": "Use a transactional write and commit atomically."
+    },
+    {
+      "note": "baseline echoes the prompt's paraphrase; an echoed prompt must not be a false oracle (ties to leakage lint)",
+      "assertion": {
+        "type": "contains",
+        "value": "BEGIN TRANSACTION"
+      },
+      "output": "The task said: ensure the write is wrapped in a transaction before committing. I will do that."
+    }
+  ]
+}

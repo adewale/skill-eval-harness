@@ -1,0 +1,31 @@
+{
+  "detector": "script",
+  "cases": [
+    {
+      "note": "oracle exits nonzero",
+      "assertion": {
+        "type": "script",
+        "command": [
+          "python3",
+          "-c",
+          "raise SystemExit(1)"
+        ]
+      },
+      "output": "done",
+      "allow_scripts": true
+    },
+    {
+      "note": "scripts are opt-in: without --allow-scripts the assertion must fail closed, not silently pass",
+      "assertion": {
+        "type": "script",
+        "command": [
+          "python3",
+          "-c",
+          "raise SystemExit(0)"
+        ]
+      },
+      "output": "done",
+      "allow_scripts": false
+    }
+  ]
+}

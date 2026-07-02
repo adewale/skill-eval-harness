@@ -195,6 +195,15 @@ Each skill repo owns an `evals/shared-benchmark.json` manifest. Add a `harness` 
 
 Use optional `files` for fixture-backed evals. Paths are relative to the manifest's `evals/` directory, validated by `validate`, and emitted by `prepare` as absolute `input_files` for the runner.
 
+Further optional manifest surfaces (each with a behavior-preserving default; see `docs/migrating-evals.md`):
+
+- `version`: 1 or 2 — `skill-benchmark migrate` upgrades 1 → 2 by stamping the defaults explicitly.
+- `judge`: `{"model": "..."}` — the default judge model for the `judge` command; `audit-manifest` flags `judge-is-model-under-test` (fatal under `--strict-judge`).
+- `datasets` + a case `template`: fan one case template over rows with `{key}` placeholder filling and stable ids (`<case>-<row id|index>`); leakage lint runs per materialized case.
+- `turns` on a case: a scripted multi-turn sequence; each turn's assertions grade that turn's transcript entry (`turn-<n>/output.md`), case-level assertions grade the final answer.
+- YAML manifests: a `.yaml` manifest (plus `dataset_files` mapping dataset ids to JSONL row files) compiles to the same shape in memory — validation, lint, and grading are identical.
+- Reference floors: `reference_score` (0-1) / `reference_graded_score` (1-5).
+
 ## Assertions
 
 Objective assertion types:
@@ -209,12 +218,18 @@ Objective assertion types:
 | `not_regex` | Regex does not match output. |
 | `file_exists` | A file exists relative to the run directory. |
 | `json_field_equals` | A JSON field equals an expected value. |
-| `script` | Opt-in deterministic oracle command against the output directory. |
+| `golden_output` | Output (or a named artifact) equals a reference file; explicit normalization (`exact` default, `trim`, `text`); unified diff as failure evidence. |
+| `similarity` | difflib ratio against an `expected` string with a `threshold` (default 0.8), emitting a score. `mode: "embedding"` uses cosine similarity behind the opt-in `--embed-cmd`. |
+| `structured_output` | JSON (an artifact via `path`, or extracted from the output) validates against a deterministic JSON-Schema subset (`type`/`properties`/`required`/`items`/`enum`/`const`/`minItems`/`maxItems`). |
+| `script` | Opt-in deterministic oracle command against the output directory. A stdout line like `{"score": 6, "max_score": 7}` feeds the graded channel; exit code still decides pass/fail. |
 | `skill_invoked` | Trace/process check that the runner loaded the skill, or did not, as expected. |
 | `command_ran` / `command_not_ran` | Trace/process checks over normalized command events. |
 | `command_order` | Trace/process check that commands appeared in a required order. |
+| `tool_call` | A tool call matching `tool`/`pattern` occurred (with `min_count`/`max_count` bounds), or an ordered `order` list of calls. Matches completed call inputs, never outputs. |
 | `tool_count_le` / `no_repeated_command_loop` | Trace/process budgets for tool use and thrashing. |
 | `total_tokens_le` / `elapsed_seconds_le` / `command_count_le` | Efficiency checks over `metrics.json`, `metadata.json`, or normalized events. |
+
+Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict` on `grade`/`benchmark` promotes soft to gate. An `atLeast` floor on a scored assertion decides its pass. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for text/process/efficiency), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`).
 
 Use `script` when a keyword check is too weak for the property you care about. The command sees the candidate run directory, so it can inspect `output.md`, generated files under `outputs/`, or metadata. Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `benchmark`, `aggregate`, or `export-anthropic`:
 
@@ -247,6 +262,9 @@ Qualitative assertion types:
 |---|---|
 | `judge` | Deferred into `judge-tasks.jsonl`; merge results with `--judge-results`. |
 | `rubric` | Same deferred qualitative flow. |
+| `factuality` | Preset: a judge assertion carrying a canned anchored factuality rubric (threshold 4). `preset: "factuality"` on a judge assertion does the same. |
+
+A judge assertion may carry **anchored graded dimensions** (`graded_dimensions: [{name, scale: "1-5", rubric: "5 = …observable…; 1 = …"}]` — the judge returns `dimension_scores`, normalized to 0-1, passing at `threshold` ≥ 4 by default) or a **dynamic rubric** (`dynamic_rubric: {instruction, minimum_criteria}` — the judge drafts case-specific criteria and must meet the minimum). A case may set a reference floor (`reference_score` 0-1 or `reference_graded_score` 1-5); scoring below it flags `below-reference-floor`. Paired reports carry a sign-flip permutation `significance` block beside every lift, and a `graded` channel when graded scores exist.
 
 Judge results are keyed by `judge_task_id`:
 
@@ -364,6 +382,14 @@ skill-benchmark run-claude --tasks tasks.jsonl --runs ../repo/eval-runs/claude-t
 
 `--model` is optional (omit for the CLI default); `--claude-bin` overrides the executable (a stub in tests). A nonzero exit/timeout is written as a `[CLAUDE FAILURE …]` body, which `execution_valid` treats as a non-scorable infra failure, exactly like the Codex/Jetty runners.
 
+### Run subagent tasks (in-process seam, tool replay, multi-turn)
+
+`run-subagent` drives prepared rows through an in-process backend — the Claude CLI by default, any provider via `--agent-cmd` (prompt JSON on stdin, `{answer, trace?, usage?}` JSON on stdout), or a plain function in tests. It writes the same run-output contract (plus normalized `events.json`/`metrics.json` from a returned trace), reuses the isolated per-variant workspace (so the CF.2 baseline-isolation invariant covers it), honors row-level models, and drives multi-turn `turns` sequences into `turn-<n>/output.md`. Tool I/O can be recorded and replayed deterministically via `--tool-replay record|replay|strict|auto` (or `$SKILL_BENCHMARK_TOOL_REPLAY`), stored as `tool-replay.json` beside each run; `strict` fails closed on an unrecorded call.
+
+```bash
+skill-benchmark run-subagent --tasks tasks.jsonl --runs eval-runs/subagent --tool-replay record
+```
+
 ### Compare judges (judge-sensitivity)
 
 A single judge number is not reproducible across judge choice for a subtle skill. Judge the same runs with two models (`benchmark --judge-results` merges each), then `compare-judges` flags whether the measured lift depends on the judge:
@@ -419,7 +445,7 @@ skill-benchmark grade ../repo/evals/shared-benchmark.json \
 
 ### Benchmark
 
-`benchmark` aggregates graded rows into variant summaries, paired deltas, slice summaries, telemetry availability, and case flags. Add `--allow-scripts` only when you trust the repo-owned oracle commands in the manifest.
+`benchmark` aggregates graded rows into variant summaries, paired deltas (with sign-flip `significance` and a `graded` channel), per-model grouping (`by_model`, `model_analysis` ranking and lift losers), slice summaries with lift concentration, oracle-strength shares, held-out vs tune-visible qualitative rates, and case flags. Add `--allow-scripts` only when you trust the repo-owned oracle commands in the manifest; `--strict` promotes soft assertions to gates; `--embed-cmd` enables embedding-mode similarity.
 
 ```bash
 skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
@@ -428,6 +454,30 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --judge-results judge-results.jsonl \
   --out benchmark.json
 ```
+
+Multi-model runs prepare with `--models a,b,c` (run dirs gain a model segment: `<case>/<model>/<variant>`); grading discovers both layouts and pairs lift per (case, model).
+
+### CI report formats
+
+`report` serializes a `benchmark.json` for CI: `--format junit` writes one `<testcase>` per case/variant/run with evidence on failures and the paired lift as suite properties; `--format github` writes job-summary markdown plus `::warning` annotations per flagged case (and an `::error` on negative lift).
+
+```bash
+skill-benchmark report --benchmark benchmark.json --format junit --out junit.xml
+skill-benchmark report --benchmark benchmark.json --format github --out "$GITHUB_STEP_SUMMARY"
+```
+
+### Trend, staleness, and harder-case suggestions
+
+`trend` keeps an append-only history of benchmark reports and emits the series, successive diffs, recurring failures ranked by prevalence x severity, and prune candidates (cases that never failed and never discriminated across the history — suggestions only, nothing is deleted). `suggest-cases` turns saturated/no-lift flags into harder-case candidate seeds; generation is opt-in behind `--generate-cmd` and never edits a manifest.
+
+```bash
+skill-benchmark trend --history eval-history --add benchmark.json --out trend.json
+skill-benchmark suggest-cases --benchmark benchmark.json --manifest evals/shared-benchmark.json --out candidates.json
+```
+
+### Migrate a manifest
+
+`migrate` upgrades a version-1 manifest to version 2: stamps default severities and oracle tiers, marks binary judge rubrics with a `graded?` todo, prints the diff plus the judgment-call checklist (`--check` for a dry run, `--out-checklist` to save it). See `docs/migrating-evals.md` for the agent runbook.
 
 ### Judge command backend
 
@@ -489,9 +539,25 @@ skill-benchmark profile-skill ../repo/evals/shared-benchmark.json \
 
 `profile-skill` reports `SKILL.md` token estimates, reference-file counts/sizes, heading/module counts, and warnings for overly broad or oversized skills. These warnings are advisory; focused 2–3-module skills are often easier for agents to apply, but large skills can be justified when references are conditional.
 
+### Cost telemetry (tokens and dollars)
+
+Cost is a first-class eval signal (issue #21). Every runner path — Pi smoke, Pi trigger, `run-codex`, `run-claude`, `run-subagent`, the judge wrapper, and the Jetty importer — writes two normalized blocks into run metadata beside the raw provider fields (which are preserved unchanged for audit):
+
+- `usage_normalized`: alias-normalized token counts (`input`/`prompt_tokens`/`totalTokens`/cache/reasoning variants) with a `source` — `provider_reported` (relayed from the provider), `trace_normalized` (summed from normalized trace events), `estimated`, `missing`, or `not_applicable`.
+- `cost_normalized`: dollar cost with `currency`, per-part costs when reported, and a `source` — `provider_reported` vs `price_table_estimated` are never conflated, and **missing cost is marked `missing`, never written as zero**. Provider-reported blocks always beat trace-derived ones; offline/stub runs carry explicit `missing` markers.
+
+Consumers of the blocks:
+
+- `benchmark`/`aggregate` emit `cost_summary`: coverage (how many runs actually carried telemetry), operational totals (**every run counts here, including execution errors — a timed-out run still cost money — while quality rates keep excluding them**), per-variant token/cost stats (mean/median/p90), per-case spend, paired `with - without` cost deltas, ablation marginal cost and cost per confirmed regression, and judge spend as its own line (never folded into model-under-test cost).
+- `cost-summary` writes the standalone suite ledger (`--out cost-summary.json`, `--md cost-summary.md`): coverage, totals, by variant/case/runner, top expensive cases and ablation arms, and `cost_quality_findings` when a `--benchmark` report is joined.
+- `suite-run` projects spend **before any model call** from previous ledgers (`--cost-history <dir>`, per-run medians) or a static assumption (`--assumed-tokens-per-run`), and gates on `--max-estimated-tokens` / `--max-estimated-cost-usd` — failing closed when a dollar cap is set but no dollar estimate exists — unless `--allow-over-budget`.
+- `audit-manifest --runs` adds cost-quality findings above `--expensive-case-usd` (default $1): `expensive-saturated-case`, `expensive-no-lift-case`, `high-cost-judge-only-case`, `ablation-high-spend-no-structured-regression`, and `high-footprint-low-lift-skill`.
+
+Interpretation rule: `provider_reported` numbers are the bill; `trace_normalized` reconstructs usage from events (good for tokens, silent on dollars); `missing` means the run truly carried no telemetry — fix the runner path rather than treating it as free.
+
 ### Token overhead
 
-`token-overhead` combines static skill profile data with paired runtime traces. It reports the static `SKILL.md`/reference footprint, `with_skill - without_skill` token deltas, objective lift, and objective lift per 1k extra total tokens when paired `metrics.json` files exist.
+`token-overhead` combines static skill profile data with paired runtime traces. It reports the static `SKILL.md`/reference footprint, `with_skill - without_skill` token deltas, objective lift, objective lift per 1k extra total tokens — and, when cost telemetry exists, `with - without` dollar deltas, objective lift per dollar, and the total spend on saturated/no-lift pairs.
 
 ```bash
 skill-benchmark token-overhead ../repo/evals/shared-benchmark.json \
@@ -561,7 +627,7 @@ skill-benchmark compare-results \
   --out compare-summary.json
 ```
 
-### Static viewer
+### Review viewer (static or served)
 
 ```bash
 skill-benchmark render-viewer \
@@ -569,6 +635,8 @@ skill-benchmark render-viewer \
   --runs ../repo/eval-runs/latest \
   --out review.html
 ```
+
+The viewer embeds run artifacts (images inline, typed links for pdf/xlsx, text in place). `--previous-workspace <dir>` embeds a diff against that iteration's `benchmark.json` (per-variant deltas, per-case deltas, new/resolved flags; pair with the `iteration-N/` directory convention). `--serve --port 8642` hosts the review with a feedback form persisting to `feedback.json` (entries keyed by case/variant/run).
 
 ### Pi trigger evals
 

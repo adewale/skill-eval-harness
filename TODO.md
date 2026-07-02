@@ -59,7 +59,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:1721`, merged in `grade_case_variant:1877`).
+threshold, evidence}` (`load_judge_results:3946`, merged in `grade_case_variant:4498`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -117,7 +117,10 @@ own projects (`anti-slop-writing`, `slide-maker`, `xampler`, `pythonbyexample`).
 Design lives in [`docs/eval-framework-roadmap-spec.md`](docs/eval-framework-roadmap-spec.md),
 keyed to the same number (`1.1`, `2.2`, `CF.1`, …). This file tracks status only; open the
 spec for each item's goal, abstractions, design, and tests. Items with no spec section are
-marked *(TODO-native)*.
+marked *(TODO-native)*. The roadmap is implemented: migration tooling included
+(`migrate` + [`docs/migrating-evals.md`](docs/migrating-evals.md)); tests live in
+`tests/test_confidence_floor.py` and `tests/test_roadmap_features.py`. The two TODO-native
+items below stay open by design.
 
 **Moat — do not dilute:** causal lift, `tune`/`holdout`/`holdback` splits, leakage lint,
 ablations, and saturation/no-lift flags are unique to this harness. None of the surveyed
@@ -128,49 +131,49 @@ Every item below slots around these, not over them.
 
 These are tests of the harness, not a new eval suite; sequence them before the buckets.
 
-- [ ] CF.1 Detector meta-fixtures (keystone) — paired should-fire/should-pass per detector
-- [ ] CF.2 One cross-runner baseline-isolation invariant
-- [ ] CF.3 Re-grade idempotence
-- [ ] CF.4 Guard: no model / no network in the core grade path
+- [x] CF.1 Detector meta-fixtures (keystone) — paired should-fire/should-pass per detector (`tests/fixtures/detectors/`, meta-test = registration contract)
+- [x] CF.2 One cross-runner baseline-isolation invariant (`WORKSPACE_BUILDERS` registry: codex/claude/jetty/subagent + pi smoke)
+- [x] CF.3 Re-grade idempotence (byte-identical report modulo `generated_at`)
+- [x] CF.4 Guard: no model / no network in the core grade path (subprocess+urllib patched to raise)
 
 ## Bucket 1 — near drop-in (fits the existing contract)
 
-- [ ] 1.1 Built-in judge presets (`factuality`, `tool_call`, `structured_output`)
-- [ ] 1.2 GitHub Actions reporter / JUnit XML over `benchmark.json`
-- [ ] 1.3 Judge config slot + "judge model ≠ model under test" guard
-- [ ] 1.4 Local/deterministic `similarity` scorer
+- [x] 1.1 Built-in judge presets (`factuality` canned rubric; `tool_call`, `structured_output` deterministic types)
+- [x] 1.2 GitHub Actions reporter / JUnit XML over `benchmark.json` (`report --format junit|github`)
+- [x] 1.3 Judge config slot + "judge model ≠ model under test" guard (manifest `judge.model`, audit finding, `--strict-judge`)
+- [x] 1.4 Local/deterministic `similarity` scorer (difflib ratio + threshold, scored, soft by default)
 - [x] 1.5 Workflow/quickstart guide (`docs/authoring-evals.md`)
-- [ ] 1.5 Fold the guide's rules into `validate`/`audit-manifest` hints
-- [ ] 1.6 `golden_output` assertion (reference-file equality)
-- [ ] 1.7 Oracle-strength labeling + hygiene check
-- [ ] 1.8 Graded script oracles (`{score, max_score}` from stdout)
-- [ ] 1.9 Staleness / pruning hygiene (depends on 2.6)
+- [x] 1.5b Fold the guide's rules into `validate`/`audit-manifest` hints (guide pointers on leakage findings and fixture recommendations)
+- [x] 1.6 `golden_output` assertion (reference-file equality, explicit normalization, diff evidence)
+- [x] 1.7 Oracle-strength labeling + hygiene check (strong/demo/live tiers, per-case strong-share, `weak-oracle-only` audit)
+- [x] 1.8 Graded script oracles (`{score, max_score}` from stdout, normalized into the graded channel; exit code still decides pass)
+- [x] 1.9 Staleness / pruning hygiene (`trend` prune candidates over history; suggests, never deletes)
 - [ ] Exapt a reusable detector library from real usage *(TODO-native; revisit end of 2026)*. Mine the GitHub fork graph and issue tracker, then harvest the deterministic checks forkers actually hand-rolled — a detector earns its place when ≥2 independent skills re-implement it (`anti-slop-writing`, `swiss-poster-skill`, `guardrails-skill` already do by hand). Each ships with the CF.1 fire/pass fixtures before it is trusted.
 
 ## Bucket 2 — natural extension of an existing subsystem
 
-- [ ] 2.1 Multi-model fan-out (priority)
-- [ ] 2.2 Graded scoring + gate/soft/critical severity + statistical lift
-- [ ] 2.3 Tool replay (record/replay tool I/O for deterministic re-runs)
-- [ ] 2.4 OpenTelemetry GenAI normalization target
-- [ ] 2.5 Dataset abstraction (one case template × row set)
-- [ ] 2.6 Cross-run trend tracking
-- [ ] 2.7 Built-in subagent runner (Claude Code / Agent SDK)
-- [ ] 2.7b Held-out rubric discipline (depends on 2.2, 2.7)
-- [ ] 2.8 Interactive served report + richer artifacts
-- [ ] 2.9 Iteration-over-time workflow
-- [ ] 2.10 "Living eval" loop on saturation
+- [x] 2.1 Multi-model fan-out (`prepare --models`, model run-dir segment, by_model report, per-(case, model) lift)
+- [x] 2.2 Graded scoring + gate/soft/critical severity + statistical lift (veto, graded_dimensions, dynamic_rubric, reference floors, sign-flip significance, `--strict`)
+- [x] 2.3 Tool replay (record/replay/strict/auto via `tool-replay.json`, hosted by the subagent runner)
+- [x] 2.4 OpenTelemetry GenAI normalization target (otel attributes per event + usage block; events schema v2, v1 still grades)
+- [x] 2.5 Dataset abstraction (case `template` × `datasets` rows, materialized early, lint per materialized case)
+- [x] 2.6 Cross-run trend tracking (`trend`: append-only history, series, diffs, prevalence×severity failure ranking)
+- [x] 2.7 Built-in subagent runner (`run-subagent`: injectable agent seam, contract writer, CF.2-registered)
+- [x] 2.7b Held-out rubric discipline (`held-out-rubric-leak` audit finding; `qualitative_by_visibility` report split)
+- [x] 2.8 Interactive served report + richer artifacts (`render-viewer --serve`, feedback.json, image/pdf/xlsx encoders)
+- [x] 2.9 Iteration-over-time workflow (iteration-N helpers, `--previous-workspace` diff)
+- [x] 2.10 "Living eval" loop on saturation (`suggest-cases`; generation opt-in via `--generate-cmd`, never edits a manifest)
 
 ## Bucket 3 — bigger lift (new axis or core-contract change)
 
-- [ ] 3.1 Multi-turn / scripted cases
-- [ ] 3.2 Per-model lift / pairing analysis
-- [ ] 3.3 No-code template/registry definitions
+- [x] 3.1 Multi-turn / scripted cases (case `turns`, turn-indexed transcript, per-turn grading + aggregate; single-shot unchanged)
+- [x] 3.2 Per-model lift / pairing analysis (`model_analysis` ranking + lift losers; slice lift concentration)
+- [x] 3.3 No-code template/registry definitions (YAML manifests + `dataset_files` JSONL, compiled before validation)
 
 ## Bucket 4 — adopt with care (needs a model; keep out of the core grade path)
 
-- [ ] 4.1 Embedding-backed `similarity` scorer
-- [ ] 4.2 Auto-generation of harder cases (living-eval loop)
+- [x] 4.1 Embedding-backed `similarity` scorer (`mode: embedding` behind opt-in `--embed-cmd`; fails closed without it)
+- [x] 4.2 Auto-generation of harder cases (shipped inside 2.10: `suggest-cases --generate-cmd`, mocked in tests, no manifest mutation)
 
 ## Punted — questionable value
 

@@ -1,0 +1,13 @@
+{
+  "detector": "regex",
+  "cases": [
+    {
+      "note": "prose paraphrase must not match the version pattern",
+      "assertion": {
+        "type": "regex",
+        "pattern": "\\bv\\d+\\.\\d+\\.\\d+\\b"
+      },
+      "output": "Released version one point two point three."
+    }
+  ]
+}

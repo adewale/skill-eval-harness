@@ -1,0 +1,72 @@
+{
+  "detector": "command_ran",
+  "cases": [
+    {
+      "note": "no command matches",
+      "assertion": {
+        "type": "command_ran",
+        "pattern": "pytest"
+      },
+      "output": "tests pass",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "ls -la",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "note": "pattern appearing only in a tool OUTPUT must not count as a command input (regression: match inputs, not outputs)",
+      "assertion": {
+        "type": "command_ran",
+        "pattern": "pytest"
+      },
+      "output": "tests pass",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "ls -la",
+              "status": "completed"
+            },
+            {
+              "type": "tool_result",
+              "output_summary": "suggestion: run pytest next"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "note": "an in-progress start notification is not a command that ran",
+      "assertion": {
+        "type": "command_ran",
+        "pattern": "pytest"
+      },
+      "output": "tests pass",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "python -m pytest -q",
+              "status": "in_progress"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

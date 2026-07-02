@@ -1,0 +1,110 @@
+{
+  "detector": "tool_call",
+  "cases": [
+    {
+      "note": "no matching call: a mention in tool OUTPUT must not count (inputs, not outputs)",
+      "assertion": {
+        "type": "tool_call",
+        "tool": "bash",
+        "pattern": "pytest"
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "ls -la",
+              "status": "completed"
+            },
+            {
+              "type": "tool_result",
+              "output_summary": "you should run pytest"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "note": "reversed order fails the ordered form",
+      "assertion": {
+        "type": "tool_call",
+        "order": [
+          "git add",
+          "git commit"
+        ]
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "git commit -m x",
+              "status": "completed"
+            },
+            {
+              "type": "command",
+              "command": "git add -A",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "note": "over max_count fires",
+      "assertion": {
+        "type": "tool_call",
+        "tool": "bash",
+        "pattern": "curl",
+        "max_count": 1
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "curl a",
+              "status": "completed"
+            },
+            {
+              "type": "command",
+              "command": "curl b",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "note": "an in-progress tool_call event is not a call that ran",
+      "assertion": {
+        "type": "tool_call",
+        "tool": "Read"
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 2,
+          "source": "subagent",
+          "events": [
+            {
+              "type": "tool_call",
+              "name": "Read",
+              "input_summary": "skills/demo/refs.md",
+              "status": "in_progress"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

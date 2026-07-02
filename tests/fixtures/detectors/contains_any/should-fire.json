@@ -1,0 +1,27 @@
+{
+  "detector": "contains_any",
+  "cases": [
+    {
+      "note": "no alternative present",
+      "assertion": {
+        "type": "contains_any",
+        "values": [
+          "rolled back",
+          "reverted"
+        ]
+      },
+      "output": "The failed migration was undone."
+    },
+    {
+      "note": "prompt echo with different inflection must not match",
+      "assertion": {
+        "type": "contains_any",
+        "values": [
+          "rolled back",
+          "reverted"
+        ]
+      },
+      "output": "You asked me to decide whether to roll back. Deciding now."
+    }
+  ]
+}

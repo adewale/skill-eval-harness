@@ -121,7 +121,7 @@ editor. This boundary is the main extension seam in the codebase.
 
 A runner consumes task rows and produces the contract. The repo ships four paths plus a
 generic one: Pi smoke (`examples/adewale-workspace/run_pi_smoke.py`), Pi trigger
-(`run_pi_trigger_eval.py`), Codex (`run_codex:1582`), Jetty (`JettyClient:663` and the
+(`run_pi_trigger_eval.py`), Codex (`run_codex:3442`), Jetty (`JettyClient:2102` and the
 export/run/import commands), and any runner that writes the contract directly. The harness
 calls no model itself; it reads what the runner left behind.
 
@@ -158,7 +158,7 @@ a re-grade cheap and deterministic.
 normalized gain, and a flag when the skill hurts). `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:164`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:316`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 ## What changes when you extend the tool

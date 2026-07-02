@@ -1,0 +1,13 @@
+{
+  "detector": "file_exists",
+  "cases": [
+    {
+      "note": "artifact missing; output text claiming it exists must not count",
+      "assertion": {
+        "type": "file_exists",
+        "path": "outputs/report.md"
+      },
+      "output": "I wrote outputs/report.md for you."
+    }
+  ]
+}

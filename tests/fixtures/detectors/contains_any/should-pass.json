@@ -1,0 +1,16 @@
+{
+  "detector": "contains_any",
+  "cases": [
+    {
+      "note": "one of the alternatives present",
+      "assertion": {
+        "type": "contains_any",
+        "values": [
+          "rolled back",
+          "reverted"
+        ]
+      },
+      "output": "The failed migration was reverted cleanly."
+    }
+  ]
+}

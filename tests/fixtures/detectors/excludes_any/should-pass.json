@@ -1,0 +1,16 @@
+{
+  "detector": "excludes_any",
+  "cases": [
+    {
+      "note": "no banned token present",
+      "assertion": {
+        "type": "excludes_any",
+        "values": [
+          "TODO",
+          "FIXME"
+        ]
+      },
+      "output": "Everything is implemented and tested."
+    }
+  ]
+}

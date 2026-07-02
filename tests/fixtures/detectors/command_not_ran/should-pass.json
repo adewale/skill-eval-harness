@@ -1,0 +1,51 @@
+{
+  "detector": "command_not_ran",
+  "cases": [
+    {
+      "note": "banned command never ran",
+      "assertion": {
+        "type": "command_not_ran",
+        "pattern": "rm -rf"
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "ls",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "note": "banned pattern in a tool OUTPUT must not fire the detector (inputs, not outputs)",
+      "assertion": {
+        "type": "command_not_ran",
+        "pattern": "rm -rf"
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 1,
+          "source": "fixture",
+          "events": [
+            {
+              "type": "command",
+              "command": "ls",
+              "status": "completed"
+            },
+            {
+              "type": "tool_result",
+              "output_summary": "warning: never run rm -rf here"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "detector": "excludes_any",
+  "cases": [
+    {
+      "note": "banned token present: a false-silent excludes_any would hide the failure",
+      "assertion": {
+        "type": "excludes_any",
+        "values": [
+          "TODO",
+          "FIXME"
+        ]
+      },
+      "output": "TODO: finish the parser."
+    }
+  ]
+}

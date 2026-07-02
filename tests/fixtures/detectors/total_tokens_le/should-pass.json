@@ -1,0 +1,18 @@
+{
+  "detector": "total_tokens_le",
+  "cases": [
+    {
+      "note": "under budget",
+      "assertion": {
+        "type": "total_tokens_le",
+        "max": 1000
+      },
+      "output": "done",
+      "files": {
+        "metadata.json": {
+          "total_tokens": 512
+        }
+      }
+    }
+  ]
+}

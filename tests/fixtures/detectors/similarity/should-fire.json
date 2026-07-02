@@ -1,0 +1,10 @@
+{
+  "detector": "similarity",
+  "cases": [
+    {
+      "note": "unrelated text must not clear the threshold",
+      "assertion": {"type": "similarity", "expected": "The migration was rolled back cleanly and the schema was restored."},
+      "output": "Completely different subject matter with zero overlap whatsoever."
+    }
+  ]
+}

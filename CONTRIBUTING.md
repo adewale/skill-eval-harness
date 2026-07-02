@@ -22,7 +22,7 @@ python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```
 
-If you change manifest parsing, grading, Jetty export/import, trigger detection, script assertions, or judge handling, add or update `tests/test_skill_benchmark.py`.
+If you change manifest parsing, grading, Jetty export/import, trigger detection, script assertions, or judge handling, add or update `tests/test_skill_benchmark.py`. Roadmap-feature tests live in `tests/test_roadmap_features.py`; the confidence floor (detector fixtures under `tests/fixtures/detectors/`, baseline isolation, idempotence, the no-model/no-network guard) lives in `tests/test_confidence_floor.py` — a new objective assertion type must ship its should-fire/should-pass fixture pair, and a new runner must register its workspace builder.
 
 ## Eval-safety rules
 

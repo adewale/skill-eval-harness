@@ -406,8 +406,12 @@ class JudgeVerdictPassedTests(unittest.TestCase):
                 base / "output.md", {}, run_number=1, run_base=base,
                 judge_results=judged)
             self.assertEqual(tasks, [])                      # verdict supplied, no new judge task
-            self.assertEqual(result["qualitative_passed"], 1)
-            self.assertEqual(result["qualitative_total"], 1)
+            # A default (soft) judge feeds the graded/soft channel, not the
+            # qualitative pass rate; the null-score verdict still merges as a pass.
+            self.assertEqual(result["qualitative_total"], 0)
+            self.assertEqual(result["soft_total"], 1)
+            self.assertEqual(result["soft_passed"], 1)
+            self.assertTrue(result["qualitative_assertions"][0]["passed"])
 
 
 class ReadinessRunSignalTests(unittest.TestCase):

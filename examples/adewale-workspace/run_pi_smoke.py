@@ -21,7 +21,7 @@ from typing import Any
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
-from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, variant_instruction, _copy_skill_root, ablation_variant_population, canonical_skill_tree_hash, detect_trigger  # noqa: E402
+from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, variant_instruction, _copy_skill_root, ablation_variant_population, canonical_skill_tree_hash, detect_trigger, normalize_usage, normalize_cost  # noqa: E402
 from ablation_model import Provenance, TreeIdentity, TIMEOUT_FAILURE  # noqa: E402
 
 # Workspace-specific example: by default this assumes the harness directory is a
@@ -84,6 +84,10 @@ def output_from_events(stdout: str) -> tuple[str, dict[str, Any]]:
         "output_tokens": usage.get("output"),
         "total_tokens": usage.get("totalTokens"),
         "cost": usage.get("cost"),
+        # Normalized telemetry blocks (issue #21); sb.write_trace_artifacts
+        # gives provider-reported blocks precedence over trace-derived ones.
+        "usage_normalized": normalize_usage(usage, source="provider_reported"),
+        "cost_normalized": normalize_cost(usage.get("cost"), source="provider_reported"),
     }
     return final_text, meta
 

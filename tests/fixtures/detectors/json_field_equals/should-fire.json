@@ -1,0 +1,30 @@
+{
+  "detector": "json_field_equals",
+  "cases": [
+    {
+      "note": "field differs",
+      "assertion": {
+        "type": "json_field_equals",
+        "path": "metadata.json",
+        "field": "provider",
+        "equals": "pi"
+      },
+      "output": "done",
+      "files": {
+        "metadata.json": {
+          "provider": "codex"
+        }
+      }
+    },
+    {
+      "note": "file missing entirely",
+      "assertion": {
+        "type": "json_field_equals",
+        "path": "metadata.json",
+        "field": "provider",
+        "equals": "pi"
+      },
+      "output": "done"
+    }
+  ]
+}

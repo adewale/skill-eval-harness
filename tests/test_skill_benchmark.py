@@ -111,8 +111,13 @@ class SkillBenchmarkTests(unittest.TestCase):
             judge_results.write_text(json.dumps({"judge_task_id": "case-1::with_skill::run-1::quality", "passed": True, "evidence": "complete"}) + "\n", encoding="utf-8")
             report = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"], judge_results_path=str(judge_results))
             result = report["results"][0]
-            self.assertEqual(result["combined_total"], 3)
-            self.assertEqual(result["combined_passed"], 3)
+            # The default judge is soft: its merged verdict fills the graded/soft
+            # channel while the combined pass rate is carried by the two gates.
+            self.assertEqual(result["combined_total"], 2)
+            self.assertEqual(result["combined_passed"], 2)
+            self.assertEqual(result["soft_total"], 1)
+            self.assertEqual(result["soft_passed"], 1)
+            self.assertTrue(result["qualitative_assertions"][0]["passed"])
             grading = sb.anthropic_grading_json(result)
             self.assertIn("expectations", grading)
             self.assertEqual(grading["summary"]["pass_rate"], 1.0)
