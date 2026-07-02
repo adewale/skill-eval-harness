@@ -2402,6 +2402,10 @@ def normalized_jetty_metadata(record: dict[str, Any], *, success: bool) -> dict[
         "jetty_snapshot": jetty.get("snapshot"),
         "trace_url": f"https://jetty.io/{collection}/{task}/{trajectory_id}" if collection and task and trajectory_id else None,
         "jetty_raw_path": "jetty_raw.json",
+        # Normalized telemetry (issue #21): provider-reported when the
+        # trajectory carried numbers, explicit missing markers otherwise.
+        "usage_normalized": normalize_usage({**usage, **{k: meta_val for k, meta_val in [("input_tokens", trajectory.get("input_tokens")), ("output_tokens", trajectory.get("output_tokens")), ("total_tokens", total_tokens)] if meta_val is not None}}, source="provider_reported"),
+        "cost_normalized": normalize_cost(trajectory.get("cost", trajectory.get("cost_usd", usage.get("cost"))), source="provider_reported", pricing_model=jetty.get("model")),
     }
     return {k: v for k, v in meta.items() if v is not None}
 
@@ -2696,6 +2700,123 @@ def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:
             if isinstance(value, (int, float)):
                 return float(value)
     return None
+
+
+USAGE_SOURCES = {"provider_reported", "trace_normalized", "estimated", "missing", "not_applicable"}
+COST_SOURCES = {"provider_reported", "price_table_estimated", "missing", "not_applicable"}
+USAGE_ALIASES: dict[str, list[str]] = {
+    "input_tokens": ["input_tokens", "prompt_tokens", "input", "promptTokens", "inputTokens"],
+    "output_tokens": ["output_tokens", "completion_tokens", "output", "completionTokens", "outputTokens"],
+    "cache_read_tokens": ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cacheReadTokens"],
+    "cache_write_tokens": ["cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens", "cacheWriteTokens"],
+    "reasoning_tokens": ["reasoning_tokens", "thinking_tokens", "reasoningTokens"],
+    "total_tokens": ["total_tokens", "totalTokens", "total"],
+}
+COST_PART_ALIASES: dict[str, tuple[str, ...]] = {
+    "input_cost": ("input_cost", "prompt_cost"),
+    "output_cost": ("output_cost", "completion_cost"),
+    "cache_read_cost": ("cache_read_cost",),
+    "cache_write_cost": ("cache_write_cost", "cache_creation_cost"),
+    "reasoning_cost": ("reasoning_cost",),
+}
+
+
+def _num(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def normalize_usage(raw: Any, *, source: str = "provider_reported") -> dict[str, Any]:
+    """The per-run usage_normalized block (issue #21): alias-normalized token
+    counts with explicit provenance. No usable numbers means {"source":
+    "missing"} — missing telemetry is never silently zero."""
+    if source not in USAGE_SOURCES:
+        raise ValueError(f"unknown usage source {source!r}; expected one of {sorted(USAGE_SOURCES)}")
+    out: dict[str, Any] = {}
+    if isinstance(raw, dict):
+        for key, aliases in USAGE_ALIASES.items():
+            for alias in aliases:
+                value = _num(raw.get(alias))
+                if value is not None:
+                    out[key] = int(value)
+                    break
+    if source == "not_applicable":
+        return {"source": "not_applicable"}
+    if "total_tokens" not in out and ("input_tokens" in out or "output_tokens" in out):
+        out["total_tokens"] = out.get("input_tokens", 0) + out.get("output_tokens", 0)
+    if not out:
+        return {"source": "missing"}
+    out["source"] = source
+    return out
+
+
+def normalize_cost(raw: Any, *, source: str = "provider_reported", currency: str = "USD",
+                   pricing_model: str | None = None, pricing_table_version: str | None = None,
+                   pricing_notes: list[str] | None = None) -> dict[str, Any]:
+    """The per-run cost_normalized block (issue #21): a provider-reported number
+    or cost object, or a price-table estimate, with currency and provenance.
+    Missing cost is marked missing, never zero."""
+    if source not in COST_SOURCES:
+        raise ValueError(f"unknown cost source {source!r}; expected one of {sorted(COST_SOURCES)}")
+    if source == "not_applicable":
+        return {"source": "not_applicable"}
+    total = _num(raw)
+    parts: dict[str, float] = {}
+    if isinstance(raw, dict):
+        for key in ("total_cost", "total_cost_usd", "cost_usd", "total", "cost", "amount"):
+            total = _num(raw.get(key))
+            if total is not None:
+                break
+        for norm_key, aliases in COST_PART_ALIASES.items():
+            for alias in aliases:
+                value = _num(raw.get(alias))
+                if value is not None:
+                    parts[norm_key] = value
+                    break
+        if total is None and parts:
+            total = sum(parts.values())
+    if total is None:
+        return {"source": "missing"}
+    out: dict[str, Any] = {"currency": currency, **{k: round(v, 6) for k, v in parts.items()}, "total_cost": round(total, 6), "source": source}
+    if pricing_model:
+        out["pricing_model"] = pricing_model
+    if pricing_table_version:
+        out["pricing_table_version"] = pricing_table_version
+    if pricing_notes:
+        out["pricing_notes"] = list(pricing_notes)
+    return out
+
+
+def run_cost_facts(merged: dict[str, Any]) -> dict[str, Any]:
+    """ONE reader for a run's usage/cost facts. Prefers the normalized blocks;
+    pre-#21 runs fall back to the legacy flat fields, so old run dirs keep
+    reporting. Returns tokens (or None), cost_usd (or None), and each source."""
+    usage_block = merged.get("usage_normalized")
+    if isinstance(usage_block, dict) and usage_block.get("source") not in (None, "missing", "not_applicable"):
+        tokens = {key: usage_block.get(key) for key in USAGE_ALIASES if isinstance(usage_block.get(key), (int, float))}
+        usage_source = str(usage_block.get("source"))
+    else:
+        tokens = {}
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            value = metric_number(merged, key)
+            if value is not None:
+                tokens[key] = int(value)
+        usage_source = "legacy_fields" if tokens else str((usage_block or {}).get("source", "missing"))
+    cost_block = merged.get("cost_normalized")
+    if isinstance(cost_block, dict) and isinstance(cost_block.get("total_cost"), (int, float)):
+        cost_usd = float(cost_block["total_cost"])
+        cost_source = str(cost_block.get("source"))
+    else:
+        legacy = metric_number(merged, "cost_usd", "cost")
+        cost_usd = float(legacy) if legacy is not None else None
+        cost_source = "legacy_fields" if cost_usd is not None else str((cost_block or {}).get("source", "missing"))
+    return {
+        "input_tokens": tokens.get("input_tokens"),
+        "output_tokens": tokens.get("output_tokens"),
+        "total_tokens": tokens.get("total_tokens"),
+        "cost_usd": cost_usd,
+        "usage_source": usage_source,
+        "cost_source": cost_source,
+    }
 
 
 def missing_evidence(name: str) -> dict[str, Any]:
@@ -3057,6 +3178,11 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
     for key, value in token_totals.items():
         if value:
             metrics[key] = int(value)
+    if any(token_totals.values()):
+        # Trace-derived tokens get the normalized block (issue #21). Never a
+        # missing marker here — a provider-reported block in run metadata must
+        # not be shadowed by an empty trace.
+        metrics["usage_normalized"] = normalize_usage(token_totals, source="trace_normalized")
     otel_usage = {}
     if token_totals["input_tokens"]:
         otel_usage["gen_ai.usage.input_tokens"] = int(token_totals["input_tokens"])
@@ -3066,6 +3192,45 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
         metrics["otel"] = otel_usage
     event_doc = {"schema_version": 2, "source": source, "events": events}
     return event_doc, metrics
+
+
+def stream_usage_and_cost(raw_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """usage_normalized/cost_normalized straight from a runner's raw JSONL
+    stream (issue #21): tokens via the trace normalizer (provider usage events
+    relayed verbatim), provider cost records summed. Missing stays marked."""
+    records = []
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped[0] != "{":
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            records.append(obj)
+    _, metrics = normalize_trace_records(records, source="stream")
+    has_tokens = any(isinstance(metrics.get(k), (int, float)) and metrics.get(k) for k in ("input_tokens", "output_tokens", "total_tokens"))
+    usage = normalize_usage(metrics if has_tokens else None, source="provider_reported")
+    cost_total = 0.0
+    cost_found = False
+    for record in records:
+        raw = raw_trace_value(record, "cost", "cost_usd", "total_cost_usd")
+        if raw is None:
+            # Pi relays cost inside the usage object ({"usage": {..., "cost": x}}).
+            usage_obj = raw_trace_value(record, "usage", "tokens")
+            if isinstance(usage_obj, dict):
+                raw = usage_obj.get("cost", usage_obj.get("cost_usd"))
+        value = None
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            value = float(raw)
+        elif isinstance(raw, dict):
+            value = normalize_cost(raw).get("total_cost")
+        if value is not None:
+            cost_total += value
+            cost_found = True
+    cost = normalize_cost(round(cost_total, 6) if cost_found else None, source="provider_reported")
+    return usage, cost
 
 
 def write_trace_artifacts(
@@ -3091,6 +3256,14 @@ def write_trace_artifacts(
         metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
     if extra_metrics:
         metrics.update(extra_metrics)
+    # Telemetry precedence (issue #21): a provider-reported (or explicit
+    # not_applicable) block handed in by the runner beats the trace-derived one
+    # in BOTH artifacts; and every metadata.json leaves here with explicit
+    # blocks — missing telemetry is marked, never silently absent or zero.
+    for key in ("usage_normalized", "cost_normalized"):
+        block = (metadata or {}).get(key)
+        if isinstance(block, dict) and block.get("source") in {"provider_reported", "price_table_estimated", "estimated", "not_applicable"}:
+            metrics[key] = block
     write_json(out_events or run_dir / "events.json", events)
     write_json(out_metrics or run_dir / "metrics.json", metrics)
     if environment:
@@ -3100,6 +3273,8 @@ def write_trace_artifacts(
         if metadata:
             existing.update(metadata)
         existing.update({k: v for k, v in metrics.items() if k not in {"schema_version", "source"}})
+        existing.setdefault("usage_normalized", {"source": "missing"})
+        existing.setdefault("cost_normalized", {"source": "missing"})
         existing["trace_source"] = source
         write_json(run_dir / "metadata.json", existing)
     return events, metrics
@@ -3405,11 +3580,16 @@ def run_claude(args: argparse.Namespace) -> int:
             prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             result = claude_cli_invoke(prompt, model=row_model, claude_bin=claude_bin, timeout=timeout)
             metrics = claude_run_metrics(result)
+            usage_block = normalize_usage(result.get("usage"), source="provider_reported")
+            cost_block = normalize_cost(result.get("cost_usd"), source="provider_reported", pricing_model=row_model)
+            metrics["usage_normalized"] = usage_block
+            metrics["cost_normalized"] = cost_block
             write_json(base / "metrics.json", metrics)
             write_json(base / "metadata.json", {
                 "provider": "claude", "model": row_model, "returncode": result.get("returncode"),
                 "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
                 "cost_usd": metrics.get("cost_usd"), "stderr": result.get("stderr", ""),
+                "usage_normalized": usage_block, "cost_normalized": cost_block,
                 "trace_source": "claude", **prov_extra})
             write_json(base / "events.json", {"schema_version": 1, "source": "claude", "events": []})
             answer = result.get("answer") or ""
@@ -3856,6 +4036,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     # the native Claude adapter when only `--judge-model` is given — the native path
     # captures the real dollar cost of judging, which a shell cmd can't report back.
     cost_usd = None
+    judge_usage = None
     if judge_cmd:
         proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
         stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
@@ -3863,6 +4044,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin)
         stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
         cost_usd = res.get("cost_usd")
+        judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
     else:
         raise ValueError("run_one_judge_task needs a judge_cmd or a judge_model")
     parsed: dict[str, Any]
@@ -3886,6 +4068,10 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         # is recorded so a panel can measure whether the answer depends on the judge.
         "judge_model": judge_model,
         "cost_usd": cost_usd,
+        # Judge-model spend is suite cost too, but a SEPARATE ledger line from
+        # the model under test (issue #21); normalized like every runner path.
+        "usage_normalized": normalize_usage(judge_usage, source="provider_reported"),
+        "cost_normalized": normalize_cost(cost_usd, source="provider_reported", pricing_model=judge_model),
         "passed": passed and returncode == 0 and parse_error is None,
         "score": score,
         "threshold": threshold,
@@ -4063,11 +4249,17 @@ def run_subagent_tasks(
         events_doc, metrics = normalize_trace_records(trace_records, source="subagent")
         metrics.update({k: v for k, v in (outcome.get("usage") or {}).items() if isinstance(v, (int, float))})
         metrics["elapsed_ms"] = int(elapsed_ms)
+        raw_usage = outcome.get("usage") if isinstance(outcome.get("usage"), dict) else None
+        usage_block = normalize_usage(raw_usage, source="provider_reported") if raw_usage else metrics.get("usage_normalized", {"source": "missing"})
+        cost_block = normalize_cost((raw_usage or {}).get("cost_usd"), source="provider_reported", pricing_model=row_model)
+        metrics["usage_normalized"] = usage_block
+        metrics["cost_normalized"] = cost_block
         write_json(base / "events.json", events_doc)
         write_json(base / "metrics.json", metrics)
         write_json(base / "metadata.json", {
             "provider": "subagent", "model": row_model, "returncode": 1 if error else outcome.get("returncode", 0),
             "timed_out": bool(outcome.get("timed_out", False)), "elapsed_ms": int(elapsed_ms),
+            "usage_normalized": usage_block, "cost_normalized": cost_block,
             "tool_replay_mode": mode, "trace_source": "subagent", **prov_extra})
         answer = str(outcome.get("answer") or "")
         if error:
@@ -5002,6 +5194,128 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     return out
 
 
+def p90(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1)))))
+    return ordered[index]
+
+
+def cost_stats(values: list[float]) -> dict[str, Any]:
+    clean = [float(v) for v in values if v is not None]
+    if not clean:
+        return {"sum": None, "mean": None, "median": None, "p90": None, "n": 0}
+    return {
+        "sum": round(sum(clean), 6),
+        "mean": round(statistics.mean(clean), 6),
+        "median": round(statistics.median(clean), 6),
+        "p90": round(p90(clean), 6),
+        "n": len(clean),
+    }
+
+
+def result_cost_facts(result: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(result.get("metadata", {}) or {})
+    merged.update(read_metrics_base(Path(result.get("run_base", ""))))
+    facts = run_cost_facts(merged)
+    facts["elapsed_ms"] = metric_number(merged, "elapsed_ms")
+    return facts
+
+
+def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str, dict[str, Any]] | None = None, confirmed_regressions: int = 0) -> dict[str, Any]:
+    """The cost ledger inside a benchmark report (issue #21). Operational by
+    design: EVERY run counts here, including execution errors — a timed-out
+    run still cost money — while quality rates elsewhere keep excluding them.
+    Coverage separates missing telemetry from zero spend."""
+    facts = [(r, result_cost_facts(r)) for r in results]
+    runs_seen = len(facts)
+    with_usage = [f for _, f in facts if f.get("total_tokens") is not None]
+    with_cost = [f for _, f in facts if f.get("cost_usd") is not None]
+    totals = {
+        "input_tokens": int(sum(f["input_tokens"] for _, f in facts if f.get("input_tokens") is not None)),
+        "output_tokens": int(sum(f["output_tokens"] for _, f in facts if f.get("output_tokens") is not None)),
+        "total_tokens": int(sum(f["total_tokens"] for _, f in facts if f.get("total_tokens") is not None)),
+        "total_cost_usd": round(sum(f["cost_usd"] for _, f in facts if f.get("cost_usd") is not None), 6),
+        "elapsed_ms_sum": int(sum(f["elapsed_ms"] for _, f in facts if f.get("elapsed_ms") is not None)),
+        "execution_errors": sum(1 for r, _ in facts if not r.get("missing_output") and not r.get("execution_valid", True)),
+    }
+    by_variant: dict[str, Any] = {}
+    for variant in sorted({r["variant"] for r, _ in facts}):
+        rows = [(r, f) for r, f in facts if r["variant"] == variant]
+        by_variant[variant] = {
+            "runs": len(rows),
+            "tokens": cost_stats([f["total_tokens"] for _, f in rows if f.get("total_tokens") is not None]),
+            "cost_usd": cost_stats([f["cost_usd"] for _, f in rows if f.get("cost_usd") is not None]),
+        }
+    by_case: dict[str, Any] = {}
+    for case_id in sorted({r["case_id"] for r, _ in facts}):
+        rows = [f for r, f in facts if r["case_id"] == case_id]
+        by_case[case_id] = {
+            "runs": len(rows),
+            "total_tokens": int(sum(f["total_tokens"] for f in rows if f.get("total_tokens") is not None)),
+            "total_cost_usd": round(sum(f["cost_usd"] for f in rows if f.get("cost_usd") is not None), 6),
+        }
+    paired_cost_delta: dict[str, Any] = {}
+    deltas = []
+    for case_id in by_case:
+        with_costs = [f["cost_usd"] for r, f in facts if r["case_id"] == case_id and r["variant"] == "with_skill" and f.get("cost_usd") is not None]
+        without_costs = [f["cost_usd"] for r, f in facts if r["case_id"] == case_id and r["variant"] == "without_skill" and f.get("cost_usd") is not None]
+        if with_costs and without_costs:
+            delta = statistics.mean(with_costs) - statistics.mean(without_costs)
+            paired_cost_delta[case_id] = {"with_skill": round(statistics.mean(with_costs), 6), "without_skill": round(statistics.mean(without_costs), 6), "delta": round(delta, 6)}
+            deltas.append(delta)
+    ablation_rows = [(r, f) for r, f in facts if str(r.get("variant", "")).startswith("ablation:")]
+    ablation_cost = round(sum(f["cost_usd"] for _, f in ablation_rows if f.get("cost_usd") is not None), 6)
+    ablation_tokens = int(sum(f["total_tokens"] for _, f in ablation_rows if f.get("total_tokens") is not None))
+    out: dict[str, Any] = {
+        "coverage": {
+            "runs_seen": runs_seen,
+            "runs_with_token_usage": len(with_usage),
+            "runs_with_dollar_cost": len(with_cost),
+            "runs_missing_usage": runs_seen - len(with_usage),
+            "runs_missing_cost": runs_seen - len(with_cost),
+        },
+        "totals": totals,
+        "by_variant": by_variant,
+        "by_case": by_case,
+        "paired_cost_delta": paired_cost_delta,
+        "mean_paired_cost_delta": round(statistics.mean(deltas), 6) if deltas else None,
+        "ablations": {
+            "runs": len(ablation_rows),
+            "total_tokens": ablation_tokens,
+            "total_cost_usd": ablation_cost,
+            "confirmed_regressions": confirmed_regressions,
+            "cost_per_confirmed_regression": round(ablation_cost / confirmed_regressions, 6) if confirmed_regressions and ablation_cost else None,
+        },
+    }
+    if judge_results:
+        judge_costs = []
+        for row in judge_results.values():
+            block = row.get("cost_normalized")
+            if isinstance(block, dict) and isinstance(block.get("total_cost"), (int, float)):
+                judge_costs.append(float(block["total_cost"]))
+            elif isinstance(row.get("cost_usd"), (int, float)):
+                judge_costs.append(float(row["cost_usd"]))
+        # Judge spend is suite cost, but its own ledger line — never folded
+        # into the model-under-test totals.
+        out["judge"] = {
+            "verdicts": len(judge_results),
+            "verdicts_with_cost": len(judge_costs),
+            "total_cost_usd": round(sum(judge_costs), 6) if judge_costs else None,
+        }
+    return out
+
+
+def confirmed_regression_count(ablation_regressions: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for entry in ablation_regressions or []
+        for reg in entry.get("regressions", [])
+        if reg.get("expected_regression_confirmed") is True
+    )
+
+
 def qualitative_by_visibility(results: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     scorable_rows = ResultSet(results).scorable().all
@@ -5186,6 +5500,7 @@ def build_benchmark_report(
         }
 
     paired_summary = build_paired_summary(results)
+    ablation_regressions = build_ablation_regression_report(manifest, results)
     return {
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
@@ -5208,7 +5523,11 @@ def build_benchmark_report(
         "paired_summary": paired_summary,
         "model_analysis": model_analysis_from_paired(paired_summary),
         "slice_summary": build_slice_summary(results, variants),
-        "ablation_regressions": build_ablation_regression_report(manifest, results),
+        "ablation_regressions": ablation_regressions,
+        # Operational spend beside the quality numbers (issue #21): totals over
+        # ALL runs (failures included), per-variant/case stats, paired cost
+        # deltas, ablation marginal cost, and separated judge spend.
+        "cost_summary": build_cost_summary(results, judge_results=judge_lookup, confirmed_regressions=confirmed_regression_count(ablation_regressions)),
         "case_flags": case_flags,
         "results": results,
     }
@@ -5338,11 +5657,21 @@ def aggregate(args: argparse.Namespace) -> int:
             runs = Path(args.runs)
         reports.append(build_benchmark_report(manifest_path, runs, args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False)))
 
+    cross_totals: dict[str, float] = {}
+    for r in reports:
+        for key, value in (r.get("cost_summary", {}).get("totals") or {}).items():
+            if isinstance(value, (int, float)):
+                cross_totals[key] = cross_totals.get(key, 0) + value
     aggregate_summary: dict[str, Any] = {
         "skills": len(reports),
         "case_variant_rows": sum(len(r["results"]) for r in reports),
         "unique_cases": sum(len({row["case_id"] for row in r["results"]}) for r in reports),
         "by_skill": {r["skill_name"]: r["summary"] for r in reports},
+        # Cross-skill spend ledger (issue #21): which skills dominate the bill.
+        "cost_summary": {
+            "totals": {k: (round(v, 6) if isinstance(v, float) else v) for k, v in cross_totals.items()},
+            "by_skill": {r["skill_name"]: (r.get("cost_summary", {}).get("totals") or {}) for r in reports},
+        },
         "flags": [
             {"skill_name": r["skill_name"], **flag}
             for r in reports
@@ -5828,6 +6157,161 @@ def migrate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict[str, Any] | None = None, judge_results: dict[str, dict[str, Any]] | None = None, top_n: int = 10) -> dict[str, Any]:
+    """The standalone suite cost ledger (issue #21's cost-summary.json): walks
+    the run tree per manifest case — every variant directory found on disk,
+    ablation arms included — and reads each run's normalized telemetry."""
+    manifest = validate_manifest(manifest_path)
+    rows: list[dict[str, Any]] = []
+    for case in iter_cases(manifest):
+        case_dir = runs / case["id"]
+        if not case_dir.is_dir():
+            continue
+        def run_bearing(d: Path) -> bool:
+            return ((d / "output.md").exists() or (d / "metadata.json").exists() or (d / "outputs").is_dir()
+                    or any(g.is_dir() and g.name.startswith(("run-", "turn-")) for g in d.iterdir()))
+
+        variant_dirs: list[tuple[str | None, str, Path]] = []
+        for child in sorted(case_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            if run_bearing(child):
+                variant_dirs.append((None, child.name, child))
+                continue
+            # No run evidence of its own but run-bearing subdirs: a model root
+            # from the multi-model layout (<case>/<model>/<variant>).
+            bearing_children = [g for g in sorted(child.iterdir()) if g.is_dir() and run_bearing(g)]
+            for g in bearing_children:
+                variant_dirs.append((child.name, g.name, g))
+        for model, variant, vdir in variant_dirs:
+            for run_number, base in discover_run_bases_under(vdir):
+                merged = read_metrics_base(base)
+                facts = run_cost_facts(merged)
+                facts["elapsed_ms"] = metric_number(merged, "elapsed_ms")
+                rows.append({
+                    "case_id": case["id"],
+                    "variant": variant,
+                    "model": model,
+                    "run_number": run_number,
+                    "runner": merged.get("provider") or merged.get("trace_source") or merged.get("source"),
+                    **facts,
+                })
+    runs_seen = len(rows)
+    with_usage = sum(1 for r in rows if r.get("total_tokens") is not None)
+    with_cost = sum(1 for r in rows if r.get("cost_usd") is not None)
+    by_variant: dict[str, Any] = {}
+    by_runner: dict[str, Any] = {}
+    by_case: dict[str, Any] = {}
+    for row in rows:
+        for bucket, key in [(by_variant, row["variant"]), (by_runner, str(row.get("runner") or "unknown")), (by_case, row["case_id"])]:
+            slot = bucket.setdefault(key, {"runs": 0, "total_tokens": 0, "total_cost_usd": 0.0})
+            slot["runs"] += 1
+            if row.get("total_tokens") is not None:
+                slot["total_tokens"] += int(row["total_tokens"])
+            if row.get("cost_usd") is not None:
+                slot["total_cost_usd"] = round(slot["total_cost_usd"] + float(row["cost_usd"]), 6)
+    expensive_cases = sorted(by_case.items(), key=lambda kv: (-(kv[1]["total_cost_usd"] or 0), -kv[1]["total_tokens"], kv[0]))[:top_n]
+    ablation_spend: dict[str, Any] = {}
+    for row in rows:
+        if str(row["variant"]).startswith("ablation:"):
+            slot = ablation_spend.setdefault(row["variant"], {"runs": 0, "total_tokens": 0, "total_cost_usd": 0.0})
+            slot["runs"] += 1
+            if row.get("total_tokens") is not None:
+                slot["total_tokens"] += int(row["total_tokens"])
+            if row.get("cost_usd") is not None:
+                slot["total_cost_usd"] = round(slot["total_cost_usd"] + float(row["cost_usd"]), 6)
+    top_ablations = sorted(ablation_spend.items(), key=lambda kv: (-(kv[1]["total_cost_usd"] or 0), -kv[1]["total_tokens"], kv[0]))[:top_n]
+    findings: list[dict[str, Any]] = []
+    if benchmark_report:
+        flagged = {flag.get("case_id"): flag.get("flags", []) for flag in benchmark_report.get("case_flags", [])}
+        for case_id, flags in flagged.items():
+            spend = by_case.get(case_id)
+            if not spend:
+                continue
+            waste_flags = [f for f in flags if "saturated" in f or "no objective lift" in f]
+            if waste_flags:
+                findings.append({
+                    "kind": "spend-on-non-discriminating-case",
+                    "case_id": case_id,
+                    "flags": waste_flags,
+                    "total_tokens": spend["total_tokens"],
+                    "total_cost_usd": spend["total_cost_usd"],
+                })
+        findings.sort(key=lambda f: (-(f.get("total_cost_usd") or 0), str(f.get("case_id"))))
+    ledger: dict[str, Any] = {
+        "generated_at": int(time.time()),
+        "manifest": str(manifest_path),
+        "skill_name": manifest.get("skill_name"),
+        "runs_root": str(runs),
+        "coverage": {
+            "runs_seen": runs_seen,
+            "runs_with_token_usage": with_usage,
+            "runs_with_dollar_cost": with_cost,
+            "runs_missing_usage": runs_seen - with_usage,
+            "runs_missing_cost": runs_seen - with_cost,
+        },
+        "totals": {
+            "input_tokens": int(sum(r["input_tokens"] for r in rows if r.get("input_tokens") is not None)),
+            "output_tokens": int(sum(r["output_tokens"] for r in rows if r.get("output_tokens") is not None)),
+            "total_tokens": int(sum(r["total_tokens"] for r in rows if r.get("total_tokens") is not None)),
+            "total_cost_usd": round(sum(r["cost_usd"] for r in rows if r.get("cost_usd") is not None), 6),
+            "elapsed_ms_sum": int(sum(r["elapsed_ms"] for r in rows if r.get("elapsed_ms") is not None)),
+        },
+        "by_variant": by_variant,
+        "by_runner": by_runner,
+        "by_case": by_case,
+        "top_expensive_cases": [{"case_id": k, **v} for k, v in expensive_cases],
+        "top_expensive_ablations": [{"variant": k, **v} for k, v in top_ablations],
+        "cost_quality_findings": findings[:top_n],
+    }
+    if judge_results:
+        judge_costs = [float(row.get("cost_usd")) for row in judge_results.values() if isinstance(row.get("cost_usd"), (int, float))]
+        ledger["judge"] = {"verdicts": len(judge_results), "verdicts_with_cost": len(judge_costs), "total_cost_usd": round(sum(judge_costs), 6) if judge_costs else None}
+    return ledger
+
+
+def cost_ledger_markdown(ledger: dict[str, Any]) -> str:
+    totals = ledger.get("totals", {})
+    coverage = ledger.get("coverage", {})
+    lines = [
+        f"# Cost summary — {ledger.get('skill_name')}",
+        "",
+        f"Runs: {coverage.get('runs_seen')} (usage on {coverage.get('runs_with_token_usage')}, dollars on {coverage.get('runs_with_dollar_cost')}; missing usage {coverage.get('runs_missing_usage')}, missing cost {coverage.get('runs_missing_cost')})",
+        "",
+        f"**Totals:** {totals.get('total_tokens'):,} tokens (in {totals.get('input_tokens'):,} / out {totals.get('output_tokens'):,}), ${totals.get('total_cost_usd')} provider-reported, {totals.get('elapsed_ms_sum')} ms summed",
+        "",
+        "| Variant | Runs | Tokens | Cost USD |",
+        "|---|---:|---:|---:|",
+    ]
+    for variant, slot in ledger.get("by_variant", {}).items():
+        lines.append(f"| {variant} | {slot['runs']} | {slot['total_tokens']:,} | {slot['total_cost_usd']} |")
+    if ledger.get("top_expensive_cases"):
+        lines += ["", "## Top expensive cases", "", "| Case | Runs | Tokens | Cost USD |", "|---|---:|---:|---:|"]
+        for row in ledger["top_expensive_cases"]:
+            lines.append(f"| {row['case_id']} | {row['runs']} | {row['total_tokens']:,} | {row['total_cost_usd']} |")
+    if ledger.get("cost_quality_findings"):
+        lines += ["", "## Cost-quality findings", ""]
+        for f in ledger["cost_quality_findings"]:
+            lines.append(f"- `{f.get('case_id')}`: {', '.join(f.get('flags', []))} — {f.get('total_tokens'):,} tokens, ${f.get('total_cost_usd')}")
+    if ledger.get("judge"):
+        j = ledger["judge"]
+        lines += ["", f"Judge spend (separate from model under test): {j.get('verdicts')} verdicts, ${j.get('total_cost_usd')}"]
+    return "\n".join(lines) + "\n"
+
+
+def cost_summary_command(args: argparse.Namespace) -> int:
+    benchmark_report = load_json(Path(args.benchmark)) if getattr(args, "benchmark", None) else None
+    judge_lookup = load_judge_results(getattr(args, "judge_results", None))
+    ledger = suite_cost_ledger(Path(args.manifest), Path(args.runs), benchmark_report=benchmark_report, judge_results=judge_lookup or None, top_n=int(getattr(args, "top", 10)))
+    if args.out:
+        write_json(Path(args.out), ledger)
+    else:
+        print(json.dumps(ledger, indent=2, ensure_ascii=False))
+    if getattr(args, "md", None):
+        Path(args.md).write_text(cost_ledger_markdown(ledger), encoding="utf-8")
+    return 0
+
+
 SEVERITY_WEIGHT = {"critical": 3.0, "gate": 2.0, "soft": 1.0}
 
 
@@ -6170,6 +6654,10 @@ def paired_token_overhead_report(
                 # crashed with_skill arm differenced to a false -1.0 "skill regression").
                 if not (scorable_run(with_grade) and scorable_run(without_grade)):
                     continue
+                with_facts = run_cost_facts(with_metrics)
+                without_facts = run_cost_facts(without_metrics)
+                wc = with_facts.get("cost_usd")
+                nc = without_facts.get("cost_usd")
                 wt = metric_number(with_metrics, "total_tokens")
                 nt = metric_number(without_metrics, "total_tokens")
                 wi = metric_number(with_metrics, "input_tokens")
@@ -6198,7 +6686,22 @@ def paired_token_overhead_report(
                     "without_objective_pass_rate": without_grade.get("objective_pass_rate"),
                     "objective_delta": (with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) if with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None,
                     "objective_lift_per_1k_total_tokens": ((with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) / ((wt - nt) / 1000)) if wt is not None and nt is not None and wt > nt and with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None,
+                    # Dollar channel (issue #21): what the skill costs, and what
+                    # a point of lift costs, in money rather than tokens.
+                    "with_cost_usd": wc,
+                    "without_cost_usd": nc,
+                    "cost_delta_usd": round(wc - nc, 6) if wc is not None and nc is not None else None,
+                    "objective_lift_per_dollar": (((with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) / (wc - nc)) if wc is not None and nc is not None and wc > nc and with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None),
                 })
+    cost_deltas = [p["cost_delta_usd"] for p in pairs if p.get("cost_delta_usd") is not None]
+    lift_per_dollar = [p["objective_lift_per_dollar"] for p in pairs if p.get("objective_lift_per_dollar") is not None]
+    # The money wasted on pairs that no longer discriminate: both arms perfect
+    # (saturated) or no lift at all.
+    waste_cost = round(sum((p.get("with_cost_usd") or 0) + (p.get("without_cost_usd") or 0)
+                           for p in pairs
+                           if p.get("objective_delta") is not None and (
+                               (p.get("objective_delta") <= 0)
+                               or (p.get("with_objective_pass_rate") == 1 and p.get("without_objective_pass_rate") == 1))), 6)
     total_deltas = [p["total_token_delta"] for p in pairs if p.get("total_token_delta") is not None]
     input_deltas = [p["input_token_delta"] for p in pairs if p.get("input_token_delta") is not None]
     output_deltas = [p["output_token_delta"] for p in pairs if p.get("output_token_delta") is not None]
@@ -6223,6 +6726,9 @@ def paired_token_overhead_report(
             "output_token_delta": stats(output_deltas),
             "objective_delta": stats(objective_deltas),
             "objective_lift_per_1k_total_tokens": stats(lift_per_1k),
+            "cost_delta_usd": stats(cost_deltas),
+            "objective_lift_per_dollar": stats(lift_per_dollar),
+            "saturated_or_no_lift_cost_usd": waste_cost,
             "mean_total_overhead_per_static_skill_token": (statistics.mean(total_deltas) / static_skill_tokens) if total_deltas and static_skill_tokens else None,
         },
         "profile": profile,
@@ -6250,14 +6756,16 @@ def token_overhead(args: argparse.Namespace) -> int:
         "reports": reports,
     }
     if args.format == "markdown":
-        lines = ["# Token overhead report", "", "| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | Median total delta | Mean input delta | Mean objective lift | Lift per 1k total tokens |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        lines = ["# Token overhead report", "", "| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | Median total delta | Mean input delta | Mean objective lift | Lift per 1k total tokens | Mean cost delta USD | Lift per $ | Saturated/no-lift cost USD |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for r in reports:
             s = r["summary"]
             td = s.get("total_token_delta") or {}
             idelta = s.get("input_token_delta") or {}
             odelta = s.get("objective_delta") or {}
             lift = s.get("objective_lift_per_1k_total_tokens") or {}
-            lines.append(f"| {r['skill_name']} | {s.get('static_skill_tokens')} | {s.get('static_reference_tokens')} | {s.get('paired_runtime_rows')} | {td.get('mean')} | {td.get('median')} | {idelta.get('mean')} | {odelta.get('mean')} | {lift.get('mean')} |")
+            cd = s.get("cost_delta_usd") or {}
+            lpd = s.get("objective_lift_per_dollar") or {}
+            lines.append(f"| {r['skill_name']} | {s.get('static_skill_tokens')} | {s.get('static_reference_tokens')} | {s.get('paired_runtime_rows')} | {td.get('mean')} | {td.get('median')} | {idelta.get('mean')} | {odelta.get('mean')} | {lift.get('mean')} | {cd.get('mean')} | {lpd.get('mean')} | {s.get('saturated_or_no_lift_cost_usd')} |")
         lines += ["", "## Per-case runtime pairs", ""]
         for r in reports:
             if not r.get("pairs"):
@@ -6502,6 +7010,7 @@ def audit_manifest_report(
     min_trigger_pos: int = 2,
     min_trigger_neg: int = 2,
     leakage_min_chars: int = 4,
+    expensive_case_usd: float = 1.0,
 ) -> dict[str, Any]:
     manifest = validate_manifest(manifest_path)
     cases = iter_cases(manifest, split)
@@ -6623,6 +7132,41 @@ def audit_manifest_report(
     if weak_only:
         finding("weak-oracle-only", "recommended", f"{len(weak_only)} case(s) are graded only by demo/live oracles (no strong deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
 
+    # Cost-quality findings (issue #21): where money is being spent without
+    # buying signal. Only computable when run data is supplied.
+    if bench_report:
+        cost_by_case = (bench_report.get("cost_summary", {}) or {}).get("by_case", {})
+        flags_by_case = {flag.get("case_id"): flag.get("flags", []) for flag in bench_report.get("case_flags", [])}
+        for case_id, spend in sorted(cost_by_case.items()):
+            cost = spend.get("total_cost_usd") or 0
+            if cost < expensive_case_usd:
+                continue
+            case_flag_list = flags_by_case.get(case_id, [])
+            if any("saturated" in f for f in case_flag_list):
+                finding("expensive-saturated-case", "recommended", f"Case {case_id} cost ${cost} but is saturated/non-discriminating — spend without signal.", spend)
+            elif any("no objective lift" in f for f in case_flag_list):
+                finding("expensive-no-lift-case", "recommended", f"Case {case_id} cost ${cost} with no objective lift — spend without signal.", spend)
+        judge_only_ids = {c.get("id") for c in cases if c.get("assertions") and all(a.get("type") in QUALITATIVE_ASSERTIONS for a in c.get("assertions", []))}
+        for case_id in sorted(judge_only_ids):
+            cost = (cost_by_case.get(case_id) or {}).get("total_cost_usd") or 0
+            if cost >= expensive_case_usd:
+                finding("high-cost-judge-only-case", "recommended", f"Case {case_id} cost ${cost} and is graded only by judge assertions; a deterministic/script oracle would make the spend verifiable.", cost_by_case.get(case_id))
+        ablation_spend: dict[str, float] = {}
+        for r in bench_report.get("results", []):
+            variant = str(r.get("variant", ""))
+            if variant.startswith("ablation:"):
+                cost_value = result_cost_facts(r).get("cost_usd")
+                if cost_value is not None:
+                    ablation_spend[variant] = round(ablation_spend.get(variant, 0.0) + cost_value, 6)
+        structured = {f"ablation:{a.get('id')}" for a in manifest.get("ablations", []) if any(isinstance(spec, dict) and spec.get("cases") and spec.get("assertions") for spec in a.get("expected_regressions", []))}
+        for variant, spend_usd in sorted(ablation_spend.items()):
+            if spend_usd >= expensive_case_usd and variant not in structured:
+                finding("ablation-high-spend-no-structured-regression", "recommended", f"Ablation arm {variant} cost ${spend_usd} but declares no structured expected_regressions (cases+assertions) to confirm — the spend cannot become causal evidence.", {"variant": variant, "total_cost_usd": spend_usd})
+        overall_lift = (bench_report.get("paired_summary", {}) or {}).get("absolute_delta")
+        static_tokens = approximate_tokens(skill_text)
+        if static_tokens >= 3000 and isinstance(overall_lift, (int, float)) and overall_lift <= 0.05:
+            finding("high-footprint-low-lift-skill", "recommended", f"Skill carries ~{static_tokens} static tokens into every run but measured lift is {overall_lift:.3f}; the footprint is not buying signal.", {"static_tokens": static_tokens, "lift": overall_lift})
+
     # 2.7b: a held-out case's grading criteria must stay out of the skill and
     # the public eval text — a skill must not teach to the rubric it will be
     # graded on ("criteria deliberately absent from generation rules").
@@ -6725,6 +7269,7 @@ def audit_manifest(args: argparse.Namespace) -> int:
         min_trigger_pos=args.min_trigger_pos,
         min_trigger_neg=args.min_trigger_neg,
         leakage_min_chars=args.leakage_min_chars,
+        expensive_case_usd=getattr(args, "expensive_case_usd", 1.0),
     )
     if args.format == "markdown":
         lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "", "| Metric | Value |", "|---|---:|"]
@@ -7072,6 +7617,54 @@ def _run_suite_tier(scope: dict[str, Any], out_dir: Path) -> list[dict[str, Any]
     return commands
 
 
+def suite_cost_estimate(scope: dict[str, Any], *, history_dir: Path | None = None, assumed_tokens_per_run: float = 30000.0, assumed_cost_per_run_usd: float | None = None) -> dict[str, Any]:
+    """Preflight cost projection (issue #21): historical per-run medians from
+    previous cost-summary ledgers when available, otherwise a static
+    assumption. Dollar projections exist only when history (or an explicit
+    assumed cost) provides them — the gate fails closed rather than guessing."""
+    totals = scope.get("totals", {}) or {}
+    rows_key = "ablation_rows" if scope.get("include_ablations") else "selected_tier_rows"
+    rows = int(totals.get(rows_key) or 0)
+    per_run_tokens: float | None = None
+    per_run_cost: float | None = None
+    basis = "static_assumption"
+    if history_dir and history_dir.is_dir():
+        token_rates: list[float] = []
+        cost_rates: list[float] = []
+        for f in sorted(history_dir.glob("*.json")):
+            try:
+                doc = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            coverage = doc.get("coverage") or {}
+            doc_totals = doc.get("totals") or {}
+            seen = coverage.get("runs_seen") or 0
+            if not seen:
+                continue
+            if isinstance(doc_totals.get("total_tokens"), (int, float)):
+                token_rates.append(doc_totals["total_tokens"] / seen)
+            costed = coverage.get("runs_with_dollar_cost") or 0
+            if costed and isinstance(doc_totals.get("total_cost_usd"), (int, float)):
+                cost_rates.append(doc_totals["total_cost_usd"] / costed)
+        if token_rates:
+            per_run_tokens = statistics.median(token_rates)
+            basis = "cost_history_median"
+        if cost_rates:
+            per_run_cost = statistics.median(cost_rates)
+    if per_run_tokens is None:
+        per_run_tokens = float(assumed_tokens_per_run)
+    if per_run_cost is None and assumed_cost_per_run_usd is not None:
+        per_run_cost = float(assumed_cost_per_run_usd)
+    return {
+        "rows": rows,
+        "per_run_tokens": round(per_run_tokens, 1),
+        "per_run_cost_usd": round(per_run_cost, 6) if per_run_cost is not None else None,
+        "estimated_tokens": int(rows * per_run_tokens),
+        "estimated_cost_usd": round(rows * per_run_cost, 2) if per_run_cost is not None else None,
+        "basis": basis,
+    }
+
+
 def suite_run(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -7096,6 +7689,35 @@ def suite_run(args: argparse.Namespace) -> int:
     print(f"estimated rows: baseline={totals['baseline_rows']} selected={totals['selected_tier_rows']} with_ablations={totals['ablation_rows']}")
     if scope["extra_manifests"]:
         print("extra manifests not in suite allowlist: " + ", ".join(scope["extra_manifests"]), file=sys.stderr)
+    # Budget gate (issue #21): project spend BEFORE any model call and refuse
+    # to start an over-budget run unless explicitly allowed.
+    estimate = suite_cost_estimate(
+        scope,
+        history_dir=Path(args.cost_history) if getattr(args, "cost_history", None) else None,
+        assumed_tokens_per_run=float(getattr(args, "assumed_tokens_per_run", 30000.0)),
+        assumed_cost_per_run_usd=getattr(args, "assumed_cost_per_run_usd", None),
+    )
+    scope["cost_estimate"] = estimate
+    dollar_note = f" ~${estimate['estimated_cost_usd']}" if estimate["estimated_cost_usd"] is not None else " (no dollar estimate: supply --cost-history or --assumed-cost-per-run-usd)"
+    print(f"projected spend: {estimate['rows']} rows x {estimate['per_run_tokens']} tokens/run = ~{estimate['estimated_tokens']:,} tokens{dollar_note} [basis: {estimate['basis']}]")
+    over_budget: list[str] = []
+    max_tokens = getattr(args, "max_estimated_tokens", None)
+    if max_tokens is not None and estimate["estimated_tokens"] > max_tokens:
+        over_budget.append(f"estimated tokens {estimate['estimated_tokens']:,} exceed --max-estimated-tokens {max_tokens:,}")
+    max_usd = getattr(args, "max_estimated_cost_usd", None)
+    if max_usd is not None:
+        if estimate["estimated_cost_usd"] is None:
+            over_budget.append("--max-estimated-cost-usd is set but no dollar estimate is available (no cost history / assumed cost); failing closed")
+        elif estimate["estimated_cost_usd"] > max_usd:
+            over_budget.append(f"estimated cost ${estimate['estimated_cost_usd']} exceeds --max-estimated-cost-usd {max_usd}")
+    if over_budget and not getattr(args, "allow_over_budget", False):
+        for message in over_budget:
+            print(f"FAIL: {message}", file=sys.stderr)
+        print("pass --allow-over-budget to run anyway", file=sys.stderr)
+        scope["status"] = "over_budget"
+        write_json(scope_path, scope)
+        print(f"wrote {scope_path}")
+        return 3
     if scope["blockers"]:
         for blocker in scope["blockers"]:
             print(f"FAIL: {blocker}", file=sys.stderr)
@@ -7277,6 +7899,15 @@ def main() -> int:
     p.add_argument("--check", action="store_true", help="dry run: print the diff and checklist, write nothing")
     p.add_argument("--out-checklist", help="also write the judgment-call checklist as JSON")
 
+    p = sub.add_parser("cost-summary", help="suite cost ledger over a runs tree: coverage, totals, by variant/case/runner, top spenders, cost-quality findings (issue #21)")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--runs", required=True)
+    p.add_argument("--benchmark", help="benchmark.json; joins case flags into cost_quality_findings")
+    p.add_argument("--judge-results", help="judge-results.jsonl; adds the separated judge spend line")
+    p.add_argument("--top", type=int, default=10)
+    p.add_argument("--out", help="write cost-summary.json here (stdout otherwise)")
+    p.add_argument("--md", help="also write a cost-summary.md rendering")
+
     p = sub.add_parser("trend", help="append-only history of benchmark reports: series, successive diffs, severity-weighted recurring failures, prune candidates")
     p.add_argument("--history", required=True, help="history directory of run-<seq>.json reports")
     p.add_argument("--add", help="append this benchmark.json to the history before reporting")
@@ -7331,6 +7962,7 @@ def main() -> int:
     p.add_argument("--leakage-min-chars", type=int, default=4)
     p.add_argument("--fail-on-blockers", action="store_true", help="exit non-zero if the readiness block has any blockers (for CI gating of an eval suite)")
     p.add_argument("--strict-judge", action="store_true", help="exit non-zero when the declared judge model is also a model under test")
+    p.add_argument("--expensive-case-usd", type=float, default=1.0, help="dollar threshold above which cost-quality findings fire for saturated/no-lift/judge-only cases and unstructured ablation arms (issue #21)")
 
     p = sub.add_parser("materialize-ablations", help="Write real, ablated skill trees for declared materialized ablations")
     p.add_argument("manifest")
@@ -7349,6 +7981,12 @@ def main() -> int:
     p.add_argument("--out")
 
     p = sub.add_parser("suite-run", help="Run an explicit allowlisted suite preflight/tier and write RUN_SCOPE.json")
+    p.add_argument("--cost-history", help="directory of previous cost-summary.json ledgers; per-run medians drive the preflight spend projection (issue #21)")
+    p.add_argument("--max-estimated-tokens", type=int, help="refuse to start when the projected token spend exceeds this budget")
+    p.add_argument("--max-estimated-cost-usd", type=float, help="refuse to start when the projected dollar spend exceeds this budget (fails closed when no dollar estimate exists)")
+    p.add_argument("--allow-over-budget", action="store_true", help="run anyway when a budget gate trips")
+    p.add_argument("--assumed-tokens-per-run", type=float, default=30000.0, help="fallback per-run token estimate when no cost history is available")
+    p.add_argument("--assumed-cost-per-run-usd", type=float, help="fallback per-run dollar estimate when no cost history is available")
     p.add_argument("suite_file", help="newline-delimited allowlist of manifest paths relative to --workspace-root")
     p.add_argument("--workspace-root", default=".", help="root containing the allowlisted skill repos")
     p.add_argument("--pins", help="optional examples/skill-pins.json-style tree-hash pins to verify")
@@ -7411,6 +8049,8 @@ def main() -> int:
         return compare_results(args)
     if args.cmd == "migrate":
         return migrate_command(args)
+    if args.cmd == "cost-summary":
+        return cost_summary_command(args)
     if args.cmd == "trend":
         return trend(args)
     if args.cmd == "suggest-cases":

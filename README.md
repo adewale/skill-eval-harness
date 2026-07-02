@@ -539,9 +539,25 @@ skill-benchmark profile-skill ../repo/evals/shared-benchmark.json \
 
 `profile-skill` reports `SKILL.md` token estimates, reference-file counts/sizes, heading/module counts, and warnings for overly broad or oversized skills. These warnings are advisory; focused 2–3-module skills are often easier for agents to apply, but large skills can be justified when references are conditional.
 
+### Cost telemetry (tokens and dollars)
+
+Cost is a first-class eval signal (issue #21). Every runner path — Pi smoke, Pi trigger, `run-codex`, `run-claude`, `run-subagent`, the judge wrapper, and the Jetty importer — writes two normalized blocks into run metadata beside the raw provider fields (which are preserved unchanged for audit):
+
+- `usage_normalized`: alias-normalized token counts (`input`/`prompt_tokens`/`totalTokens`/cache/reasoning variants) with a `source` — `provider_reported` (relayed from the provider), `trace_normalized` (summed from normalized trace events), `estimated`, `missing`, or `not_applicable`.
+- `cost_normalized`: dollar cost with `currency`, per-part costs when reported, and a `source` — `provider_reported` vs `price_table_estimated` are never conflated, and **missing cost is marked `missing`, never written as zero**. Provider-reported blocks always beat trace-derived ones; offline/stub runs carry explicit `missing` markers.
+
+Consumers of the blocks:
+
+- `benchmark`/`aggregate` emit `cost_summary`: coverage (how many runs actually carried telemetry), operational totals (**every run counts here, including execution errors — a timed-out run still cost money — while quality rates keep excluding them**), per-variant token/cost stats (mean/median/p90), per-case spend, paired `with - without` cost deltas, ablation marginal cost and cost per confirmed regression, and judge spend as its own line (never folded into model-under-test cost).
+- `cost-summary` writes the standalone suite ledger (`--out cost-summary.json`, `--md cost-summary.md`): coverage, totals, by variant/case/runner, top expensive cases and ablation arms, and `cost_quality_findings` when a `--benchmark` report is joined.
+- `suite-run` projects spend **before any model call** from previous ledgers (`--cost-history <dir>`, per-run medians) or a static assumption (`--assumed-tokens-per-run`), and gates on `--max-estimated-tokens` / `--max-estimated-cost-usd` — failing closed when a dollar cap is set but no dollar estimate exists — unless `--allow-over-budget`.
+- `audit-manifest --runs` adds cost-quality findings above `--expensive-case-usd` (default $1): `expensive-saturated-case`, `expensive-no-lift-case`, `high-cost-judge-only-case`, `ablation-high-spend-no-structured-regression`, and `high-footprint-low-lift-skill`.
+
+Interpretation rule: `provider_reported` numbers are the bill; `trace_normalized` reconstructs usage from events (good for tokens, silent on dollars); `missing` means the run truly carried no telemetry — fix the runner path rather than treating it as free.
+
 ### Token overhead
 
-`token-overhead` combines static skill profile data with paired runtime traces. It reports the static `SKILL.md`/reference footprint, `with_skill - without_skill` token deltas, objective lift, and objective lift per 1k extra total tokens when paired `metrics.json` files exist.
+`token-overhead` combines static skill profile data with paired runtime traces. It reports the static `SKILL.md`/reference footprint, `with_skill - without_skill` token deltas, objective lift, objective lift per 1k extra total tokens — and, when cost telemetry exists, `with - without` dollar deltas, objective lift per dollar, and the total spend on saturated/no-lift pairs.
 
 ```bash
 skill-benchmark token-overhead ../repo/evals/shared-benchmark.json \

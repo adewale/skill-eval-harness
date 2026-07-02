@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population, canonical_skill_tree_hash, expected_trigger_polarity, detect_trigger, event_texts_for_tool_input
+from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population, canonical_skill_tree_hash, expected_trigger_polarity, detect_trigger, event_texts_for_tool_input, stream_usage_and_cost
 from ablation_model import EvidenceClass, Provenance
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -146,6 +146,9 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             returncode = 124
         elapsed_ms = int((time.time() - start) * 1000)
         triggered, evidence = detect_trigger(stdout, skill_name_from_manifest(manifest), copied)
+        # Trigger runs now persist token/cost telemetry like the answer paths
+        # (issue #21): parsed off the same Pi JSON stream the detector reads.
+        usage_normalized, cost_normalized = stream_usage_and_cost(stdout)
         is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
         # The materialized ablation's provenance goes through Provenance (one
         # schema); the canonical (parent) tree hash is recorded on BOTH arms under
@@ -172,6 +175,8 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             "returncode": returncode,
             "timed_out": timed_out,
             "evidence": evidence,
+            "usage_normalized": usage_normalized,
+            "cost_normalized": cost_normalized,
             "ablation": ablation_field,
             "skill_tree_hash": skill_tree_hash,
             "stderr": stderr[-1000:] if stderr else "",
