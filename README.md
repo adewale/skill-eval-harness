@@ -120,15 +120,20 @@ skill-benchmark --help
 | `README.md` | Manifest shape, run layout, and command contracts. |
 | `CHANGELOG.md` | Release history and unreleased repo-surface changes. |
 | `CONTRIBUTING.md` | Local setup, validation commands, and eval-safety rules. |
-| `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work. |
-| `docs/vocabulary.md` | Glossary of harness terms: variants, splits, ablations, assertions, trace artifacts, and report flags. |
+| `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work and the roadmap/cost build-out. |
+| `docs/architecture.md` | How the pipeline fits together: the stages, the runner boundary, the model/variant/run fan-out, and the invariants that keep grading honest. |
+| `docs/abstractions.md` | What each core object is: manifest, prepared task, run-output contract, assertion result, `ResultSet`. |
+| `docs/authoring-evals.md` | Opinionated workflow/quickstart for writing a new eval suite, including severity and graded assertions. |
+| `docs/eval-framework-roadmap-spec.md` | The implemented eval-framework roadmap: goals, abstractions, and tests per feature (CF.1–CF.4, buckets 1–4, migration). |
+| `docs/migrating-evals.md` | Upgrading a manifest between versions (v1 → v2): what `migrate` stamps and the judgment calls it leaves. |
+| `docs/vocabulary.md` | Glossary of harness terms: variants, splits, models, ablations, assertions, severity/oracle tiers, graded scoring, cost telemetry, trace artifacts, and report flags. |
 | `docs/evals-are-not-tests.md` | Why a skill eval is not a unit test, and what that changes about reading results. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
 | `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
 | `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
 | `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
-| `TODO.md` | Remaining Jetty work: streaming/concurrency, live API validation, materialized ablations, judge export, and per-variant overrides. |
+| `TODO.md` | Status tracker: the eval-framework roadmap (implemented, bar two `(TODO-native)` items) and the remaining Jetty adapter work — streaming/concurrency, live API validation, judge export, per-variant overrides, and the `swap:<id>` ablation follow-on. |
 | `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two materialized ablations, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per ablation; exercised by `tests/test_example_demo.py`. Start here. |
 | `examples/adewale-workspace/` | Adewale-specific runners for Pi smoke, trigger, ablation, and aggregate reports. |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
@@ -748,21 +753,22 @@ skill-eval-harness/
 ├── README.md
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
+├── LESSONS_LEARNED.md
+├── TODO.md
 ├── pyproject.toml
-├── skill_benchmark.py
-├── run_pi_trigger_eval.py
+├── skill_benchmark.py          # the CLI, grading, reporting, and runner adapters
+├── run_pi_trigger_eval.py      # autonomous-trigger runner
+├── ablation_model.py           # typed ablation/provenance value objects
+├── docs/                       # architecture, abstractions, vocabulary, specs, guides (see the map above)
 ├── .github/
 │   ├── PULL_REQUEST_TEMPLATE.md
 │   ├── ISSUE_TEMPLATE/
 │   └── workflows/ci.yml
 ├── examples/
-│   └── adewale-workspace/
-│       ├── all-manifests.txt
-│       ├── generate_shared_manifests.py
-│       ├── run_pi_smoke.py
-│       └── smoke_report.py
-└── tests/
-    └── test_skill_benchmark.py
+│   ├── demo-skill/             # offline end-to-end example (stub runner, materialized ablations)
+│   ├── skill-pins.json         # pinned SHAs + tree hashes for the ablation study
+│   └── adewale-workspace/      # Pi smoke/trigger/ablation runners and aggregate reports
+└── tests/                      # test_skill_benchmark.py + roadmap/cost/confidence-floor/doc-ref suites
 ```
 
 ## Development
@@ -772,7 +778,7 @@ python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```
 
-The test suite covers repeated runs, artifact outputs, answer-key omission, leakage lint, script assertions, judge-command parsing, Anthropic export shape, Jetty export/import, trace normalization, variant-scoped process assertions, Codex JSONL runs, Pi trigger traces, and Pi smoke workspace isolation.
+The test suite covers repeated runs, artifact outputs, answer-key omission, leakage lint, script assertions, judge-command parsing, Anthropic export shape, Jetty export/import, trace normalization, variant-scoped process assertions, Codex JSONL runs, Pi trigger traces, and Pi smoke workspace isolation — plus the roadmap features (`test_roadmap_features.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), and the executable doc-reference guard (`test_doc_refs.py`).
 
 ## Source checked
 

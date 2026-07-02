@@ -142,6 +142,8 @@ Examples from saturation work:
 - Treat no-regression ablations as evidence that either the component is redundant/unclear or current evals do not exercise it.
 - Next improvement: materialize ablated skill variants or generate explicit ablation patches instead of only instruction-simulating removal.
 
+**Update (2026-07-02):** the "next improvement" shipped. `materialize-ablations` writes real, altered skill trees (removal-only), the runners mount them, and the benchmark report's `ablation_regressions` block confirms a regression per cited case only against verified provenance (`docs/skill-ablation-spec.md`). Instruction-simulated ablations remain supported but `audit-manifest` now flags them as non-blind, raw-measurement-only.
+
 ## 2026-06-09 — Holdout and holdback still matter after tune saturation
 
 **Problem:** Tune saturation can create false confidence.
@@ -252,6 +254,8 @@ Examples from saturation work:
 - Use cost-quality findings: expensive saturated cases, expensive no-lift cases, judge-heavy cases that could be deterministic, and ablations with high spend but no confirmable expected regression.
 - Do not mix missing cost with zero cost; offline/stub runners should mark telemetry as `not_applicable`.
 
+**Update (2026-07-02):** implemented as issue #21. Every runner path writes normalized `usage_normalized`/`cost_normalized` blocks with explicit provenance (missing is marked, never zero); `benchmark`/`aggregate` carry a `cost_summary`; `cost-summary` writes the standalone ledger; `suite-run` gates on `--max-estimated-cost-usd`/`--max-estimated-tokens`; `token-overhead` reports dollar deltas and lift-per-dollar; and `audit-manifest --runs` emits the cost-quality findings above.
+
 Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`; excludes judge and trigger cost because those paths did not persist usage/cost):
 
 | Skill | Runs | Total tokens | Cost (USD) |
@@ -280,3 +284,39 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 - Prefer materialized ablations with structured expected regressions over broad instruction-simulated ablations.
 - Keep judge assertions for properties deterministic checks cannot express; replace judge-heavy checks with script/artifact oracles when possible.
 - Use historical cost summaries to select a cheap high-signal smoke subset and reserve expensive cases for nightly or release runs.
+
+## 2026-07-02 — Make the measurement believable before scaling what you measure
+
+**Problem:** The eval-framework roadmap wanted to scale what the harness reports — graded scores, multi-model lift, more assertion families. But the one number it already prints (lift = `with_skill` − `without_skill`) rested on three things that were *intended* but never *enforced*: that detectors do not fire falsely or stay silent falsely, that the `without_skill` baseline truly cannot read the skill, and that grading is deterministic and model-free. A graded or multi-model feature built on an unverified detector only scales an unverified result.
+
+**Lesson:** Test the harness before extending it. A reported difference is only as trustworthy as the detectors, the baseline isolation, and the determinism underneath it — and those are cheap to make executable.
+
+**Rule:**
+- Ship the "confidence floor" first: paired should-fire/should-pass fixtures per objective detector (`tests/fixtures/detectors/`), a cross-runner `without_skill` isolation invariant, re-grade idempotence, and a guard that the core grade path calls no model and no network (`tests/test_confidence_floor.py`).
+- A new objective assertion type does not land without its should-fire/should-pass fixture pair; a meta-test enforces this so a detector cannot be trusted on entry without one.
+- A new runner registers its workspace builder so the baseline-isolation invariant covers it automatically; it must not hand-roll its own isolation check.
+- Sequence the floor before the buckets: a believable small number beats an impressive unverified one.
+
+## 2026-07-02 — A new scoring tier or fan-out axis must be threaded through every consumer
+
+**Problem:** Two cross-cutting additions caused silent errors far from where they were defined. Adding a `soft` severity tier (meant to feed only the graded score) still moved `combined_pass_rate`, still failed JUnit test cases, and still fed the held-out-vs-tune visibility report — because those consumers counted *all* qualitative rows, not the gated subset. Adding a `model` fan-out axis collided judge verdicts across models, because `judge_task_id` identified a run by `(case, variant, run)` and never learned the new axis, so the last-loaded verdict silently applied to every model. A PR review caught all of these after the features "worked" in isolation.
+
+**Lesson:** A cross-cutting dimension (severity, model) touches every place that *aggregates* a run or *identifies* a run, not just the place that defines it. The blast radius is the set of report views and keys, not the feature's own function.
+
+**Rule:**
+- When you add a severity tier, audit every pass-rate/totals consumer (`grade_case_variant` totals, `build_benchmark_report`, JUnit/`report`, readiness signals, the visibility split) — soft must never move a pass rate anywhere.
+- When you add a fan-out axis, audit `run_dir`, run discovery, *and* every identity key that names a run (`judge_task_id`), keeping the segment optional so single-axis records are unchanged.
+- Distinguish populations that share a mechanism: a "soft objective" check (e.g. `similarity`) and a "soft judge" verdict both live in the soft bucket, but a judge-visibility report must filter by the actual shape (`qualitative_assertions`), never by a blended proxy (`soft_total`).
+- A parse-then-persist step must forward the whole payload: the judge command dropped `dimension_scores`/`criteria` from its stored row, so graded-dimension judging silently degraded to failed plain verdicts. Have the producer and the merge derive the verdict through one shared owner, not two parallel code paths.
+
+## 2026-07-02 — Prose-to-code references rot on every large change; make them executable
+
+**Problem:** A single large merge stranded roughly fifty `name:line` references in `TODO.md` and the specs — every function reference the docs used to anchor prose to code drifted by tens to hundreds of lines. Nothing detected it, so the docs read as precise while pointing at the wrong lines.
+
+**Lesson:** Any hand-maintained pointer from prose to code drifts silently the moment the code moves. Precision that is not checked becomes confident misinformation.
+
+**Rule:**
+- A unit test resolves every documented `name:line` / `` `name` (`:line`) `` reference to the actual definition line and fails on drift (`tests/test_doc_refs.py`); fixing a failure is mechanical (the message carries the correct line).
+- Every new field, command, assertion type, or flag is reflected in `README.md` and `CHANGELOG.md` in the same change that adds it — the changelog is the release contract, not an afterthought.
+- Keep new manifest surfaces additive with behavior-preserving defaults, and regression-test that a pre-change manifest grades to identical pass rates, so "we upgraded the harness" never silently means "your old evals now score differently."
+- After a batch lands, give the docs a release-tense and status pass (per the 2026-06-11 lesson) and annotate — do not silently rewrite — any earlier "next improvement" note that has since shipped.

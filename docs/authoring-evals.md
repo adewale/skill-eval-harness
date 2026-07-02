@@ -32,14 +32,23 @@ Pick the success goals the skill owns. The harness stores these per case in `suc
 
 | Goal | The question it answers | Typical graders |
 |---|---|---|
-| `outcome` | Did it produce the right result? | `contains*`, `regex`, `file_exists`, `json_field_equals`, `script` |
-| `process` | Did it work the right way? | `skill_invoked`, `command_ran`, `command_order`, `tool_count_le` |
-| `style` | Is it phrased and structured well? | `judge` / `rubric` |
+| `outcome` | Did it produce the right result? | `contains*`, `regex`, `file_exists`, `json_field_equals`, `golden_output`, `similarity`, `structured_output`, `script` |
+| `process` | Did it work the right way? | `skill_invoked`, `command_ran`, `command_order`, `tool_call`, `tool_count_le` |
+| `style` | Is it phrased and structured well? | `judge` / `rubric` / `factuality`, with anchored `graded_dimensions` |
 | `efficiency` | Did it stay within budget? | `total_tokens_le`, `elapsed_seconds_le`, `command_count_le` |
 
 Keep the definition small and must-pass. Encode the behaviors whose regression would
 embarrass you, not every preference. A subjective skill (writing, design) may carry only a
 `judge` rubric and no objective assertion, and that is fine.
+
+Two knobs shape *how* a check counts, and both default to today's behavior so you can ignore
+them until you need them. **Severity** (`critical` / `gate` / `soft`) decides what a failure
+does: a `gate` (the default for objective checks) lowers the pass rate; a `soft` result (the
+default for `judge`/`similarity`) feeds only a per-run **graded score** — the "how much
+better" channel — and never moves a pass rate; a `critical` failure vetoes the run outright
+(see Step 4). The graded score is where a saturated binary case can still show lift, via a
+`similarity` threshold, a graded `script` oracle (`{"score", "max_score"}` on stdout), or a
+`judge` with anchored `graded_dimensions` / a `dynamic_rubric`.
 
 ## Step 1 — Write prompts only
 
@@ -102,6 +111,11 @@ skill-benchmark validate evals/shared-benchmark.json
 also warns when an assertion value appears verbatim in the prompt. That warning is the
 leakage lint, and you want to act on it.
 
+`version: 1` above is fine to start with. `version: 2` is the same manifest with the severity
+and oracle-tier defaults made explicit; `skill-benchmark migrate` upgrades a version-1 manifest
+and prints the diff plus a checklist of judgment calls (see [`migrating-evals.md`](migrating-evals.md)).
+A version-1 manifest keeps grading identically, so there is no rush.
+
 ## Step 3 — Run the pair (no Jetty required)
 
 `prepare` emits answer-key-safe task rows; a runner turns each row into the run-output contract
@@ -130,15 +144,18 @@ flag is not a boundary when the runner can `grep` the skill out of the source tr
 
 Open the outputs and write the smallest assertions that capture the behavior, in this order:
 
-1. **Deterministic objective** (`contains_any`, `regex`, `file_exists`, `json_field_equals`).
-   Test behavior, not one phrasing, so that `Decision: BLOCK` and `**Decision: BLOCK.**` both
-   pass.
+1. **Deterministic objective** (`contains_any`, `regex`, `file_exists`, `json_field_equals`;
+   plus `golden_output` for a reference-equal artifact, `similarity` for a thresholded ratio,
+   `structured_output` for a JSON-schema shape). Test behavior, not one phrasing, so that
+   `Decision: BLOCK` and `**Decision: BLOCK.**` both pass.
 2. **Process / efficiency**, but only when the runner emits trace evidence (`events.json`,
    `metrics.json`). These fail closed without evidence by design. Scope them per variant:
    `skill_invoked=true` for `with_skill`, `false` for `without_skill`.
-3. **`script` oracle**, when a keyword check is too weak. Opt in with `--allow-scripts`.
+3. **`script` oracle**, when a keyword check is too weak. Opt in with `--allow-scripts`; print a
+   `{"score", "max_score"}` line to make it a graded oracle.
 4. **`judge` / `rubric`** last, for qualitative properties. The harness defers these and picks
-   no model; you supply `--judge-cmd`.
+   no model; you supply `--judge-cmd` (or `--judge-model`). Reach for anchored `graded_dimensions`
+   when you need *how much better*, not just pass/fail.
 
 If `validate` warns that a value is in the prompt, replace the keyword with a scoped regex, a
 fixture-backed check, a script oracle, or a judge.
@@ -157,12 +174,13 @@ actually came out.
 **Name the catastrophic failures separately.** Some failures cannot be averaged away — writing
 outside the results directory, reporting success after a check failed, leaking a secret. One such
 failure across twenty runs is a catastrophe, not a 95% pass rate (the "valley-dodging" point).
-Today, enforce these as their own hard assertions — an `excludes_any` / `not_regex` for the
-forbidden state, or a `script` oracle that exits non-zero on it — and keep them as distinct,
-clearly-named cases so a high score elsewhere can never bury them. `adewale/guardrails-skill`
-encodes exactly these fences ("never write outside the results directory," "do not report success
-if a check failed"). One caution: a hard prohibition that is too broad makes a skill obstinate, so
-pair each with a negative case proving the skill still does the reasonable thing.
+Mark these `severity: "critical"` — an `excludes_any` / `not_regex` for the forbidden state, or a
+`script` oracle that exits non-zero on it, with `"severity": "critical"` set. A critical failure
+vetoes the run, collapses its rates to 0.0, and is surfaced on its own (a `critical-failure`
+flag), so no graded mean elsewhere can bury it. `adewale/guardrails-skill` encodes exactly these
+fences ("never write outside the results directory," "do not report success if a check failed").
+One caution: a hard prohibition that is too broad makes a skill obstinate, so pair each with a
+negative case proving the skill still does the reasonable thing.
 
 ## Step 5 — Benchmark and read the report
 

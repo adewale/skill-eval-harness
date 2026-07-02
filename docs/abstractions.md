@@ -63,20 +63,24 @@ harness detects memorization. `prepare` refuses to emit a hidden case with no
 An assertion is one check. The harness sorts them into four families
 (`skill_benchmark.py:29-54`):
 
-- **Text** (`contains`, `regex`, `file_exists`, `json_field_equals`, `script`): runs against
-  `output.md` and sibling files.
-- **Process** (`skill_invoked`, `command_ran`, `command_order`, `tool_count_le`): runs
-  against normalized trace events, and fails closed when the evidence is absent.
+- **Text** (`contains`, `regex`, `file_exists`, `json_field_equals`, `golden_output`,
+  `similarity`, `structured_output`, `script`): runs against `output.md` and sibling files.
+- **Process** (`skill_invoked`, `command_ran`, `command_order`, `tool_call`, `tool_count_le`):
+  runs against normalized trace events, and fails closed when the evidence is absent.
 - **Efficiency** (`total_tokens_le`, `elapsed_seconds_le`, `command_count_le`): runs against
   metrics.
-- **Qualitative** (`judge`, `rubric`): deferred to a model you supply.
+- **Qualitative** (`judge`, `rubric`, and the `factuality` preset): deferred to a model you
+  supply.
 
-`assertion_result` returns `{name, type, passed, evidence}`. The shape is binary today: there
-is a `passed` boolean and no numeric score except the one a judge may attach. The roadmap's
-severity tier changes exactly this shape.
+`assertion_result` returns `{name, type, passed, evidence, score}`. Every result carries a
+`score` (binary detectors mirror `passed` as `1.0`/`0.0`; `similarity`, `golden_output`, and a
+graded `script` oracle set a real value), and `grade_case_variant` stamps a `severity`
+(`critical`/`gate`/`soft`) and an `oracle` tier (`strong`/`demo`/`live`) on each.
 
-The planned graded shape (roadmap 2.2, ported from `adewale/anti-slop-writing`) adds an optional
-`score` and `severity` (`gate` or `soft`), plus two `judge` assertion forms:
+Severity decides how a result counts: a `critical` failure vetoes the run and is excluded from
+every mean; a `gate` carries the pass rate; a `soft` result feeds only the graded score. The
+graded shape (roadmap 2.2, ported from `adewale/anti-slop-writing`) adds two `judge` assertion
+forms:
 
 ```jsonc
 // anchored dimension: the judge scores against named, observable anchors
@@ -91,13 +95,18 @@ The planned graded shape (roadmap 2.2, ported from `adewale/anti-slop-writing`) 
 ```
 
 A graded assertion answers "how much better," where the binary `passed` answers only "right or
-wrong." That distinction is the reason a saturated binary case can still show graded lift.
+wrong." That distinction is the reason a saturated binary case can still show graded lift. An
+optional `reference_score`/`reference_graded_score` on a case sets a no-regression floor, and
+`build_paired_summary` reports a paired `graded` channel and a sign-flip significance test
+beside the raw lift.
 
 ## Prepared task row
 
-`prepared_task_rows` fans `cases × variants × runs_per_variant` into runner-neutral rows.
-Each row carries the `prompt`, the absolute `input_files`, the `skill_paths`, the
-`instruction` for its arm, and the `run_dir` it must write to. Generation rows omit
+`prepared_task_rows` fans `cases × variants × models × runs_per_variant` into runner-neutral
+rows (the `model` axis, from `prepare --models`, adds a run-dir segment only when two or more
+models run, so single-model layouts are unchanged). Each row carries the `prompt`, the absolute
+`input_files`, the `skill_paths`, the `instruction` for its arm, and the `run_dir` it must
+write to. Generation rows omit
 `expected_behavior` and rubrics unless you pass `--include-answer-key`, so a runner cannot
 accidentally feed the answer key to the model under test.
 
@@ -119,10 +128,13 @@ editor. This boundary is the main extension seam in the codebase.
 
 ## Runner / adapter
 
-A runner consumes task rows and produces the contract. The repo ships four paths plus a
+A runner consumes task rows and produces the contract. The repo ships six paths plus a
 generic one: Pi smoke (`examples/adewale-workspace/run_pi_smoke.py`), Pi trigger
-(`run_pi_trigger_eval.py`), Codex (`run_codex:3442`), Jetty (`JettyClient:2102` and the
-export/run/import commands), and any runner that writes the contract directly. The harness
+(`run_pi_trigger_eval.py`), Codex (`run_codex:3442`), Claude (`run_claude:3587`, capturing real
+per-run cost), the in-process subagent runner (`run_subagent:4338`, which hosts record/replay
+tool I/O via `ToolReplayStore`), Jetty (`JettyClient:2102` and the export/run/import commands),
+and any runner that writes the contract directly. Each runner registers a workspace builder so
+one cross-runner invariant proves its `without_skill` arm is skill-free (CF.2). The harness
 calls no model itself; it reads what the runner left behind.
 
 ## Trace normalization
@@ -137,11 +149,15 @@ gets in.
 ## Judge plumbing
 
 Qualitative assertions defer. `collect_judge_tasks` gathers every `judge`/`rubric` assertion
-across runs and keys each by `judge_task_id` (`case::variant::run-n::assertion`).
-`judge_prompt` renders the case, expected behavior, rubric, and candidate output into a
-prompt; `run_one_judge_task` pipes it to the `--judge-cmd` you supply; `merge_repeated_judge_rows`
-majority-votes pass/fail and medians scores across repeats. The harness picks no model. A
-judge result is `{judge_task_id, passed, score, evidence}`, merged back at grade time.
+across runs and keys each by `judge_task_id` (`case::variant::run-n::assertion`, with a `model`
+segment on a multi-model run). `judge_prompt` renders the case, expected behavior, rubric, and
+candidate output into a prompt — including the anchored dimensions or dynamic-rubric
+instruction for a graded assertion; `run_one_judge_task` pipes it to the `--judge-cmd` you
+supply (or `--judge-model` for the native Claude judge, which captures per-verdict cost);
+`merge_repeated_judge_rows` majority-votes pass/fail and medians scores across repeats. The
+harness picks no model. A judge result is `{judge_task_id, passed, score, evidence}` — plus
+`dimension_scores`/`criteria` for a graded verdict and normalized `usage_normalized`/
+`cost_normalized` for judge spend — merged back at grade time.
 
 ## Grade result row
 
@@ -163,8 +179,11 @@ no surveyed eval framework copies.
 
 ## What changes when you extend the tool
 
-Two abstractions absorb most of the roadmap. Adding a numeric score or a severity tier means
-changing the **assertion result shape** in `assertion_result` and the totals in
-`grade_case_variant`. Adding a model sweep means adding a `model` axis to the fan-out in
-`prepared_task_rows` and a grouping in `build_benchmark_report`. Touch those two carefully and
-most other features fall into place around them.
+Two abstractions absorbed most of the roadmap, and they remain the seams to reach for next.
+The numeric `score` and the `severity` tier live in the **assertion result shape**
+(`assertion_result`) and the totals in `grade_case_variant`; the `model` sweep is a third axis
+in the fan-out (`prepared_task_rows`) with a grouping in `build_benchmark_report`
+(`by_model`/`model_analysis`). Both are cross-cutting: a change to either touches every place
+that *aggregates* a run (each pass-rate/report view) or *identifies* one (`run_dir`, run
+discovery, `judge_task_id`), so extend by auditing those consumers, not just the definition
+site. Touch these carefully and most other features fall into place around them.

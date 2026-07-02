@@ -1,6 +1,8 @@
 # Trace-Aware Skill Eval Spec
 
-Status: v0.4.1 implementation note. The shipped slice covers three things: trace artifacts, trace-backed assertions, and runner adapters. Concretely, the harness can import traces, run Codex JSONL tasks, normalize observed Pi/Codex shapes plus documented/mocked Jetty trajectory shapes, write Pi smoke and Pi trigger trace artifacts, scope assertions by variant, and report process/efficiency evidence alongside outcome scores. The unchecked boxes below are follow-on work, not shipped behavior. This plan uses the subset of ideas from OpenAI's `eval-skills` article, SkillsBench, and Anthropic's `skill-creator` that fit the existing harness model.
+Status: v0.4.1 implementation note, with later follow-on items now shipped (see below). The shipped slice covers three things: trace artifacts, trace-backed assertions, and runner adapters. Concretely, the harness can import traces, run Codex JSONL tasks, normalize observed Pi/Codex shapes plus documented/mocked Jetty trajectory shapes, write Pi smoke and Pi trigger trace artifacts, scope assertions by variant, and report process/efficiency evidence alongside outcome scores. This plan uses the subset of ideas from OpenAI's `eval-skills` article, SkillsBench, and Anthropic's `skill-creator` that fit the existing harness model.
+
+> **Superseded in part by [`eval-framework-roadmap-spec.md`](eval-framework-roadmap-spec.md) (implemented).** Several items once listed here as follow-on work have since shipped: OpenTelemetry GenAI normalization (`events.json`/`metrics.json` are now `schema_version: 2` with `gen_ai.*` attributes; version-1 files still grade), the in-process subagent runner with record/replay tool I/O, and the viewer's serve mode with `feedback.json` capture. The Phase checkboxes below are reconciled; the still-open items (live Jetty token validation, expanded leakage lint, OpenCode/Gemini adapters) remain genuinely open.
 
 ## Design principle
 
@@ -46,7 +48,7 @@ The following ideas remain deferred or deliberately out of scope:
 
 Trace support must not break these current contracts:
 
-- `evals/shared-benchmark.json` remains version `1` until a breaking manifest change is required.
+- `evals/shared-benchmark.json` supports `version` `1` and `2`; both grade identically (version 2 only makes the severity/oracle-tier defaults explicit, and `migrate` upgrades a v1 manifest). A v1 manifest keeps validating and benchmarking unchanged.
 - Existing objective assertions (`contains`, `regex`, `file_exists`, `json_field_equals`, `script`) keep their behavior.
 - `script` assertions remain gated by `--allow-scripts`.
 - `prepare` still omits `expected_behavior`, judge rubrics, and answer keys unless an explicit debug/judge flag requests them.
@@ -91,7 +93,7 @@ Artifact roles:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "source": "codex",
   "events": [
     {
@@ -105,11 +107,14 @@ Artifact roles:
       "exit_code": 0,
       "duration_ms": 1200,
       "tokens": {"input": 100, "output": 20},
+      "otel": {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "bash", "process.exit_code": 0},
       "raw_ref": {"file": "trace.jsonl", "line": 12}
     }
   ]
 }
 ```
+
+`events.json` and `metrics.json` are now `schema_version: 2`: each event carries an `otel` block of OpenTelemetry GenAI semantic-convention attributes (`gen_ai.operation.name`, `gen_ai.tool.name`, `gen_ai.usage.*`, …) alongside the harness's own fields, and `metrics.json` gains a `gen_ai.usage` block plus the normalized `usage_normalized`/`cost_normalized` cost telemetry. Grading still reads the harness fields, and a version-1 `events.json` still grades unchanged.
 
 Required normalized fields:
 
@@ -386,9 +391,9 @@ This adopts the SkillsBench lesson that focused 2–3-module skills often outper
 
 ### Phase 4 — judge/viewer improvements
 
-- Add optional JSON Schema validation for judge results.
-- Add viewer panels for trace events, metrics, judge evidence, and human feedback export.
-- Add blind pairwise comparison only after structured judge IDs and output provenance are stable.
+- [x] Add viewer panels and richer artifacts, plus human feedback export (`render-viewer --serve` with `feedback.json` capture, image/pdf/xlsx artifact embedding, and a `--previous-workspace` iteration diff).
+- [x] Add blind pairwise comparison (`compare-tasks` / `compare-results`, keyed by stable IDs with model-facing blinding).
+- [ ] Add optional JSON Schema validation for judge-result files. (The related `structured_output` assertion validates a run's *output* JSON against a schema subset; judge-result-file schema validation is still open.)
 
 ### Phase 5 — broader runner import
 

@@ -60,8 +60,9 @@ flowchart TB
 
 Variants stay orthogonal to cases. A case knows nothing about which arm will run it, and an
 arm applies to every case, so adding a `with_skill`/`without_skill` pair never edits case
-text. The roadmap's model sweep adds a third axis (model) the same way: a new dimension in
-the fan-out, not a new kind of variant.
+text. The model sweep (`prepare --models a,b,c`) adds a third axis the same way: a new
+dimension in the fan-out (`case × variant × model × run`), not a new kind of variant. The
+report then groups `by_model` and computes lift per (case, model) — see `model_analysis`.
 
 ## The runner boundary
 
@@ -72,12 +73,14 @@ That agreement is the contract, and it is why a new runner needs no change to gr
 flowchart TB
     P[prepare\ntask rows] --> PI[Pi smoke / trigger]
     P --> CX[Codex\nrun-codex]
+    P --> CL[Claude\nrun-claude]
     P --> JT[Jetty\nexport / run / import]
-    P --> SUB[Subagent runner\nroadmap]
+    P --> SUB[Subagent\nrun-subagent\n+ tool replay]
     P --> HUM[Any runner\nor a person]
 
     PI --> CONTRACT
     CX --> CONTRACT
+    CL --> CONTRACT
     JT --> CONTRACT
     SUB --> CONTRACT
     HUM --> CONTRACT
@@ -118,20 +121,36 @@ sequenceDiagram
     B->>B: merge by judge_task_id
 ```
 
-The key is the `judge_task_id` (`case::variant::run-n::assertion`). It lets results arrive
-out of band, from any model or human, and still land on the right assertion. Deterministic
+The key is the `judge_task_id` (`case::variant::run-n::assertion`, gaining a `model` segment on
+a multi-model run so verdicts cannot collide across models). It lets results arrive out of
+band, from any model or human, and still land on the right assertion. Deterministic
 checks run first; the judge handles only what a keyword or regex cannot.
 
 ## Where grading stays honest
 
-Three properties hold across the whole pipeline, and the roadmap is written to preserve them:
+Three properties hold across the whole pipeline, and every feature — the roadmap included — is
+built to preserve them:
 
 - **Grading is local and deterministic.** `grade_case_variant` reads files and applies checks.
-  No network, no model. A re-grade after editing an assertion costs nothing.
+  No network, no model. A re-grade after editing an assertion costs nothing. A test guard
+  (`test_confidence_floor.py`) patches `subprocess`/`urllib` to raise and proves the grade path
+  completes without either.
 - **The harness picks no model.** Judge and runner models are yours to supply. The tool scores
   outputs; it does not decide who produces them.
 - **Generation is answer-key-safe.** `prepare` omits expected behavior and rubrics unless you
   ask for them, so the model under test cannot read its own answer key.
+
+Each assertion carries a **severity** (`critical`/`gate`/`soft`), so pass/fail is not flat: a
+`critical` failure vetoes the run and is excluded from every mean, a `gate` carries the pass
+rate, and a `soft` result feeds only the per-run graded score — never a pass rate. That split
+is threaded through every report view, which is what lets graded scores measure *how much
+better* without a soft miss quietly moving the headline number.
+
+Runs also carry **cost telemetry** on the same file contract: each `metadata.json`/`metrics.json`
+holds normalized `usage_normalized`/`cost_normalized` blocks (missing is marked, never zero),
+and the benchmark report aggregates them into a `cost_summary` ledger — operational spend kept
+beside the quality signal, never mixed into it. `suite-run` projects that spend before any
+model call and can gate on a budget.
 
 A feature that needs a model (embedding similarity, generating harder cases) lives behind an
 opt-in flag or an external command, the way `script` assertions already do. That placement is

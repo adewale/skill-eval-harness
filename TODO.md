@@ -72,8 +72,8 @@ threshold, evidence}` (`load_judge_results:3946`, merged in `grade_case_variant:
         manifest assertion (default `>= 4`); `passed` = `score >= threshold`. Keep per-dimension
         scores in `evidence`.
   - [ ] Programmatic: `PASS` -> `passed: true, score: 1.0`; `FAIL` -> `passed: false, score: 0.0`;
-        `PARTIAL` -> `score: 0.5`, with `passed` decided by `threshold` (soft by default once the
-        2.2 severity tier lands).
+        `PARTIAL` -> `score: 0.5`, with `passed` decided by `threshold` (soft by default under the
+        2.2 severity tier, which has landed).
   - [ ] `evidence` = the report's rationale/notes; preserve the raw Jetty score block alongside it.
 - [ ] Support `local_only`, `jetty_only`, and `merge` grader modes for combining locally-run and
       Jetty-run judge results before benchmarking.
