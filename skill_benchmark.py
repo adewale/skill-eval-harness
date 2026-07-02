@@ -5370,17 +5370,26 @@ def confirmed_regression_count(ablation_regressions: list[dict[str, Any]]) -> in
 
 
 def qualitative_by_visibility(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """2.7b's report split is about JUDGE-carried signal only: a run belongs
+    here iff it holds merged judge/rubric verdicts (qualitative_assertions),
+    and the graded mean is computed from those verdicts' soft scores — never
+    from the run-level graded_score, whose soft bucket also blends soft
+    OBJECTIVE checks (e.g. similarity). Otherwise a manifest with no judges at
+    all could report deterministic scoring as held-out rubric signal."""
     out: dict[str, Any] = {}
     scorable_rows = ResultSet(results).scorable().all
     for label, splits in [("held_out", {"holdout", "holdback"}), ("tune_visible", None)]:
-        # A judged run counts whichever channel its judges fed: gate judges fill
-        # qualitative_total, soft (default) judges fill soft_total/graded_score.
-        rows = [r for r in scorable_rows if (r.get("qualitative_total") or r.get("soft_total"))
+        rows = [r for r in scorable_rows if r.get("qualitative_assertions")
                 and ((r.get("split") in splits) if splits else (r.get("split") not in {"holdout", "holdback"}))]
         if not rows:
             continue
         rates = [r["qualitative_pass_rate"] for r in rows if r.get("qualitative_pass_rate") is not None]
-        graded = [r["graded_score"] for r in rows if isinstance(r.get("graded_score"), (int, float))]
+        graded = []
+        for r in rows:
+            judge_scores = [a["score"] for a in r.get("qualitative_assertions", [])
+                            if a.get("severity") == "soft" and isinstance(a.get("score"), (int, float))]
+            if judge_scores:
+                graded.append(statistics.mean(judge_scores))
         out[label] = {
             "runs": len(rows),
             "mean_qualitative_pass_rate": statistics.mean(rates) if rates else None,

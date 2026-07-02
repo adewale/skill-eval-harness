@@ -878,14 +878,37 @@ class HeldOutRubricTests(unittest.TestCase):
     def test_report_separates_held_out_from_tune_visible(self):
         results = [
             {"case_id": "t", "variant": "with_skill", "split": "tune", "missing_output": False, "execution_valid": True,
-             "qualitative_total": 1, "qualitative_pass_rate": 1.0, "graded_score": 0.9, "metadata": {}},
+             "qualitative_total": 1, "qualitative_pass_rate": 1.0, "metadata": {},
+             "qualitative_assertions": [{"name": "q", "passed": True, "severity": "soft", "score": 0.9}]},
             {"case_id": "h", "variant": "with_skill", "split": "holdout", "missing_output": False, "execution_valid": True,
-             "qualitative_total": 1, "qualitative_pass_rate": 0.0, "graded_score": 0.4, "metadata": {}},
+             "qualitative_total": 1, "qualitative_pass_rate": 0.0, "metadata": {},
+             "qualitative_assertions": [{"name": "q", "passed": False, "severity": "soft", "score": 0.4}]},
         ]
         visibility = sb.qualitative_by_visibility(results)
         self.assertEqual(visibility["tune_visible"]["mean_qualitative_pass_rate"], 1.0)
         self.assertEqual(visibility["held_out"]["mean_qualitative_pass_rate"], 0.0)
         self.assertEqual(visibility["held_out"]["mean_graded_score"], 0.4)
+
+    def test_soft_objective_checks_never_enter_the_visibility_view(self):
+        # P3 regression: soft_total also counts soft OBJECTIVE checks (e.g.
+        # similarity). A run with no judge verdicts at all must not appear
+        # here, and a mixed run's graded mean must use judge scores only.
+        similarity_only = {
+            "case_id": "s", "variant": "with_skill", "split": "holdout", "missing_output": False,
+            "execution_valid": True, "qualitative_total": 0, "soft_total": 1, "graded_score": 0.97,
+            "metadata": {}, "qualitative_assertions": [],
+            "assertions": [{"name": "sim", "type": "similarity", "passed": True, "severity": "soft", "score": 0.97}],
+        }
+        self.assertEqual(sb.qualitative_by_visibility([similarity_only]), {})
+        mixed = {
+            "case_id": "m", "variant": "with_skill", "split": "holdout", "missing_output": False,
+            "execution_valid": True, "qualitative_total": 0, "soft_total": 2, "graded_score": 0.7,  # blended 0.97 + 0.43
+            "metadata": {},
+            "assertions": [{"name": "sim", "type": "similarity", "passed": True, "severity": "soft", "score": 0.97}],
+            "qualitative_assertions": [{"name": "judge", "passed": False, "severity": "soft", "score": 0.43}],
+        }
+        visibility = sb.qualitative_by_visibility([mixed])
+        self.assertEqual(visibility["held_out"]["mean_graded_score"], 0.43)   # judge score, not the blend
 
 
 class DatasetAbstractionTests(unittest.TestCase):
