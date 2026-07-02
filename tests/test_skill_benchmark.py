@@ -1643,6 +1643,47 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertFalse(reg["significance"]["significant_at_0_05"])   # just not significant yet
         self.assertIn("not significant", reg["note"])
 
+    def test_multi_case_single_shot_does_not_confirm(self):
+        # Soundness (audit fix): significance is per CASE, not pooled across cases.
+        # Two cases, ONE run per arm each, both flip + drop. Per case each ties
+        # (p=1.0) so the verdict is INDETERMINATE. Pooling across cases would have
+        # given n=2 vs 2 -> p<=0.05 and wrongly CONFIRMED a stack of single shots,
+        # defeating the "single-shot can never confirm" guarantee.
+        manifest = {"skill_name": "s", "skill_paths": ["skills/good-pr/SKILL.md"], "ablations": [{
+            "id": "no-rp", "removed_component": "rp", "mechanism": "section", "class": "instructions",
+            "target": {"heading": "## X"},
+            "expected_regressions": [{"summary": "x", "cases": ["c1", "c2"], "assertions": ["detect-weak"]}],
+        }]}
+        results = []
+        for cid in ("c1", "c2"):
+            results.append({"case_id": cid, "variant": "with_skill", "objective_pass_rate": 1.0, "combined_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()})
+            results.append({"case_id": cid, "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "combined_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(manifest)})
+        reg = sb.build_ablation_regression_report(manifest, results)[0]["regressions"][0]
+        self.assertEqual(sorted(reg["confirmed_cases"]), ["c1", "c2"])   # both drops observed
+        self.assertIsNone(reg["expected_regression_confirmed"])          # but none significant per case
+        self.assertEqual(reg["evidence_class"], "indeterminate")
+        self.assertFalse(reg["significance"]["significant_at_0_05"])
+
+    def test_single_confirmed_case_replicated_confirms_among_many(self):
+        # The other side: significant iff at least one confirmed case clears the bar.
+        # c1 replicated 4x per arm (perfect drop -> p=0.0286); c2 is noise (no drop).
+        manifest = {"skill_name": "s", "skill_paths": ["skills/good-pr/SKILL.md"], "ablations": [{
+            "id": "no-rp", "removed_component": "rp", "mechanism": "section", "class": "instructions",
+            "target": {"heading": "## X"},
+            "expected_regressions": [{"summary": "x", "cases": ["c1", "c2"], "assertions": ["detect-weak"]}],
+        }]}
+        results = []
+        for _ in range(4):
+            results.append({"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "combined_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()})
+            results.append({"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "combined_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(manifest)})
+            results.append({"case_id": "c2", "variant": "with_skill", "objective_pass_rate": 1.0, "combined_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()})
+            results.append({"case_id": "c2", "variant": "ablation:no-rp", "objective_pass_rate": 1.0, "combined_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.prov(manifest)})
+        reg = sb.build_ablation_regression_report(manifest, results)[0]["regressions"][0]
+        self.assertEqual(reg["confirmed_cases"], ["c1"])                 # only c1 dropped
+        self.assertTrue(reg["expected_regression_confirmed"])
+        self.assertTrue(reg["significance"]["significant_at_0_05"])
+        self.assertTrue(reg["significance"]["by_case"]["c1"]["significant_at_0_05"])
+
     def test_score_drop_without_named_flip_is_not_confirmed(self):
         # The named assertion still passes; an unrelated assertion fails and drags
         # the aggregate down. A score drop is necessary, not sufficient.

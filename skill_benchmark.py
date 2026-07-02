@@ -2888,29 +2888,43 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
                             or (tool_folded in {"bash", "shell", "command"} and e.get("type") == "command")]
             else:
                 selected = [command_text(e) or str(e.get("name", "")) for e in completed_calls]
-            # 6: BFCL-style call taxonomy over the selected calls (name/pattern
-            # level; typed-arg matching would need runner-provided structured args).
-            # These are order-independent set relations, distinct from `order`.
+            # 6: BFCL-style call taxonomy over completed-call TOOL NAMES (exact,
+            # case-insensitive) — NOT a substring/regex over the rendered command, so
+            # `required_calls: ["Read"]` means the Read tool ran, and a shell `cat
+            # readme` (name "" / "bash") does not spuriously satisfy it. For regex or
+            # command-text matching use `pattern`/`order`/`command_ran` instead. These
+            # are order-independent set relations, distinct from `order`.
+            call_names = [str(e.get("name", "")).casefold() for e in completed_calls if e.get("name")]
             if assertion.get("expected_no_call"):
-                # Irrelevance detection: the tool (optionally, the pattern) must NOT
-                # have been called. A clean "should not fire" over tool events.
+                # Irrelevance detection: the named tool (or, if `pattern` is given, any
+                # tool NAME matching that regex) must NOT have been called.
                 pat = assertion.get("pattern")
-                offending = [c for c in selected if regex_hit(str(pat), c, ci)] if pat else selected
+                if pat:
+                    offending = sorted({n for n in call_names if regex_hit(str(pat), n, ci)})
+                elif tool:
+                    offending = sorted({n for n in call_names if n == str(tool).casefold()})
+                else:
+                    offending = sorted(set(call_names))   # no tool call at all
                 return (not offending), ("no matching tool call (as required)" if not offending else f"unexpected tool call(s): {offending[:5]}")
             required = assertion.get("required_calls")
             if isinstance(required, list) and required:
-                # Subset: every required pattern must match >=1 call; extras allowed.
-                missing = [str(p) for p in required if not any(regex_hit(str(p), c, ci) for c in selected)]
+                # Subset: every required tool name must appear >= once; extras allowed.
+                present = set(call_names)
+                missing = sorted({str(p) for p in required if str(p).casefold() not in present})
                 return (not missing), (f"all {len(required)} required tool call(s) present" if not missing else f"missing required tool call(s): {missing}")
             call_set = assertion.get("call_set")
             if isinstance(call_set, list) and call_set:
-                # Multiset/exact: every pattern matches, AND every call is claimed by
-                # some pattern (no unexpected calls) — a write-shaped exact match.
-                missing = [str(p) for p in call_set if not any(regex_hit(str(p), c, ci) for c in selected)]
-                unexpected = [c for c in selected if not any(regex_hit(str(p), c, ci) for p in call_set)]
-                if missing or unexpected:
+                # Exact multiset of tool names: same names AND same multiplicities, no
+                # unexpected named calls. (Nameless events like shell commands are not
+                # counted here — grade those with command_ran/command_order.)
+                from collections import Counter
+                want = Counter(str(p).casefold() for p in call_set)
+                got = Counter(call_names)
+                if want != got:
+                    missing = sorted((want - got).elements())
+                    unexpected = sorted((got - want).elements())
                     return False, f"call_set mismatch — missing={missing}; unexpected={unexpected[:5]}"
-                return True, f"call_set matched exactly ({len(selected)} call(s))"
+                return True, f"call_set matched exactly ({sum(got.values())} named call(s))"
             order = assertion.get("order")
             if isinstance(order, list) and order:
                 cursor = 0
@@ -4506,7 +4520,12 @@ def judge_alignment_report(human: dict[str, dict[str, Any]], judge: dict[str, di
     agreement = (tp + tn) / n if n else None
     precision = tp / (tp + fp) if (tp + fp) else None
     recall = tp / (tp + fn) if (tp + fn) else None
-    f1 = (2 * precision * recall / (precision + recall)) if (precision and recall) else None
+    # F1 from counts, not from precision*recall: precision/recall of 0.0 are falsy,
+    # so the product form returned None for a label-inverting judge (tp=0, the very
+    # worst case this command exists to flag). 2*tp/(2*tp+fp+fn) is 0.0 when any
+    # positive exists and None only when there are no positives at all.
+    f1_den = 2 * tp + fp + fn
+    f1 = (2 * tp / f1_den) if f1_den else None
     kappa = cohen_kappa(h, j)
     warnings = []
     if n == 0:
@@ -5544,15 +5563,28 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             # graded run for at least one cited case. Otherwise the comparison
             # rests on missing output and must not be reported as confirmed/refuted.
             measured_pairs = [cid for cid in cases if (cid, "with_skill") in measured_cv and (cid, variant) in measured_cv]
-            # Feature 1: a confirmation must survive a significance test across the
-            # REPLICATED runs, not just show a mean drop on one shot. Pool the per-run
-            # combined scores of the confirmed cases (with_skill vs the ablation arm)
-            # and run the unpaired label-shuffle test. With one run per arm the test
-            # ties (p=1.0), so a single-shot ablation can never confirm — the exact
-            # lesson of the n=5 walkthrough, now enforced rather than eyeballed.
-            with_runs = [v for cid in confirmed_cases for v in combined_rate_runs.get((cid, "with_skill"), [])]
-            abl_runs = [v for cid in confirmed_cases for v in combined_rate_runs.get((cid, variant), [])]
-            significance = two_sample_permutation_significance(with_runs, abl_runs) if confirmed_cases else None
+            # Feature 1: a confirmation must survive a significance test on the
+            # REPLICATED runs, not just a mean drop on one shot. The test runs PER
+            # CASE — runs of different cases have different baselines and are NOT
+            # exchangeable, so pooling them across cases both (a) lets a breadth of
+            # single-shot cases fake significance and (b) flattens a real regression
+            # on heterogeneous baselines. Each confirmed case's with_skill vs
+            # ablation runs are tested on their own; the regression is significant
+            # iff at least one confirmed case clears the bar. The exact-permutation
+            # floor means a case needs >= 4 runs per arm to ever reach p <= 0.05
+            # (C(8,4)=70 -> min p=0.0286), so a single-shot case can never confirm.
+            per_case_sig = {
+                cid: two_sample_permutation_significance(
+                    combined_rate_runs.get((cid, "with_skill"), []),
+                    combined_rate_runs.get((cid, variant), []))
+                for cid in confirmed_cases
+            }
+            significance = {
+                "method": "per-case-two-sample-permutation",
+                "significant_at_0_05": any(s.get("significant_at_0_05") for s in per_case_sig.values()),
+                "min_p_value": min((s["p_value"] for s in per_case_sig.values() if s.get("p_value") is not None), default=None),
+                "by_case": per_case_sig,
+            } if confirmed_cases else None
             reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence, "measured_cases": measured_pairs, "confirmed_cases": confirmed_cases, "significance": significance}
             # The verdict goes through the EvidenceClass guard: CONFIRMED_CAUSAL is
             # reachable only with verified provenance, coverage, and an observed
@@ -5570,8 +5602,8 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 # cannot be ruled out until it is re-run enough per arm.
                 if evidence_class is EvidenceClass.CONFIRMED_CAUSAL and not (significance and significance.get("significant_at_0_05")):
                     evidence_class = EvidenceClass.INDETERMINATE
-                    p = (significance or {}).get("p_value")
-                    reg["note"] = f"regression observed but not significant across replicates (p={p}); re-run more per arm to confirm"
+                    p = (significance or {}).get("min_p_value")
+                    reg["note"] = f"regression observed but not significant per case across replicates (min p={p}); a case needs >= 4 runs per arm to confirm"
                 elif not prov_ok:
                     reg["note"] = f"provenance unverified: {prov_note}"
                 elif not measured_pairs:

@@ -31,6 +31,21 @@ class PassAtKTests(unittest.TestCase):
         self.assertAlmostEqual(sb.pass_hat_k(10, 3, 2), 3 / 45)
         self.assertEqual(sb.pass_hat_k(4, 4, 4), 1.0)     # every run passes
         self.assertEqual(sb.pass_hat_k(4, 1, 2), 0.0)     # fewer successes than k
+        self.assertEqual(sb.pass_hat_k(4, 3, 4), 0.0)     # c<n at k=n -> not all pass
+
+    def test_k_below_one_and_n_zero_return_none(self):
+        # boundary: the `k < 1` and `n <= 0` guards (a k>=0 mutation must be caught)
+        self.assertIsNone(sb.pass_at_k(3, 1, 0))
+        self.assertIsNone(sb.pass_hat_k(3, 1, 0))
+        self.assertIsNone(sb.pass_at_k(0, 0, 1))
+
+    def test_monotonicity_properties(self):
+        # pass@k non-decreasing in k; pass^k non-increasing in k (mathematical-properties)
+        n, c = 10, 4
+        at = [sb.pass_at_k(n, c, k) for k in range(1, n + 1)]
+        hat = [sb.pass_hat_k(n, c, k) for k in range(1, n + 1)]
+        self.assertEqual(at, sorted(at))
+        self.assertEqual(hat, sorted(hat, reverse=True))
 
     def test_reliability_report_pools_per_variant(self):
         results = []
@@ -42,8 +57,19 @@ class PassAtKTests(unittest.TestCase):
         w = rel["by_case_variant"]["c1"]["with_skill"]
         self.assertEqual((w["n"], w["c"]), (4, 3))
         self.assertAlmostEqual(w["pass_at_1"], 0.75)
+        # the full estimator maps are inspected, not just pass_at_1 (kills a
+        # drop-the-dict / swap-the-dicts mutation)
+        self.assertEqual(w["pass_at_k"]["4"], 1.0)     # 3 of 4 pass -> drawing all 4 always includes a pass
+        self.assertEqual(w["pass_hat_k"]["4"], 0.0)    # ...but not all 4 pass
         self.assertEqual(rel["by_variant"]["without_skill"]["mean_pass_at_1"], 0.0)
+        self.assertAlmostEqual(rel["by_variant"]["with_skill"]["mean_pass_at_1"], 0.75)
         self.assertEqual(rel["by_variant"]["with_skill"]["all_runs_pass_rate"], 0.0)  # not every run passed
+
+    def test_all_runs_pass_rate_reaches_one(self):
+        # the c==n side of all_runs_pass_rate (a constant-0.0 mutation must be caught)
+        results = [{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0} for _ in range(3)]
+        rel = sb.build_reliability(results)
+        self.assertEqual(rel["by_variant"]["with_skill"]["all_runs_pass_rate"], 1.0)
 
 
 class TwoSamplePermutationTests(unittest.TestCase):
@@ -56,9 +82,26 @@ class TwoSamplePermutationTests(unittest.TestCase):
         self.assertFalse(sb.two_sample_permutation_significance([1, 1, 1], [0, 0, 0])["significant_at_0_05"])  # p=0.1
         self.assertTrue(sb.two_sample_permutation_significance([1, 1, 1, 1], [0, 0, 0, 0])["significant_at_0_05"])  # p=0.0286
 
+    def test_symmetric_under_group_swap(self):
+        # two-sided: the p-value must not depend on which arm is passed first (a
+        # `target = observed` one-sided mutation makes the reversed order differ)
+        fwd = sb.two_sample_permutation_significance([1, 1, 1, 1], [0, 0, 0, 0])
+        rev = sb.two_sample_permutation_significance([0, 0, 0, 0], [1, 1, 1, 1])
+        self.assertEqual(fwd["p_value"], rev["p_value"])
+        self.assertTrue(rev["significant_at_0_05"])   # reversed order still fires
+
+    def test_method_edges_and_exact_vs_sampled(self):
+        self.assertEqual(sb.two_sample_permutation_significance([1, 1, 1, 1], [0, 0, 0, 0])["method"], "two-sample-permutation-exact")
+        big = sb.two_sample_permutation_significance([1.0] * 12, [0.0] * 12)   # total 24 -> sampled
+        self.assertEqual(big["method"], "two-sample-permutation-sampled")
+        self.assertIsNone(sb.two_sample_permutation_significance([], [1, 2])["p_value"])   # empty arm
+        self.assertEqual(sb.two_sample_permutation_significance([1, 1], [1, 1])["p_value"], 1.0)  # all equal
+
     def test_deterministic_under_sampling(self):
         a, b = [1.0] * 12, [0.0] * 12   # total 24 -> sampled branch, seeded
-        self.assertEqual(sb.two_sample_permutation_significance(a, b), sb.two_sample_permutation_significance(a, b))
+        r1, r2 = sb.two_sample_permutation_significance(a, b), sb.two_sample_permutation_significance(a, b)
+        self.assertEqual(r1, r2)
+        self.assertEqual(r1["method"], "two-sample-permutation-sampled")   # actually exercising the sampled path
 
 
 class JudgeAlignmentTests(unittest.TestCase):
@@ -83,6 +126,33 @@ class JudgeAlignmentTests(unittest.TestCase):
         self.assertIsNone(rep["agreement"])
         self.assertTrue(rep["warnings"])
 
+    def test_f1_is_zero_not_none_for_label_inverting_judge(self):
+        # the worst judge (inverts every label -> tp=0) must report F1=0.0, not None,
+        # or a reviewer scanning for low F1 skips the null. Regression for the audit bug.
+        human = {"a": {"passed": True}, "b": {"passed": False}}
+        judge = {"a": {"passed": False}, "b": {"passed": True}}
+        rep = sb.judge_alignment_report(human, judge)
+        self.assertEqual(rep["confusion"], {"tp": 0, "fp": 1, "fn": 1, "tn": 0})
+        self.assertEqual(rep["f1"], 0.0)
+        self.assertEqual(rep["precision"], 0.0)
+        self.assertEqual(rep["recall"], 0.0)
+
+    def test_f1_none_only_when_no_positives_exist(self):
+        # tp=fp=fn=0 (everything a true negative) -> F1 genuinely undefined
+        rep = sb.judge_alignment_report({"a": {"passed": False}}, {"a": {"passed": False}})
+        self.assertIsNone(rep["f1"])
+        self.assertEqual(rep["confusion"], {"tp": 0, "fp": 0, "fn": 0, "tn": 1})
+
+    def test_kappa_band_thresholds(self):
+        self.assertEqual(sb.kappa_band(0.9), "almost-perfect")
+        self.assertEqual(sb.kappa_band(0.8), "substantial")   # strict > boundary
+        self.assertEqual(sb.kappa_band(0.5), "moderate")
+        self.assertEqual(sb.kappa_band(0.3), "fair")
+        self.assertEqual(sb.kappa_band(0.1), "slight")
+        self.assertEqual(sb.kappa_band(0.0), "poor (<= chance)")
+        self.assertEqual(sb.kappa_band(-0.2), "poor (<= chance)")
+        self.assertIsNone(sb.kappa_band(None))
+
 
 class ToolCallTaxonomyTests(unittest.TestCase):
     def _events(self, names):
@@ -106,12 +176,36 @@ class ToolCallTaxonomyTests(unittest.TestCase):
         miss = sb.assertion_result({"type": "tool_call", "required_calls": ["Read", "WebSearch"]}, "t", base / "output.md", run_base=base)
         self.assertFalse(miss["passed"])
 
-    def test_call_set_multiset_rejects_unexpected(self):
+    def test_call_set_multiset_rejects_unexpected_and_missing(self):
         base = self._events(["Read", "Grep"])
         ok = sb.assertion_result({"type": "tool_call", "call_set": ["Read", "Grep"]}, "t", base / "output.md", run_base=base)
         self.assertTrue(ok["passed"])
         extra = sb.assertion_result({"type": "tool_call", "call_set": ["Read"]}, "t", base / "output.md", run_base=base)
         self.assertFalse(extra["passed"])   # Grep is unexpected
+        missing = sb.assertion_result({"type": "tool_call", "call_set": ["Read", "Grep", "Edit"]}, "t", base / "output.md", run_base=base)
+        self.assertFalse(missing["passed"])  # Edit is missing (drives the missing branch)
+
+    def test_call_set_counts_multiplicity(self):
+        base = self._events(["Read", "Read"])   # two Reads
+        self.assertFalse(sb.assertion_result({"type": "tool_call", "call_set": ["Read"]}, "t", base / "output.md", run_base=base)["passed"])
+        self.assertTrue(sb.assertion_result({"type": "tool_call", "call_set": ["Read", "Read"]}, "t", base / "output.md", run_base=base)["passed"])
+
+    def test_name_match_is_not_substring(self):
+        # a shell `cat readme` (a command event, no tool name) must NOT satisfy
+        # required_calls:["Read"] — the audit's core false-positive.
+        td = Path(tempfile.mkdtemp(prefix="toolcall-cmd-"))
+        (td / "events.json").write_text(json.dumps([{"type": "command", "command": "cat README.md", "status": "completed"}]), encoding="utf-8")
+        (td / "output.md").write_text("out", encoding="utf-8")
+        res = sb.assertion_result({"type": "tool_call", "required_calls": ["Read"]}, "t", td / "output.md", run_base=td)
+        self.assertFalse(res["passed"])
+        # and a real tool named ReadFile does not satisfy "Read" (exact, not prefix)
+        base = self._events(["ReadFile"])
+        self.assertFalse(sb.assertion_result({"type": "tool_call", "required_calls": ["Read"]}, "t", base / "output.md", run_base=base)["passed"])
+
+    def test_expected_no_call_with_pattern(self):
+        base = self._events(["curl", "Read"])
+        self.assertFalse(sb.assertion_result({"type": "tool_call", "expected_no_call": True, "pattern": "curl"}, "t", base / "output.md", run_base=base)["passed"])
+        self.assertTrue(sb.assertion_result({"type": "tool_call", "expected_no_call": True, "pattern": "wget"}, "t", base / "output.md", run_base=base)["passed"])
 
 
 class ErrorAnalysisTests(unittest.TestCase):
@@ -133,6 +227,30 @@ class ErrorAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(top["share"], 2 / 3, places=4)   # report rounds to 4dp
         self.assertIn("missing-output", {b["category"] for b in out["taxonomy"]})
         self.assertEqual(out["case_flag_histogram"]["saturated/non-discriminating"], 1)
+
+    def test_execution_error_critical_and_judge_categories(self):
+        report = {"results": [
+            {"case_id": "c1", "variant": "with_skill", "execution_valid": False, "assertions": [], "qualitative_assertions": []},
+            {"case_id": "c2", "variant": "with_skill", "vetoed": True, "critical_failures": ["wrote-outside-results"], "assertions": [], "qualitative_assertions": []},
+            {"case_id": "c3", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "ok", "passed": True}],
+             "qualitative_assertions": [{"name": "rubric", "type": "judge", "passed": False, "evidence": "weak"}]},
+        ], "case_flags": []}
+        out = sb.error_analysis_report(report)
+        cats = {b["category"] for b in out["taxonomy"]}
+        self.assertIn("execution-error", cats)
+        self.assertIn("critical-failure:wrote-outside-results", cats)
+        self.assertIn("judge:rubric", cats)   # a qualitative first-failure classifies as judge
+
+    def test_review_queue_limit_truncates(self):
+        report = {"results": [
+            {"case_id": f"c{i}", "variant": "without_skill", "objective_pass_rate": 0.0,
+             "assertions": [{"name": "x", "type": "contains", "passed": False}], "qualitative_assertions": []}
+            for i in range(5)
+        ], "case_flags": []}
+        out = sb.error_analysis_report(report, limit=2)
+        self.assertEqual(len(out["review_queue"]), 2)
+        self.assertEqual(out["review_queue_truncated"], 3)
+        self.assertEqual(out["summary"]["failing_or_errored_runs"], 5)   # taxonomy still counts all
 
 
 if __name__ == "__main__":
