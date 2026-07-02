@@ -1613,10 +1613,11 @@ class AblationRegressionReportTests(unittest.TestCase):
         return {"metadata": {"skill_tree_hash": parent or self.PARENT}}
 
     def test_expected_regression_confirmed_when_named_assertion_flips(self):
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov()},
-        ]
+        # Feature 1: a confirmation must clear the replication significance gate, so
+        # the regression is replicated 4x per arm (a single shot ties at p=1.0 and
+        # downgrades to INDETERMINATE — see the next test).
+        results = ([{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()} for _ in range(4)]
+                   + [{"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov()} for _ in range(4)])
         entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
         self.assertEqual(entry["status"], "measured")
         self.assertTrue(entry["provenance_verified"])
@@ -1624,8 +1625,23 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertTrue(reg["expected_regression_confirmed"])
         self.assertEqual(reg["evidence_class"], "confirmed_causal")   # the typed verdict, via the guard
         self.assertTrue(reg["score_regressed"])
+        self.assertTrue(reg["significance"]["significant_at_0_05"])   # replicated, not eyeballed
         self.assertEqual(reg["evidence"][0]["case"], "c1")
         self.assertEqual(reg["evidence"][0]["assertion"], "detect-weak")
+
+    def test_single_shot_regression_is_indeterminate_not_confirmed(self):
+        # Feature 1: one run per arm shows the drop but cannot rule out noise, so the
+        # verdict is INDETERMINATE (None), never confirmed — the n=5 walkthrough lesson.
+        results = [
+            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
+            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov()},
+        ]
+        reg = sb.build_ablation_regression_report(self.MANIFEST, results)[0]["regressions"][0]
+        self.assertIsNone(reg["expected_regression_confirmed"])
+        self.assertEqual(reg["evidence_class"], "indeterminate")
+        self.assertTrue(reg["confirmed_cases"])                        # the drop WAS observed
+        self.assertFalse(reg["significance"]["significant_at_0_05"])   # just not significant yet
+        self.assertIn("not significant", reg["note"])
 
     def test_score_drop_without_named_flip_is_not_confirmed(self):
         # The named assertion still passes; an unrelated assertion fails and drags
@@ -1735,10 +1751,10 @@ class AblationRegressionReportTests(unittest.TestCase):
             "id": "no-rp", "removed_component": "rp", "mechanism": "section", "class": "instructions",
             "target": {"heading": "## X"}, "expected_regressions": [{"summary": "weaker rubric", "cases": ["c1"], "assertions": ["rubric"]}],
         }]}
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "combined_pass_rate": 1.0, "assertions": [], "qualitative_assertions": [{"name": "rubric", "passed": True}], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 1.0, "combined_pass_rate": 0.0, "assertions": [], "qualitative_assertions": [{"name": "rubric", "passed": False}], **self.prov(manifest)},
-        ]
+        # Replicated 4x per arm so the combined-score regression clears the
+        # significance gate (feature 1).
+        results = ([{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "combined_pass_rate": 1.0, "assertions": [], "qualitative_assertions": [{"name": "rubric", "passed": True}], **self.ws()} for _ in range(4)]
+                   + [{"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 1.0, "combined_pass_rate": 0.0, "assertions": [], "qualitative_assertions": [{"name": "rubric", "passed": False}], **self.prov(manifest)} for _ in range(4)])
         reg = sb.build_ablation_regression_report(manifest, results)[0]["regressions"][0]
         self.assertTrue(reg["expected_regression_confirmed"])
         self.assertEqual(reg["confirmed_cases"], ["c1"])
