@@ -2,6 +2,8 @@
 
 Date: 2026-06-18 (re-audit; baseline 2026-06-11)
 
+> **Note (2026-07-02):** this is a dated snapshot. Since it was written, the eval-framework roadmap and cost telemetry landed (still under CHANGELOG *Unreleased*; version is unchanged at `0.4.2`), so the figures below understate the repo — the suite is now ~399 tests across 11 files, and the feature inventory omits graded scoring, the model axis, cost telemetry, and the Claude/subagent runners. Per this audit's own re-audit trigger (a new public release), a full refresh is due when the next version tags.
+
 This audit applies the `good-repo` skill to `adewale/skill-eval-harness` as a public Python CLI/package repo for Agent Skill evaluation.
 
 ## Re-audit delta (2026-06-18)

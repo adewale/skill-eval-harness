@@ -14,11 +14,19 @@ Terms are grouped by what they describe: the units you evaluate, the comparison 
 
 **Fixture** — a real input file referenced by `case.files`, stored under the manifest's `evals/` directory. `prepare` emits fixtures as absolute `input_files` so the runner reads them before answering. Fixtures make a case harder to solve from generic knowledge or from echoing assertion keywords.
 
+**Dataset / template** — a `datasets` block plus a case `template` fans one case shape over a row set, filling `{key}` placeholders per row into stable case ids. Materialized early (inside `iter_cases`), so validation, leakage lint, prepare, and grading all see ordinary cases. A YAML manifest with `dataset_files` (JSONL row files) compiles to the same shape in memory.
+
+**Multi-turn case (`turns`)** — a case may declare a scripted `turns` sequence instead of a single prompt; each turn's assertions grade that turn's transcript entry (`turn-<n>/output.md`), case-level assertions grade the final answer, and the final turn stands in as the run's `output.md`. Single-shot cases are unchanged.
+
+**Manifest version / `migrate`** — `validate` accepts `version` 1 and 2 (both grade identically; version 2 makes the severity and oracle-tier defaults explicit). `skill-benchmark migrate` stamps the mechanical defaults and prints the diff plus a checklist of the judgment calls it leaves; see [`migrating-evals.md`](migrating-evals.md).
+
 ## Comparison structure
 
 **Variant** — which arm of the comparison a run belongs to. The two defaults are `with_skill` and `without_skill`. Optional arms are `old_skill` (requires `old_skill_paths` and `--include-old-skill`) and `ablation:<id>`. The harness compares arms; a single arm in isolation says little.
 
 **Ablation** — an opt-in variant that simulates removing one component of a skill, declared under `manifest.ablations` and prepared with `--include-ablations`. Each entry names the `removed_component` and its `expected_regressions`. An ablation is a hypothesis about which instructions are load-bearing; it becomes evidence only once it is run on a discriminating case.
+
+**Model (axis)** — a third fan-out axis beside variant and run, set with `prepare --models a,b,c`. Each row carries its target model, and the run layout gains a model segment (`<case>/<model>/<variant>`) only when two or more models run, so single-model layouts are unchanged. The report groups `by_model`, pairs lift per (case, model), and `model_analysis` ranks models by lift and names the ones that lose it. Model is a dimension, not a new kind of variant — the variant grid stays orthogonal within each model.
 
 **Split** — when a case is allowed to be seen.
 
@@ -34,15 +42,21 @@ Terms are grouped by what they describe: the units you evaluate, the comparison 
 
 **Assertion** — a single graded check on a run. Assertions fall into four groups.
 
-**Objective assertion** — a deterministic check on output text or files, graded locally with no model call: `contains`, `contains_any`, `contains_all`, `excludes_any`, `regex`, `not_regex`, `file_exists`, `json_field_equals`.
+**Objective assertion** — a deterministic check on output text or files, graded locally with no model call: `contains`, `contains_any`, `contains_all`, `excludes_any`, `regex`, `not_regex`, `file_exists`, `json_field_equals`, `golden_output` (equality against a reference file, with explicit normalization and a diff on mismatch), `similarity` (a `difflib` ratio against an `expected` string, thresholded and scored; `mode: "embedding"` swaps in cosine similarity behind the opt-in `--embed-cmd`), and `structured_output` (JSON validated against a schema subset).
 
-**Oracle** — a `script` assertion: a deterministic command the repo owns, run against the candidate output directory. Use it when a keyword check is too weak for the property you care about. Oracles are blocked unless you pass `--allow-scripts`, because they execute repo-supplied commands.
+**Script oracle** — a `script` assertion: a deterministic command the repo owns, run against the candidate output directory. Use it when a keyword check is too weak for the property you care about. Blocked unless you pass `--allow-scripts`, because it executes repo-supplied commands. A `{"score", "max_score"}` line on its stdout turns it into a graded oracle without giving up determinism.
 
-**Process assertion** — a check on *how* the run behaved, graded from trace artifacts rather than from the answer: `skill_invoked`, `command_ran` / `command_not_ran`, `command_order`, `tool_count_le`, `no_repeated_command_loop`. Process assertions fail closed when their evidence is missing, so `command_not_ran` cannot pass without `events.json`.
+**Oracle tier** — how trustworthy an assertion's evidence is, declared per assertion or defaulted by type: `strong` (deterministic, no-lies — the default for text/process/efficiency), `demo` (a marked stand-in — the default for `script`), or `live` (model-backed — the default for `judge`). The benchmark report shows each case's `strong`-oracle share, and `audit-manifest` warns on a case graded only by `demo`/`live` oracles.
+
+**Process assertion** — a check on *how* the run behaved, graded from trace artifacts rather than from the answer: `skill_invoked`, `command_ran` / `command_not_ran`, `command_order`, `tool_call` (a completed tool call matching `tool`/`pattern`, with order/count bounds — over both shell-command and normalized `tool_call` events), `tool_count_le`, `no_repeated_command_loop`. Process assertions fail closed when their evidence is missing, so `command_not_ran` cannot pass without `events.json`.
 
 **Efficiency assertion** — a budget check over `metrics.json` or `metadata.json`: `total_tokens_le`, `elapsed_seconds_le`, `command_count_le`.
 
-**Qualitative assertion** — a `judge` or `rubric` check that the harness cannot grade by string matching. These are deferred into `judge-tasks.jsonl` and resolved either by a user-supplied `--judge-cmd` or by merging `--judge-results`. The harness never picks a model for you.
+**Qualitative assertion** — a `judge` or `rubric` check (or the `factuality` preset, a canned anchored rubric) that the harness cannot grade by string matching. A `judge` assertion may carry anchored `graded_dimensions` (per-dimension 1–5 scores) or a `dynamic_rubric` (the judge drafts case-specific criteria, then grades against them). These are deferred into `judge-tasks.jsonl` and resolved either by a user-supplied `--judge-cmd` or by merging `--judge-results`. The harness never picks a model for you.
+
+**Severity** — how a failed assertion counts, declared per assertion (or defaulted by type): `critical` (an absorbing barrier — one failure vetoes the run, collapses every rate to 0.0, and is excluded from every mean), `gate` (carries the pass rate; the default for objective checks), or `soft` (feeds only the per-run graded score and never moves a pass rate; the default for `judge`/`similarity`). `--strict` promotes soft to gate.
+
+**Graded score** — the "how much better" channel beside binary pass/fail. Every assertion result carries a 0–1 `score`; soft results feed a per-run `graded_score`, and `build_paired_summary` reports a paired `graded` channel plus a sign-flip permutation significance test beside the raw lift. An optional `reference_score` / `reference_graded_score` on a case sets a no-regression floor.
 
 **Variant-scoped assertion** — an assertion restricted to specific arms via `variants` / `only_variants` / `except_variants`. Process checks need this: `skill_invoked=true` belongs to `with_skill`, and `skill_invoked=false` belongs to `without_skill`, so an unscoped skill-load requirement would wrongly penalize the baseline.
 
@@ -50,7 +64,9 @@ Terms are grouped by what they describe: the units you evaluate, the comparison 
 
 **`output.md`** — the final answer a run produced. Objective and qualitative assertions read it.
 
-**`metadata.json`** — optional per-run telemetry: elapsed time, token counts, model name.
+**`metadata.json`** — optional per-run telemetry: elapsed time, token counts, model name, and the normalized cost blocks below.
+
+**`usage_normalized` / `cost_normalized`** — the normalized token and dollar blocks every runner writes into a run's metadata/metrics, alongside the raw provider fields. Each carries a `source` provenance (`provider_reported`, `trace_normalized`, `price_table_estimated`, `missing`, or `not_applicable`) — missing telemetry is marked, never written as zero — so the report can total real spend and disclose coverage separately from quality.
 
 **Trace artifacts** — what a trace-aware runner writes so process and efficiency assertions have evidence:
 
@@ -83,7 +99,7 @@ These are flags a `benchmark` report raises so you read pass rates correctly.
 
 **Token overhead** — the static `SKILL.md` and reference footprint combined with the paired `with_skill - without_skill` token delta, reported as objective lift per 1k extra tokens. It answers whether the lift was worth the context the skill consumed.
 
-**Cost** — real dollars a run spent, recorded by a runner that reports it (`run-claude` captures `total_cost_usd` into `metrics.json`). The benchmark report totals `cost_usd_total` per arm over scorable runs, so "what did this arm cost to run" sits next to "how much did it lift."
+**Cost** — real dollars a run spent, normalized into `cost_normalized` by every runner that reports it (`run-claude` and `run-subagent` capture provider cost; Pi smoke/trigger parse it from the stream; Jetty from the trajectory). The benchmark report carries a `cost_summary` ledger — operational totals over *all* runs (execution errors included: they were still paid for), per-variant mean/median/p90, paired cost deltas, ablation marginal cost and cost per confirmed regression, and judge spend as its own line. The standalone `cost-summary` command writes the suite ledger (JSON + markdown) with top spenders and spend-without-signal findings; `suite-run` projects spend before any model call and gates on `--max-estimated-cost-usd` / `--max-estimated-tokens`; `token-overhead` adds dollar deltas and lift-per-dollar. Cost sits next to lift, never mixed into it.
 
 **Base-saturated** — a case whose *measured* `with_skill` and `without_skill` combined pass rates are equal: the base model does it with or without the skill, so the case measures nothing. Surfaced by `eval-readiness` from run data as a blocker. (Contrast **leak-saturated**, which is a static property of the prompt.)
 
