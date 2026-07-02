@@ -121,7 +121,7 @@ editor. This boundary is the main extension seam in the codebase.
 
 A runner consumes task rows and produces the contract. The repo ships four paths plus a
 generic one: Pi smoke (`examples/adewale-workspace/run_pi_smoke.py`), Pi trigger
-(`run_pi_trigger_eval.py`), Codex (`run_codex:3418`), Jetty (`JettyClient:2084` and the
+(`run_pi_trigger_eval.py`), Codex (`run_codex:3442`), Jetty (`JettyClient:2102` and the
 export/run/import commands), and any runner that writes the contract directly. The harness
 calls no model itself; it reads what the runner left behind.
 

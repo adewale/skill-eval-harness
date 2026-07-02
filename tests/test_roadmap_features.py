@@ -620,7 +620,9 @@ class JudgePresetTests(unittest.TestCase):
             jid = tasks[0]["judge_task_id"]
             merged, _ = sb.grade_case_variant(case, "with_skill", "claims", base / "output.md", {}, run_base=base,
                                               judge_results={jid: {"passed": True, "score": 5, "rationale": "grounded"}})
-        self.assertEqual(merged["qualitative_passed"], 1)
+        # factuality is soft by default: the verdict fills the soft/graded channel.
+        self.assertEqual(merged["soft_passed"], 1)
+        self.assertTrue(merged["qualitative_assertions"][0]["passed"])
         self.assertEqual(merged["qualitative_assertions"][0]["oracle"], "live")
 
     def test_unknown_preset_dies_in_validation(self):
@@ -1541,6 +1543,146 @@ class MigrationTests(unittest.TestCase):
             [r["objective_pass_rate"] for r in after["results"]],
         )
         self.assertEqual(before["paired_summary"]["absolute_delta"], after["paired_summary"]["absolute_delta"])
+
+
+class ReviewFixRegressionTests(unittest.TestCase):
+    """Regression tests for the PR #22 review findings — each encodes one
+    reported defect so it cannot return."""
+
+    def graded_case(self) -> tuple[dict, dict]:
+        assertion = {"name": "quality", "type": "judge",
+                     "graded_dimensions": [{"name": "drama", "rubric": "5 = anchored; 1 = flat"},
+                                           {"name": "craft", "rubric": "5 = anchored; 1 = flat"}]}
+        case = {"id": "c", "split": "tune", "kind": "behavior", "prompt": "p", "assertions": [assertion]}
+        return case, assertion
+
+    def test_p1_judge_command_carries_graded_payload_end_to_end(self):
+        # run_one_judge_task must persist dimension_scores/criteria and compute
+        # the verdict via the same owner the merge uses — previously the row
+        # kept only passed/score/evidence, so graded judging merged as failed.
+        case, assertion = self.graded_case()
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text("poster", encoding="utf-8")
+            _, tasks = sb.grade_case_variant(case, "with_skill", "poster", base / "output.md", {}, run_base=base)
+            judge_cmd = "python3 -c \"print('{\\\"dimension_scores\\\": {\\\"drama\\\": 5, \\\"craft\\\": 4}, \\\"rationale\\\": \\\"strong\\\"}')\""
+            row = sb.run_one_judge_task(tasks[0], judge_cmd=judge_cmd)
+            self.assertEqual(row["dimension_scores"], {"drama": 5, "craft": 4})
+            self.assertTrue(row["passed"])
+            self.assertAlmostEqual(row["score"], 0.875)
+            merged, _ = sb.grade_case_variant(case, "with_skill", "poster", base / "output.md", {}, run_base=base,
+                                              judge_results={row["judge_task_id"]: row})
+        entry = merged["qualitative_assertions"][0]
+        self.assertTrue(entry["passed"])
+        self.assertEqual(entry["dimension_scores"], {"drama": 5.0, "craft": 4.0})
+        self.assertEqual(merged["graded_score"], 0.875)
+
+    def test_p1_dynamic_rubric_criteria_survive_the_judge_command(self):
+        assertion = {"name": "dyn", "type": "judge", "dynamic_rubric": {"instruction": "draft criteria", "minimum_criteria": 2}}
+        case = {"id": "c", "split": "tune", "kind": "behavior", "prompt": "p", "assertions": [assertion]}
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text("t", encoding="utf-8")
+            _, tasks = sb.grade_case_variant(case, "with_skill", "t", base / "output.md", {}, run_base=base)
+            judge_cmd = "python3 -c \"print('{\\\"criteria\\\": [{\\\"name\\\": \\\"a\\\", \\\"met\\\": true}, {\\\"name\\\": \\\"b\\\", \\\"met\\\": true}]}')\""
+            row = sb.run_one_judge_task(tasks[0], judge_cmd=judge_cmd)
+        self.assertEqual(len(row["criteria"]), 2)
+        self.assertTrue(row["passed"])
+        self.assertEqual(row["score"], 1.0)
+
+    def test_p1_judge_task_ids_are_model_scoped(self):
+        # Without the model segment, case-1/m1/with_skill and case-1/m2/with_skill
+        # shared an ID and the last verdict silently applied to both models.
+        assertion = {"name": "q", "type": "judge", "rubric": ["good"]}
+        self.assertNotEqual(
+            sb.judge_task_id("case-1", "with_skill", 1, assertion, model="m1"),
+            sb.judge_task_id("case-1", "with_skill", 1, assertion, model="m2"))
+        self.assertEqual(sb.judge_task_id("case-1", "with_skill", 1, assertion),
+                         "case-1::with_skill::run-1::q")   # single-model shape unchanged
+        case = {"id": "case-1", "split": "tune", "kind": "behavior", "prompt": "p", "assertions": [assertion]}
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text("t", encoding="utf-8")
+            verdicts = {
+                sb.judge_task_id("case-1", "with_skill", 1, assertion, model="m1"): {"passed": True, "score": 5},
+                sb.judge_task_id("case-1", "with_skill", 1, assertion, model="m2"): {"passed": False, "score": 1},
+            }
+            m1, _ = sb.grade_case_variant(case, "with_skill", "t", base / "output.md", {}, run_base=base, judge_results=verdicts, model="m1")
+            m2, _ = sb.grade_case_variant(case, "with_skill", "t", base / "output.md", {}, run_base=base, judge_results=verdicts, model="m2")
+        self.assertTrue(m1["qualitative_assertions"][0]["passed"])
+        self.assertFalse(m2["qualitative_assertions"][0]["passed"])
+
+    def test_p1_collect_judge_tasks_scopes_ids_by_layout_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = base_manifest()
+            manifest["cases"][0]["assertions"].append({"name": "q", "type": "judge", "rubric": ["good"]})
+            path = write_manifest(root, manifest)
+            runs = root / "runs"
+            for model in ["m1", "m2"]:
+                base = runs / "case-1" / model / "with_skill"
+                base.mkdir(parents=True)
+                (base / "output.md").write_text("alpha", encoding="utf-8")
+            tasks = sb.collect_judge_tasks(path, runs, variants=["with_skill"])
+        ids = {t["judge_task_id"] for t in tasks}
+        self.assertEqual(ids, {"case-1::m1::with_skill::run-1::q", "case-1::m2::with_skill::run-1::q"})
+        self.assertEqual({t.get("model") for t in tasks}, {"m1", "m2"})
+
+    def test_p2_soft_judge_failure_leaves_combined_rate(self):
+        assertion = {"name": "q", "type": "judge", "rubric": ["good"]}
+        case = {"id": "c", "split": "tune", "kind": "behavior", "prompt": "p",
+                "assertions": [{"name": "a", "type": "contains", "value": "alpha"}, assertion]}
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text("alpha", encoding="utf-8")
+            jid = sb.judge_task_id("c", "with_skill", 1, assertion)
+            soft, _ = sb.grade_case_variant(case, "with_skill", "alpha", base / "output.md", {}, run_base=base,
+                                            judge_results={jid: {"passed": False, "score": 0.0}})
+            case_gate = json.loads(json.dumps(case))
+            case_gate["assertions"][1]["severity"] = "gate"
+            gate, _ = sb.grade_case_variant(case_gate, "with_skill", "alpha", base / "output.md", {}, run_base=base,
+                                            judge_results={jid: {"passed": False, "score": 0.0}})
+        self.assertEqual(soft["combined_pass_rate"], 1.0)   # soft failure feeds graded only
+        self.assertEqual(soft["graded_score"], 0.0)
+        self.assertEqual(gate["combined_pass_rate"], 0.5)   # gate judge stays in the rate
+
+    def test_p2_junit_counts_qualitative_gate_failures_not_soft(self):
+        result = {"case_id": "c", "variant": "with_skill", "run_number": 1, "missing_output": False,
+                  "execution_valid": True, "metadata": {},
+                  "assertions": [{"name": "a", "passed": True, "severity": "gate"}],
+                  "qualitative_assertions": [
+                      {"name": "gate-judge", "passed": False, "severity": "gate", "evidence": "weak"},
+                      {"name": "soft-judge", "passed": False, "severity": "soft", "evidence": "meh"},
+                  ]}
+        lines = sb.result_failure_lines(result)
+        self.assertEqual(lines, ["gate-judge: weak"])
+        report = {"skill_name": "d", "summary": {}, "paired_summary": {}, "case_flags": [], "results": [result]}
+        self.assertIn('failures="1"', sb.junit_xml_from_report(report))
+
+    def test_p2_tool_call_matches_normalized_tool_call_events(self):
+        events = {"schema_version": 2, "source": "subagent", "events": [
+            {"type": "tool_call", "name": "Read", "input_summary": "skills/demo/refs.md", "status": "completed"},
+            {"type": "tool_call", "name": "WebSearch", "input_summary": "query", "status": "in_progress"},
+        ]}
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "output.md").write_text("t", encoding="utf-8")
+            (base / "events.json").write_text(json.dumps(events), encoding="utf-8")
+            hit = sb.assertion_result({"type": "tool_call", "tool": "Read"}, "t", base / "output.md", run_base=base)
+            in_progress_only = sb.assertion_result({"type": "tool_call", "tool": "WebSearch"}, "t", base / "output.md", run_base=base)
+        self.assertTrue(hit["passed"], hit["evidence"])
+        self.assertFalse(in_progress_only["passed"])   # a started-but-unfinished call is not a call that ran
+
+    def test_p2_turn_assertions_are_validated(self):
+        manifest = base_manifest()
+        manifest["cases"] = [{
+            "id": "conv", "split": "tune", "kind": "behavior",
+            "turns": [{"prompt": "ask", "assertions": [{"type": "no_such_type", "value": "x"}]}],
+        }]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
 
 
 class GuideHintTests(unittest.TestCase):

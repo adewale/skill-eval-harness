@@ -343,6 +343,59 @@ def prompt_assertion_leakage_findings(manifest: dict[str, Any], manifest_path: P
     return findings
 
 
+def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, path: Path) -> None:
+    """One validator for every assertion an eval can declare — case-level and
+    per-turn alike, so no assertion shape can dodge validate and fail later
+    inside grading."""
+    where = f"{cid}: {label}"
+    if not isinstance(assertion, dict):
+        die(f"{where} must be an object")
+    validate_variant_filter(assertion, cid, index)
+    atype = assertion.get("type")
+    if atype not in OBJECTIVE_ASSERTIONS | QUALITATIVE_ASSERTIONS:
+        die(f"{where} has unsupported type {atype!r}")
+    severity = assertion.get("severity")
+    if severity is not None and severity not in SEVERITIES:
+        die(f"{where} severity must be one of {sorted(SEVERITIES)}")
+    tier = assertion.get("oracle")
+    if tier is not None and tier not in ORACLE_TIERS:
+        die(f"{where} oracle must be one of {sorted(ORACLE_TIERS)}")
+    if atype == "similarity" and not str(assertion.get("expected", assertion.get("value", ""))):
+        die(f"{where} similarity needs an expected string")
+    if atype == "similarity" and assertion.get("mode") not in (None, "ratio", "embedding"):
+        die(f"{where} similarity mode must be ratio or embedding")
+    if atype == "structured_output" and not isinstance(assertion.get("schema"), dict):
+        die(f"{where} structured_output needs a schema object")
+    if assertion.get("preset") is not None and str(assertion.get("preset")) not in JUDGE_PRESETS:
+        die(f"{where} unknown judge preset {assertion.get('preset')!r}; known: {sorted(JUDGE_PRESETS)}")
+    if "atLeast" in assertion and not isinstance(assertion.get("atLeast"), (int, float)):
+        die(f"{where} atLeast must be a number")
+    dims = assertion.get("graded_dimensions")
+    if dims is not None:
+        if not isinstance(dims, list) or not dims:
+            die(f"{where} graded_dimensions must be a non-empty list")
+        for k, dim in enumerate(dims):
+            if not isinstance(dim, dict) or not isinstance(dim.get("name"), str) or not dim.get("name"):
+                die(f"{where} graded_dimensions[{k}] needs a string name")
+            if not isinstance(dim.get("rubric"), str) or not dim.get("rubric"):
+                die(f"{where} graded_dimensions[{k}] needs an anchored string rubric")
+    dyn = assertion.get("dynamic_rubric")
+    if dyn is not None:
+        if not isinstance(dyn, dict) or not isinstance(dyn.get("instruction"), str) or not dyn.get("instruction"):
+            die(f"{where} dynamic_rubric needs a string instruction")
+        minimum = dyn.get("minimum_criteria", 3)
+        if not isinstance(minimum, int) or minimum < 1:
+            die(f"{where} dynamic_rubric.minimum_criteria must be a positive integer")
+    if atype in {"regex", "not_regex"}:
+        pattern = str(assertion.get("pattern", assertion.get("value", "")))
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            die(f"{where} invalid regex {pattern!r}: {exc}")
+    if atype == "script":
+        validate_script_assertion(assertion, path, cid, index)
+
+
 def load_manifest_source(path: Path) -> dict[str, Any]:
     """The no-code registry loader (roadmap 3.3): a manifest may be authored in
     YAML (compiled to the JSON manifest shape in memory), and `dataset_files`
@@ -467,52 +520,17 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         if graded_floor is not None and (not isinstance(graded_floor, (int, float)) or not 1 <= float(graded_floor) <= 5):
             die(f"{cid}: reference_graded_score must be a number on the 1-5 scale")
         for j, assertion in enumerate(assertions):
-            if not isinstance(assertion, dict):
-                die(f"{cid}: assertion #{j} must be an object")
-            validate_variant_filter(assertion, cid, j)
-            atype = assertion.get("type")
-            if atype not in OBJECTIVE_ASSERTIONS | QUALITATIVE_ASSERTIONS:
-                die(f"{cid}: assertion #{j} has unsupported type {atype!r}")
-            severity = assertion.get("severity")
-            if severity is not None and severity not in SEVERITIES:
-                die(f"{cid}: assertion #{j} severity must be one of {sorted(SEVERITIES)}")
-            tier = assertion.get("oracle")
-            if tier is not None and tier not in ORACLE_TIERS:
-                die(f"{cid}: assertion #{j} oracle must be one of {sorted(ORACLE_TIERS)}")
-            if atype == "similarity" and not str(assertion.get("expected", assertion.get("value", ""))):
-                die(f"{cid}: assertion #{j} similarity needs an expected string")
-            if atype == "similarity" and assertion.get("mode") not in (None, "ratio", "embedding"):
-                die(f"{cid}: assertion #{j} similarity mode must be ratio or embedding")
-            if atype == "structured_output" and not isinstance(assertion.get("schema"), dict):
-                die(f"{cid}: assertion #{j} structured_output needs a schema object")
-            if assertion.get("preset") is not None and str(assertion.get("preset")) not in JUDGE_PRESETS:
-                die(f"{cid}: assertion #{j} unknown judge preset {assertion.get('preset')!r}; known: {sorted(JUDGE_PRESETS)}")
-            if "atLeast" in assertion and not isinstance(assertion.get("atLeast"), (int, float)):
-                die(f"{cid}: assertion #{j} atLeast must be a number")
-            dims = assertion.get("graded_dimensions")
-            if dims is not None:
-                if not isinstance(dims, list) or not dims:
-                    die(f"{cid}: assertion #{j} graded_dimensions must be a non-empty list")
-                for k, dim in enumerate(dims):
-                    if not isinstance(dim, dict) or not isinstance(dim.get("name"), str) or not dim.get("name"):
-                        die(f"{cid}: assertion #{j} graded_dimensions[{k}] needs a string name")
-                    if not isinstance(dim.get("rubric"), str) or not dim.get("rubric"):
-                        die(f"{cid}: assertion #{j} graded_dimensions[{k}] needs an anchored string rubric")
-            dyn = assertion.get("dynamic_rubric")
-            if dyn is not None:
-                if not isinstance(dyn, dict) or not isinstance(dyn.get("instruction"), str) or not dyn.get("instruction"):
-                    die(f"{cid}: assertion #{j} dynamic_rubric needs a string instruction")
-                minimum = dyn.get("minimum_criteria", 3)
-                if not isinstance(minimum, int) or minimum < 1:
-                    die(f"{cid}: assertion #{j} dynamic_rubric.minimum_criteria must be a positive integer")
-            if atype in {"regex", "not_regex"}:
-                pattern = str(assertion.get("pattern", assertion.get("value", "")))
-                try:
-                    re.compile(pattern)
-                except re.error as exc:
-                    die(f"{cid}: assertion #{j} invalid regex {pattern!r}: {exc}")
-            if atype == "script":
-                validate_script_assertion(assertion, path, cid, j)
+            validate_case_assertion(cid, f"assertion #{j}", j, assertion, path)
+        # Per-turn assertions go through the SAME validator as case-level ones
+        # (an unsupported type under a turn must fail validate, not grading).
+        for t, turn in enumerate(turns or [], 1):
+            turn_assertions = turn.get("assertions", [])
+            if turn_assertions is None:
+                turn_assertions = []
+            if not isinstance(turn_assertions, list):
+                die(f"{cid}: turn #{t} assertions must be a list")
+            for j, assertion in enumerate(turn_assertions):
+                validate_case_assertion(cid, f"turn #{t} assertion #{j}", j, assertion, path)
 
     seen_ablation_ids: set[str] = set()
     for i, ablation in enumerate(manifest.get("ablations", [])):
@@ -2854,15 +2872,21 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
         commands = [command_text(e) for e in command_events(events)]
         if atype == "tool_call":
             # 1.1 preset: assert a tool was actually called — optionally matching
-            # a pattern, in order, with count bounds. Reuses command_events (only
-            # completed calls count) and the command_order matching loop.
+            # a pattern, in order, with count bounds. Completed calls only, over
+            # BOTH normalized shapes: command events and tool_call events (the
+            # normalizer emits type "tool_call" for non-shell tools, which
+            # command_events deliberately excludes).
+            completed_calls = [e for e in events
+                               if e.get("type") in {"command", "tool_call"}
+                               and str(e.get("status", "completed")).casefold() not in {"in_progress", "started", "running"}]
             tool = assertion.get("tool")
             if tool:
-                selected = [command_text(e) or str(e.get("name", "")) for e in command_events(events)
-                            if str(e.get("name", "")).casefold() == str(tool).casefold()
-                            or (str(tool).casefold() in {"bash", "shell", "command"} and e.get("type") == "command")]
+                tool_folded = str(tool).casefold()
+                selected = [command_text(e) or str(e.get("name", "")) for e in completed_calls
+                            if str(e.get("name", "")).casefold() == tool_folded
+                            or (tool_folded in {"bash", "shell", "command"} and e.get("type") == "command")]
             else:
-                selected = commands
+                selected = [command_text(e) or str(e.get("name", "")) for e in completed_calls]
             order = assertion.get("order")
             if isinstance(order, list) and order:
                 cursor = 0
@@ -3909,8 +3933,14 @@ def assertion_label(assertion: dict[str, Any]) -> str:
     return str(assertion.get("name") or assertion.get("description") or assertion.get("type") or "assertion")
 
 
-def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[str, Any]) -> str:
-    return f"{case_id}::{variant}::run-{run_number}::{assertion_label(assertion)}"
+def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[str, Any], model: str | None = None) -> str:
+    """One verdict key per (case, model, variant, run, assertion). The model
+    segment appears only on model-fanned runs (roadmap 2.1) — without it,
+    case-1/m1/with_skill and case-1/m2/with_skill would share an ID and the
+    last-loaded verdict would silently apply to both models. Single-model IDs
+    keep the historical shape."""
+    model_segment = f"{model}::" if model else ""
+    return f"{case_id}::{model_segment}{variant}::run-{run_number}::{assertion_label(assertion)}"
 
 
 def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
@@ -4001,12 +4031,14 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
     selected_variants = variants or manifest.get("variants", DEFAULT_VARIANTS)
     tasks: list[dict[str, Any]] = []
     for case in iter_cases(manifest, split):
-        for _model_name, model_root in discover_case_model_roots(runs, case["id"], selected_variants):
+        for model_name, model_root in discover_case_model_roots(runs, case["id"], selected_variants):
             for variant in selected_variants:
                 for run_number, base in discover_run_bases_under(model_root / variant):
                     text, output_path = read_output_base(base)
                     meta = read_metadata_base(base)
-                    _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={})
+                    # The layout model rides into judge_task_id so a fanned run's
+                    # verdicts merge back onto the right model's rows.
+                    _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={}, model=model_name)
                     tasks.extend(judge_tasks)
     return tasks
 
@@ -4057,9 +4089,24 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     assertion = task.get("assertion", {})
     threshold = assertion.get("threshold", parsed.get("threshold", 1))
     score = parsed.get("score")
-    passed = judge_verdict_passed({**parsed, "threshold": threshold})
+    graded_payload: dict[str, Any] = {}
+    if assertion.get("graded_dimensions") and isinstance(parsed.get("dimension_scores"), dict):
+        graded_payload["dimension_scores"] = parsed["dimension_scores"]
+    if assertion.get("dynamic_rubric") and isinstance(parsed.get("criteria"), list):
+        graded_payload["criteria"] = parsed["criteria"]
+    if graded_payload:
+        # Graded shapes (roadmap 2.2): the verdict comes from the SAME owner the
+        # merge uses (merged_qualitative_entry), and the graded payload rides
+        # the row so the merge can re-derive it — a graded response carries no
+        # top-level passed/score, so the plain path would file it as failed.
+        graded_entry = merged_qualitative_entry(assertion, parsed, task["judge_task_id"])
+        passed = bool(graded_entry.get("passed"))
+        score = graded_entry.get("score")
+    else:
+        passed = judge_verdict_passed({**parsed, "threshold": threshold})
     evidence = parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or parse_error or "judge command completed"
     row = {
+        **graded_payload,
         "judge_task_id": task["judge_task_id"],
         "case_id": task.get("case_id"),
         "variant": task.get("variant"),
@@ -4510,7 +4557,7 @@ def grade_case_variant(
             expanded = expand_judge_preset(assertion)
             if turn_n is not None:
                 expanded = {**expanded, "name": f"turn-{turn_n}: {assertion_label(expanded)}"}
-            jid = judge_task_id(case["id"], variant, run_number, expanded)
+            jid = judge_task_id(case["id"], variant, run_number, expanded, model=model)
             judged = judge_results.get(jid)
             if judged:
                 entry = merged_qualitative_entry(expanded, judged, jid)
@@ -4523,6 +4570,7 @@ def grade_case_variant(
                 judge_tasks.append({
                     "judge_task_id": jid,
                     "case_id": case["id"],
+                    **({"model": model} if model else {}),
                     "variant": variant,
                     "run_number": run_number,
                     "assertion": expanded,
@@ -4568,8 +4616,13 @@ def grade_case_variant(
     efficiency_rows = [r for r in gate_objective if r.get("type") in EFFICIENCY_ASSERTIONS]
     process_passed = sum(1 for r in process_rows if r["passed"])
     efficiency_passed = sum(1 for r in efficiency_rows if r["passed"])
-    qualitative_passed = sum(1 for r in qualitative if r["passed"])
-    qualitative_total = len(qualitative)
+    # Soft qualitative rows (the judge/rubric default) feed ONLY the graded
+    # channel; the qualitative/combined pass rates are carried by gate and
+    # critical qualitative rows, mirroring the objective split above. Declare
+    # severity: "gate" on a judge assertion to keep it in the pass rate.
+    gate_qualitative = [r for r in qualitative if r.get("severity") in {"gate", "critical"}]
+    qualitative_passed = sum(1 for r in gate_qualitative if r["passed"])
+    qualitative_total = len(gate_qualitative)
     combined_passed = objective_passed + qualitative_passed
     combined_total = objective_total + qualitative_total
     soft_scores = [r["score"] for r in soft_rows if isinstance(r.get("score"), (int, float))]
@@ -5320,7 +5373,9 @@ def qualitative_by_visibility(results: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     scorable_rows = ResultSet(results).scorable().all
     for label, splits in [("held_out", {"holdout", "holdback"}), ("tune_visible", None)]:
-        rows = [r for r in scorable_rows if r.get("qualitative_total")
+        # A judged run counts whichever channel its judges fed: gate judges fill
+        # qualitative_total, soft (default) judges fill soft_total/graded_score.
+        rows = [r for r in scorable_rows if (r.get("qualitative_total") or r.get("soft_total"))
                 and ((r.get("split") in splits) if splits else (r.get("split") not in {"holdout", "holdback"}))]
         if not rows:
             continue
@@ -5547,10 +5602,12 @@ def result_failure_lines(result: dict[str, Any]) -> list[str]:
         return [f"missing output under {result.get('run_base', '')}"]
     if not result.get("execution_valid", True):
         return [f"execution error (infra failure) under {result.get('run_base', '')}"]
+    # Objective AND qualitative failures fail the testcase; soft rows feed the
+    # graded channel only, so they never flip a JUnit verdict.
     return [
         f"{a.get('name')}: {a.get('evidence', '')}"
-        for a in result.get("assertions", [])
-        if not a.get("passed")
+        for a in result.get("assertions", []) + result.get("qualitative_assertions", [])
+        if not a.get("passed") and a.get("severity") != "soft"
     ]
 
 
@@ -6909,8 +6966,11 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
         if r.get("objective_pass_rate") is not None:
             obj.setdefault(cid, {}).setdefault(v, []).append(r["objective_pass_rate"])
         cr = r.get("combined_pass_rate")
-        if cr is None:
-            cr = r.get("objective_pass_rate")
+        # Soft judges live in graded_score, not combined; the qualitative signal
+        # this function looks for rides whichever channel the judge fed.
+        if cr is None or (r.get("combined_total") == r.get("objective_total") and isinstance(r.get("graded_score"), (int, float))):
+            blended = [x for x in (cr, r.get("graded_score")) if isinstance(x, (int, float))]
+            cr = statistics.mean(blended) if blended else r.get("objective_pass_rate")
         if cr is not None:
             comb.setdefault(cid, {}).setdefault(v, []).append(cr)
     base_saturated, qualitative_only = [], []
