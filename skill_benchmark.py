@@ -393,6 +393,32 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
             re.compile(pattern)
         except re.error as exc:
             die(f"{where} invalid regex {pattern!r}: {exc}")
+    if atype == "tool_call":
+        # The taxonomy selectors are mutually exclusive; each early-returns in
+        # grading, so a manifest setting two would silently drop the lower-precedence
+        # one. `expected_no_call` is a real bool (so "false"/0 can't sneak in truthy);
+        # `required_calls`/`call_set`/`order` are non-empty string lists. Only the
+        # regex-matched fields (`pattern`, `order`) are compile-checked — the
+        # name-matched `required_calls`/`call_set` are literal tool names.
+        if "expected_no_call" in assertion and not isinstance(assertion["expected_no_call"], bool):
+            die(f"{where} tool_call expected_no_call must be true or false")
+        active = ["expected_no_call"] if assertion.get("expected_no_call") is True else []
+        for key in ("required_calls", "call_set", "order"):
+            val = assertion.get(key)
+            if val is None:
+                continue
+            if not isinstance(val, list) or not val or not all(isinstance(x, str) for x in val):
+                die(f"{where} tool_call {key} must be a non-empty list of strings")
+            active.append(key)
+        if len(active) > 1:
+            die(f"{where} tool_call sets multiple selectors {active}; use exactly one of expected_no_call/required_calls/call_set/order")
+        for rx in [assertion.get("pattern"), *(assertion.get("order") or [])]:
+            if rx is None:
+                continue
+            try:
+                re.compile(str(rx))
+            except re.error as exc:
+                die(f"{where} tool_call invalid regex {rx!r}: {exc}")
     if atype == "script":
         validate_script_assertion(assertion, path, cid, index)
 
@@ -5058,16 +5084,20 @@ def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, sample
             if abs(s / n) >= target:
                 hits += 1
         method = "sign-flip-exact"
+        # Exact enumeration counts the observed sign pattern itself, so p is never 0.
+        p = hits / total
     else:
         rng = random.Random(0)
-        total = samples
         hits = 0
         for _ in range(samples):
             s = sum(-d if rng.random() < 0.5 else d for d in deltas)
             if abs(s / n) >= target:
                 hits += 1
         method = "sign-flip-sampled"
-    p = hits / total
+        # Monte-Carlo permutation p uses the (b+1)/(m+1) estimator: the observed
+        # pattern is one valid permutation under H0, so a sampled p is never a
+        # (statistically impossible) exact 0.
+        p = (hits + 1) / (samples + 1)
     return {"method": method, "n": n, "observed_mean_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
 
 
@@ -5114,7 +5144,9 @@ def two_sample_permutation_significance(a: list[float], b: list[float], *, max_e
             if abs(delta_for(idx[:na])) >= target:
                 hits += 1
         method = "two-sample-permutation-sampled"
-        p = hits / samples
+        # (b+1)/(m+1) Monte-Carlo estimator: the observed labeling is itself a
+        # valid permutation, so a sampled p is never an impossible exact 0.
+        p = (hits + 1) / (samples + 1)
     return {"method": method, "n_a": na, "n_b": nb, "observed_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
 
 

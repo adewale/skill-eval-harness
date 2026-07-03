@@ -103,6 +103,25 @@ class TwoSamplePermutationTests(unittest.TestCase):
         self.assertEqual(r1, r2)
         self.assertEqual(r1["method"], "two-sample-permutation-sampled")   # actually exercising the sampled path
 
+    def test_noisy_non_degenerate_effects(self):
+        # not perfect separation: a strong noisy effect (7-1 vs 1-7) is significant;
+        # a moderate one (4-1 vs 1-4, exact) is not; a weak one is not.
+        strong = sb.two_sample_permutation_significance([1, 1, 1, 1, 1, 1, 1, 0], [0, 0, 0, 0, 0, 0, 0, 1])
+        self.assertTrue(strong["significant_at_0_05"])
+        self.assertLess(strong["p_value"], 0.05)
+        moderate = sb.two_sample_permutation_significance([1, 1, 1, 1, 0], [0, 0, 0, 0, 1])
+        self.assertFalse(moderate["significant_at_0_05"])
+        self.assertAlmostEqual(moderate["p_value"], 0.206349, places=5)   # exact, deterministic
+        self.assertFalse(sb.two_sample_permutation_significance([1, 1, 0, 0], [1, 0, 0, 0])["significant_at_0_05"])
+
+    def test_sampled_p_is_never_exact_zero(self):
+        # (b+1)/(m+1) Monte-Carlo estimator: a sampled p can never be an impossible 0.0
+        r = sb.two_sample_permutation_significance([1.0] * 12, [0.0] * 12)   # sampled, perfect separation
+        self.assertGreater(r["p_value"], 0.0)
+        self.assertAlmostEqual(r["p_value"], 1 / 4097, places=6)
+        # and the pre-existing sign-flip sampled branch (n>14) is corrected too
+        self.assertGreater(sb.sign_flip_significance([0.5] * 20)["p_value"], 0.0)
+
 
 class JudgeAlignmentTests(unittest.TestCase):
     def test_cohen_kappa_chance_corrects(self):
@@ -251,6 +270,47 @@ class ErrorAnalysisTests(unittest.TestCase):
         self.assertEqual(len(out["review_queue"]), 2)
         self.assertEqual(out["review_queue_truncated"], 3)
         self.assertEqual(out["summary"]["failing_or_errored_runs"], 5)   # taxonomy still counts all
+
+
+class ToolCallValidationTests(unittest.TestCase):
+    """P2: validate_case_assertion rejects malformed tool_call assertions at
+    manifest-validation time rather than degrading silently in grading."""
+    def _validate(self, assertion):
+        sb.validate_case_assertion("c1", "a", 0, assertion, Path("."))
+
+    def test_valid_single_selectors_pass(self):
+        self._validate({"type": "tool_call", "required_calls": ["Read"]})
+        self._validate({"type": "tool_call", "call_set": ["Read", "Grep"]})
+        self._validate({"type": "tool_call", "expected_no_call": True, "pattern": "curl"})   # pattern is a modifier, not a 2nd selector
+        self._validate({"type": "tool_call", "order": ["Read", "Edit"]})
+        self._validate({"type": "tool_call", "tool": "Read"})                                # legacy pattern/count path
+
+    def test_rejects_multiple_selectors(self):
+        with self.assertRaises(SystemExit):
+            self._validate({"type": "tool_call", "required_calls": ["Read"], "call_set": ["Read"]})
+        with self.assertRaises(SystemExit):
+            self._validate({"type": "tool_call", "expected_no_call": True, "required_calls": ["Read"]})
+
+    def test_rejects_bad_list_types(self):
+        for bad in ("Read", [], [1, 2], ["ok", 3]):
+            with self.assertRaises(SystemExit):
+                self._validate({"type": "tool_call", "required_calls": bad})
+
+    def test_rejects_non_bool_expected_no_call(self):
+        with self.assertRaises(SystemExit):
+            self._validate({"type": "tool_call", "expected_no_call": "false"})   # the string footgun
+        with self.assertRaises(SystemExit):
+            self._validate({"type": "tool_call", "expected_no_call": 1})
+
+    def test_rejects_invalid_regex_in_pattern_or_order(self):
+        with self.assertRaises(SystemExit):
+            self._validate({"type": "tool_call", "pattern": "["})
+        with self.assertRaises(SystemExit):
+            self._validate({"type": "tool_call", "order": ["ok", "("]})
+
+    def test_literal_name_selectors_are_not_regex_validated(self):
+        # required_calls/call_set are exact tool NAMES, so a regex-special name is fine
+        self._validate({"type": "tool_call", "required_calls": ["Read(", "a.b"]})
 
 
 if __name__ == "__main__":
