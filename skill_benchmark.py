@@ -17,6 +17,7 @@ import difflib
 import hashlib
 import html
 import json
+import math
 import os
 import random
 import re
@@ -30,7 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import yaml
 
@@ -392,6 +393,32 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
             re.compile(pattern)
         except re.error as exc:
             die(f"{where} invalid regex {pattern!r}: {exc}")
+    if atype == "tool_call":
+        # The taxonomy selectors are mutually exclusive; each early-returns in
+        # grading, so a manifest setting two would silently drop the lower-precedence
+        # one. `expected_no_call` is a real bool (so "false"/0 can't sneak in truthy);
+        # `required_calls`/`call_set`/`order` are non-empty string lists. Only the
+        # regex-matched fields (`pattern`, `order`) are compile-checked — the
+        # name-matched `required_calls`/`call_set` are literal tool names.
+        if "expected_no_call" in assertion and not isinstance(assertion["expected_no_call"], bool):
+            die(f"{where} tool_call expected_no_call must be true or false")
+        active = ["expected_no_call"] if assertion.get("expected_no_call") is True else []
+        for key in ("required_calls", "call_set", "order"):
+            val = assertion.get(key)
+            if val is None:
+                continue
+            if not isinstance(val, list) or not val or not all(isinstance(x, str) for x in val):
+                die(f"{where} tool_call {key} must be a non-empty list of strings")
+            active.append(key)
+        if len(active) > 1:
+            die(f"{where} tool_call sets multiple selectors {active}; use exactly one of expected_no_call/required_calls/call_set/order")
+        for rx in [assertion.get("pattern"), *(assertion.get("order") or [])]:
+            if rx is None:
+                continue
+            try:
+                re.compile(str(rx))
+            except re.error as exc:
+                die(f"{where} tool_call invalid regex {rx!r}: {exc}")
     if atype == "script":
         validate_script_assertion(assertion, path, cid, index)
 
@@ -2887,6 +2914,43 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
                             or (tool_folded in {"bash", "shell", "command"} and e.get("type") == "command")]
             else:
                 selected = [command_text(e) or str(e.get("name", "")) for e in completed_calls]
+            # 6: BFCL-style call taxonomy over completed-call TOOL NAMES (exact,
+            # case-insensitive) — NOT a substring/regex over the rendered command, so
+            # `required_calls: ["Read"]` means the Read tool ran, and a shell `cat
+            # readme` (name "" / "bash") does not spuriously satisfy it. For regex or
+            # command-text matching use `pattern`/`order`/`command_ran` instead. These
+            # are order-independent set relations, distinct from `order`.
+            call_names = [str(e.get("name", "")).casefold() for e in completed_calls if e.get("name")]
+            if assertion.get("expected_no_call"):
+                # Irrelevance detection: the named tool (or, if `pattern` is given, any
+                # tool NAME matching that regex) must NOT have been called.
+                pat = assertion.get("pattern")
+                if pat:
+                    offending = sorted({n for n in call_names if regex_hit(str(pat), n, ci)})
+                elif tool:
+                    offending = sorted({n for n in call_names if n == str(tool).casefold()})
+                else:
+                    offending = sorted(set(call_names))   # no tool call at all
+                return (not offending), ("no matching tool call (as required)" if not offending else f"unexpected tool call(s): {offending[:5]}")
+            required = assertion.get("required_calls")
+            if isinstance(required, list) and required:
+                # Subset: every required tool name must appear >= once; extras allowed.
+                present = set(call_names)
+                missing = sorted({str(p) for p in required if str(p).casefold() not in present})
+                return (not missing), (f"all {len(required)} required tool call(s) present" if not missing else f"missing required tool call(s): {missing}")
+            call_set = assertion.get("call_set")
+            if isinstance(call_set, list) and call_set:
+                # Exact multiset of tool names: same names AND same multiplicities, no
+                # unexpected named calls. (Nameless events like shell commands are not
+                # counted here — grade those with command_ran/command_order.)
+                from collections import Counter
+                want = Counter(str(p).casefold() for p in call_set)
+                got = Counter(call_names)
+                if want != got:
+                    missing = sorted((want - got).elements())
+                    unexpected = sorted((got - want).elements())
+                    return False, f"call_set mismatch — missing={missing}; unexpected={unexpected[:5]}"
+                return True, f"call_set matched exactly ({sum(got.values())} named call(s))"
             order = assertion.get("order")
             if isinstance(order, list) and order:
                 cursor = 0
@@ -4434,6 +4498,176 @@ def compare_judges(args: argparse.Namespace) -> int:
     return 0
 
 
+def cohen_kappa(a: list[bool], b: list[bool]) -> float | None:
+    """Cohen's kappa for two binary raters — chance-corrected agreement, which
+    (unlike raw % agreement) does not flatter a judge on an imbalanced label set.
+    Degenerate case (both raters unanimous) returns 1.0 iff they also agree."""
+    n = len(a)
+    if n == 0:
+        return None
+    po = sum(1 for x, y in zip(a, b) if x == y) / n
+    pa, pb = sum(a) / n, sum(b) / n
+    pe = pa * pb + (1 - pa) * (1 - pb)
+    if pe >= 1.0 - 1e-12:
+        return 1.0 if po >= 1.0 - 1e-12 else 0.0
+    return (po - pe) / (1 - pe)
+
+
+def kappa_band(kappa: float | None) -> str | None:
+    if kappa is None:
+        return None
+    if kappa > 0.8:
+        return "almost-perfect"
+    if kappa > 0.6:
+        return "substantial"
+    if kappa > 0.4:
+        return "moderate"
+    if kappa > 0.2:
+        return "fair"
+    if kappa > 0:
+        return "slight"
+    return "poor (<= chance)"
+
+
+def judge_alignment_report(human: dict[str, dict[str, Any]], judge: dict[str, dict[str, Any]], *, min_labels: int = 50) -> dict[str, Any]:
+    """Feature 2: validate a JUDGE against HUMAN labels (not another judge). Both
+    are keyed by judge_task_id with a `passed` bool. Reports agreement, Cohen's
+    kappa, and precision/recall/F1 treating the human label as ground truth and
+    'pass' as the positive class — the accuracy check `compare-judges`
+    (judge-vs-judge sensitivity) deliberately does not make. Fully model-free."""
+    ids = sorted(set(human) & set(judge))
+    h = [bool(human[i].get("passed")) for i in ids]
+    j = [bool(judge[i].get("passed")) for i in ids]
+    n = len(ids)
+    tp = sum(1 for x, y in zip(h, j) if x and y)
+    tn = sum(1 for x, y in zip(h, j) if not x and not y)
+    fp = sum(1 for x, y in zip(h, j) if not x and y)   # judge passed a human-fail
+    fn = sum(1 for x, y in zip(h, j) if x and not y)    # judge failed a human-pass
+    agreement = (tp + tn) / n if n else None
+    precision = tp / (tp + fp) if (tp + fp) else None
+    recall = tp / (tp + fn) if (tp + fn) else None
+    # F1 from counts, not from precision*recall: precision/recall of 0.0 are falsy,
+    # so the product form returned None for a label-inverting judge (tp=0, the very
+    # worst case this command exists to flag). 2*tp/(2*tp+fp+fn) is 0.0 when any
+    # positive exists and None only when there are no positives at all.
+    f1_den = 2 * tp + fp + fn
+    f1 = (2 * tp / f1_den) if f1_den else None
+    kappa = cohen_kappa(h, j)
+    warnings = []
+    if n == 0:
+        warnings.append("no judge_task_id overlap between labels and judge results (nothing to compare)")
+    elif n < min_labels:
+        warnings.append(f"only {n} matched labels (< {min_labels}); alignment metrics are unstable — collect more human labels")
+    return {
+        "n": n,
+        "human_labels": len(human),
+        "judge_verdicts": len(judge),
+        "unmatched_human_ids": sorted(set(human) - set(judge))[:20],
+        "unmatched_judge_ids": sorted(set(judge) - set(human))[:20],
+        "agreement": round(agreement, 4) if agreement is not None else None,
+        "cohen_kappa": round(kappa, 4) if kappa is not None else None,
+        "kappa_interpretation": kappa_band(kappa),
+        "precision": round(precision, 4) if precision is not None else None,
+        "recall": round(recall, 4) if recall is not None else None,
+        "f1": round(f1, 4) if f1 is not None else None,
+        "confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        "warnings": warnings,
+    }
+
+
+def judge_alignment_command(args: argparse.Namespace) -> int:
+    human = load_judge_results(args.labels)
+    judge = load_judge_results(args.judge_results)
+    if not human:
+        die(f"no human labels loaded from {args.labels}")
+    report = judge_alignment_report(human, judge, min_labels=int(getattr(args, "min_labels", 50)))
+    if getattr(args, "out", None):
+        write_json(Path(args.out), report)
+    else:
+        print(json.dumps(report, indent=2))
+    return 0
+
+
+def assertion_klass(atype: str | None) -> str:
+    if atype in QUALITATIVE_ASSERTIONS:
+        return "judge"
+    if atype in PROCESS_ASSERTIONS:
+        return "process"
+    if atype in EFFICIENCY_ASSERTIONS:
+        return "efficiency"
+    return "text"
+
+
+def first_failure(result: dict[str, Any]) -> dict[str, Any] | None:
+    """The first upstream failure in a run (Hamel's open-coding rule: an upstream
+    error causes the downstream ones, so anchor on the first). Soft rows feed the
+    graded channel only, so they never count as a failure here."""
+    for a in result.get("assertions", []) + result.get("qualitative_assertions", []):
+        if not a.get("passed") and a.get("severity") != "soft":
+            return {"name": a.get("name"), "type": a.get("type"), "klass": assertion_klass(a.get("type")), "evidence": str(a.get("evidence", ""))[:400]}
+    return None
+
+
+def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[str, Any]:
+    """Feature 8: open-coding review queue + axial failure taxonomy over a
+    benchmark report (model-free). The queue is one row per failing/errored run
+    anchored on its first failure (the 'look at your data' substrate); the
+    taxonomy counts those first-failures by category so the >60%-in-a-few-buckets
+    pattern is visible. Reuses the report's own case_flags as a second histogram."""
+    results = report.get("results", [])
+    queue: list[dict[str, Any]] = []
+    taxonomy: dict[str, dict[str, Any]] = {}
+    for r in results:
+        if r.get("missing_output"):
+            category, ff = "missing-output", None
+        elif not r.get("execution_valid", True):
+            category, ff = "execution-error", None
+        elif r.get("vetoed"):
+            crit = ", ".join(r.get("critical_failures", []) or [])
+            category, ff = f"critical-failure:{crit}" if crit else "critical-failure", None
+        else:
+            ff = first_failure(r)
+            if ff is None:
+                continue   # a passing run is not a datum for error analysis
+            category = f"{ff['klass']}:{ff.get('name') or ff.get('type') or 'unnamed'}"
+        entry = {
+            "case_id": r.get("case_id"), "variant": r.get("variant"), "model": r.get("model"),
+            "run_base": r.get("run_base"), "category": category,
+            "objective_pass_rate": r.get("objective_pass_rate"), "combined_pass_rate": r.get("combined_pass_rate"),
+            "first_failure": ff, "note": "",   # open-text slot for a human annotation
+        }
+        queue.append(entry)
+        bucket = taxonomy.setdefault(category, {"category": category, "count": 0, "example_case": r.get("case_id"), "example_evidence": (ff or {}).get("evidence", "")})
+        bucket["count"] += 1
+    total = len(queue)
+    ranked = sorted(taxonomy.values(), key=lambda b: (-b["count"], b["category"]))
+    for b in ranked:
+        b["share"] = round(b["count"] / total, 4) if total else None
+    # The report's own case_flags, as a second (case-level) axial histogram.
+    flag_hist: dict[str, int] = {}
+    for cf in report.get("case_flags", []):
+        for flag in cf.get("flags", []):
+            key = flag.split(":")[0].strip() if ":" in flag else flag
+            flag_hist[key] = flag_hist.get(key, 0) + 1
+    return {
+        "summary": {"failing_or_errored_runs": total, "distinct_categories": len(ranked)},
+        "taxonomy": ranked,
+        "case_flag_histogram": dict(sorted(flag_hist.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "review_queue": queue[:limit],
+        "review_queue_truncated": max(0, total - limit),
+    }
+
+
+def error_analysis_command(args: argparse.Namespace) -> int:
+    report = load_json(Path(args.benchmark))
+    out = error_analysis_report(report, limit=int(getattr(args, "limit", 100)))
+    if getattr(args, "out", None):
+        write_json(Path(args.out), out)
+    else:
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
 def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], jid: str) -> dict[str, Any]:
     """Single owner for merging one judge verdict into a graded result row.
     Three judge shapes (roadmap 2.2): plain verdict (passed/score+threshold),
@@ -4850,17 +5084,153 @@ def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, sample
             if abs(s / n) >= target:
                 hits += 1
         method = "sign-flip-exact"
+        # Exact enumeration counts the observed sign pattern itself, so p is never 0.
+        p = hits / total
     else:
         rng = random.Random(0)
-        total = samples
         hits = 0
         for _ in range(samples):
             s = sum(-d if rng.random() < 0.5 else d for d in deltas)
             if abs(s / n) >= target:
                 hits += 1
         method = "sign-flip-sampled"
-    p = hits / total
+        # Monte-Carlo permutation p uses the (b+1)/(m+1) estimator: the observed
+        # pattern is one valid permutation under H0, so a sampled p is never a
+        # (statistically impossible) exact 0.
+        p = (hits + 1) / (samples + 1)
     return {"method": method, "n": n, "observed_mean_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
+
+
+def two_sample_permutation_significance(a: list[float], b: list[float], *, max_exact_total: int = 18, samples: int = 4096) -> dict[str, Any]:
+    """Two-sided label-shuffle permutation test on the difference of means of two
+    UNPAIRED groups (roadmap: the ablation confirmation gate). `a` is the with_skill
+    per-run scores, `b` the ablation arm's; under H0 (removing the component does
+    nothing) the arm label is exchangeable, so p = share of relabelings whose
+    |mean(a')-mean(b')| reaches the observed gap. This is the right unit for the
+    n-per-arm replication the walkthrough leaned on: with one run per arm the only
+    two relabelings tie, so p=1.0 and a single-shot ablation can never confirm.
+    Exact enumeration while the combered space is small, else a SEEDED sample so a
+    re-grade stays byte-identical (CF.3)."""
+    na, nb = len(a), len(b)
+    if na == 0 or nb == 0:
+        return {"method": "two-sample-permutation", "n_a": na, "n_b": nb, "observed_delta": None, "p_value": None, "significant_at_0_05": False}
+    observed = statistics.mean(a) - statistics.mean(b)
+    pool = list(a) + list(b)
+    total_n = na + nb
+    if all(abs(x - pool[0]) < 1e-12 for x in pool):
+        return {"method": "two-sample-permutation", "n_a": na, "n_b": nb, "observed_delta": 0.0, "p_value": 1.0, "significant_at_0_05": False}
+    target = abs(observed) - 1e-12
+    total_sum = sum(pool)
+    def delta_for(idx_a: Iterable[int]) -> float:
+        sa = sum(pool[i] for i in idx_a)
+        mean_a = sa / na
+        mean_b = (total_sum - sa) / nb
+        return mean_a - mean_b
+    if math.comb(total_n, na) <= max(1, max_exact_total ** 2) and total_n <= max_exact_total:
+        hits = 0
+        combos = 0
+        for combo in _combinations(range(total_n), na):
+            combos += 1
+            if abs(delta_for(combo)) >= target:
+                hits += 1
+        method = "two-sample-permutation-exact"
+        p = hits / combos
+    else:
+        rng = random.Random(0)
+        idx = list(range(total_n))
+        hits = 0
+        for _ in range(samples):
+            rng.shuffle(idx)
+            if abs(delta_for(idx[:na])) >= target:
+                hits += 1
+        method = "two-sample-permutation-sampled"
+        # (b+1)/(m+1) Monte-Carlo estimator: the observed labeling is itself a
+        # valid permutation, so a sampled p is never an impossible exact 0.
+        p = (hits + 1) / (samples + 1)
+    return {"method": method, "n_a": na, "n_b": nb, "observed_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
+
+
+def _combinations(items: list[int], r: int) -> Iterable[tuple[int, ...]]:
+    # Local, dependency-free itertools.combinations (kept explicit so the grade
+    # path's imports stay the audited leaf set).
+    n = len(items)
+    if r > n:
+        return
+    idx = list(range(r))
+    yield tuple(items[i] for i in idx)
+    while True:
+        for i in reversed(range(r)):
+            if idx[i] != i + n - r:
+                break
+        else:
+            return
+        idx[i] += 1
+        for j in range(i + 1, r):
+            idx[j] = idx[j - 1] + 1
+        yield tuple(items[i] for i in idx)
+
+
+def pass_at_k(n: int, c: int, k: int) -> float | None:
+    """Unbiased pass@k (roadmap 5): probability that at least one of k runs drawn
+    WITHOUT replacement from n runs (c of them successes) succeeds — `1 - C(n-c,k)/C(n,k)`.
+    NOT the biased `1-(1-c/n)^k`, which assumes replacement and underestimates."""
+    if k < 1 or k > n or n <= 0:
+        return None
+    if c >= n:
+        return 1.0
+    if n - c < k:
+        return 1.0
+    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
+
+
+def pass_hat_k(n: int, c: int, k: int) -> float | None:
+    """pass^k: probability that ALL k runs drawn without replacement succeed —
+    `C(c,k)/C(n,k)`. The reliability companion to pass@k (Anthropic's agent-eval
+    guide): pass@k asks "does the skill EVER help", pass^k "does it RELIABLY help"."""
+    if k < 1 or k > n or n <= 0:
+        return None
+    if c < k:
+        return 0.0
+    return math.comb(c, k) / math.comb(n, k)
+
+
+def build_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-(case, variant) pass@k / pass^k from the repeated-run data the harness
+    already collects (roadmap 5). A run is a SUCCESS when every objective assertion
+    passed (objective_pass_rate == 1.0); n is the scorable run count. by_variant
+    pools per-case pass@1 and the all-runs-pass rate so a variant reads as one
+    number. Deterministic — the estimators are closed-form over integer counts."""
+    by_cv = ResultSet(results).by_case_variant()
+    by_case_variant: dict[str, Any] = {}
+    variant_pass1: dict[str, list[float]] = {}
+    variant_all_pass: dict[str, list[float]] = {}
+    for case_id, by_variant in sorted(by_cv.items()):
+        for variant, rows in sorted(by_variant.items()):
+            rates = [r.get("objective_pass_rate") for r in rows if r.get("objective_pass_rate") is not None]
+            n = len(rates)
+            if n == 0:
+                continue
+            c = sum(1 for x in rates if x >= 1.0 - 1e-12)
+            ks = list(range(1, n + 1))
+            entry = {
+                "n": n, "c": c,
+                "pass_at_1": round(pass_at_k(n, c, 1), 6),
+                "pass_at_k": {str(k): round(v, 6) for k in ks if (v := pass_at_k(n, c, k)) is not None},
+                "pass_hat_k": {str(k): round(v, 6) for k in ks if (v := pass_hat_k(n, c, k)) is not None},
+            }
+            by_case_variant.setdefault(str(case_id), {})[str(variant)] = entry
+            variant_pass1.setdefault(str(variant), []).append(entry["pass_at_1"])
+            variant_all_pass.setdefault(str(variant), []).append(1.0 if c == n else 0.0)
+    by_variant_summary = {
+        v: {
+            "cases": len(variant_pass1[v]),
+            "mean_pass_at_1": round(statistics.mean(variant_pass1[v]), 6),
+            # Share of cases whose every run passed — the pass^n reliability headline.
+            "all_runs_pass_rate": round(statistics.mean(variant_all_pass[v]), 6),
+        }
+        for v in sorted(variant_pass1)
+    }
+    return {"by_case_variant": by_case_variant, "by_variant": by_variant_summary}
 
 
 def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pass_rate") -> tuple[list[float], list[float], list[dict[str, Any]]]:
@@ -5225,7 +5595,29 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             # graded run for at least one cited case. Otherwise the comparison
             # rests on missing output and must not be reported as confirmed/refuted.
             measured_pairs = [cid for cid in cases if (cid, "with_skill") in measured_cv and (cid, variant) in measured_cv]
-            reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence, "measured_cases": measured_pairs, "confirmed_cases": confirmed_cases}
+            # Feature 1: a confirmation must survive a significance test on the
+            # REPLICATED runs, not just a mean drop on one shot. The test runs PER
+            # CASE — runs of different cases have different baselines and are NOT
+            # exchangeable, so pooling them across cases both (a) lets a breadth of
+            # single-shot cases fake significance and (b) flattens a real regression
+            # on heterogeneous baselines. Each confirmed case's with_skill vs
+            # ablation runs are tested on their own; the regression is significant
+            # iff at least one confirmed case clears the bar. The exact-permutation
+            # floor means a case needs >= 4 runs per arm to ever reach p <= 0.05
+            # (C(8,4)=70 -> min p=0.0286), so a single-shot case can never confirm.
+            per_case_sig = {
+                cid: two_sample_permutation_significance(
+                    combined_rate_runs.get((cid, "with_skill"), []),
+                    combined_rate_runs.get((cid, variant), []))
+                for cid in confirmed_cases
+            }
+            significance = {
+                "method": "per-case-two-sample-permutation",
+                "significant_at_0_05": any(s.get("significant_at_0_05") for s in per_case_sig.values()),
+                "min_p_value": min((s["p_value"] for s in per_case_sig.values() if s.get("p_value") is not None), default=None),
+                "by_case": per_case_sig,
+            } if confirmed_cases else None
+            reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence, "measured_cases": measured_pairs, "confirmed_cases": confirmed_cases, "significance": significance}
             # The verdict goes through the EvidenceClass guard: CONFIRMED_CAUSAL is
             # reachable only with verified provenance, coverage, and an observed
             # regression (a cited case with BOTH a named flip and a same-case score
@@ -5235,7 +5627,16 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 reg["note"] = "invalid-skill experiment: a parser/validation rejection is not evidence of a behavioral regression"
             else:
                 evidence_class = causal_confirmation(provenance_verified=prov_ok, has_coverage=bool(measured_pairs), regression_observed=bool(confirmed_cases))
-                if not prov_ok:
+                # Significance gate (feature 1): an OBSERVED regression that is not
+                # significant across replicates is downgraded to INDETERMINATE — not
+                # REFUTED, which would wrongly claim "no regression". This is where a
+                # single-shot finding is caught: it was seen, but the noise floor
+                # cannot be ruled out until it is re-run enough per arm.
+                if evidence_class is EvidenceClass.CONFIRMED_CAUSAL and not (significance and significance.get("significant_at_0_05")):
+                    evidence_class = EvidenceClass.INDETERMINATE
+                    p = (significance or {}).get("min_p_value")
+                    reg["note"] = f"regression observed but not significant per case across replicates (min p={p}); a case needs >= 4 runs per arm to confirm"
+                elif not prov_ok:
                     reg["note"] = f"provenance unverified: {prov_note}"
                 elif not measured_pairs:
                     reg["note"] = "insufficient coverage: no cited case has a graded run in both with_skill and the ablation arm (missing output?)"
@@ -5585,6 +5986,9 @@ def build_benchmark_report(
         # so a rubric the skill could see never inflates the held-out number.
         "qualitative_by_visibility": qualitative_by_visibility(results),
         "paired_summary": paired_summary,
+        # 5: pass@k / pass^k per (case, variant) from the repeated-run data, plus a
+        # pooled per-variant reliability headline. Uses the unbiased estimator.
+        "reliability": build_reliability(results),
         "model_analysis": model_analysis_from_paired(paired_summary),
         "slice_summary": build_slice_summary(results, variants),
         "ablation_regressions": ablation_regressions,
@@ -7937,6 +8341,17 @@ def main() -> int:
     p.add_argument("--magnitude-eps", type=float, default=0.1, help="lift-spread above which the skill is judge-magnitude-sensitive")
     p.add_argument("--out")
 
+    p = sub.add_parser("judge-alignment", help="validate a judge against HUMAN labels: agreement, Cohen's kappa, precision/recall/F1 (feature 2)")
+    p.add_argument("--labels", required=True, help="human labels keyed by judge_task_id ({judge_task_id, passed}); JSONL or JSON")
+    p.add_argument("--judge-results", required=True, help="judge verdicts keyed by judge_task_id (the judge output to validate)")
+    p.add_argument("--min-labels", type=int, default=50, help="warn below this many matched labels (metrics unstable)")
+    p.add_argument("--out")
+
+    p = sub.add_parser("error-analysis", help="open-coding review queue + axial failure taxonomy over a benchmark.json (feature 8; model-free)")
+    p.add_argument("--benchmark", required=True, help="benchmark.json produced by `skill-benchmark benchmark --out`")
+    p.add_argument("--limit", type=int, default=100, help="max review-queue rows to emit")
+    p.add_argument("--out")
+
     p = sub.add_parser("export-anthropic")
     p.add_argument("manifest")
     p.add_argument("--runs", required=True)
@@ -8110,6 +8525,10 @@ def main() -> int:
         return report_command(args)
     if args.cmd == "compare-judges":
         return compare_judges(args)
+    if args.cmd == "judge-alignment":
+        return judge_alignment_command(args)
+    if args.cmd == "error-analysis":
+        return error_analysis_command(args)
     if args.cmd == "export-anthropic":
         return export_anthropic(args)
     if args.cmd == "compare-tasks":

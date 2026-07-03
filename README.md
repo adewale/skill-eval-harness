@@ -82,7 +82,7 @@ benchmark -> benchmark.json with summary, results, and case_flags
 viewer    -> review.html with assertion evidence and output previews
 ```
 
-`benchmark.json` records one row per case/variant/run, plus aggregate pass rates, timing/token summaries, and flags for saturated, no-lift, flaky, or with-skill-failed cases.
+`benchmark.json` records one row per case/variant/run, plus aggregate pass rates, timing/token summaries, and flags for saturated, no-lift, flaky, or with-skill-failed cases. It also carries a `reliability` block — unbiased **pass@k** and **pass^k** per (case, variant) from the repeated runs — beside the paired lift's sign-flip `significance`.
 
 ## Installation
 
@@ -230,7 +230,7 @@ Objective assertion types:
 | `skill_invoked` | Trace/process check that the runner loaded the skill, or did not, as expected. |
 | `command_ran` / `command_not_ran` | Trace/process checks over normalized command events. |
 | `command_order` | Trace/process check that commands appeared in a required order. |
-| `tool_call` | A tool call matching `tool`/`pattern` occurred (with `min_count`/`max_count` bounds), or an ordered `order` list of calls. Matches completed call inputs, never outputs. |
+| `tool_call` | A tool call matching `tool`/`pattern` occurred (with `min_count`/`max_count` bounds), or an ordered `order` list of calls. BFCL-style set relations over completed-call **tool names** (exact, case-insensitive — *not* substring): `expected_no_call` (the named tool, or any name matching `pattern`, must *not* have been called), `required_calls` (an order-independent subset of tool names that must all appear, extras allowed), `call_set` (an exact multiset of tool names — same names and multiplicities, no unexpected named calls). Use `pattern`/`order`/`command_ran` for regex or command-text matching. Matches completed call inputs, never outputs. |
 | `tool_count_le` / `no_repeated_command_loop` | Trace/process budgets for tool use and thrashing. |
 | `total_tokens_le` / `elapsed_seconds_le` / `command_count_le` | Efficiency checks over `metrics.json`, `metadata.json`, or normalized events. |
 
@@ -407,6 +407,29 @@ skill-benchmark compare-judges \
 ```
 
 It reports each judge's `with_skill − without_skill` combined lift and sets `sign_sensitive` (judges disagree the skill helps), `magnitude_sensitive` (lift spread > `--magnitude-eps`, default 0.1), and `judge_sensitive` (either). Needs ≥2 `--report name=path`. Every verdict from `judge` carries its `judge_model`, so which model graded a run is always recoverable.
+
+`compare-judges` asks *"does the result depend on which judge I picked?"* — not *"is the judge correct?"* For that, validate the judge against **human labels**:
+
+### Validate a judge against human labels (judge-alignment)
+
+Two judges can agree and both be wrong. `judge-alignment` scores a judge's verdicts against a human-labeled gold set (both keyed by `judge_task_id` with a `passed` bool), treating the human label as ground truth:
+
+```bash
+skill-benchmark judge-alignment \
+  --labels human-labels.jsonl \
+  --judge-results judge-results.jsonl \
+  --out judge-alignment.json
+```
+
+It reports `agreement`, **Cohen's `cohen_kappa`** (chance-corrected, so an imbalanced label set can't flatter the judge) with a `kappa_interpretation` band, and `precision`/`recall`/`f1` plus the `confusion` matrix. Below `--min-labels` (default 50) matched labels it warns that the metrics are unstable. Fully model-free — it grades a judge you already ran.
+
+### Error analysis (open coding → axial taxonomy)
+
+`error-analysis` turns a `benchmark.json` into the "look at your data" surface: an open-coding **review queue** (one row per failing/errored run, anchored on its *first* upstream failure, with an open `note` slot) and an axial **failure taxonomy** (first-failures counted by category, so the few dominant buckets are visible), alongside the report's own case-flag histogram. Model-free.
+
+```bash
+skill-benchmark error-analysis --benchmark benchmark.json --out error-analysis.json
+```
 
 ### Pi trace runners
 
@@ -714,7 +737,7 @@ skill-benchmark materialize-ablations ../repo/evals/shared-benchmark.json \
 
 Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree (every manifest root, identical surface to `with_skill`, differing only by the declared edit). Mechanisms are `frontmatter_field`, `section` (fence-aware), `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, `asset`, and `preprocess` (inline `` !`command` ``), composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`. Materialized arms are blind: the model-visible input is identical to `with_skill` (the hypothesis lives only in harness metadata).
 
-The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), `run_pi_trigger_eval.py --ablation <id>` trigger-tests a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the trigger adapter. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
+The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), `run_pi_trigger_eval.py --ablation <id>` trigger-tests a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the trigger adapter. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision **and** the replicated regression clears a significance test (a two-sided permutation test run **per case** over that case's per-run scores; a regression is significant iff at least one confirmed case clears p≤0.05). Because the exact permutation discretizes, a case needs **≥4 runs per arm** to ever reach significance (`C(8,4)=70` → minimum p `2/70≈0.029`); a single-shot (or 3-per-arm) ablation ties at a p it cannot pass and is reported `INDETERMINATE`, never confirmed. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
 
 **Evidence asymmetry (discovery vs answer).** The two paths do not yet have equal evidentiary strength:
 

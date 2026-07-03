@@ -59,7 +59,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:3946`, merged in `grade_case_variant:4498`).
+threshold, evidence}` (`load_judge_results:4010`, merged in `grade_case_variant:4732`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -174,6 +174,16 @@ These are tests of the harness, not a new eval suite; sequence them before the b
 
 - [x] 4.1 Embedding-backed `similarity` scorer (`mode: embedding` behind opt-in `--embed-cmd`; fails closed without it)
 - [x] 4.2 Auto-generation of harder cases (shipped inside 2.10: `suggest-cases --generate-cmd`, mocked in tests, no manifest mutation)
+
+## Post-#22 follow-ups (trustworthy-measurement gaps from the awesome-evals assessment)
+
+- [x] Significance gate on the ablation confirmation (feature 1): `expected_regression_confirmed` requires a two-sided permutation test over the replicated per-run scores to clear p ≤ 0.05; an observed-but-underpowered drop is `INDETERMINATE`, not confirmed. Single-shot ablations can no longer confirm.
+- [x] `judge-alignment` (feature 2): validate a judge against **human labels** — agreement, Cohen's kappa, precision/recall/F1 — the accuracy check `compare-judges` (judge-vs-judge sensitivity) does not make.
+- [x] `reliability` report block (feature 5): unbiased **pass@k** and **pass^k** per (case, variant) from repeated runs, plus a pooled per-variant headline.
+- [x] `tool_call` BFCL-style taxonomy (feature 6): `expected_no_call`, `required_calls` (subset), `call_set` (exact multiset).
+- [x] `error-analysis` (feature 8): open-coding review queue + axial failure taxonomy over a `benchmark.json`, model-free.
+- [ ] **Contamination perimeter (output side)** — still prompt-side only: output↔answer n-gram overlap, canary-GUID tripwire, `released_at`/cutoff gate. Lower priority for a pre-production skill-authoring harness.
+- [ ] **Judge robustness probes** — order-flip self-consistency and empty/master-key negative controls (need a live `--judge-cmd`; keep out of the core grade path like the other model-touching commands).
 
 ## Punted — questionable value
 
