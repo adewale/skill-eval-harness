@@ -72,6 +72,122 @@ class PassAtKTests(unittest.TestCase):
         self.assertEqual(rel["by_variant"]["with_skill"]["all_runs_pass_rate"], 1.0)
 
 
+class PairedReliabilityLiftTests(unittest.TestCase):
+    """G6 — paired with_skill − without_skill lift on pass@k / pass^k, the sliver
+    of the reliability item (#5) that build_reliability leaves per-arm."""
+
+    @staticmethod
+    def _arm(case_id, variant, n, c, model=None):
+        rows = []
+        for i in range(n):
+            r = {"case_id": case_id, "variant": variant, "objective_pass_rate": 1.0 if i < c else 0.0}
+            if model is not None:
+                r["model"] = model
+            rows.append(r)
+        return rows
+
+    def test_paired_case_counts_matches_per_arm_and_drops_unpaired(self):
+        results = (self._arm("c1", "with_skill", 4, 3) + self._arm("c1", "without_skill", 4, 0)
+                   + self._arm("c2", "with_skill", 3, 2)       # no without arm -> dropped
+                   + self._arm("c3", "without_skill", 3, 1))   # no with arm -> dropped
+        pairs = {cid: (w, n) for cid, w, n in sb.paired_case_counts(results)}
+        self.assertEqual(set(pairs), {"c1"})
+        self.assertEqual(pairs["c1"], ((4, 3), (4, 0)))
+        rel = sb.build_reliability(results)["by_case_variant"]["c1"]
+        self.assertEqual((rel["with_skill"]["n"], rel["with_skill"]["c"]), (4, 3))
+
+    def test_per_case_delta_equals_estimator_difference(self):
+        results = self._arm("c1", "with_skill", 4, 3) + self._arm("c1", "without_skill", 4, 0)
+        bc = sb.paired_reliability_block(sb.paired_case_counts(results))["by_case"]["c1"]
+        for k in range(1, 5):
+            self.assertAlmostEqual(bc["pass_at_k_delta"][str(k)],
+                                   round(sb.pass_at_k(4, 3, k) - sb.pass_at_k(4, 0, k), 6))
+            self.assertAlmostEqual(bc["pass_hat_k_delta"][str(k)],
+                                   round(sb.pass_hat_k(4, 3, k) - sb.pass_hat_k(4, 0, k), 6))
+        self.assertNotIn("5", bc["pass_at_k_delta"])   # k never exceeds n
+
+    def test_k_capped_at_min_of_the_two_arms(self):
+        results = self._arm("c1", "with_skill", 4, 4) + self._arm("c1", "without_skill", 2, 0)
+        bc = sb.paired_reliability_block(sb.paired_case_counts(results))["by_case"]["c1"]
+        self.assertEqual(set(bc["pass_at_k_delta"]), {"1", "2"})
+
+    def test_sign_convention(self):
+        helps = self._arm("c1", "with_skill", 4, 3) + self._arm("c1", "without_skill", 4, 0)
+        hurts = self._arm("c1", "with_skill", 4, 1) + self._arm("c1", "without_skill", 4, 3)
+        self.assertGreater(sb.paired_reliability_block(sb.paired_case_counts(helps))["by_case"]["c1"]["pass_at_1_delta"], 0)
+        self.assertLess(sb.paired_reliability_block(sb.paired_case_counts(hurts))["by_case"]["c1"]["pass_at_1_delta"], 0)
+
+    def test_pooling_per_k_excludes_short_cases(self):
+        results = (self._arm("c1", "with_skill", 4, 4) + self._arm("c1", "without_skill", 4, 0)
+                   + self._arm("c2", "with_skill", 2, 2) + self._arm("c2", "without_skill", 2, 0))
+        pooled = sb.paired_reliability_block(sb.paired_case_counts(results))["pooled"]
+        self.assertEqual(pooled["cases"], 2)
+        # k=4 exists only from c1 (c2 has 2 runs), so its pooled mean equals c1's own k=4 delta
+        c1 = sb.paired_reliability_block(sb.paired_case_counts(
+            self._arm("c1", "with_skill", 4, 4) + self._arm("c1", "without_skill", 4, 0)))["by_case"]["c1"]
+        self.assertAlmostEqual(pooled["mean_pass_at_k_delta"]["4"], c1["pass_at_k_delta"]["4"])
+
+    def test_significance_is_signflip_over_pass_at_1_deltas(self):
+        results = []
+        for i in range(6):
+            results += self._arm(f"c{i}", "with_skill", 3, 3) + self._arm(f"c{i}", "without_skill", 3, 0)
+        block = sb.paired_reliability_block(sb.paired_case_counts(results))
+        deltas = [block["by_case"][cid]["pass_at_1_delta"] for cid in sorted(block["by_case"])]
+        self.assertEqual(block["pooled"]["significance"], sb.sign_flip_significance(deltas))
+        self.assertTrue(block["pooled"]["significance"]["significant_at_0_05"])   # 6 unanimous cases
+
+    def test_zero_delta_not_significant(self):
+        results = self._arm("c1", "with_skill", 3, 2) + self._arm("c1", "without_skill", 3, 2)
+        block = sb.paired_reliability_block(sb.paired_case_counts(results))
+        self.assertEqual(block["by_case"]["c1"]["pass_at_1_delta"], 0.0)
+        self.assertFalse(block["pooled"]["significance"]["significant_at_0_05"])
+
+    def test_by_model_present_and_pooled_keys_tagged(self):
+        results = (self._arm("c1", "with_skill", 3, 3, model="m1") + self._arm("c1", "without_skill", 3, 0, model="m1")
+                   + self._arm("c1", "with_skill", 3, 0, model="m2") + self._arm("c1", "without_skill", 3, 0, model="m2"))
+        out = sb.build_paired_reliability(results)
+        self.assertEqual(set(out["by_model"]), {"m1", "m2"})
+        self.assertGreater(out["by_model"]["m1"]["by_case"]["c1"]["pass_at_1_delta"], 0)
+        self.assertEqual(out["by_model"]["m2"]["by_case"]["c1"]["pass_at_1_delta"], 0.0)
+        self.assertEqual(set(out["by_case"]), {"c1@m1", "c1@m2"})   # model-tagged, no collision
+
+    def test_unlabeled_uses_fallback_no_by_model(self):
+        out = sb.build_paired_reliability(self._arm("c1", "with_skill", 3, 3) + self._arm("c1", "without_skill", 3, 0))
+        self.assertNotIn("by_model", out)
+        self.assertEqual(set(out["by_case"]), {"c1"})
+
+    def test_deterministic(self):
+        results = self._arm("c1", "with_skill", 4, 3) + self._arm("c1", "without_skill", 4, 1)
+        self.assertEqual(sb.build_paired_reliability(results), sb.build_paired_reliability(results))
+
+    def test_end_to_end_attached_and_per_arm_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "repo" / "skill").mkdir(parents=True)
+            (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8")
+            (root / "repo" / "evals").mkdir()
+            manifest = {
+                "version": 1, "skill_name": "demo", "skill_paths": ["skill/SKILL.md"],
+                "variants": ["with_skill", "without_skill"],
+                "cases": [{"id": "case-1", "split": "tune", "kind": "behavior", "prompt": "Do it.",
+                           "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}]}],
+                "ablations": [],
+            }
+            path = root / "repo" / "evals" / "shared-benchmark.json"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            runs = root / "runs"
+            for variant, text in [("with_skill", "alpha"), ("without_skill", "nope")]:
+                base = runs / "case-1" / variant
+                base.mkdir(parents=True)
+                (base / "output.md").write_text(text, encoding="utf-8")
+            report = sb.build_benchmark_report(path, runs)
+        rel = report["reliability"]
+        self.assertIn("by_case_variant", rel)   # per-arm keys untouched
+        self.assertIn("by_variant", rel)
+        self.assertIn("paired_lift", rel)        # new nested block attached
+        self.assertEqual(rel["paired_lift"]["by_case"]["case-1"]["pass_at_1_delta"], 1.0)
+
+
 class TwoSamplePermutationTests(unittest.TestCase):
     def test_single_run_per_arm_never_significant(self):
         r = sb.two_sample_permutation_significance([1.0], [0.0])

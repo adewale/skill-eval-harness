@@ -20,11 +20,34 @@ Terms are grouped by what they describe: the units you evaluate, the comparison 
 
 **Manifest version / `migrate`** — `validate` accepts `version` 1 and 2 (both grade identically; version 2 makes the severity and oracle-tier defaults explicit). `skill-benchmark migrate` stamps the mechanical defaults and prints the diff plus a checklist of the judgment calls it leaves; see [`migrating-evals.md`](migrating-evals.md).
 
+## Case polarity
+
+What role a case plays in the comparison. A useful suite carries all three polarities, the way
+behavioral testing pairs functionality tests with their controls (Ribeiro et al. 2020).
+`audit-manifest` counts each and warns when one is thin; `case_polarity` (`skill_benchmark.py`)
+derives the label from the `id` prefix or `kind`.
+
+**Positive eval** — the skill *should* fire and leave verifiable evidence of its core workflow.
+Convention: `id` prefix `pos-`, or a task-success `kind`. The lift axis lives here. This is a
+minimum functionality test.
+
+**Negative eval** — the skill should be a no-op: a general checklist would overreach, but the
+right move is to stay scoped or do nothing. Convention: `id` prefix `neg-`, or `kind: "negative"`.
+It is the false-positive control that keeps a skill from over-applying.
+
+**Adversarial eval** — a near-miss: a prompt that looks like it needs the skill but should be
+refused, scoped down, or handled cautiously. `kind: "adversarial"`. In the literature this is a
+**contrast set** (Gardner et al. 2020), a small perturbation near the decision boundary, and is
+deliberately *not* an adversarial-robustness example. Read its pass rate as a discrimination
+signal, not a capability score; see [`academic-grounding.md`](academic-grounding.md).
+
+Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger** below.
+
 ## Comparison structure
 
 **Variant** — which arm of the comparison a run belongs to. The two defaults are `with_skill` and `without_skill`. Optional arms are `old_skill` (requires `old_skill_paths` and `--include-old-skill`) and `ablation:<id>`. The harness compares arms; a single arm in isolation says little.
 
-**Ablation** — an opt-in variant that simulates removing one component of a skill, declared under `manifest.ablations` and prepared with `--include-ablations`. Each entry names the `removed_component` and its `expected_regressions`. An ablation is a hypothesis about which instructions are load-bearing; it becomes evidence only once it is run on a discriminating case.
+**Ablation** — an opt-in variant that simulates removing one component of a skill, declared under `manifest.ablations` and prepared with `--include-ablations`. Each entry names the `removed_component` and its `expected_regressions`. An ablation is a hypothesis about which instructions are load-bearing; it becomes evidence only once it is run on a discriminating case. It is an ablation study in the original sense (Newell; Meyes et al. 2019) applied to instruction components, and because each entry declares `expected_regressions` it doubles as a directional-expectation (DIR) test (Ribeiro et al. 2020): a perturbation with a predicted direction of change.
 
 **Model (axis)** — a third fan-out axis beside variant and run, set with `prepare --models a,b,c`. Each row carries its target model, and the run layout gains a model segment (`<case>/<model>/<variant>`) only when two or more models run, so single-model layouts are unchanged. The report groups `by_model`, pairs lift per (case, model), and `model_analysis` ranks models by lift and names the ones that lose it. Model is a dimension, not a new kind of variant — the variant grid stays orthogonal within each model.
 
@@ -36,7 +59,7 @@ Terms are grouped by what they describe: the units you evaluate, the comparison 
 | `holdout` | At end-of-round or merge | Honest scoring |
 | `holdback` | Only after scoring | Detecting memorization |
 
-`holdout` and `holdback` prefer a private `prompt_ref` over an inline `prompt` so the answer is not exposed early. `prepare` fails on missing hidden prompts unless `--allow-missing-prompts` is passed for dry-run planning.
+`holdout` and `holdback` prefer a private `prompt_ref` over an inline `prompt` so the answer is not exposed early. `prepare` fails on missing hidden prompts unless `--allow-missing-prompts` is passed for dry-run planning. Holding cases back is the harness's contamination control: a case kept out of the skill, the docs, and the eval text cannot have been memorized, so a high score on it is evidence rather than leakage.
 
 ## Things you assert
 
@@ -81,17 +104,19 @@ The normalized shapes are an adapter boundary: Pi, Codex, and Jetty emit differe
 
 These are flags a `benchmark` report raises so you read pass rates correctly.
 
-**Lift** — the difference in objective pass rate between `with_skill` and `without_skill`. Lift, not a single arm's pass rate, is the evidence that a skill changed behavior.
+**Lift** — the difference in objective pass rate between `with_skill` and `without_skill`. Lift, not a single arm's pass rate, is the evidence that a skill changed behavior. In causal-inference terms it is the skill's average treatment effect in a paired design; the per-slice lift in `build_slice_summary` is a conditional treatment effect.
 
 **Discrimination** — an assertion's ability to separate the arms. An assertion with identical with/without pass rates discriminates nothing, whatever its individual pass rate.
 
-**Saturated** — every `with_skill` run passes. That is not a skill failure, but it is weak evidence of lift, and it is a different measurement from skill quality.
+**Saturated** — every `with_skill` run passes. That is not a skill failure, but it is weak evidence of lift, and it is a different measurement from skill quality. It is a ceiling effect: the case has stopped discriminating, which is a construct-validity warning that it no longer measures the skill.
 
 **No-lift** — `with_skill` and `without_skill` pass at the same rate, so the case shows no skill effect. Distinct from a failed run.
 
+**Negative delta** — `with_skill` passes at a *lower* rate than `without_skill`: the skill actively hurt the case, surfaced as `negative_delta_cases` in `build_paired_summary`. Distinct from a *negative eval*, which is a case designed to test a no-op; this is a negative treatment effect.
+
 **Flaky** — repeated runs of the same case/variant disagree. Flakiness is why runs repeat and why one pass is not a result.
 
-**Leakage** — an assertion value appears literally in the prompt, so a weak answer can pass by echoing the task. `validate` warns on this; `--strict-leakage` turns the warning into a failure once you have replaced the weak check.
+**Leakage** — an assertion value appears literally in the prompt, so a weak answer can pass by echoing the task. `validate` warns on this; `--strict-leakage` turns the warning into a failure once you have replaced the weak check. Leakage is an annotation artifact (Gururangan et al. 2018) in eval clothing — a surface cue that lets a model be right for the wrong reasons (McCoy et al. 2019) without exercising the skill.
 
 **Trigger / no-trigger** — whether a skill should load for a given query. A trigger case asserts autonomous skill *discovery*, detected from copied temp skill paths in the trace, not from the final answer and not from a bare skill name. Trigger behavior depends on the discovery-layer frontmatter (`description`/`when_to_use`), so a **discovery-population** ablation is measured *on* trigger cases — through `run_pi_trigger_eval.py --ablation`, which observes autonomous loading — while **answer-population** ablations (instructions/resource/runtime/preprocess) skip trigger cases. The forced-load generic runners never measure discovery ablations.
 
@@ -118,3 +143,4 @@ These are flags a `benchmark` report raises so you read pass rates correctly.
 - [`evals-are-not-tests.md`](evals-are-not-tests.md) — why these terms exist and why a test-suite vocabulary does not cover them.
 - [`../README.md`](../README.md) — manifest format, assertion reference, and command contracts.
 - [`../LESSONS_LEARNED.md`](../LESSONS_LEARNED.md) — the iteration history that produced several of these terms.
+- [`academic-grounding.md`](academic-grounding.md) — the research constructs behind these terms, with citations.

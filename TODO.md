@@ -59,7 +59,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:4010`, merged in `grade_case_variant:4732`).
+threshold, evidence}` (`load_judge_results:4074`, merged in `grade_case_variant:5100`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -182,8 +182,22 @@ These are tests of the harness, not a new eval suite; sequence them before the b
 - [x] `reliability` report block (feature 5): unbiased **pass@k** and **pass^k** per (case, variant) from repeated runs, plus a pooled per-variant headline.
 - [x] `tool_call` BFCL-style taxonomy (feature 6): `expected_no_call`, `required_calls` (subset), `call_set` (exact multiset).
 - [x] `error-analysis` (feature 8): open-coding review queue + axial failure taxonomy over a `benchmark.json`, model-free.
-- [ ] **Contamination perimeter (output side)** — still prompt-side only: output↔answer n-gram overlap, canary-GUID tripwire, `released_at`/cutoff gate. Lower priority for a pre-production skill-authoring harness.
-- [ ] **Judge robustness probes** — order-flip self-consistency and empty/master-key negative controls (need a live `--judge-cmd`; keep out of the core grade path like the other model-touching commands).
+- [x] **Contamination perimeter (output side)** — `contamination` command + pure detectors: output↔answer n-gram containment (`ngram_containment`), canary-GUID tripwire (case `canary`), and a `released_at`/`--model-cutoff` gate. Optional case fields, `--fail-on-contamination` CI gate, model-free.
+- [x] **Judge robustness probes** — `judge-robustness` command: order-flip self-consistency (`flipped_judge_task`) + empty/master-key negative controls (`JUDGE_NEGATIVE_CONTROLS`) a robust judge must reject; `order_flip_consistency`/`control_leak_rate` summary, `--fail-on-findings` CI gate. Model-touching, opt-in behind `--judge-cmd`/`--judge-model`; kept out of the core grade path.
+
+## Post-#24 external-review gaps (Pydantic / Anthropic / OpenAI / Agent-as-a-Judge)
+
+Six gaps surfaced by an external-source review (see [`docs/academic-grounding.md`](docs/academic-grounding.md)),
+deduped against the awesome-evals follow-ups above — none is a dupe; only G3 is adjacent to the
+open "Judge robustness probes" item. Sequence:
+**G6** · **G4 → G1 → G3** (judge path, serialize) · **G5 → G2** (grade path, serialize).
+
+- [x] G6 Paired pass@k/pass^k lift — `reliability.paired_lift`: with−without delta on pass@k/pass^k, per case + pooled per shared k, sign-flip tested. The sliver of feature 5 (reliability) not merged.
+- [x] G4 Schema-constrained judge output — `verdict_schema_for` + post-hoc `json_schema_errors` gate; `report` default (byte-identical), `--strict-judge-schema` / `judge.schema_enforcement` opt-in; `extract_json_object` kept as fallback.
+- [x] G1 Run-dir / trajectory judge — `--judge-trajectory` feeds the judge normalized events/metrics + a denylisted artifact inventory (`judge_artifact_inventory` excludes grading.json / answer-key / rubric / reserved files); byte-identical when off. Tool-using follow-on landed: `--judge-explore` lets a native judge explore a SANITIZED copy of the run dir (`sanitized_run_copy` removes every oracle file by construction) with read-only tools (`JUDGE_EXPLORE_TOOLS`), so a filesystem-reading judge cannot read the answer key.
+- [x] G3 Cross-judge consensus — `merge_cross_judge_rows` folds a ≥2-model panel into one verdict (majority/median, `agreement` block, ties → `unresolved`/`--quorum`); `--judge-panel`/manifest `judge.panel` via `effective_judge_models`; panel cost summed once; guard checks every member. Distinct from compare-judges/judge-alignment; 1-member short-circuits unchanged.
+- [x] G5 Capability/regression intent — per-case `eval_intent`; regression guards route to `regression_guards_holding` (never a blocker), exempt from staleness/suggest, saturated/no-lift findings suppressed. Optional, defaults to `capability`.
+- [x] G2 Assertion dependencies — `depends_on` (validated: shape/target/uniqueness/cycle, rejected in turns); a failed/skipped prerequisite SKIPS the dependent out of every denominator + the critical veto (skip, not zero); transitive + deferred-qualitative via a fixed-point post-pass. Byte-identical when unused. Inline judge-call suppression landed (skips a resolved-failed dependent without emitting a judge task / running a script).
 
 ## Punted — questionable value
 
