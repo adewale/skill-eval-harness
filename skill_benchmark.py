@@ -371,6 +371,9 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
         die(f"{where} unknown judge preset {assertion.get('preset')!r}; known: {sorted(JUDGE_PRESETS)}")
     if "atLeast" in assertion and not isinstance(assertion.get("atLeast"), (int, float)):
         die(f"{where} atLeast must be a number")
+    dep = assertion.get("depends_on")
+    if dep is not None and not ((isinstance(dep, str) and dep) or (isinstance(dep, list) and dep and all(isinstance(x, str) and x for x in dep))):
+        die(f"{where} depends_on must be a non-empty string or non-empty list of non-empty strings")
     dims = assertion.get("graded_dimensions")
     if dims is not None:
         if not isinstance(dims, list) or not dims:
@@ -553,6 +556,7 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             die(f"{cid}: reference_graded_score must be a number on the 1-5 scale")
         for j, assertion in enumerate(assertions):
             validate_case_assertion(cid, f"assertion #{j}", j, assertion, path)
+        validate_depends_on_scope(cid, assertions, path)   # G2: case-level depends_on graph
         # Per-turn assertions go through the SAME validator as case-level ones
         # (an unsupported type under a turn must fail validate, not grading).
         for t, turn in enumerate(turns or [], 1):
@@ -563,6 +567,8 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                 die(f"{cid}: turn #{t} assertions must be a list")
             for j, assertion in enumerate(turn_assertions):
                 validate_case_assertion(cid, f"turn #{t} assertion #{j}", j, assertion, path)
+                if isinstance(assertion, dict) and assertion.get("depends_on"):
+                    die(f"{cid}: turn #{t} assertion #{j} depends_on is not supported in turn assertions")
 
     seen_ablation_ids: set[str] = set()
     for i, ablation in enumerate(manifest.get("ablations", [])):
@@ -4002,6 +4008,49 @@ def assertion_label(assertion: dict[str, Any]) -> str:
     return str(assertion.get("name") or assertion.get("description") or assertion.get("type") or "assertion")
 
 
+def depends_on_targets(assertion: dict[str, Any]) -> list[str]:
+    """G2: the prerequisite assertion labels this assertion depends on (a string
+    or list), or []. The single normalizer shared by the validator and grader."""
+    dep = assertion.get("depends_on")
+    if dep is None:
+        return []
+    return [dep] if isinstance(dep, str) else [str(x) for x in dep]
+
+
+def validate_depends_on_scope(cid: str, assertions: list[Any], path: Path) -> None:
+    """G2: case-level depends_on cross-reference. Every target must name an
+    existing case-level assertion, resolve unambiguously (labels collide on
+    name/description/type, so a label used as a target must be unique), and form
+    no cycle — a self-dependency is a 1-cycle."""
+    counts: dict[str, int] = {}
+    for a in assertions:
+        if isinstance(a, dict):
+            counts[assertion_label(a)] = counts.get(assertion_label(a), 0) + 1
+    graph: dict[str, list[str]] = {}
+    for a in assertions:
+        if not isinstance(a, dict) or not depends_on_targets(a):
+            continue
+        label = assertion_label(a)
+        for t in depends_on_targets(a):
+            if t not in counts:
+                die(f"{cid}: assertion {label!r} depends_on unknown assertion {t!r}")
+            if counts[t] > 1:
+                die(f"{cid}: assertion {label!r} depends_on ambiguous label {t!r} (used by more than one assertion)")
+        graph[label] = depends_on_targets(a)
+    color: dict[str, int] = {}
+    def visit(node: str) -> None:
+        color[node] = 1
+        for nxt in graph.get(node, []):
+            if color.get(nxt) == 1:
+                die(f"{cid}: depends_on cycle involving {nxt!r}")
+            if nxt in graph and color.get(nxt, 0) == 0:
+                visit(nxt)
+        color[node] = 2
+    for node in list(graph):
+        if color.get(node, 0) == 0:
+            visit(node)
+
+
 def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[str, Any], model: str | None = None) -> str:
     """One verdict key per (case, model, variant, run, assertion). The model
     segment appears only on model-fanned runs (roadmap 2.1) — without it,
@@ -4917,9 +4966,34 @@ def grade_case_variant(
         grade_unit(assertion, text, output_path, run_base)
     for assertion, unit_text, unit_output_path, unit_base, turn_n in turn_units:
         grade_unit(assertion, unit_text, unit_output_path, unit_base, turn_n)
+    # G2: staged grading. Resolve case-level depends_on over the produced rows —
+    # a dependent whose prerequisite FAILED (or is itself skipped) is SKIPPED:
+    # dropped from every count, NOT counted as a second failure. Iterated to a
+    # fixed point so transitive chains (A -> B -> C) all resolve. A deferred
+    # qualitative prerequisite has no row on the first pass, so the dependent is
+    # resolved on the verdict-loaded second pass (the authoritative one). Turn
+    # assertions cannot declare depends_on (rejected at validate).
+    case_assertions = [a for a in case.get("assertions", []) if isinstance(a, dict)]
+    if any(depends_on_targets(a) for a in case_assertions):
+        row_by_label = {r.get("name"): r for r in objective + qualitative if r.get("turn") is None}
+        for _ in range(len(case_assertions) + 1):
+            changed = False
+            for a in case_assertions:
+                row = row_by_label.get(assertion_label(a))
+                if not depends_on_targets(a) or row is None or row.get("skipped"):
+                    continue
+                for t in depends_on_targets(a):
+                    pre = row_by_label.get(t)
+                    if pre is not None and (pre.get("skipped") or not pre.get("passed")):
+                        row["skipped"] = True
+                        row["skip_reason"] = f"prerequisite '{t}' {'skipped' if pre.get('skipped') else 'failed'}"
+                        changed = True
+                        break
+            if not changed:
+                break
     for summary_row in turn_summaries:
         n = summary_row["turn"]
-        rows_for_turn = [r for r in objective + qualitative if r.get("turn") == n]
+        rows_for_turn = [r for r in objective + qualitative if r.get("turn") == n and not r.get("skipped")]
         summary_row["passed"] = sum(1 for r in rows_for_turn if r["passed"])
         summary_row["total"] = len(rows_for_turn)
     # Severity split (roadmap 2.2). The pass-rate channel is carried by gate and
@@ -4928,9 +5002,11 @@ def grade_case_variant(
     # the graded `scored` bucket instead. A failing critical assertion is the
     # absorbing barrier: it VETOES the run — every rate collapses to 0.0 and the
     # graded score is withheld, so no mean can average the catastrophe away.
-    gate_objective = [r for r in objective if r.get("severity") in {"gate", "critical"}]
-    soft_rows = [r for r in objective + qualitative if r.get("severity") == "soft"]
-    critical_rows = [r for r in objective + qualitative if r.get("severity") == "critical"]
+    gate_objective = [r for r in objective if r.get("severity") in {"gate", "critical"} and not r.get("skipped")]
+    soft_rows = [r for r in objective + qualitative if r.get("severity") == "soft" and not r.get("skipped")]
+    # G2: a SKIPPED dependent is excluded here, so a never-run critical dependent
+    # cannot veto — the veto stays owned by the prerequisite's own severity.
+    critical_rows = [r for r in objective + qualitative if r.get("severity") == "critical" and not r.get("skipped")]
     critical_failures = [r["name"] for r in critical_rows if not r["passed"]]
     vetoed = bool(critical_failures)
     objective_passed = sum(1 for r in gate_objective if r["passed"])
@@ -4943,7 +5019,7 @@ def grade_case_variant(
     # channel; the qualitative/combined pass rates are carried by gate and
     # critical qualitative rows, mirroring the objective split above. Declare
     # severity: "gate" on a judge assertion to keep it in the pass rate.
-    gate_qualitative = [r for r in qualitative if r.get("severity") in {"gate", "critical"}]
+    gate_qualitative = [r for r in qualitative if r.get("severity") in {"gate", "critical"} and not r.get("skipped")]
     qualitative_passed = sum(1 for r in gate_qualitative if r["passed"])
     qualitative_total = len(gate_qualitative)
     combined_passed = objective_passed + qualitative_passed
@@ -4998,6 +5074,7 @@ def grade_case_variant(
         "vetoed": vetoed,
         "soft_total": len(soft_rows),
         "soft_passed": sum(1 for r in soft_rows if r["passed"]),
+        "skipped_total": sum(1 for r in objective + qualitative if r.get("skipped")),
         "graded_score": graded_score,
         "below_reference_floor": below_floor,
         **({"turns": turn_summaries} if turn_specs else {}),

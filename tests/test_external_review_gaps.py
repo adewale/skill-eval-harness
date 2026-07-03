@@ -272,5 +272,109 @@ class TrajectoryJudgeTests(unittest.TestCase):
         self.assertTrue(row["passed"])   # bad events.json -> trajectory omitted, judge still runs
 
 
+class AssertionDependenciesTests(unittest.TestCase):
+    """G2 — depends_on / staged grading. Mutation-killing: exact totals, and the
+    critical-tie both-directions (a running critical vetoes; a skipped one does not)."""
+
+    def _grade(self, assertions, text="alpha", judge_results=None):
+        case = {"id": "c", "split": "tune", "kind": "behavior", "assertions": assertions}
+        result, tasks = sb.grade_case_variant(case, "with_skill", text, Path("out.md"), {}, judge_results=judge_results or {})
+        return result, tasks
+
+    # --- validation ---
+    def test_shape_rejected(self):
+        p = Path("x")
+        for bad in ([], 5, ["ok", 1], ""):
+            with self.assertRaises(SystemExit):
+                sb.validate_case_assertion("c", "a", 0, {"type": "contains", "value": "x", "depends_on": bad}, p)
+        sb.validate_case_assertion("c", "a", 0, {"type": "contains", "value": "x", "depends_on": "pre"}, p)   # ok
+
+    def test_scope_unknown_ambiguous_and_cycle_rejected(self):
+        p = Path("x")
+        A = lambda **kw: {"type": "contains", "value": "x", **kw}
+        with self.assertRaises(SystemExit):   # unknown target
+            sb.validate_depends_on_scope("c", [A(name="dep", depends_on="missing")], p)
+        with self.assertRaises(SystemExit):   # self-cycle
+            sb.validate_depends_on_scope("c", [A(name="a", depends_on="a")], p)
+        with self.assertRaises(SystemExit):   # 2-cycle
+            sb.validate_depends_on_scope("c", [A(name="a", depends_on="b"), A(name="b", depends_on="a")], p)
+        with self.assertRaises(SystemExit):   # ambiguous target (duplicate label)
+            sb.validate_depends_on_scope("c", [A(name="pre"), A(name="pre", value="y"), A(name="dep", depends_on="pre")], p)
+        sb.validate_depends_on_scope("c", [A(name="pre"), A(name="dep", depends_on="pre")], p)   # valid graph
+
+    def test_turn_depends_on_rejected_at_validate(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "repo" / "skill").mkdir(parents=True)
+            (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
+            (root / "repo" / "evals").mkdir()
+            p = root / "repo" / "evals" / "shared-benchmark.json"
+            p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
+                "variants": ["with_skill", "without_skill"], "ablations": [],
+                "cases": [{"id": "c", "split": "tune", "kind": "behavior",
+                           "turns": [{"prompt": "p", "assertions": [{"name": "t", "type": "contains", "value": "x", "depends_on": "other"}]}]}]}), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(p)
+
+    # --- grading ---
+    def test_dependent_counted_when_prereq_passes(self):
+        result, _ = self._grade([{"name": "pre", "type": "contains", "value": "alpha"},
+                                 {"name": "dep", "type": "contains", "value": "alpha", "depends_on": "pre"}])
+        self.assertEqual(result["skipped_total"], 0)
+        self.assertEqual((result["objective_total"], result["objective_passed"]), (2, 2))
+        self.assertEqual(result["objective_pass_rate"], 1.0)
+
+    def test_dependent_SKIPPED_not_zeroed_when_prereq_fails(self):
+        result, _ = self._grade([{"name": "pre", "type": "contains", "value": "zzz"},       # FAILS
+                                 {"name": "dep", "type": "contains", "value": "alpha", "depends_on": "pre"}])
+        # mutation-killing: skip (not zero, not second-failure) => total drops to 1
+        self.assertEqual(result["objective_total"], 1)
+        self.assertEqual(result["objective_passed"], 0)
+        self.assertEqual(result["objective_pass_rate"], 0.0)
+        self.assertEqual(result["skipped_total"], 1)
+        dep = next(r for r in result["assertions"] if r["name"] == "dep")
+        self.assertTrue(dep["skipped"])
+        self.assertIn("pre", dep["skip_reason"])
+
+    def test_running_critical_failure_vetoes(self):
+        result, _ = self._grade([{"name": "crit", "type": "contains", "value": "zzz", "severity": "critical"}])
+        self.assertTrue(result["vetoed"])          # a critical that RUNS and fails still vetoes
+
+    def test_skipped_critical_dependent_does_NOT_veto(self):
+        # THE keystone: a critical dependent whose gate prerequisite failed is skipped,
+        # so it must NOT collapse the run (a never-run assertion cannot veto).
+        result, _ = self._grade([{"name": "pre", "type": "contains", "value": "zzz"},        # gate FAIL
+                                 {"name": "dep", "type": "contains", "value": "alpha", "depends_on": "pre", "severity": "critical"}])
+        self.assertFalse(result["vetoed"])
+        self.assertEqual(result["critical_total"], 0)   # dep excluded from critical_rows
+        self.assertEqual(result["skipped_total"], 1)
+
+    def test_transitive_skip(self):
+        result, _ = self._grade([{"name": "a", "type": "contains", "value": "zzz"},                    # FAIL
+                                 {"name": "b", "type": "contains", "value": "alpha", "depends_on": "a"},
+                                 {"name": "c", "type": "contains", "value": "alpha", "depends_on": "b"}])
+        self.assertEqual(result["skipped_total"], 2)
+        self.assertEqual(result["objective_total"], 1)   # only a counts
+        self.assertEqual({r["name"] for r in result["assertions"] if r.get("skipped")}, {"b", "c"})
+
+    def test_qualitative_prerequisite_skips_objective_dependent(self):
+        jassert = {"name": "jpre", "type": "judge", "severity": "gate"}
+        expanded = sb.expand_judge_preset(jassert)
+        jid = sb.judge_task_id("c", "with_skill", 1, expanded)
+        result, _ = self._grade([jassert, {"name": "dep", "type": "contains", "value": "alpha", "depends_on": "jpre"}],
+                                judge_results={jid: {"judge_task_id": jid, "passed": False, "score": 0}})
+        dep = next(r for r in result["assertions"] if r["name"] == "dep")
+        self.assertTrue(dep["skipped"])                  # resolved on the verdict-loaded pass
+        self.assertEqual(result["objective_total"], 0)   # dep skipped out
+        self.assertEqual((result["qualitative_total"], result["qualitative_passed"]), (1, 0))
+
+    def test_no_depends_on_is_byte_identical_grading(self):
+        result, _ = self._grade([{"name": "a", "type": "contains", "value": "alpha"},
+                                 {"name": "b", "type": "contains", "value": "alpha"}])
+        self.assertEqual(result["skipped_total"], 0)
+        self.assertEqual(result["objective_total"], 2)
+        self.assertFalse(any(r.get("skipped") for r in result["assertions"]))
+
+
 if __name__ == "__main__":
     unittest.main()
