@@ -59,7 +59,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:4074`, merged in `grade_case_variant:5100`).
+threshold, evidence}` (`load_judge_results:4233`, merged in `grade_case_variant:5237`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -98,12 +98,9 @@ threshold, evidence}` (`load_judge_results:4074`, merged in `grade_case_variant:
 
 ## Open questions to verify against current Jetty docs/API
 
-- [ ] Exact JSON response shape from `/api/v1/files/upload`.
-- [ ] Exact artifact listing/download shape from trajectory details.
-- [ ] Exact chat-completion response field containing `trajectory_id` in non-streaming runbook mode.
-- [ ] Full terminal status set in production.
-- [ ] Whether directory trees should be uploaded as individual files or archives.
-- [ ] Whether `use_trial_keys` is available to all relevant accounts or only trial collections.
+- [ ] The live-token questions tracked in `docs/jetty-support-spec.md` § "Remaining live-token questions"
+      (upload response shape, artifact listing shape, `trajectory_id` field, terminal status set,
+      directory-tree upload strategy, `use_trial_keys` availability). One list, one owner — the spec.
 
 ---
 
@@ -119,8 +116,9 @@ keyed to the same number (`1.1`, `2.2`, `CF.1`, …). This file tracks status on
 spec for each item's goal, abstractions, design, and tests. Items with no spec section are
 marked *(TODO-native)*. The roadmap is implemented: migration tooling included
 (`migrate` + [`docs/migrating-evals.md`](docs/migrating-evals.md)); tests live in
-`tests/test_confidence_floor.py` and `tests/test_roadmap_features.py`. The two TODO-native
-items below stay open by design.
+`tests/test_confidence_floor.py` and the subject files (`test_grading.py`,
+`test_reporting.py`, `test_runners.py`, `test_manifest.py`, `test_judging.py`,
+`test_stats.py`). The two TODO-native items below stay open by design.
 
 **Moat — do not dilute:** causal lift, `tune`/`holdout`/`holdback` splits, leakage lint,
 ablations, and saturation/no-lift flags are unique to this harness. None of the surveyed
@@ -204,6 +202,36 @@ open "Judge robustness probes" item. Sequence:
 - [ ] Ship the harness as an agent-authoring skill *(TODO-native)*. Meta/self-referential, overlaps `docs/authoring-evals.md`, adds a packaging surface, narrow audience. Revisit only if external authors adopt the harness and ask for an agent-guided authoring path.
 
 ---
+
+# Consolidation follow-ups (2026-07 duplication audit) — done
+
+All of the audit's deferred items landed in the follow-up pass:
+
+- [x] Cost ledgers merged onto shared owners: `spend_of`/`group_spend`/`cost_coverage_block`/
+      `cost_totals_block`, one `judge_cost_block`, and the billing disk-walk hoisted to the named
+      `discover_on_disk_run_rows` beside the grading discovery (the ledger deliberately bills every
+      on-disk arm; grading is variant-scoped — now a documented decision, not two private walks).
+- [x] The case/model/variant/run discovery loop extracted as `discovered_run_units`, shared by
+      `grade`, `build_benchmark_report`, `collect_judge_tasks`, and `contamination_report`.
+- [x] One timeout encoding everywhere a runner spawns a process: `timed_out: True` + returncode 124
+      (`run-codex`/`run-claude`/`run_subagent_tasks`/`shell_agent_backend`/`suggest-cases`/
+      `_run_suite_command`), with `DEFAULT_RUNNER_TIMEOUT_S` replacing the eight `1800` literals.
+      Guarded by `tests/test_consolidation_guards.py` TimeoutConventionTests.
+- [x] `_locate_section` owns the fence-aware section scan for `section_span`/`list_item_ops`.
+- [x] Sibling-TestCase borrowing removed (`make_tasks`, `make_two_model_runs`, `make_graded_repo`
+      are module-level); the cross-file and module-level builder copies delegate to
+      `tests/helpers.py`. The in-class builders still inside `tests/test_ablations.py` are
+      deliberately NOT migrated: their shapes (dangling `skill_paths` for validation-failure
+      fixtures, multi-root trees with files outside the copy-set, old-skill pairs) are the
+      behavior under test, not drift.
+- [x] The PR-named test files are gone: classes moved verbatim into subject files
+      (`test_manifest.py`, `test_grading.py`, `test_judging.py`, `test_reporting.py`,
+      `test_stats.py`, `test_runners.py`, `test_ablations.py` — the latter also absorbing
+      test_skill_benchmark's ablation half and all of test_cbc), and the one strict-subset
+      duplicate test (readiness capability-saturation, re-asserted from test_audit_fixes)
+      was deleted rather than moved.
+- [x] `ABLATION_VARIANT_PREFIX` / `is_ablation_variant()` / `ablation_id_of()` in `ablation_model`
+      own the `ablation:<id>` encoding (14 inline `split(":", 1)[1]`/`startswith` sites rewired).
 
 # User journeys the code supports but the docs don't walk
 

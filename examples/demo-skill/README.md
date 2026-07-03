@@ -44,7 +44,7 @@ You should see `with_skill` pass both assertions, `without_skill` fail both, and
 ablation arm fail exactly the one assertion whose guidance it removed — each reported
 as an `expected_regression_confirmed` because the ablation is **materialized** (a real
 edited tree, blind, with verified provenance). Swap the stub for a real runner
-(`--codex-cmd "claude -p"`, `codex exec`, etc.) to run it against an actual model.
+(`--codex-cmd "codex exec"`, etc.) to run it against an actual model — for Claude, use `skill-benchmark run-claude` instead, which parses the `claude -p` JSON envelope and captures cost.
 
 ## Measure activation (does the skill load on its own?)
 

@@ -39,7 +39,7 @@ rest of this page is the map between the bottom two rows.
 | **Saturated** | Ceiling effect (psychometrics); benchmark saturation as a construct-validity failure (Raji et al. 2021; Jacobs & Wallach 2021) | A saturated case has stopped measuring the construct. |
 | **Leakage** (`prompt_assertion_leakage_findings`) | Annotation artifacts (Gururangan et al. 2018); shortcut learning (Geirhos et al. 2020); right-for-the-wrong-reasons heuristics (McCoy et al. 2019) | An artifact in eval clothing: a surface cue that lets a weak answer pass without the capability. |
 | **Holdout / holdback** | Data contamination and memorization controls (Shi et al. 2023; survey arXiv:2406.04244) | A case withheld from skill, docs, and eval text cannot have been memorized, so a high score is evidence, not leakage. |
-| **Repeated runs / flaky** | `pass@k` with the unbiased estimator (Chen et al. 2021); `pass^k` / consistency (G-Pass@k, arXiv:2412.13147) | The harness has the samples but counts naively; flakiness is the `pass@k − pass^k` gap. |
+| **Repeated runs / flaky** | `pass@k` with the unbiased estimator (Chen et al. 2021); `pass^k` / consistency (G-Pass@k, arXiv:2412.13147) | The reliability block now reports the unbiased `pass@k` and `pass^k`; flakiness is the `pass@k − pass^k` gap. |
 | **Judge / rubric** | LLM-as-judge and its bias taxonomy: position, verbosity, self-enhancement (Zheng et al. 2023) | The biases name the justification for the judge guards below. |
 | **Process assertions** (`skill_invoked`) | Path as evidence of shortcut use vs. genuine behavior (McCoy et al. 2019) | Legitimate for *attribution*, brittle for *capability* — see the conflict section. |
 
@@ -108,13 +108,14 @@ lint the leakage — are named and justified rather than asserted.
 
 ## Open items this grounding implies
 
-- Adopt the unbiased `pass@k` estimator (Chen et al. 2021) in place of naive repeated-run
-  counting, and report `pass^k` as the consistency complement. See the roadmap's repeated-run
-  work.
-- Gloss `kind: "adversarial"` in audit output and authoring guidance as a contrast set, per the
+- [x] Adopt the unbiased `pass@k` estimator (Chen et al. 2021) and report `pass^k` as the
+  consistency complement — shipped as the benchmark report's reliability block
+  (`pass_at_k`, `pass_hat_k`).
+- [ ] Gloss `kind: "adversarial"` in audit output and authoring guidance as a contrast set, per the
   conflict above.
-- Cite the judge-bias taxonomy in the roadmap's judge items (1.3 and the graded-judge work in
-  2.2) rather than motivating those guards from intuition.
+- [x] Cite the judge-bias taxonomy in the judge guards — the order-flip and negative-control
+  probes shipped as `judge-robustness`; position/verbosity/self-enhancement biases are the
+  documented rationale.
 
 ## Sources
 

@@ -22,7 +22,9 @@ python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```
 
-If you change manifest parsing, grading, Jetty export/import, trigger detection, script assertions, or judge handling, add or update `tests/test_skill_benchmark.py`. Roadmap-feature tests live in `tests/test_roadmap_features.py`; the confidence floor (detector fixtures under `tests/fixtures/detectors/`, baseline isolation, idempotence, the no-model/no-network guard) lives in `tests/test_confidence_floor.py` — a new objective assertion type must ship its should-fire/should-pass fixture pair, and a new runner must register its workspace builder.
+(`pytest tests/` also works — `pyproject.toml` carries the pythonpath config — but CI runs `unittest discover`, so keep tests compatible with both.)
+
+Tests are organized by subject — put new tests where their subject lives: manifest validation/hygiene in `tests/test_manifest.py`, grading in `tests/test_grading.py`, judge plumbing in `tests/test_judging.py`, report views in `tests/test_reporting.py`, statistics in `tests/test_stats.py`, runner adapters in `tests/test_runners.py`, ablations in `tests/test_ablations.py`, cost telemetry in `tests/test_cost_telemetry.py`, and the CLI/report grab-bag in `tests/test_skill_benchmark.py`. Build fixtures through `tests/helpers.py` (`make_eval_repo`, `write_run`, `result_row`, `stub_claude`) instead of hand-rolling repo/manifest/run-dir scaffolding — the suite once carried ~25 drifting copies of the same builder. If you add a CLI subcommand or assertion type, `tests/test_consolidation_guards.py` will fail until the README documents it; if you move code that docs cite by line, `tests/test_doc_refs.py` tells you the correct numbers. The confidence floor (detector fixtures under `tests/fixtures/detectors/`, baseline isolation, idempotence, the no-model/no-network guard) lives in `tests/test_confidence_floor.py` — a new objective assertion type must ship its should-fire/should-pass fixture pair, and a new runner must register its workspace builder.
 
 ## Eval-safety rules
 

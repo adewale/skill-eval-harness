@@ -124,6 +124,30 @@ class EvidenceClass(str, Enum):
         return self is EvidenceClass.CONFIRMED_CAUSAL
 
 
+# The `ablation:<id>` variant-name encoding. These two helpers are the ONLY
+# reading of that prefix — every consumer (variant instructions, prepared rows,
+# cost ledgers, audits) routes through them instead of re-spelling
+# `variant.split(":", 1)[1]` inline (~14 copies before this owner existed).
+ABLATION_VARIANT_PREFIX = "ablation:"
+
+
+def is_ablation_variant(variant: Any) -> bool:
+    return str(variant).startswith(ABLATION_VARIANT_PREFIX)
+
+
+def ablation_id_of(variant: Any) -> str | None:
+    """The <id> of an `ablation:<id>` variant name, else None."""
+    return str(variant).split(":", 1)[1] if is_ablation_variant(variant) else None
+
+
+# The evidence label a whole autonomous-trigger REPORT carries. Per-row
+# measurements use EvidenceClass.RAW_MEASUREMENT; the report-level string names
+# the specific regime (single-arm autonomous trigger, no pairing). It lives here
+# — the module that owns evidence vocabulary — so the trigger runners and docs
+# reference one constant instead of each spelling the literal themselves.
+TRIGGER_MEASUREMENT_EVIDENCE_CLASS = "raw_autonomous_trigger_measurement"
+
+
 def causal_confirmation(*, provenance_verified: bool, has_coverage: bool, regression_observed: bool) -> EvidenceClass:
     """The ONLY path to CONFIRMED_CAUSAL. `regression_observed` is the domain's
     already-resolved behavioral verdict (for the report: at least one cited case
@@ -211,6 +235,11 @@ class Provenance:
                                   edited=_require(d, "skill_hash", str, "Provenance")),
             components=tuple(Component.from_dict(c) for c in comps),
         )
+
+    # The exact key set as_dict() emits / from_dict() requires. Tests and
+    # verifiers reference THIS instead of re-typing the literal set (six copies
+    # of it once drifted independently across three test files).
+    SCHEMA_KEYS = frozenset({"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
 
     def matches(self, expected: "Provenance") -> bool:
         """Exact identity match (id / mode / population / component fingerprints).
@@ -380,7 +409,7 @@ class PreparedTask:
     # --- typed predicates: one definition each, shared by every exporter ---
     @property
     def is_ablation(self) -> bool:
-        return self.variant_truth.startswith("ablation:")
+        return is_ablation_variant(self.variant_truth)
 
     @property
     def is_materialized_ablation(self) -> bool:

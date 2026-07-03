@@ -10,42 +10,12 @@ import unittest
 from pathlib import Path
 
 import skill_benchmark as sb
-
-
-def _skill(rp: Path):
-    sd = rp / "skills" / "demo"
-    sd.mkdir(parents=True)
-    (sd / "SKILL.md").write_text(
-        "---\nname: demo\ndescription: Demo skill. Use for demos.\n---\n\n# Demo\n\nDo the thing.\n",
-        encoding="utf-8")
+from helpers import make_eval_repo, stub_claude as _stub_claude
 
 
 def _manifest(rp: Path, cases):
-    (rp / "evals").mkdir(parents=True, exist_ok=True)
-    m = {"version": 1, "skill_name": "demo", "skill_paths": ["skills/demo/SKILL.md"],
-         "variants": ["with_skill", "without_skill"], "cases": cases, "ablations": []}
-    p = rp / "evals" / "shared-benchmark.json"
-    p.write_text(json.dumps(m), encoding="utf-8")
-    return p
-
-
-def _stub_claude(path: Path, *, answer="STUB ANSWER token-XYZ", cost=0.0123,
-                 in_tok=11, out_tok=22, returncode=0):
-    """A fake `claude` executable: ignores argv, reads the prompt on stdin, emits
-    the -p --output-format json envelope on stdout."""
-    body = f'''#!/usr/bin/env python3
-import sys, json
-_ = sys.stdin.read()
-env = {{"type":"result","result":{json.dumps(answer)},
-       "total_cost_usd":{cost},
-       "usage":{{"input_tokens":{in_tok},"output_tokens":{out_tok},
-                "cache_read_input_tokens":100,"cache_creation_input_tokens":5}}}}
-sys.stdout.write(json.dumps(env))
-sys.exit({returncode})
-'''
-    path.write_text(body, encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+    # Shared builder: writes the demo skill AND the manifest.
+    return make_eval_repo(rp.parent, skill_name="demo", cases=cases)
 
 
 class ParseClaudeEnvelopeTests(unittest.TestCase):
@@ -76,7 +46,7 @@ class ParseClaudeEnvelopeTests(unittest.TestCase):
 
 class RunClaudeAdapterTests(unittest.TestCase):
     def _run(self, td: Path, *, cost=0.0123, returncode=0, answer="STUB ANSWER token-XYZ"):
-        rp = td / "repo"; _skill(rp)
+        rp = td / "repo"
         case = {"id": "c", "split": "tune", "prompt": "do it",
                 "assertions": [{"name": "a", "type": "contains", "value": "token-XYZ"}]}
         p = _manifest(rp, [case])

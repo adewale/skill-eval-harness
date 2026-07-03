@@ -43,11 +43,14 @@ from ablation_model import (
     Component,
     EvidenceClass,
     InstructionSimulated,
+    ablation_id_of,
+    is_ablation_variant,
     JETTY_FAILURE,
     MaterializedArm,
     PreparedTask,
     Provenance,
     ResultSet,
+    TIMEOUT_FAILURE,
     TreeIdentity,
     causal_confirmation,
     execution_valid,
@@ -183,6 +186,29 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def emit_report(report: Any, out: str | Path | None) -> None:
+    """Single owner of every reporting command's `--out FILE else stdout` tail.
+    Routing all commands through here keeps the behavior identical everywhere:
+    parent directories are created and the file ends with a newline (two
+    commands used to hand-roll this and crashed on `--out new-dir/x.json`)."""
+    if out:
+        write_json(Path(out), report)
+    else:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+def iter_json_objects(text: str):
+    """Yield each parseable JSON value found line-by-line in a runner's stream,
+    silently skipping non-JSON lines. The one scanning loop shared by trigger
+    detection, stream telemetry, and the agent adapters — previously five
+    hand-rolled copies of the same try/except."""
+    for line in text.splitlines():
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+
 def apply_dataset_row(value: Any, row: dict[str, Any]) -> Any:
     """Fill {key} placeholders from a dataset row throughout a case template.
     Plain replace, not str.format — prompts and regex assertions legitimately
@@ -232,6 +258,22 @@ def iter_cases(manifest: dict[str, Any], split: str | None = None) -> list[dict[
     if split:
         return [c for c in cases if c.get("split") == split]
     return cases
+
+
+def is_trigger_case(case: dict[str, Any]) -> bool:
+    """Trigger/discovery cases belong to the autonomous-trigger runners, whose
+    output is a raw_autonomous_trigger_measurement — a different population from
+    answer runs. Every grading path (benchmark, grade, judge) must exclude them
+    through THIS predicate so the boundary cannot drift per-command."""
+    return case.get("kind") == "trigger"
+
+
+def is_judge_only_case(case: dict[str, Any]) -> bool:
+    """A case whose every assertion needs a model judge (judge/rubric/factuality).
+    Shared by eval-readiness and the manifest audit so their 'judge-only' cost
+    findings can never disagree about which cases qualify."""
+    assertions = [a for a in case.get("assertions", []) if isinstance(a, dict)]
+    return bool(assertions) and all(a.get("type") in QUALITATIVE_ASSERTIONS for a in assertions)
 
 
 def case_prompt(case: dict[str, Any], manifest_path: Path, allow_missing: bool = False) -> str:
@@ -626,9 +668,9 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
             "Use the old/baseline version of the skill only. Its files are provided in your "
             "workspace — read and follow them."
         )
-    if variant.startswith("ablation:"):
-        aid = variant.split(":", 1)[1]
-        ab = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+    if is_ablation_variant(variant):
+        aid = ablation_id_of(variant)
+        ab = ablation_by_id(manifest, aid)
         if not ab:
             return f"Use an ablated skill variant {aid}; ablation metadata was not found."
         # The Arm owns the blind/transparent decision: a materialized ablation is
@@ -740,7 +782,7 @@ def prepared_task_rows(
         # skill, so they cannot measure discovery. Emit no runner tasks for a trigger
         # case here, so an answer runner never spends a call on one (build_benchmark_report
         # re-checks this as defense in depth).
-        if case.get("kind") == "trigger":
+        if is_trigger_case(case):
             continue
         for variant in variants:
             record: AblationRecord | None = None
@@ -749,14 +791,14 @@ def prepared_task_rows(
                 skill_paths = []   # the no-skill arm carries NO skill files at the source (defense in depth)
             elif variant == "old_skill":
                 skill_paths = old_skill_paths   # the OLD tree, carried on the row for both runners
-            elif variant.startswith("ablation:"):
+            elif is_ablation_variant(variant):
                 population = ablation_variant_population(manifest, variant)
                 # Discovery (trigger-population) ablations measure AUTONOMOUS skill
                 # loading; they are emitted ONLY by the autonomous-trigger adapter
                 # (run_pi_trigger_eval.py --ablation), never by this answer-path preparer.
                 if population == "trigger":
                     continue
-                aid = variant.split(":", 1)[1]
+                aid = ablation_id_of(variant)
                 if aid in trees:
                     # Materialized: carry the arm's TYPED provenance straight through —
                     # no dict round-trip, no re-parse (the drop-then-reparse is gone).
@@ -792,7 +834,7 @@ def prepared_task_rows(
                         # Only the arms that derive from the CURRENT canonical tree record
                         # its hash; old_skill mounts the old tree, so stamping the current
                         # canonical hash on it would be an internally false record.
-                        skill_tree_hash=(canonical_hash if (canonical_hash and (variant == "with_skill" or variant.startswith("ablation:"))) else None),
+                        skill_tree_hash=(canonical_hash if (canonical_hash and (variant == "with_skill" or is_ablation_variant(variant))) else None),
                         answer_key=({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else None),
                     )
                     row = task.harness_record()
@@ -834,6 +876,11 @@ def prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+# THE default wall-clock budget for any spawned runner/judge/poll (seconds).
+# Eight duplicated `1800` literals used to carry this; one constant cannot drift.
+DEFAULT_RUNNER_TIMEOUT_S = 1800
+
+JETTY_DEFAULT_BASE_URL = "https://flows-api.jetty.io"
 JETTY_DEFAULT_AGENT = "claude-code"
 JETTY_DEFAULT_MODEL = "claude-sonnet-4-6"
 JETTY_DEFAULT_MODEL_PROVIDER = "anthropic"
@@ -877,6 +924,11 @@ _ABLATION_MARKER = ".skill-ablation-dir"
 
 class AblationError(Exception):
     """Raised when an ablation cannot be validated or materialized."""
+
+
+def ablation_by_id(manifest: dict[str, Any], aid: str) -> dict[str, Any] | None:
+    """The one manifest→ablation lookup (previously five inline `next(...)` copies)."""
+    return next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
 
 
 def ablation_components(ablation: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1070,17 +1122,16 @@ def frontmatter_field_span(text: str, field: str) -> tuple[int, int] | None:
     return (starts[start_i], starts[end_i])
 
 
-def section_span(text: str, heading: str) -> tuple[int, int]:
-    """Char span of a markdown section: heading line through the next heading of
-    equal-or-higher level. Fence-aware: a '##' inside a ``` block is code."""
-    fm, body = split_frontmatter(text)
-    base = len(fm)
-    lines, starts = _line_starts(body)
-    mask = _fenced_mask(lines)
+def _locate_section(lines: list[str], mask: list[bool], heading: str, *, err_context: str = "") -> tuple[int, int, int]:
+    """(heading_line, end_line, level) of a markdown section within pre-split,
+    fence-masked lines: the heading line through the next heading of
+    equal-or-higher level (a '##' inside a ``` block is code, never a heading).
+    If the target carries '#' markers, that exact heading LEVEL is required — so
+    a '## Foo' target does not accidentally match a '### Foo' subheading with
+    the same text; a bare-text target (no '#') matches any level. The one
+    section scan shared by section_span and list_item_ops (previously two
+    hand-synced copies)."""
     h = heading.strip()
-    # If the target carries '#' markers, require that exact heading LEVEL — so a
-    # '## Foo' target does not accidentally match a '### Foo' subheading with the
-    # same text. A bare-text target (no '#') still matches any level.
     want_level = (len(h) - len(h.lstrip("#"))) if h.startswith("#") else None
     want = h.lstrip("#").strip().lower()
     start_i = level = None
@@ -1092,7 +1143,7 @@ def section_span(text: str, heading: str) -> tuple[int, int]:
             start_i, level = i, len(m.group(1))
             break
     if start_i is None:
-        raise AblationError(f"section not found: {heading!r}")
+        raise AblationError(f"section not found{err_context}: {heading!r}")
     end_i = len(lines)
     for j in range(start_i + 1, len(lines)):
         if mask[j]:
@@ -1101,6 +1152,17 @@ def section_span(text: str, heading: str) -> tuple[int, int]:
         if m and len(m.group(1)) <= level:
             end_i = j
             break
+    return start_i, end_i, level
+
+
+def section_span(text: str, heading: str) -> tuple[int, int]:
+    """Char span of a markdown section: heading line through the next heading of
+    equal-or-higher level. Fence-aware: a '##' inside a ``` block is code."""
+    fm, body = split_frontmatter(text)
+    base = len(fm)
+    lines, starts = _line_starts(body)
+    mask = _fenced_mask(lines)
+    start_i, end_i, _ = _locate_section(lines, mask, heading)
     return (base + starts[start_i], base + starts[end_i])
 
 
@@ -1109,27 +1171,8 @@ def list_item_ops(text: str, section: str, contains: list[str]) -> list[tuple[in
     base = len(fm)
     lines, starts = _line_starts(body)
     mask = _fenced_mask(lines)
-    h = section.strip()
-    want_level = (len(h) - len(h.lstrip("#"))) if h.startswith("#") else None
-    want = h.lstrip("#").strip().lower()
-    body_start = level = None
-    for i, ln in enumerate(lines):
-        if mask[i]:
-            continue
-        m = re.match(r"^(#{1,6})\s+(.*)$", ln)
-        if m and m.group(2).strip().lower() == want and (want_level is None or len(m.group(1)) == want_level):
-            body_start, level = i + 1, len(m.group(1))
-            break
-    if body_start is None:
-        raise AblationError(f"section not found for list_item: {section!r}")
-    section_end = len(lines)
-    for j in range(body_start, len(lines)):
-        if mask[j]:
-            continue
-        m = re.match(r"^(#{1,6})\s+", lines[j])
-        if m and len(m.group(1)) <= level:
-            section_end = j
-            break
+    start_i, section_end, _ = _locate_section(lines, mask, section, err_context=" for list_item")
+    body_start = start_i + 1
     ops = []
     k = body_start
     while k < section_end:
@@ -1687,10 +1730,10 @@ def materialized_tree_for_variant(repo_root: Path, manifest: dict[str, Any], var
     """For an ablation:<id> variant that declares a removal, materialize the tree
     and return its provenance (with skill_files). Returns None for non-ablation
     variants and for instruction-simulated ablations (no removal declared)."""
-    if not str(variant).startswith("ablation:"):
+    aid = ablation_id_of(variant)
+    if aid is None:
         return None
-    aid = str(variant).split(":", 1)[1]
-    ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+    ablation = ablation_by_id(manifest, aid)
     if ablation is None:
         raise AblationError(f"unknown ablation variant: {variant}")
     if not ablation_components(ablation):
@@ -1734,8 +1777,7 @@ def enumerate_tree(root_dir: Path) -> list[tuple[Path, str]]:
 def ablation_variant_population(manifest: dict[str, Any], variant: str) -> str:
     """Case population for an ablation:<id> variant: trigger (discovery ablation)
     or answer (everything else, including instruction-simulated)."""
-    aid = str(variant).split(":", 1)[1]
-    ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+    ablation = ablation_by_id(manifest, ablation_id_of(variant) or "")
     comps = ablation_components(ablation) if ablation else []
     return derived_population(comps) if comps else "answer"
 
@@ -1887,8 +1929,8 @@ def safe_task_json(pt: PreparedTask, manifest: dict[str, Any], *, task_name: str
             # simulate, via the ONE typed instruction-sim record. removed_component /
             # expected_regressions come from the manifest (the prepared row carries
             # only id/mode/population).
-            aid = variant.split(":", 1)[1]
-            ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
+            aid = ablation_id_of(variant)
+            ablation = ablation_by_id(manifest, aid) or {}
             safe["ablation"] = InstructionSimulated(
                 id=aid,
                 population=(pt.ablation.population if pt.ablation else "answer"),   # from the row, not hardcoded
@@ -1964,8 +2006,8 @@ def build_jetty_payload(
                 "remote_path_hint": f"old-skills/{pt.skill_name}/{Path(local).name}",
                 "private": False,
             })
-    elif variant.startswith("ablation:"):
-        aid = variant.split(":", 1)[1]
+    elif is_ablation_variant(variant):
+        aid = ablation_id_of(variant)
         tree = (ablation_trees or {}).get(aid)
         if tree:
             # Materialized: upload the whole altered tree, preserving relative paths
@@ -2148,7 +2190,7 @@ def extract_trajectory_id(response: dict[str, Any]) -> str | None:
 
 
 class JettyClient:
-    def __init__(self, token: str, base_url: str = "https://flows-api.jetty.io"):
+    def __init__(self, token: str, base_url: str = JETTY_DEFAULT_BASE_URL):
         self.token = token
         self.base_url = base_url.rstrip("/")
 
@@ -2215,7 +2257,7 @@ class JettyClient:
     def submit(self, request_body: dict[str, Any]) -> dict[str, Any]:
         return self._json_request("POST", "/v1/chat/completions", request_body)
 
-    def poll(self, collection: str, task: str, trajectory_id: str, *, timeout_s: int = 1800, poll_interval_s: float = 5) -> dict[str, Any]:
+    def poll(self, collection: str, task: str, trajectory_id: str, *, timeout_s: int = DEFAULT_RUNNER_TIMEOUT_S, poll_interval_s: float = 5) -> dict[str, Any]:
         deadline = time.time() + timeout_s
         quoted = "/".join(urllib.parse.quote(part, safe="") for part in [collection, task, trajectory_id])
         path = f"/api/v1/db/trajectory/{quoted}"
@@ -2233,7 +2275,7 @@ class JettyClient:
         return last
 
 
-def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeout_s: int = 1800, poll_interval_s: float = 5) -> Any:
+def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeout_s: int = DEFAULT_RUNNER_TIMEOUT_S, poll_interval_s: float = 5) -> Any:
     for row in payloads:
         harness = row.get("harness", {})
         if harness.get("executable") is False:
@@ -2320,8 +2362,8 @@ def run_jetty(args: argparse.Namespace) -> int:
         token = os.environ.get("JETTY_API_TOKEN")
         if not token:
             die("JETTY_API_TOKEN is required for run-jetty (use --dry-run to validate payload loading only)")
-        client = JettyClient(token, os.environ.get("JETTY_BASE_URL", "https://flows-api.jetty.io"))
-        records = list(execute_jetty_payloads(payloads, client=client, timeout_s=getattr(args, "timeout", 1800), poll_interval_s=getattr(args, "poll_interval", 5)))
+        client = JettyClient(token, os.environ.get("JETTY_BASE_URL", JETTY_DEFAULT_BASE_URL))
+        records = list(execute_jetty_payloads(payloads, client=client, timeout_s=getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S), poll_interval_s=getattr(args, "poll_interval", 5)))
     out = Path(args.out) if getattr(args, "out", None) else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
     try:
@@ -2560,6 +2602,66 @@ def discover_run_bases_under(base: Path) -> list[tuple[int, Path]]:
     return [(1, base)]
 
 
+def discovered_run_units(runs: Path, case: dict[str, Any], variants: list[str]):
+    """Every persisted run of one case, across both run layouts: yields
+    (model_name, variant, run_number, base, text, output_path, meta). THE
+    discovery loop shared by grade, build_benchmark_report, collect_judge_tasks,
+    and contamination_report — previously four hand-synced copies of the same
+    three-deep nesting."""
+    for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
+        for variant in variants:
+            for run_number, base in discover_run_bases_under(model_root / variant):
+                text, output_path = read_output_base(base)
+                meta = read_metadata_base(base)
+                yield model_name, variant, run_number, base, text, output_path, meta
+
+
+def discover_on_disk_run_rows(manifest: dict[str, Any], runs: Path) -> list[dict[str, Any]]:
+    """Every run directory that EXISTS ON DISK for the manifest's cases — every
+    variant directory found, ablation arms included, both layouts — as merged
+    cost-fact rows. This is the BILLING discovery (suite_cost_ledger): money
+    spent on an arm must be counted even when that arm is not listed in
+    manifest['variants']. Grading paths instead use discovered_run_units, which
+    is deliberately scoped to the variants under comparison. Both discoveries
+    live here so the difference is a documented decision, not two private
+    implementations that merely happen to disagree."""
+    def run_bearing(d: Path) -> bool:
+        return ((d / "output.md").exists() or (d / "metadata.json").exists() or (d / "outputs").is_dir()
+                or any(g.is_dir() and g.name.startswith(("run-", "turn-")) for g in d.iterdir()))
+
+    rows: list[dict[str, Any]] = []
+    for case in iter_cases(manifest):
+        case_dir = runs / case["id"]
+        if not case_dir.is_dir():
+            continue
+        variant_dirs: list[tuple[str | None, str, Path]] = []
+        for child in sorted(case_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            if run_bearing(child):
+                variant_dirs.append((None, child.name, child))
+                continue
+            # No run evidence of its own but run-bearing subdirs: a model root
+            # from the multi-model layout (<case>/<model>/<variant>).
+            bearing_children = [g for g in sorted(child.iterdir()) if g.is_dir() and run_bearing(g)]
+            for g in bearing_children:
+                variant_dirs.append((child.name, g.name, g))
+        for model, variant, vdir in variant_dirs:
+            for run_number, base in discover_run_bases_under(vdir):
+                merged = read_metrics_base(base)
+                facts = run_cost_facts(merged)
+                facts["elapsed_ms"] = metric_number(merged, "elapsed_ms")
+                rows.append({
+                    "case_id": case["id"],
+                    "variant": variant,
+                    "model": model,
+                    "run_number": run_number,
+                    "runner": merged.get("provider") or merged.get("trace_source") or merged.get("source"),
+                    **facts,
+                })
+    return rows
+
+
 def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int, Path]]:
     """Return run instances for a case/variant in the legacy (model-less) layout:
       runs/<case>/<variant>/output.md
@@ -2711,24 +2813,67 @@ def event_texts_for_tool_input(obj: Any) -> list[str]:
     return out
 
 
-def detect_trigger(stdout: str, skill_name: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
+def detect_trigger(stdout: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
     """THE shared skill-invocation detector: scan a model's JSON event stream for
     evidence it actually read one of the mounted skill files. Returns (invoked,
-    evidence). Used by both the autonomous-trigger eval (run_pi_trigger_eval) and the
-    pi-smoke runner, so skill_invoked is derived the same way everywhere instead of
-    one runner asserting it by fiat. Matches on the copied temp skill paths (not the
-    bare skill name) so unrelated repo files can't look like skill-load evidence."""
+    evidence). Used by the autonomous-trigger eval (run_pi_trigger_eval), the
+    trigger matrix, and the pi-smoke runner, so skill_invoked is derived the same
+    way everywhere instead of one runner asserting it by fiat. Matches on the
+    copied temp skill paths (never a bare skill name — an earlier skill_name
+    parameter was dead weight that each caller computed differently) so unrelated
+    repo files can't look like skill-load evidence."""
     needles = [str(p) for p in copied_paths] + [str(p.parent) for p in copied_paths]
     evidence: list[str] = []
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for event in iter_json_objects(stdout):
         for text in event_texts_for_tool_input(event):
             if any(n and n in text for n in needles):
                 evidence.append(text[:500])
     return bool(evidence), evidence[:5]
+
+
+def mount_skill_tree(tree_dir: Path, skills_dir: Path) -> list[Path]:
+    """Copy each per-root subdir of a canonical/materialized skill tree into an
+    agent's skills dir. EVERY trigger arm (baseline and ablation, every adapter)
+    mounts through here, so all arms expose an identical file surface under
+    identical names — the only difference is the bytes a declared ablation edit
+    removed. Returns the copied SKILL.md (or root dir) paths, which double as
+    the skill-load detection needles for detect_trigger."""
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for root_dir in sorted(p for p in tree_dir.iterdir() if p.is_dir()):
+        dest = skills_dir / root_dir.name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(root_dir, dest)
+        copied.append(dest / "SKILL.md" if (dest / "SKILL.md").exists() else dest)
+    return copied
+
+
+def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
+                          env: dict[str, str] | None = None, timeout: int) -> dict[str, Any]:
+    """One subprocess-with-timeout convention: returns {stdout, stderr,
+    returncode, timed_out, elapsed_ms, observation_complete}. THE timeout
+    encoding, everywhere a runner spawns a process: `timed_out: True` (the flag
+    ablation_model.execution_valid keys on) plus `returncode: 124` (the shell's
+    kill-on-timeout code). observation_complete means the agent got a fair
+    window to act; a crash or timeout is a failed observation, never a
+    no-trigger pass."""
+    def _text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    start = time.time()
+    try:
+        proc = subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout)
+        stdout, stderr, returncode, timed_out = _text(proc.stdout), _text(proc.stderr), proc.returncode, False
+    except subprocess.TimeoutExpired as exc:
+        stdout, stderr, returncode, timed_out = _text(exc.stdout), _text(exc.stderr), 124, True
+    return {"stdout": stdout, "stderr": stderr, "returncode": returncode, "timed_out": timed_out,
+            "elapsed_ms": int((time.time() - start) * 1000),
+            "observation_complete": returncode == 0 and not timed_out}
 
 
 def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:
@@ -2770,13 +2915,17 @@ def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:
 
 USAGE_SOURCES = {"provider_reported", "trace_normalized", "estimated", "missing", "not_applicable"}
 COST_SOURCES = {"provider_reported", "price_table_estimated", "missing", "not_applicable"}
+# THE token-usage alias table. Every normalizer (metadata `normalize_usage`, the
+# trace-stream `usage_number`, and the Claude envelope parser) reads THIS table,
+# so the same provider payload can never be classified differently by two paths
+# (the drift that once made metrics.json and usage_normalized disagree).
 USAGE_ALIASES: dict[str, list[str]] = {
     "input_tokens": ["input_tokens", "prompt_tokens", "input", "promptTokens", "inputTokens"],
     "output_tokens": ["output_tokens", "completion_tokens", "output", "completionTokens", "outputTokens"],
-    "cache_read_tokens": ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cacheReadTokens"],
+    "cache_read_tokens": ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cached_input_tokens", "cacheReadTokens"],
     "cache_write_tokens": ["cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens", "cacheWriteTokens"],
     "reasoning_tokens": ["reasoning_tokens", "thinking_tokens", "reasoningTokens"],
-    "total_tokens": ["total_tokens", "totalTokens", "total"],
+    "total_tokens": ["total_tokens", "totalTokens", "total", "tokens"],
 }
 COST_PART_ALIASES: dict[str, tuple[str, ...]] = {
     "input_cost": ("input_cost", "prompt_cost"),
@@ -3118,14 +3267,9 @@ def nested_item_type(record: dict[str, Any]) -> str:
 
 
 def usage_number(usage: dict[str, Any], *keys: str) -> float | None:
-    aliases = {
-        "input_tokens": ["input_tokens", "input", "prompt_tokens", "cached_input_tokens"],
-        "output_tokens": ["output_tokens", "output", "completion_tokens"],
-        "total_tokens": ["total_tokens", "totalTokens", "total", "tokens"],
-    }
     search: list[str] = []
     for key in keys:
-        search.extend(aliases.get(key, [key]))
+        search.extend(USAGE_ALIASES.get(key, [key]))
     for key in search:
         value = usage.get(key)
         if isinstance(value, (int, float)):
@@ -3307,17 +3451,7 @@ def stream_usage_and_cost(raw_text: str) -> tuple[dict[str, Any], dict[str, Any]
     """usage_normalized/cost_normalized straight from a runner's raw JSONL
     stream (issue #21): tokens via the trace normalizer (provider usage events
     relayed verbatim), provider cost records summed. Missing stays marked."""
-    records = []
-    for line in raw_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped[0] != "{":
-            continue
-        try:
-            obj = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            records.append(obj)
+    records = [obj for obj in iter_json_objects(raw_text) if isinstance(obj, dict)]
     _, metrics = normalize_trace_records(records, source="stream")
     has_tokens = any(isinstance(metrics.get(k), (int, float)) and metrics.get(k) for k in ("input_tokens", "output_tokens", "total_tokens"))
     usage = normalize_usage(metrics if has_tokens else None, source="provider_reported")
@@ -3528,7 +3662,7 @@ def run_codex(args: argparse.Namespace) -> int:
     tasks = load_jsonl(Path(args.tasks))
     runs = Path(args.runs)
     cmd = getattr(args, "codex_cmd", None) or "codex exec --json"
-    timeout = int(getattr(args, "timeout", 1800))
+    timeout = int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S))
     for task in tasks:
         # Cross the JSONL boundary ONCE: from here down the typed PreparedTask is the
         # authority for variant, skill paths, ablation record, and tree hash — the
@@ -3570,7 +3704,7 @@ def run_codex(args: argparse.Namespace) -> int:
             except subprocess.TimeoutExpired as exc:
                 elapsed_ms = int((time.time() - started) * 1000)
                 (base / "output.md").write_text(f"{CODEX_FAILURE}: timed out after {timeout}s]\n", encoding="utf-8")
-                write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timed_out": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **prov_extra})
+                write_json(base / "metadata.json", {"provider": "codex", "returncode": 124, "timed_out": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **prov_extra})
     return 0
 
 
@@ -3584,11 +3718,14 @@ def run_codex(args: argparse.Namespace) -> int:
 # thing every other adapter leaves the caller to reconstruct out of band.
 # --------------------------------------------------------------------------- #
 
+# The Claude envelope's normalized keys, aliased through the ONE table above.
+# (`cache_creation_tokens` is Claude's historical metrics.json field name for
+# what USAGE_ALIASES normalizes as cache_write_tokens.)
 CLAUDE_USAGE_KEYS = {
-    "input_tokens": ("input_tokens", "prompt_tokens"),
-    "output_tokens": ("output_tokens", "completion_tokens"),
-    "cache_read_tokens": ("cache_read_input_tokens", "cache_read_tokens"),
-    "cache_creation_tokens": ("cache_creation_input_tokens", "cache_creation_tokens"),
+    "input_tokens": USAGE_ALIASES["input_tokens"],
+    "output_tokens": USAGE_ALIASES["output_tokens"],
+    "cache_read_tokens": USAGE_ALIASES["cache_read_tokens"],
+    "cache_creation_tokens": USAGE_ALIASES["cache_write_tokens"],
 }
 
 
@@ -3625,7 +3762,7 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
 
 
 def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str = "claude",
-                      timeout: int = 1800, extra_args: list[str] | None = None, cwd: str | None = None) -> dict[str, Any]:
+                      timeout: int = DEFAULT_RUNNER_TIMEOUT_S, extra_args: list[str] | None = None, cwd: str | None = None) -> dict[str, Any]:
     """Single owner for invoking Claude via `claude -p`. Returns the parsed
     envelope plus returncode/elapsed_ms/stderr. `claude_bin` is an executable path
     (tests inject a stub that emits a canned envelope), NOT a shell string — so
@@ -3640,7 +3777,7 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
         proc = subprocess.run(argv, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=cwd)
     except subprocess.TimeoutExpired as exc:
         return {"answer": "", "cost_usd": None, "usage": {}, "parse_error": None,
-                "returncode": None, "timed_out": True, "elapsed_ms": int((time.time() - started) * 1000),
+                "returncode": 124, "timed_out": True, "elapsed_ms": int((time.time() - started) * 1000),
                 "stderr": str(exc)[:4000]}
     parsed = parse_claude_cli_json(proc.stdout)
     parsed.update({
@@ -3674,7 +3811,7 @@ def run_claude(args: argparse.Namespace) -> int:
     runs = Path(args.runs)
     model = getattr(args, "model", None)
     claude_bin = getattr(args, "claude_bin", None) or "claude"
-    timeout = int(getattr(args, "timeout", 1800))
+    timeout = int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S))
     for task in tasks:
         pt = PreparedTask.from_row(task)
         # The row's model (multi-model fan-out, roadmap 2.1) beats the CLI-wide
@@ -4071,30 +4208,34 @@ def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[s
     return f"{case_id}::{model_segment}{variant}::run-{run_number}::{assertion_label(assertion)}"
 
 
+def load_result_rows(path: Path, *, id_keys: tuple[str, ...], label: str) -> list[dict[str, Any]]:
+    """One parser for every verdict/result file the harness reads back (judge
+    verdicts, comparison verdicts): accepts JSONL, a JSON array (even
+    pretty-printed across lines), or a single JSON object — the same input
+    shape can never load through one command and crash another."""
+    if not path.exists():
+        die(f"{label} file not found: {path}")
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        data = json.loads(text)
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+    try:
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    except json.JSONDecodeError:
+        rows = [json.loads(text)]   # one pretty-printed object spanning lines
+    if len(rows) == 1 and isinstance(rows[0], dict) and not any(k in rows[0] for k in id_keys):
+        rows = rows[0].get("results", [])
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
     if not path:
         return {}
-    p = Path(path)
-    if not p.exists():
-        die(f"judge results file not found: {p}")
+    rows = load_result_rows(Path(path), id_keys=("judge_task_id", "id"), label="judge results")
     lookup: dict[str, dict[str, Any]] = {}
-    lines = p.read_text(encoding="utf-8").splitlines()
-    # Accept JSONL or a JSON list/object.
-    if len(lines) == 1 and lines[0].lstrip().startswith(("[", "{")):
-        data = json.loads(lines[0])
-        if isinstance(data, list):
-            rows = data
-        elif isinstance(data, dict) and ("judge_task_id" in data or "id" in data):
-            rows = [data]
-        elif isinstance(data, dict):
-            rows = data.get("results", [])
-        else:
-            rows = []
-    else:
-        rows = [json.loads(line) for line in lines if line.strip()]
     for row in rows:
-        if not isinstance(row, dict):
-            continue
         jid = row.get("judge_task_id") or row.get("id")
         if jid:
             lookup[str(jid)] = row
@@ -4210,15 +4351,15 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
     selected_variants = variants or manifest.get("variants", DEFAULT_VARIANTS)
     tasks: list[dict[str, Any]] = []
     for case in iter_cases(manifest, split):
-        for model_name, model_root in discover_case_model_roots(runs, case["id"], selected_variants):
-            for variant in selected_variants:
-                for run_number, base in discover_run_bases_under(model_root / variant):
-                    text, output_path = read_output_base(base)
-                    meta = read_metadata_base(base)
-                    # The layout model rides into judge_task_id so a fanned run's
-                    # verdicts merge back onto the right model's rows.
-                    _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={}, model=model_name)
-                    tasks.extend(judge_tasks)
+        if is_trigger_case(case):
+            # Same population boundary as build_benchmark_report/grade: a judge
+            # never spends a model call on a discovery-population case.
+            continue
+        for model_name, variant, run_number, base, text, output_path, meta in discovered_run_units(runs, case, selected_variants):
+            # The layout model rides into judge_task_id so a fanned run's
+            # verdicts merge back onto the right model's rows.
+            _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={}, model=model_name)
+            tasks.extend(judge_tasks)
     return tasks
 
 
@@ -4628,6 +4769,10 @@ def run_subagent_tasks(
                 error = None
             except ToolReplayMiss as exc:
                 outcome, error = {}, f"tool replay miss: {exc}"
+            except subprocess.TimeoutExpired as exc:
+                # The one timeout encoding (see run_argv_with_timeout): the flag
+                # execution_valid keys on, never a generic error that loses it.
+                outcome, error = {"timed_out": True, "returncode": 124}, f"subagent timeout: {exc}"
             except Exception as exc:
                 outcome, error = {}, f"subagent error: {exc}"
             elapsed_ms = outcome.get("elapsed_ms")
@@ -4647,12 +4792,14 @@ def run_subagent_tasks(
         write_json(base / "events.json", events_doc)
         write_json(base / "metrics.json", metrics)
         write_json(base / "metadata.json", {
-            "provider": "subagent", "model": row_model, "returncode": 1 if error else outcome.get("returncode", 0),
+            "provider": "subagent", "model": row_model, "returncode": outcome.get("returncode", 1 if error else 0),
             "timed_out": bool(outcome.get("timed_out", False)), "elapsed_ms": int(elapsed_ms),
             "usage_normalized": usage_block, "cost_normalized": cost_block,
             "tool_replay_mode": mode, "trace_source": "subagent", **prov_extra})
         answer = str(outcome.get("answer") or "")
-        if error:
+        if outcome.get("timed_out"):
+            answer = f"{TIMEOUT_FAILURE}: {error or 'subagent timed out'}]\n"
+        elif error:
             answer = f"{CLAUDE_FAILURE}: {error}]\n"
         elif not answer:
             answer = f"{CLAUDE_FAILURE}: no output produced]\n"
@@ -4660,15 +4807,18 @@ def run_subagent_tasks(
     return 0
 
 
-def shell_agent_backend(agent_cmd: str, timeout: int = 1800) -> Any:
+def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S) -> Any:
     """Adapt a shell command into the subagent seam: the prompt arrives as JSON
     on stdin, the reply is JSON on stdout ({answer, trace?, usage?})."""
     def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
         payload = {"prompt": prompt, "model": model, "workspace": str(workspace)}
         if history:
             payload["history"] = history
-        proc = subprocess.run(agent_cmd, shell=True, input=json.dumps(payload),
-                              text=True, capture_output=True, timeout=timeout)
+        try:
+            proc = subprocess.run(agent_cmd, shell=True, input=json.dumps(payload),
+                                  text=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"answer": "", "returncode": 124, "timed_out": True}
         if proc.returncode != 0:
             return {"answer": "", "returncode": proc.returncode}
         try:
@@ -4683,10 +4833,10 @@ def run_subagent(args: argparse.Namespace) -> int:
     runs = Path(args.runs)
     agent_cmd = getattr(args, "agent_cmd", None)
     if agent_cmd:
-        backend = shell_agent_backend(agent_cmd, timeout=int(getattr(args, "timeout", 1800)))
+        backend = shell_agent_backend(agent_cmd, timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)))
     else:
         claude_bin = getattr(args, "claude_bin", None) or "claude"
-        timeout = int(getattr(args, "timeout", 1800))
+        timeout = int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S))
 
         def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
             if history:
@@ -4771,11 +4921,7 @@ def judge_robustness_command(args: argparse.Namespace) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="judge-robustness-"))
     report = judge_robustness_report(tasks, tmp_dir=tmp, judge_cmd=judge_cmd, judge_model=judge_model,
                                      claude_bin=getattr(args, "claude_bin", None) or "claude")
-    text = json.dumps(report, indent=2, ensure_ascii=False)
-    if getattr(args, "out", None):
-        Path(args.out).write_text(text, encoding="utf-8")
-    else:
-        print(text)
+    emit_report(report, getattr(args, "out", None))
     return 1 if (getattr(args, "fail_on_findings", False) and report["findings"]) else 0
 
 
@@ -4859,10 +5005,7 @@ def compare_judges(args: argparse.Namespace) -> int:
     if len(reports_by_judge) < 2:
         die("compare-judges needs at least two --report name=path entries (a panel)")
     result = judge_panel_sensitivity(reports_by_judge, magnitude_eps=float(getattr(args, "magnitude_eps", 0.1)))
-    if getattr(args, "out", None):
-        write_json(Path(args.out), result)
-    else:
-        print(json.dumps(result, indent=2))
+    emit_report(result, getattr(args, "out", None))
     return 0
 
 
@@ -4949,10 +5092,7 @@ def judge_alignment_command(args: argparse.Namespace) -> int:
     if not human:
         die(f"no human labels loaded from {args.labels}")
     report = judge_alignment_report(human, judge, min_labels=int(getattr(args, "min_labels", 50)))
-    if getattr(args, "out", None):
-        write_json(Path(args.out), report)
-    else:
-        print(json.dumps(report, indent=2))
+    emit_report(report, getattr(args, "out", None))
     return 0
 
 
@@ -5029,10 +5169,7 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
 def error_analysis_command(args: argparse.Namespace) -> int:
     report = load_json(Path(args.benchmark))
     out = error_analysis_report(report, limit=int(getattr(args, "limit", 100)))
-    if getattr(args, "out", None):
-        write_json(Path(args.out), out)
-    else:
-        print(json.dumps(out, indent=2, ensure_ascii=False))
+    emit_report(out, getattr(args, "out", None))
     return 0
 
 
@@ -5352,23 +5489,17 @@ def grade_case_variant(
 
 
 def anthropic_grading_json(result: dict[str, Any]) -> dict[str, Any]:
-    expectations = []
-    for assertion in result.get("assertions", []) + result.get("qualitative_assertions", []):
-        expectations.append({
-            "text": assertion.get("name", assertion.get("type", "assertion")),
-            "passed": bool(assertion.get("passed")),
-            "evidence": assertion.get("evidence", ""),
-        })
+    expectations = expectation_texts(result)
     meta = result.get("metadata", {}) or {}
-    elapsed = num(meta, "elapsed_ms")
+    elapsed = metric_number(meta, "elapsed_ms")
     if elapsed is None:
-        elapsed = num(meta, "duration_ms")
+        elapsed = metric_number(meta, "duration_ms")
     timing = {}
     if elapsed is not None:
         timing["executor_duration_seconds"] = round(elapsed / 1000, 3)
         timing["total_duration_seconds"] = round(elapsed / 1000, 3)
-    if num(meta, "total_tokens") is not None:
-        timing["total_tokens"] = int(num(meta, "total_tokens") or 0)
+    if metric_number(meta, "total_tokens") is not None:
+        timing["total_tokens"] = int(metric_number(meta, "total_tokens") or 0)
     total = result.get("combined_total", result.get("objective_total", 0))
     passed = result.get("combined_passed", result.get("objective_passed", 0))
     return {
@@ -5409,14 +5540,14 @@ def grade(args: argparse.Namespace) -> int:
     all_results = []
     all_judge_tasks = []
     for case in iter_cases(manifest, args.split):
-        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
-            for variant in variants:
-                for run_number, base in discover_run_bases_under(model_root / variant):
-                    text, output_path = read_output_base(base)
-                    meta = read_metadata_base(base)
-                    result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent, model=model_name, strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
-                    all_results.append(result)
-                    all_judge_tasks.extend(judge_tasks)
+        if is_trigger_case(case):
+            # Same population boundary as build_benchmark_report: trigger cases are
+            # graded by the autonomous-trigger runners, never by the answer grader.
+            continue
+        for model_name, variant, run_number, base, text, output_path, meta in discovered_run_units(runs, case, variants):
+            result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent, model=model_name, strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
+            all_results.append(result)
+            all_judge_tasks.extend(judge_tasks)
     report = {
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
@@ -5426,10 +5557,7 @@ def grade(args: argparse.Namespace) -> int:
     }
     if getattr(args, "write_grading_files", False):
         write_grading_files(all_results)
-    if args.out:
-        write_json(Path(args.out), report)
-    else:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+    emit_report(report, args.out)
     if args.judge_tasks:
         jt = Path(args.judge_tasks)
         jt.parent.mkdir(parents=True, exist_ok=True)
@@ -5437,18 +5565,6 @@ def grade(args: argparse.Namespace) -> int:
             for task in all_judge_tasks:
                 fh.write(json.dumps(task, ensure_ascii=False) + "\n")
     return 0
-
-def num(meta: dict[str, Any], key: str) -> float | None:
-    val = meta.get(key)
-    if isinstance(val, (int, float)):
-        return float(val)
-    usage = meta.get("usage")
-    if isinstance(usage, dict):
-        val = usage.get(key)
-        if isinstance(val, (int, float)):
-            return float(val)
-    return None
-
 
 def stats(values: list[float]) -> dict[str, float | None]:
     clean = [float(v) for v in values if v is not None]
@@ -6208,88 +6324,122 @@ def result_cost_facts(result: dict[str, Any]) -> dict[str, Any]:
     return facts
 
 
+def spend_of(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """One spend slot — {runs, total_tokens, total_cost_usd} — over cost-fact
+    rows. Missing telemetry contributes nothing (never a fake zero row). THE
+    accumulator behind every by-case/by-variant/by-runner/ablation spend view
+    in both cost ledgers (previously five hand-rolled folds)."""
+    return {
+        "runs": len(rows),
+        "total_tokens": int(sum(r["total_tokens"] for r in rows if r.get("total_tokens") is not None)),
+        "total_cost_usd": round(sum(r["cost_usd"] for r in rows if r.get("cost_usd") is not None), 6),
+    }
+
+
+def group_spend(rows: list[dict[str, Any]], key_fn) -> dict[str, dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        groups.setdefault(key_fn(r), []).append(r)
+    return {k: spend_of(v) for k, v in sorted(groups.items(), key=lambda kv: str(kv[0]))}
+
+
+def cost_coverage_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Coverage separates missing telemetry from zero spend — identical keys in
+    the benchmark cost_summary and the standalone suite ledger by construction."""
+    runs_seen = len(rows)
+    with_usage = sum(1 for r in rows if r.get("total_tokens") is not None)
+    with_cost = sum(1 for r in rows if r.get("cost_usd") is not None)
+    return {
+        "runs_seen": runs_seen,
+        "runs_with_token_usage": with_usage,
+        "runs_with_dollar_cost": with_cost,
+        "runs_missing_usage": runs_seen - with_usage,
+        "runs_missing_cost": runs_seen - with_cost,
+    }
+
+
+def cost_totals_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "input_tokens": int(sum(r["input_tokens"] for r in rows if r.get("input_tokens") is not None)),
+        "output_tokens": int(sum(r["output_tokens"] for r in rows if r.get("output_tokens") is not None)),
+        "total_tokens": int(sum(r["total_tokens"] for r in rows if r.get("total_tokens") is not None)),
+        "total_cost_usd": round(sum(r["cost_usd"] for r in rows if r.get("cost_usd") is not None), 6),
+        "elapsed_ms_sum": int(sum(r["elapsed_ms"] for r in rows if r.get("elapsed_ms") is not None)),
+    }
+
+
 def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str, dict[str, Any]] | None = None, confirmed_regressions: int = 0) -> dict[str, Any]:
     """The cost ledger inside a benchmark report (issue #21). Operational by
     design: EVERY run counts here, including execution errors — a timed-out
     run still cost money — while quality rates elsewhere keep excluding them.
     Coverage separates missing telemetry from zero spend."""
-    facts = [(r, result_cost_facts(r)) for r in results]
-    runs_seen = len(facts)
-    with_usage = [f for _, f in facts if f.get("total_tokens") is not None]
-    with_cost = [f for _, f in facts if f.get("cost_usd") is not None]
+    rows = [{**result_cost_facts(r), "case_id": r["case_id"], "variant": r["variant"],
+             "missing_output": r.get("missing_output"), "execution_valid": r.get("execution_valid", True)}
+            for r in results]
     totals = {
-        "input_tokens": int(sum(f["input_tokens"] for _, f in facts if f.get("input_tokens") is not None)),
-        "output_tokens": int(sum(f["output_tokens"] for _, f in facts if f.get("output_tokens") is not None)),
-        "total_tokens": int(sum(f["total_tokens"] for _, f in facts if f.get("total_tokens") is not None)),
-        "total_cost_usd": round(sum(f["cost_usd"] for _, f in facts if f.get("cost_usd") is not None), 6),
-        "elapsed_ms_sum": int(sum(f["elapsed_ms"] for _, f in facts if f.get("elapsed_ms") is not None)),
-        "execution_errors": sum(1 for r, _ in facts if not r.get("missing_output") and not r.get("execution_valid", True)),
+        **cost_totals_block(rows),
+        "execution_errors": sum(1 for r in rows if not r.get("missing_output") and not r.get("execution_valid", True)),
     }
     by_variant: dict[str, Any] = {}
-    for variant in sorted({r["variant"] for r, _ in facts}):
-        rows = [(r, f) for r, f in facts if r["variant"] == variant]
+    for variant in sorted({r["variant"] for r in rows}):
+        vrows = [r for r in rows if r["variant"] == variant]
         by_variant[variant] = {
-            "runs": len(rows),
-            "tokens": cost_stats([f["total_tokens"] for _, f in rows if f.get("total_tokens") is not None]),
-            "cost_usd": cost_stats([f["cost_usd"] for _, f in rows if f.get("cost_usd") is not None]),
+            "runs": len(vrows),
+            "tokens": cost_stats([r["total_tokens"] for r in vrows if r.get("total_tokens") is not None]),
+            "cost_usd": cost_stats([r["cost_usd"] for r in vrows if r.get("cost_usd") is not None]),
         }
-    by_case: dict[str, Any] = {}
-    for case_id in sorted({r["case_id"] for r, _ in facts}):
-        rows = [f for r, f in facts if r["case_id"] == case_id]
-        by_case[case_id] = {
-            "runs": len(rows),
-            "total_tokens": int(sum(f["total_tokens"] for f in rows if f.get("total_tokens") is not None)),
-            "total_cost_usd": round(sum(f["cost_usd"] for f in rows if f.get("cost_usd") is not None), 6),
-        }
+    by_case = group_spend(rows, lambda r: r["case_id"])
     paired_cost_delta: dict[str, Any] = {}
     deltas = []
     for case_id in by_case:
-        with_costs = [f["cost_usd"] for r, f in facts if r["case_id"] == case_id and r["variant"] == "with_skill" and f.get("cost_usd") is not None]
-        without_costs = [f["cost_usd"] for r, f in facts if r["case_id"] == case_id and r["variant"] == "without_skill" and f.get("cost_usd") is not None]
+        with_costs = [r["cost_usd"] for r in rows if r["case_id"] == case_id and r["variant"] == "with_skill" and r.get("cost_usd") is not None]
+        without_costs = [r["cost_usd"] for r in rows if r["case_id"] == case_id and r["variant"] == "without_skill" and r.get("cost_usd") is not None]
         if with_costs and without_costs:
             delta = statistics.mean(with_costs) - statistics.mean(without_costs)
             paired_cost_delta[case_id] = {"with_skill": round(statistics.mean(with_costs), 6), "without_skill": round(statistics.mean(without_costs), 6), "delta": round(delta, 6)}
             deltas.append(delta)
-    ablation_rows = [(r, f) for r, f in facts if str(r.get("variant", "")).startswith("ablation:")]
-    ablation_cost = round(sum(f["cost_usd"] for _, f in ablation_rows if f.get("cost_usd") is not None), 6)
-    ablation_tokens = int(sum(f["total_tokens"] for _, f in ablation_rows if f.get("total_tokens") is not None))
+    ablation_spend = spend_of([r for r in rows if is_ablation_variant(r.get("variant", ""))])
+    ablation_cost = ablation_spend["total_cost_usd"]
     out: dict[str, Any] = {
-        "coverage": {
-            "runs_seen": runs_seen,
-            "runs_with_token_usage": len(with_usage),
-            "runs_with_dollar_cost": len(with_cost),
-            "runs_missing_usage": runs_seen - len(with_usage),
-            "runs_missing_cost": runs_seen - len(with_cost),
-        },
+        "coverage": cost_coverage_block(rows),
         "totals": totals,
         "by_variant": by_variant,
         "by_case": by_case,
         "paired_cost_delta": paired_cost_delta,
         "mean_paired_cost_delta": round(statistics.mean(deltas), 6) if deltas else None,
         "ablations": {
-            "runs": len(ablation_rows),
-            "total_tokens": ablation_tokens,
-            "total_cost_usd": ablation_cost,
+            **ablation_spend,
             "confirmed_regressions": confirmed_regressions,
             "cost_per_confirmed_regression": round(ablation_cost / confirmed_regressions, 6) if confirmed_regressions and ablation_cost else None,
         },
     }
     if judge_results:
-        judge_costs = []
-        for row in judge_results.values():
-            block = row.get("cost_normalized")
-            if isinstance(block, dict) and isinstance(block.get("total_cost"), (int, float)):
-                judge_costs.append(float(block["total_cost"]))
-            elif isinstance(row.get("cost_usd"), (int, float)):
-                judge_costs.append(float(row["cost_usd"]))
         # Judge spend is suite cost, but its own ledger line — never folded
         # into the model-under-test totals.
-        out["judge"] = {
-            "verdicts": len(judge_results),
-            "verdicts_with_cost": len(judge_costs),
-            "total_cost_usd": round(sum(judge_costs), 6) if judge_costs else None,
-        }
+        out["judge"] = judge_cost_block(judge_results)
     return out
+
+
+def judge_cost_usd(row: dict[str, Any]) -> float | None:
+    """One reading of a judge verdict's dollar cost, preferring the normalized
+    block. Both cost ledgers (build_cost_summary and suite_cost_ledger) route
+    through here — they previously read different fields, so a verdict whose
+    spend lived only in cost_normalized counted in one ledger and not the other."""
+    block = row.get("cost_normalized")
+    if isinstance(block, dict) and isinstance(block.get("total_cost"), (int, float)):
+        return float(block["total_cost"])
+    if isinstance(row.get("cost_usd"), (int, float)):
+        return float(row["cost_usd"])
+    return None
+
+
+def judge_cost_block(judge_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    costs = [c for c in (judge_cost_usd(row) for row in judge_results.values()) if c is not None]
+    return {
+        "verdicts": len(judge_results),
+        "verdicts_with_cost": len(costs),
+        "total_cost_usd": round(sum(costs), 6) if costs else None,
+    }
 
 
 def confirmed_regression_count(ablation_regressions: list[dict[str, Any]]) -> int:
@@ -6402,16 +6552,12 @@ def build_benchmark_report(
         # prepared_task_rows already withholds trigger cases from the answer runners,
         # so normally no such runs exist; the grader enforces the same boundary as
         # defense in depth (e.g. hand-placed outputs) rather than trusting upstream.
-        if case.get("kind") == "trigger":
+        if is_trigger_case(case):
             skipped_trigger_cases.append(case["id"])
             continue
-        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
-            for variant in variants:
-                for run_number, base in discover_run_bases_under(model_root / variant):
-                    text, output_path = read_output_base(base)
-                    meta = read_metadata_base(base)
-                    result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name, strict=strict, embed_cmd=embed_cmd)
-                    results.append(result)
+        for model_name, variant, run_number, base, text, output_path, meta in discovered_run_units(runs, case, variants):
+            result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name, strict=strict, embed_cmd=embed_cmd)
+            results.append(result)
 
     by_variant: dict[str, list[dict[str, Any]]] = {v: [] for v in variants}
     for r in results:
@@ -6534,10 +6680,7 @@ def build_benchmark_report(
 
 def benchmark(args: argparse.Namespace) -> int:
     report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
-    if args.out:
-        write_json(Path(args.out), report)
-    else:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+    emit_report(report, args.out)
     return 0
 
 
@@ -6652,7 +6795,7 @@ def aggregate(args: argparse.Namespace) -> int:
     reports = []
     for raw in args.manifests:
         manifest_path = Path(raw)
-        repo_root = manifest_path.parents[1] if manifest_path.name == "shared-benchmark.json" else manifest_path.parent
+        repo_root = repo_root_for_manifest(manifest_path)
         runs = Path(args.runs_root) / repo_root.name / args.runs_subdir
         if args.runs:
             runs = Path(args.runs)
@@ -6680,10 +6823,7 @@ def aggregate(args: argparse.Namespace) -> int:
         ],
     }
     output = {"generated_at": int(time.time()), "summary": aggregate_summary, "reports": reports}
-    if args.out:
-        write_json(Path(args.out), output)
-    else:
-        print(json.dumps(output, indent=2, ensure_ascii=False))
+    emit_report(output, args.out)
     return 0
 
 
@@ -6708,8 +6848,8 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
     runs = []
     for r in report["results"]:
         meta = r.get("metadata", {}) or {}
-        elapsed_ms = num(meta, "elapsed_ms") or num(meta, "duration_ms") or 0.0
-        tokens = num(meta, "total_tokens") or 0.0
+        elapsed_ms = metric_number(meta, "elapsed_ms", "duration_ms") or 0.0
+        tokens = metric_number(meta, "total_tokens") or 0.0
         runs.append({
             "eval_id": r["case_id"],
             "eval_name": r["case_id"],
@@ -6766,10 +6906,7 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
 def export_anthropic(args: argparse.Namespace) -> int:
     report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False))
     benchmark = anthropic_benchmark_from_report(report, args.skill_path or "")
-    if args.out:
-        write_json(Path(args.out), benchmark)
-    else:
-        print(json.dumps(benchmark, indent=2, ensure_ascii=False))
+    emit_report(benchmark, args.out)
     return 0
 
 
@@ -6821,20 +6958,7 @@ def compare_tasks(args: argparse.Namespace) -> int:
 
 
 def load_comparison_results(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        die(f"comparison results not found: {path}")
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        return []
-    if text.startswith("["):
-        data = json.loads(text)
-        return data if isinstance(data, list) else []
-    if text.startswith("{") and "\n" not in text:
-        data = json.loads(text)
-        if isinstance(data, dict) and ("comparison_task_id" in data or "id" in data):
-            return [data]
-        return data.get("results", []) if isinstance(data, dict) else []
-    return [json.loads(line) for line in text.splitlines() if line.strip()]
+    return load_result_rows(path, id_keys=("comparison_task_id", "id"), label="comparison results")
 
 
 def compare_results(args: argparse.Namespace) -> int:
@@ -6861,10 +6985,7 @@ def compare_results(args: argparse.Namespace) -> int:
             wins["unknown"] += 1
         details.append({"comparison_task_id": tid, "winner": winner, "winning_role": role, "reasoning": row.get("reasoning", "")})
     output = {"generated_at": int(time.time()), "summary": wins, "details": details}
-    if args.out:
-        write_json(Path(args.out), output)
-    else:
-        print(json.dumps(output, indent=2, ensure_ascii=False))
+    emit_report(output, args.out)
     return 0
 
 
@@ -7163,64 +7284,12 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
     the run tree per manifest case — every variant directory found on disk,
     ablation arms included — and reads each run's normalized telemetry."""
     manifest = validate_manifest(manifest_path)
-    rows: list[dict[str, Any]] = []
-    for case in iter_cases(manifest):
-        case_dir = runs / case["id"]
-        if not case_dir.is_dir():
-            continue
-        def run_bearing(d: Path) -> bool:
-            return ((d / "output.md").exists() or (d / "metadata.json").exists() or (d / "outputs").is_dir()
-                    or any(g.is_dir() and g.name.startswith(("run-", "turn-")) for g in d.iterdir()))
-
-        variant_dirs: list[tuple[str | None, str, Path]] = []
-        for child in sorted(case_dir.iterdir()):
-            if not child.is_dir():
-                continue
-            if run_bearing(child):
-                variant_dirs.append((None, child.name, child))
-                continue
-            # No run evidence of its own but run-bearing subdirs: a model root
-            # from the multi-model layout (<case>/<model>/<variant>).
-            bearing_children = [g for g in sorted(child.iterdir()) if g.is_dir() and run_bearing(g)]
-            for g in bearing_children:
-                variant_dirs.append((child.name, g.name, g))
-        for model, variant, vdir in variant_dirs:
-            for run_number, base in discover_run_bases_under(vdir):
-                merged = read_metrics_base(base)
-                facts = run_cost_facts(merged)
-                facts["elapsed_ms"] = metric_number(merged, "elapsed_ms")
-                rows.append({
-                    "case_id": case["id"],
-                    "variant": variant,
-                    "model": model,
-                    "run_number": run_number,
-                    "runner": merged.get("provider") or merged.get("trace_source") or merged.get("source"),
-                    **facts,
-                })
-    runs_seen = len(rows)
-    with_usage = sum(1 for r in rows if r.get("total_tokens") is not None)
-    with_cost = sum(1 for r in rows if r.get("cost_usd") is not None)
-    by_variant: dict[str, Any] = {}
-    by_runner: dict[str, Any] = {}
-    by_case: dict[str, Any] = {}
-    for row in rows:
-        for bucket, key in [(by_variant, row["variant"]), (by_runner, str(row.get("runner") or "unknown")), (by_case, row["case_id"])]:
-            slot = bucket.setdefault(key, {"runs": 0, "total_tokens": 0, "total_cost_usd": 0.0})
-            slot["runs"] += 1
-            if row.get("total_tokens") is not None:
-                slot["total_tokens"] += int(row["total_tokens"])
-            if row.get("cost_usd") is not None:
-                slot["total_cost_usd"] = round(slot["total_cost_usd"] + float(row["cost_usd"]), 6)
+    rows = discover_on_disk_run_rows(manifest, runs)
+    by_variant = group_spend(rows, lambda r: r["variant"])
+    by_runner = group_spend(rows, lambda r: str(r.get("runner") or "unknown"))
+    by_case = group_spend(rows, lambda r: r["case_id"])
     expensive_cases = sorted(by_case.items(), key=lambda kv: (-(kv[1]["total_cost_usd"] or 0), -kv[1]["total_tokens"], kv[0]))[:top_n]
-    ablation_spend: dict[str, Any] = {}
-    for row in rows:
-        if str(row["variant"]).startswith("ablation:"):
-            slot = ablation_spend.setdefault(row["variant"], {"runs": 0, "total_tokens": 0, "total_cost_usd": 0.0})
-            slot["runs"] += 1
-            if row.get("total_tokens") is not None:
-                slot["total_tokens"] += int(row["total_tokens"])
-            if row.get("cost_usd") is not None:
-                slot["total_cost_usd"] = round(slot["total_cost_usd"] + float(row["cost_usd"]), 6)
+    ablation_spend = group_spend([r for r in rows if is_ablation_variant(r["variant"])], lambda r: r["variant"])
     top_ablations = sorted(ablation_spend.items(), key=lambda kv: (-(kv[1]["total_cost_usd"] or 0), -kv[1]["total_tokens"], kv[0]))[:top_n]
     findings: list[dict[str, Any]] = []
     if benchmark_report:
@@ -7244,20 +7313,8 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
         "manifest": str(manifest_path),
         "skill_name": manifest.get("skill_name"),
         "runs_root": str(runs),
-        "coverage": {
-            "runs_seen": runs_seen,
-            "runs_with_token_usage": with_usage,
-            "runs_with_dollar_cost": with_cost,
-            "runs_missing_usage": runs_seen - with_usage,
-            "runs_missing_cost": runs_seen - with_cost,
-        },
-        "totals": {
-            "input_tokens": int(sum(r["input_tokens"] for r in rows if r.get("input_tokens") is not None)),
-            "output_tokens": int(sum(r["output_tokens"] for r in rows if r.get("output_tokens") is not None)),
-            "total_tokens": int(sum(r["total_tokens"] for r in rows if r.get("total_tokens") is not None)),
-            "total_cost_usd": round(sum(r["cost_usd"] for r in rows if r.get("cost_usd") is not None), 6),
-            "elapsed_ms_sum": int(sum(r["elapsed_ms"] for r in rows if r.get("elapsed_ms") is not None)),
-        },
+        "coverage": cost_coverage_block(rows),
+        "totals": cost_totals_block(rows),
         "by_variant": by_variant,
         "by_runner": by_runner,
         "by_case": by_case,
@@ -7266,8 +7323,7 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
         "cost_quality_findings": findings[:top_n],
     }
     if judge_results:
-        judge_costs = [float(row.get("cost_usd")) for row in judge_results.values() if isinstance(row.get("cost_usd"), (int, float))]
-        ledger["judge"] = {"verdicts": len(judge_results), "verdicts_with_cost": len(judge_costs), "total_cost_usd": round(sum(judge_costs), 6) if judge_costs else None}
+        ledger["judge"] = judge_cost_block(judge_results)
     return ledger
 
 
@@ -7304,10 +7360,7 @@ def cost_summary_command(args: argparse.Namespace) -> int:
     benchmark_report = load_json(Path(args.benchmark)) if getattr(args, "benchmark", None) else None
     judge_lookup = load_judge_results(getattr(args, "judge_results", None))
     ledger = suite_cost_ledger(Path(args.manifest), Path(args.runs), benchmark_report=benchmark_report, judge_results=judge_lookup or None, top_n=int(getattr(args, "top", 10)))
-    if args.out:
-        write_json(Path(args.out), ledger)
-    else:
-        print(json.dumps(ledger, indent=2, ensure_ascii=False))
+    emit_report(ledger, args.out)
     if getattr(args, "md", None):
         Path(args.md).write_text(cost_ledger_markdown(ledger), encoding="utf-8")
     return 0
@@ -7437,10 +7490,7 @@ def trend(args: argparse.Namespace) -> int:
         print(f"appended {dest}")
     entries = load_history_reports(history)
     report = build_trend_report(entries)
-    if args.out:
-        write_json(Path(args.out), report)
-    else:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+    emit_report(report, args.out)
     return 0
 
 
@@ -7482,7 +7532,13 @@ def suggest_cases(args: argparse.Namespace) -> int:
     for seed in seeds:
         candidate = dict(seed)
         if generate_cmd:
-            proc = subprocess.run(generate_cmd, shell=True, input=json.dumps(seed), text=True, capture_output=True, timeout=float(getattr(args, "timeout", 120)))
+            gen_timeout = float(getattr(args, "timeout", 120))
+            try:
+                proc = subprocess.run(generate_cmd, shell=True, input=json.dumps(seed), text=True, capture_output=True, timeout=gen_timeout)
+            except subprocess.TimeoutExpired:
+                candidate["generation_error"] = f"generator timed out after {gen_timeout:g}s"
+                candidates.append(candidate)
+                continue
             if proc.returncode == 0:
                 try:
                     candidate["generated"] = extract_json_object(proc.stdout)
@@ -7499,10 +7555,7 @@ def suggest_cases(args: argparse.Namespace) -> int:
             "this command never edits one."
         ),
     }
-    if args.out:
-        write_json(Path(args.out), output)
-    else:
-        print(json.dumps(output, indent=2, ensure_ascii=False))
+    emit_report(output, args.out)
     return 0
 
 
@@ -7789,10 +7842,7 @@ def token_overhead(args: argparse.Namespace) -> int:
         else:
             print(text)
     else:
-        if args.out:
-            write_json(Path(args.out), output)
-        else:
-            print(json.dumps(output, indent=2, ensure_ascii=False))
+        emit_report(output, args.out)
     return 0
 
 
@@ -7821,10 +7871,7 @@ def profile_skill(args: argparse.Namespace) -> int:
         else:
             print(text)
     else:
-        if args.out:
-            write_json(Path(args.out), report)
-        else:
-            print(json.dumps(report, indent=2, ensure_ascii=False))
+        emit_report(report, args.out)
     return 0
 
 
@@ -7967,7 +8014,7 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
         if kind == "adversarial":
             adversarial += 1
         asserts = case.get("assertions", []) or []
-        if asserts and all(a.get("type") == "judge" for a in asserts):
+        if is_judge_only_case(case):
             judge_only += 1
         # A behaviour case (not a trigger/adversarial probe) with assertions but NO
         # qualitative (judge/rubric) check can only ever measure objective compliance
@@ -8102,17 +8149,14 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
     total = 0
     for case in iter_cases(manifest, split):
         max_overlap, findings = 0.0, []
-        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
-            for variant in variants:
-                for run_number, base in discover_run_bases_under(model_root / variant):
-                    text, _ = read_output_base(base)
-                    if text is None:
-                        continue
-                    chk = contamination_check(case, text, manifest_dir=manifest_path.parent, n=n,
-                                              overlap_threshold=overlap_threshold, model_cutoff=model_cutoff)
-                    max_overlap = max(max_overlap, chk["overlap"])
-                    for f in chk["findings"]:
-                        findings.append({**f, "variant": variant, "run_number": run_number, **({"model": model_name} if model_name else {})})
+        for model_name, variant, run_number, _base, text, _path, _meta in discovered_run_units(runs, case, variants):
+            if text is None:
+                continue
+            chk = contamination_check(case, text, manifest_dir=manifest_path.parent, n=n,
+                                      overlap_threshold=overlap_threshold, model_cutoff=model_cutoff)
+            max_overlap = max(max_overlap, chk["overlap"])
+            for f in chk["findings"]:
+                findings.append({**f, "variant": variant, "run_number": run_number, **({"model": model_name} if model_name else {})})
         total += len(findings)
         if findings or max_overlap > 0:
             cases_out.append({"case_id": case["id"], "max_overlap": round(max_overlap, 4), "findings": findings})
@@ -8124,11 +8168,7 @@ def contamination_command(args: argparse.Namespace) -> int:
     report = contamination_report(Path(args.manifest), Path(args.runs), split=args.split,
                                   n=getattr(args, "ngram", 8), overlap_threshold=getattr(args, "overlap_threshold", 0.6),
                                   model_cutoff=getattr(args, "model_cutoff", None))
-    text = json.dumps(report, indent=2, ensure_ascii=False)
-    if getattr(args, "out", None):
-        Path(args.out).write_text(text, encoding="utf-8")
-    else:
-        print(text)
+    emit_report(report, getattr(args, "out", None))
     return 1 if (getattr(args, "fail_on_contamination", False) and report["total_findings"]) else 0
 
 
@@ -8280,18 +8320,14 @@ def audit_manifest_report(
                 finding("expensive-saturated-case", "recommended", f"Case {case_id} cost ${cost} but is saturated/non-discriminating — spend without signal.", spend)
             elif any("no objective lift" in f for f in case_flag_list):
                 finding("expensive-no-lift-case", "recommended", f"Case {case_id} cost ${cost} with no objective lift — spend without signal.", spend)
-        judge_only_ids = {c.get("id") for c in cases if c.get("assertions") and all(a.get("type") in QUALITATIVE_ASSERTIONS for a in c.get("assertions", []))}
+        judge_only_ids = {c.get("id") for c in cases if is_judge_only_case(c)}
         for case_id in sorted(judge_only_ids):
             cost = (cost_by_case.get(case_id) or {}).get("total_cost_usd") or 0
             if cost >= expensive_case_usd:
                 finding("high-cost-judge-only-case", "recommended", f"Case {case_id} cost ${cost} and is graded only by judge assertions; a deterministic/script oracle would make the spend verifiable.", cost_by_case.get(case_id))
-        ablation_spend: dict[str, float] = {}
-        for r in bench_report.get("results", []):
-            variant = str(r.get("variant", ""))
-            if variant.startswith("ablation:"):
-                cost_value = result_cost_facts(r).get("cost_usd")
-                if cost_value is not None:
-                    ablation_spend[variant] = round(ablation_spend.get(variant, 0.0) + cost_value, 6)
+        ablation_rows = [{**result_cost_facts(r), "variant": str(r.get("variant", ""))}
+                         for r in bench_report.get("results", []) if is_ablation_variant(r.get("variant", ""))]
+        ablation_spend = {variant: slot["total_cost_usd"] for variant, slot in group_spend(ablation_rows, lambda r: r["variant"]).items()}
         structured = {f"ablation:{a.get('id')}" for a in manifest.get("ablations", []) if any(isinstance(spec, dict) and spec.get("cases") and spec.get("assertions") for spec in a.get("expected_regressions", []))}
         for variant, spend_usd in sorted(ablation_spend.items()):
             if spend_usd >= expensive_case_usd and variant not in structured:
@@ -8450,10 +8486,7 @@ def audit_manifest(args: argparse.Namespace) -> int:
         else:
             print(text)
     else:
-        if args.out:
-            write_json(Path(args.out), report)
-        else:
-            print(json.dumps(report, indent=2, ensure_ascii=False))
+        emit_report(report, args.out)
     # CI gate: non-zero exit when the readiness blockers are non-empty, so a skill
     # repo can keep its eval suite at "worth paying to run" the same way it keeps
     # tests green. Off by default — the audit stays a report unless asked to gate.
@@ -8703,14 +8736,21 @@ def _suite_python_command() -> list[str]:
     return [sys.executable, str(Path(__file__).resolve())]
 
 
-def _run_suite_command(cmd: list[str], *, cwd: Path, log_path: Path) -> dict[str, Any]:
+def _run_suite_command(cmd: list[str], *, cwd: Path, log_path: Path, timeout: int = DEFAULT_RUNNER_TIMEOUT_S) -> dict[str, Any]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
+    timed_out = False
     with log_path.open("w", encoding="utf-8") as log:
         log.write("$ " + " ".join(cmd) + "\n")
         log.flush()
-        proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=log, stderr=subprocess.STDOUT)
-    return {"cmd": cmd, "cwd": str(cwd), "log": str(log_path), "returncode": proc.returncode, "elapsed_ms": int((time.time() - start) * 1000)}
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            # The one timeout encoding (see run_argv_with_timeout).
+            returncode, timed_out = 124, True
+            log.write(f"[suite command timed out after {timeout}s]\n")
+    return {"cmd": cmd, "cwd": str(cwd), "log": str(log_path), "returncode": returncode, "timed_out": timed_out, "elapsed_ms": int((time.time() - start) * 1000)}
 
 
 def _run_suite_tier(scope: dict[str, Any], out_dir: Path) -> list[dict[str, Any]]:
@@ -8878,7 +8918,10 @@ def suite_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The complete CLI surface, buildable without parsing. Split out of
+    main() so tests can enumerate every subcommand and flag (e.g. the
+    README-coverage doc-sync guard) without invoking anything."""
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -8922,7 +8965,7 @@ def main() -> int:
     p = sub.add_parser("run-jetty")
     p.add_argument("--payloads", required=True)
     p.add_argument("--out")
-    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
     p.add_argument("--poll-interval", type=float, default=5)
     p.add_argument("--concurrency", type=int, default=1, help="reserved; current implementation runs sequentially")
     p.add_argument("--dry-run", action="store_true")
@@ -8944,14 +8987,14 @@ def main() -> int:
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--codex-cmd", default="codex exec --json", help="shell command that reads prompt on stdin and emits Codex JSONL")
-    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-claude", help="run prepared tasks through `claude -p --output-format json`, capturing cost/usage")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="claude model id (e.g. claude-haiku-4-5-20251001); omit for the CLI default")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
-    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
@@ -8959,7 +9002,7 @@ def main() -> int:
     p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
     p.add_argument("--agent-cmd", help="shell command reading {prompt, model, workspace} JSON on stdin and emitting {answer, trace?, usage?} JSON on stdout")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable for the default backend")
-    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
     p.add_argument("--tool-replay", choices=sorted(TOOL_REPLAY_MODES), help=f"tool replay mode; defaults from ${TOOL_REPLAY_ENV} (off)")
 
     p = sub.add_parser("grade")
@@ -9175,6 +9218,11 @@ def main() -> int:
     p.add_argument("--allow-extra-manifests", action="store_true", help="do not fail when --workspace-root has top-level manifests outside the suite allowlist")
     p.add_argument("--skip-pin-check", action="store_true", help="load the suite without verifying --pins tree hashes")
 
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
     args = parser.parse_args()
     if args.cmd == "validate":
         manifest_path = Path(args.manifest)

@@ -154,7 +154,7 @@ Adapters may preserve additional fields under `raw` or `details`, but assertions
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "elapsed_ms": 12345,
   "input_tokens": 1000,
   "output_tokens": 500,
@@ -386,14 +386,14 @@ This adopts the SkillsBench lesson that focused 2–3-module skills often outper
 
 - [x] Add taxonomy warnings and slice summaries.
 - [x] Add normalized gain for paired variants.
-- [ ] Expand leakage/anti-cheating lint beyond prompt/assertion literals.
+- [x] Expand leakage/anti-cheating lint beyond prompt/assertion literals (the output-side contamination perimeter: `contamination` — canary tripwire, n-gram containment, released_at/cutoff gate).
 - [x] Add skill-profile reporting.
 
 ### Phase 4 — judge/viewer improvements
 
 - [x] Add viewer panels and richer artifacts, plus human feedback export (`render-viewer --serve` with `feedback.json` capture, image/pdf/xlsx artifact embedding, and a `--previous-workspace` iteration diff).
 - [x] Add blind pairwise comparison (`compare-tasks` / `compare-results`, keyed by stable IDs with model-facing blinding).
-- [ ] Add optional JSON Schema validation for judge-result files. (The related `structured_output` assertion validates a run's *output* JSON against a schema subset; judge-result-file schema validation is still open.)
+- [x] Add optional JSON Schema validation for judge-result files (`verdict_schema_for` post-hoc validation; `--strict-judge-schema` / manifest `judge.schema_enforcement` makes it a gate).
 
 ### Phase 5 — broader runner import
 

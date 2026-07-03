@@ -277,7 +277,7 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
     if variant == "without_skill":
         runner_skill_invoked, copied_skill_evidence = False, []
     else:
-        runner_skill_invoked, copied_skill_evidence = detect_trigger(stdout, manifest["skill_name"], list(locals().get("copied_skill_paths", [])))
+        runner_skill_invoked, copied_skill_evidence = detect_trigger(stdout, list(locals().get("copied_skill_paths", [])))
     meta.update({
         "elapsed_ms": elapsed_ms,
         "returncode": returncode,

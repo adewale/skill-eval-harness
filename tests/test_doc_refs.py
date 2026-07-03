@@ -26,7 +26,17 @@ MODULES = {
 }
 MODULE_SEARCH_ORDER = ["skill_benchmark.py", "ablation_model.py", "run_pi_trigger_eval.py", "run_trigger_matrix.py", "run_pi_smoke.py"]
 
-DOC_PATHS = [ROOT / "TODO.md", *sorted((ROOT / "docs").glob("*.md"))]
+# Scan every prose surface that cites code, not only docs/ — the 2026-07
+# consolidation audit found README/CHANGELOG-class drift precisely because they
+# were outside this list.
+DOC_PATHS = [
+    ROOT / "README.md",
+    ROOT / "CHANGELOG.md",
+    ROOT / "CONTRIBUTING.md",
+    ROOT / "LESSONS_LEARNED.md",
+    ROOT / "TODO.md",
+    *sorted((ROOT / "docs").glob("*.md")),
+]
 
 INLINE_REF_RE = re.compile(r"`([A-Za-z_]\w*):(\d{2,5})`")
 PAREN_REF_RE = re.compile(r"\(`(?:([\w.]+\.py))?:(\d{2,5})`\)")
