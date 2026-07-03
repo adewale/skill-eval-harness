@@ -375,6 +375,18 @@ class AssertionDependenciesTests(unittest.TestCase):
         self.assertEqual(result["objective_total"], 2)
         self.assertFalse(any(r.get("skipped") for r in result["assertions"]))
 
+    def test_inline_suppresses_judge_task_for_skipped_dependent(self):
+        # objective prereq fails (graded first); a JUDGE dependent must be skipped
+        # WITHOUT emitting a judge task -- the inline short-circuit, not just the post-pass.
+        case = {"id": "c", "split": "tune", "kind": "behavior", "assertions": [
+            {"name": "pre", "type": "contains", "value": "zzz"},
+            {"name": "jdep", "type": "judge", "depends_on": "pre"}]}
+        result, tasks = sb.grade_case_variant(case, "with_skill", "alpha", Path("o.md"), {})
+        self.assertEqual(result["deferred_judge_tasks"], 0)   # no judge call spent on the skipped dependent
+        self.assertEqual(len(tasks), 0)
+        jdep = next(r for r in result["qualitative_assertions"] if r["name"] == "jdep")
+        self.assertTrue(jdep["skipped"])
+
 
 class CrossJudgeConsensusTests(unittest.TestCase):
     """G3 — merge_cross_judge_rows consensus + effective_judge_models panel."""

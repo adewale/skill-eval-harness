@@ -4985,6 +4985,11 @@ def grade_case_variant(
     exec_valid = execution_valid(metadata, text)
     text = text or ""
     judge_results = judge_results or {}
+    # G2 inline optimization: label -> passed for already-resolved case-level
+    # assertions, so a dependent whose prerequisite already FAILED is skipped
+    # WITHOUT evaluating (no judge task emitted, no script run). The post-pass
+    # stays authoritative for forward references and deferred qualitative prereqs.
+    satisfied: dict[str, bool] = {}
 
     def grade_unit(assertion: dict[str, Any], unit_text: str | None, unit_output_path: Path, unit_base: Path | None, turn_n: int | None = None) -> None:
         if not assertion_applies_to_variant(assertion, variant):
@@ -4992,6 +4997,17 @@ def grade_case_variant(
         atype = assertion.get("type")
         severity = assertion_severity(assertion, strict=strict)
         tier = oracle_tier(assertion)
+        if turn_n is None:
+            failed = next((t for t in depends_on_targets(assertion) if satisfied.get(t) is False), None)
+            if failed is not None:
+                label = assertion_label(assertion)
+                skip_row = {"name": label, "type": atype, "passed": False, "score": 0.0,
+                            "severity": severity, "oracle": tier, "skipped": True,
+                            "skip_reason": f"prerequisite '{failed}' not satisfied",
+                            "evidence": "skipped: prerequisite not satisfied"}
+                (qualitative if atype in QUALITATIVE_ASSERTIONS else objective).append(skip_row)
+                satisfied[label] = False
+                return
         if atype in QUALITATIVE_ASSERTIONS:
             # Judge-task emission honors THE scorable_run predicate, like every
             # other report view: a missing/infra-failed run is excluded from
@@ -5011,6 +5027,8 @@ def grade_case_variant(
                 if turn_n is not None:
                     entry["turn"] = turn_n
                 qualitative.append(entry)
+                if turn_n is None:
+                    satisfied[assertion_label(assertion)] = entry["passed"]
             else:
                 judge_tasks.append({
                     "judge_task_id": jid,
@@ -5034,6 +5052,8 @@ def grade_case_variant(
             if turn_n is not None:
                 entry["turn"] = turn_n
             objective.append(entry)
+            if turn_n is None:
+                satisfied[assertion_label(assertion)] = entry["passed"]
 
     for assertion in case.get("assertions", []):
         grade_unit(assertion, text, output_path, run_base)
