@@ -1,5 +1,4 @@
 import contextlib
-import importlib.util
 import io
 import json
 import os
@@ -9,19 +8,16 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+# Normal imports (not private importlib loads): the whole suite must share ONE
+# skill_benchmark module instance, or registries/monkeypatches/`is`-identity
+# checks silently diverge between test files.
+import skill_benchmark as sb
+import run_pi_trigger_eval as tr
+import ablation_model as am
+from helpers import load_example_module
+
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("skill_benchmark", ROOT / "skill_benchmark.py")
-sb = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(sb)
-TRIGGER_SPEC = importlib.util.spec_from_file_location("run_pi_trigger_eval", ROOT / "run_pi_trigger_eval.py")
-tr = importlib.util.module_from_spec(TRIGGER_SPEC)
-assert TRIGGER_SPEC.loader is not None
-TRIGGER_SPEC.loader.exec_module(tr)
-SMOKE_SPEC = importlib.util.spec_from_file_location("run_pi_smoke", ROOT / "examples" / "adewale-workspace" / "run_pi_smoke.py")
-smoke = importlib.util.module_from_spec(SMOKE_SPEC)
-assert SMOKE_SPEC.loader is not None
-SMOKE_SPEC.loader.exec_module(smoke)
+smoke = load_example_module("run_pi_smoke", "examples/adewale-workspace/run_pi_smoke.py")
 
 
 class SkillBenchmarkTests(unittest.TestCase):
@@ -217,9 +213,9 @@ class SkillBenchmarkTests(unittest.TestCase):
     def test_trigger_detector_uses_copied_skill_paths_not_bare_skill_name(self):
         copied = [Path("/tmp/pi-trigger-x/skills/good-readme/SKILL.md")]
         repo_event = json.dumps({"tool_input": {"path": "good-readme/README.md"}})
-        self.assertEqual(tr.detect_trigger(repo_event, "good-readme", copied), (False, []))
+        self.assertEqual(tr.detect_trigger(repo_event, copied), (False, []))
         skill_event = json.dumps({"tool_input": {"path": "/tmp/pi-trigger-x/skills/good-readme/SKILL.md"}})
-        triggered, evidence = tr.detect_trigger(skill_event, "good-readme", copied)
+        triggered, evidence = tr.detect_trigger(skill_event, copied)
         self.assertTrue(triggered)
         self.assertIn("/tmp/pi-trigger-x/skills/good-readme/SKILL.md", evidence[0])
 
@@ -1402,7 +1398,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
     def test_every_runner_emits_the_same_minimum_provenance_schema(self):
         # Invariant: every provenance source records the same minimum schema, so the
         # report's verifier can rely on it uniformly regardless of which runner ran.
-        REQUIRED = {"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"}
+        REQUIRED = am.Provenance.SCHEMA_KEYS
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])
@@ -1448,7 +1444,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             expected = am.Provenance.from_dict(res).as_dict()
             arow = next(r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl2") if r["variant"] == "ablation:no-rp")
             self.assertEqual(arow["ablation"], expected)                     # one schema, end to end
-            self.assertEqual(set(arow["ablation"]), {"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
+            self.assertEqual(set(arow["ablation"]), am.Provenance.SCHEMA_KEYS)
 
     def test_prepare_skips_discovery_ablations_for_generic_runners(self):
         # Answer-population ablations are emitted for non-trigger cases; discovery
@@ -2208,7 +2204,7 @@ class AblationLiveExecutionTests(unittest.TestCase):
             meta = json.loads((root / "good-pr" / "eval-runs" / "run" / "ans" / "ablation:no-rp" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["ablation"]["mode"], "materialized")   # provenance persisted on the run (#9)
             # the runner emits the full minimum provenance schema + canonical hash
-            self.assertTrue({"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"}.issubset(meta["ablation"]))
+            self.assertTrue(am.Provenance.SCHEMA_KEYS.issubset(meta["ablation"]))
             self.assertEqual(meta["skill_tree_hash"], meta["ablation"]["parent_skill_hash"])
             ws_meta = json.loads((root / "good-pr" / "eval-runs" / "run" / "ans" / "with_skill" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(ws_meta["skill_tree_hash"], meta["ablation"]["parent_skill_hash"])   # both arms, same revision

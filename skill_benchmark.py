@@ -183,6 +183,29 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def emit_report(report: Any, out: str | Path | None) -> None:
+    """Single owner of every reporting command's `--out FILE else stdout` tail.
+    Routing all commands through here keeps the behavior identical everywhere:
+    parent directories are created and the file ends with a newline (two
+    commands used to hand-roll this and crashed on `--out new-dir/x.json`)."""
+    if out:
+        write_json(Path(out), report)
+    else:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+def iter_json_objects(text: str):
+    """Yield each parseable JSON value found line-by-line in a runner's stream,
+    silently skipping non-JSON lines. The one scanning loop shared by trigger
+    detection, stream telemetry, and the agent adapters — previously five
+    hand-rolled copies of the same try/except."""
+    for line in text.splitlines():
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+
 def apply_dataset_row(value: Any, row: dict[str, Any]) -> Any:
     """Fill {key} placeholders from a dataset row throughout a case template.
     Plain replace, not str.format — prompts and regex assertions legitimately
@@ -232,6 +255,22 @@ def iter_cases(manifest: dict[str, Any], split: str | None = None) -> list[dict[
     if split:
         return [c for c in cases if c.get("split") == split]
     return cases
+
+
+def is_trigger_case(case: dict[str, Any]) -> bool:
+    """Trigger/discovery cases belong to the autonomous-trigger runners, whose
+    output is a raw_autonomous_trigger_measurement — a different population from
+    answer runs. Every grading path (benchmark, grade, judge) must exclude them
+    through THIS predicate so the boundary cannot drift per-command."""
+    return case.get("kind") == "trigger"
+
+
+def is_judge_only_case(case: dict[str, Any]) -> bool:
+    """A case whose every assertion needs a model judge (judge/rubric/factuality).
+    Shared by eval-readiness and the manifest audit so their 'judge-only' cost
+    findings can never disagree about which cases qualify."""
+    assertions = [a for a in case.get("assertions", []) if isinstance(a, dict)]
+    return bool(assertions) and all(a.get("type") in QUALITATIVE_ASSERTIONS for a in assertions)
 
 
 def case_prompt(case: dict[str, Any], manifest_path: Path, allow_missing: bool = False) -> str:
@@ -628,7 +667,7 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
         )
     if variant.startswith("ablation:"):
         aid = variant.split(":", 1)[1]
-        ab = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+        ab = ablation_by_id(manifest, aid)
         if not ab:
             return f"Use an ablated skill variant {aid}; ablation metadata was not found."
         # The Arm owns the blind/transparent decision: a materialized ablation is
@@ -740,7 +779,7 @@ def prepared_task_rows(
         # skill, so they cannot measure discovery. Emit no runner tasks for a trigger
         # case here, so an answer runner never spends a call on one (build_benchmark_report
         # re-checks this as defense in depth).
-        if case.get("kind") == "trigger":
+        if is_trigger_case(case):
             continue
         for variant in variants:
             record: AblationRecord | None = None
@@ -834,6 +873,7 @@ def prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+JETTY_DEFAULT_BASE_URL = "https://flows-api.jetty.io"
 JETTY_DEFAULT_AGENT = "claude-code"
 JETTY_DEFAULT_MODEL = "claude-sonnet-4-6"
 JETTY_DEFAULT_MODEL_PROVIDER = "anthropic"
@@ -877,6 +917,11 @@ _ABLATION_MARKER = ".skill-ablation-dir"
 
 class AblationError(Exception):
     """Raised when an ablation cannot be validated or materialized."""
+
+
+def ablation_by_id(manifest: dict[str, Any], aid: str) -> dict[str, Any] | None:
+    """The one manifest→ablation lookup (previously five inline `next(...)` copies)."""
+    return next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
 
 
 def ablation_components(ablation: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1690,7 +1735,7 @@ def materialized_tree_for_variant(repo_root: Path, manifest: dict[str, Any], var
     if not str(variant).startswith("ablation:"):
         return None
     aid = str(variant).split(":", 1)[1]
-    ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+    ablation = ablation_by_id(manifest, aid)
     if ablation is None:
         raise AblationError(f"unknown ablation variant: {variant}")
     if not ablation_components(ablation):
@@ -1735,7 +1780,7 @@ def ablation_variant_population(manifest: dict[str, Any], variant: str) -> str:
     """Case population for an ablation:<id> variant: trigger (discovery ablation)
     or answer (everything else, including instruction-simulated)."""
     aid = str(variant).split(":", 1)[1]
-    ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), None)
+    ablation = ablation_by_id(manifest, aid)
     comps = ablation_components(ablation) if ablation else []
     return derived_population(comps) if comps else "answer"
 
@@ -1888,7 +1933,7 @@ def safe_task_json(pt: PreparedTask, manifest: dict[str, Any], *, task_name: str
             # expected_regressions come from the manifest (the prepared row carries
             # only id/mode/population).
             aid = variant.split(":", 1)[1]
-            ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == aid), {})
+            ablation = ablation_by_id(manifest, aid) or {}
             safe["ablation"] = InstructionSimulated(
                 id=aid,
                 population=(pt.ablation.population if pt.ablation else "answer"),   # from the row, not hardcoded
@@ -2148,7 +2193,7 @@ def extract_trajectory_id(response: dict[str, Any]) -> str | None:
 
 
 class JettyClient:
-    def __init__(self, token: str, base_url: str = "https://flows-api.jetty.io"):
+    def __init__(self, token: str, base_url: str = JETTY_DEFAULT_BASE_URL):
         self.token = token
         self.base_url = base_url.rstrip("/")
 
@@ -2320,7 +2365,7 @@ def run_jetty(args: argparse.Namespace) -> int:
         token = os.environ.get("JETTY_API_TOKEN")
         if not token:
             die("JETTY_API_TOKEN is required for run-jetty (use --dry-run to validate payload loading only)")
-        client = JettyClient(token, os.environ.get("JETTY_BASE_URL", "https://flows-api.jetty.io"))
+        client = JettyClient(token, os.environ.get("JETTY_BASE_URL", JETTY_DEFAULT_BASE_URL))
         records = list(execute_jetty_payloads(payloads, client=client, timeout_s=getattr(args, "timeout", 1800), poll_interval_s=getattr(args, "poll_interval", 5)))
     out = Path(args.out) if getattr(args, "out", None) else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
@@ -2711,24 +2756,65 @@ def event_texts_for_tool_input(obj: Any) -> list[str]:
     return out
 
 
-def detect_trigger(stdout: str, skill_name: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
+def detect_trigger(stdout: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
     """THE shared skill-invocation detector: scan a model's JSON event stream for
     evidence it actually read one of the mounted skill files. Returns (invoked,
-    evidence). Used by both the autonomous-trigger eval (run_pi_trigger_eval) and the
-    pi-smoke runner, so skill_invoked is derived the same way everywhere instead of
-    one runner asserting it by fiat. Matches on the copied temp skill paths (not the
-    bare skill name) so unrelated repo files can't look like skill-load evidence."""
+    evidence). Used by the autonomous-trigger eval (run_pi_trigger_eval), the
+    trigger matrix, and the pi-smoke runner, so skill_invoked is derived the same
+    way everywhere instead of one runner asserting it by fiat. Matches on the
+    copied temp skill paths (never a bare skill name — an earlier skill_name
+    parameter was dead weight that each caller computed differently) so unrelated
+    repo files can't look like skill-load evidence."""
     needles = [str(p) for p in copied_paths] + [str(p.parent) for p in copied_paths]
     evidence: list[str] = []
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for event in iter_json_objects(stdout):
         for text in event_texts_for_tool_input(event):
             if any(n and n in text for n in needles):
                 evidence.append(text[:500])
     return bool(evidence), evidence[:5]
+
+
+def mount_skill_tree(tree_dir: Path, skills_dir: Path) -> list[Path]:
+    """Copy each per-root subdir of a canonical/materialized skill tree into an
+    agent's skills dir. EVERY trigger arm (baseline and ablation, every adapter)
+    mounts through here, so all arms expose an identical file surface under
+    identical names — the only difference is the bytes a declared ablation edit
+    removed. Returns the copied SKILL.md (or root dir) paths, which double as
+    the skill-load detection needles for detect_trigger."""
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for root_dir in sorted(p for p in tree_dir.iterdir() if p.is_dir()):
+        dest = skills_dir / root_dir.name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(root_dir, dest)
+        copied.append(dest / "SKILL.md" if (dest / "SKILL.md").exists() else dest)
+    return copied
+
+
+def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
+                          env: dict[str, str] | None = None, timeout: int) -> dict[str, Any]:
+    """One subprocess-with-timeout convention for the trigger runners: returns
+    {stdout, stderr, returncode, timed_out, elapsed_ms, observation_complete},
+    encoding a timeout as returncode 124 + timed_out=True. observation_complete
+    means the agent got a fair window to act; a crash or timeout is a failed
+    observation, never a no-trigger pass."""
+    def _text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    start = time.time()
+    try:
+        proc = subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout)
+        stdout, stderr, returncode, timed_out = _text(proc.stdout), _text(proc.stderr), proc.returncode, False
+    except subprocess.TimeoutExpired as exc:
+        stdout, stderr, returncode, timed_out = _text(exc.stdout), _text(exc.stderr), 124, True
+    return {"stdout": stdout, "stderr": stderr, "returncode": returncode, "timed_out": timed_out,
+            "elapsed_ms": int((time.time() - start) * 1000),
+            "observation_complete": returncode == 0 and not timed_out}
 
 
 def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:
@@ -2770,13 +2856,17 @@ def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:
 
 USAGE_SOURCES = {"provider_reported", "trace_normalized", "estimated", "missing", "not_applicable"}
 COST_SOURCES = {"provider_reported", "price_table_estimated", "missing", "not_applicable"}
+# THE token-usage alias table. Every normalizer (metadata `normalize_usage`, the
+# trace-stream `usage_number`, and the Claude envelope parser) reads THIS table,
+# so the same provider payload can never be classified differently by two paths
+# (the drift that once made metrics.json and usage_normalized disagree).
 USAGE_ALIASES: dict[str, list[str]] = {
     "input_tokens": ["input_tokens", "prompt_tokens", "input", "promptTokens", "inputTokens"],
     "output_tokens": ["output_tokens", "completion_tokens", "output", "completionTokens", "outputTokens"],
-    "cache_read_tokens": ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cacheReadTokens"],
+    "cache_read_tokens": ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cached_input_tokens", "cacheReadTokens"],
     "cache_write_tokens": ["cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens", "cacheWriteTokens"],
     "reasoning_tokens": ["reasoning_tokens", "thinking_tokens", "reasoningTokens"],
-    "total_tokens": ["total_tokens", "totalTokens", "total"],
+    "total_tokens": ["total_tokens", "totalTokens", "total", "tokens"],
 }
 COST_PART_ALIASES: dict[str, tuple[str, ...]] = {
     "input_cost": ("input_cost", "prompt_cost"),
@@ -3118,14 +3208,9 @@ def nested_item_type(record: dict[str, Any]) -> str:
 
 
 def usage_number(usage: dict[str, Any], *keys: str) -> float | None:
-    aliases = {
-        "input_tokens": ["input_tokens", "input", "prompt_tokens", "cached_input_tokens"],
-        "output_tokens": ["output_tokens", "output", "completion_tokens"],
-        "total_tokens": ["total_tokens", "totalTokens", "total", "tokens"],
-    }
     search: list[str] = []
     for key in keys:
-        search.extend(aliases.get(key, [key]))
+        search.extend(USAGE_ALIASES.get(key, [key]))
     for key in search:
         value = usage.get(key)
         if isinstance(value, (int, float)):
@@ -3307,17 +3392,7 @@ def stream_usage_and_cost(raw_text: str) -> tuple[dict[str, Any], dict[str, Any]
     """usage_normalized/cost_normalized straight from a runner's raw JSONL
     stream (issue #21): tokens via the trace normalizer (provider usage events
     relayed verbatim), provider cost records summed. Missing stays marked."""
-    records = []
-    for line in raw_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped[0] != "{":
-            continue
-        try:
-            obj = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            records.append(obj)
+    records = [obj for obj in iter_json_objects(raw_text) if isinstance(obj, dict)]
     _, metrics = normalize_trace_records(records, source="stream")
     has_tokens = any(isinstance(metrics.get(k), (int, float)) and metrics.get(k) for k in ("input_tokens", "output_tokens", "total_tokens"))
     usage = normalize_usage(metrics if has_tokens else None, source="provider_reported")
@@ -3584,11 +3659,14 @@ def run_codex(args: argparse.Namespace) -> int:
 # thing every other adapter leaves the caller to reconstruct out of band.
 # --------------------------------------------------------------------------- #
 
+# The Claude envelope's normalized keys, aliased through the ONE table above.
+# (`cache_creation_tokens` is Claude's historical metrics.json field name for
+# what USAGE_ALIASES normalizes as cache_write_tokens.)
 CLAUDE_USAGE_KEYS = {
-    "input_tokens": ("input_tokens", "prompt_tokens"),
-    "output_tokens": ("output_tokens", "completion_tokens"),
-    "cache_read_tokens": ("cache_read_input_tokens", "cache_read_tokens"),
-    "cache_creation_tokens": ("cache_creation_input_tokens", "cache_creation_tokens"),
+    "input_tokens": USAGE_ALIASES["input_tokens"],
+    "output_tokens": USAGE_ALIASES["output_tokens"],
+    "cache_read_tokens": USAGE_ALIASES["cache_read_tokens"],
+    "cache_creation_tokens": USAGE_ALIASES["cache_write_tokens"],
 }
 
 
@@ -4071,30 +4149,34 @@ def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[s
     return f"{case_id}::{model_segment}{variant}::run-{run_number}::{assertion_label(assertion)}"
 
 
+def load_result_rows(path: Path, *, id_keys: tuple[str, ...], label: str) -> list[dict[str, Any]]:
+    """One parser for every verdict/result file the harness reads back (judge
+    verdicts, comparison verdicts): accepts JSONL, a JSON array (even
+    pretty-printed across lines), or a single JSON object — the same input
+    shape can never load through one command and crash another."""
+    if not path.exists():
+        die(f"{label} file not found: {path}")
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        data = json.loads(text)
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+    try:
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    except json.JSONDecodeError:
+        rows = [json.loads(text)]   # one pretty-printed object spanning lines
+    if len(rows) == 1 and isinstance(rows[0], dict) and not any(k in rows[0] for k in id_keys):
+        rows = rows[0].get("results", [])
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
     if not path:
         return {}
-    p = Path(path)
-    if not p.exists():
-        die(f"judge results file not found: {p}")
+    rows = load_result_rows(Path(path), id_keys=("judge_task_id", "id"), label="judge results")
     lookup: dict[str, dict[str, Any]] = {}
-    lines = p.read_text(encoding="utf-8").splitlines()
-    # Accept JSONL or a JSON list/object.
-    if len(lines) == 1 and lines[0].lstrip().startswith(("[", "{")):
-        data = json.loads(lines[0])
-        if isinstance(data, list):
-            rows = data
-        elif isinstance(data, dict) and ("judge_task_id" in data or "id" in data):
-            rows = [data]
-        elif isinstance(data, dict):
-            rows = data.get("results", [])
-        else:
-            rows = []
-    else:
-        rows = [json.loads(line) for line in lines if line.strip()]
     for row in rows:
-        if not isinstance(row, dict):
-            continue
         jid = row.get("judge_task_id") or row.get("id")
         if jid:
             lookup[str(jid)] = row
@@ -4210,6 +4292,10 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
     selected_variants = variants or manifest.get("variants", DEFAULT_VARIANTS)
     tasks: list[dict[str, Any]] = []
     for case in iter_cases(manifest, split):
+        if is_trigger_case(case):
+            # Same population boundary as build_benchmark_report/grade: a judge
+            # never spends a model call on a discovery-population case.
+            continue
         for model_name, model_root in discover_case_model_roots(runs, case["id"], selected_variants):
             for variant in selected_variants:
                 for run_number, base in discover_run_bases_under(model_root / variant):
@@ -4771,11 +4857,7 @@ def judge_robustness_command(args: argparse.Namespace) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="judge-robustness-"))
     report = judge_robustness_report(tasks, tmp_dir=tmp, judge_cmd=judge_cmd, judge_model=judge_model,
                                      claude_bin=getattr(args, "claude_bin", None) or "claude")
-    text = json.dumps(report, indent=2, ensure_ascii=False)
-    if getattr(args, "out", None):
-        Path(args.out).write_text(text, encoding="utf-8")
-    else:
-        print(text)
+    emit_report(report, getattr(args, "out", None))
     return 1 if (getattr(args, "fail_on_findings", False) and report["findings"]) else 0
 
 
@@ -4859,10 +4941,7 @@ def compare_judges(args: argparse.Namespace) -> int:
     if len(reports_by_judge) < 2:
         die("compare-judges needs at least two --report name=path entries (a panel)")
     result = judge_panel_sensitivity(reports_by_judge, magnitude_eps=float(getattr(args, "magnitude_eps", 0.1)))
-    if getattr(args, "out", None):
-        write_json(Path(args.out), result)
-    else:
-        print(json.dumps(result, indent=2))
+    emit_report(result, getattr(args, "out", None))
     return 0
 
 
@@ -4949,10 +5028,7 @@ def judge_alignment_command(args: argparse.Namespace) -> int:
     if not human:
         die(f"no human labels loaded from {args.labels}")
     report = judge_alignment_report(human, judge, min_labels=int(getattr(args, "min_labels", 50)))
-    if getattr(args, "out", None):
-        write_json(Path(args.out), report)
-    else:
-        print(json.dumps(report, indent=2))
+    emit_report(report, getattr(args, "out", None))
     return 0
 
 
@@ -5029,10 +5105,7 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
 def error_analysis_command(args: argparse.Namespace) -> int:
     report = load_json(Path(args.benchmark))
     out = error_analysis_report(report, limit=int(getattr(args, "limit", 100)))
-    if getattr(args, "out", None):
-        write_json(Path(args.out), out)
-    else:
-        print(json.dumps(out, indent=2, ensure_ascii=False))
+    emit_report(out, getattr(args, "out", None))
     return 0
 
 
@@ -5352,23 +5425,17 @@ def grade_case_variant(
 
 
 def anthropic_grading_json(result: dict[str, Any]) -> dict[str, Any]:
-    expectations = []
-    for assertion in result.get("assertions", []) + result.get("qualitative_assertions", []):
-        expectations.append({
-            "text": assertion.get("name", assertion.get("type", "assertion")),
-            "passed": bool(assertion.get("passed")),
-            "evidence": assertion.get("evidence", ""),
-        })
+    expectations = expectation_texts(result)
     meta = result.get("metadata", {}) or {}
-    elapsed = num(meta, "elapsed_ms")
+    elapsed = metric_number(meta, "elapsed_ms")
     if elapsed is None:
-        elapsed = num(meta, "duration_ms")
+        elapsed = metric_number(meta, "duration_ms")
     timing = {}
     if elapsed is not None:
         timing["executor_duration_seconds"] = round(elapsed / 1000, 3)
         timing["total_duration_seconds"] = round(elapsed / 1000, 3)
-    if num(meta, "total_tokens") is not None:
-        timing["total_tokens"] = int(num(meta, "total_tokens") or 0)
+    if metric_number(meta, "total_tokens") is not None:
+        timing["total_tokens"] = int(metric_number(meta, "total_tokens") or 0)
     total = result.get("combined_total", result.get("objective_total", 0))
     passed = result.get("combined_passed", result.get("objective_passed", 0))
     return {
@@ -5409,6 +5476,10 @@ def grade(args: argparse.Namespace) -> int:
     all_results = []
     all_judge_tasks = []
     for case in iter_cases(manifest, args.split):
+        if is_trigger_case(case):
+            # Same population boundary as build_benchmark_report: trigger cases are
+            # graded by the autonomous-trigger runners, never by the answer grader.
+            continue
         for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
             for variant in variants:
                 for run_number, base in discover_run_bases_under(model_root / variant):
@@ -5426,10 +5497,7 @@ def grade(args: argparse.Namespace) -> int:
     }
     if getattr(args, "write_grading_files", False):
         write_grading_files(all_results)
-    if args.out:
-        write_json(Path(args.out), report)
-    else:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+    emit_report(report, args.out)
     if args.judge_tasks:
         jt = Path(args.judge_tasks)
         jt.parent.mkdir(parents=True, exist_ok=True)
@@ -5437,18 +5505,6 @@ def grade(args: argparse.Namespace) -> int:
             for task in all_judge_tasks:
                 fh.write(json.dumps(task, ensure_ascii=False) + "\n")
     return 0
-
-def num(meta: dict[str, Any], key: str) -> float | None:
-    val = meta.get(key)
-    if isinstance(val, (int, float)):
-        return float(val)
-    usage = meta.get("usage")
-    if isinstance(usage, dict):
-        val = usage.get(key)
-        if isinstance(val, (int, float)):
-            return float(val)
-    return None
-
 
 def stats(values: list[float]) -> dict[str, float | None]:
     clean = [float(v) for v in values if v is not None]
@@ -6275,21 +6331,32 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
         },
     }
     if judge_results:
-        judge_costs = []
-        for row in judge_results.values():
-            block = row.get("cost_normalized")
-            if isinstance(block, dict) and isinstance(block.get("total_cost"), (int, float)):
-                judge_costs.append(float(block["total_cost"]))
-            elif isinstance(row.get("cost_usd"), (int, float)):
-                judge_costs.append(float(row["cost_usd"]))
         # Judge spend is suite cost, but its own ledger line — never folded
         # into the model-under-test totals.
-        out["judge"] = {
-            "verdicts": len(judge_results),
-            "verdicts_with_cost": len(judge_costs),
-            "total_cost_usd": round(sum(judge_costs), 6) if judge_costs else None,
-        }
+        out["judge"] = judge_cost_block(judge_results)
     return out
+
+
+def judge_cost_usd(row: dict[str, Any]) -> float | None:
+    """One reading of a judge verdict's dollar cost, preferring the normalized
+    block. Both cost ledgers (build_cost_summary and suite_cost_ledger) route
+    through here — they previously read different fields, so a verdict whose
+    spend lived only in cost_normalized counted in one ledger and not the other."""
+    block = row.get("cost_normalized")
+    if isinstance(block, dict) and isinstance(block.get("total_cost"), (int, float)):
+        return float(block["total_cost"])
+    if isinstance(row.get("cost_usd"), (int, float)):
+        return float(row["cost_usd"])
+    return None
+
+
+def judge_cost_block(judge_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    costs = [c for c in (judge_cost_usd(row) for row in judge_results.values()) if c is not None]
+    return {
+        "verdicts": len(judge_results),
+        "verdicts_with_cost": len(costs),
+        "total_cost_usd": round(sum(costs), 6) if costs else None,
+    }
 
 
 def confirmed_regression_count(ablation_regressions: list[dict[str, Any]]) -> int:
@@ -6402,7 +6469,7 @@ def build_benchmark_report(
         # prepared_task_rows already withholds trigger cases from the answer runners,
         # so normally no such runs exist; the grader enforces the same boundary as
         # defense in depth (e.g. hand-placed outputs) rather than trusting upstream.
-        if case.get("kind") == "trigger":
+        if is_trigger_case(case):
             skipped_trigger_cases.append(case["id"])
             continue
         for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
@@ -6534,10 +6601,7 @@ def build_benchmark_report(
 
 def benchmark(args: argparse.Namespace) -> int:
     report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
-    if args.out:
-        write_json(Path(args.out), report)
-    else:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+    emit_report(report, args.out)
     return 0
 
 
@@ -6652,7 +6716,7 @@ def aggregate(args: argparse.Namespace) -> int:
     reports = []
     for raw in args.manifests:
         manifest_path = Path(raw)
-        repo_root = manifest_path.parents[1] if manifest_path.name == "shared-benchmark.json" else manifest_path.parent
+        repo_root = repo_root_for_manifest(manifest_path)
         runs = Path(args.runs_root) / repo_root.name / args.runs_subdir
         if args.runs:
             runs = Path(args.runs)
@@ -6680,10 +6744,7 @@ def aggregate(args: argparse.Namespace) -> int:
         ],
     }
     output = {"generated_at": int(time.time()), "summary": aggregate_summary, "reports": reports}
-    if args.out:
-        write_json(Path(args.out), output)
-    else:
-        print(json.dumps(output, indent=2, ensure_ascii=False))
+    emit_report(output, args.out)
     return 0
 
 
@@ -6708,8 +6769,8 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
     runs = []
     for r in report["results"]:
         meta = r.get("metadata", {}) or {}
-        elapsed_ms = num(meta, "elapsed_ms") or num(meta, "duration_ms") or 0.0
-        tokens = num(meta, "total_tokens") or 0.0
+        elapsed_ms = metric_number(meta, "elapsed_ms", "duration_ms") or 0.0
+        tokens = metric_number(meta, "total_tokens") or 0.0
         runs.append({
             "eval_id": r["case_id"],
             "eval_name": r["case_id"],
@@ -6766,10 +6827,7 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
 def export_anthropic(args: argparse.Namespace) -> int:
     report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False))
     benchmark = anthropic_benchmark_from_report(report, args.skill_path or "")
-    if args.out:
-        write_json(Path(args.out), benchmark)
-    else:
-        print(json.dumps(benchmark, indent=2, ensure_ascii=False))
+    emit_report(benchmark, args.out)
     return 0
 
 
@@ -6821,20 +6879,7 @@ def compare_tasks(args: argparse.Namespace) -> int:
 
 
 def load_comparison_results(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        die(f"comparison results not found: {path}")
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        return []
-    if text.startswith("["):
-        data = json.loads(text)
-        return data if isinstance(data, list) else []
-    if text.startswith("{") and "\n" not in text:
-        data = json.loads(text)
-        if isinstance(data, dict) and ("comparison_task_id" in data or "id" in data):
-            return [data]
-        return data.get("results", []) if isinstance(data, dict) else []
-    return [json.loads(line) for line in text.splitlines() if line.strip()]
+    return load_result_rows(path, id_keys=("comparison_task_id", "id"), label="comparison results")
 
 
 def compare_results(args: argparse.Namespace) -> int:
@@ -6861,10 +6906,7 @@ def compare_results(args: argparse.Namespace) -> int:
             wins["unknown"] += 1
         details.append({"comparison_task_id": tid, "winner": winner, "winning_role": role, "reasoning": row.get("reasoning", "")})
     output = {"generated_at": int(time.time()), "summary": wins, "details": details}
-    if args.out:
-        write_json(Path(args.out), output)
-    else:
-        print(json.dumps(output, indent=2, ensure_ascii=False))
+    emit_report(output, args.out)
     return 0
 
 
@@ -7266,8 +7308,7 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
         "cost_quality_findings": findings[:top_n],
     }
     if judge_results:
-        judge_costs = [float(row.get("cost_usd")) for row in judge_results.values() if isinstance(row.get("cost_usd"), (int, float))]
-        ledger["judge"] = {"verdicts": len(judge_results), "verdicts_with_cost": len(judge_costs), "total_cost_usd": round(sum(judge_costs), 6) if judge_costs else None}
+        ledger["judge"] = judge_cost_block(judge_results)
     return ledger
 
 
@@ -7304,10 +7345,7 @@ def cost_summary_command(args: argparse.Namespace) -> int:
     benchmark_report = load_json(Path(args.benchmark)) if getattr(args, "benchmark", None) else None
     judge_lookup = load_judge_results(getattr(args, "judge_results", None))
     ledger = suite_cost_ledger(Path(args.manifest), Path(args.runs), benchmark_report=benchmark_report, judge_results=judge_lookup or None, top_n=int(getattr(args, "top", 10)))
-    if args.out:
-        write_json(Path(args.out), ledger)
-    else:
-        print(json.dumps(ledger, indent=2, ensure_ascii=False))
+    emit_report(ledger, args.out)
     if getattr(args, "md", None):
         Path(args.md).write_text(cost_ledger_markdown(ledger), encoding="utf-8")
     return 0
@@ -7437,10 +7475,7 @@ def trend(args: argparse.Namespace) -> int:
         print(f"appended {dest}")
     entries = load_history_reports(history)
     report = build_trend_report(entries)
-    if args.out:
-        write_json(Path(args.out), report)
-    else:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+    emit_report(report, args.out)
     return 0
 
 
@@ -7499,10 +7534,7 @@ def suggest_cases(args: argparse.Namespace) -> int:
             "this command never edits one."
         ),
     }
-    if args.out:
-        write_json(Path(args.out), output)
-    else:
-        print(json.dumps(output, indent=2, ensure_ascii=False))
+    emit_report(output, args.out)
     return 0
 
 
@@ -7789,10 +7821,7 @@ def token_overhead(args: argparse.Namespace) -> int:
         else:
             print(text)
     else:
-        if args.out:
-            write_json(Path(args.out), output)
-        else:
-            print(json.dumps(output, indent=2, ensure_ascii=False))
+        emit_report(output, args.out)
     return 0
 
 
@@ -7821,10 +7850,7 @@ def profile_skill(args: argparse.Namespace) -> int:
         else:
             print(text)
     else:
-        if args.out:
-            write_json(Path(args.out), report)
-        else:
-            print(json.dumps(report, indent=2, ensure_ascii=False))
+        emit_report(report, args.out)
     return 0
 
 
@@ -7967,7 +7993,7 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
         if kind == "adversarial":
             adversarial += 1
         asserts = case.get("assertions", []) or []
-        if asserts and all(a.get("type") == "judge" for a in asserts):
+        if is_judge_only_case(case):
             judge_only += 1
         # A behaviour case (not a trigger/adversarial probe) with assertions but NO
         # qualitative (judge/rubric) check can only ever measure objective compliance
@@ -8124,11 +8150,7 @@ def contamination_command(args: argparse.Namespace) -> int:
     report = contamination_report(Path(args.manifest), Path(args.runs), split=args.split,
                                   n=getattr(args, "ngram", 8), overlap_threshold=getattr(args, "overlap_threshold", 0.6),
                                   model_cutoff=getattr(args, "model_cutoff", None))
-    text = json.dumps(report, indent=2, ensure_ascii=False)
-    if getattr(args, "out", None):
-        Path(args.out).write_text(text, encoding="utf-8")
-    else:
-        print(text)
+    emit_report(report, getattr(args, "out", None))
     return 1 if (getattr(args, "fail_on_contamination", False) and report["total_findings"]) else 0
 
 
@@ -8280,7 +8302,7 @@ def audit_manifest_report(
                 finding("expensive-saturated-case", "recommended", f"Case {case_id} cost ${cost} but is saturated/non-discriminating — spend without signal.", spend)
             elif any("no objective lift" in f for f in case_flag_list):
                 finding("expensive-no-lift-case", "recommended", f"Case {case_id} cost ${cost} with no objective lift — spend without signal.", spend)
-        judge_only_ids = {c.get("id") for c in cases if c.get("assertions") and all(a.get("type") in QUALITATIVE_ASSERTIONS for a in c.get("assertions", []))}
+        judge_only_ids = {c.get("id") for c in cases if is_judge_only_case(c)}
         for case_id in sorted(judge_only_ids):
             cost = (cost_by_case.get(case_id) or {}).get("total_cost_usd") or 0
             if cost >= expensive_case_usd:
@@ -8450,10 +8472,7 @@ def audit_manifest(args: argparse.Namespace) -> int:
         else:
             print(text)
     else:
-        if args.out:
-            write_json(Path(args.out), report)
-        else:
-            print(json.dumps(report, indent=2, ensure_ascii=False))
+        emit_report(report, args.out)
     # CI gate: non-zero exit when the readiness blockers are non-empty, so a skill
     # repo can keep its eval suite at "worth paying to run" the same way it keeps
     # tests green. Off by default — the audit stays a report unless asked to gate.
@@ -8878,7 +8897,10 @@ def suite_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The complete CLI surface, buildable without parsing. Split out of
+    main() so tests can enumerate every subcommand and flag (e.g. the
+    README-coverage doc-sync guard) without invoking anything."""
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -9175,6 +9197,11 @@ def main() -> int:
     p.add_argument("--allow-extra-manifests", action="store_true", help="do not fail when --workspace-root has top-level manifests outside the suite allowlist")
     p.add_argument("--skip-pin-check", action="store_true", help="load the suite without verifying --pins tree hashes")
 
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
     args = parser.parse_args()
     if args.cmd == "validate":
         manifest_path = Path(args.manifest)

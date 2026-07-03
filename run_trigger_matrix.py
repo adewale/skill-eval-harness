@@ -45,37 +45,43 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from skill_benchmark import build_canonical_skill_tree, canonical_skill_tree_hash, detect_trigger
-from run_pi_trigger_eval import cases_from_manifest, load_manifest, skill_name_from_manifest, seed_config_dir
+from skill_benchmark import (
+    VALID_SPLITS,
+    build_canonical_skill_tree,
+    canonical_skill_tree_hash,
+    detect_trigger,
+    frontmatter_value,
+    iter_json_objects,
+    mount_skill_tree,
+    repo_root_for_manifest,
+    run_argv_with_timeout,
+    write_json,
+)
+from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_manifest, pi_argv, skill_name_from_manifest, seed_config_dir
+from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
-
-
-def manifest_repo_root(manifest_path: Path) -> Path:
-    """Same convention as the Pi runners: evals/shared-benchmark.json sits one
-    level below the skill repo root."""
-    return manifest_path.parent.parent if manifest_path.name == "shared-benchmark.json" else manifest_path.parent
 
 
 def mounted_skill_names(copied: list[Path]) -> list[str]:
     """The `name:` each mounted SKILL.md declares in frontmatter (falling back
     to its directory name). Claude Code invokes skills by this name, so it is
-    the needle for Skill-tool detection."""
+    the needle for Skill-tool detection. Parsed with the harness's real
+    frontmatter parser, not a regex that breaks on quoted/folded values."""
     names: list[str] = []
     for p in copied:
         skill_md = p if p.name == "SKILL.md" else p / "SKILL.md"
         name = skill_md.parent.name
         if skill_md.exists():
-            m = re.search(r"^name:\s*(\S+)\s*$", skill_md.read_text(encoding="utf-8"), re.M)
-            if m:
-                name = m.group(1)
+            declared = frontmatter_value(skill_md.read_text(encoding="utf-8"), "name")
+            if declared:
+                name = str(declared)
         names.append(name)
     return names
 
@@ -107,35 +113,12 @@ class AgentAdapter:
         raise NotImplementedError
 
     def detect(self, stdout: str, skill_names: list[str], copied: list[Path]) -> tuple[bool, list[str]]:
-        return detect_trigger(stdout, skill_names[0] if skill_names else "", copied)
+        return detect_trigger(stdout, copied)
 
-    @staticmethod
-    def _mount_tree(tree_dir: Path, skills_dir: Path) -> list[Path]:
-        """Copy each per-root subdir of the canonical tree under skills_dir,
-        identical surface for every adapter (mirrors the Pi runner's mount)."""
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        copied: list[Path] = []
-        for root_dir in sorted(p for p in tree_dir.iterdir() if p.is_dir()):
-            dest = skills_dir / root_dir.name
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(root_dir, dest)
-            copied.append(dest / "SKILL.md" if (dest / "SKILL.md").exists() else dest)
-        return copied
-
-    @staticmethod
-    def _run_argv(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int) -> dict[str, Any]:
-        start = time.time()
-        try:
-            proc = subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout)
-            stdout, stderr, returncode, timed_out = proc.stdout or "", proc.stderr or "", proc.returncode, False
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-            returncode, timed_out = 124, True
-        return {"stdout": stdout, "stderr": stderr, "returncode": returncode, "timed_out": timed_out,
-                "elapsed_ms": int((time.time() - start) * 1000),
-                "observation_complete": returncode == 0 and not timed_out}
+    # The shared mount and subprocess conventions (skill_benchmark owns them;
+    # the Pi runner uses the very same functions, so adapters cannot drift).
+    _mount_tree = staticmethod(mount_skill_tree)
+    _run_argv = staticmethod(run_argv_with_timeout)
 
 
 class ClaudeAdapter(AgentAdapter):
@@ -180,11 +163,7 @@ class ClaudeAdapter(AgentAdapter):
 
     @staticmethod
     def _result_subtype(stdout: str) -> str | None:
-        for line in stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for event in iter_json_objects(stdout):
             if isinstance(event, dict) and event.get("type") == "result":
                 return event.get("subtype")
         return None
@@ -193,11 +172,7 @@ class ClaudeAdapter(AgentAdapter):
         # Primary evidence: the Skill tool invoked with a mounted skill's name.
         # Fallback: the shared path detector (the model Read the mounted files).
         evidence: list[str] = []
-        for line in stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for event in iter_json_objects(stdout):
             if not isinstance(event, dict) or event.get("type") != "assistant":
                 continue
             for block in (event.get("message") or {}).get("content") or []:
@@ -226,13 +201,9 @@ class PiAdapter(AgentAdapter):
         return self._mount_tree(tree_dir, config_dir / "skills")
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
-        argv = ["pi", "--no-session", "--mode", "json", "--no-context-files", "--no-prompt-templates",
-                "--no-extensions", "--thinking", "minimal", "--tools", "read,grep,find,ls", "-p", query]
-        if model:
-            argv[1:1] = ["--model", model]
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(workspace / ".pi-config")
-        return self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
+        return self._run_argv(pi_argv(query, model), cwd=workspace, env=env, timeout=timeout)
 
 
 class StubAdapter(AgentAdapter):
@@ -254,8 +225,7 @@ class StubAdapter(AgentAdapter):
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
         lines: list[str] = []
         for skill_md in sorted((workspace / "skills").glob("*/SKILL.md")):
-            m = re.search(r"^description:\s*(.+)$", skill_md.read_text(encoding="utf-8"), re.M)
-            description = m.group(1) if m else ""
+            description = str(frontmatter_value(skill_md.read_text(encoding="utf-8"), "description") or "")
             if len(self._content_words(query) & self._content_words(description)) >= 2:
                 # Same stream shape the real agents emit, so the shared
                 # detector — not stub-private logic — decides "triggered".
@@ -346,7 +316,7 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
                models: list[str] | None, runs_per_query: int, timeout: int, workers: int,
                claude_bin: str = "claude", max_turns: int = 6) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
-    repo_root = manifest_repo_root(manifest_path)
+    repo_root = repo_root_for_manifest(manifest_path)
     adapters: list[AgentAdapter] = []
     for name in agents:
         if name not in ADAPTERS:
@@ -375,7 +345,7 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         "generated_at": int(time.time()),
         # Same caveat as run_pi_trigger_eval.py: single-arm raw measurements —
         # rates that steer description edits, not confirmed causal effects.
-        "evidence_class": "raw_autonomous_trigger_measurement",
+        "evidence_class": TRIGGER_MEASUREMENT_EVIDENCE_CLASS,
         "skill_tree_hash": tree_hash,
         "runs_per_query": runs_per_query,
         "summary": {"total": len(results), "passed": passed,
@@ -385,11 +355,13 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
     }
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The runner's CLI surface, buildable without parsing (shared-constant
+    guards in the tests introspect it, e.g. --split choices == VALID_SPLITS)."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("manifest")
     ap.add_argument("--eval-set", help="JSON file with {query, should_trigger} rows; defaults to the manifest's kind:'trigger' cases")
-    ap.add_argument("--split", choices=["tune", "holdout", "holdback"])
+    ap.add_argument("--split", choices=sorted(VALID_SPLITS))
     ap.add_argument("--agent", action="append", choices=sorted(ADAPTERS), help="agent adapter, repeatable (default: claude)")
     ap.add_argument("--model", action="append", help="model for every selected agent, repeatable (default: the adapter's own list; claude = haiku, sonnet, opus)")
     ap.add_argument("--runs-per-query", type=int, default=3, help="repetitions per (agent, model, query); a trigger RATE needs repetition (default 3)")
@@ -398,26 +370,24 @@ def main() -> int:
     ap.add_argument("--max-turns", type=int, default=6, help="claude adapter: turns the model gets to load the skill (its observation window)")
     ap.add_argument("--claude-bin", default="claude")
     ap.add_argument("--out", required=True)
+    return ap
+
+
+def main() -> int:
+    ap = build_arg_parser()
     args = ap.parse_args()
 
     manifest_path = Path(args.manifest)
-    if args.eval_set:
-        rows = json.loads(Path(args.eval_set).read_text(encoding="utf-8"))
-        if isinstance(rows, dict):
-            rows = rows.get("evals", rows.get("queries", []))
-    else:
-        rows = cases_from_manifest(load_manifest(manifest_path), args.split)
+    rows = eval_rows_from_args(args, manifest_path)
     if not rows:
         raise SystemExit("no trigger queries: add kind:'trigger' cases to the manifest or pass --eval-set")
 
     report = run_matrix(manifest_path, rows, agents=args.agent or ["claude"], models=args.model,
                         runs_per_query=args.runs_per_query, timeout=args.timeout, workers=args.workers,
                         claude_bin=args.claude_bin, max_turns=args.max_turns)
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(Path(args.out), report)
     print_matrix(report["matrix"])
-    print(f"\nreport: {out}")
+    print(f"\nreport: {args.out}")
     return 0
 
 

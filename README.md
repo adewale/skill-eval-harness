@@ -40,8 +40,10 @@ The main question is narrow: **when the same case runs with and without the skil
 > Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Install from GitHub first:
 >
 > ```bash
-> uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.4.2
+> uv tool install git+https://github.com/adewale/skill-eval-harness.git@main
 > ```
+>
+> `@main` matches everything documented below. Pinning a release tag (latest: `@v0.4.2`) is more reproducible, but several commands documented here (see the CHANGELOG's Unreleased section) landed after that tag.
 
 Run these from a skill repo that has `evals/shared-benchmark.json`:
 
@@ -89,12 +91,13 @@ viewer    -> review.html with assertion evidence and output previews
 ### From GitHub
 
 ```bash
-uv tool install git+https://github.com/adewale/skill-eval-harness.git@v0.4.2
+# Track main (matches this README), or pin the latest release tag for reproducibility.
+uv tool install git+https://github.com/adewale/skill-eval-harness.git@main
 skill-benchmark --help
 skill-pi-trigger-eval --help
 
 # One-shot without installing globally:
-uvx --from git+https://github.com/adewale/skill-eval-harness.git@v0.4.2 skill-benchmark --help
+uvx --from git+https://github.com/adewale/skill-eval-harness.git@main skill-benchmark --help
 ```
 
 The installed commands are:
@@ -140,7 +143,7 @@ skill-benchmark --help
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
 | `TODO.md` | Status tracker: the eval-framework roadmap (implemented, bar two `(TODO-native)` items) and the remaining Jetty adapter work — streaming/concurrency, live API validation, judge export, per-variant overrides, and the `swap:<id>` ablation follow-on. |
 | `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two materialized ablations, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per ablation; exercised by `tests/test_example_demo.py`. Also carries should-fire/should-not-fire trigger cases for `skill-trigger-matrix` (offline via `--agent stub`; live smoke via `RUN_TRIGGER_SMOKE=1`). Start here. |
-| `examples/adewale-workspace/` | Adewale-specific runners for Pi smoke, trigger, ablation, and aggregate reports. |
+| `examples/adewale-workspace/` | Adewale-specific Pi smoke runner and cross-repo aggregate report (the trigger runners are the top-level `skill-pi-trigger-eval` and `skill-trigger-matrix`). |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
 
 ## Manifest format
@@ -154,7 +157,7 @@ Each skill repo owns an `evals/shared-benchmark.json` manifest. Add a `harness` 
   "harness": {
     "name": "skill-eval-harness",
     "url": "https://github.com/adewale/skill-eval-harness",
-    "version": ">=0.4.1"
+    "version": ">=0.4.2"
   },
   "skill_paths": ["skills/good-pr/SKILL.md"],
   "variants": ["with_skill", "without_skill"],
@@ -562,6 +565,43 @@ skill-benchmark audit-manifest evals/shared-benchmark.json --fail-on-blockers
 
 The systematic way to upgrade a suite is to drive those blockers to empty, repo by repo: materialize the ablations (`materialize-ablations` / declare a `mechanism`+`target`), de-leak the leak-saturated cases (move the answer out of the prompt, or assert a downstream consequence), and add adversarial cases where missing — then the gate goes green.
 
+### Contamination perimeter (output-side, model-free)
+
+```bash
+skill-benchmark contamination ../repo/evals/shared-benchmark.json \
+  --runs ../repo/eval-runs/latest \
+  --model-cutoff 2025-01 \
+  --fail-on-contamination \
+  --out contamination.json
+```
+
+Three model-free checks over saved outputs: a canary tripwire (a case's declared canary string appearing verbatim in an output), output↔answer-key n-gram containment (`--ngram`, flagged above `--overlap-threshold`), and a `released_at`-vs-`--model-cutoff` gate for cases the model may have seen in training. `--fail-on-contamination` makes it a CI gate.
+
+### Judge robustness probes
+
+```bash
+skill-benchmark judge-robustness ../repo/evals/shared-benchmark.json \
+  --runs ../repo/eval-runs/latest \
+  --judge-model claude-sonnet-4-6 \
+  --fail-on-findings \
+  --out judge-robustness.json
+```
+
+Probes a judge's stability before you trust its verdicts (model-touching; opt-in): order-flip self-consistency plus empty-output and master-key negative controls a robust judge must reject. Takes the same `--judge-cmd`/`--judge-model` backends as `judge`; `--fail-on-findings` makes it a CI gate.
+
+### Suite cost ledger
+
+```bash
+skill-benchmark cost-summary \
+  --manifest ../repo/evals/shared-benchmark.json \
+  --runs ../repo/eval-runs/latest \
+  --benchmark benchmark.json \
+  --out cost-summary.json \
+  --md cost-summary.md
+```
+
+The standalone ledger described under [Cost telemetry](#cost-telemetry-tokens-and-dollars): coverage, totals, by variant/case/runner, top spenders, and `cost_quality_findings` when a `--benchmark` report is joined.
+
 ### Profile skill size and references
 
 ```bash
@@ -807,7 +847,7 @@ skill-eval-harness/
 ├── examples/
 │   ├── demo-skill/             # offline end-to-end example (stub runner, materialized ablations)
 │   ├── skill-pins.json         # pinned SHAs + tree hashes for the ablation study
-│   └── adewale-workspace/      # Pi smoke/trigger/ablation runners and aggregate reports
+│   └── adewale-workspace/      # Pi smoke runner + cross-repo aggregate report
 └── tests/                      # test_skill_benchmark.py + roadmap/cost/confidence-floor/doc-ref suites
 ```
 

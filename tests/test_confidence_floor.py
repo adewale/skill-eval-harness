@@ -11,7 +11,6 @@ believable lift executable —
   CF.3  grading is a pure function of the run directory (re-grade idempotence);
   CF.4  the core grade path calls no model and no network.
 """
-import importlib.util
 import json
 import tempfile
 import unittest
@@ -19,14 +18,12 @@ from pathlib import Path
 from unittest import mock
 
 import skill_benchmark as sb
+from helpers import load_example_module
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "detectors"
 
-SMOKE_SPEC = importlib.util.spec_from_file_location("run_pi_smoke", ROOT / "examples" / "adewale-workspace" / "run_pi_smoke.py")
-smoke = importlib.util.module_from_spec(SMOKE_SPEC)
-assert SMOKE_SPEC.loader is not None
-SMOKE_SPEC.loader.exec_module(smoke)
+smoke = load_example_module("run_pi_smoke", "examples/adewale-workspace/run_pi_smoke.py")
 
 
 def load_fixture_cases(detector: str, kind: str) -> list[dict]:

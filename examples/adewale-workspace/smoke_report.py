@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Grade and summarize the bounded Pi smoke baseline."""
+"""Summarize the bounded Pi smoke baseline across the workspace's skill repos.
+
+This is a thin aggregator: each repo's grading, per-variant summary, and case
+flags come from the harness's own `build_benchmark_report` — never from a
+re-implemented copy of that logic (an earlier version hand-rolled the flag
+strings here and they drifted from the real report's vocabulary).
+"""
 from __future__ import annotations
 
 import json
 import os
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -38,80 +43,37 @@ def selection_for_run(run_name: str) -> dict[str, list[str]]:
 def main() -> int:
     run_name = sys.argv[1] if len(sys.argv) > 1 else "baseline-smoke"
     selection = selection_for_run(run_name)
-    results = []
-    by_repo = {}
-    for repo, case_ids in selection.items():
-        manifest_path = ROOT / repo / "evals" / "shared-benchmark.json"
-        manifest = hb.validate_manifest(manifest_path)
-        cases = {c["id"]: c for c in manifest["cases"]}
-        runs = ROOT / repo / "eval-runs" / run_name
-        repo_results = []
-        for cid in case_ids:
-            case = cases[cid]
-            for variant in ["with_skill", "without_skill"]:
-                text, output_path = hb.read_output(runs, cid, variant)
-                metadata = hb.read_metadata(runs, cid, variant)
-                row, judge_tasks = hb.grade_case_variant(case, variant, text, output_path, metadata)
-                row["repo"] = repo
-                row["judge_tasks"] = judge_tasks
-                results.append(row)
-                repo_results.append(row)
-        by_repo[repo] = repo_results
-
     summary = {}
-    for repo, rows in by_repo.items():
-        rates = [r["objective_pass_rate"] for r in rows if r["objective_pass_rate"] is not None and hb.scorable_run(r)]
-        tokens = [r["metadata"].get("total_tokens") for r in rows if isinstance(r["metadata"].get("total_tokens"), (int, float))]
-        elapsed = [r["metadata"].get("elapsed_ms") for r in rows if isinstance(r["metadata"].get("elapsed_ms"), (int, float))]
-        summary[repo] = {
-            "case_ids": sorted({r["case_id"] for r in rows}),
-            "rows": len(rows),
-            "mean_objective_pass_rate": statistics.mean(rates) if rates else None,
-            "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
-            "total_tokens": sum(tokens) if tokens else None,
-            "by_variant": {},
-        }
-        for variant in ["with_skill", "without_skill"]:
-            vr = [r for r in rows if r["variant"] == variant]
-            vrates = [r["objective_pass_rate"] for r in vr if r["objective_pass_rate"] is not None and hb.scorable_run(r)]
-            vtoks = [r["metadata"].get("total_tokens") for r in vr if isinstance(r["metadata"].get("total_tokens"), (int, float))]
-            velapsed = [r["metadata"].get("elapsed_ms") for r in vr if isinstance(r["metadata"].get("elapsed_ms"), (int, float))]
-            summary[repo]["by_variant"][variant] = {
-                "mean_objective_pass_rate": statistics.mean(vrates) if vrates else None,
-                "total_tokens": sum(vtoks) if vtoks else None,
-                "median_elapsed_ms": statistics.median(velapsed) if velapsed else None,
-            }
-
     flags = []
-    for repo, rows in by_repo.items():
-        for cid in sorted({r["case_id"] for r in rows}):
-            wr = next((r for r in rows if r["case_id"] == cid and r["variant"] == "with_skill"), None)
-            nr = next((r for r in rows if r["case_id"] == cid and r["variant"] == "without_skill"), None)
-            if not wr or not nr or not hb.scorable_run(wr) or not hb.scorable_run(nr):
-                continue   # exclude infra failures, same predicate the harness report uses
-            w = wr["objective_pass_rate"]
-            n = nr["objective_pass_rate"]
-            case_flags = []
-            if w == 1 and n == 1:
-                case_flags.append("saturated/non-discriminating")
-            if w is not None and n is not None and w <= n:
-                case_flags.append("no objective lift")
-            if w is not None and w < 1:
-                case_flags.append("with-skill objective failure")
-            if case_flags:
-                flags.append({"repo": repo, "case_id": cid, "with_skill": w, "without_skill": n, "flags": case_flags})
+    results = []
+    for repo in selection:
+        manifest_path = ROOT / repo / "evals" / "shared-benchmark.json"
+        runs = ROOT / repo / "eval-runs" / run_name
+        # The harness report: grading, scorable-run filtering, per-variant
+        # summaries, and case flags all come from the one owner.
+        report = hb.build_benchmark_report(manifest_path, runs)
+        for row in report["results"]:
+            row["repo"] = repo
+            results.append(row)
+        for flag in report.get("case_flags", []):
+            flags.append({"repo": repo, **flag})
+        summary[repo] = {
+            "case_ids": sorted({r["case_id"] for r in report["results"]}),
+            "rows": len(report["results"]),
+            "by_variant": report.get("summary", {}),
+        }
 
     report = {
         "run_name": run_name,
         "generated_at": int(time.time()),
-        "skills": len(by_repo),
+        "skills": len(summary),
         "case_variant_rows": len(results),
         "summary": summary,
         "flags": flags,
         "results": results,
     }
     out = ROOT / "baseline-metrics" / f"{run_name}-benchmark.json"
-    out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    hb.write_json(out, report)
     print(json.dumps({"out": str(out), "skills": report["skills"], "rows": report["case_variant_rows"], "flags": len(flags)}, indent=2))
     return 0
 

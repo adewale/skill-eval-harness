@@ -11,6 +11,7 @@ from pathlib import Path
 
 import ablation_model as am
 import skill_benchmark as sb
+from helpers import make_eval_repo
 
 
 SKILL = (
@@ -20,18 +21,11 @@ SKILL = (
 
 
 def repo(root: Path, ablations):
-    rp = root / "repo"
-    sd = rp / "skills" / "good-pr"
-    sd.mkdir(parents=True)
-    (sd / "SKILL.md").write_text(SKILL, encoding="utf-8")
-    (rp / "evals").mkdir()
-    m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
-         "variants": ["with_skill", "without_skill"],
-         "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-         "ablations": ablations}
-    p = rp / "evals" / "shared-benchmark.json"
-    p.write_text(json.dumps(m), encoding="utf-8")
-    return p
+    # Thin wrapper over the shared builder (tests/helpers.py).
+    return make_eval_repo(
+        root, skill_name="good-pr", skill_text=SKILL,
+        cases=[{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
+        ablations=ablations)
 
 
 SECTION_ABL = {"id": "no-rp", "removed_component": "rp", "mechanism": "section",
@@ -262,7 +256,7 @@ class MaterializeCarriesTypedArmTests(unittest.TestCase):
             rows = sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl")
             arow = next(r for r in rows if r["variant"] == "ablation:no-rp")
             wrow = next(r for r in rows if r["variant"] == "with_skill")
-            self.assertEqual(set(arow["ablation"]), {"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
+            self.assertEqual(set(arow["ablation"]), am.Provenance.SCHEMA_KEYS)
             self.assertEqual(wrow["skill_tree_hash"], arow["ablation"]["parent_skill_hash"])   # both arms, same revision
 
 

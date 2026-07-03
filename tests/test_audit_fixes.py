@@ -10,32 +10,25 @@ from pathlib import Path
 
 import skill_benchmark as sb
 import run_pi_trigger_eval as tr
+from helpers import make_eval_repo, skill_markdown, write_run as _write_run_helper
+
+GOOD_PR_SKILL = skill_markdown("good-pr", "Review PRs. Use for PRs.", "# G\n\n## Sev\n\nPick.\n")
 
 
 def _skill(rp: Path):
-    sd = rp / "skills" / "good-pr"
-    sd.mkdir(parents=True)
-    (sd / "SKILL.md").write_text(
-        "---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# G\n\n## Sev\n\nPick.\n",
-        encoding="utf-8")
+    target = rp / "skills" / "good-pr" / "SKILL.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(GOOD_PR_SKILL, encoding="utf-8")
 
 
 def _manifest(rp: Path, cases, ablations=None, extra=None):
-    (rp / "evals").mkdir(parents=True, exist_ok=True)
-    m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
-         "variants": ["with_skill", "without_skill"], "cases": cases, "ablations": ablations or []}
-    if extra:
-        m.update(extra)
-    p = rp / "evals" / "shared-benchmark.json"
-    p.write_text(json.dumps(m), encoding="utf-8")
-    return p
+    # Thin wrapper over the shared builder; kept so call sites read as before.
+    return make_eval_repo(rp.parent, skill_name="good-pr", skill_text=GOOD_PR_SKILL,
+                          cases=cases, ablations=ablations, extra=extra)
 
 
 def _write_run(base: Path, output: str, metadata: dict, metrics: dict):
-    base.mkdir(parents=True, exist_ok=True)
-    (base / "output.md").write_text(output, encoding="utf-8")
-    (base / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-    (base / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+    _write_run_helper(base, output, metadata=metadata, metrics=metrics)
 
 
 CASE = {"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "APPROVED"}]}
@@ -237,11 +230,11 @@ class SharedSkillInvokedTests(unittest.TestCase):
     def test_detect_trigger_is_evidence_based(self):
         sp = Path("/ws/skills/root-0/SKILL.md")
         read_it = json.dumps({"type": "tool_use", "name": "Read", "input": {"file_path": "/ws/skills/root-0/SKILL.md"}})
-        invoked, evidence = sb.detect_trigger(read_it, "good-pr", [sp])
+        invoked, evidence = sb.detect_trigger(read_it, [sp])
         self.assertTrue(invoked)
         self.assertTrue(evidence)
         never = json.dumps({"type": "tool_use", "name": "Read", "input": {"file_path": "/ws/inputs/data.csv"}})
-        self.assertEqual(sb.detect_trigger(never, "good-pr", [sp]), (False, []))   # mounted but unread => False
+        self.assertEqual(sb.detect_trigger(never, [sp]), (False, []))   # mounted but unread => False
 
     def test_trigger_eval_uses_the_one_owner(self):
         import run_pi_trigger_eval as tr

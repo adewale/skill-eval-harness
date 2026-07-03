@@ -61,7 +61,9 @@ class SuiteRunTests(unittest.TestCase):
         return pins
 
     def test_suite_scope_refuses_extra_top_level_manifest(self):
-        root = Path(tempfile.mkdtemp(prefix="suite-scope-"))
+        tmp = tempfile.TemporaryDirectory(prefix="suite-scope-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
         self._repo(root, "allowed")
         self._repo(root, "beautiful-mermaid", skill_name="agentic-mermaid-project-skills")
         suite = root / "suite.txt"
@@ -75,7 +77,9 @@ class SuiteRunTests(unittest.TestCase):
         self.assertTrue(any("extra top-level manifests" in b for b in scope["blockers"]))
 
     def test_suite_scope_verifies_pins_and_estimates_rows(self):
-        root = Path(tempfile.mkdtemp(prefix="suite-scope-"))
+        tmp = tempfile.TemporaryDirectory(prefix="suite-scope-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
         self._repo(root, "allowed", ablations=[{"id": "no-checklist", "removed_component": "checklist", "expected_regressions": ["less useful"]}])
         suite = root / "suite.txt"
         suite.write_text("allowed/evals/shared-benchmark.json\n", encoding="utf-8")
@@ -92,7 +96,9 @@ class SuiteRunTests(unittest.TestCase):
         self.assertEqual(scope["totals"]["judge_assertions_tune_pair"], 2)
 
     def test_suite_run_writes_run_scope_before_returning_blocked(self):
-        root = Path(tempfile.mkdtemp(prefix="suite-run-"))
+        tmp = tempfile.TemporaryDirectory(prefix="suite-run-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
         self._repo(root, "allowed")
         self._repo(root, "extra")
         suite = root / "suite.txt"
@@ -119,7 +125,9 @@ class SuiteRunTests(unittest.TestCase):
         self.assertIn("extra/evals/shared-benchmark.json", written["extra_manifests"])
 
     def test_prepare_tier_runs_only_allowlisted_manifest(self):
-        root = Path(tempfile.mkdtemp(prefix="suite-prepare-"))
+        tmp = tempfile.TemporaryDirectory(prefix="suite-prepare-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
         self._repo(root, "allowed")
         suite = root / "suite.txt"
         suite.write_text("allowed/evals/shared-benchmark.json\n", encoding="utf-8")

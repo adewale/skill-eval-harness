@@ -6,22 +6,21 @@ network — fixtures and mocks only. The confidence floor has its own file
 tests/fixtures/detectors/ per the CF.1 registration contract.
 """
 import json
+import statistics
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 import skill_benchmark as sb
+from helpers import make_eval_repo
 
 
 def write_manifest(root: Path, manifest: dict) -> Path:
-    repo = root / "repo"
-    (repo / "skill").mkdir(parents=True, exist_ok=True)
-    (repo / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8")
-    (repo / "evals").mkdir(exist_ok=True)
-    path = repo / "evals" / "shared-benchmark.json"
-    path.write_text(json.dumps(manifest), encoding="utf-8")
-    return path
+    # Thin wrapper over the shared builder (tests/helpers.py); this file's
+    # manifests carry skill_paths ["skill/SKILL.md"].
+    return make_eval_repo(root, manifest=manifest, skill_paths=["skill/SKILL.md"],
+                          skill_text="---\nname: demo\ndescription: Demo\n---\n")
 
 
 def base_manifest(**overrides) -> dict:
@@ -1144,15 +1143,12 @@ def report_fixture(case_rates: dict[str, tuple[float, float]], *, failures: list
         if fl:
             flags.append({"case_id": case_id, "flags": fl, "with_skill": w, "without_skill": n})
     paired = {
-        "with_skill_objective_pass_rate": statistics_mean([w for w, _ in case_rates.values()]),
-        "without_skill_objective_pass_rate": statistics_mean([n for _, n in case_rates.values()]),
+        "with_skill_objective_pass_rate": statistics.mean([w for w, _ in case_rates.values()]),
+        "without_skill_objective_pass_rate": statistics.mean([n for _, n in case_rates.values()]),
     }
     paired["absolute_delta"] = paired["with_skill_objective_pass_rate"] - paired["without_skill_objective_pass_rate"]
     return {"generated_at": 1, "summary": {}, "paired_summary": paired, "case_flags": flags, "results": results}
 
-
-def statistics_mean(values: list[float]) -> float:
-    return sum(values) / len(values) if values else 0.0
 
 
 class TrendTrackingTests(unittest.TestCase):

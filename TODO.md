@@ -59,7 +59,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:4074`, merged in `grade_case_variant:5100`).
+threshold, evidence}` (`load_judge_results:4174`, merged in `grade_case_variant:5173`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -98,12 +98,9 @@ threshold, evidence}` (`load_judge_results:4074`, merged in `grade_case_variant:
 
 ## Open questions to verify against current Jetty docs/API
 
-- [ ] Exact JSON response shape from `/api/v1/files/upload`.
-- [ ] Exact artifact listing/download shape from trajectory details.
-- [ ] Exact chat-completion response field containing `trajectory_id` in non-streaming runbook mode.
-- [ ] Full terminal status set in production.
-- [ ] Whether directory trees should be uploaded as individual files or archives.
-- [ ] Whether `use_trial_keys` is available to all relevant accounts or only trial collections.
+- [ ] The live-token questions tracked in `docs/jetty-support-spec.md` § "Remaining live-token questions"
+      (upload response shape, artifact listing shape, `trajectory_id` field, terminal status set,
+      directory-tree upload strategy, `use_trial_keys` availability). One list, one owner — the spec.
 
 ---
 
@@ -204,6 +201,36 @@ open "Judge robustness probes" item. Sequence:
 - [ ] Ship the harness as an agent-authoring skill *(TODO-native)*. Meta/self-referential, overlaps `docs/authoring-evals.md`, adds a packaging surface, narrow audience. Revisit only if external authors adopt the harness and ask for an agent-guided authoring path.
 
 ---
+
+# Consolidation follow-ups (deferred from the 2026-07 duplication audit)
+
+The audit's highest-leverage fixes landed (shared runner owners, one usage-alias
+table, one population boundary, `emit_report`, `tests/helpers.py`, the
+doc-sync/identity guards in `tests/test_consolidation_guards.py`). Deliberately
+deferred, in impact order:
+
+- [ ] Merge the two cost ledgers' row/rollup logic — `build_cost_summary` and `suite_cost_ledger` still
+      compute coverage/totals/by-variant independently (judge spend is unified via `judge_cost_usd`), and
+      the suite ledger discovers on-disk arms with its own `run_bearing()` walk instead of
+      `discover_case_model_roots`.
+- [ ] Extract the shared case/model/variant/run discovery+grade loop (`grade`, `build_benchmark_report`,
+      `collect_judge_tasks`, `contamination_report` each inline it; the trigger-skip policy is unified,
+      the loop itself is not).
+- [ ] One timeout-encoding convention for the answer runners: `run-codex`/`run-claude` record
+      `returncode: None, timed_out: True`, the trigger runners 124+flag, `run_subagent_tasks` loses the
+      timeout flag entirely (misclassifies a timeout as a generic failure), and `suggest_cases`/
+      `_run_suite_command` have no `TimeoutExpired` handler at all. `DEFAULT_RUNNER_TIMEOUT_S` for the
+      eight duplicated `1800` literals rides along.
+- [ ] Fold the section-locating scan shared by `section_span`/`list_item_ops` into one `_locate_section`.
+- [ ] Migrate the remaining in-class copies of the eval-repo builder onto `tests/helpers.make_eval_repo`
+      (the cross-file named duplicates are done; test_skill_benchmark.py's per-class variants and
+      test_external_review_gaps.py's three in-file copies remain), and stop instantiating sibling
+      TestCases to borrow builders (`SubagentRunnerTests().make_tasks(...)`).
+- [ ] Reorganize the PR-named test files (test_audit_fixes / test_followup_features / test_roadmap_features /
+      test_external_review_gaps) into subject files (manifest / grading / judging / reporting / stats /
+      ablations / runners), deleting the strict-subset duplicate tests identified in the audit.
+- [ ] An `ablation:`-variant prefix owner (`ABLATION_VARIANT_PREFIX` + `ablation_id_of()` in
+      ablation_model) for the ~14 inline `variant.split(":", 1)[1]` sites.
 
 # User journeys the code supports but the docs don't walk
 

@@ -291,7 +291,9 @@ class JudgeAlignmentTests(unittest.TestCase):
 
 class ToolCallTaxonomyTests(unittest.TestCase):
     def _events(self, names):
-        td = Path(tempfile.mkdtemp(prefix="toolcall-"))
+        tmp = tempfile.TemporaryDirectory(prefix="toolcall-")
+        self.addCleanup(tmp.cleanup)
+        td = Path(tmp.name)
         events = [{"type": "tool_call", "name": n, "status": "completed"} for n in names]
         (td / "events.json").write_text(json.dumps(events), encoding="utf-8")
         (td / "output.md").write_text("out", encoding="utf-8")
@@ -328,7 +330,9 @@ class ToolCallTaxonomyTests(unittest.TestCase):
     def test_name_match_is_not_substring(self):
         # a shell `cat readme` (a command event, no tool name) must NOT satisfy
         # required_calls:["Read"] — the audit's core false-positive.
-        td = Path(tempfile.mkdtemp(prefix="toolcall-cmd-"))
+        tmp = tempfile.TemporaryDirectory(prefix="toolcall-cmd-")
+        self.addCleanup(tmp.cleanup)
+        td = Path(tmp.name)
         (td / "events.json").write_text(json.dumps([{"type": "command", "command": "cat README.md", "status": "completed"}]), encoding="utf-8")
         (td / "output.md").write_text("out", encoding="utf-8")
         res = sb.assertion_result({"type": "tool_call", "required_calls": ["Read"]}, "t", td / "output.md", run_base=td)

@@ -18,7 +18,9 @@ class DemoExampleTests(unittest.TestCase):
     def _run(self):
         mp = DEMO / "evals" / "shared-benchmark.json"
         manifest = sb.validate_manifest(mp)
-        td = Path(tempfile.mkdtemp(prefix="demo-eval-"))
+        tmp = tempfile.TemporaryDirectory(prefix="demo-eval-")
+        self.addCleanup(tmp.cleanup)
+        td = Path(tmp.name)
         # 5 runs per arm so the deterministic regression clears the confirmation
         # significance gate (feature 1); a single shot would read INDETERMINATE.
         rows = sb.prepared_task_rows(mp, manifest, include_ablations=True, ablation_dir=str(td / "abl"), runs_per_variant=5)

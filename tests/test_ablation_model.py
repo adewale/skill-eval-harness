@@ -27,7 +27,7 @@ class ProvenanceSchemaTests(unittest.TestCase):
 
     def test_as_dict_is_the_minimum_schema(self):
         d = self.prov().as_dict()
-        self.assertEqual(set(d), {"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
+        self.assertEqual(set(d), am.Provenance.SCHEMA_KEYS)
         self.assertEqual(d["skill_hash"], "E")
         self.assertEqual(d["parent_skill_hash"], "C")
         self.assertEqual(d["components"][0]["class"], "instructions")

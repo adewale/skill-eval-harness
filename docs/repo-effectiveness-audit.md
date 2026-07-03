@@ -11,7 +11,7 @@ This audit applies the `good-repo` skill to `adewale/skill-eval-harness` as a pu
 Re-run after `v0.4.2` and the `token-overhead` command shipped. Score is unchanged at 86/100; the substantive surfaces remain strong.
 
 - **Fixed:** README install commands pinned the stale `@v0.4.1` tag while the current release is `v0.4.2`. Quick start and Installation now pin `@v0.4.2` (`README.md`). Historical "shipped v0.4.1 runner support" references are intentionally left as-is.
-- **Verified:** all 31 unit tests pass locally via `python3 -m unittest discover tests`.
+- **Verified (at the time of that re-run):** the unit suite passed locally via `python3 -m unittest discover tests`. (The suite has since grown severalfold; CI is the source of truth for the current count.)
 - **Still pending (owner-only):** GitHub description, topics, and homepage URL remain empty on the repo page despite being present in `pyproject.toml`. See the manual settings checklist below.
 
 ## Snapshot
@@ -34,7 +34,7 @@ The repo has a clear README, install path, CI, releases, changelog, contribution
 | Docs + architecture | 14 | 15 | `docs/`, `examples/`, tests, `TODO.md`, and `LESSONS_LEARNED.md` route readers to depth without bloating the README. |
 | GitHub metadata + discoverability | 5 | 10 | GitHub API shows empty repo description, no topics, and no homepage URL. No separate docs site was found, so an empty homepage is acceptable unless one is created. |
 | Trust + governance + maintenance | 12 | 15 | Root `LICENSE`, `CHANGELOG.md`, `CONTRIBUTING.md`, PR template, issue forms, releases, and lessons doc exist. `SECURITY.md`/support policy should wait for an owner contact and supported-version policy. |
-| Automation + release hygiene | 9 | 10 | GitHub Actions runs Python 3.10/3.11/3.12 compile, unit tests, and CLI help. Tags/releases exist. Dependency automation is not currently needed because there are no runtime dependencies. |
+| Automation + release hygiene | 9 | 10 | GitHub Actions runs Python 3.10/3.11/3.12 compile, unit tests, and CLI help. Tags/releases exist. Dependency automation is not currently needed: the only runtime dependency is PyYAML (per `pyproject.toml`). |
 | **Total** | **86** | **100** | Strong repo surface with a few owner-controlled metadata gaps. |
 
 ## Strengths

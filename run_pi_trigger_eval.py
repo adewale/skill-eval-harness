@@ -15,21 +15,43 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from skill_benchmark import write_trace_artifacts, materialize_ablation, ablation_components, build_canonical_skill_tree, derived_population, canonical_skill_tree_hash, expected_trigger_polarity, detect_trigger, event_texts_for_tool_input, stream_usage_and_cost
-from ablation_model import EvidenceClass, Provenance
+from skill_benchmark import (
+    VALID_SPLITS,
+    is_trigger_case,
+    ablation_by_id,
+    ablation_components,
+    build_canonical_skill_tree,
+    canonical_skill_tree_hash,
+    derived_population,
+    detect_trigger,
+    event_texts_for_tool_input,  # noqa: F401  (re-exported for adapters/tests)
+    expected_trigger_polarity,
+    iter_cases,
+    load_manifest_source,
+    materialize_ablation,
+    mount_skill_tree,
+    repo_root_for_manifest,
+    run_argv_with_timeout,
+    stream_usage_and_cost,
+    write_json,
+    write_trace_artifacts,
+)
+from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    """The harness's manifest loader (JSON or YAML, dataset files resolved,
+    clean FAIL on bad input) — never a private json.loads fork that would make
+    YAML manifests or dataset_files work in `benchmark` but break here."""
+    return load_manifest_source(path)
 
 
 def skill_name_from_manifest(manifest: dict[str, Any]) -> str:
@@ -45,32 +67,14 @@ def seed_config_dir(config_dir: Path) -> None:
             shutil.copy2(src, config_dir / name)
 
 
-def _mount_tree_into_config(tree_dir: Path, skills_dir: Path) -> list[Path]:
-    """Copy each per-root subdir of a canonical/materialized tree into skills_dir.
-
-    Both the baseline and ablation arms route through here, so they mount under
-    IDENTICAL names and expose an identical file surface — the only difference is
-    the bytes the ablation's declared edit removed. Returns the copied SKILL.md
-    (or root dir) paths used as skill-load detection needles.
-    """
-    copied: list[Path] = []
-    for root_dir in sorted(p for p in tree_dir.iterdir() if p.is_dir()):
-        dest = skills_dir / root_dir.name
-        if dest.exists():
-            shutil.rmtree(dest)
-        shutil.copytree(root_dir, dest)
-        copied.append(dest / "SKILL.md" if (dest / "SKILL.md").exists() else dest)
-    return copied
-
-
 def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_dir: Path, ablation_id: str | None = None) -> tuple[list[Path], dict[str, Any] | None]:
-    repo_root = manifest_path.parent.parent if manifest_path.name == "shared-benchmark.json" else manifest_path.parent
+    repo_root = repo_root_for_manifest(manifest_path)
     skills_dir = config_dir / "skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
     if ablation_id:
         # Mount a real, altered skill (e.g. a weakened description) so the trigger
         # test measures whether the ablated skill still autonomously loads.
-        ablation = next((a for a in manifest.get("ablations", []) if a.get("id") == ablation_id), None)
+        ablation = ablation_by_id(manifest, ablation_id)
         if ablation is None:
             raise RuntimeError(f"unknown ablation: {ablation_id}")
         if not ablation_components(ablation):
@@ -78,7 +82,7 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
         if derived_population(ablation_components(ablation)) != "trigger":
             raise RuntimeError(f"ablation {ablation_id} is an answer-population ablation; the trigger eval only measures discovery (trigger-population) ablations. Run it through the benchmark / Pi-smoke path.")
         res = materialize_ablation(repo_root, manifest, ablation, config_dir / "_materialized")
-        return _mount_tree_into_config(Path(res["dir"]), skills_dir), res
+        return mount_skill_tree(Path(res["dir"]), skills_dir), res
     # Baseline (no ablation): build the SAME canonical tree the ablation arm starts
     # from, so the two arms are file-for-file identical apart from the declared
     # edit — never differing by an ad-hoc copier that dropped or renamed files.
@@ -86,15 +90,20 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
     # ablation run from the same skill revision (baseline.skill_tree_hash ==
     # ablation.parent_skill_hash).
     tree = build_canonical_skill_tree(repo_root, manifest, config_dir / "_canonical")
-    return _mount_tree_into_config(Path(tree), skills_dir), {"mode": "baseline", "skill_tree_hash": canonical_skill_tree_hash(repo_root, manifest)}
+    return mount_skill_tree(Path(tree), skills_dir), {"mode": "baseline", "skill_tree_hash": canonical_skill_tree_hash(repo_root, manifest)}
 
 
-def _text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)
+def pi_argv(query: str, model: str | None = None) -> list[str]:
+    """THE Pi CLI invocation for trigger evals — isolated JSON-stream mode with
+    read-only tools. The trigger matrix's Pi adapter uses this same argv, so the
+    two runners cannot drift apart on flags."""
+    argv = [
+        "pi", "--no-session", "--mode", "json", "--no-context-files", "--no-prompt-templates", "--no-extensions",
+        "--thinking", "minimal", "--tools", "read,grep,find,ls", "-p", query,
+    ]
+    if model:
+        argv[1:1] = ["--model", model]
+    return argv
 
 
 def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, Any]) -> None:
@@ -121,31 +130,12 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
         config_dir = Path(td)
         seed_config_dir(config_dir)
         copied, abl_prov = copy_skill_to_config(manifest_path, manifest, config_dir, ablation_id=ablation)
-        cmd = [
-            "pi", "--no-session", "--mode", "json", "--no-context-files", "--no-prompt-templates", "--no-extensions",
-            "--thinking", "minimal", "--tools", "read,grep,find,ls", "-p", query,
-        ]
-        if model:
-            cmd[1:1] = ["--model", model]
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(config_dir)
-        start = time.time()
-        timed_out = False
-        stdout = ""
-        stderr = ""
-        returncode = 0
-        try:
-            proc = subprocess.run(cmd, cwd=ROOT, env=env, text=True, capture_output=True, timeout=timeout)
-            stdout = _text(proc.stdout)
-            stderr = _text(proc.stderr)
-            returncode = proc.returncode
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            stdout = _text(exc.stdout)
-            stderr = _text(exc.stderr)
-            returncode = 124
-        elapsed_ms = int((time.time() - start) * 1000)
-        triggered, evidence = detect_trigger(stdout, skill_name_from_manifest(manifest), copied)
+        run = run_argv_with_timeout(pi_argv(query, model), cwd=ROOT, env=env, timeout=timeout)
+        stdout, stderr = run["stdout"], run["stderr"]
+        returncode, timed_out, elapsed_ms = run["returncode"], run["timed_out"], run["elapsed_ms"]
+        triggered, evidence = detect_trigger(stdout, copied)
         # Trigger runs now persist token/cost telemetry like the answer paths
         # (issue #21): parsed off the same Pi JSON stream the detector reads.
         usage_normalized, cost_normalized = stream_usage_and_cost(stdout)
@@ -200,10 +190,10 @@ def trigger_query_from_case(case: dict[str, Any]) -> str:
 
 def cases_from_manifest(manifest: dict[str, Any], split: str | None) -> list[dict[str, Any]]:
     out = []
-    for c in manifest.get("cases", []):
-        if split and c.get("split") != split:
-            continue
-        if c.get("kind") == "trigger":
+    # iter_cases (not raw manifest["cases"]) so dataset-templated trigger cases
+    # fan out here exactly as they do for validation, audit, and the benchmark.
+    for c in iter_cases(manifest, split):
+        if is_trigger_case(c):
             prompt = trigger_query_from_case(c)
             # Single shared resolver with the manifest audit (skill_benchmark), so the
             # eval and the audit cannot disagree on a case's expected polarity.
@@ -212,28 +202,42 @@ def cases_from_manifest(manifest: dict[str, Any], split: str | None) -> list[dic
     return out
 
 
-def main() -> int:
+def eval_rows_from_args(args: Any, manifest_path: Path) -> list[dict[str, Any]]:
+    """Resolve the trigger rows for a runner invocation: an explicit --eval-set
+    file ({query, should_trigger} rows, bare list or under evals/queries), else
+    the manifest's kind:'trigger' cases. Shared with run_trigger_matrix."""
+    if args.eval_set:
+        rows = json.loads(Path(args.eval_set).read_text(encoding="utf-8"))
+        if isinstance(rows, dict):
+            rows = rows.get("evals", rows.get("queries", []))
+        return rows
+    return cases_from_manifest(load_manifest(manifest_path), args.split)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The runner's CLI surface, buildable without parsing (shared-constant
+    guards in the tests introspect it, e.g. --split choices == VALID_SPLITS)."""
     ap = argparse.ArgumentParser()
     ap.add_argument("manifest")
     ap.add_argument("--eval-set", help="JSON file with {query, should_trigger} rows; defaults to manifest trigger cases")
-    ap.add_argument("--split", choices=["tune", "holdout", "holdback"])
-    ap.add_argument("--runs-per-query", type=int, default=1)
+    ap.add_argument("--split", choices=sorted(VALID_SPLITS))
+    ap.add_argument("--runs-per-query", type=int, default=3, help="repetitions per query; a trigger RATE needs repetition (default 3, the floor docs/tuning-skill-activation.md recommends)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--model")
     ap.add_argument("--out", required=True)
     ap.add_argument("--trace-runs", help="optional directory for per-query trace.jsonl/events.json/metrics.json artifacts")
     ap.add_argument("--ablation", help="materialize this (discovery-population) ablation id and trigger-test the altered skill")
+    return ap
+
+
+def main() -> int:
+    ap = build_arg_parser()
     args = ap.parse_args()
 
     manifest_path = Path(args.manifest)
     manifest = load_manifest(manifest_path)
-    if args.eval_set:
-        rows = json.loads(Path(args.eval_set).read_text(encoding="utf-8"))
-        if isinstance(rows, dict):
-            rows = rows.get("evals", rows.get("queries", []))
-    else:
-        rows = cases_from_manifest(manifest, args.split)
+    rows = eval_rows_from_args(args, manifest_path)
     futures = []
     results = []
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -258,14 +262,12 @@ def main() -> int:
         # pass_rate as a measurement, not a confirmed ablation effect. The recorded
         # skill_tree_hash on each result lets a future pairing verify both arms ran
         # the same skill revision.
-        "evidence_class": "raw_autonomous_trigger_measurement",
+        "evidence_class": TRIGGER_MEASUREMENT_EVIDENCE_CLASS,
         "ablation": args.ablation,
         "summary": {"total": len(results), "passed": passed, "failed": len(results) - passed, "pass_rate": (passed / len(results)) if results else None},
         "results": results,
     }
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(output, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(Path(args.out), output)
     print(json.dumps(output["summary"], indent=2))
     return 0
 
