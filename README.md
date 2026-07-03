@@ -116,6 +116,8 @@ skill-benchmark --help
 
 ## Documentation map
 
+[`docs/README.md`](docs/README.md) groups these by kind (user journeys, concepts, specs, audits) and holds the convention for adding a new user-journey walkthrough.
+
 | File | Use it for |
 |---|---|
 | `README.md` | Manifest shape, run layout, and command contracts. |

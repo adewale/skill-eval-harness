@@ -196,8 +196,9 @@ These are tests of the harness, not a new eval suite; sequence them before the b
 A 2026-07 docs review found a pattern: the machinery for a user journey exists (commands,
 report blocks, tests) but no doc walks someone from their actual question to a decision, so
 the journey is invisible unless you already know the command names. Each item below is one
-such journey: the fix is a short walkthrough doc (or a runnable example) in the mold of
-`docs/tuning-skill-activation.md` / `docs/ablation-study-walkthrough.md`, not new machinery.
+such journey: the fix is a short walkthrough doc (or a runnable example), not new machinery.
+The mold — question-shaped title, runnable on the demo, real dated output, symptom-by-symptom
+reading guide, honesty rules, boundary — is written down in [`docs/README.md`](docs/README.md).
 
 - [x] **"How do I make my skill trigger reliably?"** — `docs/tuning-skill-activation.md`:
       trigger cases in both polarities → `skill-trigger-matrix` per (agent, model) →

@@ -37,4 +37,5 @@ If you change manifest parsing, grading, Jetty export/import, trigger detection,
 - State what command or report shape changed.
 - Include the focused validation command and result.
 - Update README/docs when CLI flags, manifest fields, output layout, or safety behavior changes.
+- A new user-facing command or report block names the user journey it serves: either a walkthrough under `docs/` (the mold is in [`docs/README.md`](docs/README.md)) or an entry in `TODO.md`'s user-journeys backlog.
 - For Jetty work, keep the manifest/grading model as the source of truth and isolate network behavior behind tests/mocks.
