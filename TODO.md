@@ -59,7 +59,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:4174`, merged in `grade_case_variant:5173`).
+threshold, evidence}` (`load_judge_results:4233`, merged in `grade_case_variant:5237`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -116,8 +116,9 @@ keyed to the same number (`1.1`, `2.2`, `CF.1`, …). This file tracks status on
 spec for each item's goal, abstractions, design, and tests. Items with no spec section are
 marked *(TODO-native)*. The roadmap is implemented: migration tooling included
 (`migrate` + [`docs/migrating-evals.md`](docs/migrating-evals.md)); tests live in
-`tests/test_confidence_floor.py` and `tests/test_roadmap_features.py`. The two TODO-native
-items below stay open by design.
+`tests/test_confidence_floor.py` and the subject files (`test_grading.py`,
+`test_reporting.py`, `test_runners.py`, `test_manifest.py`, `test_judging.py`,
+`test_stats.py`). The two TODO-native items below stay open by design.
 
 **Moat — do not dilute:** causal lift, `tune`/`holdout`/`holdback` splits, leakage lint,
 ablations, and saturation/no-lift flags are unique to this harness. None of the surveyed
@@ -202,35 +203,35 @@ open "Judge robustness probes" item. Sequence:
 
 ---
 
-# Consolidation follow-ups (deferred from the 2026-07 duplication audit)
+# Consolidation follow-ups (2026-07 duplication audit) — done
 
-The audit's highest-leverage fixes landed (shared runner owners, one usage-alias
-table, one population boundary, `emit_report`, `tests/helpers.py`, the
-doc-sync/identity guards in `tests/test_consolidation_guards.py`). Deliberately
-deferred, in impact order:
+All of the audit's deferred items landed in the follow-up pass:
 
-- [ ] Merge the two cost ledgers' row/rollup logic — `build_cost_summary` and `suite_cost_ledger` still
-      compute coverage/totals/by-variant independently (judge spend is unified via `judge_cost_usd`), and
-      the suite ledger discovers on-disk arms with its own `run_bearing()` walk instead of
-      `discover_case_model_roots`.
-- [ ] Extract the shared case/model/variant/run discovery+grade loop (`grade`, `build_benchmark_report`,
-      `collect_judge_tasks`, `contamination_report` each inline it; the trigger-skip policy is unified,
-      the loop itself is not).
-- [ ] One timeout-encoding convention for the answer runners: `run-codex`/`run-claude` record
-      `returncode: None, timed_out: True`, the trigger runners 124+flag, `run_subagent_tasks` loses the
-      timeout flag entirely (misclassifies a timeout as a generic failure), and `suggest_cases`/
-      `_run_suite_command` have no `TimeoutExpired` handler at all. `DEFAULT_RUNNER_TIMEOUT_S` for the
-      eight duplicated `1800` literals rides along.
-- [ ] Fold the section-locating scan shared by `section_span`/`list_item_ops` into one `_locate_section`.
-- [ ] Migrate the remaining in-class copies of the eval-repo builder onto `tests/helpers.make_eval_repo`
-      (the cross-file named duplicates are done; test_skill_benchmark.py's per-class variants and
-      test_external_review_gaps.py's three in-file copies remain), and stop instantiating sibling
-      TestCases to borrow builders (`SubagentRunnerTests().make_tasks(...)`).
-- [ ] Reorganize the PR-named test files (test_audit_fixes / test_followup_features / test_roadmap_features /
-      test_external_review_gaps) into subject files (manifest / grading / judging / reporting / stats /
-      ablations / runners), deleting the strict-subset duplicate tests identified in the audit.
-- [ ] An `ablation:`-variant prefix owner (`ABLATION_VARIANT_PREFIX` + `ablation_id_of()` in
-      ablation_model) for the ~14 inline `variant.split(":", 1)[1]` sites.
+- [x] Cost ledgers merged onto shared owners: `spend_of`/`group_spend`/`cost_coverage_block`/
+      `cost_totals_block`, one `judge_cost_block`, and the billing disk-walk hoisted to the named
+      `discover_on_disk_run_rows` beside the grading discovery (the ledger deliberately bills every
+      on-disk arm; grading is variant-scoped — now a documented decision, not two private walks).
+- [x] The case/model/variant/run discovery loop extracted as `discovered_run_units`, shared by
+      `grade`, `build_benchmark_report`, `collect_judge_tasks`, and `contamination_report`.
+- [x] One timeout encoding everywhere a runner spawns a process: `timed_out: True` + returncode 124
+      (`run-codex`/`run-claude`/`run_subagent_tasks`/`shell_agent_backend`/`suggest-cases`/
+      `_run_suite_command`), with `DEFAULT_RUNNER_TIMEOUT_S` replacing the eight `1800` literals.
+      Guarded by `tests/test_consolidation_guards.py` TimeoutConventionTests.
+- [x] `_locate_section` owns the fence-aware section scan for `section_span`/`list_item_ops`.
+- [x] Sibling-TestCase borrowing removed (`make_tasks`, `make_two_model_runs`, `make_graded_repo`
+      are module-level); the cross-file and module-level builder copies delegate to
+      `tests/helpers.py`. The in-class builders still inside `tests/test_ablations.py` are
+      deliberately NOT migrated: their shapes (dangling `skill_paths` for validation-failure
+      fixtures, multi-root trees with files outside the copy-set, old-skill pairs) are the
+      behavior under test, not drift.
+- [x] The PR-named test files are gone: classes moved verbatim into subject files
+      (`test_manifest.py`, `test_grading.py`, `test_judging.py`, `test_reporting.py`,
+      `test_stats.py`, `test_runners.py`, `test_ablations.py` — the latter also absorbing
+      test_skill_benchmark's ablation half and all of test_cbc), and the one strict-subset
+      duplicate test (readiness capability-saturation, re-asserted from test_audit_fixes)
+      was deleted rather than moved.
+- [x] `ABLATION_VARIANT_PREFIX` / `is_ablation_variant()` / `ablation_id_of()` in `ablation_model`
+      own the `ablation:<id>` encoding (14 inline `split(":", 1)[1]`/`startswith` sites rewired).
 
 # User journeys the code supports but the docs don't walk
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import stat
+import statistics
 import sys
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,81 @@ def load_example_module(name: str, relpath: str):
 
 def skill_markdown(name: str = "demo", description: str = "Demo skill. Use for demos.", body: str = "# Demo\n\nDo the thing.\n") -> str:
     return f"---\nname: {name}\ndescription: {description}\n---\n\n{body}"
+
+
+# The good-pr fixture family (originally test_audit_fixes'): a skill with a
+# section to ablate, a contains-assertion case, and a crashed-run body.
+GOOD_PR_SKILL = skill_markdown("good-pr", "Review PRs. Use for PRs.", "# G\n\n## Sev\n\nPick.\n")
+CONTAINS_APPROVED_CASE = {"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "APPROVED"}]}
+CODEX_CRASH_OUTPUT = "[CODEX FAILURE: returncode=1]\ninfra died before answering"
+
+
+def write_good_pr_skill(rp: Path) -> None:
+    target = rp / "skills" / "good-pr" / "SKILL.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(GOOD_PR_SKILL, encoding="utf-8")
+
+
+def good_pr_manifest(rp: Path, cases, ablations=None, extra=None) -> Path:
+    """Write the good-pr skill AND its manifest under rp; returns manifest path."""
+    return make_eval_repo(rp.parent, skill_name="good-pr", skill_text=GOOD_PR_SKILL,
+                          cases=cases, ablations=ablations, extra=extra)
+
+
+def write_demo_manifest(root: Path, manifest: dict[str, Any]) -> Path:
+    """Write a hand-built manifest verbatim with the demo skill at skill/SKILL.md
+    (originally test_roadmap_features' write_manifest)."""
+    return make_eval_repo(root, manifest=manifest, skill_paths=["skill/SKILL.md"],
+                          skill_text="---\nname: demo\ndescription: Demo\n---\n")
+
+
+def demo_manifest(**overrides) -> dict[str, Any]:
+    """The demo manifest dict (originally test_roadmap_features' base_manifest)."""
+    manifest = {
+        "version": 1,
+        "skill_name": "demo",
+        "skill_paths": ["skill/SKILL.md"],
+        "variants": ["with_skill", "without_skill"],
+        "cases": [{
+            "id": "case-1",
+            "split": "tune",
+            "kind": "behavior",
+            "prompt": "Do the task.",
+            "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}],
+        }],
+        "ablations": [],
+    }
+    manifest.update(overrides)
+    return manifest
+
+
+def report_fixture(case_rates: dict[str, tuple[float, float]], *, failures: list[dict] | None = None) -> dict:
+    """A minimal benchmark-report shape: {case: (with_rate, without_rate)}."""
+    results = []
+    for case_id, (w, n) in case_rates.items():
+        for variant, rate in [("with_skill", w), ("without_skill", n)]:
+            results.append({
+                "case_id": case_id, "variant": variant, "run_number": 1, "missing_output": False,
+                "execution_valid": True, "objective_pass_rate": rate, "metadata": {},
+                "assertions": [], "qualitative_assertions": [],
+            })
+    for f in failures or []:
+        results.append(f)
+    flags = []
+    for case_id, (w, n) in case_rates.items():
+        fl = []
+        if w == 1 and n == 1:
+            fl.append("saturated/non-discriminating")
+        if w <= n:
+            fl.append("no objective lift")
+        if fl:
+            flags.append({"case_id": case_id, "flags": fl, "with_skill": w, "without_skill": n})
+    paired = {
+        "with_skill_objective_pass_rate": statistics.mean([w for w, _ in case_rates.values()]),
+        "without_skill_objective_pass_rate": statistics.mean([n for _, n in case_rates.values()]),
+    }
+    paired["absolute_delta"] = paired["with_skill_objective_pass_rate"] - paired["without_skill_objective_pass_rate"]
+    return {"generated_at": 1, "summary": {}, "paired_summary": paired, "case_flags": flags, "results": results}
 
 
 def make_eval_repo(

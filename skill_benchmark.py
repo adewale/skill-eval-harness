@@ -43,11 +43,14 @@ from ablation_model import (
     Component,
     EvidenceClass,
     InstructionSimulated,
+    ablation_id_of,
+    is_ablation_variant,
     JETTY_FAILURE,
     MaterializedArm,
     PreparedTask,
     Provenance,
     ResultSet,
+    TIMEOUT_FAILURE,
     TreeIdentity,
     causal_confirmation,
     execution_valid,
@@ -665,8 +668,8 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
             "Use the old/baseline version of the skill only. Its files are provided in your "
             "workspace — read and follow them."
         )
-    if variant.startswith("ablation:"):
-        aid = variant.split(":", 1)[1]
+    if is_ablation_variant(variant):
+        aid = ablation_id_of(variant)
         ab = ablation_by_id(manifest, aid)
         if not ab:
             return f"Use an ablated skill variant {aid}; ablation metadata was not found."
@@ -788,14 +791,14 @@ def prepared_task_rows(
                 skill_paths = []   # the no-skill arm carries NO skill files at the source (defense in depth)
             elif variant == "old_skill":
                 skill_paths = old_skill_paths   # the OLD tree, carried on the row for both runners
-            elif variant.startswith("ablation:"):
+            elif is_ablation_variant(variant):
                 population = ablation_variant_population(manifest, variant)
                 # Discovery (trigger-population) ablations measure AUTONOMOUS skill
                 # loading; they are emitted ONLY by the autonomous-trigger adapter
                 # (run_pi_trigger_eval.py --ablation), never by this answer-path preparer.
                 if population == "trigger":
                     continue
-                aid = variant.split(":", 1)[1]
+                aid = ablation_id_of(variant)
                 if aid in trees:
                     # Materialized: carry the arm's TYPED provenance straight through —
                     # no dict round-trip, no re-parse (the drop-then-reparse is gone).
@@ -831,7 +834,7 @@ def prepared_task_rows(
                         # Only the arms that derive from the CURRENT canonical tree record
                         # its hash; old_skill mounts the old tree, so stamping the current
                         # canonical hash on it would be an internally false record.
-                        skill_tree_hash=(canonical_hash if (canonical_hash and (variant == "with_skill" or variant.startswith("ablation:"))) else None),
+                        skill_tree_hash=(canonical_hash if (canonical_hash and (variant == "with_skill" or is_ablation_variant(variant))) else None),
                         answer_key=({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else None),
                     )
                     row = task.harness_record()
@@ -872,6 +875,10 @@ def prepare(args: argparse.Namespace) -> int:
             fh.close()
     return 0
 
+
+# THE default wall-clock budget for any spawned runner/judge/poll (seconds).
+# Eight duplicated `1800` literals used to carry this; one constant cannot drift.
+DEFAULT_RUNNER_TIMEOUT_S = 1800
 
 JETTY_DEFAULT_BASE_URL = "https://flows-api.jetty.io"
 JETTY_DEFAULT_AGENT = "claude-code"
@@ -1115,17 +1122,16 @@ def frontmatter_field_span(text: str, field: str) -> tuple[int, int] | None:
     return (starts[start_i], starts[end_i])
 
 
-def section_span(text: str, heading: str) -> tuple[int, int]:
-    """Char span of a markdown section: heading line through the next heading of
-    equal-or-higher level. Fence-aware: a '##' inside a ``` block is code."""
-    fm, body = split_frontmatter(text)
-    base = len(fm)
-    lines, starts = _line_starts(body)
-    mask = _fenced_mask(lines)
+def _locate_section(lines: list[str], mask: list[bool], heading: str, *, err_context: str = "") -> tuple[int, int, int]:
+    """(heading_line, end_line, level) of a markdown section within pre-split,
+    fence-masked lines: the heading line through the next heading of
+    equal-or-higher level (a '##' inside a ``` block is code, never a heading).
+    If the target carries '#' markers, that exact heading LEVEL is required — so
+    a '## Foo' target does not accidentally match a '### Foo' subheading with
+    the same text; a bare-text target (no '#') matches any level. The one
+    section scan shared by section_span and list_item_ops (previously two
+    hand-synced copies)."""
     h = heading.strip()
-    # If the target carries '#' markers, require that exact heading LEVEL — so a
-    # '## Foo' target does not accidentally match a '### Foo' subheading with the
-    # same text. A bare-text target (no '#') still matches any level.
     want_level = (len(h) - len(h.lstrip("#"))) if h.startswith("#") else None
     want = h.lstrip("#").strip().lower()
     start_i = level = None
@@ -1137,7 +1143,7 @@ def section_span(text: str, heading: str) -> tuple[int, int]:
             start_i, level = i, len(m.group(1))
             break
     if start_i is None:
-        raise AblationError(f"section not found: {heading!r}")
+        raise AblationError(f"section not found{err_context}: {heading!r}")
     end_i = len(lines)
     for j in range(start_i + 1, len(lines)):
         if mask[j]:
@@ -1146,6 +1152,17 @@ def section_span(text: str, heading: str) -> tuple[int, int]:
         if m and len(m.group(1)) <= level:
             end_i = j
             break
+    return start_i, end_i, level
+
+
+def section_span(text: str, heading: str) -> tuple[int, int]:
+    """Char span of a markdown section: heading line through the next heading of
+    equal-or-higher level. Fence-aware: a '##' inside a ``` block is code."""
+    fm, body = split_frontmatter(text)
+    base = len(fm)
+    lines, starts = _line_starts(body)
+    mask = _fenced_mask(lines)
+    start_i, end_i, _ = _locate_section(lines, mask, heading)
     return (base + starts[start_i], base + starts[end_i])
 
 
@@ -1154,27 +1171,8 @@ def list_item_ops(text: str, section: str, contains: list[str]) -> list[tuple[in
     base = len(fm)
     lines, starts = _line_starts(body)
     mask = _fenced_mask(lines)
-    h = section.strip()
-    want_level = (len(h) - len(h.lstrip("#"))) if h.startswith("#") else None
-    want = h.lstrip("#").strip().lower()
-    body_start = level = None
-    for i, ln in enumerate(lines):
-        if mask[i]:
-            continue
-        m = re.match(r"^(#{1,6})\s+(.*)$", ln)
-        if m and m.group(2).strip().lower() == want and (want_level is None or len(m.group(1)) == want_level):
-            body_start, level = i + 1, len(m.group(1))
-            break
-    if body_start is None:
-        raise AblationError(f"section not found for list_item: {section!r}")
-    section_end = len(lines)
-    for j in range(body_start, len(lines)):
-        if mask[j]:
-            continue
-        m = re.match(r"^(#{1,6})\s+", lines[j])
-        if m and len(m.group(1)) <= level:
-            section_end = j
-            break
+    start_i, section_end, _ = _locate_section(lines, mask, section, err_context=" for list_item")
+    body_start = start_i + 1
     ops = []
     k = body_start
     while k < section_end:
@@ -1732,9 +1730,9 @@ def materialized_tree_for_variant(repo_root: Path, manifest: dict[str, Any], var
     """For an ablation:<id> variant that declares a removal, materialize the tree
     and return its provenance (with skill_files). Returns None for non-ablation
     variants and for instruction-simulated ablations (no removal declared)."""
-    if not str(variant).startswith("ablation:"):
+    aid = ablation_id_of(variant)
+    if aid is None:
         return None
-    aid = str(variant).split(":", 1)[1]
     ablation = ablation_by_id(manifest, aid)
     if ablation is None:
         raise AblationError(f"unknown ablation variant: {variant}")
@@ -1779,8 +1777,7 @@ def enumerate_tree(root_dir: Path) -> list[tuple[Path, str]]:
 def ablation_variant_population(manifest: dict[str, Any], variant: str) -> str:
     """Case population for an ablation:<id> variant: trigger (discovery ablation)
     or answer (everything else, including instruction-simulated)."""
-    aid = str(variant).split(":", 1)[1]
-    ablation = ablation_by_id(manifest, aid)
+    ablation = ablation_by_id(manifest, ablation_id_of(variant) or "")
     comps = ablation_components(ablation) if ablation else []
     return derived_population(comps) if comps else "answer"
 
@@ -1932,7 +1929,7 @@ def safe_task_json(pt: PreparedTask, manifest: dict[str, Any], *, task_name: str
             # simulate, via the ONE typed instruction-sim record. removed_component /
             # expected_regressions come from the manifest (the prepared row carries
             # only id/mode/population).
-            aid = variant.split(":", 1)[1]
+            aid = ablation_id_of(variant)
             ablation = ablation_by_id(manifest, aid) or {}
             safe["ablation"] = InstructionSimulated(
                 id=aid,
@@ -2009,8 +2006,8 @@ def build_jetty_payload(
                 "remote_path_hint": f"old-skills/{pt.skill_name}/{Path(local).name}",
                 "private": False,
             })
-    elif variant.startswith("ablation:"):
-        aid = variant.split(":", 1)[1]
+    elif is_ablation_variant(variant):
+        aid = ablation_id_of(variant)
         tree = (ablation_trees or {}).get(aid)
         if tree:
             # Materialized: upload the whole altered tree, preserving relative paths
@@ -2260,7 +2257,7 @@ class JettyClient:
     def submit(self, request_body: dict[str, Any]) -> dict[str, Any]:
         return self._json_request("POST", "/v1/chat/completions", request_body)
 
-    def poll(self, collection: str, task: str, trajectory_id: str, *, timeout_s: int = 1800, poll_interval_s: float = 5) -> dict[str, Any]:
+    def poll(self, collection: str, task: str, trajectory_id: str, *, timeout_s: int = DEFAULT_RUNNER_TIMEOUT_S, poll_interval_s: float = 5) -> dict[str, Any]:
         deadline = time.time() + timeout_s
         quoted = "/".join(urllib.parse.quote(part, safe="") for part in [collection, task, trajectory_id])
         path = f"/api/v1/db/trajectory/{quoted}"
@@ -2278,7 +2275,7 @@ class JettyClient:
         return last
 
 
-def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeout_s: int = 1800, poll_interval_s: float = 5) -> Any:
+def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeout_s: int = DEFAULT_RUNNER_TIMEOUT_S, poll_interval_s: float = 5) -> Any:
     for row in payloads:
         harness = row.get("harness", {})
         if harness.get("executable") is False:
@@ -2366,7 +2363,7 @@ def run_jetty(args: argparse.Namespace) -> int:
         if not token:
             die("JETTY_API_TOKEN is required for run-jetty (use --dry-run to validate payload loading only)")
         client = JettyClient(token, os.environ.get("JETTY_BASE_URL", JETTY_DEFAULT_BASE_URL))
-        records = list(execute_jetty_payloads(payloads, client=client, timeout_s=getattr(args, "timeout", 1800), poll_interval_s=getattr(args, "poll_interval", 5)))
+        records = list(execute_jetty_payloads(payloads, client=client, timeout_s=getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S), poll_interval_s=getattr(args, "poll_interval", 5)))
     out = Path(args.out) if getattr(args, "out", None) else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
     try:
@@ -2605,6 +2602,66 @@ def discover_run_bases_under(base: Path) -> list[tuple[int, Path]]:
     return [(1, base)]
 
 
+def discovered_run_units(runs: Path, case: dict[str, Any], variants: list[str]):
+    """Every persisted run of one case, across both run layouts: yields
+    (model_name, variant, run_number, base, text, output_path, meta). THE
+    discovery loop shared by grade, build_benchmark_report, collect_judge_tasks,
+    and contamination_report — previously four hand-synced copies of the same
+    three-deep nesting."""
+    for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
+        for variant in variants:
+            for run_number, base in discover_run_bases_under(model_root / variant):
+                text, output_path = read_output_base(base)
+                meta = read_metadata_base(base)
+                yield model_name, variant, run_number, base, text, output_path, meta
+
+
+def discover_on_disk_run_rows(manifest: dict[str, Any], runs: Path) -> list[dict[str, Any]]:
+    """Every run directory that EXISTS ON DISK for the manifest's cases — every
+    variant directory found, ablation arms included, both layouts — as merged
+    cost-fact rows. This is the BILLING discovery (suite_cost_ledger): money
+    spent on an arm must be counted even when that arm is not listed in
+    manifest['variants']. Grading paths instead use discovered_run_units, which
+    is deliberately scoped to the variants under comparison. Both discoveries
+    live here so the difference is a documented decision, not two private
+    implementations that merely happen to disagree."""
+    def run_bearing(d: Path) -> bool:
+        return ((d / "output.md").exists() or (d / "metadata.json").exists() or (d / "outputs").is_dir()
+                or any(g.is_dir() and g.name.startswith(("run-", "turn-")) for g in d.iterdir()))
+
+    rows: list[dict[str, Any]] = []
+    for case in iter_cases(manifest):
+        case_dir = runs / case["id"]
+        if not case_dir.is_dir():
+            continue
+        variant_dirs: list[tuple[str | None, str, Path]] = []
+        for child in sorted(case_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            if run_bearing(child):
+                variant_dirs.append((None, child.name, child))
+                continue
+            # No run evidence of its own but run-bearing subdirs: a model root
+            # from the multi-model layout (<case>/<model>/<variant>).
+            bearing_children = [g for g in sorted(child.iterdir()) if g.is_dir() and run_bearing(g)]
+            for g in bearing_children:
+                variant_dirs.append((child.name, g.name, g))
+        for model, variant, vdir in variant_dirs:
+            for run_number, base in discover_run_bases_under(vdir):
+                merged = read_metrics_base(base)
+                facts = run_cost_facts(merged)
+                facts["elapsed_ms"] = metric_number(merged, "elapsed_ms")
+                rows.append({
+                    "case_id": case["id"],
+                    "variant": variant,
+                    "model": model,
+                    "run_number": run_number,
+                    "runner": merged.get("provider") or merged.get("trace_source") or merged.get("source"),
+                    **facts,
+                })
+    return rows
+
+
 def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int, Path]]:
     """Return run instances for a case/variant in the legacy (model-less) layout:
       runs/<case>/<variant>/output.md
@@ -2794,11 +2851,13 @@ def mount_skill_tree(tree_dir: Path, skills_dir: Path) -> list[Path]:
 
 def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
                           env: dict[str, str] | None = None, timeout: int) -> dict[str, Any]:
-    """One subprocess-with-timeout convention for the trigger runners: returns
-    {stdout, stderr, returncode, timed_out, elapsed_ms, observation_complete},
-    encoding a timeout as returncode 124 + timed_out=True. observation_complete
-    means the agent got a fair window to act; a crash or timeout is a failed
-    observation, never a no-trigger pass."""
+    """One subprocess-with-timeout convention: returns {stdout, stderr,
+    returncode, timed_out, elapsed_ms, observation_complete}. THE timeout
+    encoding, everywhere a runner spawns a process: `timed_out: True` (the flag
+    ablation_model.execution_valid keys on) plus `returncode: 124` (the shell's
+    kill-on-timeout code). observation_complete means the agent got a fair
+    window to act; a crash or timeout is a failed observation, never a
+    no-trigger pass."""
     def _text(value: Any) -> str:
         if value is None:
             return ""
@@ -3603,7 +3662,7 @@ def run_codex(args: argparse.Namespace) -> int:
     tasks = load_jsonl(Path(args.tasks))
     runs = Path(args.runs)
     cmd = getattr(args, "codex_cmd", None) or "codex exec --json"
-    timeout = int(getattr(args, "timeout", 1800))
+    timeout = int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S))
     for task in tasks:
         # Cross the JSONL boundary ONCE: from here down the typed PreparedTask is the
         # authority for variant, skill paths, ablation record, and tree hash — the
@@ -3645,7 +3704,7 @@ def run_codex(args: argparse.Namespace) -> int:
             except subprocess.TimeoutExpired as exc:
                 elapsed_ms = int((time.time() - started) * 1000)
                 (base / "output.md").write_text(f"{CODEX_FAILURE}: timed out after {timeout}s]\n", encoding="utf-8")
-                write_json(base / "metadata.json", {"provider": "codex", "returncode": None, "timed_out": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **prov_extra})
+                write_json(base / "metadata.json", {"provider": "codex", "returncode": 124, "timed_out": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **prov_extra})
     return 0
 
 
@@ -3703,7 +3762,7 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
 
 
 def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str = "claude",
-                      timeout: int = 1800, extra_args: list[str] | None = None, cwd: str | None = None) -> dict[str, Any]:
+                      timeout: int = DEFAULT_RUNNER_TIMEOUT_S, extra_args: list[str] | None = None, cwd: str | None = None) -> dict[str, Any]:
     """Single owner for invoking Claude via `claude -p`. Returns the parsed
     envelope plus returncode/elapsed_ms/stderr. `claude_bin` is an executable path
     (tests inject a stub that emits a canned envelope), NOT a shell string — so
@@ -3718,7 +3777,7 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
         proc = subprocess.run(argv, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=cwd)
     except subprocess.TimeoutExpired as exc:
         return {"answer": "", "cost_usd": None, "usage": {}, "parse_error": None,
-                "returncode": None, "timed_out": True, "elapsed_ms": int((time.time() - started) * 1000),
+                "returncode": 124, "timed_out": True, "elapsed_ms": int((time.time() - started) * 1000),
                 "stderr": str(exc)[:4000]}
     parsed = parse_claude_cli_json(proc.stdout)
     parsed.update({
@@ -3752,7 +3811,7 @@ def run_claude(args: argparse.Namespace) -> int:
     runs = Path(args.runs)
     model = getattr(args, "model", None)
     claude_bin = getattr(args, "claude_bin", None) or "claude"
-    timeout = int(getattr(args, "timeout", 1800))
+    timeout = int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S))
     for task in tasks:
         pt = PreparedTask.from_row(task)
         # The row's model (multi-model fan-out, roadmap 2.1) beats the CLI-wide
@@ -4296,15 +4355,11 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
             # Same population boundary as build_benchmark_report/grade: a judge
             # never spends a model call on a discovery-population case.
             continue
-        for model_name, model_root in discover_case_model_roots(runs, case["id"], selected_variants):
-            for variant in selected_variants:
-                for run_number, base in discover_run_bases_under(model_root / variant):
-                    text, output_path = read_output_base(base)
-                    meta = read_metadata_base(base)
-                    # The layout model rides into judge_task_id so a fanned run's
-                    # verdicts merge back onto the right model's rows.
-                    _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={}, model=model_name)
-                    tasks.extend(judge_tasks)
+        for model_name, variant, run_number, base, text, output_path, meta in discovered_run_units(runs, case, selected_variants):
+            # The layout model rides into judge_task_id so a fanned run's
+            # verdicts merge back onto the right model's rows.
+            _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={}, model=model_name)
+            tasks.extend(judge_tasks)
     return tasks
 
 
@@ -4714,6 +4769,10 @@ def run_subagent_tasks(
                 error = None
             except ToolReplayMiss as exc:
                 outcome, error = {}, f"tool replay miss: {exc}"
+            except subprocess.TimeoutExpired as exc:
+                # The one timeout encoding (see run_argv_with_timeout): the flag
+                # execution_valid keys on, never a generic error that loses it.
+                outcome, error = {"timed_out": True, "returncode": 124}, f"subagent timeout: {exc}"
             except Exception as exc:
                 outcome, error = {}, f"subagent error: {exc}"
             elapsed_ms = outcome.get("elapsed_ms")
@@ -4733,12 +4792,14 @@ def run_subagent_tasks(
         write_json(base / "events.json", events_doc)
         write_json(base / "metrics.json", metrics)
         write_json(base / "metadata.json", {
-            "provider": "subagent", "model": row_model, "returncode": 1 if error else outcome.get("returncode", 0),
+            "provider": "subagent", "model": row_model, "returncode": outcome.get("returncode", 1 if error else 0),
             "timed_out": bool(outcome.get("timed_out", False)), "elapsed_ms": int(elapsed_ms),
             "usage_normalized": usage_block, "cost_normalized": cost_block,
             "tool_replay_mode": mode, "trace_source": "subagent", **prov_extra})
         answer = str(outcome.get("answer") or "")
-        if error:
+        if outcome.get("timed_out"):
+            answer = f"{TIMEOUT_FAILURE}: {error or 'subagent timed out'}]\n"
+        elif error:
             answer = f"{CLAUDE_FAILURE}: {error}]\n"
         elif not answer:
             answer = f"{CLAUDE_FAILURE}: no output produced]\n"
@@ -4746,15 +4807,18 @@ def run_subagent_tasks(
     return 0
 
 
-def shell_agent_backend(agent_cmd: str, timeout: int = 1800) -> Any:
+def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S) -> Any:
     """Adapt a shell command into the subagent seam: the prompt arrives as JSON
     on stdin, the reply is JSON on stdout ({answer, trace?, usage?})."""
     def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
         payload = {"prompt": prompt, "model": model, "workspace": str(workspace)}
         if history:
             payload["history"] = history
-        proc = subprocess.run(agent_cmd, shell=True, input=json.dumps(payload),
-                              text=True, capture_output=True, timeout=timeout)
+        try:
+            proc = subprocess.run(agent_cmd, shell=True, input=json.dumps(payload),
+                                  text=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"answer": "", "returncode": 124, "timed_out": True}
         if proc.returncode != 0:
             return {"answer": "", "returncode": proc.returncode}
         try:
@@ -4769,10 +4833,10 @@ def run_subagent(args: argparse.Namespace) -> int:
     runs = Path(args.runs)
     agent_cmd = getattr(args, "agent_cmd", None)
     if agent_cmd:
-        backend = shell_agent_backend(agent_cmd, timeout=int(getattr(args, "timeout", 1800)))
+        backend = shell_agent_backend(agent_cmd, timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)))
     else:
         claude_bin = getattr(args, "claude_bin", None) or "claude"
-        timeout = int(getattr(args, "timeout", 1800))
+        timeout = int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S))
 
         def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
             if history:
@@ -5480,14 +5544,10 @@ def grade(args: argparse.Namespace) -> int:
             # Same population boundary as build_benchmark_report: trigger cases are
             # graded by the autonomous-trigger runners, never by the answer grader.
             continue
-        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
-            for variant in variants:
-                for run_number, base in discover_run_bases_under(model_root / variant):
-                    text, output_path = read_output_base(base)
-                    meta = read_metadata_base(base)
-                    result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent, model=model_name, strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
-                    all_results.append(result)
-                    all_judge_tasks.extend(judge_tasks)
+        for model_name, variant, run_number, base, text, output_path, meta in discovered_run_units(runs, case, variants):
+            result, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=getattr(args, "allow_scripts", False), manifest_dir=path.parent, model=model_name, strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
+            all_results.append(result)
+            all_judge_tasks.extend(judge_tasks)
     report = {
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
@@ -6264,68 +6324,91 @@ def result_cost_facts(result: dict[str, Any]) -> dict[str, Any]:
     return facts
 
 
+def spend_of(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """One spend slot — {runs, total_tokens, total_cost_usd} — over cost-fact
+    rows. Missing telemetry contributes nothing (never a fake zero row). THE
+    accumulator behind every by-case/by-variant/by-runner/ablation spend view
+    in both cost ledgers (previously five hand-rolled folds)."""
+    return {
+        "runs": len(rows),
+        "total_tokens": int(sum(r["total_tokens"] for r in rows if r.get("total_tokens") is not None)),
+        "total_cost_usd": round(sum(r["cost_usd"] for r in rows if r.get("cost_usd") is not None), 6),
+    }
+
+
+def group_spend(rows: list[dict[str, Any]], key_fn) -> dict[str, dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        groups.setdefault(key_fn(r), []).append(r)
+    return {k: spend_of(v) for k, v in sorted(groups.items(), key=lambda kv: str(kv[0]))}
+
+
+def cost_coverage_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Coverage separates missing telemetry from zero spend — identical keys in
+    the benchmark cost_summary and the standalone suite ledger by construction."""
+    runs_seen = len(rows)
+    with_usage = sum(1 for r in rows if r.get("total_tokens") is not None)
+    with_cost = sum(1 for r in rows if r.get("cost_usd") is not None)
+    return {
+        "runs_seen": runs_seen,
+        "runs_with_token_usage": with_usage,
+        "runs_with_dollar_cost": with_cost,
+        "runs_missing_usage": runs_seen - with_usage,
+        "runs_missing_cost": runs_seen - with_cost,
+    }
+
+
+def cost_totals_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "input_tokens": int(sum(r["input_tokens"] for r in rows if r.get("input_tokens") is not None)),
+        "output_tokens": int(sum(r["output_tokens"] for r in rows if r.get("output_tokens") is not None)),
+        "total_tokens": int(sum(r["total_tokens"] for r in rows if r.get("total_tokens") is not None)),
+        "total_cost_usd": round(sum(r["cost_usd"] for r in rows if r.get("cost_usd") is not None), 6),
+        "elapsed_ms_sum": int(sum(r["elapsed_ms"] for r in rows if r.get("elapsed_ms") is not None)),
+    }
+
+
 def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str, dict[str, Any]] | None = None, confirmed_regressions: int = 0) -> dict[str, Any]:
     """The cost ledger inside a benchmark report (issue #21). Operational by
     design: EVERY run counts here, including execution errors — a timed-out
     run still cost money — while quality rates elsewhere keep excluding them.
     Coverage separates missing telemetry from zero spend."""
-    facts = [(r, result_cost_facts(r)) for r in results]
-    runs_seen = len(facts)
-    with_usage = [f for _, f in facts if f.get("total_tokens") is not None]
-    with_cost = [f for _, f in facts if f.get("cost_usd") is not None]
+    rows = [{**result_cost_facts(r), "case_id": r["case_id"], "variant": r["variant"],
+             "missing_output": r.get("missing_output"), "execution_valid": r.get("execution_valid", True)}
+            for r in results]
     totals = {
-        "input_tokens": int(sum(f["input_tokens"] for _, f in facts if f.get("input_tokens") is not None)),
-        "output_tokens": int(sum(f["output_tokens"] for _, f in facts if f.get("output_tokens") is not None)),
-        "total_tokens": int(sum(f["total_tokens"] for _, f in facts if f.get("total_tokens") is not None)),
-        "total_cost_usd": round(sum(f["cost_usd"] for _, f in facts if f.get("cost_usd") is not None), 6),
-        "elapsed_ms_sum": int(sum(f["elapsed_ms"] for _, f in facts if f.get("elapsed_ms") is not None)),
-        "execution_errors": sum(1 for r, _ in facts if not r.get("missing_output") and not r.get("execution_valid", True)),
+        **cost_totals_block(rows),
+        "execution_errors": sum(1 for r in rows if not r.get("missing_output") and not r.get("execution_valid", True)),
     }
     by_variant: dict[str, Any] = {}
-    for variant in sorted({r["variant"] for r, _ in facts}):
-        rows = [(r, f) for r, f in facts if r["variant"] == variant]
+    for variant in sorted({r["variant"] for r in rows}):
+        vrows = [r for r in rows if r["variant"] == variant]
         by_variant[variant] = {
-            "runs": len(rows),
-            "tokens": cost_stats([f["total_tokens"] for _, f in rows if f.get("total_tokens") is not None]),
-            "cost_usd": cost_stats([f["cost_usd"] for _, f in rows if f.get("cost_usd") is not None]),
+            "runs": len(vrows),
+            "tokens": cost_stats([r["total_tokens"] for r in vrows if r.get("total_tokens") is not None]),
+            "cost_usd": cost_stats([r["cost_usd"] for r in vrows if r.get("cost_usd") is not None]),
         }
-    by_case: dict[str, Any] = {}
-    for case_id in sorted({r["case_id"] for r, _ in facts}):
-        rows = [f for r, f in facts if r["case_id"] == case_id]
-        by_case[case_id] = {
-            "runs": len(rows),
-            "total_tokens": int(sum(f["total_tokens"] for f in rows if f.get("total_tokens") is not None)),
-            "total_cost_usd": round(sum(f["cost_usd"] for f in rows if f.get("cost_usd") is not None), 6),
-        }
+    by_case = group_spend(rows, lambda r: r["case_id"])
     paired_cost_delta: dict[str, Any] = {}
     deltas = []
     for case_id in by_case:
-        with_costs = [f["cost_usd"] for r, f in facts if r["case_id"] == case_id and r["variant"] == "with_skill" and f.get("cost_usd") is not None]
-        without_costs = [f["cost_usd"] for r, f in facts if r["case_id"] == case_id and r["variant"] == "without_skill" and f.get("cost_usd") is not None]
+        with_costs = [r["cost_usd"] for r in rows if r["case_id"] == case_id and r["variant"] == "with_skill" and r.get("cost_usd") is not None]
+        without_costs = [r["cost_usd"] for r in rows if r["case_id"] == case_id and r["variant"] == "without_skill" and r.get("cost_usd") is not None]
         if with_costs and without_costs:
             delta = statistics.mean(with_costs) - statistics.mean(without_costs)
             paired_cost_delta[case_id] = {"with_skill": round(statistics.mean(with_costs), 6), "without_skill": round(statistics.mean(without_costs), 6), "delta": round(delta, 6)}
             deltas.append(delta)
-    ablation_rows = [(r, f) for r, f in facts if str(r.get("variant", "")).startswith("ablation:")]
-    ablation_cost = round(sum(f["cost_usd"] for _, f in ablation_rows if f.get("cost_usd") is not None), 6)
-    ablation_tokens = int(sum(f["total_tokens"] for _, f in ablation_rows if f.get("total_tokens") is not None))
+    ablation_spend = spend_of([r for r in rows if is_ablation_variant(r.get("variant", ""))])
+    ablation_cost = ablation_spend["total_cost_usd"]
     out: dict[str, Any] = {
-        "coverage": {
-            "runs_seen": runs_seen,
-            "runs_with_token_usage": len(with_usage),
-            "runs_with_dollar_cost": len(with_cost),
-            "runs_missing_usage": runs_seen - len(with_usage),
-            "runs_missing_cost": runs_seen - len(with_cost),
-        },
+        "coverage": cost_coverage_block(rows),
         "totals": totals,
         "by_variant": by_variant,
         "by_case": by_case,
         "paired_cost_delta": paired_cost_delta,
         "mean_paired_cost_delta": round(statistics.mean(deltas), 6) if deltas else None,
         "ablations": {
-            "runs": len(ablation_rows),
-            "total_tokens": ablation_tokens,
-            "total_cost_usd": ablation_cost,
+            **ablation_spend,
             "confirmed_regressions": confirmed_regressions,
             "cost_per_confirmed_regression": round(ablation_cost / confirmed_regressions, 6) if confirmed_regressions and ablation_cost else None,
         },
@@ -6472,13 +6555,9 @@ def build_benchmark_report(
         if is_trigger_case(case):
             skipped_trigger_cases.append(case["id"])
             continue
-        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
-            for variant in variants:
-                for run_number, base in discover_run_bases_under(model_root / variant):
-                    text, output_path = read_output_base(base)
-                    meta = read_metadata_base(base)
-                    result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name, strict=strict, embed_cmd=embed_cmd)
-                    results.append(result)
+        for model_name, variant, run_number, base, text, output_path, meta in discovered_run_units(runs, case, variants):
+            result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name, strict=strict, embed_cmd=embed_cmd)
+            results.append(result)
 
     by_variant: dict[str, list[dict[str, Any]]] = {v: [] for v in variants}
     for r in results:
@@ -7205,64 +7284,12 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
     the run tree per manifest case — every variant directory found on disk,
     ablation arms included — and reads each run's normalized telemetry."""
     manifest = validate_manifest(manifest_path)
-    rows: list[dict[str, Any]] = []
-    for case in iter_cases(manifest):
-        case_dir = runs / case["id"]
-        if not case_dir.is_dir():
-            continue
-        def run_bearing(d: Path) -> bool:
-            return ((d / "output.md").exists() or (d / "metadata.json").exists() or (d / "outputs").is_dir()
-                    or any(g.is_dir() and g.name.startswith(("run-", "turn-")) for g in d.iterdir()))
-
-        variant_dirs: list[tuple[str | None, str, Path]] = []
-        for child in sorted(case_dir.iterdir()):
-            if not child.is_dir():
-                continue
-            if run_bearing(child):
-                variant_dirs.append((None, child.name, child))
-                continue
-            # No run evidence of its own but run-bearing subdirs: a model root
-            # from the multi-model layout (<case>/<model>/<variant>).
-            bearing_children = [g for g in sorted(child.iterdir()) if g.is_dir() and run_bearing(g)]
-            for g in bearing_children:
-                variant_dirs.append((child.name, g.name, g))
-        for model, variant, vdir in variant_dirs:
-            for run_number, base in discover_run_bases_under(vdir):
-                merged = read_metrics_base(base)
-                facts = run_cost_facts(merged)
-                facts["elapsed_ms"] = metric_number(merged, "elapsed_ms")
-                rows.append({
-                    "case_id": case["id"],
-                    "variant": variant,
-                    "model": model,
-                    "run_number": run_number,
-                    "runner": merged.get("provider") or merged.get("trace_source") or merged.get("source"),
-                    **facts,
-                })
-    runs_seen = len(rows)
-    with_usage = sum(1 for r in rows if r.get("total_tokens") is not None)
-    with_cost = sum(1 for r in rows if r.get("cost_usd") is not None)
-    by_variant: dict[str, Any] = {}
-    by_runner: dict[str, Any] = {}
-    by_case: dict[str, Any] = {}
-    for row in rows:
-        for bucket, key in [(by_variant, row["variant"]), (by_runner, str(row.get("runner") or "unknown")), (by_case, row["case_id"])]:
-            slot = bucket.setdefault(key, {"runs": 0, "total_tokens": 0, "total_cost_usd": 0.0})
-            slot["runs"] += 1
-            if row.get("total_tokens") is not None:
-                slot["total_tokens"] += int(row["total_tokens"])
-            if row.get("cost_usd") is not None:
-                slot["total_cost_usd"] = round(slot["total_cost_usd"] + float(row["cost_usd"]), 6)
+    rows = discover_on_disk_run_rows(manifest, runs)
+    by_variant = group_spend(rows, lambda r: r["variant"])
+    by_runner = group_spend(rows, lambda r: str(r.get("runner") or "unknown"))
+    by_case = group_spend(rows, lambda r: r["case_id"])
     expensive_cases = sorted(by_case.items(), key=lambda kv: (-(kv[1]["total_cost_usd"] or 0), -kv[1]["total_tokens"], kv[0]))[:top_n]
-    ablation_spend: dict[str, Any] = {}
-    for row in rows:
-        if str(row["variant"]).startswith("ablation:"):
-            slot = ablation_spend.setdefault(row["variant"], {"runs": 0, "total_tokens": 0, "total_cost_usd": 0.0})
-            slot["runs"] += 1
-            if row.get("total_tokens") is not None:
-                slot["total_tokens"] += int(row["total_tokens"])
-            if row.get("cost_usd") is not None:
-                slot["total_cost_usd"] = round(slot["total_cost_usd"] + float(row["cost_usd"]), 6)
+    ablation_spend = group_spend([r for r in rows if is_ablation_variant(r["variant"])], lambda r: r["variant"])
     top_ablations = sorted(ablation_spend.items(), key=lambda kv: (-(kv[1]["total_cost_usd"] or 0), -kv[1]["total_tokens"], kv[0]))[:top_n]
     findings: list[dict[str, Any]] = []
     if benchmark_report:
@@ -7286,20 +7313,8 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
         "manifest": str(manifest_path),
         "skill_name": manifest.get("skill_name"),
         "runs_root": str(runs),
-        "coverage": {
-            "runs_seen": runs_seen,
-            "runs_with_token_usage": with_usage,
-            "runs_with_dollar_cost": with_cost,
-            "runs_missing_usage": runs_seen - with_usage,
-            "runs_missing_cost": runs_seen - with_cost,
-        },
-        "totals": {
-            "input_tokens": int(sum(r["input_tokens"] for r in rows if r.get("input_tokens") is not None)),
-            "output_tokens": int(sum(r["output_tokens"] for r in rows if r.get("output_tokens") is not None)),
-            "total_tokens": int(sum(r["total_tokens"] for r in rows if r.get("total_tokens") is not None)),
-            "total_cost_usd": round(sum(r["cost_usd"] for r in rows if r.get("cost_usd") is not None), 6),
-            "elapsed_ms_sum": int(sum(r["elapsed_ms"] for r in rows if r.get("elapsed_ms") is not None)),
-        },
+        "coverage": cost_coverage_block(rows),
+        "totals": cost_totals_block(rows),
         "by_variant": by_variant,
         "by_runner": by_runner,
         "by_case": by_case,
@@ -7517,7 +7532,13 @@ def suggest_cases(args: argparse.Namespace) -> int:
     for seed in seeds:
         candidate = dict(seed)
         if generate_cmd:
-            proc = subprocess.run(generate_cmd, shell=True, input=json.dumps(seed), text=True, capture_output=True, timeout=float(getattr(args, "timeout", 120)))
+            gen_timeout = float(getattr(args, "timeout", 120))
+            try:
+                proc = subprocess.run(generate_cmd, shell=True, input=json.dumps(seed), text=True, capture_output=True, timeout=gen_timeout)
+            except subprocess.TimeoutExpired:
+                candidate["generation_error"] = f"generator timed out after {gen_timeout:g}s"
+                candidates.append(candidate)
+                continue
             if proc.returncode == 0:
                 try:
                     candidate["generated"] = extract_json_object(proc.stdout)
@@ -8128,17 +8149,14 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
     total = 0
     for case in iter_cases(manifest, split):
         max_overlap, findings = 0.0, []
-        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
-            for variant in variants:
-                for run_number, base in discover_run_bases_under(model_root / variant):
-                    text, _ = read_output_base(base)
-                    if text is None:
-                        continue
-                    chk = contamination_check(case, text, manifest_dir=manifest_path.parent, n=n,
-                                              overlap_threshold=overlap_threshold, model_cutoff=model_cutoff)
-                    max_overlap = max(max_overlap, chk["overlap"])
-                    for f in chk["findings"]:
-                        findings.append({**f, "variant": variant, "run_number": run_number, **({"model": model_name} if model_name else {})})
+        for model_name, variant, run_number, _base, text, _path, _meta in discovered_run_units(runs, case, variants):
+            if text is None:
+                continue
+            chk = contamination_check(case, text, manifest_dir=manifest_path.parent, n=n,
+                                      overlap_threshold=overlap_threshold, model_cutoff=model_cutoff)
+            max_overlap = max(max_overlap, chk["overlap"])
+            for f in chk["findings"]:
+                findings.append({**f, "variant": variant, "run_number": run_number, **({"model": model_name} if model_name else {})})
         total += len(findings)
         if findings or max_overlap > 0:
             cases_out.append({"case_id": case["id"], "max_overlap": round(max_overlap, 4), "findings": findings})
@@ -8307,13 +8325,9 @@ def audit_manifest_report(
             cost = (cost_by_case.get(case_id) or {}).get("total_cost_usd") or 0
             if cost >= expensive_case_usd:
                 finding("high-cost-judge-only-case", "recommended", f"Case {case_id} cost ${cost} and is graded only by judge assertions; a deterministic/script oracle would make the spend verifiable.", cost_by_case.get(case_id))
-        ablation_spend: dict[str, float] = {}
-        for r in bench_report.get("results", []):
-            variant = str(r.get("variant", ""))
-            if variant.startswith("ablation:"):
-                cost_value = result_cost_facts(r).get("cost_usd")
-                if cost_value is not None:
-                    ablation_spend[variant] = round(ablation_spend.get(variant, 0.0) + cost_value, 6)
+        ablation_rows = [{**result_cost_facts(r), "variant": str(r.get("variant", ""))}
+                         for r in bench_report.get("results", []) if is_ablation_variant(r.get("variant", ""))]
+        ablation_spend = {variant: slot["total_cost_usd"] for variant, slot in group_spend(ablation_rows, lambda r: r["variant"]).items()}
         structured = {f"ablation:{a.get('id')}" for a in manifest.get("ablations", []) if any(isinstance(spec, dict) and spec.get("cases") and spec.get("assertions") for spec in a.get("expected_regressions", []))}
         for variant, spend_usd in sorted(ablation_spend.items()):
             if spend_usd >= expensive_case_usd and variant not in structured:
@@ -8722,14 +8736,21 @@ def _suite_python_command() -> list[str]:
     return [sys.executable, str(Path(__file__).resolve())]
 
 
-def _run_suite_command(cmd: list[str], *, cwd: Path, log_path: Path) -> dict[str, Any]:
+def _run_suite_command(cmd: list[str], *, cwd: Path, log_path: Path, timeout: int = DEFAULT_RUNNER_TIMEOUT_S) -> dict[str, Any]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
+    timed_out = False
     with log_path.open("w", encoding="utf-8") as log:
         log.write("$ " + " ".join(cmd) + "\n")
         log.flush()
-        proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=log, stderr=subprocess.STDOUT)
-    return {"cmd": cmd, "cwd": str(cwd), "log": str(log_path), "returncode": proc.returncode, "elapsed_ms": int((time.time() - start) * 1000)}
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            # The one timeout encoding (see run_argv_with_timeout).
+            returncode, timed_out = 124, True
+            log.write(f"[suite command timed out after {timeout}s]\n")
+    return {"cmd": cmd, "cwd": str(cwd), "log": str(log_path), "returncode": returncode, "timed_out": timed_out, "elapsed_ms": int((time.time() - start) * 1000)}
 
 
 def _run_suite_tier(scope: dict[str, Any], out_dir: Path) -> list[dict[str, Any]]:
@@ -8944,7 +8965,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run-jetty")
     p.add_argument("--payloads", required=True)
     p.add_argument("--out")
-    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
     p.add_argument("--poll-interval", type=float, default=5)
     p.add_argument("--concurrency", type=int, default=1, help="reserved; current implementation runs sequentially")
     p.add_argument("--dry-run", action="store_true")
@@ -8966,14 +8987,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--codex-cmd", default="codex exec --json", help="shell command that reads prompt on stdin and emits Codex JSONL")
-    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-claude", help="run prepared tasks through `claude -p --output-format json`, capturing cost/usage")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="claude model id (e.g. claude-haiku-4-5-20251001); omit for the CLI default")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
-    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
@@ -8981,7 +9002,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
     p.add_argument("--agent-cmd", help="shell command reading {prompt, model, workspace} JSON on stdin and emitting {answer, trace?, usage?} JSON on stdout")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable for the default backend")
-    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
     p.add_argument("--tool-replay", choices=sorted(TOOL_REPLAY_MODES), help=f"tool replay mode; defaults from ${TOOL_REPLAY_ENV} (off)")
 
     p = sub.add_parser("grade")

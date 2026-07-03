@@ -858,7 +858,7 @@ python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```
 
-The test suite covers repeated runs, artifact outputs, answer-key omission, leakage lint, script assertions, judge-command parsing, Anthropic export shape, Jetty export/import, trace normalization, variant-scoped process assertions, Codex JSONL runs, Pi trigger traces, and Pi smoke workspace isolation — plus the roadmap features (`test_roadmap_features.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), and the executable doc-reference guard (`test_doc_refs.py`).
+The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics (`test_stats.py`), runner adapters (`test_runners.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus two executable drift guards: doc code references (`test_doc_refs.py`) and shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`). Shared fixture builders live in `tests/helpers.py`.
 
 ## Source checked
 

@@ -124,6 +124,22 @@ class EvidenceClass(str, Enum):
         return self is EvidenceClass.CONFIRMED_CAUSAL
 
 
+# The `ablation:<id>` variant-name encoding. These two helpers are the ONLY
+# reading of that prefix — every consumer (variant instructions, prepared rows,
+# cost ledgers, audits) routes through them instead of re-spelling
+# `variant.split(":", 1)[1]` inline (~14 copies before this owner existed).
+ABLATION_VARIANT_PREFIX = "ablation:"
+
+
+def is_ablation_variant(variant: Any) -> bool:
+    return str(variant).startswith(ABLATION_VARIANT_PREFIX)
+
+
+def ablation_id_of(variant: Any) -> str | None:
+    """The <id> of an `ablation:<id>` variant name, else None."""
+    return str(variant).split(":", 1)[1] if is_ablation_variant(variant) else None
+
+
 # The evidence label a whole autonomous-trigger REPORT carries. Per-row
 # measurements use EvidenceClass.RAW_MEASUREMENT; the report-level string names
 # the specific regime (single-arm autonomous trigger, no pairing). It lives here
@@ -393,7 +409,7 @@ class PreparedTask:
     # --- typed predicates: one definition each, shared by every exporter ---
     @property
     def is_ablation(self) -> bool:
-        return self.variant_truth.startswith("ablation:")
+        return is_ablation_variant(self.variant_truth)
 
     @property
     def is_materialized_ablation(self) -> bool:

@@ -187,54 +187,57 @@ class CF2BaselineIsolation(unittest.TestCase):
             sb.WORKSPACE_BUILDERS.pop(leaky_name, None)
 
 
+def make_graded_repo(root: Path) -> tuple[Path, Path]:
+    """A graded fixture repo + runs tree. Module-level so CF4 never instantiates CF3 to borrow it."""
+    repo = root / "repo"
+    (repo / "skill").mkdir(parents=True)
+    (repo / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8")
+    (repo / "evals").mkdir()
+    manifest = {
+        "version": 1,
+        "skill_name": "demo",
+        "skill_paths": ["skill/SKILL.md"],
+        "variants": ["with_skill", "without_skill"],
+        "cases": [{
+            "id": "case-1",
+            "split": "tune",
+            "kind": "behavior",
+            "prompt": "Say alpha, run pytest, stay under budget.",
+            "assertions": [
+                {"name": "has-alpha", "type": "contains", "value": "alpha"},
+                {"name": "ran-tests", "type": "command_ran", "pattern": "pytest"},
+                {"name": "token-budget", "type": "total_tokens_le", "max": 1000},
+            ],
+        }],
+        "ablations": [],
+    }
+    manifest_path = repo / "evals" / "shared-benchmark.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    runs = root / "runs"
+    outputs = {
+        "with_skill": ["alpha beta", "alpha only"],
+        "without_skill": ["no match here", "alpha maybe"],
+    }
+    for variant, texts in outputs.items():
+        for i, text in enumerate(texts, 1):
+            base = runs / "case-1" / variant / f"run-{i}"
+            base.mkdir(parents=True)
+            (base / "output.md").write_text(text, encoding="utf-8")
+            (base / "metadata.json").write_text(json.dumps({"total_tokens": 500 + i, "elapsed_ms": 1000 * i}), encoding="utf-8")
+            (base / "events.json").write_text(json.dumps({"schema_version": 1, "source": "fixture", "events": [{"type": "command", "command": "python -m pytest -q", "status": "completed"}]}), encoding="utf-8")
+    return manifest_path, runs
+
+
 class CF3RegradeIdempotence(unittest.TestCase):
     """CF.3: grading reads only from disk and is deterministic — the same run
     directory grades to a byte-identical benchmark report (modulo the explicit
     generated_at timestamp), so the cheap re-grade workflow rests on fact."""
 
-    def make_graded_repo(self, root: Path) -> tuple[Path, Path]:
-        repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8")
-        (repo / "evals").mkdir()
-        manifest = {
-            "version": 1,
-            "skill_name": "demo",
-            "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [{
-                "id": "case-1",
-                "split": "tune",
-                "kind": "behavior",
-                "prompt": "Say alpha, run pytest, stay under budget.",
-                "assertions": [
-                    {"name": "has-alpha", "type": "contains", "value": "alpha"},
-                    {"name": "ran-tests", "type": "command_ran", "pattern": "pytest"},
-                    {"name": "token-budget", "type": "total_tokens_le", "max": 1000},
-                ],
-            }],
-            "ablations": [],
-        }
-        manifest_path = repo / "evals" / "shared-benchmark.json"
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        runs = root / "runs"
-        outputs = {
-            "with_skill": ["alpha beta", "alpha only"],
-            "without_skill": ["no match here", "alpha maybe"],
-        }
-        for variant, texts in outputs.items():
-            for i, text in enumerate(texts, 1):
-                base = runs / "case-1" / variant / f"run-{i}"
-                base.mkdir(parents=True)
-                (base / "output.md").write_text(text, encoding="utf-8")
-                (base / "metadata.json").write_text(json.dumps({"total_tokens": 500 + i, "elapsed_ms": 1000 * i}), encoding="utf-8")
-                (base / "events.json").write_text(json.dumps({"schema_version": 1, "source": "fixture", "events": [{"type": "command", "command": "python -m pytest -q", "status": "completed"}]}), encoding="utf-8")
-        return manifest_path, runs
 
     def test_grading_the_same_run_dir_twice_is_byte_identical(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest_path, runs = self.make_graded_repo(root)
+            manifest_path, runs = make_graded_repo(root)
             first = sb.build_benchmark_report(manifest_path, runs)
             second = sb.build_benchmark_report(manifest_path, runs)
         for report in (first, second):
@@ -258,8 +261,7 @@ class CF4NoModelNoNetworkGuard(unittest.TestCase):
     def test_core_grade_path_calls_no_subprocess_and_no_network(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            helper = CF3RegradeIdempotence()
-            manifest_path, runs = helper.make_graded_repo(root)
+            manifest_path, runs = make_graded_repo(root)
 
             def boom(*args, **kwargs):
                 raise AssertionError("core grade path attempted a subprocess or network call")
