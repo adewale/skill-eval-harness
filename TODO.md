@@ -185,6 +185,20 @@ These are tests of the harness, not a new eval suite; sequence them before the b
 - [ ] **Contamination perimeter (output side)** — still prompt-side only: output↔answer n-gram overlap, canary-GUID tripwire, `released_at`/cutoff gate. Lower priority for a pre-production skill-authoring harness.
 - [ ] **Judge robustness probes** — order-flip self-consistency and empty/master-key negative controls (need a live `--judge-cmd`; keep out of the core grade path like the other model-touching commands).
 
+## Post-#24 external-review gaps (Pydantic / Anthropic / OpenAI / Agent-as-a-Judge)
+
+Six gaps surfaced by an external-source review (see [`docs/academic-grounding.md`](docs/academic-grounding.md)),
+deduped against the awesome-evals follow-ups above — none is a dupe; only G3 is adjacent to the
+open "Judge robustness probes" item. Sequence:
+**G6** · **G4 → G1 → G3** (judge path, serialize) · **G5 → G2** (grade path, serialize).
+
+- [x] G6 Paired pass@k/pass^k lift — `reliability.paired_lift`: with−without delta on pass@k/pass^k, per case + pooled per shared k, sign-flip tested. The sliver of feature 5 (reliability) not merged.
+- [ ] G4 Schema-constrained judge output — validate the judge verdict against a canonical JSON schema (reuse `json_schema_errors`); surface-only default, `strict` opt-in.
+- [ ] G1 Run-dir / trajectory judge — feed an opt-in judge the run's normalized events/metrics + a denylisted artifact inventory (leakage guard mandatory); prompt-embedded only, tool-using follow-on held.
+- [ ] G3 Cross-judge consensus — ensemble ≥2 judge models into one verdict (reuse `merge_repeated_judge_rows`); coordinate the shared panel plumbing with judge-robustness-probes above.
+- [ ] G5 Capability/regression intent — per-case `eval_intent: capability|regression`; intent-aware saturation/no-lift/staleness and `--fail-on-blockers`.
+- [ ] G2 Assertion dependencies — `depends_on`; a failed prerequisite skips the dependent (out of every denominator and the critical veto), not a fresh failure.
+
 ## Punted — questionable value
 
 - [ ] Ship the harness as an agent-authoring skill *(TODO-native)*. Meta/self-referential, overlaps `docs/authoring-evals.md`, adds a packaging surface, narrow audience. Revisit only if external authors adopt the harness and ask for an agent-guided authoring path.

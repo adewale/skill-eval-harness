@@ -5253,6 +5253,33 @@ def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pa
     return paired_with_rates, paired_without_rates, negative_cases
 
 
+def _reliability_counts(rows: list[dict[str, Any]]) -> tuple[int, int]:
+    """(n, c) for one arm: n = scorable runs carrying an objective pass rate,
+    c = runs where every objective assertion passed. Identical predicate to
+    build_reliability (:build_reliability) so the paired counts line up with the
+    per-arm block above them."""
+    rates = [r.get("objective_pass_rate") for r in rows if r.get("objective_pass_rate") is not None]
+    return len(rates), sum(1 for x in rates if x >= 1.0 - 1e-12)
+
+
+def paired_case_counts(results: list[dict[str, Any]]) -> list[tuple[str, tuple[int, int], tuple[int, int]]]:
+    """Per-case paired (n, c) success counts for with_skill vs without_skill —
+    the integer companion to paired_case_rates. pass@k / pass^k need the raw
+    success count c, which a mean rate cannot recover, so this returns counts.
+    Same scorable-filtered grouping (ResultSet.by_case_variant) and success
+    predicate as build_reliability; a case is dropped unless both arms have at
+    least one scorable run."""
+    by_case_variant = ResultSet(results).by_case_variant()
+    pairs: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
+    for case_id, by_variant in sorted(by_case_variant.items()):
+        nw, cw = _reliability_counts(by_variant.get("with_skill", []))
+        nn, cn = _reliability_counts(by_variant.get("without_skill", []))
+        if nw == 0 or nn == 0:
+            continue
+        pairs.append((str(case_id), (nw, cw), (nn, cn)))
+    return pairs
+
+
 def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates: list[float], negative_cases: list[dict[str, Any]]) -> dict[str, Any]:
     with_rate = statistics.mean(paired_with_rates) if paired_with_rates else None
     without_rate = statistics.mean(paired_without_rates) if paired_without_rates else None
@@ -5320,6 +5347,76 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
             "delta": round(statistics.mean(graded_deltas), 4),
             "significance": sign_flip_significance(graded_deltas),
         }
+    if by_model:
+        out["by_model"] = by_model
+    return out
+
+
+def paired_reliability_block(pairs: list[tuple[str, tuple[int, int], tuple[int, int]]]) -> dict[str, Any]:
+    """with_skill − without_skill lift on pass@k / pass^k, per case and pooled
+    per shared k, with a sign-flip permutation p-value on the pass@1 delta.
+    pass@k lift answers "does the skill raise the ceiling (ever succeeds)",
+    pass^k lift "does it raise the reliability (always succeeds)". Sign
+    convention (with − without) matches paired_block_from_rates' absolute_delta."""
+    by_case: dict[str, Any] = {}
+    pass_at_1_deltas: list[float] = []
+    at_k_pool: dict[int, list[float]] = {}
+    hat_k_pool: dict[int, list[float]] = {}
+    for case_id, (nw, cw), (nn, cn) in pairs:
+        at_k_delta: dict[str, float] = {}
+        hat_k_delta: dict[str, float] = {}
+        # k only ranges over 1..min(n_w, n_n): a k neither arm can draw is undefined.
+        for k in range(1, min(nw, nn) + 1):
+            aw, an = pass_at_k(nw, cw, k), pass_at_k(nn, cn, k)
+            if aw is not None and an is not None:
+                at_k_delta[str(k)] = round(aw - an, 6)
+                at_k_pool.setdefault(k, []).append(aw - an)
+            hw, hn = pass_hat_k(nw, cw, k), pass_hat_k(nn, cn, k)
+            if hw is not None and hn is not None:
+                hat_k_delta[str(k)] = round(hw - hn, 6)
+                hat_k_pool.setdefault(k, []).append(hw - hn)
+        p1 = at_k_delta.get("1")
+        if p1 is not None:
+            pass_at_1_deltas.append(p1)
+        by_case[case_id] = {
+            "with_skill": {"n": nw, "c": cw},
+            "without_skill": {"n": nn, "c": cn},
+            "pass_at_1_delta": p1,
+            "pass_at_k_delta": at_k_delta,
+            "pass_hat_k_delta": hat_k_delta,
+        }
+    pooled = {
+        "cases": len(pairs),
+        "mean_pass_at_1_delta": round(statistics.mean(pass_at_1_deltas), 6) if pass_at_1_deltas else None,
+        # Pooled PER k (not one scalar): higher k thin out as run counts vary,
+        # so each k averages only over the cases that support it.
+        "mean_pass_at_k_delta": {str(k): round(statistics.mean(v), 6) for k, v in sorted(at_k_pool.items())},
+        "mean_pass_hat_k_delta": {str(k): round(statistics.mean(v), 6) for k, v in sorted(hat_k_pool.items())},
+        "significance": sign_flip_significance(pass_at_1_deltas),
+    }
+    return {"by_case": by_case, "pooled": pooled}
+
+
+def build_paired_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Paired pass@k / pass^k lift, mirroring build_paired_summary's (case, model)
+    pairing so by_model reliability lift lines up with paired_summary.by_model.
+    build_reliability scores each arm in isolation; this reports the with −
+    without delta the reliability block otherwise leaves the reader to compute."""
+    models = sorted({str(r.get("model")) for r in results if r.get("model")})
+    unlabeled = [r for r in results if not r.get("model")]
+    all_pairs: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
+    by_model: dict[str, dict[str, Any]] = {}
+    for model in models:
+        rows = [r for r in results if str(r.get("model")) == model]
+        pairs = paired_case_counts(rows)
+        by_model[model] = paired_reliability_block(pairs)
+        # Pool per-(case, model), tagging the case key so a case measured under
+        # several models does not collide in the pooled by_case view.
+        all_pairs.extend((f"{cid}@{model}", w, n) for (cid, w, n) in pairs)
+    if unlabeled or not models:
+        pool = unlabeled if models else results
+        all_pairs.extend(paired_case_counts(pool))
+    out = paired_reliability_block(all_pairs)
     if by_model:
         out["by_model"] = by_model
     return out
@@ -5988,7 +6085,7 @@ def build_benchmark_report(
         "paired_summary": paired_summary,
         # 5: pass@k / pass^k per (case, variant) from the repeated-run data, plus a
         # pooled per-variant reliability headline. Uses the unbiased estimator.
-        "reliability": build_reliability(results),
+        "reliability": {**build_reliability(results), "paired_lift": build_paired_reliability(results)},
         "model_analysis": model_analysis_from_paired(paired_summary),
         "slice_summary": build_slice_summary(results, variants),
         "ablation_regressions": ablation_regressions,
