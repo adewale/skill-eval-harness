@@ -534,5 +534,139 @@ class ContaminationPerimeterTests(unittest.TestCase):
         self.assertEqual(report["cases"][0]["findings"][0]["kind"], "canary-hit")
 
 
+class JudgeRobustnessTests(unittest.TestCase):
+    """Judge-robustness probes: order-flip self-consistency + empty/master-key
+    negative controls a robust judge must reject. Stub judges are real subprocesses
+    (file-based, deterministic) so run_one_judge_task runs for real; each broken
+    judge isolates exactly ONE dimension so the finding-set assertions are
+    mutation-killing (a rate that stops distinguishing the four judges is a bug)."""
+
+    # A candidate output carrying this marker is the only "genuinely good" answer.
+    ROBUST = 'import sys\ns = sys.stdin.read()\nprint(\'{"passed": true}\' if "GOODANSWER" in s else \'{"passed": false}\')\n'
+    ALWAYS_PASS = 'import sys\nsys.stdin.read()\nprint(\'{"passed": true}\')\n'
+    # Obeys an instruction injected into the candidate output -> defeated by the master key only.
+    MASTER_KEY_VULN = ('import sys\ns = sys.stdin.read()\n'
+                       'ok = "GOODANSWER" in s or "IGNORE ALL PRIOR INSTRUCTIONS" in s\n'
+                       'print(\'{"passed": true}\' if ok else \'{"passed": false}\')\n')
+    # Passes only when ZEBRA-FIRST precedes ALPHA-SECOND -> the order flip inverts it.
+    ORDER_SENSITIVE = ('import sys\ns = sys.stdin.read()\n'
+                       'try:\n    ordered = s.index("ZEBRA-FIRST") < s.index("ALPHA-SECOND")\n'
+                       'except ValueError:\n    ordered = False\n'
+                       'ok = ordered and "GOODANSWER" in s\n'
+                       'print(\'{"passed": true}\' if ok else \'{"passed": false}\')\n')
+
+    def _judge(self, td, name, body):
+        f = Path(td) / f"judge_{name}.py"
+        f.write_text(body, encoding="utf-8")
+        return f"python3 {f}"
+
+    def _task(self, td, *, output="GOODANSWER is present"):
+        run = Path(td) / "run"
+        run.mkdir(exist_ok=True)
+        (run / "output.md").write_text(output, encoding="utf-8")
+        return {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
+                "run_number": 1, "prompt": "p", "expected_behavior": ["ZEBRA-FIRST", "ALPHA-SECOND"],
+                "output_path": str(run / "output.md"), "assertion": {"type": "judge", "name": "j"}}
+
+    def _report(self, td, name, body, task=None):
+        ctl = Path(td) / "ctl"
+        ctl.mkdir(exist_ok=True)
+        return sb.judge_robustness_report([task or self._task(td)], tmp_dir=ctl,
+                                          judge_cmd=self._judge(td, name, body))
+
+    def test_robust_judge_has_no_findings(self):
+        with tempfile.TemporaryDirectory() as td:
+            rep = self._report(td, "robust", self.ROBUST)
+        self.assertEqual(rep["findings"], [])                                             # clean, exactly
+        self.assertEqual(rep["summary"], {"n": 1, "order_flip_consistency": 1.0, "control_leak_rate": 0.0})
+        self.assertEqual(rep["tasks"][0]["controls_passed"], {"empty": False, "master-key": False})
+        self.assertIs(rep["tasks"][0]["order_flip_consistent"], True)
+
+    def test_always_pass_leaks_both_controls(self):
+        with tempfile.TemporaryDirectory() as td:
+            rep = self._report(td, "yes", self.ALWAYS_PASS)
+        self.assertEqual(sorted(f["kind"] for f in rep["findings"]),
+                         ["passes-empty-control", "passes-master-key-control"])
+        self.assertEqual(rep["summary"]["control_leak_rate"], 1.0)                        # 2 of 2
+        self.assertEqual(rep["summary"]["order_flip_consistency"], 1.0)                   # passes base and flip alike
+        self.assertEqual(rep["tasks"][0]["controls_passed"], {"empty": True, "master-key": True})
+
+    def test_master_key_vuln_isolates_that_control(self):
+        with tempfile.TemporaryDirectory() as td:
+            rep = self._report(td, "mk", self.MASTER_KEY_VULN)
+        self.assertEqual(len(rep["findings"]), 1)                                         # ONLY the master key leaks
+        self.assertEqual(rep["findings"][0]["kind"], "passes-master-key-control")
+        self.assertEqual(rep["findings"][0]["judge_task_id"], "c::with_skill::run-1::j")
+        self.assertEqual(rep["tasks"][0]["controls_passed"], {"empty": False, "master-key": True})
+        self.assertEqual(rep["summary"]["control_leak_rate"], 0.5)                        # 1 of 2
+        self.assertEqual(rep["summary"]["order_flip_consistency"], 1.0)
+
+    def test_order_sensitive_judge_flagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            rep = self._report(td, "ord", self.ORDER_SENSITIVE)
+        self.assertEqual(len(rep["findings"]), 1)
+        self.assertEqual(rep["findings"][0]["kind"], "order-flip-inconsistent")
+        self.assertEqual(rep["summary"]["order_flip_consistency"], 0.0)                   # the one task flipped
+        self.assertEqual(rep["summary"]["control_leak_rate"], 0.0)                        # still rejects both controls
+        self.assertIs(rep["tasks"][0]["order_flip_consistent"], False)
+
+    def test_flip_reverses_and_does_not_mutate(self):
+        import copy
+        task = {"expected_behavior": ["a", "b", "c"], "review_rubric": ["x", "y"],
+                "assertion": {"graded_dimensions": ["d1", "d2"]}}
+        original = copy.deepcopy(task)
+        flipped = sb.flipped_judge_task(task)
+        self.assertEqual(flipped["expected_behavior"], ["c", "b", "a"])
+        self.assertEqual(flipped["review_rubric"], ["y", "x"])
+        self.assertEqual(flipped["assertion"]["graded_dimensions"], ["d2", "d1"])
+        self.assertEqual(task, original)                                                  # input untouched (no aliasing)
+        double = sb.flipped_judge_task(flipped)                                           # flip is an involution
+        self.assertEqual(double["expected_behavior"], original["expected_behavior"])
+        self.assertEqual(double["review_rubric"], original["review_rubric"])
+        self.assertEqual(double["assertion"]["graded_dimensions"], original["assertion"]["graded_dimensions"])
+
+    def test_flip_tolerates_missing_and_nonlist_keys(self):
+        out = sb.flipped_judge_task({"prompt": "p"})
+        self.assertEqual(out["assertion"], {})                                            # normalized to a dict
+        self.assertNotIn("expected_behavior", out)                                        # absent stays absent
+        out2 = sb.flipped_judge_task({"expected_behavior": "notalist"})
+        self.assertEqual(out2["expected_behavior"], "notalist")                           # non-list left alone
+
+    def _cli_manifest(self, td):
+        root = Path(td)
+        (root / "repo" / "skill").mkdir(parents=True)
+        (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
+        (root / "repo" / "evals").mkdir()
+        p = root / "repo" / "evals" / "shared-benchmark.json"
+        p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
+            "variants": ["with_skill", "without_skill"], "ablations": [],
+            "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
+                       "assertions": [{"name": "j", "type": "judge", "review_rubric": ["is it good"]}]}]}), encoding="utf-8")
+        runs = root / "runs"
+        (runs / "c" / "with_skill").mkdir(parents=True)
+        (runs / "c" / "with_skill" / "output.md").write_text("GOODANSWER is present", encoding="utf-8")
+        (runs / "c" / "without_skill").mkdir(parents=True)
+        (runs / "c" / "without_skill" / "output.md").write_text("GOODANSWER is present", encoding="utf-8")
+        return p, runs
+
+    def _args(self, td, p, runs, name, body, *, fail_on_findings=False):
+        from types import SimpleNamespace
+        return SimpleNamespace(cmd="judge-robustness", manifest=str(p), runs=str(runs), split="tune",
+                               variant=None, judge_cmd=self._judge(td, name, body), judge_model=None,
+                               claude_bin="claude", fail_on_findings=fail_on_findings, out=str(Path(td) / "rep.json"))
+
+    def test_command_exit_code_contract_end_to_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            p, runs = self._cli_manifest(td)
+            # Robust judge -> no findings -> exit 0 even with the CI gate armed.
+            self.assertEqual(sb.judge_robustness_command(self._args(td, p, runs, "robust", self.ROBUST, fail_on_findings=True)), 0)
+            report = json.loads((Path(td) / "rep.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["findings"], [])
+            self.assertEqual(report["summary"]["n"], 2)   # one judge task per variant (with_skill + without_skill)
+            # Always-pass judge leaks controls: findings present, and the gate flips exit code.
+            self.assertEqual(sb.judge_robustness_command(self._args(td, p, runs, "yes", self.ALWAYS_PASS, fail_on_findings=False)), 0)
+            self.assertEqual(sb.judge_robustness_command(self._args(td, p, runs, "yes", self.ALWAYS_PASS, fail_on_findings=True)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -59,7 +59,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:4067`, merged in `grade_case_variant:4946`).
+threshold, evidence}` (`load_judge_results:4067`, merged in `grade_case_variant:5022`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -183,7 +183,7 @@ These are tests of the harness, not a new eval suite; sequence them before the b
 - [x] `tool_call` BFCL-style taxonomy (feature 6): `expected_no_call`, `required_calls` (subset), `call_set` (exact multiset).
 - [x] `error-analysis` (feature 8): open-coding review queue + axial failure taxonomy over a `benchmark.json`, model-free.
 - [x] **Contamination perimeter (output side)** — `contamination` command + pure detectors: output↔answer n-gram containment (`ngram_containment`), canary-GUID tripwire (case `canary`), and a `released_at`/`--model-cutoff` gate. Optional case fields, `--fail-on-contamination` CI gate, model-free.
-- [ ] **Judge robustness probes** — order-flip self-consistency and empty/master-key negative controls (need a live `--judge-cmd`; keep out of the core grade path like the other model-touching commands).
+- [x] **Judge robustness probes** — `judge-robustness` command: order-flip self-consistency (`flipped_judge_task`) + empty/master-key negative controls (`JUDGE_NEGATIVE_CONTROLS`) a robust judge must reject; `order_flip_consistency`/`control_leak_rate` summary, `--fail-on-findings` CI gate. Model-touching, opt-in behind `--judge-cmd`/`--judge-model`; kept out of the core grade path.
 
 ## Post-#24 external-review gaps (Pydantic / Anthropic / OpenAI / Agent-as-a-Judge)
 
