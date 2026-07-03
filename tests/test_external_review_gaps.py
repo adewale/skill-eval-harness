@@ -102,5 +102,93 @@ class VerdictSchemaTests(unittest.TestCase):
             sb.validate_manifest(write(None))                                   # absent is fine
 
 
+class CapabilityRegressionIntentTests(unittest.TestCase):
+    """G5 — per-case eval_intent makes saturation/no-lift/staleness intent-aware."""
+
+    @staticmethod
+    def _rows(case_id, intent, w, n):
+        return [
+            {"case_id": case_id, "variant": "with_skill", "objective_pass_rate": w, "combined_pass_rate": w, "eval_intent": intent},
+            {"case_id": case_id, "variant": "without_skill", "objective_pass_rate": n, "combined_pass_rate": n, "eval_intent": intent},
+        ]
+
+    def _write_manifest(self, td, cases):
+        root = Path(td)
+        (root / "repo" / "skill").mkdir(parents=True, exist_ok=True)
+        (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
+        (root / "repo" / "evals").mkdir(exist_ok=True)
+        p = root / "repo" / "evals" / "shared-benchmark.json"
+        p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
+                                 "variants": ["with_skill", "without_skill"], "cases": cases, "ablations": []}), encoding="utf-8")
+        return p
+
+    def _case(self, cid, intent=None, value="y"):
+        c = {"id": cid, "split": "tune", "kind": "behavior", "prompt": "x",
+             "assertions": [{"name": "a", "type": "contains", "value": value}]}
+        if intent is not None:
+            c["eval_intent"] = intent
+        return c
+
+    def test_validate_enum(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(self._write_manifest(td, [self._case("c", "bogus")]))
+            for good in ("capability", "regression", None):
+                sb.validate_manifest(self._write_manifest(td, [self._case("c", good)]))
+
+    def test_result_rows_carry_intent_end_to_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write_manifest(td, [self._case("reg", "regression", "alpha"), self._case("cap", None, "alpha")])
+            runs = Path(td) / "runs"
+            for cid in ("reg", "cap"):
+                for variant in ("with_skill", "without_skill"):
+                    base = runs / cid / variant
+                    base.mkdir(parents=True)
+                    (base / "output.md").write_text("alpha", encoding="utf-8")
+            report = sb.build_benchmark_report(p, runs)
+        intent = {r["case_id"]: r.get("eval_intent") for r in report["results"]}
+        self.assertEqual(intent["reg"], "regression")
+        self.assertEqual(intent["cap"], "capability")   # default when untagged
+
+    def test_readiness_splits_saturation_by_intent(self):
+        report = {"results": self._rows("cap", "capability", 1.0, 1.0) + self._rows("reg", "regression", 1.0, 1.0)}
+        sig = sb.readiness_run_signals(report)
+        self.assertIn("cap", sig["base_saturated_cases"])
+        self.assertIn("reg", sig["base_saturated_expected_cases"])
+        self.assertNotIn("reg", sig["base_saturated_cases"])
+
+    def test_eval_readiness_regression_guard_not_a_blocker(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write_manifest(td, [self._case("reg", "regression")])
+            m = sb.validate_manifest(p)
+            readiness = sb.eval_readiness(m, p, benchmark_report={"results": self._rows("reg", "regression", 1.0, 1.0)})
+        self.assertIn("reg", readiness["regression_guards_holding"])
+        self.assertNotIn("reg", readiness["base_saturated_cases"])
+        self.assertFalse(any("base-saturated" in b for b in readiness["blockers"]))
+
+    def test_eval_readiness_capability_saturation_blocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write_manifest(td, [self._case("cap")])
+            m = sb.validate_manifest(p)
+            readiness = sb.eval_readiness(m, p, benchmark_report={"results": self._rows("cap", "capability", 1.0, 1.0)})
+        self.assertIn("cap", readiness["base_saturated_cases"])
+        self.assertTrue(any("base-saturated" in b for b in readiness["blockers"]))
+
+    def test_stale_exempts_regression_guard(self):
+        rep = {"results": self._rows("cap", "capability", 1.0, 1.0) + self._rows("reg", "regression", 1.0, 1.0)}
+        ids = {c["case_id"] for c in sb.stale_case_candidates([rep, rep])}
+        self.assertIn("cap", ids)          # all-green capability probe -> prune candidate
+        self.assertNotIn("reg", ids)       # all-green regression guard -> exempt
+
+    def test_suggest_exempts_regression_guard(self):
+        report = {"case_flags": [{"case_id": "cap", "flags": ["saturated/non-discriminating"]},
+                                 {"case_id": "reg", "flags": ["saturated/non-discriminating"]}]}
+        manifest = {"cases": [{"id": "cap", "prompt": "p", "assertions": []},
+                              {"id": "reg", "prompt": "p", "assertions": [], "eval_intent": "regression"}]}
+        ids = {s["case_id"] for s in sb.suggest_case_candidates(report, manifest)}
+        self.assertIn("cap", ids)
+        self.assertNotIn("reg", ids)
+
+
 if __name__ == "__main__":
     unittest.main()

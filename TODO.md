@@ -59,7 +59,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:4012`, merged in `grade_case_variant:4772`).
+threshold, evidence}` (`load_judge_results:4015`, merged in `grade_case_variant:4775`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -196,7 +196,7 @@ open "Judge robustness probes" item. Sequence:
 - [x] G4 Schema-constrained judge output — `verdict_schema_for` + post-hoc `json_schema_errors` gate; `report` default (byte-identical), `--strict-judge-schema` / `judge.schema_enforcement` opt-in; `extract_json_object` kept as fallback.
 - [ ] G1 Run-dir / trajectory judge — feed an opt-in judge the run's normalized events/metrics + a denylisted artifact inventory (leakage guard mandatory); prompt-embedded only, tool-using follow-on held.
 - [ ] G3 Cross-judge consensus — ensemble ≥2 judge models into one verdict (reuse `merge_repeated_judge_rows`); coordinate the shared panel plumbing with judge-robustness-probes above.
-- [ ] G5 Capability/regression intent — per-case `eval_intent: capability|regression`; intent-aware saturation/no-lift/staleness and `--fail-on-blockers`.
+- [x] G5 Capability/regression intent — per-case `eval_intent`; regression guards route to `regression_guards_holding` (never a blocker), exempt from staleness/suggest, saturated/no-lift findings suppressed. Optional, defaults to `capability`.
 - [ ] G2 Assertion dependencies — `depends_on`; a failed prerequisite skips the dependent (out of every denominator and the critical veto), not a fresh failure.
 
 ## Punted — questionable value

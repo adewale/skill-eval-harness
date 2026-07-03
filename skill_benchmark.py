@@ -517,6 +517,9 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         split = case.get("split")
         if split not in VALID_SPLITS:
             die(f"{cid}: split must be one of {sorted(VALID_SPLITS)}")
+        eval_intent = case.get("eval_intent")
+        if eval_intent is not None and eval_intent not in {"capability", "regression"}:
+            die(f"{cid}: eval_intent must be 'capability' or 'regression'")
         turns = case.get("turns")
         if turns is not None:
             if not isinstance(turns, list) or not turns:
@@ -4918,6 +4921,9 @@ def grade_case_variant(
         "difficulty": case.get("difficulty"),
         "trigger_type": case.get("trigger_type"),
         "success_goals": case.get("success_goals", []),
+        # G5: capability (default) vs regression intent. A regression guard's
+        # saturation / no-lift is the intended steady state, not a blocker.
+        "eval_intent": case.get("eval_intent", "capability"),
         "variant": variant,
         "run_number": run_number,
         # The model axis (roadmap 2.1): the run-layout model segment wins;
@@ -6077,7 +6083,7 @@ def build_benchmark_report(
         if floor_hits:
             flags.append(f"below-reference-floor: {', '.join(floor_hits)}")
         if flags:
-            case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate, "without_skill": n_rate})
+            case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate, "without_skill": n_rate, "eval_intent": ws_rows[0].get("eval_intent", "capability")})
 
     # 1.7: per case, how much of the pass rate rests on strong oracles. A case
     # passing mostly on demo/live tiers looks solid while resting on weak checks.
@@ -6996,12 +7002,14 @@ def stale_case_candidates(reports: list[dict[str, Any]], *, min_runs: int = 2) -
     (with == without == 1.0 every time) is a prune CANDIDATE. The harness
     suggests, never deletes — and a single run never flags anything."""
     observations: dict[str, list[tuple[float, float]]] = {}
+    intent: dict[str, str] = {}
     for report in reports:
         by_case: dict[str, dict[str, list[float]]] = {}
         for r in report.get("results", []):
             rate = r.get("objective_pass_rate")
             if rate is None or r.get("variant") not in {"with_skill", "without_skill"}:
                 continue
+            intent.setdefault(r["case_id"], r.get("eval_intent", "capability"))
             by_case.setdefault(r["case_id"], {}).setdefault(r["variant"], []).append(rate)
         for case_id, arms in by_case.items():
             if "with_skill" in arms and "without_skill" in arms:
@@ -7009,6 +7017,9 @@ def stale_case_candidates(reports: list[dict[str, Any]], *, min_runs: int = 2) -
                     (statistics.mean(arms["with_skill"]), statistics.mean(arms["without_skill"])))
     candidates = []
     for case_id, pairs in sorted(observations.items()):
+        # G5: a regression guard is MEANT to stay green — never a prune candidate.
+        if intent.get(case_id) == "regression":
+            continue
         if len(pairs) < min_runs:
             continue
         if all(w == 1.0 and n == 1.0 for w, n in pairs):
@@ -7057,6 +7068,9 @@ def suggest_case_candidates(report: dict[str, Any], manifest: dict[str, Any]) ->
         if not reasons:
             continue
         case = cases.get(flag.get("case_id"), {})
+        # G5: a saturated regression guard is not a hardening seed.
+        if case.get("eval_intent") == "regression":
+            continue
         seeds.append({
             "case_id": flag.get("case_id"),
             "flags": reasons,
@@ -7509,10 +7523,12 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
                          this skill useless (the anti-slop case)."""
     obj: dict[Any, dict[str, list]] = {}
     comb: dict[Any, dict[str, list]] = {}
+    intent: dict[Any, str] = {}
     for r in benchmark_report.get("results", []) or []:
         if not scorable_run(r):
             continue
         cid, v = r.get("case_id"), r.get("variant")
+        intent.setdefault(cid, r.get("eval_intent", "capability"))
         if r.get("objective_pass_rate") is not None:
             obj.setdefault(cid, {}).setdefault(v, []).append(r["objective_pass_rate"])
         cr = r.get("combined_pass_rate")
@@ -7523,19 +7539,21 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
             cr = statistics.mean(blended) if blended else r.get("objective_pass_rate")
         if cr is not None:
             comb.setdefault(cid, {}).setdefault(v, []).append(cr)
-    base_saturated, qualitative_only = [], []
+    base_saturated, base_saturated_expected, qualitative_only = [], [], []
     for cid, cv in comb.items():
         cw, cn = _mean_or_none(cv.get("with_skill")), _mean_or_none(cv.get("without_skill"))
         if cw is None or cn is None:
             continue
         if abs(cw - cn) <= eps:
-            base_saturated.append(cid)
+            # G5: a saturated regression guard is holding (expected), not a blocker.
+            (base_saturated_expected if intent.get(cid) == "regression" else base_saturated).append(cid)
             continue
         ow = _mean_or_none(obj.get(cid, {}).get("with_skill"))
         on = _mean_or_none(obj.get(cid, {}).get("without_skill"))
         if ow is not None and on is not None and abs(ow - on) <= eps and cw > cn + eps:
             qualitative_only.append(cid)
     return {"base_saturated_cases": sorted(base_saturated, key=str),
+            "base_saturated_expected_cases": sorted(base_saturated_expected, key=str),
             "qualitative_only_cases": sorted(qualitative_only, key=str)}
 
 
@@ -7593,7 +7611,7 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
     # blocker (a case that measures nothing is wasted budget); qualitative_only is a
     # warning that the case's signal lives entirely in the judge, so an
     # objective-only reading would miss it.
-    run = readiness_run_signals(benchmark_report) if benchmark_report else {"base_saturated_cases": [], "qualitative_only_cases": []}
+    run = readiness_run_signals(benchmark_report) if benchmark_report else {"base_saturated_cases": [], "base_saturated_expected_cases": [], "qualitative_only_cases": []}
     if run["base_saturated_cases"]:
         blockers.append(f"{len(run['base_saturated_cases'])} case(s) are base-saturated (measured with_skill == without_skill) — they cannot measure the skill; cut or harden them")
     return {
@@ -7604,6 +7622,9 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
         "judge_only_cases": judge_only,
         "base_saturated_cases": run["base_saturated_cases"],
         "qualitative_only_cases": run["qualitative_only_cases"],
+        # G5: regression guards that saturated are the intended steady state —
+        # surfaced, but never a blocker (so --fail-on-blockers stays green).
+        "regression_guards_holding": run["base_saturated_expected_cases"],
         "blockers": blockers,
     }
 
@@ -7710,9 +7731,9 @@ def audit_manifest_report(
         benchmark_summary = {"summary": report["summary"], "case_flags": report["case_flags"]}
         for flag in report["case_flags"]:
             for f in flag.get("flags", []):
-                if "saturated" in f:
+                if "saturated" in f and flag.get("eval_intent") != "regression":
                     finding("saturated-eval", "recommended", f"Case {flag['case_id']} is saturated/non-discriminating.", flag)
-                elif "no objective lift" in f:
+                elif "no objective lift" in f and flag.get("eval_intent") != "regression":
                     finding("no-lift-eval", "recommended", f"Case {flag['case_id']} shows no objective lift.", flag)
                 elif "flaky" in f:
                     finding("flaky-eval", "required", f"Case {flag['case_id']} has repeated-run variance.", flag)
@@ -7895,6 +7916,8 @@ def audit_manifest(args: argparse.Namespace) -> int:
         if rd.get("base_saturated_cases") or rd.get("qualitative_only_cases"):
             lines.append(f"- measured signals: base-saturated (with==without): {len(rd.get('base_saturated_cases',[]))}   "
                          f"qualitative-only (judge carries the lift): {len(rd.get('qualitative_only_cases',[]))}")
+        if rd.get("regression_guards_holding"):
+            lines.append(f"- regression guards holding (expected steady-state green): {len(rd.get('regression_guards_holding',[]))}")
         if rd.get("blockers"):
             lines.append("- **blockers before a paid run:**")
             for b in rd["blockers"]:
