@@ -2,6 +2,8 @@
 test_followup_features.py beside the reliability tests; G4 onward are here. All
 deterministic, no live model or network."""
 import json
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -666,6 +668,154 @@ class JudgeRobustnessTests(unittest.TestCase):
             # Always-pass judge leaks controls: findings present, and the gate flips exit code.
             self.assertEqual(sb.judge_robustness_command(self._args(td, p, runs, "yes", self.ALWAYS_PASS, fail_on_findings=False)), 0)
             self.assertEqual(sb.judge_robustness_command(self._args(td, p, runs, "yes", self.ALWAYS_PASS, fail_on_findings=True)), 1)
+
+
+class ToolUsingJudgeTests(unittest.TestCase):
+    """G1 follow-on — the opt-in tool-using judge explores a SANITIZED copy of the
+    run dir. The security invariant is safety-by-CONSTRUCTION: the oracle is never
+    copied, so a filesystem-reading judge cannot read the answer key. The keystone
+    test proves that through the real run_one_judge_task path with a stub judge that
+    lists the directory it was actually given."""
+
+    ORACLE = {"grading.json": '{"answer": "BLOCK"}', "answer_key.txt": "BLOCK",
+              "rubric.md": "grade on X", "expected.json": "{}", "GOLD.txt": "g"}
+    LEGIT = {"output.md": "the candidate answer", "events.json": '{"events": []}',
+             "metrics.json": '{"total_tokens": 9}', "poster.html": "<html>", "notes.txt": "scratch"}
+
+    def _run_dir(self, td, *, nested=False):
+        run = Path(td) / "run"
+        run.mkdir()
+        for name, body in {**self.LEGIT, **self.ORACLE}.items():
+            (run / name).write_text(body, encoding="utf-8")
+        if nested:
+            (run / "sub").mkdir()
+            (run / "sub" / "answer_note.txt").write_text("BLOCK", encoding="utf-8")  # oracle, nested
+            (run / "sub" / "artifact.txt").write_text("keep me", encoding="utf-8")   # legit, nested
+            (run / "grading").mkdir()                                                # whole oracle dir
+            (run / "grading" / "key.txt").write_text("BLOCK", encoding="utf-8")
+        return run
+
+    # --- sanitized_run_copy: the safety-by-construction core ---
+    def test_copy_drops_every_oracle_keeps_legit_and_reserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            dest = sb.sanitized_run_copy(self._run_dir(td), Path(td) / "san")
+            present = {p.name for p in dest.iterdir()}
+        for oracle in self.ORACLE:
+            self.assertNotIn(oracle, present)        # KEYSTONE: no answer key / rubric on disk
+        for legit in self.LEGIT:
+            self.assertIn(legit, present)            # reserved files STAY (judge reads output.md etc.)
+
+    def test_copy_drops_oracle_in_nested_dirs(self):
+        with tempfile.TemporaryDirectory() as td:
+            dest = sb.sanitized_run_copy(self._run_dir(td, nested=True), Path(td) / "san")
+            self.assertTrue((dest / "sub" / "artifact.txt").exists())        # legit nested file kept
+            self.assertFalse((dest / "sub" / "answer_note.txt").exists())    # oracle nested file dropped
+            self.assertFalse((dest / "grading").exists())                    # whole oracle dir dropped
+
+    def test_copy_returns_none_when_run_base_absent(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertIsNone(sb.sanitized_run_copy(Path(td) / "missing", Path(td) / "san"))
+
+    # --- prompt hint: additive, byte-identical when off, never names the oracle ---
+    def test_prompt_byte_identical_when_off_and_carries_dir_when_on(self):
+        task = {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
+                "run_number": 1, "prompt": "p", "assertion": {"type": "judge", "name": "j"}}
+        off = sb.judge_prompt(task, "out")
+        self.assertEqual(off, sb.judge_prompt(task, "out", explore_dir=None))   # None -> unchanged
+        self.assertNotIn("explore", off.lower())
+        on = sb.judge_prompt(task, "out", explore_dir="/tmp/san/run")
+        self.assertIn("/tmp/san/run", on)
+        self.assertIn("read-only tools", on)
+        self.assertIn("NOT present", on)                                       # tells the judge the oracle is absent
+        # Composes with the trajectory hint without clobbering it.
+        both = sb.judge_prompt(task, "out", trajectory=[{"type": "tool_call"}], explore_dir="/tmp/san/run")
+        self.assertIn("trajectory", both)
+        self.assertIn("/tmp/san/run", both)
+
+    def _stub_claude(self, td):
+        """A fake `claude`: records the argv + a listing of the --add-dir it was handed
+        to a probe.json beside itself, then emits a passing verdict envelope."""
+        stub = Path(td) / "claude_stub.py"
+        body = ('#!/usr/bin/env python3\n'
+                'import sys, json, os\n'
+                'argv = sys.argv[1:]\n'
+                '_ = sys.stdin.read()\n'
+                'add_dir = None\n'
+                'for i, a in enumerate(argv):\n'
+                '    if a == "--add-dir" and i + 1 < len(argv): add_dir = argv[i+1]\n'
+                'seen = sorted(os.listdir(add_dir)) if add_dir and os.path.isdir(add_dir) else []\n'
+                'probe = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "probe.json")\n'
+                'json.dump({"argv": argv, "add_dir": add_dir, "seen": seen}, open(probe, "w"))\n'
+                'verdict = json.dumps({"passed": True, "score": 5, "rationale": "explored"})\n'
+                'env = {"type": "result", "result": verdict, "total_cost_usd": 0.01,\n'
+                '       "usage": {"input_tokens": 1, "output_tokens": 1}}\n'
+                'sys.stdout.write(json.dumps(env))\n')
+        stub.write_text(body, encoding="utf-8")
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return stub
+
+    def _task(self, run):
+        return {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
+                "run_number": 1, "prompt": "p", "run_base": str(run),
+                "output_path": str(run / "output.md"), "assertion": {"type": "judge", "name": "j"}}
+
+    def _tmp_explore_dirs(self):
+        return {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("judge-explore-")}
+
+    def test_explore_end_to_end_sanitizes_and_arms_readonly_tools(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            stub = self._stub_claude(td)
+            before = self._tmp_explore_dirs()
+            row = sb.run_one_judge_task(self._task(run), judge_model="m", claude_bin=str(stub), explore=True)
+            probe = json.loads((Path(td) / "probe.json").read_text(encoding="utf-8"))
+            after = self._tmp_explore_dirs()
+        self.assertTrue(row["passed"])                                     # verdict flows back unchanged
+        self.assertEqual(row["score"], 5)
+        self.assertIn("--add-dir", probe["argv"])                          # tools were armed
+        self.assertIn("--allowedTools", probe["argv"])
+        self.assertEqual(probe["argv"][probe["argv"].index("--allowedTools") + 1], "Read,Grep,Glob,LS")
+        self.assertIn("output.md", probe["seen"])                          # judge saw the real output...
+        for oracle in self.ORACLE:
+            self.assertNotIn(oracle, probe["seen"])                        # ...but NEVER the answer key
+        self.assertEqual(after, before)                                    # the scratch copy was cleaned up
+
+    def test_explore_off_arms_no_tools_and_no_add_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            stub = self._stub_claude(td)
+            row = sb.run_one_judge_task(self._task(run), judge_model="m", claude_bin=str(stub), explore=False)
+            probe = json.loads((Path(td) / "probe.json").read_text(encoding="utf-8"))
+        self.assertTrue(row["passed"])
+        self.assertIsNone(probe["add_dir"])                                # off -> no directory handed over
+        self.assertNotIn("--add-dir", probe["argv"])                       # byte-identical invocation
+
+    def test_explore_is_inert_on_shell_judge_cmd(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            vf = Path(td) / "verdict.json"
+            vf.write_text(json.dumps({"passed": True}), encoding="utf-8")
+            # explore=True but a shell judge_cmd (no judge_model): no copy built, no crash.
+            row = sb.run_one_judge_task(self._task(run), judge_cmd=f"cat {vf}", explore=True)
+        self.assertTrue(row["passed"])
+
+    def test_command_rejects_explore_with_shell_judge_cmd(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "skill").mkdir(parents=True)
+            (root / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
+            p = root / "shared-benchmark.json"
+            p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
+                "variants": ["with_skill", "without_skill"], "ablations": [],
+                "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
+                           "assertions": [{"name": "a", "type": "contains", "value": "y"}]}]}), encoding="utf-8")
+            args = SimpleNamespace(manifest=str(p), runs=str(root / "runs"), split=None, variant=None,
+                                   judge_cmd="cat x", judge_model=None, judge_panel=None, claude_bin="claude",
+                                   judge_runs=1, strict_judge_schema=False, judge_trajectory=False,
+                                   judge_explore=True, quorum=None, transcripts=None, out=None)
+            with self.assertRaises(SystemExit):
+                sb.judge_command(args)
 
 
 if __name__ == "__main__":

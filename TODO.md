@@ -59,7 +59,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:4067`, merged in `grade_case_variant:5022`).
+threshold, evidence}` (`load_judge_results:4067`, merged in `grade_case_variant:5075`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -194,7 +194,7 @@ open "Judge robustness probes" item. Sequence:
 
 - [x] G6 Paired pass@k/pass^k lift — `reliability.paired_lift`: with−without delta on pass@k/pass^k, per case + pooled per shared k, sign-flip tested. The sliver of feature 5 (reliability) not merged.
 - [x] G4 Schema-constrained judge output — `verdict_schema_for` + post-hoc `json_schema_errors` gate; `report` default (byte-identical), `--strict-judge-schema` / `judge.schema_enforcement` opt-in; `extract_json_object` kept as fallback.
-- [x] G1 Run-dir / trajectory judge — `--judge-trajectory` feeds the judge normalized events/metrics + a denylisted artifact inventory (`judge_artifact_inventory` excludes grading.json / answer-key / rubric / reserved files); byte-identical when off; prompt-embedded only, tool-using follow-on held.
+- [x] G1 Run-dir / trajectory judge — `--judge-trajectory` feeds the judge normalized events/metrics + a denylisted artifact inventory (`judge_artifact_inventory` excludes grading.json / answer-key / rubric / reserved files); byte-identical when off. Tool-using follow-on landed: `--judge-explore` lets a native judge explore a SANITIZED copy of the run dir (`sanitized_run_copy` removes every oracle file by construction) with read-only tools (`JUDGE_EXPLORE_TOOLS`), so a filesystem-reading judge cannot read the answer key.
 - [x] G3 Cross-judge consensus — `merge_cross_judge_rows` folds a ≥2-model panel into one verdict (majority/median, `agreement` block, ties → `unresolved`/`--quorum`); `--judge-panel`/manifest `judge.panel` via `effective_judge_models`; panel cost summed once; guard checks every member. Distinct from compare-judges/judge-alignment; 1-member short-circuits unchanged.
 - [x] G5 Capability/regression intent — per-case `eval_intent`; regression guards route to `regression_guards_holding` (never a blocker), exempt from staleness/suggest, saturated/no-lift findings suppressed. Optional, defaults to `capability`.
 - [x] G2 Assertion dependencies — `depends_on` (validated: shape/target/uniqueness/cycle, rejected in turns); a failed/skipped prerequisite SKIPS the dependent out of every denominator + the critical veto (skip, not zero); transitive + deferred-qualitative via a fixed-point post-pass. Byte-identical when unused. Inline judge-call suppression landed (skips a resolved-failed dependent without emitting a judge task / running a script).

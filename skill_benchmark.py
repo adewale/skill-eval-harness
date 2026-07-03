@@ -4132,7 +4132,7 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
             "properties": {"passed": {"type": "boolean"}, "score": {"type": "number"}, "rationale": {"type": "string"}}}
 
 
-def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | None = None, metrics: dict | None = None, artifacts: list | None = None) -> str:
+def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | None = None, metrics: dict | None = None, artifacts: list | None = None, explore_dir: str | None = None) -> str:
     assertion = task.get("assertion", {})
     payload = {
         "judge_task_id": task.get("judge_task_id"),
@@ -4157,6 +4157,14 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
                     "and an `artifacts` inventory — weigh HOW the answer was produced (skill invoked? sensible "
                     "tools? no forbidden command?), not only candidate_output.\n"
                     if (trajectory is not None or metrics or artifacts) else "")
+    # G1 tool-using follow-on: invite exploration of a SANITIZED copy of the run dir.
+    # The grader's oracle is not on disk there (sanitized_run_copy removed it), so the
+    # judge cannot read the answer key even with read-only filesystem tools.
+    if explore_dir:
+        context_hint += (f"You MAY explore the run's working directory at `{explore_dir}` with read-only tools "
+                         "(Read/Grep/Glob/LS) to inspect the artifacts and intermediate files it produced. The "
+                         "grader's answer key and rubric are NOT present there — judge on the evidence you find, "
+                         "never a leaked oracle.\n")
     # G4: hand the model the exact schema the validator enforces (purely additive
     # instruction — the parse path is unchanged).
     schema_hint = "Your output MUST validate against this JSON Schema:\n" + json.dumps(verdict_schema_for(assertion)) + "\n\n"
@@ -4246,33 +4254,75 @@ def judge_artifact_inventory(run_base: Path) -> list[str]:
     return out
 
 
+# Read-only tools a tool-using judge may use to explore the run dir (G1 follow-on).
+# Deliberately no Write/Edit/Bash: the judge inspects, it never mutates or executes.
+JUDGE_EXPLORE_TOOLS = "Read,Grep,Glob,LS"
+
+
+def sanitized_run_copy(run_base: Path, dest: Path) -> Path | None:
+    """Safety-by-construction for the tool-using judge (G1 follow-on). Copies the
+    run dir to `dest` with every oracle file removed — anything whose name carries a
+    JUDGE_LEAK_MARKER (grading / answer / rubric / expected / gold), files AND
+    directories alike — so a judge exploring `dest` with read-only tools PHYSICALLY
+    cannot read the grader's answer key: the file is not on disk to be read. Unlike
+    judge_artifact_inventory, reserved files (output.md/events/metrics) STAY — a
+    tool-using judge legitimately reads them; only the oracle is withheld. Returns
+    dest, or None when run_base is absent (nothing to explore)."""
+    if not run_base or not run_base.exists():
+        return None
+
+    def ignore(_dirpath: str, names: list[str]) -> list[str]:
+        return [n for n in names if any(mk in n.lower() for mk in JUDGE_LEAK_MARKERS)]
+
+    shutil.copytree(run_base, dest, ignore=ignore)
+    return dest
+
+
 def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, transcripts_dir: Path | None = None,
-                       repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude", schema_enforcement: str = "report", include_trajectory: bool = False) -> dict[str, Any]:
+                       repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude", schema_enforcement: str = "report", include_trajectory: bool = False, explore: bool = False) -> dict[str, Any]:
     output_path = Path(task.get("output_path", ""))
     output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
+    run_base = Path(task.get("run_base", ""))
+    # G1 tool-using follow-on: an opt-in judge may EXPLORE a SANITIZED copy of the run
+    # dir (oracle files removed by construction) with read-only tools, rather than only
+    # reading a prompt-embedded trajectory. Native adapter only, and only when the run
+    # dir exists to copy. The copy — never the live run dir — is what the judge sees.
+    explore_root: Path | None = None
+    explore_dir: Path | None = None
+    extra_args: list[str] | None = None
+    if explore and judge_model and run_base.exists():
+        explore_root = Path(tempfile.mkdtemp(prefix="judge-explore-"))
+        explore_dir = sanitized_run_copy(run_base, explore_root / "run")
+        if explore_dir is not None:
+            extra_args = ["--add-dir", str(explore_dir), "--allowedTools", JUDGE_EXPLORE_TOOLS]
+    explore_hint = str(explore_dir) if explore_dir is not None else None
     if include_trajectory:
         # G1: hand the judge the same normalized trajectory the objective detectors
         # see, plus a denylisted artifact inventory (never the grader's answer key).
-        run_base = Path(task.get("run_base", ""))
         events, _ = read_events_base(run_base)
-        prompt = judge_prompt(task, output_text, trajectory=events, metrics=read_metrics_base(run_base), artifacts=judge_artifact_inventory(run_base))
+        prompt = judge_prompt(task, output_text, trajectory=events, metrics=read_metrics_base(run_base), artifacts=judge_artifact_inventory(run_base), explore_dir=explore_hint)
     else:
-        prompt = judge_prompt(task, output_text)
+        prompt = judge_prompt(task, output_text, explore_dir=explore_hint)
     # Two judge backends, one verdict shape. A shell `judge_cmd` (any provider), OR
     # the native Claude adapter when only `--judge-model` is given — the native path
     # captures the real dollar cost of judging, which a shell cmd can't report back.
     cost_usd = None
     judge_usage = None
-    if judge_cmd:
-        proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
-        stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
-    elif judge_model:
-        res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin)
-        stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
-        cost_usd = res.get("cost_usd")
-        judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
-    else:
-        raise ValueError("run_one_judge_task needs a judge_cmd or a judge_model")
+    try:
+        if judge_cmd:
+            proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
+            stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
+        elif judge_model:
+            res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin, extra_args=extra_args)
+            stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
+            cost_usd = res.get("cost_usd")
+            judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
+        else:
+            raise ValueError("run_one_judge_task needs a judge_cmd or a judge_model")
+    finally:
+        # The sanitized copy is scratch; the judge has already run against it.
+        if explore_root is not None:
+            shutil.rmtree(explore_root, ignore_errors=True)
     parsed: dict[str, Any]
     parse_error = None
     try:
@@ -4710,8 +4760,11 @@ def judge_command(args: argparse.Namespace) -> int:
     panel = effective_judge_models(manifest_for_judge, getattr(args, "judge_panel", None), getattr(args, "judge_model", None))
     schema_enforcement = "strict" if getattr(args, "strict_judge_schema", False) else ((manifest_for_judge.get("judge") or {}).get("schema_enforcement") or "report")
     include_trajectory = getattr(args, "judge_trajectory", False)
+    explore = getattr(args, "judge_explore", False)
     if not judge_cmd and not panel:
         die("judge needs --judge-cmd (any provider), --judge-model/--judge-panel, or a manifest judge.model default")
+    if explore and judge_cmd:
+        die("--judge-explore is for a native tool-using judge (the claude adapter); it can't combine with a shell --judge-cmd")
     claude_bin = getattr(args, "claude_bin", None) or "claude"
     tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
     transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
@@ -4729,7 +4782,7 @@ def judge_command(args: argparse.Namespace) -> int:
             if judge_cmd:
                 members = [merge_repeated_judge_rows([run_one_judge_task(task, judge_cmd, transcripts, i, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory) for i in range(1, repeat + 1)])]
             else:
-                members = [merge_repeated_judge_rows([run_one_judge_task(task, None, transcripts, i, judge_model=model, claude_bin=claude_bin, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory) for i in range(1, repeat + 1)]) for model in panel]
+                members = [merge_repeated_judge_rows([run_one_judge_task(task, None, transcripts, i, judge_model=model, claude_bin=claude_bin, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory, explore=explore) for i in range(1, repeat + 1)]) for model in panel]
             fh.write(json.dumps(merge_cross_judge_rows(members, quorum=quorum), ensure_ascii=False) + "\n")
     finally:
         if out:
@@ -8871,6 +8924,7 @@ def main() -> int:
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
     p.add_argument("--strict-judge-schema", action="store_true", help="fail a judge verdict whose JSON violates its canonical schema (default: surface violations in a schema_errors field only)")
     p.add_argument("--judge-trajectory", action="store_true", help="also give the judge the run's normalized trajectory (events/metrics) and a denylisted artifact inventory, not just the final output (G1)")
+    p.add_argument("--judge-explore", action="store_true", help="let a native tool-using judge explore a SANITIZED copy of the run dir (oracle files removed) with read-only tools (G1 follow-on; requires --judge-model/--judge-panel)")
     p.add_argument("--judge-panel", action="append", help="judge model for a consensus panel; repeat for >=2 to ensemble verdicts across judges (G3)")
     p.add_argument("--quorum", type=int, help="consensus: require k-of-n panel members to pass (default: strict majority; an even tie resolves to 'unresolved')")
     p.add_argument("--transcripts", help="directory for per-task prompt/stdout/stderr/result audit transcripts")
