@@ -4352,6 +4352,56 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return first
 
 
+def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = None) -> dict[str, Any]:
+    """G3: fold a PANEL of >=2 per-model verdicts (one per judge_model) into ONE
+    consensus verdict of the SAME shape, so the benchmark join is untouched.
+    Sibling of merge_repeated_judge_rows (which is WITHIN-judge); this is
+    ACROSS-model. `passed` = strict majority, `score` = median of members,
+    evidence joined. Even ties resolve to `unresolved` (passed=False) unless the
+    score median crosses the threshold or an explicit --quorum decides it — never
+    a silent coin-flip. Adds `agreement` (per-task inter-rater concordance, NOT a
+    per-report metric spread — that is compare_judges' job — and NOT accuracy vs
+    ground truth — that is judge_alignment's job). Panel cost is SUMMED onto the
+    single top row with members nested under judge_panel, so the judge ledger
+    reads one un-doubled line. len==1 returns the row unchanged (single-judge path
+    stays byte-identical)."""
+    if len(rows) == 1:
+        return rows[0]
+    n = len(rows)
+    concur = sum(1 for r in rows if r.get("passed"))
+    scores = [r.get("score") for r in rows if isinstance(r.get("score"), (int, float))]
+    median_score = statistics.median(scores) if scores else None
+    unresolved = False
+    if isinstance(quorum, int) and quorum > 0:
+        passed = concur >= quorum
+    elif concur * 2 > n:
+        passed = True
+    elif concur * 2 < n:
+        passed = False
+    else:
+        # Exact tie, no quorum: let the score median decide; else mark unresolved.
+        thr = rows[0].get("threshold", 1)
+        if median_score is not None and isinstance(thr, (int, float)):
+            passed = median_score >= thr
+        else:
+            passed, unresolved = False, True
+    out = dict(rows[0])
+    out["judge_model"] = "consensus"
+    out["judge_models"] = [r.get("judge_model") for r in rows]
+    out["passed"] = passed
+    if median_score is not None:
+        out["score"] = median_score
+    out["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
+    out["agreement"] = {"concur": concur, "n": n, "concur_fraction": round(concur / n, 4),
+                        "unanimous": concur in (0, n), "unresolved": unresolved}
+    member_cost = [r.get("cost_usd") for r in rows if isinstance(r.get("cost_usd"), (int, float))]
+    if member_cost:
+        out["cost_usd"] = sum(member_cost)
+        out["cost_normalized"] = normalize_cost(out["cost_usd"], source="provider_reported", pricing_model="consensus")
+    out["judge_panel"] = rows
+    return out
+
+
 def effective_judge_model(manifest: dict[str, Any], cli_model: str | None) -> str | None:
     """The judge config slot (roadmap 1.3): an explicit --judge-model wins;
     otherwise the manifest's judge.model is the declared default."""
@@ -4359,6 +4409,21 @@ def effective_judge_model(manifest: dict[str, Any], cli_model: str | None) -> st
         return cli_model
     configured = (manifest.get("judge") or {}).get("model")
     return str(configured) if configured else None
+
+
+def effective_judge_models(manifest: dict[str, Any], cli_panel: list[str] | None, cli_single: str | None = None) -> list[str]:
+    """G3: the ordered judge panel. Explicit --judge-panel wins, else a manifest
+    judge.panel (or judge.models) list, else the single judge (effective_judge_model)
+    as a 1-element panel — so a lone judge resolves to a 1-member panel and its
+    path is unchanged."""
+    if cli_panel:
+        return [str(m) for m in cli_panel]
+    cfg = manifest.get("judge") or {}
+    manifest_panel = cfg.get("panel") or cfg.get("models")
+    if isinstance(manifest_panel, list) and manifest_panel:
+        return [str(m) for m in manifest_panel]
+    single = effective_judge_model(manifest, cli_single)
+    return [single] if single else []
 
 
 TOOL_REPLAY_ENV = "SKILL_BENCHMARK_TOOL_REPLAY"
@@ -4563,11 +4628,11 @@ register_workspace_builder("subagent", codex_skill_workspace)   # run-subagent i
 def judge_command(args: argparse.Namespace) -> int:
     judge_cmd = getattr(args, "judge_cmd", None)
     manifest_for_judge = validate_manifest(Path(args.manifest))
-    judge_model = effective_judge_model(manifest_for_judge, getattr(args, "judge_model", None))
+    panel = effective_judge_models(manifest_for_judge, getattr(args, "judge_panel", None), getattr(args, "judge_model", None))
     schema_enforcement = "strict" if getattr(args, "strict_judge_schema", False) else ((manifest_for_judge.get("judge") or {}).get("schema_enforcement") or "report")
     include_trajectory = getattr(args, "judge_trajectory", False)
-    if not judge_cmd and not judge_model:
-        die("judge needs --judge-cmd (any provider), --judge-model, or a manifest judge.model default")
+    if not judge_cmd and not panel:
+        die("judge needs --judge-cmd (any provider), --judge-model/--judge-panel, or a manifest judge.model default")
     claude_bin = getattr(args, "claude_bin", None) or "claude"
     tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
     transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
@@ -4575,10 +4640,18 @@ def judge_command(args: argparse.Namespace) -> int:
     out = Path(args.out) if getattr(args, "out", None) else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
     try:
+        quorum = getattr(args, "quorum", None)
         for task in tasks:
-            rows = [run_one_judge_task(task, judge_cmd, transcripts, i, judge_model=judge_model, claude_bin=claude_bin, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory)
-                    for i in range(1, repeat + 1)]
-            fh.write(json.dumps(merge_repeated_judge_rows(rows), ensure_ascii=False) + "\n")
+            # Two-level merge (G3): repeat-merge kills within-judge noise per model;
+            # cross-judge consensus then folds the panel into one verdict per task.
+            # A shell --judge-cmd is one opaque judge (a 1-member panel); native
+            # --judge-model(s) form the panel. A 1-member panel short-circuits to
+            # the single-judge verdict unchanged.
+            if judge_cmd:
+                members = [merge_repeated_judge_rows([run_one_judge_task(task, judge_cmd, transcripts, i, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory) for i in range(1, repeat + 1)])]
+            else:
+                members = [merge_repeated_judge_rows([run_one_judge_task(task, None, transcripts, i, judge_model=model, claude_bin=claude_bin, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory) for i in range(1, repeat + 1)]) for model in panel]
+            fh.write(json.dumps(merge_cross_judge_rows(members, quorum=quorum), ensure_ascii=False) + "\n")
     finally:
         if out:
             fh.close()
@@ -7949,8 +8022,11 @@ def audit_manifest_report(
     # 1.3: the judge must not be the model under test. Compare the declared
     # judge model against the manifest's jetty.model and, when run data is
     # supplied, every model recorded in run metadata.
-    judge_model = str((manifest.get("judge") or {}).get("model") or "").strip()
-    if judge_model:
+    jcfg = manifest.get("judge") or {}
+    # G3: check the scalar judge.model AND every consensus panel member, so no
+    # judge in the panel grades a model that is also under test.
+    judge_models = [str(m).strip() for m in ([jcfg.get("model")] + list(jcfg.get("panel") or jcfg.get("models") or [])) if str(m or "").strip()]
+    if judge_models:
         under_test: set[str] = set()
         jetty_model = str((manifest.get("jetty") or {}).get("model") or "").strip()
         if jetty_model:
@@ -7960,13 +8036,14 @@ def audit_manifest_report(
                 meta_model = str((r.get("metadata") or {}).get("model") or "").strip()
                 if meta_model:
                     under_test.add(meta_model)
-        if judge_model in under_test:
-            finding(
-                "judge-is-model-under-test",
-                "required",
-                f"manifest.judge.model {judge_model!r} is also a model under test; a model grading its own output inflates qualitative scores. Use a different judge model (or pass --strict-judge in CI to make this fatal).",
-                sorted(under_test),
-            )
+        for jm in judge_models:
+            if jm in under_test:
+                finding(
+                    "judge-is-model-under-test",
+                    "required",
+                    f"judge model {jm!r} is also a model under test; a model grading its own output inflates qualitative scores. Use a different judge model (or pass --strict-judge in CI to make this fatal).",
+                    sorted(under_test),
+                )
 
     fixtures = fixture_recommendations(manifest)
     if fixtures:
@@ -8602,6 +8679,8 @@ def main() -> int:
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
     p.add_argument("--strict-judge-schema", action="store_true", help="fail a judge verdict whose JSON violates its canonical schema (default: surface violations in a schema_errors field only)")
     p.add_argument("--judge-trajectory", action="store_true", help="also give the judge the run's normalized trajectory (events/metrics) and a denylisted artifact inventory, not just the final output (G1)")
+    p.add_argument("--judge-panel", action="append", help="judge model for a consensus panel; repeat for >=2 to ensemble verdicts across judges (G3)")
+    p.add_argument("--quorum", type=int, help="consensus: require k-of-n panel members to pass (default: strict majority; an even tie resolves to 'unresolved')")
     p.add_argument("--transcripts", help="directory for per-task prompt/stdout/stderr/result audit transcripts")
     p.add_argument("--out")
 

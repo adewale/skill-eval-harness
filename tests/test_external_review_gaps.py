@@ -376,5 +376,86 @@ class AssertionDependenciesTests(unittest.TestCase):
         self.assertFalse(any(r.get("skipped") for r in result["assertions"]))
 
 
+class CrossJudgeConsensusTests(unittest.TestCase):
+    """G3 — merge_cross_judge_rows consensus + effective_judge_models panel."""
+
+    @staticmethod
+    def _row(model, passed, score=None, cost=None):
+        r = {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
+             "run_number": 1, "judge_model": model, "passed": passed, "threshold": 3, "evidence": f"{model}-ev"}
+        if score is not None:
+            r["score"] = score
+        if cost is not None:
+            r["cost_usd"] = cost
+        return r
+
+    def test_len1_shortcircuits_unchanged(self):
+        row = self._row("m1", True, 4)
+        self.assertIs(sb.merge_cross_judge_rows([row]), row)   # single-judge path stays byte-identical
+
+    def test_unanimous_pass_median_and_agreement(self):
+        out = sb.merge_cross_judge_rows([self._row("m1", True, 4), self._row("m2", True, 5), self._row("m3", True, 3)])
+        self.assertTrue(out["passed"])
+        self.assertEqual(out["score"], 4)                      # median(4,5,3)
+        self.assertEqual(out["judge_model"], "consensus")
+        self.assertEqual(out["judge_models"], ["m1", "m2", "m3"])
+        self.assertEqual(out["agreement"], {"concur": 3, "n": 3, "concur_fraction": 1.0, "unanimous": True, "unresolved": False})
+        self.assertEqual(len(out["judge_panel"]), 3)           # members nested
+        self.assertIn("m1-ev", out["evidence"])
+
+    def test_majority_and_minority(self):
+        maj = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5), self._row("m3", False, 1)])
+        self.assertTrue(maj["passed"])
+        self.assertEqual(maj["agreement"]["concur_fraction"], round(2 / 3, 4))
+        self.assertFalse(maj["agreement"]["unanimous"])
+        minr = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", False, 1), self._row("m3", False, 1)])
+        self.assertFalse(minr["passed"])
+
+    def test_even_tie_resolved_by_score_median(self):
+        # 2-2 split; median score 4 >= threshold 3 -> passed, not unresolved
+        out = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5),
+                                         self._row("m3", False, 3), self._row("m4", False, 3)])
+        self.assertTrue(out["passed"])
+        self.assertFalse(out["agreement"]["unresolved"])
+
+    def test_even_tie_without_scores_is_unresolved_not_coinflip(self):
+        out = sb.merge_cross_judge_rows([self._row("m1", True), self._row("m2", False)])
+        self.assertFalse(out["passed"])
+        self.assertTrue(out["agreement"]["unresolved"])        # explicit, never a silent coin-flip
+
+    def test_quorum_overrides_majority(self):
+        out = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5), self._row("m3", False, 1)], quorum=3)
+        self.assertFalse(out["passed"])                        # 2-of-3 pass, but quorum demands 3
+
+    def test_consensus_is_order_independent(self):
+        rows = [self._row("m1", True, 5), self._row("m2", False, 1), self._row("m3", True, 4)]
+        a = sb.merge_cross_judge_rows(list(rows))
+        b = sb.merge_cross_judge_rows(list(reversed(rows)))
+        self.assertEqual((a["passed"], a["score"], a["agreement"]["concur"], a["agreement"]["unanimous"]),
+                         (b["passed"], b["score"], b["agreement"]["concur"], b["agreement"]["unanimous"]))
+
+    def test_cost_is_panel_summed_once(self):
+        out = sb.merge_cross_judge_rows([self._row("m1", True, 5, cost=0.10), self._row("m2", True, 5, cost=0.20)])
+        self.assertAlmostEqual(out["cost_usd"], 0.30)          # summed on the top row, not double-counted
+
+    def test_effective_judge_models_precedence(self):
+        self.assertEqual(sb.effective_judge_models({}, ["a", "b"], "x"), ["a", "b"])                       # cli panel wins
+        self.assertEqual(sb.effective_judge_models({"judge": {"panel": ["p1", "p2"]}}, None, None), ["p1", "p2"])
+        self.assertEqual(sb.effective_judge_models({"judge": {"models": ["q1"]}}, None, None), ["q1"])
+        self.assertEqual(sb.effective_judge_models({"judge": {"model": "solo"}}, None, None), ["solo"])    # scalar -> 1-member
+        self.assertEqual(sb.effective_judge_models({}, None, "cli"), ["cli"])
+        self.assertEqual(sb.effective_judge_models({}, None, None), [])
+
+    def test_consensus_row_joins_like_a_single_verdict(self):
+        jassert = {"name": "j", "type": "judge", "severity": "gate"}
+        jid = sb.judge_task_id("c", "with_skill", 1, sb.expand_judge_preset(jassert))
+        consensus = sb.merge_cross_judge_rows([{**self._row("m1", True, 5), "judge_task_id": jid},
+                                               {**self._row("m2", True, 5), "judge_task_id": jid}])
+        case = {"id": "c", "split": "tune", "kind": "behavior", "assertions": [jassert]}
+        result, _ = sb.grade_case_variant(case, "with_skill", "x", Path("o.md"), {}, judge_results={jid: consensus})
+        self.assertEqual(len(result["qualitative_assertions"]), 1)                 # exactly one merged verdict per jid
+        self.assertEqual((result["qualitative_total"], result["qualitative_passed"]), (1, 1))
+
+
 if __name__ == "__main__":
     unittest.main()
