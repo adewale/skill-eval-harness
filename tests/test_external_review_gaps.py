@@ -101,7 +101,13 @@ class VerdictSchemaTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 sb.validate_manifest(write({"schema_enforcement": "loose"}))   # invalid enum rejected
             sb.validate_manifest(write({"schema_enforcement": "strict"}))       # valid accepted
+            sb.validate_manifest(write({"schema_enforcement": "report"}))       # the documented default, also accepted
             sb.validate_manifest(write(None))                                   # absent is fine
+            # G3 panel activation surface (judge.panel / judge.models) is validated too.
+            sb.validate_manifest(write({"panel": ["m1", "m2"]}))                # good panel accepted
+            for bad in ({"panel": []}, {"panel": ["m1", 2]}, {"models": "solo"}, {"models": [""]}):
+                with self.assertRaises(SystemExit):
+                    sb.validate_manifest(write(bad))
 
 
 class CapabilityRegressionIntentTests(unittest.TestCase):
@@ -207,6 +213,7 @@ class TrajectoryJudgeTests(unittest.TestCase):
         (run / "poster.html").write_text("<html>", encoding="utf-8")     # legit artifact
         (run / "notes.txt").write_text("scratch", encoding="utf-8")      # legit artifact
         (run / "grading.json").write_text(json.dumps({"answer": "BLOCK"}), encoding="utf-8")  # PLANTED oracle
+        (run / "result.json").write_text(json.dumps({"passed": True}), encoding="utf-8")      # a PRIOR judge verdict
         for name, body in (extra or {}).items():
             (run / name).write_text(body, encoding="utf-8")
         return run
@@ -222,8 +229,8 @@ class TrajectoryJudgeTests(unittest.TestCase):
         self.assertIn("poster.html", inv)
         self.assertIn("notes.txt", inv)
         self.assertNotIn("grading.json", inv)   # KEYSTONE: never leak the grader's answer key
-        for reserved in ("output.md", "events.json", "metrics.json"):
-            self.assertNotIn(reserved, inv)      # rides its own payload key
+        for reserved in ("output.md", "events.json", "metrics.json", "result.json"):
+            self.assertNotIn(reserved, inv)      # rides its own payload key (result.json is a prior verdict)
 
     def test_inventory_denylists_answer_and_rubric_names(self):
         with tempfile.TemporaryDirectory() as td:
@@ -247,6 +254,11 @@ class TrajectoryJudgeTests(unittest.TestCase):
             prompt = sb.judge_prompt(task, "the answer", trajectory=events,
                                      metrics=sb.read_metrics_base(run), artifacts=sb.judge_artifact_inventory(run))
         self.assertIn("trajectory", prompt)
+        # The EVENTS must reach the payload, not merely the hint word "trajectory": the
+        # hint says "tool-call" (hyphen); the event value "tool_call" (underscore) plus
+        # the tool name "Read" only appear when the events themselves are embedded.
+        self.assertIn("tool_call", prompt)
+        self.assertIn('"name": "Read"', prompt)
         self.assertIn("poster.html", prompt)       # inventory embedded
         self.assertIn("total_tokens", prompt)       # metrics embedded
         self.assertNotIn("grading.json", prompt)    # oracle filename never embedded
@@ -388,6 +400,40 @@ class AssertionDependenciesTests(unittest.TestCase):
         self.assertEqual(len(tasks), 0)
         jdep = next(r for r in result["qualitative_assertions"] if r["name"] == "jdep")
         self.assertTrue(jdep["skipped"])
+        self.assertEqual(result["qualitative_total"], 0)      # skipped judge dependent drops out of the qual denominator
+
+    def test_forward_reference_to_preset_prerequisite_resolves_both_orders(self):
+        # A preset prerequisite's row name is rewritten (-> "factuality") while depends_on
+        # targets the author's label ("grounded"). A forward reference (dependent listed
+        # first) must STILL skip, not spuriously veto. Regression for the order-dependent
+        # bug: the post-pass keyed row_by_label on the emitted name, missing the preset.
+        A = {"type": "factuality", "description": "grounded"}
+        B = {"name": "B", "type": "contains", "value": "ZZZ_absent", "depends_on": "grounded", "critical": True}
+        jid = sb.judge_task_id("c", "with_skill", 1, sb.expand_judge_preset(A))
+        verdict = {jid: {"judge_task_id": jid, "passed": False, "score": 1}}
+        for order, assertions in (("in_order", [A, B]), ("forward", [B, A])):
+            result, _ = self._grade(assertions, judge_results=verdict)
+            skipped = {r.get("name") for r in result["assertions"] if r.get("skipped")}
+            self.assertEqual(skipped, {"B"}, order)            # dependent skipped in BOTH orders
+            self.assertFalse(result.get("vetoed"), order)      # never a spurious critical veto
+            self.assertEqual(result["skipped_total"], 1, order)
+
+    def test_reverse_order_transitive_chain_needs_fixed_point(self):
+        # c->b->a declared in REVERSE: resolving c needs b resolved first, so one pass is
+        # insufficient — the fixed-point loop must iterate. (test_transitive_skip declares
+        # in dependency order, which the inline short-circuit alone would satisfy.)
+        result, _ = self._grade([{"name": "c", "type": "contains", "value": "alpha", "depends_on": "b"},
+                                 {"name": "b", "type": "contains", "value": "alpha", "depends_on": "a"},
+                                 {"name": "a", "type": "contains", "value": "zzz"}])   # a FAILS
+        self.assertEqual({r["name"] for r in result["assertions"] if r.get("skipped")}, {"b", "c"})
+        self.assertEqual(result["objective_total"], 1)   # only a counts
+        self.assertEqual(result["skipped_total"], 2)
+
+    def test_skipped_soft_dependent_excluded_from_soft_total(self):
+        result, _ = self._grade([{"name": "pre", "type": "contains", "value": "zzz"},   # FAIL
+                                 {"name": "s", "type": "contains", "value": "alpha", "severity": "soft", "depends_on": "pre"}])
+        self.assertEqual(result["soft_total"], 0)   # skipped soft dependent drops out of the soft denominator
+        self.assertEqual({r["name"] for r in result["assertions"] if r.get("skipped")}, {"s"})
 
 
 class CrossJudgeConsensusTests(unittest.TestCase):
@@ -470,6 +516,42 @@ class CrossJudgeConsensusTests(unittest.TestCase):
         self.assertEqual(len(result["qualitative_assertions"]), 1)                 # exactly one merged verdict per jid
         self.assertEqual((result["qualitative_total"], result["qualitative_passed"]), (1, 1))
 
+    def test_consensus_score_is_median_not_mean(self):
+        # [5,5,1]: median 5 vs mean ~3.67 -> pins median; a mean mutation would show 3.67.
+        out = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5), self._row("m3", False, 1)])
+        self.assertEqual(out["score"], 5)
+
+    def test_even_tie_with_scores_but_no_threshold_is_unresolved(self):
+        # a bare raw-score panel (no calibrated threshold) must NOT pass on the default-1
+        # fallback (median >= 1 is ~always true) — it resolves to unresolved.
+        row = lambda m, p, s: {"judge_task_id": "j", "judge_model": m, "passed": p, "score": s, "evidence": "e"}
+        out = sb.merge_cross_judge_rows([row("m1", True, 3), row("m2", False, 2)])   # no threshold key
+        self.assertFalse(out["passed"])
+        self.assertTrue(out["agreement"]["unresolved"])
+
+    def test_quorum_exactly_met_passes(self):
+        out = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5), self._row("m3", False, 1)], quorum=2)
+        self.assertTrue(out["passed"])                         # concur == quorum passes (>=, not >)
+
+    def test_even_tie_median_equals_threshold_passes(self):
+        # 2-2 tie, all scores 3, threshold 3 -> median == threshold -> passed via >=.
+        out = sb.merge_cross_judge_rows([self._row("m1", True, 3), self._row("m2", True, 3),
+                                         self._row("m3", False, 3), self._row("m4", False, 3)])
+        self.assertTrue(out["passed"])
+        self.assertFalse(out["agreement"]["unresolved"])
+
+    def test_even_tie_median_below_threshold_fails_but_resolved(self):
+        # median 2 < threshold 3 -> passed False, but RESOLVED (the median decided), not unresolved.
+        out = sb.merge_cross_judge_rows([self._row("m1", True, 2), self._row("m2", True, 2),
+                                         self._row("m3", False, 2), self._row("m4", False, 2)])
+        self.assertFalse(out["passed"])
+        self.assertFalse(out["agreement"]["unresolved"])
+
+    def test_all_fail_panel_is_unanimous(self):
+        out = sb.merge_cross_judge_rows([self._row("m1", False, 1), self._row("m2", False, 1)])
+        self.assertTrue(out["agreement"]["unanimous"])         # concur == 0 is unanimous too, not just concur == n
+        self.assertFalse(out["passed"])
+
 
 class ContaminationPerimeterTests(unittest.TestCase):
     """Output-side contamination perimeter: canary tripwire, output<->answer n-gram
@@ -504,6 +586,35 @@ class ContaminationPerimeterTests(unittest.TestCase):
         self.assertTrue(any(f["kind"] == "released-before-cutoff" for f in sb.contamination_check(case, "x", model_cutoff="2025-01")["findings"]))
         self.assertFalse(any(f["kind"] == "released-before-cutoff" for f in sb.contamination_check(case, "x", model_cutoff="2024-01")["findings"]))
 
+    def test_released_at_numeric_not_lexicographic(self):
+        # "2024-6" <= "2024-12" is FALSE as strings ('6' > '1') though June precedes December;
+        # the gate must order by date. Mixed precision: a mid-month release vs a month cutoff.
+        hit = lambda rel, cut: any(f["kind"] == "released-before-cutoff"
+                                   for f in sb.contamination_check({"id": "c", "released_at": rel}, "x", model_cutoff=cut)["findings"])
+        self.assertTrue(hit("2024-6", "2024-12"))       # was a false-negative under string compare
+        self.assertTrue(hit("2024-06-15", "2024-06"))   # released inside the cutoff month -> flagged
+        self.assertFalse(hit("2025-06", "2024-01"))     # clearly after the cutoff -> not flagged
+
+    def test_released_at_equal_to_cutoff_flags(self):
+        # docstring says "at/before" -> the == boundary must fire.
+        case = {"id": "c", "released_at": "2024-06"}
+        self.assertTrue(any(f["kind"] == "released-before-cutoff"
+                            for f in sb.contamination_check(case, "x", model_cutoff="2024-06")["findings"]))
+
+    def test_cutoff_key_precision_and_unparseable(self):
+        self.assertEqual(sb.cutoff_key("2024", end=False), (2024, 1, 1))
+        self.assertEqual(sb.cutoff_key("2024", end=True), (2024, 12, 31))
+        self.assertEqual(sb.cutoff_key("2024-06", end=False), (2024, 6, 1))
+        self.assertEqual(sb.cutoff_key("2024-06-15", end=True), (2024, 6, 15))
+        self.assertIsNone(sb.cutoff_key("not-a-date", end=False))     # unparseable -> gate no-ops
+
+    def test_overlap_at_exact_threshold_flags(self):
+        # overlap exactly == threshold must fire (>=, not >): answer has two 2-grams, output has one.
+        case = {"id": "c", "expected_behavior": ["a b c"]}
+        r = sb.contamination_check(case, "a b", n=2, overlap_threshold=0.5)
+        self.assertEqual(r["overlap"], 0.5)
+        self.assertTrue(any(f["kind"] == "output-answer-overlap" for f in r["findings"]))
+
     def _manifest(self, td, case_extra):
         root = Path(td)
         (root / "repo" / "skill").mkdir(parents=True)
@@ -519,6 +630,12 @@ class ContaminationPerimeterTests(unittest.TestCase):
     def test_validate_rejects_non_string_canary(self):
         with tempfile.TemporaryDirectory() as td:
             _, p = self._manifest(td, {"canary": 123})
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(p)
+
+    def test_validate_rejects_non_string_released_at(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, p = self._manifest(td, {"released_at": 123})
             with self.assertRaises(SystemExit):
                 sb.validate_manifest(p)
 
@@ -745,7 +862,7 @@ class ToolUsingJudgeTests(unittest.TestCase):
                 '    if a == "--add-dir" and i + 1 < len(argv): add_dir = argv[i+1]\n'
                 'seen = sorted(os.listdir(add_dir)) if add_dir and os.path.isdir(add_dir) else []\n'
                 'probe = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "probe.json")\n'
-                'json.dump({"argv": argv, "add_dir": add_dir, "seen": seen}, open(probe, "w"))\n'
+                'json.dump({"argv": argv, "add_dir": add_dir, "seen": seen, "cwd": os.getcwd()}, open(probe, "w"))\n'
                 'verdict = json.dumps({"passed": True, "score": 5, "rationale": "explored"})\n'
                 'env = {"type": "result", "result": verdict, "total_cost_usd": 0.01,\n'
                 '       "usage": {"input_tokens": 1, "output_tokens": 1}}\n'
@@ -778,6 +895,10 @@ class ToolUsingJudgeTests(unittest.TestCase):
         self.assertIn("output.md", probe["seen"])                          # judge saw the real output...
         for oracle in self.ORACLE:
             self.assertNotIn(oracle, probe["seen"])                        # ...but NEVER the answer key
+        # The judge runs WITH the sanitized copy as cwd — not the repo root, which holds
+        # the live oracle. Read/Grep with no path would otherwise range over the repo.
+        self.assertIn("judge-explore-", probe["cwd"])
+        self.assertNotEqual(probe["cwd"], os.getcwd())
         self.assertEqual(after, before)                                    # the scratch copy was cleaned up
 
     def test_explore_off_arms_no_tools_and_no_add_dir(self):
@@ -789,6 +910,37 @@ class ToolUsingJudgeTests(unittest.TestCase):
         self.assertTrue(row["passed"])
         self.assertIsNone(probe["add_dir"])                                # off -> no directory handed over
         self.assertNotIn("--add-dir", probe["argv"])                       # byte-identical invocation
+        self.assertEqual(probe["cwd"], os.getcwd())                        # off -> inherits cwd unchanged (cwd=None)
+
+    def test_copy_drops_innocent_named_symlink_to_oracle(self):
+        # KEYSTONE: copytree(symlinks=False) dereferences a link, copying the target's
+        # CONTENT under the link's name — an oracle smuggled past the name denylist.
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            os.symlink(run / "grading.json", run / "notes_link.txt")   # innocent name -> oracle
+            os.symlink(Path(td) / "outside_secret.txt", run / "data.txt")  # escapes run_base
+            (Path(td) / "outside_secret.txt").write_text("EXFIL", encoding="utf-8")
+            dest = sb.sanitized_run_copy(run, Path(td) / "san")
+            present = {p.name for p in dest.iterdir()}
+        self.assertNotIn("notes_link.txt", present)                    # link to grading.json not followed
+        self.assertNotIn("data.txt", present)                          # link escaping run_base not followed
+        self.assertIn("output.md", present)                            # real files still copied
+
+    def test_explore_skipped_when_run_base_missing(self):
+        # A task with no run_base must NOT resolve to '.' (repo root) and copy it.
+        with tempfile.TemporaryDirectory() as td:
+            stub = self._stub_claude(td)
+            task = {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
+                    "run_number": 1, "prompt": "p", "output_path": str(Path(td) / "missing.md"),
+                    "assertion": {"type": "judge", "name": "j"}}   # NO run_base key
+            before = self._tmp_explore_dirs()
+            row = sb.run_one_judge_task(task, judge_model="m", claude_bin=str(stub), explore=True)
+            probe = json.loads((Path(td) / "probe.json").read_text(encoding="utf-8"))
+            after = self._tmp_explore_dirs()
+        self.assertTrue(row["passed"])
+        self.assertIsNone(probe["add_dir"])          # no run dir -> no copy, no --add-dir over the repo
+        self.assertEqual(probe["cwd"], os.getcwd())  # and no stray cwd change
+        self.assertEqual(after, before)
 
     def test_explore_is_inert_on_shell_judge_cmd(self):
         with tempfile.TemporaryDirectory() as td:

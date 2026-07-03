@@ -493,6 +493,13 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             die("manifest.judge.model must be a non-empty string")
         if "schema_enforcement" in judge_cfg and judge_cfg.get("schema_enforcement") not in ("report", "strict"):
             die('manifest.judge.schema_enforcement must be "report" or "strict"')
+        # A manifest panel (judge.panel / judge.models) activates cross-judge consensus
+        # (G3) with no CLI flag, so validate its shape like every other activation field.
+        for pfield in ("panel", "models"):
+            if pfield in judge_cfg and (not isinstance(judge_cfg.get(pfield), list)
+                                        or not judge_cfg.get(pfield)
+                                        or not all(isinstance(m, str) and m for m in judge_cfg[pfield])):
+                die(f"manifest.judge.{pfield} must be a non-empty list of non-empty model-name strings")
     datasets = manifest.get("datasets")
     if datasets is not None:
         if not isinstance(datasets, dict):
@@ -3618,7 +3625,7 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
 
 
 def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str = "claude",
-                      timeout: int = 1800, extra_args: list[str] | None = None) -> dict[str, Any]:
+                      timeout: int = 1800, extra_args: list[str] | None = None, cwd: str | None = None) -> dict[str, Any]:
     """Single owner for invoking Claude via `claude -p`. Returns the parsed
     envelope plus returncode/elapsed_ms/stderr. `claude_bin` is an executable path
     (tests inject a stub that emits a canned envelope), NOT a shell string — so
@@ -3630,7 +3637,7 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
         argv += list(extra_args)
     started = time.time()
     try:
-        proc = subprocess.run(argv, input=prompt, text=True, capture_output=True, timeout=timeout)
+        proc = subprocess.run(argv, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=cwd)
     except subprocess.TimeoutExpired as exc:
         return {"answer": "", "cost_usd": None, "usage": {}, "parse_error": None,
                 "returncode": None, "timed_out": True, "elapsed_ms": int((time.time() - started) * 1000),
@@ -4266,13 +4273,21 @@ def sanitized_run_copy(run_base: Path, dest: Path) -> Path | None:
     directories alike — so a judge exploring `dest` with read-only tools PHYSICALLY
     cannot read the grader's answer key: the file is not on disk to be read. Unlike
     judge_artifact_inventory, reserved files (output.md/events/metrics) STAY — a
-    tool-using judge legitimately reads them; only the oracle is withheld. Returns
-    dest, or None when run_base is absent (nothing to explore)."""
+    tool-using judge legitimately reads them; only the oracle is withheld. Symlinks
+    are dropped entirely: copytree with the default symlinks=False DEREFERENCES a
+    link, copying the target's CONTENT into `dest` under the link's (possibly
+    innocent) name, which would smuggle an oracle past the name denylist — so a link
+    named 'notes.txt' -> grading.json must never be followed. Returns dest, or None
+    when run_base is absent (nothing to explore)."""
     if not run_base or not run_base.exists():
         return None
 
-    def ignore(_dirpath: str, names: list[str]) -> list[str]:
-        return [n for n in names if any(mk in n.lower() for mk in JUDGE_LEAK_MARKERS)]
+    def ignore(dirpath: str, names: list[str]) -> list[str]:
+        dropped = [n for n in names if any(mk in n.lower() for mk in JUDGE_LEAK_MARKERS)]
+        # A symlink can deref to an oracle under an innocent name (copytree follows it
+        # by default), so never carry one into the copy.
+        dropped += [n for n in names if n not in dropped and os.path.islink(os.path.join(dirpath, n))]
+        return dropped
 
     shutil.copytree(run_base, dest, ignore=ignore)
     return dest
@@ -4282,21 +4297,28 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
                        repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude", schema_enforcement: str = "report", include_trajectory: bool = False, explore: bool = False) -> dict[str, Any]:
     output_path = Path(task.get("output_path", ""))
     output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
-    run_base = Path(task.get("run_base", ""))
+    # A task without an explicit run_base has no run dir to inspect. Do NOT let an
+    # empty path resolve to '.' — that is the repo root, which holds the live oracle
+    # (runs/<case>/<variant>/grading.json). Both the trajectory and explore paths
+    # require a real run_base; absent one, they degrade to output-only.
+    rb = task.get("run_base")
+    run_base = Path(rb) if rb else None
+    has_run_base = run_base is not None and run_base.exists()
     # G1 tool-using follow-on: an opt-in judge may EXPLORE a SANITIZED copy of the run
     # dir (oracle files removed by construction) with read-only tools, rather than only
     # reading a prompt-embedded trajectory. Native adapter only, and only when the run
-    # dir exists to copy. The copy — never the live run dir — is what the judge sees.
+    # dir exists to copy. The copy — never the live run dir — is what the judge sees,
+    # and the judge is run WITH the copy as cwd so its tools can't range over the repo.
     explore_root: Path | None = None
     explore_dir: Path | None = None
     extra_args: list[str] | None = None
-    if explore and judge_model and run_base.exists():
+    if explore and judge_model and has_run_base:
         explore_root = Path(tempfile.mkdtemp(prefix="judge-explore-"))
         explore_dir = sanitized_run_copy(run_base, explore_root / "run")
         if explore_dir is not None:
             extra_args = ["--add-dir", str(explore_dir), "--allowedTools", JUDGE_EXPLORE_TOOLS]
     explore_hint = str(explore_dir) if explore_dir is not None else None
-    if include_trajectory:
+    if include_trajectory and has_run_base:
         # G1: hand the judge the same normalized trajectory the objective detectors
         # see, plus a denylisted artifact inventory (never the grader's answer key).
         events, _ = read_events_base(run_base)
@@ -4313,7 +4335,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
             proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
             stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
         elif judge_model:
-            res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin, extra_args=extra_args)
+            res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin, extra_args=extra_args, cwd=explore_hint)
             stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
             cost_usd = res.get("cost_usd")
             judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
@@ -4432,8 +4454,11 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
     elif concur * 2 < n:
         passed = False
     else:
-        # Exact tie, no quorum: let the score median decide; else mark unresolved.
-        thr = rows[0].get("threshold", 1)
+        # Exact tie, no quorum: let the score median decide ONLY against an EXPLICIT
+        # threshold. A bare raw-score panel with no calibrated threshold must not pass
+        # on the default-1 fallback (median >= 1 is ~always true — a silent coin-flip
+        # toward PASS); it resolves to `unresolved` instead.
+        thr = rows[0].get("threshold")
         if median_score is not None and isinstance(thr, (int, float)):
             passed = median_score >= thr
         else:
@@ -5137,6 +5162,8 @@ def grade_case_variant(
                             "severity": severity, "oracle": tier, "skipped": True,
                             "skip_reason": f"prerequisite '{failed}' not satisfied",
                             "evidence": "skipped: prerequisite not satisfied"}
+                if case_uses_depends_on:
+                    skip_row["_dep_label"] = label
                 (qualitative if atype in QUALITATIVE_ASSERTIONS else objective).append(skip_row)
                 satisfied[label] = False
                 return
@@ -5161,6 +5188,8 @@ def grade_case_variant(
                 qualitative.append(entry)
                 if turn_n is None:
                     satisfied[assertion_label(assertion)] = entry["passed"]
+                    if case_uses_depends_on:
+                        entry["_dep_label"] = assertion_label(assertion)
             else:
                 judge_tasks.append({
                     "judge_task_id": jid,
@@ -5186,7 +5215,11 @@ def grade_case_variant(
             objective.append(entry)
             if turn_n is None:
                 satisfied[assertion_label(assertion)] = entry["passed"]
+                if case_uses_depends_on:
+                    entry["_dep_label"] = assertion_label(assertion)
 
+    case_assertions = [a for a in case.get("assertions", []) if isinstance(a, dict)]
+    case_uses_depends_on = any(depends_on_targets(a) for a in case_assertions)
     for assertion in case.get("assertions", []):
         grade_unit(assertion, text, output_path, run_base)
     for assertion, unit_text, unit_output_path, unit_base, turn_n in turn_units:
@@ -5198,9 +5231,14 @@ def grade_case_variant(
     # qualitative prerequisite has no row on the first pass, so the dependent is
     # resolved on the verdict-loaded second pass (the authoritative one). Turn
     # assertions cannot declare depends_on (rejected at validate).
-    case_assertions = [a for a in case.get("assertions", []) if isinstance(a, dict)]
-    if any(depends_on_targets(a) for a in case_assertions):
-        row_by_label = {r.get("name"): r for r in objective + qualitative if r.get("turn") is None}
+    if case_uses_depends_on:
+        # Key on a STABLE original-assertion label, not the emitted row name: a preset
+        # rewrites the row name (e.g. -> "factuality") while depends_on targets the
+        # author's label (e.g. "grounded"), so keying on the row name lost forward
+        # references to a preset prerequisite (an order-dependent spurious veto). The
+        # `_dep_label` stamp is transient and stripped below, so serialized rows are
+        # unchanged.
+        row_by_label = {r.get("_dep_label"): r for r in objective + qualitative if r.get("turn") is None and r.get("_dep_label") is not None}
         for _ in range(len(case_assertions) + 1):
             changed = False
             for a in case_assertions:
@@ -5216,6 +5254,8 @@ def grade_case_variant(
                         break
             if not changed:
                 break
+        for r in objective + qualitative:
+            r.pop("_dep_label", None)   # transient resolver key; never serialized
     for summary_row in turn_summaries:
         n = summary_row["turn"]
         rows_for_turn = [r for r in objective + qualitative if r.get("turn") == n and not r.get("skipped")]
@@ -8012,6 +8052,26 @@ def case_answer_material(case: dict[str, Any], manifest_dir: Path | None) -> str
     return "\n".join(parts)
 
 
+def cutoff_key(value: Any, *, end: bool) -> tuple[int, int, int] | None:
+    """Parse a YYYY / YYYY-MM / YYYY-MM-DD stamp into a comparable (y, m, d) tuple so
+    a released_at/cutoff gate orders by DATE, not lexically ("2024-6" > "2024-12" as
+    strings, the bug this fixes). A coarse stamp fills its missing fields to the
+    period's start (end=False) or end (end=True): a release compares as its EARLIEST
+    day and a cutoff as its LATEST, so "released at/before the cutoff" stays
+    conservative across mixed precisions. Returns None if unparseable (gate no-ops)."""
+    parts = [p for p in re.split(r"[-/]", str(value).strip()) if p != ""]
+    try:
+        nums = [int(p) for p in parts[:3]]
+    except ValueError:
+        return None
+    if not nums:
+        return None
+    y = nums[0]
+    m = nums[1] if len(nums) >= 2 else (12 if end else 1)
+    d = nums[2] if len(nums) >= 3 else (31 if end else 1)
+    return (y, m, d)
+
+
 def contamination_check(case: dict[str, Any], output_text: str, *, manifest_dir: Path | None = None,
                         n: int = 8, overlap_threshold: float = 0.6, model_cutoff: str | None = None) -> dict[str, Any]:
     """Output-side contamination perimeter for one (case, output): a canary-GUID
@@ -8027,7 +8087,9 @@ def contamination_check(case: dict[str, Any], output_text: str, *, manifest_dir:
     if answer and overlap >= overlap_threshold:
         findings.append({"kind": "output-answer-overlap", "detail": f"{overlap:.2f} of the answer key's {n}-grams appear verbatim in the output"})
     released_at = case.get("released_at")
-    if released_at and model_cutoff and str(released_at) <= str(model_cutoff):
+    rel_key = cutoff_key(released_at, end=False) if released_at else None
+    cut_key = cutoff_key(model_cutoff, end=True) if model_cutoff else None
+    if rel_key and cut_key and rel_key <= cut_key:
         findings.append({"kind": "released-before-cutoff", "detail": f"case released_at {released_at} is at/before the model cutoff {model_cutoff} — the model may have trained on it"})
     return {"case_id": case.get("id"), "overlap": round(overlap, 4), "findings": findings}
 
