@@ -29,9 +29,10 @@ Documentation = "https://github.com/adewale/skill-eval-harness#readme"
 [project.scripts]
 skill-benchmark = "skill_benchmark:main"
 skill-pi-trigger-eval = "run_pi_trigger_eval:main"
+skill-trigger-matrix = "run_trigger_matrix:main"
 
 [tool.setuptools]
-py-modules = ["skill_benchmark", "run_pi_trigger_eval", "ablation_model"]
+py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

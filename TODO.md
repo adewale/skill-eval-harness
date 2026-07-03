@@ -188,3 +188,39 @@ These are tests of the harness, not a new eval suite; sequence them before the b
 ## Punted — questionable value
 
 - [ ] Ship the harness as an agent-authoring skill *(TODO-native)*. Meta/self-referential, overlaps `docs/authoring-evals.md`, adds a packaging surface, narrow audience. Revisit only if external authors adopt the harness and ask for an agent-guided authoring path.
+
+---
+
+# User journeys the code supports but the docs don't walk
+
+A 2026-07 docs review found a pattern: the machinery for a user journey exists (commands,
+report blocks, tests) but no doc walks someone from their actual question to a decision, so
+the journey is invisible unless you already know the command names. Each item below is one
+such journey: the fix is a short walkthrough doc (or a runnable example) in the mold of
+`docs/tuning-skill-activation.md` / `docs/ablation-study-walkthrough.md`, not new machinery.
+
+- [x] **"How do I make my skill trigger reliably?"** — `docs/tuning-skill-activation.md`:
+      trigger cases in both polarities → `skill-trigger-matrix` per (agent, model) →
+      description edits → re-run. Runnable on `examples/demo-skill` (offline `--agent stub`,
+      live `RUN_TRIGGER_SMOKE=1`).
+- [ ] **"Is my skill worth its tokens?"** — `token-overhead` (dollar deltas, lift-per-dollar),
+      `cost-summary`, and `audit-manifest --runs` cost findings all exist; nothing walks from
+      "my skill adds 9 KB of context" to a keep/trim/cut decision.
+- [ ] **"Did my skill edit regress anything?"** — the `old_skill` variant, `compare-results`,
+      the `iteration-N/` convention, and `render-viewer --previous-workspace` diffs exist;
+      no doc shows the edit → re-run → diff-against-last-iteration loop end to end.
+- [ ] **"Which model should my skill target?"** — multi-model fan-out (`prepare --models`),
+      the `by_model` report block, and `model_analysis` per-(case, model) lift exist; no doc
+      shows choosing (or dropping) a model tier from those numbers.
+- [ ] **"Why did this run fail?"** — trace artifacts, `error-analysis` (open-coding queue +
+      failure taxonomy), and the viewer exist; `docs/authoring-evals.md` names the four
+      failure classes but no walkthrough debugs one real trace to a manifest/skill fix.
+- [ ] **"Can I trust my judge?"** — `judge-alignment` (human labels, kappa, precision/recall),
+      `compare-judges` (judge-sensitivity), and `--judge-runs` repetition exist; no doc walks
+      labeling a sample and deciding whether the judge is usable.
+- [ ] **"How do I gate my skill repo's CI on this?"** — `report --format junit|github`,
+      `audit-manifest --fail-on-blockers`, and `suite-run` cost ceilings exist; no recipe
+      shows a skill repo's workflow file failing a PR on a confirmed regression.
+- [ ] **"How do I port my existing evals into the harness?"** — `prepare` JSONL as the import
+      seam, YAML manifests, and the Jetty/trace importers exist; `docs/migrating-evals.md`
+      only covers v1→v2 manifests, not arriving from another framework's suite.

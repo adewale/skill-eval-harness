@@ -21,9 +21,10 @@ MODULES = {
     "skill_benchmark.py": ROOT / "skill_benchmark.py",
     "ablation_model.py": ROOT / "ablation_model.py",
     "run_pi_trigger_eval.py": ROOT / "run_pi_trigger_eval.py",
+    "run_trigger_matrix.py": ROOT / "run_trigger_matrix.py",
     "run_pi_smoke.py": ROOT / "examples" / "adewale-workspace" / "run_pi_smoke.py",
 }
-MODULE_SEARCH_ORDER = ["skill_benchmark.py", "ablation_model.py", "run_pi_trigger_eval.py", "run_pi_smoke.py"]
+MODULE_SEARCH_ORDER = ["skill_benchmark.py", "ablation_model.py", "run_pi_trigger_eval.py", "run_trigger_matrix.py", "run_pi_smoke.py"]
 
 DOC_PATHS = [ROOT / "TODO.md", *sorted((ROOT / "docs").glob("*.md"))]
 

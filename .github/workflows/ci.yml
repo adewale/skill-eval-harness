@@ -35,3 +35,4 @@ jobs:
         run: |
           python skill_benchmark.py --help
           python run_pi_trigger_eval.py --help
+          python run_trigger_matrix.py --help
