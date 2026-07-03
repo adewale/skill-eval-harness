@@ -4080,7 +4080,7 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
             "properties": {"passed": {"type": "boolean"}, "score": {"type": "number"}, "rationale": {"type": "string"}}}
 
 
-def judge_prompt(task: dict[str, Any], output_text: str) -> str:
+def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | None = None, metrics: dict | None = None, artifacts: list | None = None) -> str:
     assertion = task.get("assertion", {})
     payload = {
         "judge_task_id": task.get("judge_task_id"),
@@ -4093,6 +4093,18 @@ def judge_prompt(task: dict[str, Any], output_text: str) -> str:
         "assertion": assertion,
         "candidate_output": output_text,
     }
+    # G1: an opt-in trajectory judge also weighs HOW the answer was produced. Added
+    # only when provided, so the default (text-only) prompt is byte-identical.
+    if trajectory is not None:
+        payload["trajectory"] = trajectory
+    if metrics:
+        payload["metrics"] = metrics
+    if artifacts is not None:
+        payload["artifacts"] = artifacts
+    context_hint = ("You are ALSO given the run's `trajectory` (normalized tool-call events), `metrics`, "
+                    "and an `artifacts` inventory — weigh HOW the answer was produced (skill invoked? sensible "
+                    "tools? no forbidden command?), not only candidate_output.\n"
+                    if (trajectory is not None or metrics or artifacts) else "")
     # G4: hand the model the exact schema the validator enforces (purely additive
     # instruction — the parse path is unchanged).
     schema_hint = "Your output MUST validate against this JSON Schema:\n" + json.dumps(verdict_schema_for(assertion)) + "\n\n"
@@ -4102,6 +4114,7 @@ def judge_prompt(task: dict[str, Any], output_text: str) -> str:
             "Score each dimension on its stated scale (default 1-5) strictly against its anchored rubric —\n"
             "the anchors name what each score level looks like; score against the criteria, not a vibe.\n"
             "Return only JSON with keys: dimension_scores (object mapping each dimension name to a number), rationale (string).\n"
+            + context_hint
             + schema_hint
             + json.dumps(payload, indent=2, ensure_ascii=False)
         )
@@ -4112,12 +4125,14 @@ def judge_prompt(task: dict[str, Any], output_text: str) -> str:
             f"First draft 3-5 case-specific criteria per the assertion's instruction (at least {minimum}),\n"
             "then grade the candidate output against each criterion you drafted.\n"
             "Return only JSON with keys: criteria (list of {name (string), met (boolean)}), rationale (string).\n"
+            + context_hint
             + schema_hint
             + json.dumps(payload, indent=2, ensure_ascii=False)
         )
     return (
         "You are grading one Skill Eval Harness judge assertion.\n"
         "Return only JSON with keys: passed (boolean), score (number optional), rationale (string).\n"
+        + context_hint
         + schema_hint
         + json.dumps(payload, indent=2, ensure_ascii=False)
     )
@@ -4156,11 +4171,41 @@ def judge_verdict_passed(verdict: dict[str, Any], *, default_threshold: float = 
     return False
 
 
+JUDGE_RESERVED_FILES = {"output.md", "events.json", "metrics.json", "metadata.json", "timing.json", "environment.json", "trace.jsonl", "result.json"}
+# Never expose a grader answer key / rubric to a blind judge (G1 leakage guard).
+JUDGE_LEAK_MARKERS = ("grading", "answer", "rubric", "expected", "gold")
+
+
+def judge_artifact_inventory(run_base: Path) -> list[str]:
+    """The run's own artifact files as relative paths, for an opt-in trajectory
+    judge (G1). This is a DENYLIST, not a bare walk: --write-grading-files drops
+    grading.json (and answer-key/rubric files) INTO the run dir, so handing a
+    blind judge the whole tree would leak the oracle. Reserved files
+    (output/events/metrics/...) ride their own payload keys and are excluded too."""
+    if not run_base or not run_base.exists():
+        return []
+    out: list[str] = []
+    for p in sorted(run_base.rglob("*")):
+        if not p.is_file() or p.name in JUDGE_RESERVED_FILES:
+            continue
+        if any(mk in p.name.lower() for mk in JUDGE_LEAK_MARKERS):
+            continue
+        out.append(str(p.relative_to(run_base)))
+    return out
+
+
 def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, transcripts_dir: Path | None = None,
-                       repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude", schema_enforcement: str = "report") -> dict[str, Any]:
+                       repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude", schema_enforcement: str = "report", include_trajectory: bool = False) -> dict[str, Any]:
     output_path = Path(task.get("output_path", ""))
     output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
-    prompt = judge_prompt(task, output_text)
+    if include_trajectory:
+        # G1: hand the judge the same normalized trajectory the objective detectors
+        # see, plus a denylisted artifact inventory (never the grader's answer key).
+        run_base = Path(task.get("run_base", ""))
+        events, _ = read_events_base(run_base)
+        prompt = judge_prompt(task, output_text, trajectory=events, metrics=read_metrics_base(run_base), artifacts=judge_artifact_inventory(run_base))
+    else:
+        prompt = judge_prompt(task, output_text)
     # Two judge backends, one verdict shape. A shell `judge_cmd` (any provider), OR
     # the native Claude adapter when only `--judge-model` is given — the native path
     # captures the real dollar cost of judging, which a shell cmd can't report back.
@@ -4471,6 +4516,7 @@ def judge_command(args: argparse.Namespace) -> int:
     manifest_for_judge = validate_manifest(Path(args.manifest))
     judge_model = effective_judge_model(manifest_for_judge, getattr(args, "judge_model", None))
     schema_enforcement = "strict" if getattr(args, "strict_judge_schema", False) else ((manifest_for_judge.get("judge") or {}).get("schema_enforcement") or "report")
+    include_trajectory = getattr(args, "judge_trajectory", False)
     if not judge_cmd and not judge_model:
         die("judge needs --judge-cmd (any provider), --judge-model, or a manifest judge.model default")
     claude_bin = getattr(args, "claude_bin", None) or "claude"
@@ -4481,7 +4527,7 @@ def judge_command(args: argparse.Namespace) -> int:
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
     try:
         for task in tasks:
-            rows = [run_one_judge_task(task, judge_cmd, transcripts, i, judge_model=judge_model, claude_bin=claude_bin, schema_enforcement=schema_enforcement)
+            rows = [run_one_judge_task(task, judge_cmd, transcripts, i, judge_model=judge_model, claude_bin=claude_bin, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory)
                     for i in range(1, repeat + 1)]
             fh.write(json.dumps(merge_repeated_judge_rows(rows), ensure_ascii=False) + "\n")
     finally:
@@ -8478,6 +8524,7 @@ def main() -> int:
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable when using --judge-model")
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
     p.add_argument("--strict-judge-schema", action="store_true", help="fail a judge verdict whose JSON violates its canonical schema (default: surface violations in a schema_errors field only)")
+    p.add_argument("--judge-trajectory", action="store_true", help="also give the judge the run's normalized trajectory (events/metrics) and a denylisted artifact inventory, not just the final output (G1)")
     p.add_argument("--transcripts", help="directory for per-task prompt/stdout/stderr/result audit transcripts")
     p.add_argument("--out")
 

@@ -190,5 +190,87 @@ class CapabilityRegressionIntentTests(unittest.TestCase):
         self.assertNotIn("reg", ids)
 
 
+class TrajectoryJudgeTests(unittest.TestCase):
+    """G1 — opt-in run-dir/trajectory judge, gated by the leakage denylist."""
+
+    def _run_dir(self, td, *, events="valid", extra=None):
+        run = Path(td) / "run"
+        run.mkdir()
+        (run / "output.md").write_text("the answer", encoding="utf-8")
+        if events == "valid":
+            (run / "events.json").write_text(json.dumps({"events": [{"type": "tool_call", "name": "Read"}]}), encoding="utf-8")
+        elif events == "malformed":
+            (run / "events.json").write_text("{not json", encoding="utf-8")
+        (run / "metrics.json").write_text(json.dumps({"total_tokens": 42}), encoding="utf-8")
+        (run / "poster.html").write_text("<html>", encoding="utf-8")     # legit artifact
+        (run / "notes.txt").write_text("scratch", encoding="utf-8")      # legit artifact
+        (run / "grading.json").write_text(json.dumps({"answer": "BLOCK"}), encoding="utf-8")  # PLANTED oracle
+        for name, body in (extra or {}).items():
+            (run / name).write_text(body, encoding="utf-8")
+        return run
+
+    def _task(self, run):
+        return {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
+                "run_number": 1, "prompt": "p", "run_base": str(run),
+                "output_path": str(run / "output.md"), "assertion": {"type": "judge", "name": "j"}}
+
+    def test_inventory_denylists_oracle_and_reserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            inv = sb.judge_artifact_inventory(self._run_dir(td))
+        self.assertIn("poster.html", inv)
+        self.assertIn("notes.txt", inv)
+        self.assertNotIn("grading.json", inv)   # KEYSTONE: never leak the grader's answer key
+        for reserved in ("output.md", "events.json", "metrics.json"):
+            self.assertNotIn(reserved, inv)      # rides its own payload key
+
+    def test_inventory_denylists_answer_and_rubric_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            inv = sb.judge_artifact_inventory(self._run_dir(td, extra={"answer_key.txt": "x", "rubric.md": "y", "expected.json": "z"}))
+        for leaky in ("answer_key.txt", "rubric.md", "expected.json"):
+            self.assertNotIn(leaky, inv)
+
+    def test_flag_off_prompt_is_byte_identical(self):
+        with tempfile.TemporaryDirectory() as td:
+            task = self._task(self._run_dir(td))
+            off = sb.judge_prompt(task, "the answer")
+            explicit_none = sb.judge_prompt(task, "the answer", trajectory=None, metrics=None, artifacts=None)
+        self.assertEqual(off, explicit_none)
+        self.assertNotIn("trajectory", off)
+
+    def test_flag_on_payload_carries_trajectory_not_oracle(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            task = self._task(run)
+            events, _ = sb.read_events_base(run)
+            prompt = sb.judge_prompt(task, "the answer", trajectory=events,
+                                     metrics=sb.read_metrics_base(run), artifacts=sb.judge_artifact_inventory(run))
+        self.assertIn("trajectory", prompt)
+        self.assertIn("poster.html", prompt)       # inventory embedded
+        self.assertIn("total_tokens", prompt)       # metrics embedded
+        self.assertNotIn("grading.json", prompt)    # oracle filename never embedded
+
+    def test_run_one_judge_task_shape_unchanged_with_trajectory(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            task = self._task(run)
+            vf = Path(td) / "verdict.json"      # outside run_base so it is not an artifact
+            vf.write_text(json.dumps({"passed": True, "score": 4, "rationale": "ok"}), encoding="utf-8")
+            cmd = f"cat {vf}"
+            text_row = sb.run_one_judge_task(task, judge_cmd=cmd)
+            traj_row = sb.run_one_judge_task(task, judge_cmd=cmd, include_trajectory=True)
+        self.assertEqual(set(text_row), set(traj_row))   # trajectory changes the INPUT, not the row contract
+        self.assertTrue(traj_row["passed"])
+        self.assertEqual(traj_row["judge_task_id"], "c::with_skill::run-1::j")
+
+    def test_malformed_events_degrades_without_crashing(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td, events="malformed")
+            task = self._task(run)
+            vf = Path(td) / "verdict.json"
+            vf.write_text(json.dumps({"passed": True}), encoding="utf-8")
+            row = sb.run_one_judge_task(task, judge_cmd=f"cat {vf}", include_trajectory=True)
+        self.assertTrue(row["passed"])   # bad events.json -> trajectory omitted, judge still runs
+
+
 if __name__ == "__main__":
     unittest.main()
