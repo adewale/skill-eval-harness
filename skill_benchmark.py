@@ -488,6 +488,8 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             die("manifest.judge must be an object (e.g. {\"model\": \"...\"})")
         if "model" in judge_cfg and (not isinstance(judge_cfg.get("model"), str) or not judge_cfg.get("model")):
             die("manifest.judge.model must be a non-empty string")
+        if "schema_enforcement" in judge_cfg and judge_cfg.get("schema_enforcement") not in ("report", "strict"):
+            die('manifest.judge.schema_enforcement must be "report" or "strict"')
     datasets = manifest.get("datasets")
     if datasets is not None:
         if not isinstance(datasets, dict):
@@ -4053,6 +4055,28 @@ def extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("no JSON object found in judge output")
 
 
+def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
+    """The canonical JSON Schema for a judge verdict of this assertion's shape
+    (G4), branching exactly as judge_prompt does. Handed to the model as the
+    contract and validated post-hoc by json_schema_errors. `passed` is required
+    for the plain shape so a missing-key verdict is loud instead of silently
+    coerced to failed; score stays optional (judge_verdict_passed reads `passed`
+    first). Kept beside run_one_judge_task/merged_qualitative_entry so the schema
+    and its one consumer of each shape never drift."""
+    if assertion.get("graded_dimensions"):
+        return {"type": "object", "required": ["dimension_scores"],
+                "properties": {"dimension_scores": {"type": "object"}, "rationale": {"type": "string"}}}
+    if assertion.get("dynamic_rubric"):
+        minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
+        return {"type": "object", "required": ["criteria"],
+                "properties": {"criteria": {"type": "array", "minItems": minimum,
+                                            "items": {"type": "object", "required": ["name", "met"],
+                                                      "properties": {"name": {"type": "string"}, "met": {"type": "boolean"}}}},
+                               "rationale": {"type": "string"}}}
+    return {"type": "object", "required": ["passed"],
+            "properties": {"passed": {"type": "boolean"}, "score": {"type": "number"}, "rationale": {"type": "string"}}}
+
+
 def judge_prompt(task: dict[str, Any], output_text: str) -> str:
     assertion = task.get("assertion", {})
     payload = {
@@ -4066,12 +4090,16 @@ def judge_prompt(task: dict[str, Any], output_text: str) -> str:
         "assertion": assertion,
         "candidate_output": output_text,
     }
+    # G4: hand the model the exact schema the validator enforces (purely additive
+    # instruction — the parse path is unchanged).
+    schema_hint = "Your output MUST validate against this JSON Schema:\n" + json.dumps(verdict_schema_for(assertion)) + "\n\n"
     if assertion.get("graded_dimensions"):
         return (
             "You are grading one Skill Eval Harness judge assertion with ANCHORED graded dimensions.\n"
             "Score each dimension on its stated scale (default 1-5) strictly against its anchored rubric —\n"
             "the anchors name what each score level looks like; score against the criteria, not a vibe.\n"
-            "Return only JSON with keys: dimension_scores (object mapping each dimension name to a number), rationale (string).\n\n"
+            "Return only JSON with keys: dimension_scores (object mapping each dimension name to a number), rationale (string).\n"
+            + schema_hint
             + json.dumps(payload, indent=2, ensure_ascii=False)
         )
     if assertion.get("dynamic_rubric"):
@@ -4080,12 +4108,14 @@ def judge_prompt(task: dict[str, Any], output_text: str) -> str:
             "You are grading one Skill Eval Harness judge assertion with a DYNAMIC rubric.\n"
             f"First draft 3-5 case-specific criteria per the assertion's instruction (at least {minimum}),\n"
             "then grade the candidate output against each criterion you drafted.\n"
-            "Return only JSON with keys: criteria (list of {name (string), met (boolean)}), rationale (string).\n\n"
+            "Return only JSON with keys: criteria (list of {name (string), met (boolean)}), rationale (string).\n"
+            + schema_hint
             + json.dumps(payload, indent=2, ensure_ascii=False)
         )
     return (
         "You are grading one Skill Eval Harness judge assertion.\n"
-        "Return only JSON with keys: passed (boolean), score (number optional), rationale (string).\n\n"
+        "Return only JSON with keys: passed (boolean), score (number optional), rationale (string).\n"
+        + schema_hint
         + json.dumps(payload, indent=2, ensure_ascii=False)
     )
 
@@ -4124,7 +4154,7 @@ def judge_verdict_passed(verdict: dict[str, Any], *, default_threshold: float = 
 
 
 def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, transcripts_dir: Path | None = None,
-                       repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude") -> dict[str, Any]:
+                       repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude", schema_enforcement: str = "report") -> dict[str, Any]:
     output_path = Path(task.get("output_path", ""))
     output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
     prompt = judge_prompt(task, output_text)
@@ -4151,6 +4181,13 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         parsed = {}
         parse_error = str(exc)
     assertion = task.get("assertion", {})
+    # G4: validate the verdict SHAPE against its canonical schema. extract_json_object
+    # accepts any JSON object, so a wrong-keys verdict (no `passed`, a graded verdict
+    # with no dimension_scores) would be silently coerced downstream. `report` (default)
+    # only surfaces the violation in schema_errors; `strict` fails it closed.
+    schema_errors = json_schema_errors(parsed, verdict_schema_for(assertion)) if (parse_error is None and isinstance(parsed, dict)) else []
+    if schema_errors and schema_enforcement == "strict":
+        parse_error = "verdict schema: " + "; ".join(schema_errors[:5])
     threshold = assertion.get("threshold", parsed.get("threshold", 1))
     score = parsed.get("score")
     graded_payload: dict[str, Any] = {}
@@ -4190,6 +4227,8 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         "returncode": returncode,
         "stderr": stderr[:4000] if stderr else "",
     }
+    if schema_errors:
+        row["schema_errors"] = schema_errors
     if transcripts_dir:
         safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", task["judge_task_id"])
         dest = transcripts_dir / safe / f"run-{repeat_index}"
@@ -4428,6 +4467,7 @@ def judge_command(args: argparse.Namespace) -> int:
     judge_cmd = getattr(args, "judge_cmd", None)
     manifest_for_judge = validate_manifest(Path(args.manifest))
     judge_model = effective_judge_model(manifest_for_judge, getattr(args, "judge_model", None))
+    schema_enforcement = "strict" if getattr(args, "strict_judge_schema", False) else ((manifest_for_judge.get("judge") or {}).get("schema_enforcement") or "report")
     if not judge_cmd and not judge_model:
         die("judge needs --judge-cmd (any provider), --judge-model, or a manifest judge.model default")
     claude_bin = getattr(args, "claude_bin", None) or "claude"
@@ -4438,7 +4478,7 @@ def judge_command(args: argparse.Namespace) -> int:
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
     try:
         for task in tasks:
-            rows = [run_one_judge_task(task, judge_cmd, transcripts, i, judge_model=judge_model, claude_bin=claude_bin)
+            rows = [run_one_judge_task(task, judge_cmd, transcripts, i, judge_model=judge_model, claude_bin=claude_bin, schema_enforcement=schema_enforcement)
                     for i in range(1, repeat + 1)]
             fh.write(json.dumps(merge_repeated_judge_rows(rows), ensure_ascii=False) + "\n")
     finally:
@@ -8414,6 +8454,7 @@ def main() -> int:
     p.add_argument("--judge-model", help="judge natively with `claude -p <model>` (captures cost); stamped on every verdict")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable when using --judge-model")
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
+    p.add_argument("--strict-judge-schema", action="store_true", help="fail a judge verdict whose JSON violates its canonical schema (default: surface violations in a schema_errors field only)")
     p.add_argument("--transcripts", help="directory for per-task prompt/stdout/stderr/result audit transcripts")
     p.add_argument("--out")
 
