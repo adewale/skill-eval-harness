@@ -554,6 +554,9 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         graded_floor = case.get("reference_graded_score")
         if graded_floor is not None and (not isinstance(graded_floor, (int, float)) or not 1 <= float(graded_floor) <= 5):
             die(f"{cid}: reference_graded_score must be a number on the 1-5 scale")
+        for cfield in ("canary", "released_at"):   # contamination perimeter (output side)
+            if case.get(cfield) is not None and not isinstance(case.get(cfield), str):
+                die(f"{cid}: {cfield} must be a string")
         for j, assertion in enumerate(assertions):
             validate_case_assertion(cid, f"assertion #{j}", j, assertion, path)
         validate_depends_on_scope(cid, assertions, path)   # G2: case-level depends_on graph
@@ -7845,6 +7848,99 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
     }
 
 
+def word_ngrams(text: str, n: int) -> set[tuple[str, ...]]:
+    words = re.findall(r"\w+", (text or "").lower())
+    return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)} if len(words) >= n else set()
+
+
+def ngram_containment(candidate: str, reference: str, n: int = 8) -> float:
+    """Fraction of the reference's word n-grams that appear verbatim in the
+    candidate. High containment = the output reproduces the answer key — the
+    output-side contamination signal (memorization / the eval leaked into
+    training). Never divides by zero: a reference too short for one n-gram is 0.0."""
+    ref = word_ngrams(reference, n)
+    if not ref:
+        return 0.0
+    return len(ref & word_ngrams(candidate, n)) / len(ref)
+
+
+def case_answer_material(case: dict[str, Any], manifest_dir: Path | None) -> str:
+    """The answer-key text a contaminated model might reproduce: expected_behavior,
+    review_rubric, and any golden_output reference file content."""
+    parts: list[str] = []
+    for key in ("expected_behavior", "review_rubric"):
+        v = case.get(key)
+        if isinstance(v, list):
+            parts.extend(str(x) for x in v)
+        elif v:
+            parts.append(str(v))
+    if manifest_dir:
+        for a in case.get("assertions", []) or []:
+            if isinstance(a, dict) and a.get("type") == "golden_output" and a.get("reference"):
+                ref = manifest_dir / str(a["reference"])
+                if ref.exists():
+                    parts.append(ref.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(parts)
+
+
+def contamination_check(case: dict[str, Any], output_text: str, *, manifest_dir: Path | None = None,
+                        n: int = 8, overlap_threshold: float = 0.6, model_cutoff: str | None = None) -> dict[str, Any]:
+    """Output-side contamination perimeter for one (case, output): a canary-GUID
+    tripwire, an output<->answer n-gram overlap, and a released_at/cutoff gate.
+    Pure and deterministic — no model, no network. Complements the prompt-side
+    leakage lint, which cannot see the output."""
+    findings: list[dict[str, str]] = []
+    canary = case.get("canary")
+    if canary and str(canary) in (output_text or ""):
+        findings.append({"kind": "canary-hit", "detail": f"canary {str(canary)!r} appeared in the output — the model has seen this held-out eval"})
+    answer = case_answer_material(case, manifest_dir)
+    overlap = ngram_containment(output_text or "", answer, n) if answer else 0.0
+    if answer and overlap >= overlap_threshold:
+        findings.append({"kind": "output-answer-overlap", "detail": f"{overlap:.2f} of the answer key's {n}-grams appear verbatim in the output"})
+    released_at = case.get("released_at")
+    if released_at and model_cutoff and str(released_at) <= str(model_cutoff):
+        findings.append({"kind": "released-before-cutoff", "detail": f"case released_at {released_at} is at/before the model cutoff {model_cutoff} — the model may have trained on it"})
+    return {"case_id": case.get("id"), "overlap": round(overlap, 4), "findings": findings}
+
+
+def contamination_report(manifest_path: Path, runs: Path, *, split: str | None = None, n: int = 8,
+                         overlap_threshold: float = 0.6, model_cutoff: str | None = None) -> dict[str, Any]:
+    manifest = validate_manifest(manifest_path)
+    variants = manifest.get("variants", DEFAULT_VARIANTS)
+    cases_out: list[dict[str, Any]] = []
+    total = 0
+    for case in iter_cases(manifest, split):
+        max_overlap, findings = 0.0, []
+        for model_name, model_root in discover_case_model_roots(runs, case["id"], variants):
+            for variant in variants:
+                for run_number, base in discover_run_bases_under(model_root / variant):
+                    text, _ = read_output_base(base)
+                    if text is None:
+                        continue
+                    chk = contamination_check(case, text, manifest_dir=manifest_path.parent, n=n,
+                                              overlap_threshold=overlap_threshold, model_cutoff=model_cutoff)
+                    max_overlap = max(max_overlap, chk["overlap"])
+                    for f in chk["findings"]:
+                        findings.append({**f, "variant": variant, "run_number": run_number, **({"model": model_name} if model_name else {})})
+        total += len(findings)
+        if findings or max_overlap > 0:
+            cases_out.append({"case_id": case["id"], "max_overlap": round(max_overlap, 4), "findings": findings})
+    return {"cases": cases_out, "total_findings": total,
+            "params": {"ngram": n, "overlap_threshold": overlap_threshold, "model_cutoff": model_cutoff}}
+
+
+def contamination_command(args: argparse.Namespace) -> int:
+    report = contamination_report(Path(args.manifest), Path(args.runs), split=args.split,
+                                  n=getattr(args, "ngram", 8), overlap_threshold=getattr(args, "overlap_threshold", 0.6),
+                                  model_cutoff=getattr(args, "model_cutoff", None))
+    text = json.dumps(report, indent=2, ensure_ascii=False)
+    if getattr(args, "out", None):
+        Path(args.out).write_text(text, encoding="utf-8")
+    else:
+        print(text)
+    return 1 if (getattr(args, "fail_on_contamination", False) and report["total_findings"]) else 0
+
+
 def audit_manifest_report(
     manifest_path: Path,
     *,
@@ -8736,6 +8832,16 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=100, help="max review-queue rows to emit")
     p.add_argument("--out")
 
+    p = sub.add_parser("contamination", help="output-side contamination perimeter: canary tripwire, output<->answer n-gram overlap, released_at/cutoff gate (model-free)")
+    p.add_argument("manifest")
+    p.add_argument("--runs", required=True)
+    p.add_argument("--split", choices=sorted(VALID_SPLITS))
+    p.add_argument("--ngram", type=int, default=8, help="word n-gram size for output<->answer overlap")
+    p.add_argument("--overlap-threshold", type=float, default=0.6, help="flag when this fraction of the answer key's n-grams appear verbatim in the output")
+    p.add_argument("--model-cutoff", help="model training cutoff (e.g. 2025-01); flags cases whose released_at is at/before it")
+    p.add_argument("--fail-on-contamination", action="store_true", help="exit non-zero if any contamination finding fires (CI gate)")
+    p.add_argument("--out")
+
     p = sub.add_parser("export-anthropic")
     p.add_argument("manifest")
     p.add_argument("--runs", required=True)
@@ -8913,6 +9019,8 @@ def main() -> int:
         return judge_alignment_command(args)
     if args.cmd == "error-analysis":
         return error_analysis_command(args)
+    if args.cmd == "contamination":
+        return contamination_command(args)
     if args.cmd == "export-anthropic":
         return export_anthropic(args)
     if args.cmd == "compare-tasks":

@@ -469,5 +469,70 @@ class CrossJudgeConsensusTests(unittest.TestCase):
         self.assertEqual((result["qualitative_total"], result["qualitative_passed"]), (1, 1))
 
 
+class ContaminationPerimeterTests(unittest.TestCase):
+    """Output-side contamination perimeter: canary tripwire, output<->answer n-gram
+    overlap, released_at/cutoff gate. All pure and model-free."""
+
+    def test_ngram_containment_exact_partial_and_safe(self):
+        ans = "the quick brown fox jumps over the lazy dog again today here now"
+        self.assertEqual(sb.ngram_containment(ans, ans, 4), 1.0)                          # output == answer
+        self.assertEqual(sb.ngram_containment("wholly unrelated different content written elsewhere entirely", ans, 4), 0.0)
+        partial = sb.ngram_containment("the quick brown fox jumps over", ans, 4)
+        self.assertGreater(partial, 0.0)
+        self.assertLess(partial, 1.0)
+        self.assertEqual(sb.ngram_containment("a b c", "a b", 4), 0.0)                    # reference too short -> 0.0, no ZeroDivision
+
+    def test_canary_tripwire_both_directions(self):
+        case = {"id": "c", "canary": "CANARY-GUID-abc123"}
+        self.assertTrue(any(f["kind"] == "canary-hit" for f in sb.contamination_check(case, "leak CANARY-GUID-abc123 here")["findings"]))
+        self.assertFalse(sb.contamination_check(case, "no canary present")["findings"])
+
+    def test_output_answer_overlap_flags(self):
+        answer = " ".join(f"word{i}" for i in range(30))
+        case = {"id": "c", "expected_behavior": [answer]}
+        hit = sb.contamination_check(case, answer, n=6, overlap_threshold=0.6)
+        self.assertAlmostEqual(hit["overlap"], 1.0)
+        self.assertTrue(any(f["kind"] == "output-answer-overlap" for f in hit["findings"]))
+        clean = sb.contamination_check(case, "entirely unrelated prose about other matters", n=6, overlap_threshold=0.6)
+        self.assertEqual(clean["overlap"], 0.0)
+        self.assertFalse(clean["findings"])
+
+    def test_released_at_cutoff_gate_both_directions(self):
+        case = {"id": "c", "released_at": "2024-06"}
+        self.assertTrue(any(f["kind"] == "released-before-cutoff" for f in sb.contamination_check(case, "x", model_cutoff="2025-01")["findings"]))
+        self.assertFalse(any(f["kind"] == "released-before-cutoff" for f in sb.contamination_check(case, "x", model_cutoff="2024-01")["findings"]))
+
+    def _manifest(self, td, case_extra):
+        root = Path(td)
+        (root / "repo" / "skill").mkdir(parents=True)
+        (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
+        (root / "repo" / "evals").mkdir()
+        p = root / "repo" / "evals" / "shared-benchmark.json"
+        p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
+            "variants": ["with_skill", "without_skill"], "ablations": [],
+            "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
+                       "assertions": [{"name": "a", "type": "contains", "value": "y"}], **case_extra}]}), encoding="utf-8")
+        return root, p
+
+    def test_validate_rejects_non_string_canary(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, p = self._manifest(td, {"canary": 123})
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(p)
+
+    def test_report_flags_canary_in_output_end_to_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._manifest(td, {"canary": "ZZ-CANARY-99"})
+            runs = root / "runs"
+            (runs / "c" / "with_skill").mkdir(parents=True)
+            (runs / "c" / "with_skill" / "output.md").write_text("here is the ZZ-CANARY-99 leaking", encoding="utf-8")
+            (runs / "c" / "without_skill").mkdir(parents=True)
+            (runs / "c" / "without_skill" / "output.md").write_text("clean output", encoding="utf-8")
+            report = sb.contamination_report(p, runs, split="tune")
+        self.assertEqual(report["total_findings"], 1)
+        self.assertEqual(report["cases"][0]["case_id"], "c")
+        self.assertEqual(report["cases"][0]["findings"][0]["kind"], "canary-hit")
+
+
 if __name__ == "__main__":
     unittest.main()
