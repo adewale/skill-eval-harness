@@ -46,6 +46,30 @@ as an `expected_regression_confirmed` because the ablation is **materialized** (
 edited tree, blind, with verified provenance). Swap the stub for a real runner
 (`--codex-cmd "claude -p"`, `codex exec`, etc.) to run it against an actual model.
 
+## Measure activation (does the skill load on its own?)
+
+Everything above force-loads the skill, so it says nothing about whether an agent
+would *discover* it. The manifest also carries one should-fire and one
+should-not-fire `kind: "trigger"` case for that question. Offline first (the stub
+'agent' decides from the mounted description, deterministically):
+
+```bash
+python3 ../../run_trigger_matrix.py evals/shared-benchmark.json \
+  --agent stub --out /tmp/demo-trigger-stub.json
+```
+
+Then for real, across Claude Code subagents on haiku, sonnet, and opus (spends
+tokens; also wired into the manual smoke test
+`RUN_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix -v`):
+
+```bash
+python3 ../../run_trigger_matrix.py evals/shared-benchmark.json \
+  --agent claude --runs-per-query 3 --out /tmp/demo-trigger-matrix.json
+```
+
+The loop for acting on the resulting per-model trigger rates is
+[`docs/tuning-skill-activation.md`](../../docs/tuning-skill-activation.md).
+
 ## What it teaches
 
 - A **materialized** ablation (real removal) yields a *confirmable* regression; an

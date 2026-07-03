@@ -21,7 +21,7 @@ The main question is narrow: **when the same case runs with and without the skil
 - Split discipline: `tune`, `holdout`, and `holdback` stay separate.
 - Local grading: deterministic assertions run without model calls.
 - Eval hygiene: leakage lint, manifest audit, trigger checks, repeated-run stats, and fixture recommendations.
-- Interop: Anthropic-style exports, static HTML review pages, Pi trigger evals, and Jetty runbook-mode import/export.
+- Interop: Anthropic-style exports, static HTML review pages, Pi trigger evals, agent×model trigger matrices, and Jetty runbook-mode import/export.
 - Judge plumbing: `judge`/`rubric` assertions can be exported or run through a user-supplied `--judge-cmd`; the harness does not choose a model for you.
 
 ## Contents
@@ -103,6 +103,7 @@ The installed commands are:
 |---|---|
 | `skill-benchmark` | Validate manifests, prepare tasks, grade outputs, compare variants, run judges, and import/export runner formats. |
 | `skill-pi-trigger-eval` | Runs Pi without forced `--skill` and checks whether the model loads the skill from stream events. |
+| `skill-trigger-matrix` | Measures autonomous skill activation per (agent, model) cell — Claude Code subagents on haiku/sonnet/opus by default, Pi and an offline stub included, other agents via an adapter subclass. |
 
 ### Local development
 
@@ -115,6 +116,8 @@ skill-benchmark --help
 
 ## Documentation map
 
+[`docs/README.md`](docs/README.md) groups these by kind (user journeys, concepts, specs, audits) and holds the convention for adding a new user-journey walkthrough.
+
 | File | Use it for |
 |---|---|
 | `README.md` | Manifest shape, run layout, and command contracts. |
@@ -124,6 +127,7 @@ skill-benchmark --help
 | `docs/architecture.md` | How the pipeline fits together: the stages, the runner boundary, the model/variant/run fan-out, and the invariants that keep grading honest. |
 | `docs/abstractions.md` | What each core object is: manifest, prepared task, run-output contract, assertion result, `ResultSet`. |
 | `docs/authoring-evals.md` | Opinionated workflow/quickstart for writing a new eval suite, including severity and graded assertions. |
+| `docs/tuning-skill-activation.md` | The activation-tuning loop: trigger cases in both polarities, the (agent, model) trigger-rate matrix, how to read under/over-trigger, and the adapter seam for adding agents. |
 | `docs/eval-framework-roadmap-spec.md` | The implemented eval-framework roadmap: goals, abstractions, and tests per feature (CF.1–CF.4, buckets 1–4, migration). |
 | `docs/migrating-evals.md` | Upgrading a manifest between versions (v1 → v2): what `migrate` stamps and the judgment calls it leaves. |
 | `docs/vocabulary.md` | Glossary of harness terms: variants, splits, models, ablations, assertions, severity/oracle tiers, graded scoring, cost telemetry, trace artifacts, and report flags. |
@@ -135,7 +139,7 @@ skill-benchmark --help
 | `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
 | `TODO.md` | Status tracker: the eval-framework roadmap (implemented, bar two `(TODO-native)` items) and the remaining Jetty adapter work — streaming/concurrency, live API validation, judge export, per-variant overrides, and the `swap:<id>` ablation follow-on. |
-| `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two materialized ablations, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per ablation; exercised by `tests/test_example_demo.py`. Start here. |
+| `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two materialized ablations, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per ablation; exercised by `tests/test_example_demo.py`. Also carries should-fire/should-not-fire trigger cases for `skill-trigger-matrix` (offline via `--agent stub`; live smoke via `RUN_TRIGGER_SMOKE=1`). Start here. |
 | `examples/adewale-workspace/` | Adewale-specific runners for Pi smoke, trigger, ablation, and aggregate reports. |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
 
@@ -667,6 +671,17 @@ skill-benchmark render-viewer \
 
 The viewer embeds run artifacts (images inline, typed links for pdf/xlsx, text in place). `--previous-workspace <dir>` embeds a diff against that iteration's `benchmark.json` (per-variant deltas, per-case deltas, new/resolved flags; pair with the `iteration-N/` directory convention). `--serve --port 8642` hosts the review with a feedback form persisting to `feedback.json` (entries keyed by case/variant/run).
 
+### Trigger matrix (activation across agents and models)
+
+```bash
+skill-trigger-matrix ../repo/evals/shared-benchmark.json \
+  --agent claude \
+  --runs-per-query 3 \
+  --out trigger-matrix.json
+```
+
+For each (agent, model) cell this mounts the skill where that agent discovers skills autonomously (never forcing the load), runs the manifest's `kind: "trigger"` cases the requested number of times, and reports per-cell trigger rates split by should-fire / should-not-fire polarity. The `claude` adapter spawns headless Claude Code subagents and defaults to haiku, sonnet, and opus; `--agent pi` and the offline `--agent stub` are included, and other agents (Codex, …) register through an `AgentAdapter` subclass. The tuning loop that consumes these rates is [`docs/tuning-skill-activation.md`](docs/tuning-skill-activation.md); a manual live smoke test wraps the same path (`RUN_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix -v`).
+
 ### Pi trigger evals
 
 ```bash
@@ -676,7 +691,7 @@ skill-pi-trigger-eval ../repo/evals/shared-benchmark.json \
   --out trigger-report.json
 ```
 
-This creates a temporary `PI_CODING_AGENT_DIR`, copies the skill under `skills/`, runs Pi without forced `--skill`, and detects whether the model loaded the skill from JSON stream events.
+This creates a temporary `PI_CODING_AGENT_DIR`, copies the skill under `skills/`, runs Pi without forced `--skill`, and detects whether the model loaded the skill from JSON stream events. It is the deeper Pi-specific tool: discovery-population ablation arms, per-query trace artifacts, and cost telemetry.
 
 ### Jetty adapter
 
@@ -768,7 +783,7 @@ For manifest or grading changes, add or update `tests/test_skill_benchmark.py`. 
 - Grading and aggregation do not call a model. Model execution happens outside that path, except for the explicit runner/judge commands that exist to call one: `run-codex`, `run-claude`, `run-jetty`, and `judge` (via `--judge-cmd` or, natively, `--judge-model`).
 - The harness does not decide qualitative truth by itself; it emits judge prompts, runs a judge (an opt-in `--judge-cmd`, or `--judge-model` for the native Claude judge), and merges the returned JSON — recording which `judge_model` produced each verdict.
 - Hidden prompts are not protected if you pass `--include-answer-key` to generation jobs.
-- A passing answer benchmark does not prove autonomous skill loading; run `skill-pi-trigger-eval` for that.
+- A passing answer benchmark does not prove autonomous skill loading; run `skill-trigger-matrix` (any adapter-backed agent × model) or `skill-pi-trigger-eval` (Pi, with ablation arms) for that.
 
 ## Repository layout
 
@@ -781,7 +796,8 @@ skill-eval-harness/
 ├── TODO.md
 ├── pyproject.toml
 ├── skill_benchmark.py          # the CLI, grading, reporting, and runner adapters
-├── run_pi_trigger_eval.py      # autonomous-trigger runner
+├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
+├── run_trigger_matrix.py       # activation matrix across agents × models (claude/pi/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance value objects
 ├── docs/                       # architecture, abstractions, vocabulary, specs, guides (see the map above)
 ├── .github/
@@ -810,6 +826,7 @@ This README was written against:
 
 - `skill_benchmark.py` CLI and assertion implementation
 - `run_pi_trigger_eval.py` trigger runner
+- `run_trigger_matrix.py` agent×model activation matrix
 - `pyproject.toml` package metadata
 - `docs/repo-effectiveness-audit.md` for the current `good-repo` audit
 - `tests/test_skill_benchmark.py` behavior coverage
