@@ -77,6 +77,9 @@ class SubagentRunnerTests(unittest.TestCase):
                 self.assertEqual(events["source"], "subagent")
                 metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
                 self.assertEqual(metrics["total_tokens"], 42)
+                # The subagent now re-serializes its records to trace.jsonl (the
+                # shared writer's raw-trace artifact), like every other runner.
+                self.assertTrue((base / "trace.jsonl").exists())
         without_prompt = next(p for p in seen_prompts if "Do not use any skill" in p)
         self.assertNotIn("skills/", without_prompt)
 
@@ -315,10 +318,20 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertTrue(self.SHARED_META_KEYS.issubset(claude_meta), self.SHARED_META_KEYS - set(claude_meta))
             self.assertEqual(codex_meta["provider"], "codex")
             self.assertEqual(claude_meta["provider"], "claude")
-            # Telemetry is always an explicit block — never silently absent.
-            for meta in (codex_meta, claude_meta):
-                self.assertIn("source", meta["usage_normalized"])
-                self.assertIn("source", meta["cost_normalized"])
+            # Telemetry is an explicit block carrying the real normalized values,
+            # not merely a present key — a regression dropping the numbers must fail.
+            self.assertEqual(codex_meta["usage_normalized"]["total_tokens"], 10)   # 4+6 from the trace
+            self.assertEqual(codex_meta["usage_normalized"]["source"], "trace_normalized")
+            self.assertEqual(claude_meta["usage_normalized"]["total_tokens"], 33)  # 11+22 from the envelope
+            self.assertEqual(claude_meta["usage_normalized"]["source"], "provider_reported")
+            self.assertIn("source", codex_meta["cost_normalized"])
+            self.assertIn("source", claude_meta["cost_normalized"])
+            # The whole-writer consolidation means both providers land on the same
+            # events/metrics schema version (2, the trace-normalizer's), even with
+            # no trace — Claude's empty-trace run is not a schema-1 island.
+            for base in (codex_base, claude_base):
+                self.assertEqual(json.loads((base / "events.json").read_text())["schema_version"], 2)
+                self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
 
     def test_write_runner_outcome_derives_none_answer_from_trace(self):
         # answer=None means "the answer is the final trace message" (the Codex seam).
@@ -364,6 +377,40 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             text = (base / "output.md").read_text(encoding="utf-8")
             self.assertIn("no output produced", text)
             self.assertNotIn("returncode=3", text)
+
+    def test_empty_string_answer_is_never_reconstructed_from_trace(self):
+        # The answer=None sentinel (Codex) is what derives from the trace; a string
+        # answer — even "" — is used verbatim. This guards validity gating: an empty
+        # answer that happens to carry a trace must become the failure marker, never
+        # leak the trace's final message and slip past execution_valid().
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            trace = json.dumps({"role": "assistant", "content": "LEAKED FROM TRACE"})
+            outcome = am.RunnerOutcome(provider="subagent", answer="", returncode=0, trace_text=trace)
+            sb.write_runner_outcome(base, outcome)
+            text = (base / "output.md").read_text(encoding="utf-8")
+            self.assertNotIn("LEAKED FROM TRACE", text)
+            self.assertTrue(text.lstrip().startswith(am.CLAUDE_FAILURE))
+            self.assertFalse(am.execution_valid({"returncode": 0}, text))
+
+    def test_codex_empty_output_writes_explicit_missing_telemetry(self):
+        # The PR's headline consistency fix: an empty Codex run now goes through the
+        # shared writer, so it gets explicit missing telemetry and schema-2 metrics
+        # (was schema-1 metadata with no normalized blocks before the consolidation).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            silent = root / "silent_codex.py"
+            silent.write_text("import sys\n_ = sys.stdin.read()\n", encoding="utf-8")  # emits nothing
+            runs = root / "runs"
+            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs),
+                                         codex_cmd=f"{sys.executable} {silent}", timeout=30))
+            base = runs / run_dir
+            self.assertIn("no output produced", (base / "output.md").read_text(encoding="utf-8"))
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["usage_normalized"], {"source": "missing"})
+            self.assertEqual(meta["cost_normalized"], {"source": "missing"})
+            self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
 
 
 if __name__ == "__main__":
