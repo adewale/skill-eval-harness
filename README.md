@@ -374,13 +374,13 @@ skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out t
 skill-benchmark run-codex --tasks tasks.jsonl --runs ../repo/eval-runs/codex-tune
 ```
 
-Override `--codex-cmd` for local wrappers or tests. A concrete Codex smoke command is:
+Override `--codex-cmd` for local wrappers or tests:
 
 ```bash
 skill-benchmark run-codex \
   --tasks tasks.jsonl \
   --runs ../repo/eval-runs/codex-trace \
-  --codex-cmd 'codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral'
+  --codex-cmd ./bin/codex-jsonl-wrapper
 ```
 
 ### Run Claude tasks (with cost capture)
@@ -720,7 +720,7 @@ skill-trigger-matrix ../repo/evals/shared-benchmark.json \
   --out trigger-matrix.json
 ```
 
-For each (agent, model) cell this mounts the skill where that agent discovers skills autonomously (never forcing the load), runs the manifest's `kind: "trigger"` cases the requested number of times, and reports per-cell trigger rates split by should-fire / should-not-fire polarity. The `claude` adapter spawns headless Claude Code subagents and defaults to haiku, sonnet, and opus; `--agent pi` and the offline `--agent stub` are included, and other agents (Codex, …) register through an `AgentAdapter` subclass. The tuning loop that consumes these rates is [`docs/tuning-skill-activation.md`](docs/tuning-skill-activation.md); a manual live smoke test wraps the same path (`RUN_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix -v`).
+For each (agent, model) cell this mounts the skill where that agent discovers skills autonomously (never forcing the load), runs the manifest's `kind: "trigger"` cases the requested number of times, and reports per-cell trigger rates split by should-fire / should-not-fire polarity. The `claude` adapter spawns headless Claude Code subagents and defaults to haiku, sonnet, and opus; `--agent codex`, `--agent pi`, and the offline `--agent stub` are included. Additional agents register through an `AgentAdapter` subclass plus an `AGENT_CAPABILITIES` row. The tuning loop that consumes these rates is [`docs/tuning-skill-activation.md`](docs/tuning-skill-activation.md); manual live smoke tests wrap the same path (`RUN_TRIGGER_SMOKE=1` for Claude, `RUN_CODEX_TRIGGER_SMOKE=1` for Codex). For a cheaper auth/network/process check that invokes every supported live adapter/model without asserting trigger behavior, run `RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v`.
 
 ### Pi trigger evals
 

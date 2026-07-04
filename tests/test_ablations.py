@@ -24,6 +24,7 @@ from unittest import mock
 
 import skill_benchmark as sb
 import run_pi_trigger_eval as tr
+import run_trigger_matrix as tm
 import ablation_model as am
 from helpers import (
     CODEX_CRASH_OUTPUT as CRASH,
@@ -576,6 +577,18 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
                 text = Path(copied[0]).read_text(encoding="utf-8")
                 self.assertNotIn("when_to_use", text)
                 self.assertIn("name: good-pr", text)
+
+    def test_trigger_matrix_ablation_hash_comes_from_provenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = self.repo(root, [self.DISCO_ABL])
+            manifest = sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
+            tree_dir, tree_hash, provenance = tm.trigger_tree_for_manifest(repo_root, manifest, root / "work", "no-wtu")
+            self.assertTrue(tree_dir.is_dir())
+            prov = am.Provenance.from_dict(provenance)
+            self.assertEqual(tree_hash, prov.identity.canonical)
+            self.assertEqual(tree_hash, provenance["parent_skill_hash"])
 
     def test_pi_trigger_baseline_matches_ablation_surface(self):
         # The baseline (no-ablation) arm must use the SAME canonical tree builder as

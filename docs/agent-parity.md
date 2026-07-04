@@ -18,7 +18,6 @@ Codex is no longer only an answer runner. The trigger matrix now accepts `--agen
 ```bash
 skill-trigger-matrix examples/demo-skill/evals/shared-benchmark.json \
   --agent codex \
-  --codex-cmd 'codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral' \
   --runs-per-query 3 \
   --out /tmp/trigger-codex.json
 ```

@@ -1600,6 +1600,21 @@ def materialize_ablation(repo_root: Path, manifest: dict[str, Any], ablation: di
     return materialize(ValidatedAblation.validate(repo_root, manifest, ablation), out_root).as_legacy_dict()
 
 
+def materialize_trigger_ablation(repo_root: Path, manifest: dict[str, Any], ablation_id: str, out_root: Path) -> dict[str, Any]:
+    """Materialize a discovery/trigger-population ablation for autonomous trigger
+    runners. This is the shared gate for Pi trigger and the trigger matrix, so
+    they cannot diverge on which ablations are valid to mount."""
+    ablation = ablation_by_id(manifest, ablation_id)
+    if ablation is None:
+        raise AblationError(f"unknown ablation: {ablation_id}")
+    components = ablation_components(ablation)
+    if not components:
+        raise AblationError(f"ablation {ablation_id} is instruction-simulated; trigger ablations must declare a materialized removal")
+    if derived_population(components) != "trigger":
+        raise AblationError(f"ablation {ablation_id} is an answer-population ablation; trigger ablations must target discovery/trigger behavior")
+    return materialize_ablation(repo_root, manifest, ablation, out_root)
+
+
 def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm:
     """Produce out_root/<id>/ holding the altered skill tree for a VALIDATED
     ablation, and return a MaterializedArm (which itself cannot exist without an
@@ -2798,14 +2813,27 @@ def event_mentions_skill_file(event: dict[str, Any]) -> bool:
     return "SKILL.md" in hay or "/skills/" in hay or "\\skills\\" in hay
 
 
+EVENT_TEXT_KEYS = {"file_path", "path", "skill", "input", "partial_json", "command", "cmd", "args", "argv"}
+
+
+def _flatten_event_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(_flatten_event_text(item) for item in value).strip()
+    return ""
+
+
 def event_texts_for_tool_input(obj: Any) -> list[str]:
     """Recursively collect file-path-ish strings from a runner event (tool inputs),
     used to detect whether the model actually opened a mounted skill file."""
     out: list[str] = []
     if isinstance(obj, dict):
         for key, value in obj.items():
-            if key in {"file_path", "path", "skill", "input", "partial_json"} and isinstance(value, str):
-                out.append(value)
+            if key in EVENT_TEXT_KEYS:
+                text = _flatten_event_text(value)
+                if text:
+                    out.append(text)
             out.extend(event_texts_for_tool_input(value))
     elif isinstance(obj, list):
         for item in obj:
@@ -2829,6 +2857,11 @@ def detect_trigger(stdout: str, copied_paths: list[Path]) -> tuple[bool, list[st
             if any(n and n in text for n in needles):
                 evidence.append(text[:500])
     return bool(evidence), evidence[:5]
+
+
+def safe_trace_label(text: str, fallback: str) -> str:
+    label = re.sub(r"[^a-zA-Z0-9_.-]+", "-", text)[:80].strip("-")
+    return label or fallback
 
 
 def mount_skill_tree(tree_dir: Path, skills_dir: Path) -> list[Path]:
@@ -3447,31 +3480,61 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
     return event_doc, metrics
 
 
+def _stream_usage_doc(record: dict[str, Any]) -> dict[str, Any] | None:
+    usage = raw_trace_value(record, "usage", "tokens")
+    return usage if isinstance(usage, dict) else None
+
+
+def _is_cumulative_usage_record(record: dict[str, Any]) -> bool:
+    top_type = str(raw_trace_value(record, "type", "event", "name", "kind") or "").casefold()
+    item_type = nested_item_type(record).casefold()
+    return top_type in {"result", "response.completed"} or item_type in {"result", "response.completed"}
+
+
+def _sum_stream_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
+    totals: dict[str, int] = {}
+    for record in records:
+        usage = _stream_usage_doc(record)
+        if not usage:
+            continue
+        normalized = normalize_usage(usage, source="provider_reported")
+        for key in USAGE_ALIASES:
+            value = normalized.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                totals[key] = totals.get(key, 0) + int(value)
+    return normalize_usage(totals if totals else None, source="provider_reported")
+
+
+def _cost_value_from_record(record: dict[str, Any]) -> float | None:
+    raw = raw_trace_value(record, "cost", "cost_usd", "total_cost_usd")
+    if raw is None:
+        usage_obj = _stream_usage_doc(record)
+        if isinstance(usage_obj, dict):
+            raw = usage_obj.get("cost", usage_obj.get("cost_usd"))
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return float(raw)
+    if isinstance(raw, dict):
+        value = normalize_cost(raw).get("total_cost")
+        return float(value) if isinstance(value, (int, float)) else None
+    return None
+
+
 def stream_usage_and_cost(raw_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """usage_normalized/cost_normalized straight from a runner's raw JSONL
-    stream (issue #21): tokens via the trace normalizer (provider usage events
-    relayed verbatim), provider cost records summed. Missing stays marked."""
+    stream (issue #21). Prefer final cumulative result/completion usage when a
+    provider emits it; otherwise sum per-event usage deltas. Missing stays
+    marked."""
     records = [obj for obj in iter_json_objects(raw_text) if isinstance(obj, dict)]
-    _, metrics = normalize_trace_records(records, source="stream")
-    has_tokens = any(isinstance(metrics.get(k), (int, float)) and metrics.get(k) for k in ("input_tokens", "output_tokens", "total_tokens"))
-    usage = normalize_usage(metrics if has_tokens else None, source="provider_reported")
-    cost_total = 0.0
-    cost_found = False
-    for record in records:
-        raw = raw_trace_value(record, "cost", "cost_usd", "total_cost_usd")
-        if raw is None:
-            # Pi relays cost inside the usage object ({"usage": {..., "cost": x}}).
-            usage_obj = raw_trace_value(record, "usage", "tokens")
-            if isinstance(usage_obj, dict):
-                raw = usage_obj.get("cost", usage_obj.get("cost_usd"))
-        value = None
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-            value = float(raw)
-        elif isinstance(raw, dict):
-            value = normalize_cost(raw).get("total_cost")
-        if value is not None:
-            cost_total += value
-            cost_found = True
+    cumulative_usage = [_stream_usage_doc(record) for record in records if _is_cumulative_usage_record(record) and _stream_usage_doc(record)]
+    usage = normalize_usage(cumulative_usage[-1], source="provider_reported") if cumulative_usage else _sum_stream_usage(records)
+
+    cumulative_cost = [_cost_value_from_record(record) for record in records if _is_cumulative_usage_record(record) and _cost_value_from_record(record) is not None]
+    if cumulative_cost:
+        cost = normalize_cost(cumulative_cost[-1], source="provider_reported")
+        return usage, cost
+    cost_values = [_cost_value_from_record(record) for record in records]
+    cost_total = sum(value for value in cost_values if value is not None)
+    cost_found = any(value is not None for value in cost_values)
     cost = normalize_cost(round(cost_total, 6) if cost_found else None, source="provider_reported")
     return usage, cost
 

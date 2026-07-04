@@ -16,9 +16,9 @@ Four adapters ship:
               haiku / sonnet / opus aliases. The skill mounts as a project
               skill; loading is detected from the Skill tool-use event and,
               as a fallback, path evidence of the model reading the mounted
-              SKILL.md. A fresh CLAUDE_CONFIG_DIR per run keeps your personal
-              skills out; Claude Code's built-in skills stay, because your
-              users run against them too.
+              SKILL.md. It uses an isolated CLAUDE_CONFIG_DIR when auth can be
+              copied, otherwise preserves the normal Claude config so
+              OAuth/keychain logins still work.
 - `codex`   — Codex CLI (`codex exec --json` by default), mounted in the
               Codex project-skill directory and detected through the shared
               path-evidence detector. Override the command with `--codex-cmd`
@@ -59,26 +59,29 @@ from typing import Any
 from agent_capabilities import AGENT_CAPABILITIES
 from skill_benchmark import (
     VALID_SPLITS,
-    ablation_by_id,
-    ablation_components,
+    AblationError,
     build_canonical_skill_tree,
     canonical_skill_tree_hash,
     detect_trigger,
-    derived_population,
     frontmatter_value,
     iter_json_objects,
-    materialize_ablation,
+    materialize_trigger_ablation,
     mount_skill_tree,
     repo_root_for_manifest,
     run_argv_with_timeout,
+    safe_trace_label,
     stream_usage_and_cost,
     write_json,
     write_trace_artifacts,
 )
 from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_manifest, pi_argv, skill_name_from_manifest, seed_config_dir
-from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS
+from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, Provenance
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
+DEFAULT_CODEX_CMD = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral"
+INVOKE_RESULT_KEYS = ("stdout", "stderr", "returncode", "timed_out", "elapsed_ms", "observation_complete")
+CODEX_HOME_FILES = ("auth.json", "config.toml")
+CLAUDE_PORTABLE_AUTH_FILES = (".credentials.json",)
 
 
 def mounted_skill_names(copied: list[Path]) -> list[str]:
@@ -98,9 +101,48 @@ def mounted_skill_names(copied: list[Path]) -> list[str]:
     return names
 
 
-def safe_trace_label(text: str, fallback: str) -> str:
-    label = re.sub(r"[^a-zA-Z0-9_.-]+", "-", text)[:80].strip("-")
-    return label or fallback
+def require_agent_capabilities(name: str) -> Any:
+    try:
+        return AGENT_CAPABILITIES[name]
+    except KeyError as exc:
+        raise SystemExit(f"agent {name!r} is registered in ADAPTERS but missing agent_capabilities.AGENT_CAPABILITIES[{name!r}]") from exc
+
+
+def validate_invoke_result(agent: str, result: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise TypeError(f"{agent}.invoke must return a dict, got {type(result).__name__}")
+    missing = [key for key in INVOKE_RESULT_KEYS if key not in result]
+    if missing:
+        raise KeyError(f"{agent}.invoke missing required result key(s): {', '.join(missing)}")
+    return result
+
+
+def seed_codex_home(codex_home: Path) -> None:
+    """Copy Codex auth/config into an isolated CODEX_HOME, but not user skills."""
+    codex_home.mkdir(parents=True, exist_ok=True)
+    source = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    for name in CODEX_HOME_FILES:
+        src = source / name
+        dst = codex_home / name
+        if not src.is_file():
+            continue
+        if src.resolve() == dst.resolve():
+            continue
+        shutil.copy2(src, dst)
+
+
+def seed_claude_config_dir(config_dir: Path, source_config: Path | None = None) -> bool:
+    """Copy portable Claude CLI auth into an isolated config dir when present."""
+    source = Path(source_config or os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    copied = False
+    for name in CLAUDE_PORTABLE_AUTH_FILES:
+        src = source / name
+        if not src.is_file():
+            continue
+        config_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, config_dir / name)
+        copied = True
+    return copied
 
 
 class AgentAdapter:
@@ -154,23 +196,20 @@ class ClaudeAdapter(AgentAdapter):
         return self._mount_tree(tree_dir, workspace / ".claude" / "skills")
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
-        # A fresh config dir keeps the experimenter's personal ~/.claude/skills
-        # out of the sandbox (the Pi runner's isolation lesson); auth is carried
-        # over by copying .credentials.json when it exists, and env-based auth
-        # (ANTHROPIC_API_KEY / OAuth) passes through untouched.
+        # Use a fresh config dir when auth is portable, so personal config does
+        # not bleed into the run. Claude Code's current OAuth/keychain login is
+        # not file-seedable; pointing CLAUDE_CONFIG_DIR at an empty directory
+        # turns a valid login into "not logged in", so preserve the normal CLI
+        # config path in that case.
         config_dir = workspace / ".trigger-config"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        default_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-        creds = default_config / ".credentials.json"
-        if creds.is_file():
-            shutil.copy2(creds, config_dir / ".credentials.json")
         argv = [self.claude_bin, "-p", query, "--output-format", "stream-json", "--verbose",
                 "--max-turns", str(self.max_turns),
                 "--allowedTools", "Skill", "Read", "Glob", "Grep"]
         if model:
             argv += ["--model", model]
         env = os.environ.copy()
-        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+        if os.environ.get("ANTHROPIC_API_KEY") or seed_claude_config_dir(config_dir):
+            env["CLAUDE_CONFIG_DIR"] = str(config_dir)
         result = self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
         # Hitting --max-turns exits nonzero, but the model HAD its window to
         # load the skill — that is a completed observation, not a broken run.
@@ -211,7 +250,7 @@ class CodexAdapter(AgentAdapter):
     name = "codex"
     default_models: list[str | None] = [None]
 
-    def __init__(self, codex_cmd: str = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral") -> None:
+    def __init__(self, codex_cmd: str = DEFAULT_CODEX_CMD) -> None:
         self.codex_cmd = codex_cmd
 
     def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
@@ -226,7 +265,9 @@ class CodexAdapter(AgentAdapter):
             argv += ["--model", model]
         argv.append(query)
         env = os.environ.copy()
-        env["CODEX_HOME"] = str(workspace / ".codex")
+        codex_home = workspace / ".codex"
+        seed_codex_home(codex_home)
+        env["CODEX_HOME"] = str(codex_home)
         return self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
 
 
@@ -283,16 +324,17 @@ ADAPTERS: dict[str, type[AgentAdapter]] = {"claude": ClaudeAdapter, "codex": Cod
 
 
 def adapter_instance(name: str, *, claude_bin: str = "claude", codex_cmd: str | None = None, max_turns: int = 6) -> AgentAdapter:
-    if name == "claude":
+    adapter_cls = ADAPTERS[name]
+    if adapter_cls is ClaudeAdapter:
         return ClaudeAdapter(claude_bin=claude_bin, max_turns=max_turns)
-    if name == "codex":
-        return CodexAdapter(codex_cmd=codex_cmd or "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral")
-    return ADAPTERS[name]()
+    if adapter_cls is CodexAdapter:
+        return CodexAdapter(codex_cmd=codex_cmd or DEFAULT_CODEX_CMD)
+    return adapter_cls()
 
 
 def matrix_capabilities() -> dict[str, Any]:
     """Capability rows for exactly the agents accepted by this command."""
-    return {name: AGENT_CAPABILITIES[name] for name in sorted(ADAPTERS)}
+    return {name: require_agent_capabilities(name) for name in sorted(ADAPTERS)}
 
 
 def trigger_tree_for_manifest(repo_root: Path, manifest: dict[str, Any], work_dir: Path, ablation: str | None) -> tuple[Path, str, dict[str, Any] | None]:
@@ -303,16 +345,11 @@ def trigger_tree_for_manifest(repo_root: Path, manifest: dict[str, Any], work_di
         tree_dir = Path(build_canonical_skill_tree(repo_root, manifest, work_dir / "canonical"))
         return tree_dir, canonical_skill_tree_hash(repo_root, manifest), {"mode": "baseline"}
 
-    ablation_doc = ablation_by_id(manifest, ablation)
-    if ablation_doc is None:
-        raise SystemExit(f"unknown ablation: {ablation}")
-    components = ablation_components(ablation_doc)
-    if not components:
-        raise SystemExit(f"ablation {ablation} is instruction-simulated; trigger matrix ablations must declare a materialized removal")
-    if derived_population(components) != "trigger":
-        raise SystemExit(f"ablation {ablation} is an answer-population ablation; trigger matrix ablations must target discovery/trigger behavior")
-    provenance = materialize_ablation(repo_root, manifest, ablation_doc, work_dir / "materialized" / str(ablation))
-    tree_hash = str(((provenance.get("identity") or {}).get("canonical")) or canonical_skill_tree_hash(repo_root, manifest))
+    try:
+        provenance = materialize_trigger_ablation(repo_root, manifest, ablation, work_dir / "materialized" / str(ablation))
+    except AblationError as exc:
+        raise SystemExit(str(exc)) from exc
+    tree_hash = Provenance.from_dict(provenance).identity.canonical
     return Path(provenance["dir"]), tree_hash, provenance
 
 
@@ -324,11 +361,11 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
         workspace = Path(td)
         copied = adapter.mount(tree_dir, workspace)
         names = mounted_skill_names(copied)
-        result = adapter.invoke(query, model, workspace, timeout)
-        stdout = str(result.get("stdout") or "")
+        result = validate_invoke_result(adapter.name, adapter.invoke(query, model, workspace, timeout))
+        stdout = str(result["stdout"])
         triggered, evidence = adapter.detect(stdout, names, copied)
     usage, cost = stream_usage_and_cost(stdout)
-    observation_complete = bool(result.get("observation_complete"))
+    observation_complete = bool(result["observation_complete"])
     row = {
         "agent": adapter.name,
         "model": model,
@@ -337,13 +374,13 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
         "triggered": triggered,
         "pass": observation_complete and triggered == should_trigger,
         "observation_complete": observation_complete,
-        "returncode": result.get("returncode"),
-        "timed_out": bool(result.get("timed_out")),
-        "elapsed_ms": result.get("elapsed_ms"),
+        "returncode": result["returncode"],
+        "timed_out": bool(result["timed_out"]),
+        "elapsed_ms": result["elapsed_ms"],
         "evidence": evidence,
         "usage_normalized": usage,
         "cost_normalized": cost,
-        "stderr": (str(result.get("stderr") or ""))[-1000:],
+        "stderr": (str(result["stderr"] or ""))[-1000:],
     }
     if metadata:
         row.update({k: v for k, v in metadata.items() if k not in row})
@@ -437,10 +474,15 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
     manifest = load_manifest(manifest_path)
     repo_root = repo_root_for_manifest(manifest_path)
     adapters: list[AgentAdapter] = []
+    capability_rows: dict[str, Any] = {}
     for name in agents:
         if name not in ADAPTERS:
             raise SystemExit(f"unknown agent {name!r}; known: {sorted(ADAPTERS)} (subclass AgentAdapter to add one)")
-        adapters.append(adapter_instance(name, claude_bin=claude_bin, codex_cmd=codex_cmd, max_turns=max_turns))
+        capability_rows[name] = require_agent_capabilities(name)
+        adapter = adapter_instance(name, claude_bin=claude_bin, codex_cmd=codex_cmd, max_turns=max_turns)
+        if adapter.name != name:
+            raise SystemExit(f"ADAPTERS[{name!r}] returned adapter with name {adapter.name!r}; set the adapter's name to {name!r}")
+        adapters.append(adapter)
     with tempfile.TemporaryDirectory(prefix="trigger-tree-") as td:
         # One skill tree for the whole matrix: every cell mounts the exact same
         # bytes, and the recorded hash/provenance proves which revision was measured.
@@ -478,7 +520,7 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         "skill_tree_hash": tree_hash,
         "ablation": ablation,
         "provenance": provenance,
-        "agents": {name: AGENT_CAPABILITIES[name].as_dict() for name in sorted({r["agent"] for r in results})},
+        "agents": {name: capability_rows[name].as_dict() for name in sorted(capability_rows)},
         "runs_per_query": runs_per_query,
         "summary": {"total": len(results), "passed": passed,
                     "pass_rate": (passed / len(results)) if results else None},
@@ -501,7 +543,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-turns", type=int, default=6, help="claude adapter: turns the model gets to load the skill (its observation window)")
     ap.add_argument("--claude-bin", default="claude")
-    ap.add_argument("--codex-cmd", default="codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral",
+    ap.add_argument("--codex-cmd", default=DEFAULT_CODEX_CMD,
                     help="codex adapter command prefix; the raw query is appended as the final argv item")
     ap.add_argument("--trace-runs", help="optional directory for per-run trace.jsonl/events.json/metrics.json artifacts for every selected agent")
     ap.add_argument("--ablation", help="materialize this discovery/trigger-population ablation id and trigger-test the altered skill")
