@@ -51,6 +51,7 @@ from ablation_model import (
     PreparedTask,
     Provenance,
     ResultSet,
+    RunnerOutcome,
     TIMEOUT_FAILURE,
     TreeIdentity,
     causal_confirmation,
@@ -3646,6 +3647,59 @@ def final_answer_from_events(events: dict[str, Any]) -> str:
     return ""
 
 
+def write_runner_outcome(run_dir: Path, outcome: RunnerOutcome) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The ONE adapter from a RunnerOutcome to the on-disk run contract, shared by
+    every answer runner (codex/claude/subagent). Provider-specific work — spawning
+    the tool and parsing its wire format — happens in the runner; everything from
+    here down is identical for all providers:
+
+      * events.json / metrics.json / metadata.json / trace.jsonl come from
+        write_trace_artifacts, so the telemetry-precedence rule (a provider block
+        beats the trace-derived one; missing telemetry is marked, never zero) and
+        the current-run-only metadata guarantee have a single owner.
+      * usage/cost are normalized here from the provider-reported numbers; passing
+        the blocks through metadata lets write_trace_artifacts stamp them into both
+        artifacts (or fall back to trace-derived / explicit missing).
+      * output.md is formatted through RunnerOutcome.output_body, so a timeout is
+        encoded the same way everywhere (timed_out=True + returncode 124 in
+        metadata, a failure marker in the body) and no runner can hand-roll a body
+        that slips a crashed run past execution_valid().
+
+    A None answer is derived from the parsed trace (the Codex path); a string
+    answer is used verbatim."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    trace_text = outcome.trace_text or ""
+    usage_block = normalize_usage(outcome.usage, source="provider_reported")
+    cost_block = normalize_cost(outcome.cost_usd, source="provider_reported", pricing_model=outcome.model)
+    metadata = {
+        "provider": outcome.provider,
+        "model": outcome.model,
+        "returncode": outcome.returncode,
+        "timed_out": bool(outcome.timed_out),
+        "elapsed_ms": int(outcome.elapsed_ms),
+        "stderr": outcome.stderr,
+        "usage_normalized": usage_block,
+        "cost_normalized": cost_block,
+        **outcome.metadata_extra,
+    }
+    extra_metrics = {"elapsed_ms": int(outcome.elapsed_ms), "returncode": outcome.returncode, **outcome.metrics_extra}
+    events, metrics = write_trace_artifacts(
+        run_dir,
+        trace_text,
+        source=outcome.provider,
+        metadata=metadata,
+        extra_metrics=extra_metrics,
+        environment=outcome.environment,
+        write_metadata=True,
+        write_raw_trace=bool(trace_text),
+    )
+    answer = outcome.answer
+    if answer is None:   # Codex: the answer is the final trace message, known only now.
+        answer = final_answer_from_events(events) or trace_text.strip()
+    (run_dir / "output.md").write_text(outcome.output_body(answer), encoding="utf-8")
+    return events, metrics
+
+
 def safe_child_path(root: Path, relative: str) -> Path:
     rel = Path(relative)
     if rel.is_absolute() or ".." in rel.parts:
@@ -3769,37 +3823,27 @@ def run_codex(args: argparse.Namespace) -> int:
         # arm and the with_skill arm share a skill revision (skill_tree_hash).
         prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
         started = time.time()
+        environment = {"runner": "codex", "command": cmd, "cwd": "<isolated workspace>", "variant": pt.variant_truth}
         with tempfile.TemporaryDirectory(prefix="codex-ws-") as wd:
             ws = Path(wd)
             skill_rel, input_rel = codex_skill_workspace(pt, ws)
             prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             try:
                 proc = subprocess.run(cmd, shell=True, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=str(ws))
-                elapsed_ms = int((time.time() - started) * 1000)
-                trace_text = proc.stdout if proc.stdout.strip() else ""
-                if trace_text:
-                    events, metrics = write_trace_artifacts(
-                        base,
-                        trace_text,
-                        source="codex",
-                        metadata={"provider": "codex", "elapsed_ms": elapsed_ms, "stderr": proc.stderr[:4000] if proc.stderr else "", **prov_extra},
-                        extra_metrics={"elapsed_ms": elapsed_ms, "returncode": proc.returncode},
-                        environment={"runner": "codex", "command": cmd, "cwd": "<isolated workspace>", "variant": pt.variant_truth},
-                        write_metadata=True,
-                    )
-                else:
-                    events, metrics = {"schema_version": 1, "source": "codex", "events": []}, {"schema_version": 1, "source": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode}
-                    write_json(base / "events.json", events)
-                    write_json(base / "metrics.json", metrics)
-                    write_json(base / "metadata.json", {"provider": "codex", "elapsed_ms": elapsed_ms, "returncode": proc.returncode, "stderr": proc.stderr[:4000] if proc.stderr else "", "trace_source": "codex", **prov_extra})
-                answer = final_answer_from_events(events) or proc.stdout.strip()
-                if proc.returncode != 0:
-                    answer = f"{CODEX_FAILURE}: returncode={proc.returncode}]\n\n{answer}\n\nstderr:\n{proc.stderr[:4000]}"
-                (base / "output.md").write_text(answer or f"{CODEX_FAILURE}: no output produced]\n", encoding="utf-8")
+                # answer=None: the Codex answer is the final trace message, derived
+                # by the writer once the trace is parsed.
+                outcome = RunnerOutcome(
+                    provider="codex", answer=None, returncode=proc.returncode,
+                    elapsed_ms=int((time.time() - started) * 1000),
+                    stderr=proc.stderr[:4000] if proc.stderr else "",
+                    trace_text=proc.stdout if proc.stdout.strip() else "",
+                    metadata_extra=prov_extra, environment=environment)
             except subprocess.TimeoutExpired as exc:
-                elapsed_ms = int((time.time() - started) * 1000)
-                (base / "output.md").write_text(f"{CODEX_FAILURE}: timed out after {timeout}s]\n", encoding="utf-8")
-                write_json(base / "metadata.json", {"provider": "codex", "returncode": 124, "timed_out": True, "elapsed_ms": elapsed_ms, "stderr": str(exc)[:4000], **prov_extra})
+                outcome = RunnerOutcome(
+                    provider="codex", answer="", returncode=124, timed_out=True, timeout_s=timeout,
+                    elapsed_ms=int((time.time() - started) * 1000), stderr=str(exc)[:4000],
+                    metadata_extra=prov_extra, environment=environment)
+        write_runner_outcome(base, outcome)
     return 0
 
 
@@ -3920,27 +3964,18 @@ def run_claude(args: argparse.Namespace) -> int:
             skill_rel, input_rel = codex_skill_workspace(pt, ws)
             prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             result = claude_cli_invoke(prompt, model=row_model, claude_bin=claude_bin, timeout=timeout)
-            metrics = claude_run_metrics(result)
-            usage_block = normalize_usage(result.get("usage"), source="provider_reported")
-            cost_block = normalize_cost(result.get("cost_usd"), source="provider_reported", pricing_model=row_model)
-            metrics["usage_normalized"] = usage_block
-            metrics["cost_normalized"] = cost_block
-            write_json(base / "metrics.json", metrics)
-            write_json(base / "metadata.json", {
-                "provider": "claude", "model": row_model, "returncode": result.get("returncode"),
-                "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
-                "cost_usd": metrics.get("cost_usd"), "stderr": result.get("stderr", ""),
-                "usage_normalized": usage_block, "cost_normalized": cost_block,
-                "trace_source": "claude", **prov_extra})
-            write_json(base / "events.json", {"schema_version": 1, "source": "claude", "events": []})
-            answer = result.get("answer") or ""
-            if result.get("timed_out"):
-                answer = f"{CLAUDE_FAILURE}: timed out after {timeout}s]\n"
-            elif result.get("returncode") not in (0, None):
-                answer = f"{CLAUDE_FAILURE}: returncode={result.get('returncode')}]\n\n{answer}\n\nstderr:\n{result.get('stderr','')}"
-            elif not answer:
-                answer = f"{CLAUDE_FAILURE}: no output produced]\n"
-            (base / "output.md").write_text(answer, encoding="utf-8")
+            # Claude parses its envelope here; the top-level token/cost fields it
+            # aggregates ride metrics_extra so metrics.json keeps its shape.
+            claude_metrics = claude_run_metrics(result)
+            metrics_extra = {k: v for k, v in claude_metrics.items() if k not in ("schema_version", "source")}
+            outcome = RunnerOutcome(
+                provider="claude", answer=result.get("answer") or "",
+                returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
+                timeout_s=timeout, elapsed_ms=result.get("elapsed_ms") or 0, stderr=result.get("stderr", ""),
+                usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=row_model,
+                metadata_extra={**prov_extra, "cost_usd": claude_metrics.get("cost_usd")},
+                metrics_extra=metrics_extra)
+            write_runner_outcome(base, outcome)
     return 0
 
 
@@ -4875,30 +4910,25 @@ def run_subagent_tasks(
                 elapsed_ms = int((time.time() - started) * 1000)
         if store is not None:
             store.save()
+        # The subagent seam returns structured trace records; re-serialize them to
+        # JSONL so the SAME parse→normalize path (and trace.jsonl) that every other
+        # runner uses produces events/metrics — no private normalize call here.
         trace_records = outcome.get("trace") if isinstance(outcome.get("trace"), list) else []
-        events_doc, metrics = normalize_trace_records(trace_records, source="subagent")
-        metrics.update({k: v for k, v in (outcome.get("usage") or {}).items() if isinstance(v, (int, float))})
-        metrics["elapsed_ms"] = int(elapsed_ms)
+        trace_text = "\n".join(json.dumps(r, ensure_ascii=False, default=str) for r in trace_records) if trace_records else ""
         raw_usage = outcome.get("usage") if isinstance(outcome.get("usage"), dict) else None
-        usage_block = normalize_usage(raw_usage, source="provider_reported") if raw_usage else metrics.get("usage_normalized", {"source": "missing"})
-        cost_block = normalize_cost((raw_usage or {}).get("cost_usd"), source="provider_reported", pricing_model=row_model)
-        metrics["usage_normalized"] = usage_block
-        metrics["cost_normalized"] = cost_block
-        write_json(base / "events.json", events_doc)
-        write_json(base / "metrics.json", metrics)
-        write_json(base / "metadata.json", {
-            "provider": "subagent", "model": row_model, "returncode": outcome.get("returncode", 1 if error else 0),
-            "timed_out": bool(outcome.get("timed_out", False)), "elapsed_ms": int(elapsed_ms),
-            "usage_normalized": usage_block, "cost_normalized": cost_block,
-            "tool_replay_mode": mode, "trace_source": "subagent", **prov_extra})
-        answer = str(outcome.get("answer") or "")
-        if outcome.get("timed_out"):
-            answer = f"{TIMEOUT_FAILURE}: {error or 'subagent timed out'}]\n"
-        elif error:
-            answer = f"{CLAUDE_FAILURE}: {error}]\n"
-        elif not answer:
-            answer = f"{CLAUDE_FAILURE}: no output produced]\n"
-        (base / "output.md").write_text(answer, encoding="utf-8")
+        timed_out = bool(outcome.get("timed_out", False))
+        ro = RunnerOutcome(
+            provider="subagent", answer=str(outcome.get("answer") or ""),
+            returncode=outcome.get("returncode", 1 if error else 0), timed_out=timed_out,
+            # A timeout keeps its error string (or the subagent's default) so the
+            # TIMEOUT marker, not the provider marker, heads the body.
+            error=error or ("subagent timed out" if timed_out else None),
+            elapsed_ms=int(elapsed_ms), trace_text=trace_text,
+            usage=raw_usage, cost_usd=(raw_usage or {}).get("cost_usd"), model=row_model,
+            metadata_extra={"tool_replay_mode": mode, **prov_extra},
+            metrics_extra={k: v for k, v in (raw_usage or {}).items() if isinstance(v, (int, float))},
+            diagnose_returncode=False)
+        write_runner_outcome(base, ro)
     return 0
 
 
