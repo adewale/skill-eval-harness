@@ -663,9 +663,9 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             wrow = next(r for r in rows if r["variant"] == "with_skill")
             apt, wpt = sb.PreparedTask.from_row(arow), sb.PreparedTask.from_row(wrow)
             with tempfile.TemporaryDirectory() as ca, tempfile.TemporaryDirectory() as cb:
-                sa, ia = sb.codex_skill_workspace(apt, Path(ca))
-                sw, iw = sb.codex_skill_workspace(wpt, Path(cb))
-                cpa, cpw = sb.codex_task_prompt(apt, sa, ia), sb.codex_task_prompt(wpt, sw, iw)
+                sa, ia = sb.build_skill_workspace(apt, Path(ca))
+                sw, iw = sb.build_skill_workspace(wpt, Path(cb))
+                cpa, cpw = sb.build_task_prompt(apt, sa, ia), sb.build_task_prompt(wpt, sw, iw)
                 self.assertEqual(cpa, cpw)
                 self.assertEqual(sa, sw)                   # identical relative mounts
                 leaks["codex_prompt"] = cpa
@@ -1602,13 +1602,13 @@ class AblationReviewFixesTests(unittest.TestCase):
             base = {"skill_paths": [str(skill / "SKILL.md")], "input_files": [], "prompt": "x"}
             with tempfile.TemporaryDirectory() as w1:
                 ws = Path(w1)
-                sk, _ = sb.codex_skill_workspace(sb.PreparedTask.from_row({**base, "variant": "without_skill"}), ws)
+                sk, _ = sb.build_skill_workspace(sb.PreparedTask.from_row({**base, "variant": "without_skill"}), ws)
                 self.assertEqual(sk, [])                       # without_skill mounts no skill
                 self.assertFalse((ws / "skills").exists())
-                self.assertIn("Do not use any skill", sb.codex_task_prompt(sb.PreparedTask.from_row({"variant": "without_skill", "prompt": "x"}), sk, []))
+                self.assertIn("Do not use any skill", sb.build_task_prompt(sb.PreparedTask.from_row({"variant": "without_skill", "prompt": "x"}), sk, []))
             with tempfile.TemporaryDirectory() as w2:
                 ws = Path(w2)
-                sk, _ = sb.codex_skill_workspace(sb.PreparedTask.from_row({**base, "variant": "with_skill"}), ws)
+                sk, _ = sb.build_skill_workspace(sb.PreparedTask.from_row({**base, "variant": "with_skill"}), ws)
                 self.assertTrue(sk and (ws / sk[0]).exists())  # skill mounted inside the isolated workspace
                 self.assertTrue(sk[0].startswith("skills/"))   # workspace-relative, not the original repo path
 
@@ -1621,7 +1621,7 @@ class AblationReviewFixesTests(unittest.TestCase):
             "ablation": {"id": "no-rp", "mode": "instruction_simulated", "population": "answer", "removed_component": "regression-proof"},
             "instruction": "Use the good-pr skill, but simulate this ablation: remove/ignore regression-proof. Expected regression to watch for: accepts weak tests.",
         }
-        sim_prompt = sb.codex_task_prompt(sb.PreparedTask.from_row(sim), skills, [])
+        sim_prompt = sb.build_task_prompt(sb.PreparedTask.from_row(sim), skills, [])
         self.assertIn("simulate this ablation", sim_prompt)
         self.assertIn("regression-proof", sim_prompt)
         # materialized: the on-disk skill is already altered -> blind, no hypothesis text.
@@ -1632,8 +1632,8 @@ class AblationReviewFixesTests(unittest.TestCase):
                          "components": [{"class": "instructions", "mechanism": "section", "skill_root": "skills/root-0/SKILL.md", "target": {"heading": "## H"}}]},
             "instruction": "Use the skill under test (good-pr). Its files are provided in your workspace ...",
         }
-        mat_prompt = sb.codex_task_prompt(sb.PreparedTask.from_row(mat), skills, [])
-        with_prompt = sb.codex_task_prompt(sb.PreparedTask.from_row({"variant": "with_skill", "prompt": "Review.", "instruction": "x"}), skills, [])
+        mat_prompt = sb.build_task_prompt(sb.PreparedTask.from_row(mat), skills, [])
+        with_prompt = sb.build_task_prompt(sb.PreparedTask.from_row({"variant": "with_skill", "prompt": "Review.", "instruction": "x"}), skills, [])
         self.assertNotIn("simulate", mat_prompt)
         self.assertNotIn("ignore/remove", mat_prompt)
         self.assertNotIn("regression-proof", mat_prompt)
@@ -2315,9 +2315,9 @@ class ConsumersTakeAPreparedTaskTests(unittest.TestCase):
                                prompt="Review.", tags=(), ablation=sim)
 
     def test_codex_prompt_consumes_preparedtask_and_blinds_materialized(self):
-        mat = sb.codex_task_prompt(self.mat_pt(), ["skills/root-0/SKILL.md"], [])
+        mat = sb.build_task_prompt(self.mat_pt(), ["skills/root-0/SKILL.md"], [])
         self.assertNotIn("simulate", mat)                  # materialized arm is blind: no hypothesis text
-        sim = sb.codex_task_prompt(self.sim_pt(), ["skills/root-0/SKILL.md"], [])
+        sim = sb.build_task_prompt(self.sim_pt(), ["skills/root-0/SKILL.md"], [])
         self.assertIn("simulate this ablation", sim)       # instruction-simulated is told what to do
 
     def test_safe_task_json_model_visible_variant_is_owned_by_the_object(self):
@@ -2400,7 +2400,7 @@ class OldSkillParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as ws:
             p = self.repo(Path(td))
             _, row = self.old_row(p)
-            skill_rel, _ = sb.codex_skill_workspace(sb.PreparedTask.from_row(row), Path(ws))
+            skill_rel, _ = sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(ws))
             mounted = (Path(ws) / skill_rel[0]).read_text(encoding="utf-8")
             self.assertIn("OLD-MARKER", mounted)
             self.assertNotIn("CURRENT-MARKER", mounted)   # the silent bug: used to mount the current skill
