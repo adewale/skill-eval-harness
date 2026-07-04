@@ -35,6 +35,11 @@ class NormalizeUsageCostTests(unittest.TestCase):
         self.assertEqual(sb.normalize_usage({}), {"source": "missing"})
         self.assertEqual(sb.normalize_usage({"input_tokens": 5}, source="not_applicable"), {"source": "not_applicable"})
 
+    def test_non_finite_numbers_are_missing_not_exceptions(self):
+        self.assertEqual(sb.normalize_usage({"input_tokens": float("inf")}), {"source": "missing"})
+        self.assertEqual(sb.normalize_usage({"input_tokens": float("nan")}), {"source": "missing"})
+        self.assertEqual(sb.normalize_cost(float("inf")), {"source": "missing"})
+
     def test_invalid_source_raises(self):
         with self.assertRaises(ValueError):
             sb.normalize_usage({"input_tokens": 1}, source="vibes")
@@ -99,6 +104,33 @@ class RunnerStampTests(unittest.TestCase):
             self.assertEqual(metrics["usage_normalized"]["total_tokens"], 42)
             self.assertEqual(metrics["usage_normalized"]["source"], "trace_normalized")
 
+    def test_trace_artifacts_tolerate_non_finite_json_numbers(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run"
+            sb.write_trace_artifacts(
+                run_dir,
+                '{"usage":{"input_tokens":1e999},"duration_ms":1e999,"cost":NaN}',
+                source="codex",
+            )
+            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+            event = json.loads((run_dir / "events.json").read_text(encoding="utf-8"))["events"][0]
+            self.assertNotIn("usage_normalized", metrics)
+            self.assertNotIn("elapsed_ms", metrics)
+            self.assertEqual(event.get("tokens"), {})
+            self.assertNotIn("duration_ms", event)
+
+    def test_write_trace_artifacts_metadata_is_current_run_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text(json.dumps({"parse_errors": ["stale"], "old": True}), encoding="utf-8")
+            sb.write_trace_artifacts(run_dir, "", source="codex", metadata={"provider": "codex"})
+            metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertNotIn("old", metadata)
+            self.assertNotIn("parse_errors", metadata)
+            self.assertNotIn("schema_version", metadata)
+            self.assertNotIn("source", metadata)
+
     def test_stream_usage_and_cost(self):
         stream = "\n".join([
             json.dumps({"type": "message_end", "usage": {"input": 200, "output": 50, "totalTokens": 250, "cost": 0.01}}),
@@ -107,11 +139,48 @@ class RunnerStampTests(unittest.TestCase):
         ])
         usage, cost = sb.stream_usage_and_cost(stream)
         self.assertEqual(usage["total_tokens"], 375)
-        self.assertEqual(usage["source"], "provider_reported")
+        self.assertEqual(usage["source"], "trace_normalized")
         self.assertEqual(cost["total_cost"], 0.015)
         empty_usage, empty_cost = sb.stream_usage_and_cost("plain text only")
         self.assertEqual(empty_usage, {"source": "missing"})
         self.assertEqual(empty_cost, {"source": "missing"})
+
+    def test_stream_usage_and_cost_tolerates_non_finite_json_numbers(self):
+        usage, cost = sb.stream_usage_and_cost('{"type":"result","usage":{"input_tokens":1e999},"total_cost_usd":NaN}')
+        self.assertEqual(usage, {"source": "missing"})
+        self.assertEqual(cost, {"source": "missing"})
+
+    def test_stream_usage_and_cost_ignores_non_finite_sibling_costs(self):
+        stream = "\n".join([
+            json.dumps({"cost": 0.25}),
+            '{"cost": 1e999}',
+        ])
+        _, cost = sb.stream_usage_and_cost(stream)
+        self.assertEqual(cost["total_cost"], 0.25)
+        self.assertEqual(cost["source"], "trace_normalized")
+
+    def test_stream_usage_and_cost_uses_last_valid_cumulative_blocks(self):
+        stream = "\n".join([
+            json.dumps({"type": "result", "usage": {"input_tokens": 7, "output_tokens": 3}, "cost": 0.25}),
+            '{"type":"result","usage":{"input_tokens":1e999},"cost":1e999}',
+        ])
+        usage, cost = sb.stream_usage_and_cost(stream)
+        self.assertEqual(usage["input_tokens"], 7)
+        self.assertEqual(usage["output_tokens"], 3)
+        self.assertEqual(usage["total_tokens"], 10)
+        self.assertEqual(cost["total_cost"], 0.25)
+
+    def test_stream_usage_prefers_cumulative_result_usage(self):
+        stream = "\n".join([
+            json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 100, "output_tokens": 20}}}),
+            json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 200, "output_tokens": 40}}}),
+            json.dumps({"type": "result", "usage": {"input_tokens": 300, "output_tokens": 60, "total_tokens": 360}}),
+        ])
+        usage, _ = sb.stream_usage_and_cost(stream)
+        self.assertEqual(usage["input_tokens"], 300)
+        self.assertEqual(usage["output_tokens"], 60)
+        self.assertEqual(usage["total_tokens"], 360)
+        self.assertEqual(usage["source"], "trace_normalized")
 
     def test_jetty_metadata_carries_blocks_both_ways(self):
         record = {"trajectory_id": "t1", "status": "completed",

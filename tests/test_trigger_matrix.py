@@ -4,24 +4,30 @@ Offline: the stub adapter runs the whole pipeline in CI with no model — the
 demo skill's should-fire query triggers, the should-not-fire query doesn't,
 and weakening the mounted description measurably under-triggers (the tuning
 loop's core signal, reproduced deterministically). Claude-specific detection
-and the observation-window rule are covered with canned event streams.
+and the observation-window rule are covered with canned event streams; Codex is
+covered through its adapter contract and shared path-evidence detector.
 
-Live (manual): RUN_TRIGGER_SMOKE=1 runs the real Claude CLI across haiku,
-sonnet, and opus as subagents:
+Live (manual): RUN_AGENT_INVOKE_SMOKE=1 runs one cheap invocation for every
+supported live trigger adapter/model to verify auth/network/process plumbing.
+RUN_TRIGGER_SMOKE=1 runs the fuller Claude trigger matrix across haiku, sonnet,
+and opus; RUN_CODEX_TRIGGER_SMOKE=1 and RUN_PI_TRIGGER_SMOKE=1 run the same
+trigger path for those adapters:
 
+    RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v
     RUN_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix -v
 
-It needs a `claude` binary and API credentials, spends real tokens (roughly
-a dollar at the default 1 run per query x 3 models x 2 queries), and asserts
-the pipeline — every cell observed, at least one autonomous load detected —
-not per-model trigger outcomes, which are the measurement, not the contract.
+Live smokes need the relevant CLI and API credentials, and spend real tokens.
+The cheap agent smoke asserts invocation only; the trigger-matrix smokes assert
+observed trigger-eval runs and at least one autonomous load.
 """
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from agent_capabilities import AGENT_CAPABILITIES
 import run_trigger_matrix as tm
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +58,139 @@ class StubMatrixOfflineTests(unittest.TestCase):
             self.assertEqual((s["should_not_trigger"]["passed"], s["should_not_trigger"]["total"]), (2, 2), cell["model"])
             self.assertEqual(s["incomplete_observations"], 0)
         self.assertEqual(report["summary"]["pass_rate"], 1.0)
+
+    def test_trace_runs_are_written_for_matrix_agents(self):
+        with tempfile.TemporaryDirectory() as td:
+            trace_root = Path(td) / "traces"
+            report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=["offline"], runs_per_query=1,
+                                   timeout=30, workers=1, trace_runs=trace_root)
+            trace_dir = Path(report["results"][0]["trace_dir"])
+            self.assertTrue((trace_dir / "trace.jsonl").is_file())
+            self.assertTrue((trace_dir / "events.json").is_file())
+            self.assertTrue((trace_dir / "metrics.json").is_file())
+            meta = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["provider"], "stub")
+            self.assertEqual(meta["measurement"], "raw_measurement")
+            self.assertEqual(report["results"][0]["measurement"], "raw_measurement")
+            self.assertTrue(trace_dir.is_relative_to(trace_root))
+
+    def test_trace_runs_use_unique_matrix_root_per_invocation(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.time, "time", return_value=1234567890):
+            trace_root = Path(td) / "traces"
+            first = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                  models=["offline"], runs_per_query=2,
+                                  timeout=30, workers=1, trace_runs=trace_root)
+            second = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=["offline"], runs_per_query=1,
+                                   timeout=30, workers=1, trace_runs=trace_root)
+        first_roots = {Path(r["trace_dir"]).relative_to(trace_root).parts[0] for r in first["results"]}
+        second_roots = {Path(r["trace_dir"]).relative_to(trace_root).parts[0] for r in second["results"]}
+        self.assertEqual(len(first_roots), 1)
+        self.assertEqual(len(second_roots), 1)
+        self.assertNotEqual(first_roots, second_roots)
+
+    def test_trace_model_segment_is_path_safe(self):
+        with tempfile.TemporaryDirectory() as td:
+            trace_root = Path(td) / "traces"
+            report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=["../bad/model"], runs_per_query=1,
+                                   timeout=30, workers=1, trace_runs=trace_root)
+            trace_dir = Path(report["results"][0]["trace_dir"])
+        self.assertTrue(trace_dir.is_relative_to(trace_root))
+        parts = trace_dir.relative_to(trace_root).parts
+        self.assertNotIn("..", parts)
+        self.assertIn("bad-model", parts)
+
+    def test_baseline_provenance_records_skill_tree_hash(self):
+        report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                               models=[None], runs_per_query=1, timeout=30, workers=1)
+        self.assertEqual(report["provenance"], {"mode": "baseline", "skill_tree_hash": report["skill_tree_hash"]})
+
+    def test_demo_manifest_contains_documented_discovery_ablation(self):
+        manifest = tm.load_manifest(DEMO_MANIFEST)
+        repo_root = tm.repo_root_for_manifest(DEMO_MANIFEST)
+        with tempfile.TemporaryDirectory() as td:
+            _, tree_hash, provenance = tm.trigger_tree_for_manifest(repo_root, manifest, Path(td), "weaker-description")
+        self.assertEqual(provenance["id"], "weaker-description")
+        self.assertEqual(provenance["population"], "trigger")
+        self.assertEqual(tree_hash, provenance["parent_skill_hash"])
+        self.assertNotIn("dir", provenance)
+        self.assertNotIn("skill_files", provenance)
+
+    def test_duplicate_agents_or_models_are_rejected(self):
+        with self.assertRaises(SystemExit) as agent_ctx:
+            tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub", "stub"],
+                          models=[None], runs_per_query=1, timeout=30, workers=1)
+        self.assertIn("duplicate --agent", str(agent_ctx.exception))
+        with self.assertRaises(SystemExit) as model_ctx:
+            tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                          models=["same", "same"], runs_per_query=1, timeout=30, workers=1)
+        self.assertIn("duplicate --model", str(model_ctx.exception))
+
+    def test_trace_write_failure_does_not_discard_observation(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm, "write_trace_artifacts", side_effect=OSError("ENOSPC")):
+            report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=[None], runs_per_query=1, timeout=30, workers=1,
+                                   trace_runs=Path(td) / "traces")
+        self.assertEqual(report["summary"]["total"], 1)
+        self.assertEqual(report["summary"]["passed"], 1)
+        self.assertIn("ENOSPC", report["results"][0]["trace_error"])
+
+    def test_worker_exception_becomes_incomplete_row(self):
+        class FailingAdapter(tm.AgentAdapter):
+            name = "stub"
+
+            def mount(self, tree_dir, workspace):
+                raise OSError("disk full")
+
+            def invoke(self, query, model, workspace, timeout):
+                raise AssertionError("unreachable")
+
+        old = tm.ADAPTERS["stub"]
+        try:
+            tm.ADAPTERS["stub"] = FailingAdapter
+            report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=[None], runs_per_query=1, timeout=30, workers=1)
+        finally:
+            tm.ADAPTERS["stub"] = old
+        self.assertEqual(report["summary"]["total"], 1)
+        self.assertEqual(report["summary"]["passed"], 0)
+        self.assertEqual(report["matrix"][0]["summary"]["incomplete_observations"], 1)
+        self.assertIn("disk full", report["results"][0]["error"])
+
+    def test_trace_redacts_workspace_credentials(self):
+        class SecretEchoAdapter(tm.AgentAdapter):
+            name = "secret"
+
+            def mount(self, tree_dir, workspace):
+                (workspace / ".codex").mkdir(parents=True)
+                (workspace / ".codex" / "auth.json").write_text('{"token":"SECRET-TOKEN-12345"}', encoding="utf-8")
+                return self._mount_tree(tree_dir, workspace / "skills")
+
+            def invoke(self, query, model, workspace, timeout):
+                skill = next((workspace / "skills").glob("*/SKILL.md"))
+                stdout = json.dumps({
+                    "type": "command",
+                    "command": ["bash", "-lc", f"cat {skill}; echo SECRET-TOKEN-12345"],
+                }) + "\n"
+                return {"stdout": stdout, "stderr": "", "returncode": 0, "timed_out": False,
+                        "elapsed_ms": 1, "observation_complete": True}
+
+        with tempfile.TemporaryDirectory() as td:
+            tree = tm.build_canonical_skill_tree(tm.repo_root_for_manifest(DEMO_MANIFEST), tm.load_manifest(DEMO_MANIFEST), Path(td) / "tree")
+            trace_dir = Path(td) / "trace"
+            row = tm.run_cell_query(SecretEchoAdapter(), tree, "q", True, None, 12, trace_dir)
+            trace_text = (trace_dir / "trace.jsonl").read_text(encoding="utf-8")
+            metadata_text = (trace_dir / "metadata.json").read_text(encoding="utf-8")
+            metrics_text = (trace_dir / "metrics.json").read_text(encoding="utf-8")
+        self.assertTrue(row["triggered"])
+        self.assertNotIn("SECRET-TOKEN-12345", trace_text)
+        self.assertNotIn("SECRET-TOKEN-12345", json.dumps(row))
+        self.assertNotIn("SECRET-TOKEN-12345", metadata_text)
+        self.assertNotIn("SECRET-TOKEN-12345", metrics_text)
+        self.assertIn("[REDACTED]", trace_text)
+        self.assertIn("[REDACTED]", json.dumps(row))
 
     def test_weakened_description_under_triggers_offline(self):
         """The loop's core signal, deterministic: strip the description of the
@@ -84,7 +223,7 @@ class StubMatrixOfflineTests(unittest.TestCase):
 
     def test_unknown_agent_names_the_extension_seam(self):
         with self.assertRaises(SystemExit) as ctx:
-            tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["codex"], models=None,
+            tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["missing-agent"], models=None,
                           runs_per_query=1, timeout=30, workers=1)
         self.assertIn("AgentAdapter", str(ctx.exception))
 
@@ -130,6 +269,285 @@ class ClaudeDetectionTests(unittest.TestCase):
             skill_md.write_text("---\nname: demo-reviewer\ndescription: x\n---\n", encoding="utf-8")
             self.assertEqual(tm.mounted_skill_names([skill_md]), ["demo-reviewer"])
 
+    def test_claude_invoke_seeds_portable_auth_into_isolated_config(self):
+        seen = {}
+
+        def fake_run(argv, *, cwd, env, timeout):
+            config_dir = Path(env["CLAUDE_CONFIG_DIR"])
+            seen["config_dir"] = config_dir
+            seen["credentials"] = (config_dir / ".credentials.json").read_text(encoding="utf-8")
+            return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False,
+                    "elapsed_ms": 1, "observation_complete": True}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)):
+            root = Path(td)
+            source = root / "user-claude"
+            source.mkdir()
+            (source / ".credentials.json").write_text('{"token":"t"}', encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(source)}, clear=True):
+                result = tm.ClaudeAdapter().invoke("q", "haiku", root / "run", 12)
+        self.assertEqual(seen["credentials"], '{"token":"t"}')
+        self.assertTrue(str(seen["config_dir"]).endswith(".trigger-config"))
+        self.assertTrue(result["config_isolated"])
+        self.assertNotIn("config_isolation_warning", result)
+
+    def test_claude_invoke_preserves_nonportable_oauth_config(self):
+        seen = {}
+
+        def fake_run(argv, *, cwd, env, timeout):
+            seen["config_dir"] = env.get("CLAUDE_CONFIG_DIR")
+            return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False,
+                    "elapsed_ms": 1, "observation_complete": True}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)):
+            root = Path(td)
+            source = root / "oauth-backed-claude"
+            source.mkdir()
+            workspace = root / "run"
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(source)}, clear=True):
+                result = tm.ClaudeAdapter().invoke("q", "haiku", workspace, 12)
+        self.assertEqual(seen["config_dir"], str(source))
+        self.assertFalse((workspace / ".trigger-config").exists())
+        self.assertFalse(result["config_isolated"])
+        self.assertIn("personal config may influence", result["config_isolation_warning"])
+
+
+class CodexAdapterTests(unittest.TestCase):
+    """Codex trigger support without a live codex binary."""
+
+    def test_codex_is_registered_and_declares_matrix_capability(self):
+        self.assertIn("codex", tm.ADAPTERS)
+        cap = tm.matrix_capabilities()["codex"]
+        self.assertTrue(cap.autonomous_trigger)
+        self.assertTrue(cap.trigger_ablation)
+        parser = tm.build_arg_parser()
+        agent_action = next(a for a in parser._actions if "--agent" in getattr(a, "option_strings", ()))
+        self.assertIn("codex", agent_action.choices)
+
+    def test_codex_uses_shared_path_evidence_detector(self):
+        mounted = Path("/tmp/trigger-x/.codex/skills/demo-reviewer/SKILL.md")
+        stream = json.dumps({"type": "command", "command": ["bash", "-lc", f"cat {mounted}"]})
+        triggered, evidence = tm.CodexAdapter().detect(stream, ["demo-reviewer"], [mounted])
+        self.assertTrue(triggered)
+        self.assertTrue(evidence)
+        prose = json.dumps({"type": "message", "content": "I would use demo-reviewer."})
+        self.assertEqual(tm.CodexAdapter().detect(prose, ["demo-reviewer"], [mounted]), (False, []))
+
+    def test_codex_invoke_appends_raw_query_and_model(self):
+        seen = {}
+
+        def fake_run(argv, *, cwd, env, timeout):
+            seen.update({"argv": argv, "cwd": cwd, "env": env, "timeout": timeout})
+            return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False,
+                    "elapsed_ms": 1, "observation_complete": True}
+
+        with mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
+            with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"CODEX_HOME": str(Path(td) / "source-codex")}):
+                tm.CodexAdapter(codex_cmd="codex exec --json").invoke("raw trigger query", "o4-mini", Path(td), 12)
+        self.assertEqual(seen["argv"], ["codex", "exec", "--json", "--model", "o4-mini", "raw trigger query"])
+        self.assertTrue(str(seen["env"]["CODEX_HOME"]).endswith(".codex"))
+        self.assertEqual(seen["timeout"], 12)
+        self.assertIs(tm.CodexAdapter()._run_argv, tm.run_argv_with_timeout)
+
+    def test_codex_invoke_seeds_auth_without_copying_user_skills(self):
+        seen = {}
+
+        def fake_run(argv, *, cwd, env, timeout):
+            codex_home = Path(env["CODEX_HOME"])
+            seen["auth"] = (codex_home / "auth.json").read_text(encoding="utf-8")
+            seen["config"] = (codex_home / "config.toml").read_text(encoding="utf-8")
+            seen["mounted_skills_survive"] = (codex_home / "skills" / "demo").is_dir()
+            seen["user_skills_not_copied"] = not (codex_home / "skills" / "personal").exists()
+            return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False,
+                    "elapsed_ms": 1, "observation_complete": True}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
+            root = Path(td)
+            source = root / "user-codex"
+            (source / "skills" / "personal").mkdir(parents=True)
+            (source / "auth.json").write_text('{"token":"t"}', encoding="utf-8")
+            (source / "config.toml").write_text("model = 'm'\n", encoding="utf-8")
+            workspace = root / "run"
+            (workspace / ".codex" / "skills" / "demo").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(source)}):
+                tm.CodexAdapter(codex_cmd="codex exec --json").invoke("q", None, workspace, 12)
+        self.assertEqual(seen["auth"], '{"token":"t"}')
+        self.assertEqual(seen["config"], "model = 'm'\n")
+        self.assertTrue(seen["mounted_skills_survive"])
+        self.assertTrue(seen["user_skills_not_copied"])
+
+    def test_run_cell_query_requires_invoke_contract(self):
+        class BrokenAdapter(tm.AgentAdapter):
+            name = "broken"
+
+            def mount(self, tree_dir, workspace):
+                return self._mount_tree(tree_dir, workspace / "skills")
+
+            def invoke(self, query, model, workspace, timeout):
+                return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False, "elapsed_ms": 1}
+
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td) / "tree"
+            skill = tree / "demo"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+            with self.assertRaises(KeyError) as ctx:
+                tm.run_cell_query(BrokenAdapter(), tree, "q", True, None, 12)
+        self.assertIn("observation_complete", str(ctx.exception))
+
+    def test_missing_capability_row_fails_before_any_runs(self):
+        class UnregisteredAdapter(tm.AgentAdapter):
+            name = "my-agent"
+
+            def mount(self, tree_dir, workspace):
+                raise AssertionError("mount should not run before capability validation")
+
+            def invoke(self, query, model, workspace, timeout):
+                raise AssertionError("invoke should not run before capability validation")
+
+        old = dict(tm.ADAPTERS)
+        try:
+            tm.ADAPTERS["my-agent"] = UnregisteredAdapter
+            with self.assertRaises(SystemExit) as ctx:
+                tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["my-agent"],
+                              models=[None], runs_per_query=1, timeout=30, workers=1)
+        finally:
+            tm.ADAPTERS.clear()
+            tm.ADAPTERS.update(old)
+        self.assertIn("AGENT_CAPABILITIES", str(ctx.exception))
+
+    def test_codex_default_command_is_single_owner(self):
+        self.assertEqual(tm.CodexAdapter().codex_cmd, tm.DEFAULT_CODEX_CMD)
+        parser = tm.build_arg_parser()
+        codex_action = next(a for a in parser._actions if "--codex-cmd" in getattr(a, "option_strings", ()))
+        self.assertEqual(codex_action.default, tm.DEFAULT_CODEX_CMD)
+
+
+def _csv_env(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return list(default)
+    return [part.strip() or None for part in raw.split(",")]
+
+
+def _live_invoke_smoke_agents():
+    configured = [name for name in _csv_env("AGENT_INVOKE_SMOKE_AGENTS", []) if name]
+    if configured:
+        return [str(name) for name in configured if name]
+    return [
+        name for name in tm.ADAPTERS
+        if name != "stub" and tm.require_agent_capabilities(name).autonomous_trigger
+    ]
+
+
+def _live_invoke_smoke_models(agent_name, adapter):
+    upper = agent_name.upper().replace("-", "_")
+    models = _csv_env(f"{upper}_INVOKE_SMOKE_MODELS", adapter.default_models)
+    if os.environ.get(f"{upper}_INVOKE_SMOKE_MODEL") is not None:
+        models = [os.environ.get(f"{upper}_INVOKE_SMOKE_MODEL") or None]
+    return models
+
+
+@unittest.skipUnless(os.environ.get("RUN_AGENT_INVOKE_SMOKE") == "1",
+                     "cheap manual smoke: set RUN_AGENT_INVOKE_SMOKE=1 (needs live agent CLIs + credentials, spends tiny requests)")
+class AgentInvokeSmokeTests(unittest.TestCase):
+    def test_live_agents_complete_trivial_prompt_for_each_model(self):
+        query = os.environ.get("AGENT_INVOKE_SMOKE_QUERY", "Reply with exactly: OK")
+        timeout = int(os.environ.get("AGENT_INVOKE_SMOKE_TIMEOUT", "90"))
+        manifest = tm.load_manifest(DEMO_MANIFEST)
+        repo_root = tm.repo_root_for_manifest(DEMO_MANIFEST)
+        results = []
+        failures = []
+
+        for agent_name in _live_invoke_smoke_agents():
+            try:
+                adapter = tm.adapter_instance(
+                    agent_name,
+                    claude_bin=os.environ.get("CLAUDE_INVOKE_SMOKE_BIN", "claude"),
+                    codex_cmd=os.environ.get("CODEX_INVOKE_SMOKE_CMD", tm.DEFAULT_CODEX_CMD),
+                    max_turns=int(os.environ.get("CLAUDE_INVOKE_SMOKE_MAX_TURNS", "1")),
+                )
+                models = _live_invoke_smoke_models(agent_name, adapter)
+            except Exception as exc:
+                failures.append(f"{agent_name}/(setup): {exc!r}")
+                results.append({"agent": agent_name, "model": "(setup)", "ok": False, "error": repr(exc)})
+                continue
+
+            for model in models:
+                model_label = model or "(default)"
+                row = {"agent": agent_name, "model": model_label}
+                try:
+                    with tempfile.TemporaryDirectory(prefix=f"{agent_name}-invoke-smoke-") as td:
+                        workspace = Path(td)
+                        tree = tm.build_canonical_skill_tree(repo_root, manifest, workspace / "tree")
+                        copied = adapter.mount(tree, workspace)
+                        result = tm.validate_invoke_result(
+                            agent_name,
+                            adapter.invoke(query, model, workspace, timeout),
+                        )
+                    row.update({
+                        "returncode": result["returncode"],
+                        "timed_out": result["timed_out"],
+                        "observation_complete": result["observation_complete"],
+                        "elapsed_ms": result["elapsed_ms"],
+                        "stdout_bytes": len(str(result["stdout"])),
+                        "stdout_tail": str(result["stdout"])[-300:],
+                        "stderr_tail": str(result["stderr"])[-300:],
+                        "mounted_paths": len(copied),
+                    })
+                    ok = (
+                        not result["timed_out"] and
+                        result["returncode"] == 0 and
+                        result["observation_complete"] and
+                        bool(str(result["stdout"]).strip())
+                    )
+                    row["ok"] = ok
+                    if not ok:
+                        failures.append(
+                            f"{agent_name}/{model_label}: returncode={result['returncode']} "
+                            f"timed_out={result['timed_out']} observation_complete={result['observation_complete']} "
+                            f"stdout_bytes={len(str(result['stdout']))} "
+                            f"stdout_tail={str(result['stdout'])[-300:]!r} "
+                            f"stderr_tail={str(result['stderr'])[-300:]!r}"
+                        )
+                except Exception as exc:
+                    row.update({"ok": False, "error": repr(exc)})
+                    failures.append(f"{agent_name}/{model_label}: {exc!r}")
+                results.append(row)
+
+        if not results:
+            failures.append("no live agent/model smoke targets were selected")
+        print(json.dumps({"cheap_invoke_smoke": results}, indent=2, sort_keys=True))
+        self.assertFalse(failures, "\n".join(failures))
+
+
+class AgentInvokeSmokeConfigTests(unittest.TestCase):
+    def test_default_cheap_smoke_targets_every_live_supported_agent_and_model(self):
+        clean_env = {
+            "AGENT_INVOKE_SMOKE_AGENTS": "",
+            "CLAUDE_INVOKE_SMOKE_MODELS": "",
+            "CODEX_INVOKE_SMOKE_MODEL": "",
+            "PI_INVOKE_SMOKE_MODEL": "",
+        }
+        with mock.patch.dict(os.environ, clean_env, clear=False):
+            for key in clean_env:
+                os.environ.pop(key, None)
+            agents = _live_invoke_smoke_agents()
+            models = {
+                name: _live_invoke_smoke_models(name, tm.adapter_instance(name))
+                for name in agents
+            }
+        self.assertEqual(agents, ["claude", "codex", "pi"])
+        self.assertEqual(models["claude"], ["haiku", "sonnet", "opus"])
+        self.assertEqual(models["codex"], [None])
+        self.assertEqual(models["pi"], [None])
+
+    def test_advertised_live_smoke_envs_are_consumed_by_tests(self):
+        test_source = Path(__file__).read_text(encoding="utf-8")
+        for agent, cap in AGENT_CAPABILITIES.items():
+            if cap.live_smoke_env:
+                self.assertIn(cap.live_smoke_env, test_source, agent)
+
 
 @unittest.skipUnless(os.environ.get("RUN_TRIGGER_SMOKE") == "1",
                      "manual smoke: set RUN_TRIGGER_SMOKE=1 (needs claude CLI + credentials, spends tokens)")
@@ -145,6 +563,38 @@ class ClaudeMatrixSmokeTests(unittest.TestCase):
         self.assertFalse(incomplete, f"broken runs (crash/timeout), not trigger signal: {incomplete}")
         self.assertTrue(any(r["triggered"] for r in report["results"]),
                         "no model loaded the skill on any run — detection or mounting is broken")
+
+
+@unittest.skipUnless(os.environ.get("RUN_CODEX_TRIGGER_SMOKE") == "1",
+                     "manual smoke: set RUN_CODEX_TRIGGER_SMOKE=1 (needs codex CLI + credentials, spends tokens)")
+class CodexMatrixSmokeTests(unittest.TestCase):
+    def test_codex_matrix_end_to_end(self):
+        runs = int(os.environ.get("CODEX_TRIGGER_SMOKE_RUNS", "1"))
+        model = os.environ.get("CODEX_TRIGGER_SMOKE_MODEL")
+        report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["codex"],
+                               models=[model] if model else [None], runs_per_query=runs,
+                               timeout=300, workers=1)
+        tm.print_matrix(report["matrix"])
+        incomplete = [r for r in report["results"] if not r["observation_complete"]]
+        self.assertFalse(incomplete, f"broken runs (crash/timeout), not trigger signal: {incomplete}")
+        self.assertTrue(any(r["triggered"] for r in report["results"]),
+                        "no Codex run loaded the skill — detection, auth, or mounting is broken")
+
+
+@unittest.skipUnless(os.environ.get("RUN_PI_TRIGGER_SMOKE") == "1",
+                     "manual smoke: set RUN_PI_TRIGGER_SMOKE=1 (needs Pi CLI + credentials, spends tokens)")
+class PiMatrixSmokeTests(unittest.TestCase):
+    def test_pi_matrix_end_to_end(self):
+        runs = int(os.environ.get("PI_TRIGGER_SMOKE_RUNS", "1"))
+        model = os.environ.get("PI_TRIGGER_SMOKE_MODEL")
+        report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["pi"],
+                               models=[model] if model else [None], runs_per_query=runs,
+                               timeout=300, workers=1)
+        tm.print_matrix(report["matrix"])
+        incomplete = [r for r in report["results"] if not r["observation_complete"]]
+        self.assertFalse(incomplete, f"broken runs (crash/timeout), not trigger signal: {incomplete}")
+        self.assertTrue(any(r["triggered"] for r in report["results"]),
+                        "no Pi run loaded the skill — detection, auth, or mounting is broken")
 
 
 if __name__ == "__main__":

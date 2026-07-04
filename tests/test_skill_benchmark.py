@@ -219,6 +219,13 @@ class SkillBenchmarkTests(unittest.TestCase):
         self.assertTrue(triggered)
         self.assertIn("/tmp/pi-trigger-x/skills/good-readme/SKILL.md", evidence[0])
 
+    def test_trigger_detector_reads_command_array_events(self):
+        copied = [Path("/tmp/codex-trigger-x/.codex/skills/good-readme/SKILL.md")]
+        event = json.dumps({"type": "command", "command": ["bash", "-lc", f"cat {copied[0]}"]})
+        triggered, evidence = tr.detect_trigger(event, copied)
+        self.assertTrue(triggered)
+        self.assertIn("SKILL.md", evidence[0])
+
     def test_prepare_includes_input_files(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

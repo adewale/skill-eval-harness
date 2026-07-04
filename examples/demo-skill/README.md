@@ -5,13 +5,15 @@ API key**: a deterministic stub stands in for the model, so the whole
 prepare → run → report → ablation-confirmation loop is reproducible (and runs in
 CI via `tests/test_example_demo.py`).
 
-The skill (`skills/demo/`) has exactly two load-bearing pieces, each targeted by one
-**materialized** ablation in `evals/shared-benchmark.json`:
+The skill (`skills/demo/`) has two answer-path load-bearing pieces, each targeted by one
+**materialized** ablation in `evals/shared-benchmark.json`. It also has a
+discovery-population ablation for autonomous trigger examples.
 
 | ablation | mechanism | removes | confirms a regression on |
 |---|---|---|---|
 | `no-severity` | `section` | the `## Severity rules` section of SKILL.md | the `severity-label` assertion |
 | `no-checklist` | `reference` (`remove: content`) | the body of `references/checklist.md` | the `cite-checklist` assertion |
+| `weaker-description` | `frontmatter_field` | the extra `when_to_use` trigger hints | measured by `skill-trigger-matrix --ablation weaker-description` |
 
 `stub_runner.py` answers by reading the skill that the harness actually mounted into
 the isolated workspace, so removing a piece really changes the output — the
@@ -69,6 +71,8 @@ python3 ../../run_trigger_matrix.py evals/shared-benchmark.json \
 
 The loop for acting on the resulting per-model trigger rates is
 [`docs/tuning-skill-activation.md`](../../docs/tuning-skill-activation.md).
+To exercise the bundled discovery ablation, add
+`--ablation weaker-description --trace-runs /tmp/demo-trigger-traces`.
 
 ## What it teaches
 

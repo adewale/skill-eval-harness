@@ -26,7 +26,9 @@ exists, so writing the journey is documentation work, not feature work.
 [`architecture.md`](architecture.md) (how the pipeline fits together),
 [`abstractions.md`](abstractions.md) (what each core object is),
 [`vocabulary.md`](vocabulary.md) (glossary),
-[`evals-are-not-tests.md`](evals-are-not-tests.md) (how to read results).
+[`evals-are-not-tests.md`](evals-are-not-tests.md) (how to read results),
+[`agent-parity.md`](agent-parity.md) (which agent surfaces are supported by Codex,
+Claude, Pi, Jetty, subagent, and stub).
 
 ## Specs
 

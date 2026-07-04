@@ -25,6 +25,7 @@ import skill_benchmark as sb
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
 import ablation_model as am
+import agent_capabilities as ac
 from helpers import make_eval_repo
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,17 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertIs(tm.cases_from_manifest, tr.cases_from_manifest)
         self.assertIs(tm.eval_rows_from_args, tr.eval_rows_from_args)
         self.assertIs(tm.pi_argv, tr.pi_argv)
+
+    def test_trigger_runners_share_trace_label_sanitizer(self):
+        self.assertIs(tr.safe_trace_label, sb.safe_trace_label)
+        self.assertIs(tm.safe_trace_label, sb.safe_trace_label)
+
+    def test_codex_default_command_has_one_code_owner(self):
+        parser = tm.build_arg_parser()
+        codex_action = next(a for a in parser._actions if "--codex-cmd" in getattr(a, "option_strings", ()))
+        self.assertEqual(codex_action.default, tm.DEFAULT_CODEX_CMD)
+        self.assertEqual(tm.CodexAdapter().codex_cmd, tm.DEFAULT_CODEX_CMD)
+        self.assertEqual((ROOT / "run_trigger_matrix.py").read_text(encoding="utf-8").count(tm.DEFAULT_CODEX_CMD), 1)
 
     def test_manifest_loading_goes_through_the_harness_source_loader(self):
         # tr.load_manifest is a thin named wrapper; what matters is that a YAML
@@ -122,6 +134,10 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertIn("cost_totals_block", inspect.getsource(sb.build_cost_summary))
         self.assertIn("cost_totals_block", inspect.getsource(sb.suite_cost_ledger))
         self.assertIn("discover_on_disk_run_rows", inspect.getsource(sb.suite_cost_ledger))
+
+    def test_agent_cost_capabilities_use_normalized_source_vocabulary(self):
+        for name, cap in ac.AGENT_CAPABILITIES.items():
+            self.assertIn(cap.dollar_cost, sb.COST_SOURCES, name)
 
 
 class TimeoutConventionTests(unittest.TestCase):
