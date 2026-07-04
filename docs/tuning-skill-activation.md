@@ -69,6 +69,22 @@ it):
 RUN_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix -v
 ```
 
+Codex is now a shipped matrix adapter too. It mounts the same canonical skill tree
+under the Codex project skill directory, runs the raw query through `codex exec --json`,
+and uses the same mounted-path evidence detector as Pi/stub:
+
+```bash
+skill-trigger-matrix examples/demo-skill/evals/shared-benchmark.json \
+  --agent codex \
+  --codex-cmd 'codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral' \
+  --runs-per-query 3 \
+  --out /tmp/trigger-codex.json
+```
+
+Use `--trace-runs DIR` to write `trace.jsonl`/`events.json`/`metrics.json` per run, and
+`--ablation ID` to measure a materialized discovery/trigger-population ablation through
+any selected adapter, including Codex.
+
 ## Reading the matrix
 
 - **Positives fail on some model** → the description omits the invocation language
@@ -116,33 +132,36 @@ Each rule below exists because its violation produced a wrong number at least on
 
 `run_trigger_matrix.py` treats an agent as three operations: mount the skill tree
 where that agent discovers skills, run it headless on the raw query, detect load
-evidence in its event stream. Claude Code, Pi, and the offline stub ship as
-adapters; adding Codex (or anything else) is one subclass:
+evidence in its event stream. Claude Code, Codex, Pi, and the offline stub ship as
+adapters. `docs/agent-parity.md` is the capability table for which surfaces each
+agent currently supports.
+
+Adding another agent is one subclass plus one registry row:
 
 ```python
-class CodexAdapter(AgentAdapter):
-    name = "codex"
+class MyAgentAdapter(AgentAdapter):
+    name = "my-agent"
 
     def mount(self, tree_dir, workspace):
-        # wherever Codex discovers skills on its own
-        return self._mount_tree(tree_dir, workspace / ".codex" / "skills")
+        return self._mount_tree(tree_dir, workspace / ".my-agent" / "skills")
 
     def invoke(self, query, model, workspace, timeout):
-        argv = ["codex", "exec", "--json", query] + (["--model", model] if model else [])
+        argv = ["my-agent", "run", "--json", query] + (["--model", model] if model else [])
         return self._run_argv(argv, cwd=workspace, env=os.environ.copy(), timeout=timeout)
 
-ADAPTERS["codex"] = CodexAdapter
+ADAPTERS["my-agent"] = MyAgentAdapter
 ```
 
 The default `detect()` already scans any JSON event stream for reads of the mounted
 skill paths; override it only when an agent reports skill loads some other way, as
-Claude Code does. Once registered, `--agent codex` joins the same matrix, and the
+Claude Code does. Once registered, `--agent my-agent` joins the same matrix, and the
 report's cells stay comparable because every adapter mounts the identical canonical
-skill tree and the same detector rules decide "triggered."
+or materialized skill tree and the same detector rules decide "triggered."
 
-For Pi specifically, `run_pi_trigger_eval.py` remains the deeper tool — it adds
-discovery-population ablation arms, per-query trace artifacts, and cost telemetry
-on top of the same mount-and-detect approach.
+For Pi specifically, `skill-pi-trigger-eval` remains a compatibility entry point for
+older scripts. The matrix now has the shared surfaces that matter for parity: per-run
+trace artifacts, materialized trigger ablations, cost/usage parsing where the stream
+reports it, and the same evidence-class stamp.
 
 The demo's Haiku cell is the method in miniature: one run said the description was
 fine, three runs put its Haiku trigger rate at 1-in-3, and only the matrix made the
