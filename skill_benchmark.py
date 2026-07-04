@@ -3657,7 +3657,7 @@ def safe_child_path(root: Path, relative: str) -> Path:
     return dest
 
 
-def codex_skill_workspace(pt: PreparedTask, ws: Path) -> tuple[list[str], list[str]]:
+def build_skill_workspace(pt: PreparedTask, ws: Path) -> tuple[list[str], list[str]]:
     """Build an isolated workspace holding ONLY the task's selected skill tree (per
     variant) and fixtures, so executing with cwd here cannot reach the original
     repo skill. For an ablation the PreparedTask's skill_paths are the materialized
@@ -3725,12 +3725,12 @@ def register_workspace_builder(name: str, builder: Any) -> None:
     WORKSPACE_BUILDERS[name] = builder
 
 
-register_workspace_builder("codex", codex_skill_workspace)     # run-codex
-register_workspace_builder("claude", codex_skill_workspace)    # run-claude shares the workspace builder
+register_workspace_builder("codex", build_skill_workspace)     # run-codex
+register_workspace_builder("claude", build_skill_workspace)    # run-claude shares the workspace builder
 register_workspace_builder("jetty", jetty_upload_workspace)    # export-jetty upload surface
 
 
-def codex_task_prompt(pt: PreparedTask, skill_paths: list[str] | None = None, input_files: list[str] | None = None) -> str:
+def build_task_prompt(pt: PreparedTask, skill_paths: list[str] | None = None, input_files: list[str] | None = None) -> str:
     file_note = "\n".join(f"- {p}" for p in (input_files or [])) if input_files else "- none"
     if pt.variant_truth == "without_skill":
         skill_note = "Do not use any skill. No skill files are present in this workspace."
@@ -3771,8 +3771,8 @@ def run_codex(args: argparse.Namespace) -> int:
         started = time.time()
         with tempfile.TemporaryDirectory(prefix="codex-ws-") as wd:
             ws = Path(wd)
-            skill_rel, input_rel = codex_skill_workspace(pt, ws)
-            prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
+            skill_rel, input_rel = build_skill_workspace(pt, ws)
+            prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             try:
                 proc = subprocess.run(cmd, shell=True, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=str(ws))
                 elapsed_ms = int((time.time() - started) * 1000)
@@ -3917,8 +3917,8 @@ def run_claude(args: argparse.Namespace) -> int:
         prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
         with tempfile.TemporaryDirectory(prefix="claude-ws-") as wd:
             ws = Path(wd)
-            skill_rel, input_rel = codex_skill_workspace(pt, ws)
-            prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
+            skill_rel, input_rel = build_skill_workspace(pt, ws)
+            prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             result = claude_cli_invoke(prompt, model=row_model, claude_bin=claude_bin, timeout=timeout)
             metrics = claude_run_metrics(result)
             usage_block = normalize_usage(result.get("usage"), source="provider_reported")
@@ -4839,8 +4839,8 @@ def run_subagent_tasks(
         turns = [str(t) for t in task.get("turns") or [] if str(t)]
         with tempfile.TemporaryDirectory(prefix="subagent-ws-") as wd:
             ws = Path(wd)
-            skill_rel, input_rel = codex_skill_workspace(pt, ws)
-            prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
+            skill_rel, input_rel = build_skill_workspace(pt, ws)
+            prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             started = time.time()
             try:
                 if turns:
@@ -4945,7 +4945,7 @@ def run_subagent(args: argparse.Namespace) -> int:
                               replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode())
 
 
-register_workspace_builder("subagent", codex_skill_workspace)   # run-subagent inherits CF.2
+register_workspace_builder("subagent", build_skill_workspace)   # run-subagent inherits CF.2
 
 
 JUDGE_NEGATIVE_CONTROLS = {

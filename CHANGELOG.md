@@ -4,6 +4,8 @@ All notable public changes are listed here. Release tags are the source of truth
 
 ## Unreleased
 
+- **Provider-neutral workspace/prompt helpers.** `codex_skill_workspace` and `codex_task_prompt` are renamed to `build_skill_workspace` and `build_task_prompt`. They were never Codex-only: `run-codex`, `run-claude`, and `run-subagent` all mount their isolated workspace and build their task prompt through the same two helpers (all three register `build_skill_workspace` as their workspace builder). The names now describe the behavior instead of one caller. Pure rename — no behavior change.
+
 - **Consolidation audit, part 2: the deferred structural refactors.**
   - *One discovery loop.* `discovered_run_units` now owns the case/model/variant/run walk for `grade`, `benchmark`, the judge collector, and the contamination report (four hand-synced copies before). The suite ledger's disk walk is the named `discover_on_disk_run_rows` beside it — the ledger deliberately bills every on-disk arm while grading is variant-scoped, and that difference is now a documented decision instead of two private implementations.
   - *One cost rollup.* Both ledgers (and the manifest audit's ablation-spend finding) build coverage/totals/spend groups from shared `spend_of`/`group_spend`/`cost_coverage_block`/`cost_totals_block`/`judge_cost_block` helpers.
