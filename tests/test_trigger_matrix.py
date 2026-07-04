@@ -4,7 +4,8 @@ Offline: the stub adapter runs the whole pipeline in CI with no model — the
 demo skill's should-fire query triggers, the should-not-fire query doesn't,
 and weakening the mounted description measurably under-triggers (the tuning
 loop's core signal, reproduced deterministically). Claude-specific detection
-and the observation-window rule are covered with canned event streams.
+and the observation-window rule are covered with canned event streams; Codex is
+covered through its adapter contract and shared path-evidence detector.
 
 Live (manual): RUN_TRIGGER_SMOKE=1 runs the real Claude CLI across haiku,
 sonnet, and opus as subagents:
@@ -53,6 +54,20 @@ class StubMatrixOfflineTests(unittest.TestCase):
             self.assertEqual(s["incomplete_observations"], 0)
         self.assertEqual(report["summary"]["pass_rate"], 1.0)
 
+    def test_trace_runs_are_written_for_matrix_agents(self):
+        with tempfile.TemporaryDirectory() as td:
+            trace_root = Path(td) / "traces"
+            report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=["offline"], runs_per_query=1,
+                                   timeout=30, workers=1, trace_runs=trace_root)
+            trace_dir = Path(report["results"][0]["trace_dir"])
+            self.assertTrue((trace_dir / "trace.jsonl").is_file())
+            self.assertTrue((trace_dir / "events.json").is_file())
+            self.assertTrue((trace_dir / "metrics.json").is_file())
+            meta = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["provider"], "stub")
+            self.assertEqual(meta["measurement"], "raw_autonomous_trigger_measurement")
+
     def test_weakened_description_under_triggers_offline(self):
         """The loop's core signal, deterministic: strip the description of the
         words users actually type and the (stub) agent stops loading the skill
@@ -84,7 +99,7 @@ class StubMatrixOfflineTests(unittest.TestCase):
 
     def test_unknown_agent_names_the_extension_seam(self):
         with self.assertRaises(SystemExit) as ctx:
-            tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["codex"], models=None,
+            tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["missing-agent"], models=None,
                           runs_per_query=1, timeout=30, workers=1)
         self.assertIn("AgentAdapter", str(ctx.exception))
 
@@ -129,6 +144,47 @@ class ClaudeDetectionTests(unittest.TestCase):
             skill_md.parent.mkdir()
             skill_md.write_text("---\nname: demo-reviewer\ndescription: x\n---\n", encoding="utf-8")
             self.assertEqual(tm.mounted_skill_names([skill_md]), ["demo-reviewer"])
+
+
+class CodexAdapterTests(unittest.TestCase):
+    """Codex trigger support without a live codex binary."""
+
+    def test_codex_is_registered_and_declares_matrix_capability(self):
+        self.assertIn("codex", tm.ADAPTERS)
+        cap = tm.matrix_capabilities()["codex"]
+        self.assertTrue(cap.autonomous_trigger)
+        self.assertTrue(cap.trigger_ablation)
+        parser = tm.build_arg_parser()
+        agent_action = next(a for a in parser._actions if "--agent" in getattr(a, "option_strings", ()))
+        self.assertIn("codex", agent_action.choices)
+
+    def test_codex_uses_shared_path_evidence_detector(self):
+        mounted = Path("/tmp/trigger-x/.codex/skills/demo-reviewer/SKILL.md")
+        stream = json.dumps({"type": "tool_use", "name": "Read", "input": {"file_path": str(mounted)}})
+        triggered, evidence = tm.CodexAdapter().detect(stream, ["demo-reviewer"], [mounted])
+        self.assertTrue(triggered)
+        self.assertTrue(evidence)
+        prose = json.dumps({"type": "message", "content": "I would use demo-reviewer."})
+        self.assertEqual(tm.CodexAdapter().detect(prose, ["demo-reviewer"], [mounted]), (False, []))
+
+    def test_codex_invoke_appends_raw_query_and_model(self):
+        seen = {}
+        old = tm.CodexAdapter._run_argv
+
+        def fake_run(argv, *, cwd, env, timeout):
+            seen.update({"argv": argv, "cwd": cwd, "env": env, "timeout": timeout})
+            return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False,
+                    "elapsed_ms": 1, "observation_complete": True}
+
+        try:
+            tm.CodexAdapter._run_argv = staticmethod(fake_run)
+            with tempfile.TemporaryDirectory() as td:
+                tm.CodexAdapter(codex_cmd="codex exec --json").invoke("raw trigger query", "o4-mini", Path(td), 12)
+        finally:
+            tm.CodexAdapter._run_argv = old
+        self.assertEqual(seen["argv"], ["codex", "exec", "--json", "--model", "o4-mini", "raw trigger query"])
+        self.assertTrue(str(seen["env"]["CODEX_HOME"]).endswith(".codex"))
+        self.assertEqual(seen["timeout"], 12)
 
 
 @unittest.skipUnless(os.environ.get("RUN_TRIGGER_SMOKE") == "1",
