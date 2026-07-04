@@ -7,7 +7,7 @@ The harness supports several agent surfaces, but not every agent supports every 
 | `claude` | yes (`run-claude`) | yes (`skill-trigger-matrix --agent claude`) | yes | yes | yes | provider-reported | yes (`--judge-model`) | yes through `run-subagent` | `RUN_TRIGGER_SMOKE` |
 | `codex` | yes (`run-codex`) | yes (`skill-trigger-matrix --agent codex`) | yes | yes | yes, when stream reports it | explicit `missing` unless a wrapper emits cost | no native backend; use `--judge-cmd` | no native replay | `RUN_CODEX_TRIGGER_SMOKE` |
 | `pi` | no core answer runner | yes (`skill-pi-trigger-eval`, `skill-trigger-matrix --agent pi`) | yes | yes | yes, when stream reports it | stream-reported when available | no | no | `RUN_PI_TRIGGER_SMOKE` |
-| `jetty` | yes (`export-jetty` / `run-jetty` / `import-jetty-results`) | no | answer-path ablations only | imported | imported | imported | planned in Jetty TODO | no | `RUN_JETTY_SMOKE` |
+| `jetty` | yes (`export-jetty` / `run-jetty` / `import-jetty-results`) | no | answer-path ablations only | imported | imported | imported | planned in Jetty TODO | no | n/a |
 | `subagent` | yes (`run-subagent`) | no | no | yes | yes, when backend returns it | explicit `missing` unless backend emits cost | no | yes | n/a |
 | `stub` | yes, demo/offline only | yes | yes | yes | not applicable | not applicable | no | no | n/a |
 
@@ -32,4 +32,4 @@ skill-trigger-matrix examples/demo-skill/evals/shared-benchmark.json \
   --out /tmp/trigger-codex-ablation.json
 ```
 
-Every row remains stamped `raw_autonomous_trigger_measurement`. These are rates for tuning descriptions, not provenance-confirmed causal lift claims.
+The report-level evidence class is `raw_autonomous_trigger_measurement`; individual result rows use the shared `raw_measurement` enum value. These are rates for tuning descriptions, not provenance-confirmed causal lift claims.

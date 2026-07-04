@@ -25,6 +25,7 @@ import skill_benchmark as sb
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
 import ablation_model as am
+import agent_capabilities as ac
 from helpers import make_eval_repo
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,6 +134,10 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertIn("cost_totals_block", inspect.getsource(sb.build_cost_summary))
         self.assertIn("cost_totals_block", inspect.getsource(sb.suite_cost_ledger))
         self.assertIn("discover_on_disk_run_rows", inspect.getsource(sb.suite_cost_ledger))
+
+    def test_agent_cost_capabilities_use_normalized_source_vocabulary(self):
+        for name, cap in ac.AGENT_CAPABILITIES.items():
+            self.assertIn(cap.dollar_cost, sb.COST_SOURCES, name)
 
 
 class TimeoutConventionTests(unittest.TestCase):

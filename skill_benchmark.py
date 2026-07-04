@@ -22,6 +22,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -2899,11 +2900,18 @@ def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
         return str(value)
 
     start = time.time()
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, start_new_session=True)
     try:
-        proc = subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout)
-        stdout, stderr, returncode, timed_out = _text(proc.stdout), _text(proc.stderr), proc.returncode, False
-    except subprocess.TimeoutExpired as exc:
-        stdout, stderr, returncode, timed_out = _text(exc.stdout), _text(exc.stderr), 124, True
+        out, err = proc.communicate(timeout=timeout)
+        stdout, stderr, returncode, timed_out = _text(out), _text(err), proc.returncode, False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        out, err = proc.communicate()
+        stdout, stderr, returncode, timed_out = _text(out), _text(err), 124, True
     return {"stdout": stdout, "stderr": stderr, "returncode": returncode, "timed_out": timed_out,
             "elapsed_ms": int((time.time() - start) * 1000),
             "observation_complete": returncode == 0 and not timed_out}
@@ -2947,7 +2955,7 @@ def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:
 
 
 USAGE_SOURCES = {"provider_reported", "trace_normalized", "estimated", "missing", "not_applicable"}
-COST_SOURCES = {"provider_reported", "price_table_estimated", "missing", "not_applicable"}
+COST_SOURCES = {"provider_reported", "trace_normalized", "price_table_estimated", "missing", "not_applicable"}
 # THE token-usage alias table. Every normalizer (metadata `normalize_usage`, the
 # trace-stream `usage_number`, and the Claude envelope parser) reads THIS table,
 # so the same provider payload can never be classified differently by two paths
@@ -2970,7 +2978,13 @@ COST_PART_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 def _num(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def normalize_usage(raw: Any, *, source: str = "provider_reported") -> dict[str, Any]:
@@ -3304,9 +3318,9 @@ def usage_number(usage: dict[str, Any], *keys: str) -> float | None:
     for key in keys:
         search.extend(USAGE_ALIASES.get(key, [key]))
     for key in search:
-        value = usage.get(key)
-        if isinstance(value, (int, float)):
-            return float(value)
+        value = _num(usage.get(key))
+        if value is not None:
+            return value
     return None
 
 
@@ -3362,12 +3376,12 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     exit_code = raw_trace_value(record, "exit_code", "returncode")
     if isinstance(exit_code, int):
         event["exit_code"] = exit_code
-    duration = raw_trace_value(record, "duration_ms", "elapsed_ms")
-    if isinstance(duration, (int, float)):
+    duration = _num(raw_trace_value(record, "duration_ms", "elapsed_ms"))
+    if duration is not None:
         event["duration_ms"] = duration
     usage = raw_trace_value(record, "usage", "tokens")
     if isinstance(usage, dict):
-        token_doc = {k: v for k, v in usage.items() if isinstance(v, (int, float))}
+        token_doc = {k: v for k, raw in usage.items() if (v := _num(raw)) is not None}
         normalized_total = usage_number(usage, "total_tokens")
         normalized_input = usage_number(usage, "input_tokens")
         normalized_output = usage_number(usage, "output_tokens")
@@ -3411,10 +3425,10 @@ def otel_attributes_for_event(event: dict[str, Any]) -> dict[str, Any]:
             attrs["file.path"] = event["input_summary"][:500]
     tokens = event.get("tokens")
     if isinstance(tokens, dict):
-        if isinstance(tokens.get("input_tokens"), (int, float)):
-            attrs["gen_ai.usage.input_tokens"] = int(tokens["input_tokens"])
-        if isinstance(tokens.get("output_tokens"), (int, float)):
-            attrs["gen_ai.usage.output_tokens"] = int(tokens["output_tokens"])
+        if (input_tokens := _num(tokens.get("input_tokens"))) is not None:
+            attrs["gen_ai.usage.input_tokens"] = int(input_tokens)
+        if (output_tokens := _num(tokens.get("output_tokens"))) is not None:
+            attrs["gen_ai.usage.output_tokens"] = int(output_tokens)
     if isinstance(event.get("exit_code"), int):
         attrs["process.exit_code"] = event["exit_code"]
     return attrs
@@ -3436,9 +3450,9 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
             for key, value in [("input_tokens", input_tokens), ("output_tokens", output_tokens), ("total_tokens", total_tokens)]:
                 if isinstance(value, (int, float)):
                     token_totals[key] += value
-        duration = raw_trace_value(record, "duration_ms", "elapsed_ms")
-        if isinstance(duration, (int, float)):
-            elapsed_ms += float(duration)
+        duration = _num(raw_trace_value(record, "duration_ms", "elapsed_ms"))
+        if duration is not None:
+            elapsed_ms += duration
         tokens = event.get("tokens")
         if isinstance(tokens, dict) and not isinstance(usage, dict):
             for key in token_totals:
@@ -3497,12 +3511,12 @@ def _sum_stream_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
         usage = _stream_usage_doc(record)
         if not usage:
             continue
-        normalized = normalize_usage(usage, source="provider_reported")
+        normalized = normalize_usage(usage, source="trace_normalized")
         for key in USAGE_ALIASES:
             value = normalized.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 totals[key] = totals.get(key, 0) + int(value)
-    return normalize_usage(totals if totals else None, source="provider_reported")
+    return normalize_usage(totals if totals else None, source="trace_normalized")
 
 
 def _cost_value_from_record(record: dict[str, Any]) -> float | None:
@@ -3512,10 +3526,10 @@ def _cost_value_from_record(record: dict[str, Any]) -> float | None:
         if isinstance(usage_obj, dict):
             raw = usage_obj.get("cost", usage_obj.get("cost_usd"))
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-        return float(raw)
+        return _num(raw)
     if isinstance(raw, dict):
         value = normalize_cost(raw).get("total_cost")
-        return float(value) if isinstance(value, (int, float)) else None
+        return _num(value)
     return None
 
 
@@ -3525,17 +3539,35 @@ def stream_usage_and_cost(raw_text: str) -> tuple[dict[str, Any], dict[str, Any]
     provider emits it; otherwise sum per-event usage deltas. Missing stays
     marked."""
     records = [obj for obj in iter_json_objects(raw_text) if isinstance(obj, dict)]
-    cumulative_usage = [_stream_usage_doc(record) for record in records if _is_cumulative_usage_record(record) and _stream_usage_doc(record)]
-    usage = normalize_usage(cumulative_usage[-1], source="provider_reported") if cumulative_usage else _sum_stream_usage(records)
+    cumulative_usage: list[dict[str, Any]] = []
+    for record in records:
+        if not _is_cumulative_usage_record(record):
+            continue
+        usage_doc = _stream_usage_doc(record)
+        if not usage_doc:
+            continue
+        normalized = normalize_usage(usage_doc, source="trace_normalized")
+        if normalized.get("source") != "missing":
+            cumulative_usage.append(normalized)
+    usage = cumulative_usage[-1] if cumulative_usage else _sum_stream_usage(records)
 
-    cumulative_cost = [_cost_value_from_record(record) for record in records if _is_cumulative_usage_record(record) and _cost_value_from_record(record) is not None]
+    cumulative_cost: list[dict[str, Any]] = []
+    for record in records:
+        if not _is_cumulative_usage_record(record):
+            continue
+        value = _cost_value_from_record(record)
+        if value is None:
+            continue
+        normalized = normalize_cost(value, source="trace_normalized")
+        if normalized.get("source") != "missing":
+            cumulative_cost.append(normalized)
     if cumulative_cost:
-        cost = normalize_cost(cumulative_cost[-1], source="provider_reported")
+        cost = cumulative_cost[-1]
         return usage, cost
     cost_values = [_cost_value_from_record(record) for record in records]
     cost_total = sum(value for value in cost_values if value is not None)
     cost_found = any(value is not None for value in cost_values)
-    cost = normalize_cost(round(cost_total, 6) if cost_found else None, source="provider_reported")
+    cost = normalize_cost(round(cost_total, 6) if cost_found else None, source="trace_normalized")
     return usage, cost
 
 
@@ -3568,14 +3600,14 @@ def write_trace_artifacts(
     # blocks — missing telemetry is marked, never silently absent or zero.
     for key in ("usage_normalized", "cost_normalized"):
         block = (metadata or {}).get(key)
-        if isinstance(block, dict) and block.get("source") in {"provider_reported", "price_table_estimated", "estimated", "not_applicable"}:
+        if isinstance(block, dict) and block.get("source") in {"provider_reported", "trace_normalized", "price_table_estimated", "estimated", "not_applicable"}:
             metrics[key] = block
     write_json(out_events or run_dir / "events.json", events)
     write_json(out_metrics or run_dir / "metrics.json", metrics)
     if environment:
         write_json(run_dir / "environment.json", environment)
     if write_metadata:
-        existing = read_metadata_base(run_dir)
+        existing: dict[str, Any] = {}
         if metadata:
             existing.update(metadata)
         existing.update({k: v for k, v in metrics.items() if k not in {"schema_version", "source"}})

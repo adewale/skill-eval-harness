@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-CostSupport = Literal["provider", "stream", "imported", "estimated", "missing", "not_applicable"]
+CostSupport = Literal["provider_reported", "trace_normalized", "price_table_estimated", "missing", "not_applicable"]
 
 
 @dataclass(frozen=True)
@@ -37,7 +37,7 @@ AGENT_CAPABILITIES: dict[str, AgentCapabilities] = {
         trigger_ablation=True,
         trace_artifacts=True,
         token_usage=True,
-        dollar_cost="provider",
+        dollar_cost="provider_reported",
         judge_backend=True,
         tool_replay=True,
         live_smoke_env="RUN_TRIGGER_SMOKE",
@@ -61,7 +61,7 @@ AGENT_CAPABILITIES: dict[str, AgentCapabilities] = {
         trigger_ablation=True,
         trace_artifacts=True,
         token_usage=True,
-        dollar_cost="stream",
+        dollar_cost="trace_normalized",
         judge_backend=False,
         tool_replay=False,
         live_smoke_env="RUN_PI_TRIGGER_SMOKE",
@@ -73,10 +73,10 @@ AGENT_CAPABILITIES: dict[str, AgentCapabilities] = {
         trigger_ablation=False,
         trace_artifacts=True,
         token_usage=True,
-        dollar_cost="imported",
+        dollar_cost="provider_reported",
         judge_backend=False,
         tool_replay=False,
-        live_smoke_env="RUN_JETTY_SMOKE",
+        live_smoke_env=None,
         notes="Jetty supports answer-path export/run/import; autonomous trigger and judge export/import remain separate Jetty TODOs.",
     ),
     "subagent": AgentCapabilities(

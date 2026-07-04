@@ -67,6 +67,9 @@ it):
 
 ```bash
 RUN_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix -v
+RUN_CODEX_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.CodexMatrixSmokeTests -v
+RUN_PI_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.PiMatrixSmokeTests -v
+RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v
 ```
 
 Codex is now a shipped matrix adapter too. It mounts the same canonical skill tree
@@ -157,7 +160,7 @@ AGENT_CAPABILITIES["my-agent"] = AgentCapabilities(
     trigger_ablation=True,
     trace_artifacts=True,
     token_usage=True,
-    dollar_cost="stream",
+    dollar_cost="trace_normalized",
     judge_backend=False,
     tool_replay=False,
     live_smoke_env=None,

@@ -589,6 +589,8 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             prov = am.Provenance.from_dict(provenance)
             self.assertEqual(tree_hash, prov.identity.canonical)
             self.assertEqual(tree_hash, provenance["parent_skill_hash"])
+            self.assertNotIn("dir", provenance)
+            self.assertNotIn("skill_files", provenance)
 
     def test_pi_trigger_baseline_matches_ablation_surface(self):
         # The baseline (no-ablation) arm must use the SAME canonical tree builder as

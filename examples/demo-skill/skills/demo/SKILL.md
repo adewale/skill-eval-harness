@@ -1,6 +1,7 @@
 ---
 name: demo-reviewer
 description: Demo skill for the Skill Eval Harness example. Use it to review a proposed change and label the severity of each finding.
+when_to_use: Use this skill when asked to review a proposed code change, inspect a diff, or label how serious a finding is.
 ---
 
 # Demo Reviewer

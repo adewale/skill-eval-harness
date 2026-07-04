@@ -75,13 +75,22 @@ from skill_benchmark import (
     write_trace_artifacts,
 )
 from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_manifest, pi_argv, skill_name_from_manifest, seed_config_dir
-from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, Provenance
+from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
 DEFAULT_CODEX_CMD = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral"
 INVOKE_RESULT_KEYS = ("stdout", "stderr", "returncode", "timed_out", "elapsed_ms", "observation_complete")
+INVOKE_RESULT_METADATA_KEYS = ("config_isolated", "config_isolation_warning")
 CODEX_HOME_FILES = ("auth.json", "config.toml")
 CLAUDE_PORTABLE_AUTH_FILES = (".credentials.json",)
+SENSITIVE_WORKSPACE_FILES = (
+    ".trigger-config/.credentials.json",
+    ".codex/auth.json",
+    ".codex/config.toml",
+    ".pi-config/auth.json",
+    ".pi-config/settings.json",
+    ".pi-config/APPEND_SYSTEM.md",
+)
 
 
 def mounted_skill_names(copied: list[Path]) -> list[str]:
@@ -143,6 +152,63 @@ def seed_claude_config_dir(config_dir: Path, source_config: Path | None = None) 
         shutil.copy2(src, config_dir / name)
         copied = True
     return copied
+
+
+def reject_duplicates(values: list[Any], label: str) -> None:
+    seen: set[Any] = set()
+    duplicates: list[str] = []
+    for value in values:
+        key = value if value is not None else "<default>"
+        if key in seen and str(key) not in duplicates:
+            duplicates.append(str(key))
+        seen.add(key)
+    if duplicates:
+        raise SystemExit(f"duplicate {label} value(s): {', '.join(duplicates)}; use --runs-per-query for repeated measurements")
+
+
+def _json_secret_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if len(value) >= 8 else []
+    if isinstance(value, dict):
+        out: list[str] = []
+        for child in value.values():
+            out.extend(_json_secret_values(child))
+        return out
+    if isinstance(value, list):
+        out: list[str] = []
+        for child in value:
+            out.extend(_json_secret_values(child))
+        return out
+    return []
+
+
+def workspace_secret_values(workspace: Path) -> list[str]:
+    secrets: list[str] = []
+    for rel in SENSITIVE_WORKSPACE_FILES:
+        path = workspace / rel
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if len(text.strip()) >= 8:
+            secrets.append(text)
+        try:
+            secrets.extend(_json_secret_values(json.loads(text)))
+        except json.JSONDecodeError:
+            secrets.extend(m.group(1) for m in re.finditer(r"""["']([^"']{8,})["']""", text))
+    # Longest first handles whole-file redaction before nested token values.
+    return sorted({s for s in secrets if s}, key=len, reverse=True)
+
+
+def redact_sensitive_text(text: str, secrets: list[str]) -> str:
+    redacted = text
+    for secret in secrets:
+        redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
+
+
+def safe_trace_segment(text: str, fallback: str) -> str:
+    label = safe_trace_label(text, fallback).strip(".-")
+    return label if label and label not in {".", ".."} else fallback
 
 
 class AgentAdapter:
@@ -208,9 +274,17 @@ class ClaudeAdapter(AgentAdapter):
         if model:
             argv += ["--model", model]
         env = os.environ.copy()
+        config_isolated = False
         if os.environ.get("ANTHROPIC_API_KEY") or seed_claude_config_dir(config_dir):
             env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+            config_isolated = True
         result = self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
+        result["config_isolated"] = config_isolated
+        if not config_isolated:
+            result["config_isolation_warning"] = (
+                "Claude OAuth/keychain auth was not portable; preserved the normal Claude config, "
+                "so personal config may influence this measurement"
+            )
         # Hitting --max-turns exits nonzero, but the model HAD its window to
         # load the skill — that is a completed observation, not a broken run.
         if result["returncode"] != 0 and self._result_subtype(result["stdout"]) == "error_max_turns":
@@ -343,28 +417,64 @@ def trigger_tree_for_manifest(repo_root: Path, manifest: dict[str, Any], work_di
     ablation, so Claude/Pi/Codex all measure the same altered bytes."""
     if not ablation:
         tree_dir = Path(build_canonical_skill_tree(repo_root, manifest, work_dir / "canonical"))
-        return tree_dir, canonical_skill_tree_hash(repo_root, manifest), {"mode": "baseline"}
+        tree_hash = canonical_skill_tree_hash(repo_root, manifest)
+        return tree_dir, tree_hash, {"mode": "baseline", "skill_tree_hash": tree_hash}
 
     try:
         provenance = materialize_trigger_ablation(repo_root, manifest, ablation, work_dir / "materialized" / str(ablation))
     except AblationError as exc:
         raise SystemExit(str(exc)) from exc
-    tree_hash = Provenance.from_dict(provenance).identity.canonical
-    return Path(provenance["dir"]), tree_hash, provenance
+    prov = Provenance.from_dict(provenance)
+    return Path(provenance["dir"]), prov.identity.canonical, prov.as_dict()
+
+
+def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger: bool,
+                       exc: BaseException, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    message = f"{type(exc).__name__}: {exc}"
+    row: dict[str, Any] = {
+        "agent": agent,
+        "model": model,
+        "query": query,
+        "should_trigger": should_trigger,
+        "triggered": False,
+        "pass": False,
+        "observation_complete": False,
+        "returncode": None,
+        "timed_out": False,
+        "elapsed_ms": 0,
+        "evidence": [],
+        "usage_normalized": {"source": "missing"},
+        "cost_normalized": {"source": "missing"},
+        "stderr": message[-1000:],
+        "error": message,
+    }
+    if metadata:
+        row.update({k: v for k, v in metadata.items() if k not in row})
+    return row
 
 
 def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_trigger: bool,
                    model: str | None, timeout: int, trace_dir: Path | None = None,
                    metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """One run of one query in one (agent, model) cell, in a fresh workspace."""
+    secrets: list[str] = []
     with tempfile.TemporaryDirectory(prefix=f"trigger-{adapter.name}-") as td:
         workspace = Path(td)
         copied = adapter.mount(tree_dir, workspace)
         names = mounted_skill_names(copied)
         result = validate_invoke_result(adapter.name, adapter.invoke(query, model, workspace, timeout))
         stdout = str(result["stdout"])
+        secrets = workspace_secret_values(workspace)
         triggered, evidence = adapter.detect(stdout, names, copied)
-    usage, cost = stream_usage_and_cost(stdout)
+    redacted_stdout = redact_sensitive_text(stdout, secrets)
+    redacted_evidence = [redact_sensitive_text(str(item), secrets) for item in evidence]
+    redacted_stderr = redact_sensitive_text(str(result["stderr"] or ""), secrets)
+    telemetry_error = None
+    try:
+        usage, cost = stream_usage_and_cost(stdout)
+    except Exception as exc:
+        telemetry_error = f"{type(exc).__name__}: {exc}"
+        usage, cost = {"source": "missing"}, {"source": "missing"}
     observation_complete = bool(result["observation_complete"])
     row = {
         "agent": adapter.name,
@@ -377,11 +487,16 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
         "returncode": result["returncode"],
         "timed_out": bool(result["timed_out"]),
         "elapsed_ms": result["elapsed_ms"],
-        "evidence": evidence,
+        "evidence": redacted_evidence,
         "usage_normalized": usage,
         "cost_normalized": cost,
-        "stderr": (str(result["stderr"] or ""))[-1000:],
+        "stderr": redacted_stderr[-1000:],
     }
+    for key in INVOKE_RESULT_METADATA_KEYS:
+        if key in result:
+            row[key] = result[key]
+    if telemetry_error:
+        row["telemetry_error"] = telemetry_error
     if metadata:
         row.update({k: v for k, v in metadata.items() if k not in row})
     if trace_dir is not None:
@@ -393,26 +508,32 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
             "timed_out": row["timed_out"],
             "observation_complete": observation_complete,
             "triggered": triggered,
-            "evidence": evidence,
+            "evidence": redacted_evidence,
             "usage_normalized": usage,
             "cost_normalized": cost,
             **(metadata or {}),
         }
-        write_trace_artifacts(
-            trace_dir,
-            stdout,
-            source=adapter.name,
-            metadata=trace_metadata,
-            extra_metrics={
-                "elapsed_ms": row["elapsed_ms"],
-                "returncode": row["returncode"],
-                "timed_out": row["timed_out"],
-                "skill_invoked": triggered,
-                "skill_invocation_evidence": evidence,
-            },
-            environment={"runner": adapter.name, "model": model, "trigger_eval": True},
-            write_metadata=True,
-        )
+        for key in INVOKE_RESULT_METADATA_KEYS:
+            if key in result:
+                trace_metadata[key] = result[key]
+        try:
+            write_trace_artifacts(
+                trace_dir,
+                redacted_stdout,
+                source=adapter.name,
+                metadata=trace_metadata,
+                extra_metrics={
+                    "elapsed_ms": row["elapsed_ms"],
+                    "returncode": row["returncode"],
+                    "timed_out": row["timed_out"],
+                    "skill_invoked": triggered,
+                    "skill_invocation_evidence": redacted_evidence,
+                },
+                environment={"runner": adapter.name, "model": model, "trigger_eval": True},
+                write_metadata=True,
+            )
+        except Exception as exc:
+            row["trace_error"] = f"{type(exc).__name__}: {exc}"
     return row
 
 
@@ -473,6 +594,9 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
                ablation: str | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     repo_root = repo_root_for_manifest(manifest_path)
+    reject_duplicates(agents, "--agent")
+    if models is not None:
+        reject_duplicates(models, "--model")
     adapters: list[AgentAdapter] = []
     capability_rows: dict[str, Any] = {}
     for name in agents:
@@ -487,7 +611,12 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         # One skill tree for the whole matrix: every cell mounts the exact same
         # bytes, and the recorded hash/provenance proves which revision was measured.
         tree_dir, tree_hash, provenance = trigger_tree_for_manifest(repo_root, manifest, Path(td), ablation)
+        trace_root = None
+        if trace_runs is not None:
+            trace_runs.mkdir(parents=True, exist_ok=True)
+            trace_root = Path(tempfile.mkdtemp(prefix="matrix-", dir=trace_runs))
         futures, results = [], []
+        future_context: dict[Any, tuple[str, str | None, str, bool, dict[str, Any]]] = {}
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for adapter in adapters:
                 for model in (models if models is not None else adapter.default_models):
@@ -495,20 +624,28 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
                         query = str(row["query"])
                         for run_number in range(1, runs_per_query + 1):
                             trace_dir = None
-                            if trace_runs is not None:
-                                trace_dir = (trace_runs / adapter.name / str(model or "default") /
+                            if trace_root is not None:
+                                agent_segment = safe_trace_segment(adapter.name, "agent")
+                                model_segment = safe_trace_segment(str(model or "default"), "default")
+                                trace_dir = (trace_root / agent_segment / model_segment /
                                              f"query-{row_index:03d}-{safe_trace_label(query, f'query-{row_index}')}" /
                                              f"run-{run_number}")
                             metadata = {
-                                "measurement": TRIGGER_MEASUREMENT_EVIDENCE_CLASS,
+                                "measurement": EvidenceClass.RAW_MEASUREMENT.value,
                                 "ablation": ablation,
                                 "skill_tree_hash": tree_hash,
                             }
-                            futures.append(ex.submit(run_cell_query, adapter, tree_dir,
-                                                     query, bool(row["should_trigger"]),
-                                                     model, timeout, trace_dir, metadata))
+                            future = ex.submit(run_cell_query, adapter, tree_dir,
+                                               query, bool(row["should_trigger"]),
+                                               model, timeout, trace_dir, metadata)
+                            futures.append(future)
+                            future_context[future] = (adapter.name, model, query, bool(row["should_trigger"]), metadata)
             for fut in as_completed(futures):
-                results.append(fut.result())
+                try:
+                    results.append(fut.result())
+                except Exception as exc:
+                    agent, model, query, should_trigger, metadata = future_context[fut]
+                    results.append(matrix_failure_row(agent, model, query, should_trigger, exc, metadata))
     matrix = summarize_matrix(results)
     passed = sum(1 for r in results if r["pass"])
     return {

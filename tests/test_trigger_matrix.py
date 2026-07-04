@@ -10,7 +10,8 @@ covered through its adapter contract and shared path-evidence detector.
 Live (manual): RUN_AGENT_INVOKE_SMOKE=1 runs one cheap invocation for every
 supported live trigger adapter/model to verify auth/network/process plumbing.
 RUN_TRIGGER_SMOKE=1 runs the fuller Claude trigger matrix across haiku, sonnet,
-and opus:
+and opus; RUN_CODEX_TRIGGER_SMOKE=1 and RUN_PI_TRIGGER_SMOKE=1 run the same
+trigger path for those adapters:
 
     RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v
     RUN_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix -v
@@ -26,6 +27,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from agent_capabilities import AGENT_CAPABILITIES
 import run_trigger_matrix as tm
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,7 +71,126 @@ class StubMatrixOfflineTests(unittest.TestCase):
             self.assertTrue((trace_dir / "metrics.json").is_file())
             meta = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["provider"], "stub")
-            self.assertEqual(meta["measurement"], "raw_autonomous_trigger_measurement")
+            self.assertEqual(meta["measurement"], "raw_measurement")
+            self.assertEqual(report["results"][0]["measurement"], "raw_measurement")
+            self.assertTrue(trace_dir.is_relative_to(trace_root))
+
+    def test_trace_runs_use_unique_matrix_root_per_invocation(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.time, "time", return_value=1234567890):
+            trace_root = Path(td) / "traces"
+            first = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                  models=["offline"], runs_per_query=2,
+                                  timeout=30, workers=1, trace_runs=trace_root)
+            second = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=["offline"], runs_per_query=1,
+                                   timeout=30, workers=1, trace_runs=trace_root)
+        first_roots = {Path(r["trace_dir"]).relative_to(trace_root).parts[0] for r in first["results"]}
+        second_roots = {Path(r["trace_dir"]).relative_to(trace_root).parts[0] for r in second["results"]}
+        self.assertEqual(len(first_roots), 1)
+        self.assertEqual(len(second_roots), 1)
+        self.assertNotEqual(first_roots, second_roots)
+
+    def test_trace_model_segment_is_path_safe(self):
+        with tempfile.TemporaryDirectory() as td:
+            trace_root = Path(td) / "traces"
+            report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=["../bad/model"], runs_per_query=1,
+                                   timeout=30, workers=1, trace_runs=trace_root)
+            trace_dir = Path(report["results"][0]["trace_dir"])
+        self.assertTrue(trace_dir.is_relative_to(trace_root))
+        parts = trace_dir.relative_to(trace_root).parts
+        self.assertNotIn("..", parts)
+        self.assertIn("bad-model", parts)
+
+    def test_baseline_provenance_records_skill_tree_hash(self):
+        report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                               models=[None], runs_per_query=1, timeout=30, workers=1)
+        self.assertEqual(report["provenance"], {"mode": "baseline", "skill_tree_hash": report["skill_tree_hash"]})
+
+    def test_demo_manifest_contains_documented_discovery_ablation(self):
+        manifest = tm.load_manifest(DEMO_MANIFEST)
+        repo_root = tm.repo_root_for_manifest(DEMO_MANIFEST)
+        with tempfile.TemporaryDirectory() as td:
+            _, tree_hash, provenance = tm.trigger_tree_for_manifest(repo_root, manifest, Path(td), "weaker-description")
+        self.assertEqual(provenance["id"], "weaker-description")
+        self.assertEqual(provenance["population"], "trigger")
+        self.assertEqual(tree_hash, provenance["parent_skill_hash"])
+        self.assertNotIn("dir", provenance)
+        self.assertNotIn("skill_files", provenance)
+
+    def test_duplicate_agents_or_models_are_rejected(self):
+        with self.assertRaises(SystemExit) as agent_ctx:
+            tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub", "stub"],
+                          models=[None], runs_per_query=1, timeout=30, workers=1)
+        self.assertIn("duplicate --agent", str(agent_ctx.exception))
+        with self.assertRaises(SystemExit) as model_ctx:
+            tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                          models=["same", "same"], runs_per_query=1, timeout=30, workers=1)
+        self.assertIn("duplicate --model", str(model_ctx.exception))
+
+    def test_trace_write_failure_does_not_discard_observation(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm, "write_trace_artifacts", side_effect=OSError("ENOSPC")):
+            report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=[None], runs_per_query=1, timeout=30, workers=1,
+                                   trace_runs=Path(td) / "traces")
+        self.assertEqual(report["summary"]["total"], 1)
+        self.assertEqual(report["summary"]["passed"], 1)
+        self.assertIn("ENOSPC", report["results"][0]["trace_error"])
+
+    def test_worker_exception_becomes_incomplete_row(self):
+        class FailingAdapter(tm.AgentAdapter):
+            name = "stub"
+
+            def mount(self, tree_dir, workspace):
+                raise OSError("disk full")
+
+            def invoke(self, query, model, workspace, timeout):
+                raise AssertionError("unreachable")
+
+        old = tm.ADAPTERS["stub"]
+        try:
+            tm.ADAPTERS["stub"] = FailingAdapter
+            report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=[None], runs_per_query=1, timeout=30, workers=1)
+        finally:
+            tm.ADAPTERS["stub"] = old
+        self.assertEqual(report["summary"]["total"], 1)
+        self.assertEqual(report["summary"]["passed"], 0)
+        self.assertEqual(report["matrix"][0]["summary"]["incomplete_observations"], 1)
+        self.assertIn("disk full", report["results"][0]["error"])
+
+    def test_trace_redacts_workspace_credentials(self):
+        class SecretEchoAdapter(tm.AgentAdapter):
+            name = "secret"
+
+            def mount(self, tree_dir, workspace):
+                (workspace / ".codex").mkdir(parents=True)
+                (workspace / ".codex" / "auth.json").write_text('{"token":"SECRET-TOKEN-12345"}', encoding="utf-8")
+                return self._mount_tree(tree_dir, workspace / "skills")
+
+            def invoke(self, query, model, workspace, timeout):
+                skill = next((workspace / "skills").glob("*/SKILL.md"))
+                stdout = json.dumps({
+                    "type": "command",
+                    "command": ["bash", "-lc", f"cat {skill}; echo SECRET-TOKEN-12345"],
+                }) + "\n"
+                return {"stdout": stdout, "stderr": "", "returncode": 0, "timed_out": False,
+                        "elapsed_ms": 1, "observation_complete": True}
+
+        with tempfile.TemporaryDirectory() as td:
+            tree = tm.build_canonical_skill_tree(tm.repo_root_for_manifest(DEMO_MANIFEST), tm.load_manifest(DEMO_MANIFEST), Path(td) / "tree")
+            trace_dir = Path(td) / "trace"
+            row = tm.run_cell_query(SecretEchoAdapter(), tree, "q", True, None, 12, trace_dir)
+            trace_text = (trace_dir / "trace.jsonl").read_text(encoding="utf-8")
+            metadata_text = (trace_dir / "metadata.json").read_text(encoding="utf-8")
+            metrics_text = (trace_dir / "metrics.json").read_text(encoding="utf-8")
+        self.assertTrue(row["triggered"])
+        self.assertNotIn("SECRET-TOKEN-12345", trace_text)
+        self.assertNotIn("SECRET-TOKEN-12345", json.dumps(row))
+        self.assertNotIn("SECRET-TOKEN-12345", metadata_text)
+        self.assertNotIn("SECRET-TOKEN-12345", metrics_text)
+        self.assertIn("[REDACTED]", trace_text)
+        self.assertIn("[REDACTED]", json.dumps(row))
 
     def test_weakened_description_under_triggers_offline(self):
         """The loop's core signal, deterministic: strip the description of the
@@ -164,9 +285,11 @@ class ClaudeDetectionTests(unittest.TestCase):
             source.mkdir()
             (source / ".credentials.json").write_text('{"token":"t"}', encoding="utf-8")
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(source)}, clear=True):
-                tm.ClaudeAdapter().invoke("q", "haiku", root / "run", 12)
+                result = tm.ClaudeAdapter().invoke("q", "haiku", root / "run", 12)
         self.assertEqual(seen["credentials"], '{"token":"t"}')
         self.assertTrue(str(seen["config_dir"]).endswith(".trigger-config"))
+        self.assertTrue(result["config_isolated"])
+        self.assertNotIn("config_isolation_warning", result)
 
     def test_claude_invoke_preserves_nonportable_oauth_config(self):
         seen = {}
@@ -182,9 +305,11 @@ class ClaudeDetectionTests(unittest.TestCase):
             source.mkdir()
             workspace = root / "run"
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(source)}, clear=True):
-                tm.ClaudeAdapter().invoke("q", "haiku", workspace, 12)
+                result = tm.ClaudeAdapter().invoke("q", "haiku", workspace, 12)
         self.assertEqual(seen["config_dir"], str(source))
         self.assertFalse((workspace / ".trigger-config").exists())
+        self.assertFalse(result["config_isolated"])
+        self.assertIn("personal config may influence", result["config_isolation_warning"])
 
 
 class CodexAdapterTests(unittest.TestCase):
@@ -417,6 +542,12 @@ class AgentInvokeSmokeConfigTests(unittest.TestCase):
         self.assertEqual(models["codex"], [None])
         self.assertEqual(models["pi"], [None])
 
+    def test_advertised_live_smoke_envs_are_consumed_by_tests(self):
+        test_source = Path(__file__).read_text(encoding="utf-8")
+        for agent, cap in AGENT_CAPABILITIES.items():
+            if cap.live_smoke_env:
+                self.assertIn(cap.live_smoke_env, test_source, agent)
+
 
 @unittest.skipUnless(os.environ.get("RUN_TRIGGER_SMOKE") == "1",
                      "manual smoke: set RUN_TRIGGER_SMOKE=1 (needs claude CLI + credentials, spends tokens)")
@@ -448,6 +579,22 @@ class CodexMatrixSmokeTests(unittest.TestCase):
         self.assertFalse(incomplete, f"broken runs (crash/timeout), not trigger signal: {incomplete}")
         self.assertTrue(any(r["triggered"] for r in report["results"]),
                         "no Codex run loaded the skill — detection, auth, or mounting is broken")
+
+
+@unittest.skipUnless(os.environ.get("RUN_PI_TRIGGER_SMOKE") == "1",
+                     "manual smoke: set RUN_PI_TRIGGER_SMOKE=1 (needs Pi CLI + credentials, spends tokens)")
+class PiMatrixSmokeTests(unittest.TestCase):
+    def test_pi_matrix_end_to_end(self):
+        runs = int(os.environ.get("PI_TRIGGER_SMOKE_RUNS", "1"))
+        model = os.environ.get("PI_TRIGGER_SMOKE_MODEL")
+        report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["pi"],
+                               models=[model] if model else [None], runs_per_query=runs,
+                               timeout=300, workers=1)
+        tm.print_matrix(report["matrix"])
+        incomplete = [r for r in report["results"] if not r["observation_complete"]]
+        self.assertFalse(incomplete, f"broken runs (crash/timeout), not trigger signal: {incomplete}")
+        self.assertTrue(any(r["triggered"] for r in report["results"]),
+                        "no Pi run loaded the skill — detection, auth, or mounting is broken")
 
 
 if __name__ == "__main__":

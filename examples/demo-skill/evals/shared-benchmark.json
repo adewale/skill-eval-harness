@@ -3,7 +3,7 @@
   "skill_name": "demo-reviewer",
   "skill_paths": ["skills/demo/SKILL.md"],
   "variants": ["with_skill", "without_skill"],
-  "notes": "Self-contained harness demo. Runs fully offline with examples/demo-skill/stub_runner.py as the 'model'. The two ablations each remove one load-bearing piece of the skill and confirm a regression on a distinct assertion.",
+  "notes": "Self-contained harness demo. Runs fully offline with examples/demo-skill/stub_runner.py as the 'model'. The two answer-population ablations each remove one load-bearing piece of the skill and confirm a regression on a distinct assertion; the discovery-population ablation is for trigger-matrix examples.",
   "cases": [
     {
       "id": "c-review",
@@ -67,6 +67,16 @@
       "target": {"path": "references/checklist.md", "remove": "content"},
       "expected_regressions": [
         {"summary": "with the checklist content gone the reviewer stops citing file/line", "cases": ["c-review"], "assertions": ["cite-checklist"]}
+      ]
+    },
+    {
+      "id": "weaker-description",
+      "removed_component": "extra discovery trigger phrases",
+      "mechanism": "frontmatter_field",
+      "class": "discovery",
+      "target": {"field": "when_to_use"},
+      "expected_regressions": [
+        {"summary": "without the extra discovery hints the skill may load less often for trigger queries", "cases": ["trig-pos-review-change"]}
       ]
     }
   ]

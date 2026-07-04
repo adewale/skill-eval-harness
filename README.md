@@ -142,7 +142,7 @@ skill-benchmark --help
 | `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
 | `TODO.md` | Status tracker: the eval-framework roadmap (implemented, bar two `(TODO-native)` items) and the remaining Jetty adapter work — streaming/concurrency, live API validation, judge export, per-variant overrides, and the `swap:<id>` ablation follow-on. |
-| `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two materialized ablations, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per ablation; exercised by `tests/test_example_demo.py`. Also carries should-fire/should-not-fire trigger cases for `skill-trigger-matrix` (offline via `--agent stub`; live smoke via `RUN_TRIGGER_SMOKE=1`). Start here. |
+| `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two answer-path materialized ablations, one discovery ablation for trigger examples, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per answer-path ablation; exercised by `tests/test_example_demo.py`. Also carries should-fire/should-not-fire trigger cases for `skill-trigger-matrix` (offline via `--agent stub`; live smoke via `RUN_TRIGGER_SMOKE=1`). Start here. |
 | `examples/adewale-workspace/` | Adewale-specific Pi smoke runner and cross-repo aggregate report (the trigger runners are the top-level `skill-pi-trigger-eval` and `skill-trigger-matrix`). |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
 
@@ -617,7 +617,7 @@ skill-benchmark profile-skill ../repo/evals/shared-benchmark.json \
 Cost is a first-class eval signal (issue #21). Every runner path — Pi smoke, Pi trigger, `run-codex`, `run-claude`, `run-subagent`, the judge wrapper, and the Jetty importer — writes two normalized blocks into run metadata beside the raw provider fields (which are preserved unchanged for audit):
 
 - `usage_normalized`: alias-normalized token counts (`input`/`prompt_tokens`/`totalTokens`/cache/reasoning variants) with a `source` — `provider_reported` (relayed from the provider), `trace_normalized` (summed from normalized trace events), `estimated`, `missing`, or `not_applicable`.
-- `cost_normalized`: dollar cost with `currency`, per-part costs when reported, and a `source` — `provider_reported` vs `price_table_estimated` are never conflated, and **missing cost is marked `missing`, never written as zero**. Provider-reported blocks always beat trace-derived ones; offline/stub runs carry explicit `missing` markers.
+- `cost_normalized`: dollar cost with `currency`, per-part costs when reported, and a `source` — `provider_reported`, `trace_normalized`, and `price_table_estimated` are never conflated, and **missing cost is marked `missing`, never written as zero**. Provider-reported blocks always beat trace-derived ones; offline/stub runs carry explicit `missing` markers.
 
 Consumers of the blocks:
 
@@ -626,7 +626,7 @@ Consumers of the blocks:
 - `suite-run` projects spend **before any model call** from previous ledgers (`--cost-history <dir>`, per-run medians) or a static assumption (`--assumed-tokens-per-run`), and gates on `--max-estimated-tokens` / `--max-estimated-cost-usd` — failing closed when a dollar cap is set but no dollar estimate exists — unless `--allow-over-budget`.
 - `audit-manifest --runs` adds cost-quality findings above `--expensive-case-usd` (default $1): `expensive-saturated-case`, `expensive-no-lift-case`, `high-cost-judge-only-case`, `ablation-high-spend-no-structured-regression`, and `high-footprint-low-lift-skill`.
 
-Interpretation rule: `provider_reported` numbers are the bill; `trace_normalized` reconstructs usage from events (good for tokens, silent on dollars); `missing` means the run truly carried no telemetry — fix the runner path rather than treating it as free.
+Interpretation rule: `provider_reported` numbers are a direct provider envelope; `trace_normalized` reconstructs usage or cost from event streams; `missing` means the run truly carried no telemetry — fix the runner path rather than treating it as free.
 
 ### Token overhead
 
@@ -720,7 +720,7 @@ skill-trigger-matrix ../repo/evals/shared-benchmark.json \
   --out trigger-matrix.json
 ```
 
-For each (agent, model) cell this mounts the skill where that agent discovers skills autonomously (never forcing the load), runs the manifest's `kind: "trigger"` cases the requested number of times, and reports per-cell trigger rates split by should-fire / should-not-fire polarity. The `claude` adapter spawns headless Claude Code subagents and defaults to haiku, sonnet, and opus; `--agent codex`, `--agent pi`, and the offline `--agent stub` are included. Additional agents register through an `AgentAdapter` subclass plus an `AGENT_CAPABILITIES` row. The tuning loop that consumes these rates is [`docs/tuning-skill-activation.md`](docs/tuning-skill-activation.md); manual live smoke tests wrap the same path (`RUN_TRIGGER_SMOKE=1` for Claude, `RUN_CODEX_TRIGGER_SMOKE=1` for Codex). For a cheaper auth/network/process check that invokes every supported live adapter/model without asserting trigger behavior, run `RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v`.
+For each (agent, model) cell this mounts the skill where that agent discovers skills autonomously (never forcing the load), runs the manifest's `kind: "trigger"` cases the requested number of times, and reports per-cell trigger rates split by should-fire / should-not-fire polarity. The `claude` adapter spawns headless Claude Code subagents and defaults to haiku, sonnet, and opus; `--agent codex`, `--agent pi`, and the offline `--agent stub` are included. Additional agents register through an `AgentAdapter` subclass plus an `AGENT_CAPABILITIES` row. The tuning loop that consumes these rates is [`docs/tuning-skill-activation.md`](docs/tuning-skill-activation.md); manual live smoke tests wrap the same path (`RUN_TRIGGER_SMOKE=1` for Claude, `RUN_CODEX_TRIGGER_SMOKE=1` for Codex, `RUN_PI_TRIGGER_SMOKE=1` for Pi). For a cheaper auth/network/process check that invokes every supported live adapter/model without asserting trigger behavior, run `RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v`.
 
 ### Pi trigger evals
 
