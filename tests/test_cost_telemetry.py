@@ -113,6 +113,18 @@ class RunnerStampTests(unittest.TestCase):
         self.assertEqual(empty_usage, {"source": "missing"})
         self.assertEqual(empty_cost, {"source": "missing"})
 
+    def test_stream_usage_prefers_cumulative_result_usage(self):
+        stream = "\n".join([
+            json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 100, "output_tokens": 20}}}),
+            json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 200, "output_tokens": 40}}}),
+            json.dumps({"type": "result", "usage": {"input_tokens": 300, "output_tokens": 60, "total_tokens": 360}}),
+        ])
+        usage, _ = sb.stream_usage_and_cost(stream)
+        self.assertEqual(usage["input_tokens"], 300)
+        self.assertEqual(usage["output_tokens"], 60)
+        self.assertEqual(usage["total_tokens"], 360)
+        self.assertEqual(usage["source"], "provider_reported")
+
     def test_jetty_metadata_carries_blocks_both_ways(self):
         record = {"trajectory_id": "t1", "status": "completed",
                   "trajectory": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14, "cost": 0.07},

@@ -24,23 +24,22 @@ from typing import Any
 from skill_benchmark import (
     VALID_SPLITS,
     is_trigger_case,
-    ablation_by_id,
-    ablation_components,
     build_canonical_skill_tree,
     canonical_skill_tree_hash,
-    derived_population,
     detect_trigger,
     event_texts_for_tool_input,  # noqa: F401  (re-exported for adapters/tests)
     expected_trigger_polarity,
     iter_cases,
     load_manifest_source,
-    materialize_ablation,
+    materialize_trigger_ablation,
     mount_skill_tree,
     repo_root_for_manifest,
     run_argv_with_timeout,
+    safe_trace_label,
     stream_usage_and_cost,
     write_json,
     write_trace_artifacts,
+    AblationError,
 )
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 
@@ -74,14 +73,10 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
     if ablation_id:
         # Mount a real, altered skill (e.g. a weakened description) so the trigger
         # test measures whether the ablated skill still autonomously loads.
-        ablation = ablation_by_id(manifest, ablation_id)
-        if ablation is None:
-            raise RuntimeError(f"unknown ablation: {ablation_id}")
-        if not ablation_components(ablation):
-            raise RuntimeError(f"ablation {ablation_id} is instruction-simulated; a trigger ablation must declare a removal")
-        if derived_population(ablation_components(ablation)) != "trigger":
-            raise RuntimeError(f"ablation {ablation_id} is an answer-population ablation; the trigger eval only measures discovery (trigger-population) ablations. Run it through the benchmark / Pi-smoke path.")
-        res = materialize_ablation(repo_root, manifest, ablation, config_dir / "_materialized")
+        try:
+            res = materialize_trigger_ablation(repo_root, manifest, ablation_id, config_dir / "_materialized")
+        except AblationError as exc:
+            raise RuntimeError(str(exc)) from exc
         return mount_skill_tree(Path(res["dir"]), skills_dir), res
     # Baseline (no ablation): build the SAME canonical tree the ablation arm starts
     # from, so the two arms are file-for-file identical apart from the declared
@@ -245,7 +240,7 @@ def main() -> int:
             for run_number in range(1, args.runs_per_query + 1):
                 trace_dir = None
                 if args.trace_runs:
-                    label = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(row.get("query", f"query-{i}")))[:80].strip("-") or f"query-{i}"
+                    label = safe_trace_label(str(row.get("query", f"query-{i}")), f"query-{i}")
                     trace_dir = Path(args.trace_runs) / f"query-{i:03d}-{label}" / f"run-{run_number}"
                 futures.append(ex.submit(run_query, manifest_path, str(row["query"]), bool(row["should_trigger"]), args.timeout, args.model, trace_dir, args.ablation))
         for fut in as_completed(futures):

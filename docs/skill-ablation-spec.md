@@ -37,7 +37,7 @@ Internal — the contracts this builds on:
 
 - `validate_manifest` ablation block (`skill_benchmark.py:513`) — today checks only non-empty `id` + `removed_component`.
 - `variant_instruction` (`skill_benchmark.py:646`) / `task_variants` (`:689`) / `prepared_task_rows` (`:734`) — `skill_paths` is currently the manifest's, identical for every variant.
-- `safe_task_json` (`skill_benchmark.py:1903`) / `build_jetty_payload` (`:1945`) — Jetty export; ablation reads `task["skill_paths"]`, uploads flat files via `JettyClient.upload` with a basename-only `remote_path_hint`.
+- `safe_task_json` (`skill_benchmark.py:1918`) / `build_jetty_payload` (`:1960`) — Jetty export; ablation reads `task["skill_paths"]`, uploads flat files via `JettyClient.upload` with a basename-only `remote_path_hint`.
 - `copy_skill_to_config` (`skill_benchmark.py:47`) and `copy_skill_source` (`run_pi_smoke.py:103`) — both collapse a file-valued path to `<dir>/SKILL.md`, `rmtree` the destination, and whitelist only `references`/`scripts`/`assets`.
 - `run_pi_trigger_eval.py` — the autonomous-trigger runner; copies from the manifest and takes no variant input.
 

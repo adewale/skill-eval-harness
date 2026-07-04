@@ -51,6 +51,17 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertIs(tm.eval_rows_from_args, tr.eval_rows_from_args)
         self.assertIs(tm.pi_argv, tr.pi_argv)
 
+    def test_trigger_runners_share_trace_label_sanitizer(self):
+        self.assertIs(tr.safe_trace_label, sb.safe_trace_label)
+        self.assertIs(tm.safe_trace_label, sb.safe_trace_label)
+
+    def test_codex_default_command_has_one_code_owner(self):
+        parser = tm.build_arg_parser()
+        codex_action = next(a for a in parser._actions if "--codex-cmd" in getattr(a, "option_strings", ()))
+        self.assertEqual(codex_action.default, tm.DEFAULT_CODEX_CMD)
+        self.assertEqual(tm.CodexAdapter().codex_cmd, tm.DEFAULT_CODEX_CMD)
+        self.assertEqual((ROOT / "run_trigger_matrix.py").read_text(encoding="utf-8").count(tm.DEFAULT_CODEX_CMD), 1)
+
     def test_manifest_loading_goes_through_the_harness_source_loader(self):
         # tr.load_manifest is a thin named wrapper; what matters is that a YAML
         # manifest or dataset_files resolve for the runners exactly as for the

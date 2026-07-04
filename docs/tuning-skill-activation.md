@@ -76,7 +76,6 @@ and uses the same mounted-path evidence detector as Pi/stub:
 ```bash
 skill-trigger-matrix examples/demo-skill/evals/shared-benchmark.json \
   --agent codex \
-  --codex-cmd 'codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral' \
   --runs-per-query 3 \
   --out /tmp/trigger-codex.json
 ```
@@ -136,9 +135,11 @@ evidence in its event stream. Claude Code, Codex, Pi, and the offline stub ship 
 adapters. `docs/agent-parity.md` is the capability table for which surfaces each
 agent currently supports.
 
-Adding another agent is one subclass plus one registry row:
+Adding another agent is one subclass plus one capability registry row:
 
 ```python
+from agent_capabilities import AGENT_CAPABILITIES, AgentCapabilities
+
 class MyAgentAdapter(AgentAdapter):
     name = "my-agent"
 
@@ -150,13 +151,26 @@ class MyAgentAdapter(AgentAdapter):
         return self._run_argv(argv, cwd=workspace, env=os.environ.copy(), timeout=timeout)
 
 ADAPTERS["my-agent"] = MyAgentAdapter
+AGENT_CAPABILITIES["my-agent"] = AgentCapabilities(
+    answer_runner=False,
+    autonomous_trigger=True,
+    trigger_ablation=True,
+    trace_artifacts=True,
+    token_usage=True,
+    dollar_cost="stream",
+    judge_backend=False,
+    tool_replay=False,
+    live_smoke_env=None,
+)
 ```
 
 The default `detect()` already scans any JSON event stream for reads of the mounted
 skill paths; override it only when an agent reports skill loads some other way, as
 Claude Code does. Once registered, `--agent my-agent` joins the same matrix, and the
 report's cells stay comparable because every adapter mounts the identical canonical
-or materialized skill tree and the same detector rules decide "triggered."
+or materialized skill tree and the same detector rules decide "triggered." The
+matrix validates the capability row before starting runs so a new adapter cannot
+finish live calls and then fail during report assembly.
 
 For Pi specifically, `skill-pi-trigger-eval` remains a compatibility entry point for
 older scripts. The matrix now has the shared surfaces that matter for parity: per-run
