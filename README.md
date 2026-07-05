@@ -35,7 +35,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 - [Run output contract](#run-output-contract)
 - [Ablations](#ablations)
 - [Commands](#commands) (full detail in [`docs/commands.md`](docs/commands.md))
-- [Jetty adapter](#jetty-adapter)
+- [Jetty adapter](docs/commands.md#jetty-adapter)
 - [Contributing](#contributing)
 
 ## Quick start
@@ -424,7 +424,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 |---|---|
 | `skill-benchmark export-anthropic` | Emit an Anthropic-skill-creator-compatible `benchmark.json`. |
 | `skill-benchmark compare-tasks` / `skill-benchmark compare-results` | Blind A/B comparison export and scoring. |
-| `skill-benchmark export-jetty` / `skill-benchmark run-jetty` / `skill-benchmark import-jetty-results` | Jetty runbook-mode export, execute, and import (optional; see the [Jetty adapter](#jetty-adapter)). |
+| `skill-benchmark export-jetty` / `skill-benchmark run-jetty` / `skill-benchmark import-jetty-results` | Jetty runbook-mode export, execute, and import (optional; see the [Jetty adapter](docs/commands.md#jetty-adapter)). |
 
 **Activation** (separate entry points — does the skill load on its own?)
 
@@ -491,7 +491,7 @@ python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```
 
-The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics (`test_stats.py`), runner adapters (`test_runners.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus two executable drift guards: doc code references (`test_doc_refs.py`) and shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`). Shared fixture builders live in `tests/helpers.py`.
+The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics (`test_stats.py`), runner adapters (`test_runners.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus three executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), and relative-link resolution across the docs (`test_doc_links.py`). Shared fixture builders live in `tests/helpers.py`.
 
 ## Source checked
 

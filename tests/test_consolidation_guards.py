@@ -211,7 +211,8 @@ class ConceptDocConventionTests(unittest.TestCase):
     def test_each_lens_doc_links_to_the_glossary(self):
         for name in self.LENSES:
             text = (self.DOCS / name).read_text(encoding="utf-8")
-            self.assertIn("vocabulary.md", text, f"{name} must link the canonical glossary, not redefine terms")
+            # a real markdown link, not a bare mention or a filename inside a fence
+            self.assertIn("](vocabulary.md", text, f"{name} must link the canonical glossary, not redefine terms")
 
     def test_docs_index_states_the_one_definer_convention(self):
         index = (self.DOCS / "README.md").read_text(encoding="utf-8")

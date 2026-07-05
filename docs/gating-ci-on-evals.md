@@ -51,13 +51,16 @@ Actions run. `--format junit` writes the same result as JUnit XML, one `<testcas
 case/variant/run, which any CI that reads JUnit will render and gate on:
 
 ```text
-<testsuite name="skill-eval:demo-reviewer" tests="8" failures="5" errors="0" ...>
-  <testcase classname="demo-reviewer.c-review" name="with_skill/run-1" time="0.025" />
-  <testcase classname="demo-reviewer.c-review" name="without_skill/run-1" ...>
+<testsuite name="skill-eval:demo-reviewer" tests="4" failures="2" errors="0" ...>
+  <testcase classname="demo-reviewer.c-review" name="with_skill/run-1" />
+  <testcase classname="demo-reviewer.c-review" name="without_skill/run-1">
     <failure message="2 failing check(s)">severity-label: none matched: ['Blocking', 'Minor', 'Clean']
 cite-checklist: none matched: ['file and line']</failure>
   </testcase>
-  ...
+  <testcase classname="demo-reviewer.c-adversarial" name="with_skill/run-1" />
+  <testcase classname="demo-reviewer.c-adversarial" name="without_skill/run-1">
+    <failure message="1 failing check(s)">severity-label: none matched: ['Blocking', 'Minor', 'Clean']</failure>
+  </testcase>
 </testsuite>
 ```
 
@@ -98,7 +101,7 @@ negative or adversarial cases, a leak-saturated case (an assertion the base mode
 from the prompt alone), or an ablation that is only *instruction-simulated* and so can
 never confirm a causal regression. The demo has none, so it gates clean.
 
-Note the distinction the exit code draws: `audit-manifest` *also* emitted seven
+Note the distinction the exit code draws: `audit-manifest` *also* emitted eight
 `findings` at `recommended`/`required` severity on this same run (missing domain tags,
 missing difficulty tags, …). Those are advice, not blockers — `--fail-on-blockers`
 deliberately does **not** fail on them, so your CI fails on "this suite can't be trusted"

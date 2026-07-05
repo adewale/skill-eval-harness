@@ -141,6 +141,7 @@ These are flags a `benchmark` report raises so you read pass rates correctly.
 ## See also
 
 - [`evals-are-not-tests.md`](evals-are-not-tests.md) — why these terms exist and why a test-suite vocabulary does not cover them.
-- [`../README.md`](../README.md) — manifest format, assertion reference, and command contracts.
+- [`../README.md`](../README.md) — manifest format, assertion reference, and the command index.
+- [`commands.md`](commands.md) — per-command contracts: flags, examples, and output shapes.
 - [`../LESSONS_LEARNED.md`](../LESSONS_LEARNED.md) — the iteration history that produced several of these terms.
 - [`academic-grounding.md`](academic-grounding.md) — the research constructs behind these terms, with citations.
