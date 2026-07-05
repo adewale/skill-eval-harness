@@ -33,6 +33,7 @@ from helpers import (
     load_example_module,
     make_eval_repo,
     report_fixture,
+    stub_claude,
     write_demo_manifest as write_manifest,
     write_good_pr_skill as _skill,
     write_run,
@@ -76,6 +77,9 @@ class SubagentRunnerTests(unittest.TestCase):
                 self.assertEqual(events["source"], "subagent")
                 metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
                 self.assertEqual(metrics["total_tokens"], 42)
+                # The subagent now re-serializes its records to trace.jsonl (the
+                # shared writer's raw-trace artifact), like every other runner.
+                self.assertTrue((base / "trace.jsonl").exists())
         without_prompt = next(p for p in seen_prompts if "Do not use any skill" in p)
         self.assertNotIn("skills/", without_prompt)
 
@@ -260,6 +264,153 @@ class JettyReferencesUploadTests(unittest.TestCase):
             ws = next(pl for pl in payloads if pl["harness"]["variant"] == "with_skill")
             hints = [f["remote_path_hint"] for f in ws["upload_plan"]["files"] if f["role"] == "skill"]
             self.assertTrue(any(h.endswith("references/g.md") for h in hints))   # the reference file is uploaded
+
+
+class RunnerOutcomeContractTests(unittest.TestCase):
+    """RunnerOutcome + write_runner_outcome: every answer runner returns the typed
+    outcome and the ONE writer adapts it onto the run contract the same way, so a
+    provider only does provider-specific parsing (the runner-outcome consolidation)."""
+
+    # The run-contract files and the metadata keys every provider's run must carry
+    # after going through write_runner_outcome — the shared shape the refactor pins.
+    CONTRACT_FILES = {"output.md", "metadata.json", "events.json", "metrics.json"}
+    SHARED_META_KEYS = {"provider", "model", "returncode", "timed_out", "elapsed_ms",
+                        "stderr", "usage_normalized", "cost_normalized", "trace_source"}
+
+    def _one_with_skill_task(self, root: Path) -> tuple[Path, str]:
+        case = {"id": "c", "split": "tune", "prompt": "do it",
+                "assertions": [{"name": "a", "type": "contains", "value": "token"}]}
+        manifest = make_eval_repo(root, cases=[case])
+        rows = [r for r in sb.prepared_task_rows(manifest, sb.validate_manifest(manifest)) if r["variant"] == "with_skill"]
+        tasks = root / "tasks.jsonl"
+        tasks.write_text(json.dumps(rows[0]) + "\n", encoding="utf-8")
+        return tasks, rows[0]["run_dir"]
+
+    def test_codex_and_claude_produce_the_same_contract_shape(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+
+            fake_codex = root / "fake_codex.py"
+            fake_codex.write_text(
+                "import json, sys\n_ = sys.stdin.read()\n"
+                "print(json.dumps({'role': 'assistant', 'content': 'token from codex',"
+                " 'usage': {'input_tokens': 4, 'output_tokens': 6}}))\n",
+                encoding="utf-8")
+            codex_runs = root / "codex-runs"
+            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(codex_runs),
+                                         codex_cmd=f"{sys.executable} {fake_codex}", timeout=30))
+
+            claude_bin = stub_claude(root / "claude_stub.py", answer="token from claude")
+            claude_runs = root / "claude-runs"
+            sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(claude_runs),
+                                             model="claude-haiku-4-5-20251001", claude_bin=str(claude_bin), timeout=30))
+
+            codex_base = codex_runs / run_dir
+            claude_base = claude_runs / run_dir
+            # Same set of contract files from both providers.
+            for base in (codex_base, claude_base):
+                self.assertTrue(self.CONTRACT_FILES.issubset({p.name for p in base.iterdir()}), base)
+            codex_meta = json.loads((codex_base / "metadata.json").read_text(encoding="utf-8"))
+            claude_meta = json.loads((claude_base / "metadata.json").read_text(encoding="utf-8"))
+            # The shared metadata keys are present in BOTH, with the provider stamped.
+            self.assertTrue(self.SHARED_META_KEYS.issubset(codex_meta), self.SHARED_META_KEYS - set(codex_meta))
+            self.assertTrue(self.SHARED_META_KEYS.issubset(claude_meta), self.SHARED_META_KEYS - set(claude_meta))
+            self.assertEqual(codex_meta["provider"], "codex")
+            self.assertEqual(claude_meta["provider"], "claude")
+            # Telemetry is an explicit block carrying the real normalized values,
+            # not merely a present key — a regression dropping the numbers must fail.
+            self.assertEqual(codex_meta["usage_normalized"]["total_tokens"], 10)   # 4+6 from the trace
+            self.assertEqual(codex_meta["usage_normalized"]["source"], "trace_normalized")
+            self.assertEqual(claude_meta["usage_normalized"]["total_tokens"], 33)  # 11+22 from the envelope
+            self.assertEqual(claude_meta["usage_normalized"]["source"], "provider_reported")
+            self.assertIn("source", codex_meta["cost_normalized"])
+            self.assertIn("source", claude_meta["cost_normalized"])
+            # The whole-writer consolidation means both providers land on the same
+            # events/metrics schema version (2, the trace-normalizer's), even with
+            # no trace — Claude's empty-trace run is not a schema-1 island.
+            for base in (codex_base, claude_base):
+                self.assertEqual(json.loads((base / "events.json").read_text())["schema_version"], 2)
+                self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
+
+    def test_write_runner_outcome_derives_none_answer_from_trace(self):
+        # answer=None means "the answer is the final trace message" (the Codex seam).
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            trace = json.dumps({"role": "assistant", "content": "derived answer"})
+            outcome = am.RunnerOutcome(provider="codex", answer=None, returncode=0, trace_text=trace)
+            sb.write_runner_outcome(base, outcome)
+            self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "derived answer")
+            self.assertTrue((base / "trace.jsonl").exists())
+
+    def test_write_runner_outcome_encodes_timeout_uniformly(self):
+        # One timeout encoding for every provider: timed_out + returncode 124, a
+        # failure-marker body, and execution_valid() rejects it.
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            outcome = am.RunnerOutcome(provider="claude", answer="", timed_out=True)
+            sb.write_runner_outcome(base, outcome)
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            text = (base / "output.md").read_text(encoding="utf-8")
+            self.assertTrue(meta["timed_out"])
+            self.assertEqual(meta["returncode"], 124)
+            self.assertTrue(text.lstrip().startswith(am.CLAUDE_FAILURE))
+            self.assertNotIn("None", text)
+            self.assertFalse(am.execution_valid(meta, text))
+
+    def test_write_runner_outcome_marks_missing_telemetry_explicit(self):
+        # No provider usage/cost and no trace → explicit missing, never zero/absent.
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            sb.write_runner_outcome(base, am.RunnerOutcome(provider="subagent", answer="hi", returncode=0))
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["usage_normalized"], {"source": "missing"})
+            self.assertEqual(meta["cost_normalized"], {"source": "missing"})
+
+    def test_subagent_returncode_body_stays_error_shaped(self):
+        # The subagent seam diagnoses via error/empty, not a returncode+stderr body:
+        # diagnose_returncode=False keeps its historical body shape.
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            outcome = am.RunnerOutcome(provider="subagent", answer="", returncode=3, diagnose_returncode=False)
+            sb.write_runner_outcome(base, outcome)
+            text = (base / "output.md").read_text(encoding="utf-8")
+            self.assertIn("no output produced", text)
+            self.assertNotIn("returncode=3", text)
+
+    def test_empty_string_answer_is_never_reconstructed_from_trace(self):
+        # The answer=None sentinel (Codex) is what derives from the trace; a string
+        # answer — even "" — is used verbatim. This guards validity gating: an empty
+        # answer that happens to carry a trace must become the failure marker, never
+        # leak the trace's final message and slip past execution_valid().
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            trace = json.dumps({"role": "assistant", "content": "LEAKED FROM TRACE"})
+            outcome = am.RunnerOutcome(provider="subagent", answer="", returncode=0, trace_text=trace)
+            sb.write_runner_outcome(base, outcome)
+            text = (base / "output.md").read_text(encoding="utf-8")
+            self.assertNotIn("LEAKED FROM TRACE", text)
+            self.assertTrue(text.lstrip().startswith(am.CLAUDE_FAILURE))
+            self.assertFalse(am.execution_valid({"returncode": 0}, text))
+
+    def test_codex_empty_output_writes_explicit_missing_telemetry(self):
+        # The PR's headline consistency fix: an empty Codex run now goes through the
+        # shared writer, so it gets explicit missing telemetry and schema-2 metrics
+        # (was schema-1 metadata with no normalized blocks before the consolidation).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            silent = root / "silent_codex.py"
+            silent.write_text("import sys\n_ = sys.stdin.read()\n", encoding="utf-8")  # emits nothing
+            runs = root / "runs"
+            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs),
+                                         codex_cmd=f"{sys.executable} {silent}", timeout=30))
+            base = runs / run_dir
+            self.assertIn("no output produced", (base / "output.md").read_text(encoding="utf-8"))
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["usage_normalized"], {"source": "missing"})
+            self.assertEqual(meta["cost_normalized"], {"source": "missing"})
+            self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
 
 
 if __name__ == "__main__":

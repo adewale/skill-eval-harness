@@ -152,6 +152,32 @@ class TimeoutConventionTests(unittest.TestCase):
                 defaults.append(action)
         self.assertGreaterEqual(len(defaults), 4, "the runner --timeout flags no longer share DEFAULT_RUNNER_TIMEOUT_S")
 
+    def test_answer_runners_write_the_contract_through_one_owner(self):
+        # Every answer runner adapts its RunnerOutcome onto the run contract via
+        # write_runner_outcome — none may hand-roll a metadata/metrics/events/
+        # output write, the drift that let the Codex empty-output path skip the
+        # normalized telemetry blocks the others wrote.
+        for fn in (sb.run_codex, sb.run_claude, sb.run_subagent_tasks):
+            src = inspect.getsource(fn)
+            self.assertIn("write_runner_outcome", src,
+                          f"{fn.__name__} does not write its run through write_runner_outcome")
+            # The run-level (base /) contract writes must be the writer's; a
+            # per-turn turn_dir/output.md write is not one of these.
+            for artifact in ('"metadata.json"', '"metrics.json"', '"events.json"', '"output.md"'):
+                self.assertNotIn(f"write_json(base / {artifact}", src,
+                                 f"{fn.__name__} hand-rolls a write to {artifact} instead of using write_runner_outcome")
+                self.assertNotIn(f"(base / {artifact}).write_text", src,
+                                 f"{fn.__name__} hand-rolls output for {artifact} instead of using write_runner_outcome")
+
+    def test_runner_failure_markers_have_one_provider_map(self):
+        # A provider is bound to its failure marker in exactly one place, and the
+        # subagent reuses the Claude marker (its backend IS Claude).
+        self.assertIs(sb.RunnerOutcome("codex").failure_marker, am.CODEX_FAILURE)
+        self.assertIs(sb.RunnerOutcome("claude").failure_marker, am.CLAUDE_FAILURE)
+        self.assertIs(sb.RunnerOutcome("subagent").failure_marker, am.CLAUDE_FAILURE)
+        for marker in am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values():
+            self.assertIn(marker, am.RUNNER_FAILURE_MARKERS)
+
     def test_subagent_timeout_is_a_timeout_not_a_generic_error(self):
         # A backend that times out must yield metadata the scorable predicate
         # excludes AND that names the timeout — not a generic error that loses
@@ -165,6 +191,26 @@ class TimeoutConventionTests(unittest.TestCase):
             rows = sb.prepared_task_rows(manifest, sb.validate_manifest(manifest))
             runs = root / "runs"
             sb.run_subagent_tasks(rows[:1], runs, timing_out_backend)
+            base = runs / rows[0]["run_dir"]
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            text = (base / "output.md").read_text(encoding="utf-8")
+        self.assertTrue(meta["timed_out"])
+        self.assertEqual(meta["returncode"], 124)
+        self.assertTrue(text.startswith(am.TIMEOUT_FAILURE))
+        self.assertFalse(am.execution_valid(meta, text))
+
+    def test_subagent_reported_timeout_defaults_to_124(self):
+        # If the backend reports a timeout rather than raising TimeoutExpired, the
+        # shared writer still owns the shell-compatible timeout return code.
+        def reported_timeout_backend(*, prompt, workspace, model, tool_executor, history=None):
+            return {"answer": "", "timed_out": True}
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_eval_repo(root)
+            rows = sb.prepared_task_rows(manifest, sb.validate_manifest(manifest))
+            runs = root / "runs"
+            sb.run_subagent_tasks(rows[:1], runs, reported_timeout_backend)
             base = runs / rows[0]["run_dir"]
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             text = (base / "output.md").read_text(encoding="utf-8")
