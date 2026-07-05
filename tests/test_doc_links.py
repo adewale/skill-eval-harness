@@ -9,7 +9,9 @@ of a link, so a section move that stranded an in-page `#anchor` shipped green.
 This guard is fence- and inline-code-aware (so it flags only links a reader
 would click) and validates the fragment too: a `#anchor` — same-file or
 `file.md#anchor` — must match a real heading in the target file, using GitHub's
-slug rules.
+slug rules. Headings are read as ATX (`## x`) or setext (underlined) after a
+leading YAML frontmatter block is dropped; link targets are unwrapped from
+`<...>`, and a `?query` / `%20` escape is normalized before the file is resolved.
 
 Known limitation: inline-code stripping is regex-based, so a stray unbalanced
 backtick sitting between a link and the next backtick can mis-span and hide that
@@ -24,6 +26,7 @@ skills whose `references/*.md` live in the source repo, not this tree); so is
 import re
 import unittest
 from pathlib import Path
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -35,6 +38,25 @@ DOC_FILES = sorted(
 _FENCE_OPEN = re.compile(r"^[ \t]*(`{3,}|~{3,})")
 # inline code: a run of N backticks closed by a run of N backticks (handles ``, ```).
 _INLINE = re.compile(r"(`+)(?:.+?)\1", re.S)
+# inline links / images: ](target ...) — a <bracketed> target may contain spaces.
+_LINK = re.compile(r"\]\(\s*(<[^>]*>|[^)\s]+)")
+# reference-style definitions: [label]: target
+_DEF = re.compile(r"(?m)^\s*\[[^\]]+\]:\s*(<[^>]*>|\S+)")
+# ATX heading line, and a setext underline (= or -) with the lines it can't underline.
+_ATX = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$")
+_SETEXT = re.compile(r"^[ \t]{0,3}(=+|-+)[ \t]*$")
+_BLOCK_MARKER = re.compile(r"^[ \t]*(#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t]|>|\||=+[ \t]*$|-+[ \t]*$)")
+
+
+def _strip_frontmatter(text):
+    """Drop a leading YAML frontmatter block (--- ... ---); it carries no
+    clickable links or heading anchors."""
+    lines = text.splitlines(keepends=True)
+    if lines and lines[0].rstrip("\r\n") == "---":
+        for i in range(1, len(lines)):
+            if lines[i].rstrip("\r\n") == "---":
+                return "".join(lines[i + 1:])
+    return text
 
 
 def _strip_fences(text):
@@ -54,17 +76,12 @@ def _strip_fences(text):
         elif re.match(rf"{re.escape(fence[0])}{{{fence[1]},}}[ \t]*$", stripped):
             fence = None  # close line consumed, not emitted
     return "".join(out)
-# inline links / images: ](target ...) — target ends at whitespace or ')'
-_LINK = re.compile(r"\]\(\s*([^)\s]+)")
-# reference-style definitions: [label]: target
-_DEF = re.compile(r"(?m)^\s*\[[^\]]+\]:\s*(\S+)")
-# ATX headings, used to build the anchor set of each file
-_HEADING = re.compile(r"(?m)^\#{1,6}[ \t]+(.+?)[ \t]*#*\s*$")
 
 
 def prose_only(text):
-    """Drop fenced blocks then inline code, so link *syntax* shown as an example
-    is not mistaken for a live link."""
+    """Drop frontmatter, fenced blocks, then inline code, so link *syntax* shown
+    as an example is not mistaken for a live link."""
+    text = _strip_frontmatter(text)
     text = _strip_fences(text)
     text = _INLINE.sub("", text)
     return text
@@ -79,11 +96,19 @@ def slugify(heading):
 
 
 def heading_slugs(text):
-    """The set of anchors a reader can link to in a file (with GitHub's -1/-2
-    disambiguation for repeated headings)."""
+    """The anchors a reader can link to in a file — ATX and setext headings — with
+    GitHub's -1/-2 disambiguation for repeated headings."""
+    lines = prose_only(text).splitlines()
+    headings = []
+    for i, line in enumerate(lines):
+        m = _ATX.match(line)
+        if m:
+            headings.append(m.group(1))
+        elif _SETEXT.match(line) and i and lines[i - 1].strip() and not _BLOCK_MARKER.match(lines[i - 1]):
+            headings.append(lines[i - 1].strip())
     slugs, counts = set(), {}
-    for m in _HEADING.finditer(prose_only(text)):
-        base = slugify(m.group(1))
+    for h in headings:
+        base = slugify(h)
         n = counts.get(base, 0)
         slugs.add(base if n == 0 else f"{base}-{n}")
         counts[base] = n + 1
@@ -96,10 +121,11 @@ def relative_targets(text):
     prose = prose_only(text)
     for m in (*_LINK.finditer(prose), *_DEF.finditer(prose)):
         target = m.group(1)
-        if target.startswith(("http://", "https://", "mailto:", "tel:")):
-            continue
         core = target[1:-1] if target.startswith("<") and target.endswith(">") else target
-        path, _, frag = core.partition("#")
+        if core.startswith(("http://", "https://", "mailto:", "tel:", "//")):
+            continue
+        ref, _, frag = core.partition("#")
+        path = unquote(ref.split("?", 1)[0])  # drop query, decode %20 etc.
         yield target, path, frag
 
 
