@@ -5,7 +5,7 @@ becomes task rows, task rows become files on disk, files on disk become graded r
 and result rows become a report. Because the boundaries are explicit, you can swap the
 runner without touching grading, and grading never has to call a model.
 
-Symbols below point at `skill_benchmark.py` at the line where each abstraction is defined.
+This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md): what each object *is* in the code and what it hands downstream. The glossary defines the words; this page shows their shape. Symbols below point at `skill_benchmark.py` at the line where each abstraction is defined.
 
 ## The objects, in pipeline order
 

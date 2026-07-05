@@ -1,10 +1,11 @@
 # Academic grounding
 
-The harness's vocabulary was built from practice, but almost every term in it re-derives a
-construct that already has a name, a citation, and a documented failure mode in the research
-literature. This page is the index that connects the two, so a reader who knows the academic
-term can find the harness feature, and a contributor writing docs can borrow the precision and
-the references instead of re-arguing from scratch.
+This is the **research lens** on the terms in [`vocabulary.md`](vocabulary.md): the harness's
+vocabulary was built from practice, but almost every term in it re-derives a construct that
+already has a name, a citation, and a documented failure mode in the research literature. This
+page connects the two, so a reader who knows the academic term can find the harness feature,
+and a contributor writing docs can borrow the precision and the references instead of
+re-arguing from scratch. The glossary defines each term; this page names the construct behind it.
 
 It also settles the one place where the harness's wording actively disagrees with the
 literature — the word *adversarial* — and records why the name is kept but qualified.

@@ -246,9 +246,11 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       trigger cases in both polarities → `skill-trigger-matrix` per (agent, model) →
       description edits → re-run. Runnable on `examples/demo-skill` (offline `--agent stub`,
       live `RUN_TRIGGER_SMOKE=1`).
-- [ ] **"Is my skill worth its tokens?"** — `token-overhead` (dollar deltas, lift-per-dollar),
-      `cost-summary`, and `audit-manifest --runs` cost findings all exist; nothing walks from
-      "my skill adds 9 KB of context" to a keep/trim/cut decision.
+- [x] **"Is my skill worth its tokens?"** — [`docs/is-my-skill-worth-its-tokens.md`](docs/is-my-skill-worth-its-tokens.md):
+      static footprint (`profile-skill`, offline) vs. runtime lift-per-token/lift-per-dollar
+      (`token-overhead`, `cost-summary`, `audit-manifest --runs`), with the keep/trim/cut
+      reading guide. Runnable on `examples/demo-skill` (offline shows the `source: "missing"`
+      telemetry shape; real dollar numbers cited from the issue #21 suite run).
 - [ ] **"Did my skill edit regress anything?"** — the `old_skill` variant, `compare-results`,
       the `iteration-N/` convention, and `render-viewer --previous-workspace` diffs exist;
       no doc shows the edit → re-run → diff-against-last-iteration loop end to end.
@@ -261,9 +263,11 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
 - [ ] **"Can I trust my judge?"** — `judge-alignment` (human labels, kappa, precision/recall),
       `compare-judges` (judge-sensitivity), and `--judge-runs` repetition exist; no doc walks
       labeling a sample and deciding whether the judge is usable.
-- [ ] **"How do I gate my skill repo's CI on this?"** — `report --format junit|github`,
-      `audit-manifest --fail-on-blockers`, and `suite-run` cost ceilings exist; no recipe
-      shows a skill repo's workflow file failing a PR on a confirmed regression.
+- [x] **"How do I gate my skill repo's CI on this?"** — [`docs/gating-ci-on-evals.md`](docs/gating-ci-on-evals.md):
+      the two-gate recipe (`report --format junit|github` for regressions +
+      `audit-manifest --fail-on-blockers` for manifest trust), a workflow file, and the
+      "gate on lift/named regressions, not raw pass count" reading guide. Runnable offline on
+      `examples/demo-skill` (real 2026-07-05 report/junit/readiness output).
 - [ ] **"How do I port my existing evals into the harness?"** — `prepare` JSONL as the import
       seam, YAML manifests, and the Jetty/trace importers exist; `docs/migrating-evals.md`
       only covers v1→v2 manifests, not arriving from another framework's suite.

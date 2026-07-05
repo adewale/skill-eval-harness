@@ -247,5 +247,25 @@ class DocSyncTests(unittest.TestCase):
         self.assertFalse(documented - known, f"README documents assertion types the code does not register: {sorted(documented - known)}")
 
 
+class ConceptDocConventionTests(unittest.TestCase):
+    """One definer per concept: vocabulary.md defines a term; the lens docs link
+    to it rather than redefine it (2026-07 concept-doc consolidation)."""
+
+    DOCS = ROOT / "docs"
+    LENSES = ("abstractions.md", "academic-grounding.md", "evals-are-not-tests.md")
+
+    def test_each_lens_doc_links_to_the_glossary(self):
+        for name in self.LENSES:
+            text = (self.DOCS / name).read_text(encoding="utf-8")
+            # a real markdown link, not a bare mention or a filename inside a fence
+            self.assertIn("](vocabulary.md", text, f"{name} must link the canonical glossary, not redefine terms")
+
+    def test_docs_index_states_the_one_definer_convention(self):
+        index = (self.DOCS / "README.md").read_text(encoding="utf-8")
+        self.assertIn("canonical glossary", index)
+        for name in self.LENSES:
+            self.assertIn(name, index, f"docs/README.md must list the lens doc {name}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 # Evals Are Not Tests
 
-A unit test and a skill eval both end in pass or fail, which is why they get confused. The machinery underneath is different, and treating an eval like a test produces confident, wrong conclusions. This page explains the difference using the things this harness actually measures.
+This is the **interpretation lens** on the terms in [`vocabulary.md`](vocabulary.md): how to read the numbers they name. A unit test and a skill eval both end in pass or fail, which is why they get confused. The machinery underneath is different, and treating an eval like a test produces confident, wrong conclusions. This page explains the difference using the things this harness actually measures.
 
 The short version: a test asks whether one program is correct; an eval asks whether a change moved a model's behavior, and by how much, across many cases and repeated runs. Almost everything that follows is a consequence of that gap.
 
