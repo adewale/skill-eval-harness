@@ -3669,20 +3669,22 @@ def write_runner_outcome(run_dir: Path, outcome: RunnerOutcome) -> tuple[dict[st
     answer is used verbatim."""
     run_dir.mkdir(parents=True, exist_ok=True)
     trace_text = outcome.trace_text or ""
+    timed_out = bool(outcome.timed_out)
+    returncode = 124 if timed_out else outcome.returncode
     usage_block = normalize_usage(outcome.usage, source="provider_reported")
     cost_block = normalize_cost(outcome.cost_usd, source="provider_reported", pricing_model=outcome.model)
     metadata = {
+        **outcome.metadata_extra,
         "provider": outcome.provider,
         "model": outcome.model,
-        "returncode": outcome.returncode,
-        "timed_out": bool(outcome.timed_out),
+        "returncode": returncode,
+        "timed_out": timed_out,
         "elapsed_ms": int(outcome.elapsed_ms),
         "stderr": outcome.stderr,
         "usage_normalized": usage_block,
         "cost_normalized": cost_block,
-        **outcome.metadata_extra,
     }
-    extra_metrics = {"elapsed_ms": int(outcome.elapsed_ms), "returncode": outcome.returncode, **outcome.metrics_extra}
+    extra_metrics = {**outcome.metrics_extra, "elapsed_ms": int(outcome.elapsed_ms), "returncode": returncode}
     events, metrics = write_trace_artifacts(
         run_dir,
         trace_text,
@@ -4919,7 +4921,7 @@ def run_subagent_tasks(
         timed_out = bool(outcome.get("timed_out", False))
         ro = RunnerOutcome(
             provider="subagent", answer=str(outcome.get("answer") or ""),
-            returncode=outcome.get("returncode", 1 if error else 0), timed_out=timed_out,
+            returncode=outcome.get("returncode", 124 if timed_out else (1 if error else 0)), timed_out=timed_out,
             # A timeout keeps its error string (or the subagent's default) so the
             # TIMEOUT marker, not the provider marker, heads the body.
             error=error or ("subagent timed out" if timed_out else None),

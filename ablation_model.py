@@ -159,7 +159,9 @@ class RunnerOutcome:
         if self.timed_out:
             if self.error:
                 return f"{TIMEOUT_FAILURE}: {self.error}]\n"
-            return f"{marker}: timed out after {self.timeout_s}s]\n"
+            if self.timeout_s is not None:
+                return f"{marker}: timed out after {self.timeout_s}s]\n"
+            return f"{marker}: timed out]\n"
         if self.error:
             return f"{marker}: {self.error}]\n"
         if self.diagnose_returncode and self.returncode not in (0, None):

@@ -199,6 +199,26 @@ class TimeoutConventionTests(unittest.TestCase):
         self.assertTrue(text.startswith(am.TIMEOUT_FAILURE))
         self.assertFalse(am.execution_valid(meta, text))
 
+    def test_subagent_reported_timeout_defaults_to_124(self):
+        # If the backend reports a timeout rather than raising TimeoutExpired, the
+        # shared writer still owns the shell-compatible timeout return code.
+        def reported_timeout_backend(*, prompt, workspace, model, tool_executor, history=None):
+            return {"answer": "", "timed_out": True}
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_eval_repo(root)
+            rows = sb.prepared_task_rows(manifest, sb.validate_manifest(manifest))
+            runs = root / "runs"
+            sb.run_subagent_tasks(rows[:1], runs, reported_timeout_backend)
+            base = runs / rows[0]["run_dir"]
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            text = (base / "output.md").read_text(encoding="utf-8")
+        self.assertTrue(meta["timed_out"])
+        self.assertEqual(meta["returncode"], 124)
+        self.assertTrue(text.startswith(am.TIMEOUT_FAILURE))
+        self.assertFalse(am.execution_valid(meta, text))
+
     def test_shell_agent_backend_encodes_timeouts(self):
         backend = sb.shell_agent_backend("sleep 5", timeout=1)
         outcome = backend(prompt="p", workspace=Path("."), model=None, tool_executor=None)

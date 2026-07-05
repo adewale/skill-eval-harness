@@ -348,14 +348,14 @@ class RunnerOutcomeContractTests(unittest.TestCase):
         # failure-marker body, and execution_valid() rejects it.
         with tempfile.TemporaryDirectory() as td:
             base = Path(td) / "run"
-            outcome = am.RunnerOutcome(provider="claude", answer="", returncode=124,
-                                       timed_out=True, timeout_s=45)
+            outcome = am.RunnerOutcome(provider="claude", answer="", timed_out=True)
             sb.write_runner_outcome(base, outcome)
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             text = (base / "output.md").read_text(encoding="utf-8")
             self.assertTrue(meta["timed_out"])
             self.assertEqual(meta["returncode"], 124)
             self.assertTrue(text.lstrip().startswith(am.CLAUDE_FAILURE))
+            self.assertNotIn("None", text)
             self.assertFalse(am.execution_valid(meta, text))
 
     def test_write_runner_outcome_marks_missing_telemetry_explicit(self):
