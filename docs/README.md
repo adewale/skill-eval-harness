@@ -25,12 +25,20 @@ exists, so writing the journey is documentation work, not feature work.
 
 ## Concepts
 
-[`architecture.md`](architecture.md) (how the pipeline fits together),
-[`abstractions.md`](abstractions.md) (what each core object is),
-[`vocabulary.md`](vocabulary.md) (glossary),
-[`evals-are-not-tests.md`](evals-are-not-tests.md) (how to read results),
-[`agent-parity.md`](agent-parity.md) (which agent surfaces are supported by Codex,
-Claude, Pi, Jetty, subagent, and stub).
+[`vocabulary.md`](vocabulary.md) is the canonical glossary — a term is **defined there once**,
+and the three docs below apply a lens to those terms rather than redefine them:
+[`abstractions.md`](abstractions.md) (the engineering shape — what each object is in the code),
+[`academic-grounding.md`](academic-grounding.md) (the research construct behind each term), and
+[`evals-are-not-tests.md`](evals-are-not-tests.md) (how to read the number a term names). When
+a definition changes, change it in the glossary and let the lenses follow. Standing apart from
+the glossary: [`architecture.md`](architecture.md) (how the pipeline fits together, a flow not a
+definition) and [`agent-parity.md`](agent-parity.md) (which surfaces Codex, Claude, Pi, Jetty,
+subagent, and stub support).
+
+## Reference
+
+[`commands.md`](commands.md) is the full per-command reference (flags, examples, output shapes);
+the [README](../README.md#commands) carries the grouped index.
 
 ## Specs
 

@@ -1,6 +1,6 @@
 # Vocabulary
 
-This page collects the terms the harness uses, with the place each one shows up in a manifest, a command, or a report. The README defines most of them inline where they first appear; this page is the single index so you do not have to hunt.
+This page is the canonical glossary: each term is defined here once, with the place it shows up in a manifest, a command, or a report. The other concept docs apply a lens to these terms rather than redefine them — [`abstractions.md`](abstractions.md) the engineering shape, [`academic-grounding.md`](academic-grounding.md) the research construct, [`evals-are-not-tests.md`](evals-are-not-tests.md) how to read the number — so when a definition changes, it changes here and the lenses follow. (The README still defines a term inline where you first meet it in a workflow; that is reference-at-use, not a second home for the definition.)
 
 Terms are grouped by what they describe: the units you evaluate, the comparison structure, the things you assert, the artifacts a run produces, and the signals a report flags.
 
