@@ -11,9 +11,10 @@ would click) and validates the fragment too: a `#anchor` — same-file or
 `file.md#anchor` — must match a real heading in the target file, using GitHub's
 slug rules.
 
-Known limitation: code stripping is regex-based, so a source file with unbalanced
-inline backticks can mis-span a code region. The maintained docs keep backtick
-parity; a real markdown tokenizer would be the fix if that ever stops holding.
+Known limitation: inline-code stripping is regex-based, so a stray unbalanced
+backtick sitting between a link and the next backtick can mis-span and hide that
+one link. No maintained doc triggers this today; a real markdown tokenizer would
+be the fix if that changes.
 
 Scope is the maintained documentation surface — the root narrative files,
 `docs/`, and `examples/`. `tests/corpus/` is excluded (fixture copies of real
@@ -30,11 +31,29 @@ DOC_FILES = sorted(
     {*ROOT.glob("*.md"), *ROOT.glob("docs/**/*.md"), *ROOT.glob("examples/**/*.md")}
 )
 
-# fenced blocks: an opening run of >=3 ` or ~, closed by a run of the same char at
-# least as long, or by end-of-string (CommonMark leaves an unclosed fence open to EOF).
-_FENCE = re.compile(r"(?ms)^[ \t]*(`{3,}|~{3,})(?:.*?^[ \t]*\1+[ \t]*$|.*\Z)")
+# opening fence: a run of >=3 ` or ~ (with optional info string).
+_FENCE_OPEN = re.compile(r"^[ \t]*(`{3,}|~{3,})")
 # inline code: a run of N backticks closed by a run of N backticks (handles ``, ```).
 _INLINE = re.compile(r"(`+)(?:.+?)\1", re.S)
+
+
+def _strip_fences(text):
+    """Drop fenced code blocks. A block opens on a run of >=3 ` or ~ and closes on
+    a run of the *same* char at least as long (CommonMark); an unclosed fence runs
+    to end-of-file. Line-scanned rather than regex'd so a longer-than-opening close
+    can't be missed and swallow the rest of the file."""
+    out, fence = [], None  # fence = (char, length) while open
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip(" \t")
+        if fence is None:
+            m = _FENCE_OPEN.match(line)
+            if m:
+                fence = (m.group(1)[0], len(m.group(1)))
+            else:
+                out.append(line)
+        elif re.match(rf"{re.escape(fence[0])}{{{fence[1]},}}[ \t]*$", stripped):
+            fence = None  # close line consumed, not emitted
+    return "".join(out)
 # inline links / images: ](target ...) — target ends at whitespace or ')'
 _LINK = re.compile(r"\]\(\s*([^)\s]+)")
 # reference-style definitions: [label]: target
@@ -46,7 +65,7 @@ _HEADING = re.compile(r"(?m)^\#{1,6}[ \t]+(.+?)[ \t]*#*\s*$")
 def prose_only(text):
     """Drop fenced blocks then inline code, so link *syntax* shown as an example
     is not mistaken for a live link."""
-    text = _FENCE.sub("", text)
+    text = _strip_fences(text)
     text = _INLINE.sub("", text)
     return text
 
@@ -101,7 +120,9 @@ class DocLinkTests(unittest.TestCase):
                     continue
                 if frag:
                     slugs = self._slugs_for(md, path)
-                    if slugs is not None and frag.lower() not in slugs:
+                    # case-exact: GitHub ids are lowercase, so a mixed-case #Anchor
+                    # does not navigate even when the slug exists.
+                    if slugs is not None and frag not in slugs:
                         broken.append(f"{md.relative_to(ROOT)} -> {target} (missing anchor #{frag})")
         self.assertEqual(broken, [], "broken relative doc links:\n" + "\n".join(broken))
 
