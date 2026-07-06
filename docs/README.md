@@ -17,6 +17,9 @@ title is the question; the body is the loop that answers it, runnable on
 | Which parts of my skill are load-bearing? | [`ablation-study-walkthrough.md`](ablation-study-walkthrough.md) |
 | Is my skill worth its tokens? | [`is-my-skill-worth-its-tokens.md`](is-my-skill-worth-its-tokens.md) |
 | How do I gate my skill repo's CI on this? | [`gating-ci-on-evals.md`](gating-ci-on-evals.md) |
+| Did my skill edit regress anything? | [`did-my-skill-edit-regress.md`](did-my-skill-edit-regress.md) |
+| Which model should my skill target? | [`which-model-should-my-skill-target.md`](which-model-should-my-skill-target.md) |
+| Why did this run fail? | [`why-did-this-run-fail.md`](why-did-this-run-fail.md) |
 | How do I upgrade a v1 manifest to v2? | [`migrating-evals.md`](migrating-evals.md) |
 
 The unwritten ones are tracked in [`TODO.md`](../TODO.md) under "User journeys the
