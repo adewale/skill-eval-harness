@@ -1,13 +1,12 @@
 # Did my skill edit regress anything?
 
-You changed a line in `SKILL.md`, trimmed a reference, tightened a heading — and want to
-know whether anything you already pass got worse. The naive question wants a `diff` of the
-two outputs: run before, run after, eyeball it. But a skill's output is a *sample*, not a
-fixed string, so a single before/after diff is a coin toss dressed up as evidence. A
-regression worth acting on is not a raw score wobble — it is a **named assertion flipping
-pass→fail with provenance**, the same case failing a check it used to pass. That reframes
-the loop into: pin a baseline, re-run the arms you already grade, read which *named* checks
-moved.
+You changed a line in `SKILL.md`, trimmed a reference, retitled a heading. Now you want to
+know whether anything you already pass got worse. The obvious move is to `diff` the two
+outputs: run before, run after, eyeball it. But a skill's output is a *sample*, not a fixed
+string, so one before/after diff is a coin toss dressed up as evidence. The regression worth
+acting on has a sharper shape: a **named assertion flips pass→fail with provenance**, the
+same case failing a check it used to pass. So pin a baseline, re-run the arms you already
+grade, and read which *named* checks moved.
 
 Two honest ways to pin that baseline, carrying different evidence:
 
@@ -20,10 +19,10 @@ Two honest ways to pin that baseline, carrying different evidence:
   report-to-report with `render-viewer --previous-workspace`: per-variant and per-case
   deltas plus flag churn between two `benchmark.json`, the descriptive localizer.
 
-A command that *sounds* right — `compare-results` — is not it. It tallies a pairwise-
-preference judge (mapping a judge's `A`/`B`/`TIE` winners onto `primary`/`baseline` roles
-from a truth file), answering "which output did a judge prefer," not "did my assertions
-regress." Use the two blocks above.
+One command *sounds* like the tool for this and isn't: `compare-results`. It tallies a
+pairwise-preference judge (mapping a judge's `A`/`B`/`TIE` winners onto `primary`/`baseline`
+roles from a truth file), so it answers "which output did a judge prefer," not "did my
+assertions regress." Use the two blocks above.
 
 ## The offline loop, arm 1: an ablation stands in for a bad edit
 
@@ -163,7 +162,7 @@ empty diff instead (real output, same command against a cosmetic-only iteration)
   appears at 4 runs per arm, where perfectly-separated scores clear the exact-permutation
   floor (`min_p_value: 0.028571 ≤ 0.05`). A regression is a *named assertion flipping with
   provenance and significance*, not a score that wobbled once.
-- **The deterministic stub makes the demo diff exact — that is the caveat, not the result.**
+- **The demo diff is exact only because the stub is deterministic.**
   Its four replicates are identical, so the permutation test clears on perfect separation. A
   real model's runs carry variance; there you need *genuine* repeats before a one-run diff
   earns trust, and the significance gate is what stops an unreplicated dip from counting.

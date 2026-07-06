@@ -1,14 +1,13 @@
 # Why did this run fail?
 
-A benchmark run is over, the pass rate is below where you wanted it, and you have a
-directory of graded results. The naive ask is "show me the failures" — but a flat list
-of failing runs is noise, not a diagnosis. Two failures with the same red mark can mean
-opposite things: one is the baseline arm working exactly as designed (the whole point of
-the skill), the other is an assertion that is too narrow and is failing a *correct*
-answer. The measurable question is not "which runs failed" but "what failed *first* in
-each one, do those first-failures cluster into a systematic mode, and for the dominant
-cluster — is the eval right and the model wrong, or is the eval wrong and the manifest
-needs a fix?"
+A benchmark run is over, the pass rate came in low, and you have a directory of graded
+results. Ask "show me the failures" and you get a flat list, which diagnoses nothing. Two
+runs carrying the same red mark can mean opposite things: one is the baseline arm working
+exactly as designed (the whole point of the skill), the other is an assertion too narrow
+to accept a *correct* answer. So the question worth measuring is not "which runs failed"
+but "what failed *first* in each one, do those first-failures cluster into a systematic
+mode, and for the dominant cluster — is the eval right and the model wrong, or is the eval
+wrong and the manifest needs a fix?"
 
 The harness answers this in three layers, deepest last:
 
@@ -31,9 +30,9 @@ real failing run down to a class and a decision.
 
 Run the bundled demo ([`examples/demo-skill/`](../examples/demo-skill/)) with the
 deterministic stub — no model, no key. This grades a `with_skill` / `without_skill` pair
-plus two materialized ablation arms, which gives a natural, real spread of failures: the
-baseline fails both assertions, and each ablation arm fails exactly the one assertion
-whose skill piece it removed.
+plus two materialized ablation arms, which produces a spread of failures with known
+causes: the baseline fails both assertions, and each ablation arm fails exactly the one
+assertion whose skill piece it removed.
 
 ```bash
 cd examples/demo-skill
@@ -110,8 +109,8 @@ two review-queue rows:
 ```
 
 Five failing runs, two categories, and one category (`text:severity-label`) owns 80% of
-them. That `share: 0.8` is the whole value of the taxonomy: the failures are not
-scattered noise, they are one systematic mode. Fix (or explain) the one thing.
+them. That `share: 0.8` is what the taxonomy is for: the failures cluster into one
+systematic mode instead of scattering. Fix (or explain) that one thing.
 
 ## Walk one row end to end
 
@@ -122,8 +121,8 @@ Take the top row: **`c-review / without_skill`**, category `text:severity-label`
 assertion (a `contains_any` over `text`) was the first non-soft assertion to fail, and it
 told you exactly what it wanted — one of `Blocking`, `Minor`, `Clean` — and that none
 matched. The queue anchors on this *first* failure and stops; it does not also list the
-`cite-checklist` failure on the same run, because an upstream miss cascades and you fix
-the seam, not the wreckage downstream of it.
+`cite-checklist` failure on the same run, because an upstream miss cascades: you fix the
+seam it broke at, not every failure downstream of it.
 
 **Layer 2 — what the model actually did.** Open the run dir the row points at
 (`run_base` in the full JSON). The output:

@@ -1,9 +1,10 @@
 # Which model should my skill target?
 
 A skill does not buy the same lift on every model. The same guidance that turns a
-weak model's 0.2 pass rate into 0.9 can buy *nothing* on a strong one — not because
-the skill got worse, but because the strong base model already passes the cases
-without it. So the naive question ("what's the best model for my skill?") has no
+weak model's 0.2 pass rate into 0.9 can buy *nothing* on a strong one, because the
+strong base model already passes those cases without it. The skill hasn't gotten
+worse; the model has left it no room to help. So the naive question ("what's the
+best model for my skill?") has no
 single answer; the measurable version is **on which model tier does my skill still
 buy real, significant lift, and where has the base model already saturated the cases
 so there is no lift left to see.** You answer it by fanning the same paired cases
@@ -48,9 +49,9 @@ Python 3.11):
 "lift_losers": []
 ```
 
-**Every tier reports the identical lift of 1.0.** That is not a bug — it is the
-honest shape of an offline stub. `stub_runner.py` answers by reading the skill tree
-the harness mounted; it is deterministic and **model-blind** — it never looks at the
+**Every tier reports the identical lift of 1.0.** Nothing broke; an offline stub can
+only produce that one number. `stub_runner.py` answers by reading the skill tree
+the harness mounted. It is deterministic and **model-blind**: it never reads the
 `model` label the row carries. So all three model rows run through the same stub and
 produce the same output, and `by_model` / `paired_summary.by_model` show the same
 delta three times. This is exactly analogous to the token journey's "runtime pairs 0
@@ -70,8 +71,9 @@ trustworthy as the case count and repeat count behind each cell.
 
 ## Reading the ranking, symptom by symptom
 
-On a **real** multi-model run the tiers stop agreeing, and that disagreement is the
-whole point. Read `model_analysis.ranking` top-to-bottom against `case_flags`:
+On a **real** multi-model run the tiers stop agreeing, and where they disagree is
+what tells you which tier to target. Read `model_analysis.ranking` top-to-bottom
+against `case_flags`:
 
 - **High, significant lift on a weak tier; lift ≈ 0 on a strong tier, and that
   tier's cases carry the `saturated/non-discriminating` flag** → the skill is *for*
