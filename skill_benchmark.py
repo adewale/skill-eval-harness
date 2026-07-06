@@ -3824,7 +3824,7 @@ def run_claude(args: argparse.Namespace) -> int:
             ws = Path(wd)
             skill_rel, input_rel = codex_skill_workspace(pt, ws)
             prompt = codex_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
-            result = claude_cli_invoke(prompt, model=row_model, claude_bin=claude_bin, timeout=timeout)
+            result = claude_cli_invoke(prompt, model=row_model, claude_bin=claude_bin, timeout=timeout, cwd=str(ws))
             metrics = claude_run_metrics(result)
             usage_block = normalize_usage(result.get("usage"), source="provider_reported")
             cost_block = normalize_cost(result.get("cost_usd"), source="provider_reported", pricing_model=row_model)

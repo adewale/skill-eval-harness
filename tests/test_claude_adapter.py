@@ -75,6 +75,30 @@ class RunClaudeAdapterTests(unittest.TestCase):
             self.assertEqual(meta["provider"], "claude")
             self.assertEqual(meta["model"], "claude-haiku-4-5-20251001")
 
+    def test_runs_claude_from_isolated_workspace_so_skill_files_are_visible(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            rp = td / "repo"
+            case = {"id": "c", "split": "tune", "prompt": "read the mounted skill",
+                    "assertions": [{"name": "a", "type": "contains", "value": "MOUNTED"}]}
+            p = _manifest(rp, [case])
+            rows = [r for r in sb.prepared_task_rows(p, sb.validate_manifest(p)) if r["variant"] == "with_skill"]
+            tasks = td / "tasks.jsonl"
+            tasks.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+            stub = td / "claude_cwd_stub.py"
+            stub.write_text("""#!/usr/bin/env python3
+import json, os, sys
+_ = sys.stdin.read()
+answer = "MOUNTED" if os.path.exists("skills/root-0/SKILL.md") else "MISSING"
+sys.stdout.write(json.dumps({"type": "result", "result": answer, "usage": {"input_tokens": 1, "output_tokens": 1}}))
+""", encoding="utf-8")
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+            runs = td / "runs"
+            ns = argparse.Namespace(tasks=str(tasks), runs=str(runs), model=None, claude_bin=str(stub), timeout=60)
+            sb.run_claude(ns)
+            output = (runs / rows[0]["run_dir"] / "output.md").read_text(encoding="utf-8")
+            self.assertEqual(output, "MOUNTED")
+
     def test_nonzero_returncode_marks_infra_failure(self):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
