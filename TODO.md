@@ -251,15 +251,22 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       (`token-overhead`, `cost-summary`, `audit-manifest --runs`), with the keep/trim/cut
       reading guide. Runnable on `examples/demo-skill` (offline shows the `source: "missing"`
       telemetry shape; real dollar numbers cited from the issue #21 suite run).
-- [ ] **"Did my skill edit regress anything?"** — the `old_skill` variant, `compare-results`,
-      the `iteration-N/` convention, and `render-viewer --previous-workspace` diffs exist;
-      no doc shows the edit → re-run → diff-against-last-iteration loop end to end.
-- [ ] **"Which model should my skill target?"** — multi-model fan-out (`prepare --models`),
-      the `by_model` report block, and `model_analysis` per-(case, model) lift exist; no doc
-      shows choosing (or dropping) a model tier from those numbers.
-- [ ] **"Why did this run fail?"** — trace artifacts, `error-analysis` (open-coding queue +
-      failure taxonomy), and the viewer exist; `docs/authoring-evals.md` names the four
-      failure classes but no walkthrough debugs one real trace to a manifest/skill fix.
+- [x] **"Did my skill edit regress anything?"** — [`docs/did-my-skill-edit-regress.md`](docs/did-my-skill-edit-regress.md):
+      the within-run `ablation_regressions` block (assertion-level, significance-gated) as the
+      before/after, and `render-viewer --previous-workspace` diffs across the `iteration-N/`
+      convention as the cross-iteration localizer; `old_skill` formalizes the baseline in a real
+      repo. Runnable offline on `examples/demo-skill` (real 2026-07-06 confirmed/indeterminate/empty
+      diffs). `compare-results` was evaluated and rejected — it tallies a pairwise-preference judge,
+      not an assertion diff.
+- [x] **"Which model should my skill target?"** — [`docs/which-model-should-my-skill-target.md`](docs/which-model-should-my-skill-target.md):
+      multi-model fan-out (`prepare --models`), the `by_model` report block, and `model_analysis`
+      per-(case, model) lift, with the real-lift-vs-base-saturation reading guide. Runnable offline
+      on `examples/demo-skill` (the model-blind stub yields identical tiers — plumbing proven, real
+      divergence needs a live runner).
+- [x] **"Why did this run fail?"** — [`docs/why-did-this-run-fail.md`](docs/why-did-this-run-fail.md):
+      the `error-analysis` open-coding queue + failure taxonomy, then the run dir
+      (`output.md`/`metadata.json`), mapped to a failure class and a manifest-or-skill decision.
+      Runnable offline on `examples/demo-skill` (real 2026-07-06 taxonomy/queue over the failing arms).
 - [ ] **"Can I trust my judge?"** — `judge-alignment` (human labels, kappa, precision/recall),
       `compare-judges` (judge-sensitivity), and `--judge-runs` repetition exist; no doc walks
       labeling a sample and deciding whether the judge is usable.
