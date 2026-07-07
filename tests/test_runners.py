@@ -354,6 +354,20 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                                             codex_cmd="codex exec --json", claude_bin=str(claude_bin), timeout=30))
             self.assertIn("token from claude", (claude_runs / run_dir / "output.md").read_text(encoding="utf-8"))
 
+    def test_run_agent_writes_failure_artifact_when_native_command_is_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            runs = root / "runs"
+            sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(runs), model="gpt-mini",
+                                            codex_cmd=str(root / "missing-codex"), claude_bin="claude", timeout=30))
+            base = runs / run_dir
+            text = (base / "output.md").read_text(encoding="utf-8")
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertTrue(text.lstrip().startswith(sb.CODEX_FAILURE))
+            self.assertEqual(meta["returncode"], 127)
+            self.assertFalse(sb.execution_valid(meta, text))
+
     def test_write_runner_outcome_derives_none_answer_from_trace(self):
         # answer=None means "the answer is the final trace message" (the Codex seam).
         with tempfile.TemporaryDirectory() as td:

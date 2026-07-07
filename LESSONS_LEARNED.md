@@ -359,3 +359,5 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 - A provider-reported error envelope is an infrastructure failure even when the process exits 0; never grade a quota message as an answer.
 - Codex judge verdicts come from `--output-last-message`, while stdout JSONL is telemetry; adapt schemas for the provider, then validate returned verdicts against the harness's canonical schema.
 - Run live parity checks with the smallest models first, and record quota/auth/config failures as eval-run artifacts rather than losing the row.
+
+**Follow-up from PR audit:** these failures were exactly what Correctness by Construction is meant to prevent. The fix was not another scatter of checks; it moved invariants into the adapter boundary: native subprocess calls require an explicit cwd, all native invocations share one process-group timeout/spawn-failure contract, and provider-specific schema conversion constructs a strict schema before Codex ever sees it. Tests now try to reach the invalid states directly: repo-cwd inheritance, missing executable with no artifact, and graded-dimension schemas without strict object constraints.

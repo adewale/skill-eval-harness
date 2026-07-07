@@ -223,6 +223,11 @@ class TimeoutConventionTests(unittest.TestCase):
         self.assertTrue(text.startswith(am.TIMEOUT_FAILURE))
         self.assertFalse(am.execution_valid(meta, text))
 
+    def test_native_invocation_helper_kills_process_groups_on_timeout(self):
+        src = inspect.getsource(sb.run_argv_capture)
+        self.assertIn("start_new_session=True", src)
+        self.assertIn("os.killpg", src)
+
     def test_shell_agent_backend_encodes_timeouts(self):
         backend = sb.shell_agent_backend("sleep 5", timeout=1)
         outcome = backend(prompt="p", workspace=Path("."), model=None, tool_executor=None)

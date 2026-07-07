@@ -58,7 +58,7 @@ skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out t
 skill-benchmark run-codex --tasks tasks.jsonl --runs ../repo/eval-runs/codex-tune
 ```
 
-Override `--codex-cmd` for local wrappers or tests:
+Override `--codex-cmd` for local wrappers or tests. It is an argv-style command prefix parsed with `shlex.split`; shell metacharacters, pipes, and inline env assignments are not interpreted. Put those in a wrapper script and pass the wrapper path instead.
 
 ```bash
 skill-benchmark run-codex \
@@ -244,7 +244,7 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --out benchmark.json
 ```
 
-Native Claude uses `claude -p --output-format json`; native Codex uses `codex exec --output-last-message <file> --output-schema <schema.json>` so verdict parsing reads the final assistant message rather than the event JSONL stream. For Codex/OpenAI structured output, the harness adapts the canonical verdict schema into a strict provider schema (`additionalProperties:false`; optional fields become nullable) while still validating the returned verdict against the canonical schema. A shell judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting. `--transcripts` saves the exact prompt, stdout, stderr, and parsed result for each judge task.
+Native Claude uses `claude -p --output-format json`; native Codex uses `codex exec --output-last-message <file> --output-schema <schema.json>` so verdict parsing reads the final assistant message rather than the event JSONL stream. Native judges run from an explicit working directory: a sanitized run-copy when tool exploration is enabled, otherwise a fresh empty temp directory so they cannot accidentally read the harness repo cwd. For Codex/OpenAI structured output, the harness adapts the canonical verdict schema into a strict provider schema (`additionalProperties:false`; optional fields become nullable) while still validating the returned verdict against the canonical schema. A shell judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting. `--transcripts` saves the exact prompt, stdout, stderr, and parsed result for each judge task.
 
 ## Audit manifest quality
 

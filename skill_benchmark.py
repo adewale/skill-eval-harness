@@ -3850,16 +3850,38 @@ def coerce_text(value: Any) -> str:
     return str(value)
 
 
-def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str | None, timeout: int, env: dict[str, str] | None = None) -> InvocationResult:
-    """One subprocess semantic for native agent backends: timeout, stderr cap,
-    elapsed time, and returncode shape. Shell-command escape hatches remain for
-    compatibility, but native adapters should enter through this function."""
+def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeout: int, env: dict[str, str] | None = None) -> InvocationResult:
+    """One subprocess semantic for native agent backends.
+
+    Correctness-by-construction boundary: callers must choose an explicit cwd,
+    so a native agent never accidentally inherits the harness repo directory.
+    The helper owns spawn failure, process-group timeout cleanup, stderr capping,
+    elapsed time, and returncode shape for every native CLI adapter."""
     started = time.time()
     try:
-        proc = subprocess.run(argv, input=input_text, text=True, capture_output=True, timeout=timeout, cwd=str(cwd) if cwd else None, env=env)
-        return InvocationResult(stdout=proc.stdout or "", stderr=(proc.stderr or "")[:4000], returncode=proc.returncode, elapsed_ms=int((time.time() - started) * 1000), timed_out=False)
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=env,
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        return InvocationResult(stdout="", stderr=f"{type(exc).__name__}: {exc}"[:4000], returncode=127, elapsed_ms=int((time.time() - started) * 1000), timed_out=False)
+    try:
+        out, err = proc.communicate(input=input_text, timeout=timeout)
+        return InvocationResult(stdout=coerce_text(out), stderr=coerce_text(err)[:4000], returncode=proc.returncode, elapsed_ms=int((time.time() - started) * 1000), timed_out=False)
     except subprocess.TimeoutExpired as exc:
-        return InvocationResult(stdout=coerce_text(exc.stdout), stderr=coerce_text(exc.stderr or str(exc))[:4000], returncode=124, elapsed_ms=int((time.time() - started) * 1000), timed_out=True)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        out, err = proc.communicate()
+        stderr = coerce_text(err or exc.stderr or str(exc))[:4000]
+        return InvocationResult(stdout=coerce_text(out or exc.stdout), stderr=stderr, returncode=124, elapsed_ms=int((time.time() - started) * 1000), timed_out=True)
 
 
 class AgentBackend:
@@ -3874,7 +3896,10 @@ class CodexBackend(AgentBackend):
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> RunnerOutcome:
         cmd = str(options.get("codex_cmd") or "codex exec --json")
-        argv = shlex.split(cmd)
+        try:
+            argv = shlex.split(cmd)
+        except ValueError as exc:
+            return RunnerOutcome(provider="codex", answer="", returncode=127, stderr=f"invalid --codex-cmd: {exc}", model=request.model, environment={"runner": "codex", "command": "<invalid --codex-cmd>", "cwd": "<isolated workspace>"})
         if not argv:
             argv = ["codex", "exec"]
         if "--json" not in argv:
@@ -4019,32 +4044,41 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
 
 
 def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str = "claude",
-                      timeout: int = DEFAULT_RUNNER_TIMEOUT_S, extra_args: list[str] | None = None, cwd: str | None = None) -> dict[str, Any]:
-    """Single owner for invoking Claude via `claude -p`. Returns the parsed
-    envelope plus returncode/elapsed_ms/stderr. `claude_bin` is an executable path
-    (tests inject a stub that emits a canned envelope), NOT a shell string — so
-    there is no shell-quoting seam between the harness and the model."""
+                      timeout: int = DEFAULT_RUNNER_TIMEOUT_S, extra_args: list[str] | None = None, cwd: str | Path | None = None) -> dict[str, Any]:
+    """Single owner for invoking Claude via `claude -p`.
+
+    Returns the parsed envelope plus returncode/elapsed_ms/stderr. `claude_bin`
+    is an executable path (tests inject a stub that emits a canned envelope), NOT
+    a shell string — so there is no shell-quoting seam between the harness and
+    the model. If no cwd is supplied, run in an empty temporary directory rather
+    than inheriting the harness repo cwd."""
     argv = [claude_bin, "-p", "--output-format", "json"]
     if model:
         argv += ["--model", model]
     if extra_args:
         argv += list(extra_args)
-    started = time.time()
-    try:
-        proc = subprocess.run(argv, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=cwd)
-    except subprocess.TimeoutExpired as exc:
+
+    def invoke(cwd_path: Path | str) -> InvocationResult:
+        return run_argv_capture(argv, input_text=prompt, cwd=cwd_path, timeout=timeout)
+
+    if cwd is None:
+        with tempfile.TemporaryDirectory(prefix="claude-invoke-cwd-") as td:
+            result = invoke(Path(td))
+    else:
+        result = invoke(cwd)
+    if result.timed_out:
         return {"answer": "", "cost_usd": None, "usage": {}, "parse_error": None,
-                "returncode": 124, "timed_out": True, "elapsed_ms": int((time.time() - started) * 1000),
-                "stderr": str(exc)[:4000]}
-    parsed = parse_claude_cli_json(proc.stdout)
-    effective_returncode = proc.returncode
+                "returncode": 124, "timed_out": True, "elapsed_ms": result.elapsed_ms,
+                "stderr": result.stderr}
+    parsed = parse_claude_cli_json(result.stdout)
+    effective_returncode = result.returncode
     if effective_returncode == 0 and parsed.get("is_error"):
         effective_returncode = 1
     parsed.update({
         "returncode": effective_returncode,
         "timed_out": False,
-        "elapsed_ms": int((time.time() - started) * 1000),
-        "stderr": (proc.stderr or "")[:4000],
+        "elapsed_ms": result.elapsed_ms,
+        "stderr": result.stderr,
     })
     return parsed
 
@@ -4074,8 +4108,9 @@ def run_claude(args: argparse.Namespace) -> int:
 
 def json_schema_errors(instance: Any, schema: dict[str, Any], path: str = "$") -> list[str]:
     """Deterministic subset of JSON-Schema for structured_output (roadmap 1.1):
-    type, properties, required, items, enum, const, minItems/maxItems. Enough
-    to pin a tool-output contract without a new dependency."""
+    type, properties, required, additionalProperties:false, items, enum, const,
+    minItems/maxItems. Enough to pin a tool-output contract without a new
+    dependency."""
     errors: list[str] = []
     if "const" in schema and instance != schema["const"]:
         errors.append(f"{path}: expected const {schema['const']!r}, got {instance!r}")
@@ -4097,10 +4132,15 @@ def json_schema_errors(instance: Any, schema: dict[str, Any], path: str = "$") -
             errors.append(f"{path}: expected type {expected_type}, got {type(instance).__name__}")
             return errors   # type mismatch makes deeper checks noise
     if isinstance(instance, dict):
+        props = schema.get("properties") or {}
         for key in schema.get("required", []):
             if key not in instance:
                 errors.append(f"{path}: missing required key {key!r}")
-        for key, sub in (schema.get("properties") or {}).items():
+        if schema.get("additionalProperties") is False:
+            extras = sorted(str(k) for k in instance if k not in props)
+            for key in extras:
+                errors.append(f"{path}: unexpected key {key!r}")
+        for key, sub in props.items():
             if key in instance and isinstance(sub, dict):
                 errors.extend(json_schema_errors(instance[key], sub, f"{path}.{key}"))
     if isinstance(instance, list):
@@ -4139,10 +4179,11 @@ def codex_structured_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
     def walk(node: Any) -> None:
         if not isinstance(node, dict):
             return
-        if node.get("type") == "object" and isinstance(node.get("properties"), dict):
-            props = node["properties"]
+        if node.get("type") == "object":
+            props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
             original_required = set(node.get("required") or [])
             node["additionalProperties"] = False
+            node["properties"] = props
             node["required"] = list(props.keys())
             for name, child in props.items():
                 if isinstance(child, dict) and name not in original_required:
@@ -4168,7 +4209,12 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
     come from `--output-last-message` so callers never parse JSONL as if it were
     the final JSON object. Tests inject a Python command via `codex_cmd`; the
     command only needs to honor `--output-last-message` for native-judge tests."""
-    argv = shlex.split(codex_cmd)
+    try:
+        argv = shlex.split(codex_cmd)
+    except ValueError as exc:
+        return {"answer": "", "trace_text": "", "stderr": f"invalid --codex-cmd: {exc}", "returncode": 127,
+                "timed_out": False, "elapsed_ms": 0, "usage": {}, "cost_usd": None,
+                "model": f"codex/{model}" if model else "codex/default"}
     if not argv:
         argv = ["codex", "exec"]
     if json_events and "--json" not in argv:
@@ -4187,6 +4233,8 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
         argv += ["--sandbox", sandbox]
     with tempfile.TemporaryDirectory(prefix="codex-invoke-") as td:
         tmp = Path(td)
+        invoke_cwd = Path(cwd) if cwd is not None else tmp / "cwd"
+        invoke_cwd.mkdir(parents=True, exist_ok=True)
         last_message = tmp / "last-message.json"
         argv += ["--output-last-message", str(last_message)]
         if output_schema is not None:
@@ -4194,7 +4242,7 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
             write_json(schema_path, codex_structured_output_schema(output_schema))
             argv += ["--output-schema", str(schema_path)]
         argv.append("-")
-        result = run_argv_capture(argv, input_text=prompt, cwd=cwd, timeout=timeout)
+        result = run_argv_capture(argv, input_text=prompt, cwd=invoke_cwd, timeout=timeout)
         final_text = last_message.read_text(encoding="utf-8", errors="replace") if last_message.exists() else result.stdout
     usage: dict[str, Any] = {}
     cost_usd = None
@@ -4593,8 +4641,12 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
     first). Kept beside run_one_judge_task/merged_qualitative_entry so the schema
     and its one consumer of each shape never drift."""
     if assertion.get("graded_dimensions"):
+        dim_names = [str(d.get("name")) for d in assertion.get("graded_dimensions", []) if isinstance(d, dict) and d.get("name")]
+        dim_schema: dict[str, Any] = {"type": "object", "properties": {name: {"type": "number"} for name in dim_names}}
+        if dim_names:
+            dim_schema["required"] = dim_names
         return {"type": "object", "required": ["dimension_scores"],
-                "properties": {"dimension_scores": {"type": "object"}, "rationale": {"type": "string"}}}
+                "properties": {"dimension_scores": dim_schema, "rationale": {"type": "string"}}}
     if assertion.get("dynamic_rubric"):
         minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
         return {"type": "object", "required": ["criteria"],
@@ -9326,7 +9378,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run-codex")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
-    p.add_argument("--codex-cmd", default="codex exec --json", help="shell command that reads prompt on stdin and emits Codex JSONL")
+    p.add_argument("--codex-cmd", default="codex exec --json", help="argv-style Codex command prefix that reads prompt on stdin and emits Codex JSONL; shell metacharacters are not interpreted")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-claude", help="run prepared tasks through `claude -p --output-format json`, capturing cost/usage")
@@ -9342,7 +9394,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable for --agent claude")
-    p.add_argument("--codex-cmd", default="codex exec --json", help="shell command for --agent codex answer runs")
+    p.add_argument("--codex-cmd", default="codex exec --json", help="argv-style Codex command prefix for --agent codex answer runs; shell metacharacters are not interpreted")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")
@@ -9376,7 +9428,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--judge-backend", choices=["claude", "codex", "cmd"], help="native judge backend; defaults to cmd when --judge-cmd is supplied, otherwise claude")
     p.add_argument("--judge-model", help="judge model id for the selected native backend; with --judge-backend codex this is a Codex/OpenAI model")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable when using the claude judge backend")
-    p.add_argument("--codex-cmd", default="codex exec", help="base Codex command for --judge-backend codex; the harness adds --json/--output-last-message/--output-schema")
+    p.add_argument("--codex-cmd", default="codex exec", help="argv-style Codex command prefix for --judge-backend codex; the harness adds --json/--output-last-message/--output-schema and shell metacharacters are not interpreted")
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
     p.add_argument("--strict-judge-schema", action="store_true", help="fail a judge verdict whose JSON violates its canonical schema (default: surface violations in a schema_errors field only)")
     p.add_argument("--judge-trajectory", action="store_true", help="also give the judge the run's normalized trajectory (events/metrics) and a denylisted artifact inventory, not just the final output (G1)")
