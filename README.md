@@ -147,6 +147,7 @@ skill-benchmark --help
 | `docs/academic-grounding.md` | The research constructs behind the harness's terms, with citations; meshes the workflow, measurement, and theory layers. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
 | `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
+| `docs/agent-backend-interface-spec.md` | Draft spec for turning Claude/Codex/Gemini/Vibe support into a shared agent backend interface: parity matrix, judge backends, trigger adapters, telemetry, and tool replay. |
 | `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
 | `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
