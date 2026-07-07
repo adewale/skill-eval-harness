@@ -333,6 +333,26 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 self.assertEqual(json.loads((base / "events.json").read_text())["schema_version"], 2)
                 self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
 
+    def test_run_agent_dispatches_registered_claude_and_codex_backends(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            fake_codex = root / "fake_codex.py"
+            fake_codex.write_text(
+                "import json, sys\n_ = sys.stdin.read()\n"
+                "print(json.dumps({'role': 'assistant', 'content': 'token from codex'}))\n",
+                encoding="utf-8")
+            codex_runs = root / "agent-codex"
+            sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(codex_runs), model=None,
+                                            codex_cmd=f"{sys.executable} {fake_codex}", claude_bin="claude", timeout=30))
+            self.assertIn("token from codex", (codex_runs / run_dir / "output.md").read_text(encoding="utf-8"))
+
+            claude_bin = stub_claude(root / "claude_stub.py", answer="token from claude")
+            claude_runs = root / "agent-claude"
+            sb.run_agent(argparse.Namespace(agent="claude", tasks=str(tasks), runs=str(claude_runs), model="claude-haiku-4-5-20251001",
+                                            codex_cmd="codex exec --json", claude_bin=str(claude_bin), timeout=30))
+            self.assertIn("token from claude", (claude_runs / run_dir / "output.md").read_text(encoding="utf-8"))
+
     def test_write_runner_outcome_derives_none_answer_from_trace(self):
         # answer=None means "the answer is the final trace message" (the Codex seam).
         with tempfile.TemporaryDirectory() as td:

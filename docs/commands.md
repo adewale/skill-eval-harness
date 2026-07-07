@@ -51,7 +51,7 @@ skill-benchmark import-trace \
 
 ## Run Codex JSONL tasks
 
-`run-codex` executes prepared rows through a command compatible with `codex exec --json`, saves `trace.jsonl`, normalizes events/metrics, extracts the final answer into `output.md`, and records nonzero/timeouts as failed run artifacts:
+`run-codex` is a compatibility wrapper for `run-agent --agent codex`. It executes prepared rows through a command compatible with `codex exec --json`, saves `trace.jsonl`, normalizes events/metrics, extracts the final answer into `output.md`, and records nonzero/timeouts as failed run artifacts:
 
 ```bash
 skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl
@@ -67,9 +67,21 @@ skill-benchmark run-codex \
   --codex-cmd ./bin/codex-jsonl-wrapper
 ```
 
+## Run native agent tasks
+
+`run-agent` is the provider-neutral native runner. It dispatches prepared rows through a registered backend and writes the same run contract as the compatibility wrappers:
+
+```bash
+skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl
+skill-benchmark run-agent --agent codex --tasks tasks.jsonl --runs ../repo/eval-runs/codex-tune \
+  --model openai/gpt-5.4-mini
+skill-benchmark run-agent --agent claude --tasks tasks.jsonl --runs ../repo/eval-runs/claude-tune \
+  --model claude-haiku-4-5-20251001
+```
+
 ## Run Claude tasks (with cost capture)
 
-`run-claude` executes prepared rows through `claude -p --output-format json`, extracts the answer into `output.md`, and records real per-run `total_cost_usd` + token usage into `metrics.json`. The benchmark report then totals `cost_usd_total` per arm (over scorable runs), so a paired eval reports actual dollars:
+`run-claude` is a compatibility wrapper for `run-agent --agent claude`: it executes prepared rows through `claude -p --output-format json`, extracts the answer into `output.md`, and records real per-run `total_cost_usd` + token usage into `metrics.json`. The benchmark report then totals `cost_usd_total` per arm (over scorable runs), so a paired eval reports actual dollars:
 
 ```bash
 skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl
@@ -201,11 +213,25 @@ skill-benchmark suggest-cases --benchmark benchmark.json --manifest evals/shared
 
 `migrate` upgrades a version-1 manifest to version 2: stamps default severities and oracle tiers, marks binary judge rubrics with a `graded?` todo, prints the diff plus the judgment-call checklist (`--check` for a dry run, `--out-checklist` to save it). See [`migrating-evals.md`](migrating-evals.md) for the agent runbook.
 
-## Judge command backend
+## Judge backends
 
-Run deferred `judge`/`rubric` assertions with a command that reads one grading prompt from stdin and emits JSON on stdout. The prompt contains the original case prompt, `expected_behavior`, `review_rubric`, the assertion, and the saved candidate output.
+Run deferred `judge`/`rubric` assertions with either a native backend (`--judge-backend claude` or `--judge-backend codex`) or a shell command (`--judge-cmd`) that reads one grading prompt from stdin and emits JSON on stdout. The prompt contains the original case prompt, `expected_behavior`, `review_rubric`, the assertion, and the saved candidate output.
 
 ```bash
+skill-benchmark judge ../repo/evals/shared-benchmark.json \
+  --runs ../repo/eval-runs/latest \
+  --judge-backend claude \
+  --judge-model claude-haiku-4-5-20251001 \
+  --transcripts judge-transcripts \
+  --out judge-results.jsonl
+
+skill-benchmark judge ../repo/evals/shared-benchmark.json \
+  --runs ../repo/eval-runs/latest \
+  --judge-backend codex \
+  --judge-model openai/gpt-5.4-mini \
+  --transcripts judge-transcripts-codex \
+  --out judge-results.codex.jsonl
+
 skill-benchmark judge ../repo/evals/shared-benchmark.json \
   --runs ../repo/eval-runs/latest \
   --judge-cmd 'claude -p' \
@@ -218,7 +244,7 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --out benchmark.json
 ```
 
-The judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting. `--transcripts` saves the exact prompt, stdout, stderr, and parsed result for each judge task.
+Native Claude uses `claude -p --output-format json`; native Codex uses `codex exec --output-last-message <file> --output-schema <schema.json>` so verdict parsing reads the final assistant message rather than the event JSONL stream. For Codex/OpenAI structured output, the harness adapts the canonical verdict schema into a strict provider schema (`additionalProperties:false`; optional fields become nullable) while still validating the returned verdict against the canonical schema. A shell judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting. `--transcripts` saves the exact prompt, stdout, stderr, and parsed result for each judge task.
 
 ## Audit manifest quality
 

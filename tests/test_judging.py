@@ -208,6 +208,27 @@ class VerdictSchemaTests(unittest.TestCase):
             self.assertNotIn("schema_errors", r)   # clean verdict -> no new key -> byte-identical row
             self.assertTrue(r["passed"])
 
+    def test_native_codex_judge_uses_last_message_and_schema(self):
+        with tempfile.TemporaryDirectory() as td:
+            task = self._task(td)
+            fake = Path(td) / "codex_stub.py"
+            fake.write_text(
+                "import json, pathlib, sys\n"
+                "_ = sys.stdin.read()\n"
+                "out = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+                "schema = json.loads(pathlib.Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())\n"
+                "assert schema['additionalProperties'] is False\n"
+                "assert set(schema['required']) == {'passed', 'score', 'rationale'}\n"
+                "assert 'null' in schema['properties']['score']['type']\n"
+                "out.write_text(json.dumps({'passed': True, 'score': 1, 'rationale': 'codex ok'}))\n"
+                "print(json.dumps({'type':'usage','usage':{'input_tokens':2,'output_tokens':3}}))\n",
+                encoding="utf-8")
+            row = sb.run_one_judge_task(task, judge_backend="codex", judge_model="gpt-mini", codex_cmd=f"{sys.executable} {fake}")
+        self.assertTrue(row["passed"])
+        self.assertEqual(row["judge_model"], "codex/gpt-mini")
+        self.assertEqual(row["judge_backend"], "codex")
+        self.assertEqual(row["usage_normalized"]["total_tokens"], 5)
+
     def test_prompt_embeds_the_schema(self):
         task = {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
                 "run_number": 1, "prompt": "p", "assertion": self.PLAIN}

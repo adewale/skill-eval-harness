@@ -84,6 +84,27 @@ class RunClaudeAdapterTests(unittest.TestCase):
             # and it is recognized as a non-scorable infra failure
             self.assertFalse(sb.execution_valid({"returncode": 3}, text))
 
+    def test_json_is_error_marks_infra_failure_even_with_zero_exit(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            stub = td / "quota_stub.py"
+            stub.write_text(
+                "#!/usr/bin/env python3\nimport json\n"
+                "print(json.dumps({'type':'result','is_error':True,'api_error_status':429,"
+                "'result':'limit reached','total_cost_usd':0,'usage':{}}))\n",
+                encoding="utf-8")
+            stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+            _, runs, run_dir = self._run(td, cost=0.0, answer="unused")
+            # Re-run the same prepared task through the quota-shaped stub.
+            tasks = td / "tasks.jsonl"
+            sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(runs), model="claude-haiku-4-5-20251001", claude_bin=str(stub), timeout=60))
+            base = runs / run_dir
+            text = (base / "output.md").read_text()
+            meta = json.loads((base / "metadata.json").read_text())
+            self.assertEqual(meta["returncode"], 1)
+            self.assertTrue(text.lstrip().startswith(sb.CLAUDE_FAILURE))
+            self.assertFalse(sb.execution_valid(meta, text))
+
     def test_benchmark_totals_cost(self):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)

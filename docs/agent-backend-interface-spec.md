@@ -8,10 +8,9 @@ This spec captures the current Claude-specific surfaces, the work required to ma
 
 The harness already treats saved run directories as the stable grading contract, but model execution still leaks provider-specific assumptions into several places:
 
-- `run-claude` owns a native Claude CLI invocation and cost parser.
-- `run-codex` owns a separate Codex JSONL runner.
+- `run-claude` and `run-codex` are compatibility wrappers around a shared native `run-agent` path.
 - `skill-trigger-matrix` has its own `AgentAdapter` family for autonomous skill activation.
-- `judge` has a native Claude backend plus an untyped shell `--judge-cmd` escape hatch for every other provider.
+- `judge` has native Claude and Codex backends plus an untyped shell `--judge-cmd` escape hatch for every other provider.
 - Tool replay exists through `run-subagent`, not through every native CLI runner.
 
 That is enough to ship features, but it makes parity hard to reason about. A new agent should not require inventing seven separate integration stories.
@@ -82,9 +81,9 @@ The point of the adapter work is not only feature parity. The refactor should ma
 | Trace artifacts | Codex JSONL normalized. | Expand parser fixtures for current event names and usage/cost events. |
 | Token usage | Supported when stream reports it. | Make coverage explicit in `AgentCapabilities`. |
 | Dollar cost | Currently `missing` unless a wrapper reports it. | Parse provider-reported cost if Codex exposes it, otherwise estimate from pricing table and mark source `price_table_estimated`. |
-| Native judge | None; use `--judge-cmd` wrapper. | Add native `CodexJudgeBackend`. |
-| Judge schema | Only prompt-level via `--judge-cmd`. | Use `codex exec --output-schema <schema.json>`. |
-| Judge transcripts | Generic `--judge-cmd` transcripts exist. | Stamp backend/model, parsed Codex metadata, usage, and cost. |
+| Native judge | Implemented via `judge --judge-backend codex`. | Keep conformance coverage and add more parser fixtures as Codex event shapes evolve. |
+| Judge schema | Implemented via `codex exec --output-schema <schema.json>` with a provider-compatible strict copy of the canonical verdict schema. | Keep harness-side schema validation as a fail-closed backstop. |
+| Judge transcripts | Native transcripts stamp backend/model plus parsed usage/cost when present. | Expand cost coverage if Codex emits price/cost events. |
 | Judge trajectory/explore | Generic `--judge-cmd` can receive prompt text only; no native sanitized tool access. | Add read-only workspace policy if Codex can inspect a sanitized run dir safely. |
 | Autonomous trigger | `skill-trigger-matrix --agent codex` mounts `.codex/skills` and runs `codex exec --json`. | Verify against current Codex skill-discovery docs and add model matrix defaults. |
 | Tool replay | None for native Codex CLI. | Implement through MCP/tool-host boundary or keep unsupported in native path and offer `run-subagent`/MCP replay. |
@@ -336,13 +335,13 @@ Live smoke tests remain opt-in by env var, one per adapter:
    - Extract Claude and Codex answer invocation into `AgentBackend` implementations.
    - Keep old commands as wrappers.
    - Move trigger adapters into the same registry.
-2. **Codex native judge**
-   - Implement `CodexJudgeBackend` using `--output-last-message` and `--output-schema`.
-   - Parse optional JSONL telemetry.
-   - Update capability row to `judge_backend=native` once tests pass.
-3. **Shared judge backend CLI**
-   - Add `--judge-backend` and `--judge-model` semantics independent of provider.
-   - Keep `--judge-cmd` as `backend=cmd`.
+2. **Codex native judge** — done for the current CLI surface.
+   - Uses `--output-last-message` and `--output-schema`.
+   - Parses optional JSONL telemetry when present.
+   - Capability row now advertises native judge support.
+3. **Shared judge backend CLI** — initial implementation done.
+   - `--judge-backend claude|codex|cmd` selects the backend.
+   - `--judge-cmd` remains `backend=cmd` for arbitrary providers.
 4. **Gemini adapter**
    - Answer runner and judge first (`--output-format json|stream-json`).
    - Trigger adapter after headless Agent Skills activation is proven.
