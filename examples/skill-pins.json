@@ -5,8 +5,8 @@
     "anti-slop-writing": {
       "repo": "adewale/anti-slop-writing",
       "ref": "main",
-      "sha": "ec704359bc4fafcbc3fd3cbe232aa1ebc3bb2f46",
-      "commit_date": "2026-06-27T16:51:25+02:00",
+      "sha": "7bafe1a0ad58fb15e5ccc8cccdeece765e5aa489",
+      "commit_date": "2026-07-07T08:01:13+01:00",
       "skill_paths": [
         "skills/anti-slop-writing/SKILL.md"
       ],
@@ -16,8 +16,8 @@
     "audit-skill": {
       "repo": "adewale/audit-skill",
       "ref": "main",
-      "sha": "49cb1bb389aeef8721109d294185d3c58685a372",
-      "commit_date": "2026-06-15T18:01:12+01:00",
+      "sha": "fc44b08b81ef4d282c42f62ca579d63ddbae87fb",
+      "commit_date": "2026-07-07T08:01:13+01:00",
       "skill_paths": [
         "skills/audit/SKILL.md"
       ],
@@ -27,19 +27,19 @@
     "cfdoctor": {
       "repo": "adewale/cfdoctor",
       "ref": "main",
-      "sha": "0110c42662b324e22280e75ff4775e3f6ebef090",
-      "commit_date": "2026-06-27T16:51:32+02:00",
+      "sha": "4a14f4df19dd83799e4168f538f2b16c0a5670ba",
+      "commit_date": "2026-07-07T08:01:33+01:00",
       "skill_paths": [
         "skills/cloudflare-doctor/SKILL.md"
       ],
-      "tree_hash": "d285b437b7d83df62a2871a689eaaa39d22767d2814ecf027121216b2452b445",
+      "tree_hash": "092a119644309fb30ff18cf69bb7ea4657f962a42f1776963c8917a98f6bbf9a",
       "verified": true
     },
     "good-pr": {
       "repo": "adewale/good-pr",
       "ref": "main",
-      "sha": "06a2b9973c48fc43012d25f844a9e0060afdcf03",
-      "commit_date": "2026-06-15T18:01:16+01:00",
+      "sha": "8e613beba912411217ae89b82fadb081a4380bb5",
+      "commit_date": "2026-07-07T08:01:14+01:00",
       "skill_paths": [
         "skills/good-pr/SKILL.md"
       ],
@@ -49,8 +49,8 @@
     "good-readme": {
       "repo": "adewale/good-readme",
       "ref": "main",
-      "sha": "837e0d292224e1718ed6335b36019e6527ddf024",
-      "commit_date": "2026-06-15T18:01:20+01:00",
+      "sha": "263b521fb6d4af2a25b20840c361842b690099ee",
+      "commit_date": "2026-07-07T08:01:14+01:00",
       "skill_paths": [
         "skills/good-readme/SKILL.md"
       ],
@@ -60,8 +60,8 @@
     "good-repo": {
       "repo": "adewale/good-repo",
       "ref": "main",
-      "sha": "cb1c9c99091baac0ceed5df15feb5f724767874c",
-      "commit_date": "2026-06-27T16:51:39+02:00",
+      "sha": "e30d2c8af8e997a5998b5b3690aad28111a19d6d",
+      "commit_date": "2026-07-07T08:01:14+01:00",
       "skill_paths": [
         "skills/good-repo/SKILL.md"
       ],
@@ -71,8 +71,8 @@
     "guardrails-skill": {
       "repo": "adewale/guardrails-skill",
       "ref": "main",
-      "sha": "9b99313b89abe9a3316a48b91eb4249ab114699d",
-      "commit_date": "2026-06-27T16:51:46+02:00",
+      "sha": "a800ecf25365659727863c71c5b824578070210b",
+      "commit_date": "2026-07-07T08:01:14+01:00",
       "skill_paths": [
         "skills/guardrails/SKILL.md"
       ],
@@ -82,8 +82,8 @@
     "slide-maker": {
       "repo": "adewale/slide-maker",
       "ref": "main",
-      "sha": "98ebae01372f5d0fab3b0f21f3d862c766accabd",
-      "commit_date": "2026-06-30T14:50:42+02:00",
+      "sha": "a3f04815d046c0db7cef7e71f1cc4efba7ce70e2",
+      "commit_date": "2026-07-07T08:01:14+01:00",
       "skill_paths": [
         "skills/slide-maker/SKILL.md"
       ],
@@ -104,8 +104,8 @@
     "testing-best-practices": {
       "repo": "adewale/testing-best-practices",
       "ref": "main",
-      "sha": "4c3ec8eb761f39d8b5ea344ec4d3c8e0c59a171d",
-      "commit_date": "2026-06-27T16:52:01+02:00",
+      "sha": "e50479920006aa010850a2c37f9bee1e02b5badf",
+      "commit_date": "2026-07-07T08:01:14+01:00",
       "skill_paths": [
         "testing-best-practices/SKILL.md"
       ],
