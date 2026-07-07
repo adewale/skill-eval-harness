@@ -3898,7 +3898,7 @@ class CodexBackend(AgentBackend):
             provider="codex", answer=None if result.stdout.strip() else "",
             returncode=result.returncode, timed_out=result.timed_out, timeout_s=request.timeout_s,
             elapsed_ms=result.elapsed_ms, stderr=result.stderr,
-            trace_text=result.stdout if result.stdout.strip() else "",
+            trace_text=result.stdout if result.stdout.strip() else "", model=request.model,
             environment={"runner": "codex", "command": " ".join(shlex.quote(a) for a in argv), "cwd": "<isolated workspace>"})
 
 

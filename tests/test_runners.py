@@ -343,9 +343,10 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 "print(json.dumps({'role': 'assistant', 'content': 'token from codex'}))\n",
                 encoding="utf-8")
             codex_runs = root / "agent-codex"
-            sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(codex_runs), model=None,
+            sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(codex_runs), model="gpt-mini",
                                             codex_cmd=f"{sys.executable} {fake_codex}", claude_bin="claude", timeout=30))
             self.assertIn("token from codex", (codex_runs / run_dir / "output.md").read_text(encoding="utf-8"))
+            self.assertEqual(json.loads((codex_runs / run_dir / "metadata.json").read_text(encoding="utf-8"))["model"], "gpt-mini")
 
             claude_bin = stub_claude(root / "claude_stub.py", answer="token from claude")
             claude_runs = root / "agent-claude"
