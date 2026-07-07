@@ -93,8 +93,8 @@
     "swiss-poster-skill": {
       "repo": "adewale/swiss-poster-skill",
       "ref": "main",
-      "sha": "9f2c64ab5eb72d458e9b11f01e8023e08f6068b9",
-      "commit_date": "2026-06-27T16:51:53+02:00",
+      "sha": "235c020b33814fea6988ad8db5dff379a52fa355",
+      "commit_date": "2026-07-07T08:20:58+01:00",
       "skill_paths": [
         "swiss-poster/SKILL.md"
       ],
