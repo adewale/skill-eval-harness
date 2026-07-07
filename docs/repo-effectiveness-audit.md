@@ -2,7 +2,7 @@
 
 Date: 2026-06-18 (re-audit; baseline 2026-06-11)
 
-> **Note (2026-07-02):** this is a dated snapshot. Since it was written, the eval-framework roadmap and cost telemetry landed (still under CHANGELOG *Unreleased*; version is unchanged at `0.4.2`), so the figures below understate the repo — the suite is now ~399 tests across 11 files, and the feature inventory omits graded scoring, the model axis, cost telemetry, and the Claude/subagent runners. Per this audit's own re-audit trigger (a new public release), a full refresh is due when the next version tags.
+> **Note (2026-07-08):** this is a dated snapshot. Since it was written, the eval-framework roadmap, cost telemetry, and native Claude/Codex backend work shipped in `v0.5.0`, so the figures below understate the repo — the suite is larger, and the feature inventory omits graded scoring, the model axis, cost telemetry, and the native agent-backend parity work. Per this audit's own re-audit trigger (a new public release), a full refresh is due after `v0.5.0`.
 
 This audit applies the `good-repo` skill to `adewale/skill-eval-harness` as a public Python CLI/package repo for Agent Skill evaluation.
 
@@ -10,7 +10,7 @@ This audit applies the `good-repo` skill to `adewale/skill-eval-harness` as a pu
 
 Re-run after `v0.4.2` and the `token-overhead` command shipped. Score is unchanged at 86/100; the substantive surfaces remain strong.
 
-- **Fixed:** README install commands pinned the stale `@v0.4.1` tag while the current release is `v0.4.2`. Quick start and Installation now pin `@v0.4.2` (`README.md`). Historical "shipped v0.4.1 runner support" references are intentionally left as-is.
+- **Fixed at that re-run:** README install commands pinned the stale `@v0.4.1` tag while the then-current release was `v0.4.2`. Quick start and Installation pinned `@v0.4.2` (`README.md`). Historical "shipped v0.4.1 runner support" references are intentionally left as-is.
 - **Verified (at the time of that re-run):** the unit suite passed locally via `python3 -m unittest discover tests`. (The suite has since grown severalfold; CI is the source of truth for the current count.)
 - **Still pending (owner-only):** GitHub description, topics, and homepage URL remain empty on the repo page despite being present in `pyproject.toml`. See the manual settings checklist below.
 

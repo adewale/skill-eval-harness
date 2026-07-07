@@ -46,7 +46,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 > uv tool install git+https://github.com/adewale/skill-eval-harness.git@main
 > ```
 >
-> `@main` matches everything documented below. Pinning a release tag (latest: `@v0.4.2`) is more reproducible, but several commands documented here (see the CHANGELOG's Unreleased section) landed after that tag.
+> `@main` matches the development branch. Pinning the latest release tag (`@v0.5.0`) is more reproducible and matches this release's documented command surface.
 
 Run these from a skill repo that has `evals/shared-benchmark.json`:
 
@@ -167,7 +167,7 @@ Each skill repo owns an `evals/shared-benchmark.json` manifest. Add a `harness` 
   "harness": {
     "name": "skill-eval-harness",
     "url": "https://github.com/adewale/skill-eval-harness",
-    "version": ">=0.4.2"
+    "version": ">=0.5.0"
   },
   "skill_paths": ["skills/good-pr/SKILL.md"],
   "variants": ["with_skill", "without_skill"],
