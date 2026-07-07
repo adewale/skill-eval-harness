@@ -333,6 +333,41 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 self.assertEqual(json.loads((base / "events.json").read_text())["schema_version"], 2)
                 self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
 
+    def test_run_agent_dispatches_registered_claude_and_codex_backends(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            fake_codex = root / "fake_codex.py"
+            fake_codex.write_text(
+                "import json, sys\n_ = sys.stdin.read()\n"
+                "print(json.dumps({'role': 'assistant', 'content': 'token from codex'}))\n",
+                encoding="utf-8")
+            codex_runs = root / "agent-codex"
+            sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(codex_runs), model="gpt-mini",
+                                            codex_cmd=f"{sys.executable} {fake_codex}", claude_bin="claude", timeout=30))
+            self.assertIn("token from codex", (codex_runs / run_dir / "output.md").read_text(encoding="utf-8"))
+            self.assertEqual(json.loads((codex_runs / run_dir / "metadata.json").read_text(encoding="utf-8"))["model"], "gpt-mini")
+
+            claude_bin = stub_claude(root / "claude_stub.py", answer="token from claude")
+            claude_runs = root / "agent-claude"
+            sb.run_agent(argparse.Namespace(agent="claude", tasks=str(tasks), runs=str(claude_runs), model="claude-haiku-4-5-20251001",
+                                            codex_cmd="codex exec --json", claude_bin=str(claude_bin), timeout=30))
+            self.assertIn("token from claude", (claude_runs / run_dir / "output.md").read_text(encoding="utf-8"))
+
+    def test_run_agent_writes_failure_artifact_when_native_command_is_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            runs = root / "runs"
+            sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(runs), model="gpt-mini",
+                                            codex_cmd=str(root / "missing-codex"), claude_bin="claude", timeout=30))
+            base = runs / run_dir
+            text = (base / "output.md").read_text(encoding="utf-8")
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertTrue(text.lstrip().startswith(sb.CODEX_FAILURE))
+            self.assertEqual(meta["returncode"], 127)
+            self.assertFalse(sb.execution_valid(meta, text))
+
     def test_write_runner_outcome_derives_none_answer_from_trace(self):
         # answer=None means "the answer is the final trace message" (the Codex seam).
         with tempfile.TemporaryDirectory() as td:

@@ -208,6 +208,55 @@ class VerdictSchemaTests(unittest.TestCase):
             self.assertNotIn("schema_errors", r)   # clean verdict -> no new key -> byte-identical row
             self.assertTrue(r["passed"])
 
+    def test_native_codex_judge_uses_last_message_and_schema(self):
+        with tempfile.TemporaryDirectory() as td:
+            task = self._task(td)
+            fake = Path(td) / "codex_stub.py"
+            fake.write_text(
+                "import json, pathlib, sys\n"
+                "_ = sys.stdin.read()\n"
+                "out = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+                "schema = json.loads(pathlib.Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())\n"
+                "assert schema['additionalProperties'] is False\n"
+                "assert set(schema['required']) == {'passed', 'score', 'rationale'}\n"
+                "assert 'null' in schema['properties']['score']['type']\n"
+                "out.write_text(json.dumps({'passed': True, 'score': 1, 'rationale': 'codex ok'}))\n"
+                "print(json.dumps({'type':'usage','usage':{'input_tokens':2,'output_tokens':3}}))\n",
+                encoding="utf-8")
+            row = sb.run_one_judge_task(task, judge_backend="codex", judge_model="gpt-mini", codex_cmd=f"{sys.executable} {fake}")
+        self.assertTrue(row["passed"])
+        self.assertEqual(row["judge_model"], "codex/gpt-mini")
+        self.assertEqual(row["judge_backend"], "codex")
+        self.assertEqual(row["usage_normalized"]["total_tokens"], 5)
+
+    def test_native_codex_judge_default_cwd_is_isolated_from_repo(self):
+        with tempfile.TemporaryDirectory() as td:
+            task = self._task(td)
+            cwd_file = Path(td) / "cwd.txt"
+            fake = Path(td) / "codex_stub.py"
+            fake.write_text(
+                "import json, os, pathlib, sys\n"
+                "pathlib.Path(sys.argv[1]).write_text(os.getcwd())\n"
+                "out = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+                "out.write_text(json.dumps({'passed': True, 'score': 1, 'rationale': 'ok'}))\n",
+                encoding="utf-8")
+            row = sb.run_one_judge_task(task, judge_backend="codex", judge_model="gpt-mini", codex_cmd=f"{sys.executable} {fake} {cwd_file}")
+            self.assertTrue(row["passed"])
+            invoked_cwd = Path(cwd_file.read_text(encoding="utf-8"))
+            self.assertFalse((invoked_cwd / "skill_benchmark.py").exists(), invoked_cwd)
+            self.assertNotEqual(invoked_cwd.resolve(), ROOT.resolve())
+
+    def test_codex_structured_schema_supports_graded_dimensions(self):
+        assertion = {"type": "judge", "graded_dimensions": [{"name": "clarity", "rubric": "anchored"}]}
+        schema = sb.codex_structured_output_schema(sb.verdict_schema_for(assertion))
+        self.assertFalse(schema["additionalProperties"])
+        dim_scores = schema["properties"]["dimension_scores"]
+        self.assertFalse(dim_scores["additionalProperties"])
+        self.assertEqual(dim_scores["required"], ["clarity"])
+        self.assertEqual(dim_scores["properties"]["clarity"]["type"], "number")
+        self.assertTrue(sb.json_schema_errors({"dimension_scores": {"other": 3}, "rationale": None}, schema))
+        self.assertFalse(sb.json_schema_errors({"dimension_scores": {"clarity": 4}, "rationale": None}, schema))
+
     def test_prompt_embeds_the_schema(self):
         task = {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
                 "run_number": 1, "prompt": "p", "assertion": self.PLAIN}
@@ -706,8 +755,9 @@ class ToolUsingJudgeTests(unittest.TestCase):
             probe = json.loads((Path(td) / "probe.json").read_text(encoding="utf-8"))
         self.assertTrue(row["passed"])
         self.assertIsNone(probe["add_dir"])                                # off -> no directory handed over
-        self.assertNotIn("--add-dir", probe["argv"])                       # byte-identical invocation
-        self.assertEqual(probe["cwd"], os.getcwd())                        # off -> inherits cwd unchanged (cwd=None)
+        self.assertNotIn("--add-dir", probe["argv"])
+        self.assertNotEqual(probe["cwd"], os.getcwd())                     # native judges never inherit repo cwd
+        self.assertIn("claude-invoke-cwd-", probe["cwd"])                 # isolated empty cwd by construction
 
     def test_copy_drops_innocent_named_symlink_to_oracle(self):
         # KEYSTONE: copytree(symlinks=False) dereferences a link, copying the target's
@@ -736,7 +786,8 @@ class ToolUsingJudgeTests(unittest.TestCase):
             after = self._tmp_explore_dirs()
         self.assertTrue(row["passed"])
         self.assertIsNone(probe["add_dir"])          # no run dir -> no copy, no --add-dir over the repo
-        self.assertEqual(probe["cwd"], os.getcwd())  # and no stray cwd change
+        self.assertNotEqual(probe["cwd"], os.getcwd())
+        self.assertIn("claude-invoke-cwd-", probe["cwd"])
         self.assertEqual(after, before)
 
     def test_explore_is_inert_on_shell_judge_cmd(self):

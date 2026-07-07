@@ -130,9 +130,9 @@ editor. This boundary is the main extension seam in the codebase.
 
 A runner consumes task rows and produces the contract. The repo ships six paths plus a
 generic one: Pi smoke (`examples/adewale-workspace/run_pi_smoke.py`), Pi trigger
-(`run_pi_trigger_eval.py`), Codex (`run_codex:3812`), Claude (`run_claude:3950`, capturing real
-per-run cost), the in-process subagent runner (`run_subagent:4958`, which hosts record/replay
-tool I/O via `ToolReplayStore`), Jetty (`JettyClient:2209` and the export/run/import commands),
+(`run_pi_trigger_eval.py`), Codex (`run_codex:3985`), Claude (`run_claude:4103`, capturing real
+per-run cost), the in-process subagent runner (`run_subagent:5217`, which hosts record/replay
+tool I/O via `ToolReplayStore`), Jetty (`JettyClient:2210` and the export/run/import commands),
 and any runner that writes the contract directly. Each runner registers a workspace builder so
 one cross-runner invariant proves its `without_skill` arm is skill-free (CF.2). The harness
 calls no model itself; it reads what the runner left behind.
@@ -153,7 +153,7 @@ across runs and keys each by `judge_task_id` (`case::variant::run-n::assertion`,
 segment on a multi-model run). `judge_prompt` renders the case, expected behavior, rubric, and
 candidate output into a prompt — including the anchored dimensions or dynamic-rubric
 instruction for a graded assertion; `run_one_judge_task` pipes it to the `--judge-cmd` you
-supply (or `--judge-model` for the native Claude judge, which captures per-verdict cost);
+supply or to a native `--judge-backend` (`claude` or `codex`) plus `--judge-model`;
 `merge_repeated_judge_rows` majority-votes pass/fail and medians scores across repeats. The
 harness picks no model. A judge result is `{judge_task_id, passed, score, evidence}` — plus
 `dimension_scores`/`criteria` for a graded verdict and normalized `usage_normalized`/
@@ -174,7 +174,7 @@ a re-grade cheap and deterministic.
 normalized gain, and a flag when the skill hurts). `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:361`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:362`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 ## What changes when you extend the tool

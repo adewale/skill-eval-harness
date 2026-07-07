@@ -157,7 +157,7 @@ class TimeoutConventionTests(unittest.TestCase):
         # write_runner_outcome — none may hand-roll a metadata/metrics/events/
         # output write, the drift that let the Codex empty-output path skip the
         # normalized telemetry blocks the others wrote.
-        for fn in (sb.run_codex, sb.run_claude, sb.run_subagent_tasks):
+        for fn in (sb.run_agent_tasks, sb.run_subagent_tasks):
             src = inspect.getsource(fn)
             self.assertIn("write_runner_outcome", src,
                           f"{fn.__name__} does not write its run through write_runner_outcome")
@@ -168,6 +168,10 @@ class TimeoutConventionTests(unittest.TestCase):
                                  f"{fn.__name__} hand-rolls a write to {artifact} instead of using write_runner_outcome")
                 self.assertNotIn(f"(base / {artifact}).write_text", src,
                                  f"{fn.__name__} hand-rolls output for {artifact} instead of using write_runner_outcome")
+        for fn in (sb.run_codex, sb.run_claude, sb.run_agent):
+            src = inspect.getsource(fn)
+            self.assertIn("run_agent_tasks", src,
+                          f"{fn.__name__} bypasses the shared native answer runner")
 
     def test_runner_failure_markers_have_one_provider_map(self):
         # A provider is bound to its failure marker in exactly one place, and the
@@ -218,6 +222,11 @@ class TimeoutConventionTests(unittest.TestCase):
         self.assertEqual(meta["returncode"], 124)
         self.assertTrue(text.startswith(am.TIMEOUT_FAILURE))
         self.assertFalse(am.execution_valid(meta, text))
+
+    def test_native_invocation_helper_kills_process_groups_on_timeout(self):
+        src = inspect.getsource(sb.run_argv_capture)
+        self.assertIn("start_new_session=True", src)
+        self.assertIn("os.killpg", src)
 
     def test_shell_agent_backend_encodes_timeouts(self):
         backend = sb.shell_agent_backend("sleep 5", timeout=1)

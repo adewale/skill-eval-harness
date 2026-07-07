@@ -347,3 +347,17 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 - Give each run a clean discovery environment: a fresh `CLAUDE_CONFIG_DIR` per run so personal skills stay out while the agent's built-ins stay in. A leaked config dir turns "did it discover the skill" into "did it already have the skill."
 - Keep the discovery population out of the answer graders: `is_trigger_case` routes `kind: "trigger"` cases away from `benchmark`/`grade`/the judge collector so a discovery output is never graded or judge-billed as an answer, and the report stamps the `raw_autonomous_trigger_measurement` evidence class (owned once as `TRIGGER_MEASUREMENT_EVIDENCE_CLASS`).
 - Ship an offline deterministic adapter (`stub`) that decides from the mounted description, so a weakened description measurably under-triggers in CI without a model call; other agents register via an `AgentAdapter` subclass rather than re-forking the mount/detect loop (per the one-owner lesson above).
+
+## 2026-07-07 — Native agent parity is mostly subprocess contracts, not model prompting
+
+**Problem:** Adding Claude/Codex parity looked like "call another CLI", but the live run exposed three non-prompting failure modes: Claude can return a JSON envelope with `is_error:true` and exit 0; Codex structured output requires provider-strict JSON Schema (`additionalProperties:false`, nullable optionals); and Codex answer runs need an isolated, config-light invocation (`--skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules --sandbox read-only -`) or local user config/MCPs leak into eval cost and stderr.
+
+**Lesson:** Treat every agent backend as an adapter contract: argv construction, cwd, timeout, error envelope semantics, final-message extraction, schema adaptation, telemetry normalization, and failure-body writing are the product. The prompt is only one field in that contract.
+
+**Rule:**
+- Native answer runners enter through one `run-agent` path and write through `RunnerOutcome`/`write_runner_outcome`; compatibility commands (`run-claude`, `run-codex`) stay thin wrappers.
+- A provider-reported error envelope is an infrastructure failure even when the process exits 0; never grade a quota message as an answer.
+- Codex judge verdicts come from `--output-last-message`, while stdout JSONL is telemetry; adapt schemas for the provider, then validate returned verdicts against the harness's canonical schema.
+- Run live parity checks with the smallest models first, and record quota/auth/config failures as eval-run artifacts rather than losing the row.
+
+**Follow-up from PR audit:** these failures were exactly what Correctness by Construction is meant to prevent. The fix was not another scatter of checks; it moved invariants into the adapter boundary: native subprocess calls require an explicit cwd, all native invocations share one process-group timeout/spawn-failure contract, and provider-specific schema conversion constructs a strict schema before Codex ever sees it. Tests now try to reach the invalid states directly: repo-cwd inheritance, missing executable with no artifact, and graded-dimension schemas without strict object constraints.

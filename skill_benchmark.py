@@ -22,6 +22,7 @@ import os
 import random
 import re
 import shutil
+import shlex
 import signal
 import statistics
 import subprocess
@@ -3809,44 +3810,182 @@ def build_task_prompt(pt: PreparedTask, skill_paths: list[str] | None = None, in
     )
 
 
-def run_codex(args: argparse.Namespace) -> int:
-    tasks = load_jsonl(Path(args.tasks))
-    runs = Path(args.runs)
-    cmd = getattr(args, "codex_cmd", None) or "codex exec --json"
-    timeout = int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S))
+@_dataclass(frozen=True)
+class InvocationRequest:
+    """Provider-neutral request handed to an agent backend.
+
+    The harness owns workspace construction and output writing. A backend owns
+    only the invocation wire format: argv/env/stdout parsing. Keeping that seam
+    small makes Claude/Codex parity testable without live model calls."""
+
+    prompt: str
+    workspace: Path
+    model: str | None
+    timeout_s: int
+    output_schema: dict[str, Any] | None = None
+    mode: str = "answer"
+
+
+@_dataclass(frozen=True)
+class InvocationResult:
+    stdout: str
+    stderr: str
+    returncode: int
+    elapsed_ms: int
+    timed_out: bool = False
+    final_text: str | None = None
+    raw_trace: str | None = None
+    usage: dict[str, Any] | None = None
+    cost_usd: float | None = None
+    model: str | None = None
+    provider: str | None = None
+    adapter_metadata: dict[str, Any] | None = None
+
+
+def coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeout: int, env: dict[str, str] | None = None) -> InvocationResult:
+    """One subprocess semantic for native agent backends.
+
+    Correctness-by-construction boundary: callers must choose an explicit cwd,
+    so a native agent never accidentally inherits the harness repo directory.
+    The helper owns spawn failure, process-group timeout cleanup, stderr capping,
+    elapsed time, and returncode shape for every native CLI adapter."""
+    started = time.time()
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=env,
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        return InvocationResult(stdout="", stderr=f"{type(exc).__name__}: {exc}"[:4000], returncode=127, elapsed_ms=int((time.time() - started) * 1000), timed_out=False)
+    try:
+        out, err = proc.communicate(input=input_text, timeout=timeout)
+        return InvocationResult(stdout=coerce_text(out), stderr=coerce_text(err)[:4000], returncode=proc.returncode, elapsed_ms=int((time.time() - started) * 1000), timed_out=False)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        out, err = proc.communicate()
+        stderr = coerce_text(err or exc.stderr or str(exc))[:4000]
+        return InvocationResult(stdout=coerce_text(out or exc.stdout), stderr=stderr, returncode=124, elapsed_ms=int((time.time() - started) * 1000), timed_out=True)
+
+
+class AgentBackend:
+    name = "agent"
+
+    def invoke_answer(self, request: InvocationRequest, **options: Any) -> RunnerOutcome:
+        raise NotImplementedError
+
+
+class CodexBackend(AgentBackend):
+    name = "codex"
+
+    def invoke_answer(self, request: InvocationRequest, **options: Any) -> RunnerOutcome:
+        cmd = str(options.get("codex_cmd") or "codex exec --json")
+        try:
+            argv = shlex.split(cmd)
+        except ValueError as exc:
+            return RunnerOutcome(provider="codex", answer="", returncode=127, stderr=f"invalid --codex-cmd: {exc}", model=request.model, environment={"runner": "codex", "command": "<invalid --codex-cmd>", "cwd": "<isolated workspace>"})
+        if not argv:
+            argv = ["codex", "exec"]
+        if "--json" not in argv:
+            argv.append("--json")
+        if request.model:
+            argv += ["--model", request.model]
+        if "--skip-git-repo-check" not in argv:
+            argv.append("--skip-git-repo-check")
+        if "--ephemeral" not in argv:
+            argv.append("--ephemeral")
+        if "--ignore-user-config" not in argv:
+            argv.append("--ignore-user-config")
+        if "--ignore-rules" not in argv:
+            argv.append("--ignore-rules")
+        if "--sandbox" not in argv:
+            argv += ["--sandbox", "read-only"]
+        if "-" not in argv:
+            argv.append("-")
+        result = run_argv_capture(argv, input_text=request.prompt, cwd=request.workspace, timeout=request.timeout_s)
+        return RunnerOutcome(
+            provider="codex", answer=None if result.stdout.strip() else "",
+            returncode=result.returncode, timed_out=result.timed_out, timeout_s=request.timeout_s,
+            elapsed_ms=result.elapsed_ms, stderr=result.stderr,
+            trace_text=result.stdout if result.stdout.strip() else "", model=request.model,
+            environment={"runner": "codex", "command": " ".join(shlex.quote(a) for a in argv), "cwd": "<isolated workspace>"})
+
+
+class ClaudeBackend(AgentBackend):
+    name = "claude"
+
+    def invoke_answer(self, request: InvocationRequest, **options: Any) -> RunnerOutcome:
+        result = claude_cli_invoke(request.prompt, model=request.model, claude_bin=str(options.get("claude_bin") or "claude"), timeout=request.timeout_s, cwd=str(request.workspace))
+        claude_metrics = claude_run_metrics(result)
+        metrics_extra = {k: v for k, v in claude_metrics.items() if k not in ("schema_version", "source")}
+        return RunnerOutcome(
+            provider="claude", answer=result.get("answer") or "",
+            returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
+            timeout_s=request.timeout_s, elapsed_ms=result.get("elapsed_ms") or 0, stderr=result.get("stderr", ""),
+            usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
+            metadata_extra={"cost_usd": claude_metrics.get("cost_usd")}, metrics_extra=metrics_extra,
+            environment={"runner": "claude", "command": "claude -p --output-format json", "cwd": "<isolated workspace>"})
+
+
+AGENT_BACKENDS: dict[str, AgentBackend] = {"claude": ClaudeBackend(), "codex": CodexBackend()}
+
+
+def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, **options: Any) -> int:
+    """Shared answer-runner loop for native CLI backends.
+
+    Existing `run-claude` and `run-codex` now use this path, and the new
+    `run-agent` command exposes it directly. Provider-specific code returns a
+    RunnerOutcome; this loop owns PreparedTask handling, workspace construction,
+    provenance, and the run-output contract."""
     for task in tasks:
-        # Cross the JSONL boundary ONCE: from here down the typed PreparedTask is the
-        # authority for variant, skill paths, ablation record, and tree hash — the
-        # runner no longer threads a raw row through dict-based helpers.
         pt = PreparedTask.from_row(task)
+        row_model = task.get("model") or model
         base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
         base.mkdir(parents=True, exist_ok=True)
-        # Provenance persisted on every run so the report can verify the ablation
-        # arm and the with_skill arm share a skill revision (skill_tree_hash).
         prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
-        started = time.time()
-        environment = {"runner": "codex", "command": cmd, "cwd": "<isolated workspace>", "variant": pt.variant_truth}
-        with tempfile.TemporaryDirectory(prefix="codex-ws-") as wd:
+        with tempfile.TemporaryDirectory(prefix=f"{backend.name}-ws-") as wd:
             ws = Path(wd)
             skill_rel, input_rel = build_skill_workspace(pt, ws)
             prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
-            try:
-                proc = subprocess.run(cmd, shell=True, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=str(ws))
-                # answer=None: the Codex answer is the final trace message, derived
-                # by the writer once the trace is parsed.
-                outcome = RunnerOutcome(
-                    provider="codex", answer=None, returncode=proc.returncode,
-                    elapsed_ms=int((time.time() - started) * 1000),
-                    stderr=proc.stderr[:4000] if proc.stderr else "",
-                    trace_text=proc.stdout if proc.stdout.strip() else "",
-                    metadata_extra=prov_extra, environment=environment)
-            except subprocess.TimeoutExpired as exc:
-                outcome = RunnerOutcome(
-                    provider="codex", answer="", returncode=124, timed_out=True, timeout_s=timeout,
-                    elapsed_ms=int((time.time() - started) * 1000), stderr=str(exc)[:4000],
-                    metadata_extra=prov_extra, environment=environment)
+            outcome = backend.invoke_answer(InvocationRequest(prompt=prompt, workspace=ws, model=row_model, timeout_s=timeout, mode="answer"), **options)
+        outcome.metadata_extra = {**prov_extra, **(outcome.metadata_extra or {})}
+        env = dict(outcome.environment or {})
+        env.setdefault("runner", backend.name)
+        env["variant"] = pt.variant_truth
+        outcome.environment = env
         write_runner_outcome(base, outcome)
     return 0
+
+
+def run_agent(args: argparse.Namespace) -> int:
+    agent = getattr(args, "agent", None)
+    if agent not in AGENT_BACKENDS:
+        die(f"unknown agent backend {agent!r}; expected one of {sorted(AGENT_BACKENDS)}")
+    return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), AGENT_BACKENDS[agent],
+                           model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
+                           claude_bin=getattr(args, "claude_bin", None), codex_cmd=getattr(args, "codex_cmd", None))
+
+
+def run_codex(args: argparse.Namespace) -> int:
+    return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), AGENT_BACKENDS["codex"],
+                           timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
+                           codex_cmd=getattr(args, "codex_cmd", None) or "codex exec --json")
 
 
 # --------------------------------------------------------------------------- #
@@ -3899,33 +4038,47 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
         "cost_usd": cost if isinstance(cost, (int, float)) else None,
         "usage": usage,
         "parse_error": None,
+        "is_error": bool(env.get("is_error")),
+        "api_error_status": env.get("api_error_status"),
     }
 
 
 def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str = "claude",
-                      timeout: int = DEFAULT_RUNNER_TIMEOUT_S, extra_args: list[str] | None = None, cwd: str | None = None) -> dict[str, Any]:
-    """Single owner for invoking Claude via `claude -p`. Returns the parsed
-    envelope plus returncode/elapsed_ms/stderr. `claude_bin` is an executable path
-    (tests inject a stub that emits a canned envelope), NOT a shell string — so
-    there is no shell-quoting seam between the harness and the model."""
+                      timeout: int = DEFAULT_RUNNER_TIMEOUT_S, extra_args: list[str] | None = None, cwd: str | Path | None = None) -> dict[str, Any]:
+    """Single owner for invoking Claude via `claude -p`.
+
+    Returns the parsed envelope plus returncode/elapsed_ms/stderr. `claude_bin`
+    is an executable path (tests inject a stub that emits a canned envelope), NOT
+    a shell string — so there is no shell-quoting seam between the harness and
+    the model. If no cwd is supplied, run in an empty temporary directory rather
+    than inheriting the harness repo cwd."""
     argv = [claude_bin, "-p", "--output-format", "json"]
     if model:
         argv += ["--model", model]
     if extra_args:
         argv += list(extra_args)
-    started = time.time()
-    try:
-        proc = subprocess.run(argv, input=prompt, text=True, capture_output=True, timeout=timeout, cwd=cwd)
-    except subprocess.TimeoutExpired as exc:
+
+    def invoke(cwd_path: Path | str) -> InvocationResult:
+        return run_argv_capture(argv, input_text=prompt, cwd=cwd_path, timeout=timeout)
+
+    if cwd is None:
+        with tempfile.TemporaryDirectory(prefix="claude-invoke-cwd-") as td:
+            result = invoke(Path(td))
+    else:
+        result = invoke(cwd)
+    if result.timed_out:
         return {"answer": "", "cost_usd": None, "usage": {}, "parse_error": None,
-                "returncode": 124, "timed_out": True, "elapsed_ms": int((time.time() - started) * 1000),
-                "stderr": str(exc)[:4000]}
-    parsed = parse_claude_cli_json(proc.stdout)
+                "returncode": 124, "timed_out": True, "elapsed_ms": result.elapsed_ms,
+                "stderr": result.stderr}
+    parsed = parse_claude_cli_json(result.stdout)
+    effective_returncode = result.returncode
+    if effective_returncode == 0 and parsed.get("is_error"):
+        effective_returncode = 1
     parsed.update({
-        "returncode": proc.returncode,
+        "returncode": effective_returncode,
         "timed_out": False,
-        "elapsed_ms": int((time.time() - started) * 1000),
-        "stderr": (proc.stderr or "")[:4000],
+        "elapsed_ms": result.elapsed_ms,
+        "stderr": result.stderr,
     })
     return parsed
 
@@ -3948,43 +4101,16 @@ def claude_run_metrics(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_claude(args: argparse.Namespace) -> int:
-    tasks = load_jsonl(Path(args.tasks))
-    runs = Path(args.runs)
-    model = getattr(args, "model", None)
-    claude_bin = getattr(args, "claude_bin", None) or "claude"
-    timeout = int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S))
-    for task in tasks:
-        pt = PreparedTask.from_row(task)
-        # The row's model (multi-model fan-out, roadmap 2.1) beats the CLI-wide
-        # default, so one prepared JSONL can drive several models in one pass.
-        row_model = task.get("model") or model
-        base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
-        base.mkdir(parents=True, exist_ok=True)
-        prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
-        with tempfile.TemporaryDirectory(prefix="claude-ws-") as wd:
-            ws = Path(wd)
-            skill_rel, input_rel = build_skill_workspace(pt, ws)
-            prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
-            result = claude_cli_invoke(prompt, model=row_model, claude_bin=claude_bin, timeout=timeout)
-            # Claude parses its envelope here; the top-level token/cost fields it
-            # aggregates ride metrics_extra so metrics.json keeps its shape.
-            claude_metrics = claude_run_metrics(result)
-            metrics_extra = {k: v for k, v in claude_metrics.items() if k not in ("schema_version", "source")}
-            outcome = RunnerOutcome(
-                provider="claude", answer=result.get("answer") or "",
-                returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
-                timeout_s=timeout, elapsed_ms=result.get("elapsed_ms") or 0, stderr=result.get("stderr", ""),
-                usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=row_model,
-                metadata_extra={**prov_extra, "cost_usd": claude_metrics.get("cost_usd")},
-                metrics_extra=metrics_extra)
-            write_runner_outcome(base, outcome)
-    return 0
+    return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), AGENT_BACKENDS["claude"],
+                           model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
+                           claude_bin=getattr(args, "claude_bin", None) or "claude")
 
 
 def json_schema_errors(instance: Any, schema: dict[str, Any], path: str = "$") -> list[str]:
     """Deterministic subset of JSON-Schema for structured_output (roadmap 1.1):
-    type, properties, required, items, enum, const, minItems/maxItems. Enough
-    to pin a tool-output contract without a new dependency."""
+    type, properties, required, additionalProperties:false, items, enum, const,
+    minItems/maxItems. Enough to pin a tool-output contract without a new
+    dependency."""
     errors: list[str] = []
     if "const" in schema and instance != schema["const"]:
         errors.append(f"{path}: expected const {schema['const']!r}, got {instance!r}")
@@ -4006,10 +4132,15 @@ def json_schema_errors(instance: Any, schema: dict[str, Any], path: str = "$") -
             errors.append(f"{path}: expected type {expected_type}, got {type(instance).__name__}")
             return errors   # type mismatch makes deeper checks noise
     if isinstance(instance, dict):
+        props = schema.get("properties") or {}
         for key in schema.get("required", []):
             if key not in instance:
                 errors.append(f"{path}: missing required key {key!r}")
-        for key, sub in (schema.get("properties") or {}).items():
+        if schema.get("additionalProperties") is False:
+            extras = sorted(str(k) for k in instance if k not in props)
+            for key in extras:
+                errors.append(f"{path}: unexpected key {key!r}")
+        for key, sub in props.items():
             if key in instance and isinstance(sub, dict):
                 errors.extend(json_schema_errors(instance[key], sub, f"{path}.{key}"))
     if isinstance(instance, list):
@@ -4024,6 +4155,117 @@ def json_schema_errors(instance: Any, schema: dict[str, Any], path: str = "$") -
             for i, element in enumerate(instance):
                 errors.extend(json_schema_errors(element, items, f"{path}[{i}]"))
     return errors
+
+
+def codex_structured_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return a Codex/OpenAI structured-output-compatible copy of a verdict schema.
+
+    The harness's canonical verdict schemas allow optional fields. Codex's
+    `--output-schema` path is stricter: object schemas must set
+    `additionalProperties:false`, and optional properties are safest as required
+    nullable fields. Keep the canonical schema for harness validation and prompt
+    text; adapt only the provider-facing schema here."""
+    converted = copy.deepcopy(schema)
+
+    def nullable(node: dict[str, Any]) -> None:
+        t = node.get("type")
+        if isinstance(t, str):
+            if t != "null":
+                node["type"] = [t, "null"]
+        elif isinstance(t, list):
+            if "null" not in t:
+                node["type"] = [*t, "null"]
+
+    def walk(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "object":
+            props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+            original_required = set(node.get("required") or [])
+            node["additionalProperties"] = False
+            node["properties"] = props
+            node["required"] = list(props.keys())
+            for name, child in props.items():
+                if isinstance(child, dict) and name not in original_required:
+                    nullable(child)
+                walk(child)
+        if node.get("type") == "array" and isinstance(node.get("items"), dict):
+            walk(node["items"])
+        for key in ("anyOf", "oneOf", "allOf"):
+            if isinstance(node.get(key), list):
+                for child in node[key]:
+                    walk(child)
+
+    walk(converted)
+    return converted
+
+
+def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = "codex exec", timeout: int = DEFAULT_RUNNER_TIMEOUT_S,
+                      output_schema: dict[str, Any] | None = None, cwd: str | Path | None = None,
+                      sandbox: str = "read-only", json_events: bool = True) -> dict[str, Any]:
+    """Native Codex invocation for judge-style calls.
+
+    Codex's event stream is useful for telemetry, but the verdict/answer should
+    come from `--output-last-message` so callers never parse JSONL as if it were
+    the final JSON object. Tests inject a Python command via `codex_cmd`; the
+    command only needs to honor `--output-last-message` for native-judge tests."""
+    try:
+        argv = shlex.split(codex_cmd)
+    except ValueError as exc:
+        return {"answer": "", "trace_text": "", "stderr": f"invalid --codex-cmd: {exc}", "returncode": 127,
+                "timed_out": False, "elapsed_ms": 0, "usage": {}, "cost_usd": None,
+                "model": f"codex/{model}" if model else "codex/default"}
+    if not argv:
+        argv = ["codex", "exec"]
+    if json_events and "--json" not in argv:
+        argv.append("--json")
+    if model:
+        argv += ["--model", model]
+    if "--skip-git-repo-check" not in argv:
+        argv.append("--skip-git-repo-check")
+    if "--ephemeral" not in argv:
+        argv.append("--ephemeral")
+    if "--ignore-user-config" not in argv:
+        argv.append("--ignore-user-config")
+    if "--ignore-rules" not in argv:
+        argv.append("--ignore-rules")
+    if sandbox and "--sandbox" not in argv:
+        argv += ["--sandbox", sandbox]
+    with tempfile.TemporaryDirectory(prefix="codex-invoke-") as td:
+        tmp = Path(td)
+        invoke_cwd = Path(cwd) if cwd is not None else tmp / "cwd"
+        invoke_cwd.mkdir(parents=True, exist_ok=True)
+        last_message = tmp / "last-message.json"
+        argv += ["--output-last-message", str(last_message)]
+        if output_schema is not None:
+            schema_path = tmp / "schema.json"
+            write_json(schema_path, codex_structured_output_schema(output_schema))
+            argv += ["--output-schema", str(schema_path)]
+        argv.append("-")
+        result = run_argv_capture(argv, input_text=prompt, cwd=invoke_cwd, timeout=timeout)
+        final_text = last_message.read_text(encoding="utf-8", errors="replace") if last_message.exists() else result.stdout
+    usage: dict[str, Any] = {}
+    cost_usd = None
+    if result.stdout.strip():
+        records, _ = parse_trace_jsonl_text(result.stdout)
+        if records:
+            _, metrics = normalize_trace_records(records, source="codex")
+            for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens"):
+                if isinstance(metrics.get(k), (int, float)):
+                    usage[k] = int(metrics[k])
+            if isinstance(metrics.get("cost_usd"), (int, float)):
+                cost_usd = float(metrics["cost_usd"])
+    return {
+        "answer": final_text,
+        "trace_text": result.stdout,
+        "stderr": result.stderr,
+        "returncode": result.returncode,
+        "timed_out": result.timed_out,
+        "elapsed_ms": result.elapsed_ms,
+        "usage": usage,
+        "cost_usd": cost_usd,
+        "model": f"codex/{model}" if model else "codex/default",
+    }
 
 
 def parse_script_score_line(stdout: str) -> float | None:
@@ -4399,8 +4641,12 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
     first). Kept beside run_one_judge_task/merged_qualitative_entry so the schema
     and its one consumer of each shape never drift."""
     if assertion.get("graded_dimensions"):
+        dim_names = [str(d.get("name")) for d in assertion.get("graded_dimensions", []) if isinstance(d, dict) and d.get("name")]
+        dim_schema: dict[str, Any] = {"type": "object", "properties": {name: {"type": "number"} for name in dim_names}}
+        if dim_names:
+            dim_schema["required"] = dim_names
         return {"type": "object", "required": ["dimension_scores"],
-                "properties": {"dimension_scores": {"type": "object"}, "rationale": {"type": "string"}}}
+                "properties": {"dimension_scores": dim_schema, "rationale": {"type": "string"}}}
     if assertion.get("dynamic_rubric"):
         minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
         return {"type": "object", "required": ["criteria"],
@@ -4567,7 +4813,9 @@ def sanitized_run_copy(run_base: Path, dest: Path) -> Path | None:
 
 
 def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, transcripts_dir: Path | None = None,
-                       repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude", schema_enforcement: str = "report", include_trajectory: bool = False, explore: bool = False) -> dict[str, Any]:
+                       repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude",
+                       judge_backend: str = "claude", codex_cmd: str = "codex exec", schema_enforcement: str = "report",
+                       include_trajectory: bool = False, explore: bool = False) -> dict[str, Any]:
     output_path = Path(task.get("output_path", ""))
     output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
     # A task without an explicit run_base has no run dir to inspect. Do NOT let an
@@ -4598,22 +4846,32 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         prompt = judge_prompt(task, output_text, trajectory=events, metrics=read_metrics_base(run_base), artifacts=judge_artifact_inventory(run_base), explore_dir=explore_hint)
     else:
         prompt = judge_prompt(task, output_text, explore_dir=explore_hint)
-    # Two judge backends, one verdict shape. A shell `judge_cmd` (any provider), OR
-    # the native Claude adapter when only `--judge-model` is given — the native path
-    # captures the real dollar cost of judging, which a shell cmd can't report back.
+    # Three judge backends, one verdict shape. A shell `judge_cmd` remains the
+    # universal escape hatch; native Claude captures provider cost directly;
+    # native Codex uses --output-last-message/--output-schema so stdout JSONL is
+    # telemetry, not the verdict stream.
     cost_usd = None
     judge_usage = None
+    usage_source = "provider_reported"
+    judge_model_label = judge_model
     try:
         if judge_cmd:
             proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
             stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
+        elif judge_backend == "codex":
+            res = codex_cli_invoke(prompt, model=judge_model, codex_cmd=codex_cmd, output_schema=verdict_schema_for(task.get("assertion", {})), cwd=explore_hint)
+            stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
+            cost_usd = res.get("cost_usd")
+            judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
+            usage_source = "trace_normalized" if judge_usage else "provider_reported"
+            judge_model_label = str(res.get("model") or f"codex/{judge_model or 'default'}")
         elif judge_model:
             res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin, extra_args=extra_args, cwd=explore_hint)
             stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
             cost_usd = res.get("cost_usd")
             judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
         else:
-            raise ValueError("run_one_judge_task needs a judge_cmd or a judge_model")
+            raise ValueError("run_one_judge_task needs a judge_cmd, a native judge_model, or judge_backend='codex'")
     finally:
         # The sanitized copy is scratch; the judge has already run against it.
         if explore_root is not None:
@@ -4659,12 +4917,13 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         "run_number": task.get("run_number"),
         # The judge is a variable, not a constant: which model produced this verdict
         # is recorded so a panel can measure whether the answer depends on the judge.
-        "judge_model": judge_model,
+        "judge_model": judge_model_label,
+        "judge_backend": judge_backend if not judge_cmd else "cmd",
         "cost_usd": cost_usd,
         # Judge-model spend is suite cost too, but a SEPARATE ledger line from
         # the model under test (issue #21); normalized like every runner path.
-        "usage_normalized": normalize_usage(judge_usage, source="provider_reported"),
-        "cost_normalized": normalize_cost(cost_usd, source="provider_reported", pricing_model=judge_model),
+        "usage_normalized": normalize_usage(judge_usage, source=usage_source),
+        "cost_normalized": normalize_cost(cost_usd, source="provider_reported", pricing_model=judge_model_label),
         "passed": passed and returncode == 0 and parse_error is None,
         "score": score,
         "threshold": threshold,
@@ -5055,15 +5314,21 @@ def judge_robustness_command(args: argparse.Namespace) -> int:
 def judge_command(args: argparse.Namespace) -> int:
     judge_cmd = getattr(args, "judge_cmd", None)
     manifest_for_judge = validate_manifest(Path(args.manifest))
+    judge_backend = getattr(args, "judge_backend", None) or ("cmd" if judge_cmd else "claude")
     panel = effective_judge_models(manifest_for_judge, getattr(args, "judge_panel", None), getattr(args, "judge_model", None))
+    if judge_backend == "codex" and not panel:
+        panel = [None]  # use Codex CLI's configured default model
     schema_enforcement = "strict" if getattr(args, "strict_judge_schema", False) else ((manifest_for_judge.get("judge") or {}).get("schema_enforcement") or "report")
     include_trajectory = getattr(args, "judge_trajectory", False)
     explore = getattr(args, "judge_explore", False)
-    if not judge_cmd and not panel:
+    if judge_backend == "cmd" and not judge_cmd:
+        die("judge --judge-backend cmd needs --judge-cmd")
+    if judge_backend == "claude" and not panel:
         die("judge needs --judge-cmd (any provider), --judge-model/--judge-panel, or a manifest judge.model default")
-    if explore and judge_cmd:
-        die("--judge-explore is for a native tool-using judge (the claude adapter); it can't combine with a shell --judge-cmd")
+    if explore and judge_backend != "claude":
+        die("--judge-explore is for the native claude judge backend only")
     claude_bin = getattr(args, "claude_bin", None) or "claude"
+    codex_cmd = getattr(args, "codex_cmd", None) or "codex exec"
     tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
     transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
     repeat = max(1, int(getattr(args, "judge_runs", 1)))
@@ -5077,10 +5342,10 @@ def judge_command(args: argparse.Namespace) -> int:
             # A shell --judge-cmd is one opaque judge (a 1-member panel); native
             # --judge-model(s) form the panel. A 1-member panel short-circuits to
             # the single-judge verdict unchanged.
-            if judge_cmd:
-                members = [merge_repeated_judge_rows([run_one_judge_task(task, judge_cmd, transcripts, i, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory) for i in range(1, repeat + 1)])]
+            if judge_backend == "cmd":
+                members = [merge_repeated_judge_rows([run_one_judge_task(task, judge_cmd, transcripts, i, judge_backend="cmd", schema_enforcement=schema_enforcement, include_trajectory=include_trajectory) for i in range(1, repeat + 1)])]
             else:
-                members = [merge_repeated_judge_rows([run_one_judge_task(task, None, transcripts, i, judge_model=model, claude_bin=claude_bin, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory, explore=explore) for i in range(1, repeat + 1)]) for model in panel]
+                members = [merge_repeated_judge_rows([run_one_judge_task(task, None, transcripts, i, judge_model=model, claude_bin=claude_bin, judge_backend=judge_backend, codex_cmd=codex_cmd, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory, explore=explore) for i in range(1, repeat + 1)]) for model in panel]
             fh.write(json.dumps(merge_cross_judge_rows(members, quorum=quorum), ensure_ascii=False) + "\n")
     finally:
         if out:
@@ -9113,7 +9378,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run-codex")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
-    p.add_argument("--codex-cmd", default="codex exec --json", help="shell command that reads prompt on stdin and emits Codex JSONL")
+    p.add_argument("--codex-cmd", default="codex exec --json", help="argv-style Codex command prefix that reads prompt on stdin and emits Codex JSONL; shell metacharacters are not interpreted")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-claude", help="run prepared tasks through `claude -p --output-format json`, capturing cost/usage")
@@ -9121,6 +9386,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="claude model id (e.g. claude-haiku-4-5-20251001); omit for the CLI default")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
+    p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
+
+    p = sub.add_parser("run-agent", help="run prepared tasks through a registered native agent backend (claude or codex)")
+    p.add_argument("--agent", required=True, choices=sorted(AGENT_BACKENDS), help="native backend to use")
+    p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
+    p.add_argument("--runs", required=True, help="output runs directory")
+    p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
+    p.add_argument("--claude-bin", default="claude", help="path to the claude executable for --agent claude")
+    p.add_argument("--codex-cmd", default="codex exec --json", help="argv-style Codex command prefix for --agent codex answer runs; shell metacharacters are not interpreted")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")
@@ -9151,8 +9425,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-cmd", help="shell command that reads a judge prompt on stdin and emits JSON on stdout (any provider)")
-    p.add_argument("--judge-model", help="judge natively with `claude -p <model>` (captures cost); stamped on every verdict")
-    p.add_argument("--claude-bin", default="claude", help="path to the claude executable when using --judge-model")
+    p.add_argument("--judge-backend", choices=["claude", "codex", "cmd"], help="native judge backend; defaults to cmd when --judge-cmd is supplied, otherwise claude")
+    p.add_argument("--judge-model", help="judge model id for the selected native backend; with --judge-backend codex this is a Codex/OpenAI model")
+    p.add_argument("--claude-bin", default="claude", help="path to the claude executable when using the claude judge backend")
+    p.add_argument("--codex-cmd", default="codex exec", help="argv-style Codex command prefix for --judge-backend codex; the harness adds --json/--output-last-message/--output-schema and shell metacharacters are not interpreted")
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
     p.add_argument("--strict-judge-schema", action="store_true", help="fail a judge verdict whose JSON violates its canonical schema (default: surface violations in a schema_errors field only)")
     p.add_argument("--judge-trajectory", action="store_true", help="also give the judge the run's normalized trajectory (events/metrics) and a denylisted artifact inventory, not just the final output (G1)")
@@ -9379,6 +9655,8 @@ def main() -> int:
         return import_trace(args)
     if args.cmd == "run-codex":
         return run_codex(args)
+    if args.cmd == "run-agent":
+        return run_agent(args)
     if args.cmd == "run-subagent":
         return run_subagent(args)
     if args.cmd == "run-claude":

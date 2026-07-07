@@ -50,10 +50,10 @@ AGENT_CAPABILITIES: dict[str, AgentCapabilities] = {
         trace_artifacts=True,
         token_usage=True,
         dollar_cost="missing",
-        judge_backend=False,
+        judge_backend=True,
         tool_replay=False,
         live_smoke_env="RUN_CODEX_TRIGGER_SMOKE",
-        notes="Codex trigger support uses codex exec --json and path evidence; dollar cost remains explicit missing unless a wrapper emits cost.",
+        notes="Codex answer/trigger support uses codex exec JSONL; native judging uses codex exec --output-last-message/--output-schema. Dollar cost remains explicit missing unless the stream reports cost or a wrapper estimates it.",
     ),
     "pi": AgentCapabilities(
         answer_runner=False,
