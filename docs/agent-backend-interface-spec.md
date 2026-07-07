@@ -31,6 +31,23 @@ That is enough to ship features, but it makes parity hard to reason about. A new
 - Do not require every agent to support every surface. Adapters declare capabilities; commands fail fast or degrade explicitly when a surface is unsupported.
 - Do not trust one judge model by default. The existing `compare-judges`, `judge-alignment`, and `judge-robustness` gates remain necessary.
 
+## Quality refactorings required by this plan
+
+The point of the adapter work is not only feature parity. The refactor should make every implementation easier to test, less brittle, and more comparable. The implementation plan must therefore include these quality moves:
+
+1. **Move provider-specific process code behind typed protocols.** Claude, Codex, Gemini, Vibe, Pi, Jetty, and future agents should return the same `InvocationResult` shape instead of leaking raw CLI dictionaries into grading, judging, or trigger code.
+2. **Centralize subprocess execution semantics.** One runner utility should own timeout handling, cwd/env isolation, stdout/stderr capture, elapsed time, redaction, and nonzero-return recording. Adapter code should describe argv/env, not reinvent failure behavior.
+3. **Separate workspace construction from invocation.** Skill mounting, input-file copying, ablation materialization, config-home isolation, and global-skill suppression should be independently testable without calling a model.
+4. **Use golden parser fixtures per backend.** Each adapter needs checked-in raw stdout/stderr examples for success, schema failure, timeout/nonzero, tool-call traces, token usage, and cost/usage absence. Parser tests should not require live API credentials.
+5. **Keep deterministic CI with fake adapters.** Every command path should be runnable against stub/fake backends that emit fixture traces and verdicts, so test coverage does not depend on Claude/Codex/Gemini/Vibe availability.
+6. **Capability-gate command routing.** Commands must fail fast with actionable messages when an adapter does not support a requested surface (`native judge`, `trigger ablation`, `tool replay`, `schema-constrained output`) instead of silently degrading.
+7. **Normalize telemetry in one place.** Token usage, dollar cost, model name, provider name, finish reason, and trace-derived metrics should flow through shared normalizers with explicit source labels (`provider_reported`, `trace_normalized`, `price_table_estimated`, `missing`).
+8. **Preserve one failure taxonomy.** Timeout, max-turn/exceeded-budget, auth/config failure, schema-invalid judge verdict, missing final answer, and model refusal should map to stable metadata fields consumed consistently by `execution_valid`, reports, cost ledgers, and error analysis.
+9. **Make security/isolation observable.** Run metadata should record config isolation mode, mounted skill roots, allowed tool policy, and whether global/user skills or context files were suppressed. Tests should assert these for each native adapter.
+10. **Keep compatibility wrappers thin.** Existing `run-claude`, `run-codex`, and `judge --judge-model/--judge-cmd` should become wrappers around the shared registry so behavior stays stable while new adapters get the same core path.
+11. **Enforce docs/registry drift tests.** `agent_capabilities.py`, `docs/agent-parity.md`, command help, and this spec should be checked together whenever a backend gains or loses a surface.
+12. **Prefer conformance tests over provider-specific assertions.** The same tests should run against every adapter that claims a capability: final-answer extraction, trace normalization, judge verdict parsing, transcript writing, trigger detection, ablation provenance, and failure semantics.
+
 ## Current Claude features
 
 | Surface | Current Claude behavior |
