@@ -4,6 +4,8 @@ All notable public changes are listed here. Release tags are the source of truth
 
 ## Unreleased
 
+- Packaging: add a PyPI trusted-publishing workflow (`.github/workflows/publish.yml`) for tokenless release uploads from GitHub Actions.
+
 ## v0.5.1 — 2026-07-08
 
 - Packaging: add an explicit setuptools build backend (`[build-system]`) so PyPI/PEP 517 builds do not rely on implicit backend defaults.
