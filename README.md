@@ -7,6 +7,22 @@ Skill Eval Harness is a Python CLI that measures the **causal lift** of an Agent
 
 General eval frameworks (openai/evals, vitest-evals, viteval) score one output against a rubric. This one measures the *difference the skill makes*, and spends its surface area on keeping that difference honest: paired with/without comparison, `tune`/`holdout`/`holdback` split discipline, leakage lint, materialized ablations with provenance gates, and per-model lift. None of those frameworks have them, and they are what make a reported number trustworthy rather than merely green.
 
+## Questions this helps answer
+
+| Question | Command/report to use |
+|---|---|
+| Does this skill improve outputs compared with no skill at all? | `prepare` paired `with_skill` / `without_skill` rows, then `benchmark` paired lift and significance. |
+| Which prompts improved, regressed, saturated, or showed no lift? | `benchmark` `case_flags`, `render-viewer`, and `error-analysis`. |
+| Is the skill worth its extra tokens or dollars? | `profile-skill`, `token-overhead`, `cost-summary`, and lift-per-dollar summaries. |
+| Did my latest skill edit introduce a regression? | Re-run the same manifest, inspect `ablation_regressions`, `trend`, and `render-viewer --previous-workspace`. |
+| Which instruction, checklist, reference, script, or asset is load-bearing? | Materialized `ablation:<id>` arms plus declared `expected_regressions`. |
+| Does the agent discover/load the skill when it should, and stay quiet when it should not? | `skill-trigger-matrix` or `skill-pi-trigger-eval`, split by should-fire / should-not-fire cases. |
+| Which model tier should this skill target? | `prepare --models`, then `benchmark` `by_model` and `model_analysis`. |
+| Is this eval safe to spend model budget on? | `validate --strict-leakage --leakage-min-chars 1 --check-ablations` and `audit-manifest --fail-on-blockers`. |
+| Can I trust this LLM judge or rubric result? | `judge`, `compare-judges`, `judge-robustness`, and `judge-alignment`. |
+| Could the eval be contaminated by leaked answer keys or memorized canaries? | Prompt leakage lint plus `contamination` over generated outputs. |
+| Can this become a CI gate? | `suite-run`, `report --format junit|github`, and readiness blockers from `audit-manifest`. |
+
 ## Core loop
 
 1. **Describe cases** in `evals/shared-benchmark.json`: prompt, split, fixture files, variants, assertions, and ablations.
@@ -28,6 +44,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 
 ## Contents
 
+- [Questions this helps answer](#questions-this-helps-answer)
 - [Quick start](#quick-start)
 - [Installation](#installation)
 - [Manifest format](#manifest-format)

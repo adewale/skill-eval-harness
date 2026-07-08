@@ -4,7 +4,36 @@ All notable public changes are listed here. Release tags are the source of truth
 
 ## Unreleased
 
+- Documentation-only: make the README's user-facing questions explicit, restructure the v0.5.0 changelog for scanability, and normalize GitHub release titles to version numbers.
+
 ## v0.5.0 — 2026-07-08
+
+### Release summary
+
+v0.5.0 is the first native multi-backend release. It moves the harness from a mostly runner/import/export workflow to a shared agent-backend path with native Claude and Codex answer runs, native Codex judging, stricter subprocess safety, and a larger release-grade eval surface.
+
+| Area | What changed |
+|---|---|
+| Native runners | Added `skill-benchmark run-agent --agent claude|codex`; `run-claude` and `run-codex` remain compatibility wrappers over the shared path. |
+| Native judging | Added `judge --judge-backend codex`, reading verdicts from `--output-last-message` and treating Codex stdout JSONL as telemetry. |
+| Safety by construction | Native subprocesses require an explicit cwd, default to isolated workspaces, write failure artifacts on spawn errors, and kill process groups on timeout. |
+| Structured verdicts | Codex/OpenAI-facing schemas are adapted to strict structured-output requirements while returned verdicts still validate against the canonical harness schema. |
+| Eval framework surface | Materialized ablations, model-axis reporting, cost telemetry, trigger matrices, judge robustness/alignment, contamination checks, CI reports, viewer improvements, and the offline demo-skill workflow are included in this release line. |
+| Docs/specs | Added the agent backend interface spec and expanded command/parity docs for Claude, Codex, and future Gemini/Vibe-style adapters. |
+
+### Validation
+
+- GitHub CI passed on Python 3.10, 3.11, and 3.12 for the release commit.
+- Local full suite passed: 607 tests OK, 4 skipped.
+- Strict demo eval-quality gate passed: `validate --strict-leakage --leakage-min-chars 1 --check-ablations`.
+- Demo suite smoke tiers passed: `preflight`, `static`, `prepare`, and `jetty-dry-run`.
+- Package artifacts built and passed `twine check dist/*`.
+
+### Known caveat
+
+- Claude live runs can still fail under local Claude quota/auth limits; v0.5.0 records those as non-scorable failure artifacts instead of grading quota text as candidate answers.
+
+### Detailed changes
 
 - **Native Claude/Codex parity path.** `skill-benchmark run-agent --agent claude|codex` is the shared native answer-runner path; `run-claude` and `run-codex` are now compatibility wrappers. Claude runs execute in the isolated task workspace and treat `claude -p` JSON envelopes with `is_error:true` (for example quota/429 responses that exit 0) as non-scorable infrastructure failures instead of grading the quota text. Codex answer runs use a config-light isolated invocation (`--skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules --sandbox read-only -`) and keep trace-derived token telemetry. `judge --judge-backend codex` adds native Codex judging via `codex exec --output-last-message --output-schema`; stdout JSONL is telemetry, not the verdict stream, and the provider-facing schema is adapted to Codex/OpenAI structured-output requirements while returned verdicts still validate against the canonical harness schema. Native subprocesses now require an explicit cwd by construction, write failure artifacts on spawn errors, and use process-group timeout cleanup. Docs, capability rows, and parity spec updated; live good-pr smoke artifacts under `/tmp/skill-eval-agent-parity-good-pr-20260707-204946` show successful Codex answer/judge coverage and fail-closed Claude quota handling.
 
