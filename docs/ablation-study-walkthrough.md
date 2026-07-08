@@ -109,9 +109,16 @@ python3 -c "import json,skill_benchmark as sb; from pathlib import Path; print(s
 
 # run the arms with your runner
 HARNESS=/path/to/skill_benchmark.py
-python3 $HARNESS prepare evals/shared-benchmark.json --split tune --include-ablations --ablation-dir /tmp/abl --out /tmp/tasks.jsonl
+python3 $HARNESS prepare evals/shared-benchmark.json --split tune --include-ablations \
+  --ablation-dir /tmp/abl --runs-per-variant 4 --out /tmp/tasks.jsonl
 python3 $HARNESS run-codex --tasks /tmp/tasks.jsonl --runs /tmp/runs --codex-cmd "claude -p"
-python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/runs --variant with_skill --variant without_skill
+python3 - <<'PY' > /tmp/ablation-variants.args
+import json
+manifest = json.load(open('evals/shared-benchmark.json'))
+print(' '.join(f"--variant ablation:{a['id']}" for a in manifest.get('ablations', [])))
+PY
+python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/runs \
+  --variant with_skill --variant without_skill $(cat /tmp/ablation-variants.args)
 ```
 
 Note: the skills' *shipped* manifests declare **instruction-simulated** ablations

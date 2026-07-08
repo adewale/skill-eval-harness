@@ -24,10 +24,12 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
 from agent_capabilities import AGENT_CAPABILITIES
+import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +39,40 @@ DEMO_MANIFEST = ROOT / "examples" / "demo-skill" / "evals" / "shared-benchmark.j
 def demo_trigger_rows():
     manifest = tm.load_manifest(DEMO_MANIFEST)
     return tm.cases_from_manifest(manifest, "tune")
+
+
+class TriggerRowBoundaryTests(unittest.TestCase):
+    def test_eval_set_requires_real_boolean_should_trigger(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "rows.json"
+            path.write_text(json.dumps([{"query": "review this", "should_trigger": "false"}]), encoding="utf-8")
+            args = SimpleNamespace(eval_set=str(path), split="tune")
+            with self.assertRaises(SystemExit) as ctx:
+                tm.eval_rows_from_args(args, DEMO_MANIFEST)
+        self.assertIn("should_trigger must be true or false", str(ctx.exception))
+
+    def test_eval_set_preserves_false_boolean(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "rows.json"
+            path.write_text(json.dumps({"evals": [{"query": "hello", "should_trigger": False}]}), encoding="utf-8")
+            args = SimpleNamespace(eval_set=str(path), split="tune")
+            rows = tm.eval_rows_from_args(args, DEMO_MANIFEST)
+        self.assertEqual(rows, [{"query": "hello", "should_trigger": False}])
+
+    def test_pi_trigger_runner_invokes_pi_from_isolated_workspace(self):
+        seen = {}
+
+        def fake_run(argv, *, cwd, env, timeout):
+            seen.update({"argv": argv, "cwd": str(cwd), "config_dir": env["PI_CODING_AGENT_DIR"], "timeout": timeout})
+            return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False,
+                    "elapsed_ms": 1, "observation_complete": True}
+
+        with mock.patch.object(tr, "run_argv_with_timeout", side_effect=fake_run):
+            result = tr.run_query(DEMO_MANIFEST, "ordinary chat", False, 12, None)
+        self.assertTrue(result["pass"])
+        self.assertEqual(seen["cwd"], seen["config_dir"])
+        self.assertIn("pi-trigger-", seen["cwd"])
+        self.assertNotEqual(Path(seen["cwd"]).resolve(), ROOT.resolve())
 
 
 class StubMatrixOfflineTests(unittest.TestCase):

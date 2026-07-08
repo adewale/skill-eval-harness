@@ -18,11 +18,13 @@ Ablate along the skill format's seams, not along lines of text. Removal and
 substitution are different experiments and must not be conflated.**
 
 The harness produces a real, altered skill tree and the runners execute against
-it. Removal logic lives in the harness once. But materialization is not free:
-the runners and the Jetty exporter currently reconstruct skill files from the
-manifest, so they must be refactored to consume the materialized tree (see
-*Runner integration*). The earlier draft's claim that they "already copy
-whatever `skill_paths` resolves to" was wrong.
+it. Removal logic lives in the harness once. The current runner/exporter paths
+consume the materialized tree for declared removals: answer-population rows route
+through `prepare --include-ablations --ablation-dir`, trigger-population rows use
+`run_pi_trigger_eval.py --ablation` / `skill-trigger-matrix --ablation`, and
+Jetty exports upload the altered tree recursively. The pre-materialization,
+instruction-simulated path remains only as a fallback for label-only ablations
+that do not declare a removal mechanism.
 
 ## Grounding sources
 
@@ -33,23 +35,23 @@ list evolves, so handling is data-driven, never a hardcoded list):
 - Claude Code skills docs & frontmatter reference — `https://code.claude.com/docs/en/skills`.
 - Skill authoring best practices — `https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices`.
 
-Internal — the contracts this builds on:
+Internal — the current contracts this builds on:
 
-- `validate_manifest` ablation block (`skill_benchmark.py:516`) — today checks only non-empty `id` + `removed_component`.
-- `variant_instruction` (`skill_benchmark.py:649`) / `task_variants` (`:692`) / `prepared_task_rows` (`:737`) — `skill_paths` is currently the manifest's, identical for every variant.
-- `safe_task_json` (`skill_benchmark.py:1921`) / `build_jetty_payload` (`:1963`) — Jetty export; ablation reads `task["skill_paths"]`, uploads flat files via `JettyClient.upload` with a basename-only `remote_path_hint`.
-- `copy_skill_to_config` (`skill_benchmark.py:47`) and `copy_skill_source` (`run_pi_smoke.py:103`) — both collapse a file-valued path to `<dir>/SKILL.md`, `rmtree` the destination, and whitelist only `references`/`scripts`/`assets`.
-- `run_pi_trigger_eval.py` — the autonomous-trigger runner; copies from the manifest and takes no variant input.
+- `validate_manifest` and `validate_ablation_specs` validate ablation shape, population, mechanisms, expected regressions, and dry-run materialization gates.
+- `prepared_task_rows` routes answer-population ablations to answer cases and requires `--ablation-dir` for declared removals; discovery-population ablations stay out of forced-load answer runners.
+- `materialize_declared_ablations` / `materialize_trigger_ablation` are the only writers of altered skill trees; they record provenance and tree hashes used by the benchmark confirmation gate.
+- `build_skill_workspace`, `copy_skill_to_config`, `run_pi_trigger_eval.py`, and `export-jetty` consume canonical or materialized trees rather than reconstructing ad-hoc file subsets.
+- `ablation_regression_summary` confirms only named expected regressions whose provenance, scorable coverage, and per-case significance gate verify the comparison.
 
-## Current state: instruction-simulated ablations
+## Fallback state: instruction-simulated ablations
 
-Every variant — including `ablation:<id>` — receives the same unmodified skill.
-The runner copies the full real skill and the instruction asks the model to
-"ignore component X" (`run_pi_smoke.py:161`). This is a prompt *about* the skill,
-not a changed skill: weak evidence, because the model still sees the full text.
-It stays supported as a fallback (the derived `instruction_simulated` mode; see
-*Vocabulary additions*), but it is no longer how an ablation that declares a
-removal behaves.
+A label-only ablation with no `mechanism` / `components` / `target` still receives
+the unmodified skill and asks the model to ignore a named component. This is a
+prompt *about* the skill, not a changed skill: weak evidence, because the model
+still sees the full text. It stays supported as a fallback (the derived
+`instruction_simulated` mode; see *Vocabulary additions*) for backwards
+compatibility and raw measurement only. It is not used for an ablation that
+declares a materialized removal.
 
 ## A skill is a structured artifact: component class vs case population
 

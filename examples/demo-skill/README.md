@@ -30,7 +30,8 @@ python3 $HARNESS validate evals/shared-benchmark.json --check-ablations
 
 # 2. prepare the with_skill / without_skill / ablation arms (materializes the ablations)
 python3 $HARNESS prepare evals/shared-benchmark.json --split tune \
-  --include-ablations --ablation-dir /tmp/demo-abl --out /tmp/demo-tasks.jsonl
+  --include-ablations --ablation-dir /tmp/demo-abl --runs-per-variant 4 \
+  --out /tmp/demo-tasks.jsonl
 
 # 3. run every arm with the deterministic stub 'model'
 python3 $HARNESS run-codex --tasks /tmp/demo-tasks.jsonl --runs /tmp/demo-runs \
@@ -45,7 +46,9 @@ python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/demo-runs \
 You should see `with_skill` pass both assertions, `without_skill` fail both, and each
 ablation arm fail exactly the one assertion whose guidance it removed — each reported
 as an `expected_regression_confirmed` because the ablation is **materialized** (a real
-edited tree, blind, with verified provenance). Swap the stub for a real runner
+edited tree, blind, with verified provenance) and the four repeated runs clear the
+per-case significance gate. With a single run per arm the same observed drop is reported
+as indeterminate, not confirmed. Swap the stub for a real runner
 (`--codex-cmd "codex exec"`, etc.) to run it against an actual model — for Claude, use `skill-benchmark run-claude` instead, which parses the `claude -p` JSON envelope and captures cost.
 
 ## Measure activation (does the skill load on its own?)

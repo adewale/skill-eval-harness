@@ -2886,14 +2886,16 @@ def mount_skill_tree(tree_dir: Path, skills_dir: Path) -> list[Path]:
 
 
 def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
-                          env: dict[str, str] | None = None, timeout: int) -> dict[str, Any]:
-    """One subprocess-with-timeout convention: returns {stdout, stderr,
-    returncode, timed_out, elapsed_ms, observation_complete}. THE timeout
-    encoding, everywhere a runner spawns a process: `timed_out: True` (the flag
-    ablation_model.execution_valid keys on) plus `returncode: 124` (the shell's
-    kill-on-timeout code). observation_complete means the agent got a fair
-    window to act; a crash or timeout is a failed observation, never a
-    no-trigger pass."""
+                          env: dict[str, str] | None = None, timeout: int,
+                          input_text: str | None = None) -> dict[str, Any]:
+    """One subprocess convention for every spawned runner/adapter process.
+
+    Returns {stdout, stderr, returncode, timed_out, elapsed_ms,
+    observation_complete}. This is the single low-level owner for spawn failure,
+    process-group timeout cleanup, and the timeout encoding: `timed_out: True`
+    plus `returncode: 124`. observation_complete means the agent got a fair
+    window to act; a crash, spawn failure, or timeout is a failed observation,
+    never a no-trigger pass."""
     def _text(value: Any) -> str:
         if value is None:
             return ""
@@ -2902,18 +2904,34 @@ def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
         return str(value)
 
     start = time.time()
-    proc = subprocess.Popen(argv, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, start_new_session=True)
     try:
-        out, err = proc.communicate(timeout=timeout)
-        stdout, stderr, returncode, timed_out = _text(out), _text(err), proc.returncode, False
-    except subprocess.TimeoutExpired:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            text=True,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        return {"stdout": "", "stderr": f"{type(exc).__name__}: {exc}"[:4000],
+                "returncode": 127, "timed_out": False,
+                "elapsed_ms": int((time.time() - start) * 1000),
+                "observation_complete": False}
+    try:
+        out, err = proc.communicate(input=input_text, timeout=timeout)
+        stdout, stderr, returncode, timed_out = _text(out), _text(err)[:4000], proc.returncode, False
+    except subprocess.TimeoutExpired as exc:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except Exception:
             proc.kill()
         out, err = proc.communicate()
-        stdout, stderr, returncode, timed_out = _text(out), _text(err), 124, True
+        stdout = _text(out or exc.stdout)
+        stderr = _text(err or exc.stderr or str(exc))[:4000]
+        returncode, timed_out = 124, True
     return {"stdout": stdout, "stderr": stderr, "returncode": returncode, "timed_out": timed_out,
             "elapsed_ms": int((time.time() - start) * 1000),
             "observation_complete": returncode == 0 and not timed_out}
@@ -3851,37 +3869,19 @@ def coerce_text(value: Any) -> str:
 
 
 def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeout: int, env: dict[str, str] | None = None) -> InvocationResult:
-    """One subprocess semantic for native agent backends.
+    """Native agent adapter wrapper over the one subprocess owner.
 
     Correctness-by-construction boundary: callers must choose an explicit cwd,
     so a native agent never accidentally inherits the harness repo directory.
-    The helper owns spawn failure, process-group timeout cleanup, stderr capping,
-    elapsed time, and returncode shape for every native CLI adapter."""
-    started = time.time()
-    try:
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(cwd),
-            env=env,
-            text=True,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-    except (OSError, ValueError) as exc:
-        return InvocationResult(stdout="", stderr=f"{type(exc).__name__}: {exc}"[:4000], returncode=127, elapsed_ms=int((time.time() - started) * 1000), timed_out=False)
-    try:
-        out, err = proc.communicate(input=input_text, timeout=timeout)
-        return InvocationResult(stdout=coerce_text(out), stderr=coerce_text(err)[:4000], returncode=proc.returncode, elapsed_ms=int((time.time() - started) * 1000), timed_out=False)
-    except subprocess.TimeoutExpired as exc:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
-            proc.kill()
-        out, err = proc.communicate()
-        stderr = coerce_text(err or exc.stderr or str(exc))[:4000]
-        return InvocationResult(stdout=coerce_text(out or exc.stdout), stderr=stderr, returncode=124, elapsed_ms=int((time.time() - started) * 1000), timed_out=True)
+    `run_argv_with_timeout` owns spawn failure, process-group timeout cleanup,
+    stderr capping, elapsed time, and returncode shape; this function only adapts
+    that dict contract into `InvocationResult`."""
+    result = run_argv_with_timeout(argv, input_text=input_text, cwd=cwd, env=env, timeout=timeout)
+    return InvocationResult(stdout=coerce_text(result.get("stdout")),
+                            stderr=coerce_text(result.get("stderr"))[:4000],
+                            returncode=int(result.get("returncode") or 0),
+                            elapsed_ms=int(result.get("elapsed_ms") or 0),
+                            timed_out=bool(result.get("timed_out")))
 
 
 class AgentBackend:

@@ -43,8 +43,6 @@ from skill_benchmark import (
 )
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 
-ROOT = Path(__file__).resolve().parents[1]
-
 
 def load_manifest(path: Path) -> dict[str, Any]:
     """The harness's manifest loader (JSON or YAML, dataset files resolved,
@@ -127,7 +125,7 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
         copied, abl_prov = copy_skill_to_config(manifest_path, manifest, config_dir, ablation_id=ablation)
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(config_dir)
-        run = run_argv_with_timeout(pi_argv(query, model), cwd=ROOT, env=env, timeout=timeout)
+        run = run_argv_with_timeout(pi_argv(query, model), cwd=config_dir, env=env, timeout=timeout)
         stdout, stderr = run["stdout"], run["stderr"]
         returncode, timed_out, elapsed_ms = run["returncode"], run["timed_out"], run["elapsed_ms"]
         triggered, evidence = detect_trigger(stdout, copied)
@@ -197,6 +195,29 @@ def cases_from_manifest(manifest: dict[str, Any], split: str | None) -> list[dic
     return out
 
 
+def validate_trigger_rows(rows: Any, source: str) -> list[dict[str, Any]]:
+    """Validate the shared trigger-row JSON boundary.
+
+    `should_trigger` must already be a JSON boolean; using Python truthiness here
+    would turn strings like "false" into True and invert the measurement."""
+    if not isinstance(rows, list):
+        raise SystemExit(f"{source}: expected a list of trigger rows or an object with evals/queries")
+    out: list[dict[str, Any]] = []
+    for i, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            raise SystemExit(f"{source}: row {i} must be an object")
+        query = row.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise SystemExit(f"{source}: row {i} query must be a non-empty string")
+        if not isinstance(row.get("should_trigger"), bool):
+            raise SystemExit(f"{source}: row {i} should_trigger must be true or false")
+        normalized = dict(row)
+        normalized["query"] = query
+        normalized["should_trigger"] = row["should_trigger"]
+        out.append(normalized)
+    return out
+
+
 def eval_rows_from_args(args: Any, manifest_path: Path) -> list[dict[str, Any]]:
     """Resolve the trigger rows for a runner invocation: an explicit --eval-set
     file ({query, should_trigger} rows, bare list or under evals/queries), else
@@ -205,8 +226,8 @@ def eval_rows_from_args(args: Any, manifest_path: Path) -> list[dict[str, Any]]:
         rows = json.loads(Path(args.eval_set).read_text(encoding="utf-8"))
         if isinstance(rows, dict):
             rows = rows.get("evals", rows.get("queries", []))
-        return rows
-    return cases_from_manifest(load_manifest(manifest_path), args.split)
+        return validate_trigger_rows(rows, str(args.eval_set))
+    return validate_trigger_rows(cases_from_manifest(load_manifest(manifest_path), args.split), str(manifest_path))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -242,7 +263,7 @@ def main() -> int:
                 if args.trace_runs:
                     label = safe_trace_label(str(row.get("query", f"query-{i}")), f"query-{i}")
                     trace_dir = Path(args.trace_runs) / f"query-{i:03d}-{label}" / f"run-{run_number}"
-                futures.append(ex.submit(run_query, manifest_path, str(row["query"]), bool(row["should_trigger"]), args.timeout, args.model, trace_dir, args.ablation))
+                futures.append(ex.submit(run_query, manifest_path, row["query"], row["should_trigger"], args.timeout, args.model, trace_dir, args.ablation))
         for fut in as_completed(futures):
             results.append(fut.result())
     passed = sum(1 for r in results if r["pass"])
