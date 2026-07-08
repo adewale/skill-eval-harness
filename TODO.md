@@ -104,6 +104,57 @@ threshold, evidence}` (`load_judge_results:4607`, merged in `grade_case_variant:
 
 ---
 
+# Agent backend parity follow-ups
+
+Design and acceptance criteria live in [`docs/agent-backend-interface-spec.md`](docs/agent-backend-interface-spec.md).
+Claude and Codex are the first native `run-agent`/judge backends; the next parity targets are
+Gemini CLI and Mistral Vibe. Keep the invariant from the v0.5.0 work: new providers implement
+shared backend protocols and conformance tests, not one-off grading or benchmark paths.
+
+## Gemini CLI
+
+- [ ] Add a native Gemini answer backend (`run-agent --agent gemini`) with isolated cwd/config,
+      `InvocationRequest`/`InvocationResult` plumbing, answer extraction from Gemini's JSON or
+      stream JSON mode, provider telemetry normalization, and failure artifacts on spawn/nonzero/
+      timeout. Mount skills under the Gemini/Agent Skills discovery locations described in the
+      backend spec.
+- [ ] Add a native Gemini judge backend (`judge --judge-backend gemini`) that returns the canonical
+      verdict JSON shape, stamps backend/model/usage metadata, and uses harness-side schema
+      validation (`verdict_schema_for`, `--strict-judge-schema`) unless Gemini exposes a reliable
+      provider-enforced schema hook.
+- [ ] Add a Gemini autonomous trigger adapter for `skill-trigger-matrix --agent gemini`: fresh
+      config/home per run, skill mounting, activation evidence from Gemini skill/tool events when
+      available, path-evidence fallback, and `RUN_GEMINI_TRIGGER_SMOKE` live-smoke coverage.
+- [ ] Add Gemini offline conformance fixtures: success, malformed JSON/schema failure, timeout,
+      nonzero/spawn failure, usage-present, usage-missing, tool/skill-activation traces, and judge
+      verdict parsing.
+
+## Mistral Vibe
+
+- [ ] Add a native Mistral Vibe answer backend (`run-agent --agent vibe`) with isolated `VIBE_HOME`
+      or equivalent config, project workspace setup, answer extraction from Vibe JSON/stream output,
+      usage/cost normalization when available, and the same native failure artifact contract as
+      Claude/Codex/Gemini.
+- [ ] Add a native Mistral Vibe judge backend (`judge --judge-backend vibe`) using the canonical
+      verdict schema and strict-schema gate; preserve raw transcripts and normalized usage/cost
+      blocks for every verdict.
+- [ ] Add a Mistral Vibe autonomous trigger adapter for `skill-trigger-matrix --agent vibe`: mount
+      skills under `.agents/skills` or Vibe's native skill path, detect explicit skill activation
+      events where possible, fall back to mounted-path evidence, and add `RUN_VIBE_TRIGGER_SMOKE`.
+- [ ] Add Vibe offline conformance fixtures matching the Gemini fixture set, including tool-call /
+      skill-activation evidence and missing-telemetry cases.
+
+## Cross-provider registry/docs
+
+- [ ] Extend `agent_capabilities.py`, `docs/agent-parity.md`, CLI help, README command tables, and
+      smoke-test environment documentation as each Gemini/Vibe surface lands.
+- [ ] Add a registry/conformance guard that fails when a backend is partially registered (for
+      example `run-agent` supports it but parity docs or capability rows do not).
+- [ ] Keep `--judge-cmd` as the escape hatch for arbitrary providers while first-class Gemini/Vibe
+      support moves through the native backend registry.
+
+---
+
 # Eval-framework parity & ideas
 
 Backlog distilled from a comparison against eve.dev, Sentry vitest-evals, viteval,
