@@ -4,6 +4,7 @@ All notable public changes are listed here. Release tags are the source of truth
 
 ## Unreleased
 
+- Packaging: add an explicit setuptools build backend (`[build-system]`) so PyPI/PEP 517 builds do not rely on implicit backend defaults.
 - Documentation-only: make the README's user-facing questions explicit, restructure the v0.5.0 changelog for scanability, and normalize GitHub release titles to version numbers.
 
 ## v0.5.0 — 2026-07-08
