@@ -60,13 +60,16 @@ harness detects memorization. `prepare` refuses to emit a hidden case with no
 
 ## Assertion
 
-An assertion is one check. The harness sorts them into four families
-(`skill_benchmark.py:29-54`):
+An assertion is one check. The code-side registries are `TEXT_ASSERTIONS`,
+`PROCESS_ASSERTIONS`, `EFFICIENCY_ASSERTIONS`, and `QUALITATIVE_ASSERTIONS`
+(`skill_benchmark.py:66-95`):
 
-- **Text** (`contains`, `regex`, `file_exists`, `json_field_equals`, `golden_output`,
-  `similarity`, `structured_output`, `script`): runs against `output.md` and sibling files.
-- **Process** (`skill_invoked`, `command_ran`, `command_order`, `tool_call`, `tool_count_le`):
-  runs against normalized trace events, and fails closed when the evidence is absent.
+- **Text** (`contains`, `contains_any`, `contains_all`, `excludes_any`, `regex`,
+  `not_regex`, `file_exists`, `json_field_equals`, `golden_output`, `similarity`,
+  `structured_output`, `script`): runs against `output.md` and sibling files.
+- **Process** (`skill_invoked`, `command_ran`, `command_not_ran`, `command_order`,
+  `tool_call`, `tool_count_le`, `no_repeated_command_loop`): runs against normalized trace
+  events, and fails closed when the evidence is absent.
 - **Efficiency** (`total_tokens_le`, `elapsed_seconds_le`, `command_count_le`): runs against
   metrics.
 - **Qualitative** (`judge`, `rubric`, and the `factuality` preset): deferred to a model you

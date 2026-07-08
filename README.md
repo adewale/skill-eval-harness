@@ -27,7 +27,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 
 1. **Describe cases** in `evals/shared-benchmark.json`: prompt, split, fixture files, variants, assertions, and ablations.
 2. **Prepare tasks** with `skill-benchmark prepare`; generation rows omit `expected_behavior` and judge rubrics unless you explicitly request them.
-3. **Run tasks** with Pi, Claude Code, Jetty, or another runner; each run writes `output.md` and optional `metadata.json`.
+3. **Run tasks** with Claude, Codex, Jetty, or any runner that writes the run-output contract; Pi support is currently trigger-focused plus workspace-specific smoke tooling.
 4. **Grade outputs** with deterministic assertions: string, regex, file, JSON field, and opt-in `script` oracles.
 5. **Inspect the report** for pass rates, flaky repeated runs, no-lift cases, saturated assertions, judge tasks, and trigger/no-trigger results.
 

@@ -92,7 +92,7 @@ AGENT_CAPABILITIES: dict[str, AgentCapabilities] = {
         notes="Generic in-process/shell seam for answer runs and tool replay; not an autonomous discovery adapter.",
     ),
     "stub": AgentCapabilities(
-        answer_runner=True,
+        answer_runner=False,
         autonomous_trigger=True,
         trigger_ablation=True,
         trace_artifacts=True,

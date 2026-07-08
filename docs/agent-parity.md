@@ -7,9 +7,9 @@ The harness supports several agent surfaces, but not every agent supports every 
 | `claude` | yes (`run-claude`, `run-agent --agent claude`) | yes (`skill-trigger-matrix --agent claude`) | yes | yes | yes | provider-reported | yes (`judge --judge-backend claude` / `--judge-model`) | yes through `run-subagent` | `RUN_TRIGGER_SMOKE` |
 | `codex` | yes (`run-codex`, `run-agent --agent codex`) | yes (`skill-trigger-matrix --agent codex`) | yes | yes | yes, when stream reports it | explicit `missing` unless a wrapper emits/estimates cost | yes (`judge --judge-backend codex`) | no native replay | `RUN_CODEX_TRIGGER_SMOKE` |
 | `pi` | no core answer runner | yes (`skill-pi-trigger-eval`, `skill-trigger-matrix --agent pi`) | yes | yes | yes, when stream reports it | stream-reported when available | no | no | `RUN_PI_TRIGGER_SMOKE` |
-| `jetty` | yes (`export-jetty` / `run-jetty` / `import-jetty-results`) | no | answer-path ablations only | imported | imported | imported | planned in Jetty TODO | no | n/a |
+| `jetty` | yes (`export-jetty` / `run-jetty` / `import-jetty-results`; answer-path ablations only) | no | no | imported | imported | imported | planned in Jetty TODO | no | n/a |
 | `subagent` | yes (`run-subagent`) | no | no | yes | yes, when backend returns it | explicit `missing` unless backend emits cost | no | yes | n/a |
-| `stub` | yes, demo/offline only | yes | yes | yes | not applicable | not applicable | no | no | n/a |
+| `stub` | no native answer runner; demo stub uses `run-codex --codex-cmd` | yes | yes | yes | not applicable | not applicable | no | no | n/a |
 
 ## What changed for Codex
 

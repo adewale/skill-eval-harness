@@ -74,7 +74,7 @@ from skill_benchmark import (
     write_json,
     write_trace_artifacts,
 )
-from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_manifest, pi_argv, skill_name_from_manifest, seed_config_dir
+from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_manifest, pi_argv, skill_name_from_manifest, seed_config_dir, validate_trigger_rows
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
@@ -602,7 +602,12 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
     for name in agents:
         if name not in ADAPTERS:
             raise SystemExit(f"unknown agent {name!r}; known: {sorted(ADAPTERS)} (subclass AgentAdapter to add one)")
-        capability_rows[name] = require_agent_capabilities(name)
+        cap = require_agent_capabilities(name)
+        if not cap.autonomous_trigger:
+            raise SystemExit(f"agent {name!r} is not registered for autonomous trigger measurement")
+        if ablation and not cap.trigger_ablation:
+            raise SystemExit(f"agent {name!r} does not support trigger ablations")
+        capability_rows[name] = cap
         adapter = adapter_instance(name, claude_bin=claude_bin, codex_cmd=codex_cmd, max_turns=max_turns)
         if adapter.name != name:
             raise SystemExit(f"ADAPTERS[{name!r}] returned adapter with name {adapter.name!r}; set the adapter's name to {name!r}")
@@ -635,11 +640,12 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
                                 "ablation": ablation,
                                 "skill_tree_hash": tree_hash,
                             }
+                            should_trigger = row["should_trigger"]
                             future = ex.submit(run_cell_query, adapter, tree_dir,
-                                               query, bool(row["should_trigger"]),
+                                               query, should_trigger,
                                                model, timeout, trace_dir, metadata)
                             futures.append(future)
-                            future_context[future] = (adapter.name, model, query, bool(row["should_trigger"]), metadata)
+                            future_context[future] = (adapter.name, model, query, should_trigger, metadata)
             for fut in as_completed(futures):
                 try:
                     results.append(fut.result())

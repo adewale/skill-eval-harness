@@ -34,5 +34,22 @@ jobs:
           python -m pip install --upgrade twine
           python -m twine check dist/*
 
+      - name: Smoke installed wheel
+        run: |
+          python -m venv /tmp/skill-eval-wheel-smoke
+          /tmp/skill-eval-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/skill-eval-wheel-smoke/bin/python -m pip install dist/*.whl
+          /tmp/skill-eval-wheel-smoke/bin/python - <<'PY'
+          import importlib.metadata
+          import tomllib
+          from pathlib import Path
+          expected = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          actual = importlib.metadata.version("skill-eval-harness")
+          assert actual == expected, f"installed version {actual!r} != pyproject {expected!r}"
+          PY
+          /tmp/skill-eval-wheel-smoke/bin/skill-benchmark --help
+          /tmp/skill-eval-wheel-smoke/bin/skill-pi-trigger-eval --help
+          /tmp/skill-eval-wheel-smoke/bin/skill-trigger-matrix --help
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

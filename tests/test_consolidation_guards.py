@@ -50,6 +50,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
     def test_trigger_matrix_reuses_the_pi_runner_row_loaders(self):
         self.assertIs(tm.cases_from_manifest, tr.cases_from_manifest)
         self.assertIs(tm.eval_rows_from_args, tr.eval_rows_from_args)
+        self.assertIs(tm.validate_trigger_rows, tr.validate_trigger_rows)
         self.assertIs(tm.pi_argv, tr.pi_argv)
 
     def test_trigger_runners_share_trace_label_sanitizer(self):
@@ -139,6 +140,24 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         for name, cap in ac.AGENT_CAPABILITIES.items():
             self.assertIn(cap.dollar_cost, sb.COST_SOURCES, name)
 
+    def test_agent_capability_registry_matches_registered_surfaces(self):
+        for name in tm.ADAPTERS:
+            self.assertIn(name, ac.AGENT_CAPABILITIES)
+            self.assertTrue(ac.AGENT_CAPABILITIES[name].autonomous_trigger, name)
+        autonomous = {name for name, cap in ac.AGENT_CAPABILITIES.items() if cap.autonomous_trigger}
+        self.assertEqual(autonomous, set(tm.ADAPTERS))
+        for name, cap in ac.AGENT_CAPABILITIES.items():
+            if cap.trigger_ablation:
+                self.assertTrue(cap.autonomous_trigger, name)
+        for name in sb.AGENT_BACKENDS:
+            self.assertTrue(ac.AGENT_CAPABILITIES[name].answer_runner, name)
+        parser = sb.build_arg_parser()
+        subs = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
+        judge_parser = subs.choices["judge"]
+        judge_backend_action = next(a for a in judge_parser._actions if "--judge-backend" in getattr(a, "option_strings", ()))
+        native_judges = set(judge_backend_action.choices) - {"cmd"}
+        self.assertEqual(native_judges, {name for name, cap in ac.AGENT_CAPABILITIES.items() if cap.judge_backend})
+
 
 class TimeoutConventionTests(unittest.TestCase):
     """One timeout encoding: timed_out=True (the flag execution_valid keys on)
@@ -224,14 +243,34 @@ class TimeoutConventionTests(unittest.TestCase):
         self.assertFalse(am.execution_valid(meta, text))
 
     def test_native_invocation_helper_kills_process_groups_on_timeout(self):
-        src = inspect.getsource(sb.run_argv_capture)
+        src = inspect.getsource(sb.run_argv_with_timeout)
         self.assertIn("start_new_session=True", src)
         self.assertIn("os.killpg", src)
+        self.assertIn("returncode\": 127", src)
+        self.assertIn("run_argv_with_timeout", inspect.getsource(sb.run_argv_capture))
+
+    def test_run_argv_with_timeout_converts_spawn_failure_to_failed_observation(self):
+        result = sb.run_argv_with_timeout(["/definitely/not/a/real/binary"], cwd=Path("."), timeout=1)
+        self.assertEqual(result["returncode"], 127)
+        self.assertFalse(result["observation_complete"])
+        self.assertFalse(result["timed_out"])
+        self.assertIn("FileNotFoundError", result["stderr"])
 
     def test_shell_agent_backend_encodes_timeouts(self):
         backend = sb.shell_agent_backend("sleep 5", timeout=1)
         outcome = backend(prompt="p", workspace=Path("."), model=None, tool_executor=None)
         self.assertEqual(outcome, {"answer": "", "returncode": 124, "timed_out": True})
+
+
+class PackagingWorkflowTests(unittest.TestCase):
+    def test_publish_workflow_smokes_the_built_wheel_before_upload(self):
+        text = (ROOT / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
+        publish_index = text.index("pypa/gh-action-pypi-publish")
+        pre_publish = text[:publish_index]
+        self.assertIn("pip install dist/*.whl", pre_publish)
+        self.assertIn("importlib.metadata.version", pre_publish)
+        for command in ("skill-benchmark --help", "skill-pi-trigger-eval --help", "skill-trigger-matrix --help"):
+            self.assertIn(command, pre_publish)
 
 
 class DocSyncTests(unittest.TestCase):

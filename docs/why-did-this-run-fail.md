@@ -41,7 +41,8 @@ S=/tmp/j-fail    # any unique scratch dir
 rm -rf "$S"; mkdir -p "$S"
 
 python3 $H prepare evals/shared-benchmark.json --split tune \
-  --include-ablations --ablation-dir "$S/abl" --out "$S/tasks.jsonl"
+  --include-ablations --ablation-dir "$S/abl" --runs-per-variant 4 \
+  --out "$S/tasks.jsonl"
 python3 $H run-codex --tasks "$S/tasks.jsonl" --runs "$S/runs" \
   --codex-cmd "python3 $(pwd)/stub_runner.py"
 python3 $H benchmark evals/shared-benchmark.json --runs "$S/runs" \
@@ -52,25 +53,24 @@ python3 $H benchmark evals/shared-benchmark.json --runs "$S/runs" \
 python3 $H error-analysis --benchmark "$S/bench.json"
 ```
 
-Real output (2026-07-06, offline stub), trimmed to the summary, taxonomy, and the first
-two review-queue rows:
+Representative output (offline stub, four runs per arm so materialized ablations can clear the significance gate), trimmed to the summary, taxonomy, and selected review-queue rows:
 
 ```json
 "summary": {
-  "failing_or_errored_runs": 5,
+  "failing_or_errored_runs": 20,
   "distinct_categories": 2
 },
 "taxonomy": [
   {
     "category": "text:severity-label",
-    "count": 4,
+    "count": 16,
     "example_case": "c-review",
     "example_evidence": "none matched: ['Blocking', 'Minor', 'Clean']",
     "share": 0.8
   },
   {
     "category": "text:cite-checklist",
-    "count": 1,
+    "count": 4,
     "example_case": "c-review",
     "example_evidence": "none matched: ['file and line']",
     "share": 0.2
@@ -108,7 +108,7 @@ two review-queue rows:
 ]
 ```
 
-Five failing runs, two categories, and one category (`text:severity-label`) owns 80% of
+Twenty failing runs, two categories, and one category (`text:severity-label`) owns 80% of
 them. That `share: 0.8` is what the taxonomy is for: the failures cluster into one
 systematic mode instead of scattering. Fix (or explain) that one thing.
 
