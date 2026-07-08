@@ -4,7 +4,7 @@ All notable public changes are listed here. Release tags are the source of truth
 
 ## Unreleased
 
-- Packaging: add a PyPI trusted-publishing workflow (`.github/workflows/publish.yml`) for tokenless release uploads from GitHub Actions.
+- Packaging: add a PyPI trusted-publishing workflow (`.github/workflows/publish.yml`) for tokenless release uploads from GitHub Actions, publish `skill-eval-harness==0.5.1` to PyPI, and update README install examples to prefer PyPI.
 
 ## v0.5.1 — 2026-07-08
 

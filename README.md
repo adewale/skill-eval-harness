@@ -57,13 +57,13 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 
 ## Quick start
 
-> Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Install from GitHub first:
+> Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Install from PyPI:
 >
 > ```bash
-> uv tool install git+https://github.com/adewale/skill-eval-harness.git@main
+> uv tool install skill-eval-harness
 > ```
 >
-> `@main` matches the development branch. Pinning the latest release tag (`@v0.5.1`) is more reproducible and matches this release's documented command surface.
+> For exact reproducibility, pin the current release: `uv tool install skill-eval-harness==0.5.1`.
 
 Run these from a skill repo that has `evals/shared-benchmark.json`:
 
@@ -108,15 +108,26 @@ viewer    -> review.html with assertion evidence and output previews
 
 ## Installation
 
-### From GitHub
+### From PyPI
 
 ```bash
-# Track main (matches this README), or pin the latest release tag for reproducibility.
-uv tool install git+https://github.com/adewale/skill-eval-harness.git@main
+uv tool install skill-eval-harness
 skill-benchmark --help
 skill-pi-trigger-eval --help
 
+# Pin a release exactly:
+uv tool install skill-eval-harness==0.5.1
+
 # One-shot without installing globally:
+uvx --from skill-eval-harness skill-benchmark --help
+```
+
+### From GitHub
+
+Use this for development snapshots before the next PyPI release:
+
+```bash
+uv tool install git+https://github.com/adewale/skill-eval-harness.git@main
 uvx --from git+https://github.com/adewale/skill-eval-harness.git@main skill-benchmark --help
 ```
 
