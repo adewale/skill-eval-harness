@@ -4,8 +4,12 @@ All notable public changes are listed here. Release tags are the source of truth
 
 ## Unreleased
 
+## v0.5.1 — 2026-07-08
+
 - Packaging: add an explicit setuptools build backend (`[build-system]`) so PyPI/PEP 517 builds do not rely on implicit backend defaults.
-- Documentation-only: make the README's user-facing questions explicit, restructure the v0.5.0 changelog for scanability, and normalize GitHub release titles to version numbers.
+- Documentation: make the README's user-facing questions explicit, restructure the v0.5.0 changelog for scanability, and normalize GitHub release titles to version numbers.
+- Roadmap: track first-class Gemini CLI and Mistral Vibe backend support in `TODO.md`, including answer runners, judge backends, autonomous trigger adapters, smoke-test env vars, and offline conformance fixtures.
+- No runtime behavior changes from v0.5.0.
 
 ## v0.5.0 — 2026-07-08
 
