@@ -48,6 +48,7 @@ from ablation_model import (
     ablation_id_of,
     is_ablation_variant,
     JETTY_FAILURE,
+    VIBE_FAILURE,
     MaterializedArm,
     PreparedTask,
     Provenance,
@@ -892,6 +893,12 @@ JETTY_ALLOWED_AGENTS = {"claude-code", "opencode", "codex", "gemini-cli"}
 JETTY_TERMINAL_SUCCESS = {"completed", "complete", "succeeded", "success"}
 JETTY_TERMINAL_FAILURE = {"failed", "failure", "error", "errored", "canceled", "cancelled", "timeout", "timed_out"}
 JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
+
+CODEX_HOME_FILES = ("auth.json", "config.toml")
+
+VIBE_DEFAULT_CMD = "vibe"
+VIBE_READ_ONLY_TOOLS = ("skill", "read_file", "grep")
+VIBE_NO_TOOLS = ("re:^$",)
 
 
 # ---------------------------------------------------------------------------
@@ -3884,6 +3891,248 @@ def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeo
                             timed_out=bool(result.get("timed_out")))
 
 
+def seed_codex_home(codex_home: Path) -> dict[str, Any]:
+    """Copy portable Codex auth/config into an isolated CODEX_HOME.
+
+    `$CODEX_HOME/skills` is also Codex's skill-discovery surface, so seeding is
+    file-allowlisted: copy auth/config files only, never user skills/plugins.
+    `--ignore-user-config` keeps copied config from influencing native harness
+    runs unless Codex needs it for auth compatibility."""
+    codex_home.mkdir(parents=True, exist_ok=True)
+    source = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    copied: list[str] = []
+    for name in CODEX_HOME_FILES:
+        src = source / name
+        dst = codex_home / name
+        if not src.is_file():
+            continue
+        if src.resolve() == dst.resolve():
+            continue
+        shutil.copy2(src, dst)
+        copied.append(name)
+    return {"codex_home": str(codex_home), "codex_home_files_copied": copied, "config_isolated": True}
+
+
+def codex_env_for_home(codex_home: Path) -> tuple[dict[str, str], dict[str, Any]]:
+    env = os.environ.copy()
+    seeded = seed_codex_home(codex_home)
+    env["CODEX_HOME"] = seeded["codex_home"]
+    return env, seeded
+
+
+def seed_vibe_home(vibe_home: Path) -> dict[str, Any]:
+    """Create an isolated VIBE_HOME for native Vibe runs.
+
+    Vibe discovers user skills/tools from VIBE_HOME, so every harness run gets a
+    fresh home by default. Auth is carried by MISTRAL_API_KEY; if that env var is
+    absent but the user has the documented ~/.vibe/.env file, copy only that env
+    file and no skills/config/agents, preserving baseline isolation."""
+    vibe_home.mkdir(parents=True, exist_ok=True)
+    copied_env = False
+    if not os.environ.get("MISTRAL_API_KEY"):
+        source_home = Path(os.environ.get("VIBE_HOME") or (Path.home() / ".vibe"))
+        src = source_home / ".env"
+        if src.is_file() and src.resolve() != (vibe_home / ".env").resolve():
+            shutil.copy2(src, vibe_home / ".env")
+            copied_env = True
+    return {"vibe_home": str(vibe_home), "vibe_env_file_copied": copied_env}
+
+
+def vibe_env_for_workspace(workspace: Path, model: str | None = None) -> tuple[dict[str, str], dict[str, Any]]:
+    env = os.environ.copy()
+    seeded = seed_vibe_home(workspace / ".vibe-home")
+    env["VIBE_HOME"] = seeded["vibe_home"]
+    if model:
+        env["VIBE_ACTIVE_MODEL"] = model
+    return env, {**seeded, "config_isolated": True, **({"active_model_env": "VIBE_ACTIVE_MODEL"} if model else {})}
+
+
+def build_vibe_cli_argv(vibe_cmd: str | None = None, *, prompt: str, cwd: Path | str | None = None,
+                        output: str = "streaming", tools: Iterable[str] | None = VIBE_READ_ONLY_TOOLS,
+                        auto_approve: bool = True, max_turns: int | None = None,
+                        max_price: float | None = None, max_tokens: int | None = None) -> list[str]:
+    try:
+        argv = shlex.split(vibe_cmd or VIBE_DEFAULT_CMD)
+    except ValueError as exc:
+        raise ValueError(f"invalid --vibe-cmd: {exc}") from exc
+    if not argv:
+        argv = [VIBE_DEFAULT_CMD]
+    argv += ["--prompt", prompt, "--output", output]
+    if cwd is not None:
+        argv += ["--workdir", str(cwd)]
+    argv.append("--trust")
+    if auto_approve:
+        argv.append("--auto-approve")
+    for tool in (tools or ()):  # `re:^$` is the explicit no-tools sentinel.
+        argv += ["--enabled-tools", str(tool)]
+    if max_turns is not None:
+        argv += ["--max-turns", str(max_turns)]
+    if max_price is not None:
+        argv += ["--max-price", str(max_price)]
+    if max_tokens is not None:
+        argv += ["--max-tokens", str(max_tokens)]
+    return argv
+
+
+def redact_vibe_prompt_arg(argv: list[str]) -> list[str]:
+    redacted = list(argv)
+    for idx, arg in enumerate(redacted[:-1]):
+        if arg == "--prompt":
+            redacted[idx + 1] = "<prompt>"
+            break
+    return redacted
+
+
+def parse_vibe_messages(stdout: str) -> list[dict[str, Any]]:
+    """Parse Vibe --output json (one list) or --output streaming (JSONL).
+
+    The Vibe CLI emits LLMMessage dictionaries, not a provider-enforced answer
+    schema. The harness therefore treats the final assistant message content as
+    the answer/verdict, while preserving all parsed messages as trace JSONL."""
+    text = coerce_text(stdout).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        records, _ = parse_trace_jsonl_text(text)
+        return records
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("messages"), list):
+            return [item for item in parsed["messages"] if isinstance(item, dict)]
+        return [parsed]
+    return []
+
+
+def _vibe_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                elif isinstance(item.get("content"), str):
+                    parts.append(item["content"])
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return "" if content is None else str(content)
+
+
+def vibe_final_answer(messages: list[dict[str, Any]], fallback: str = "") -> str:
+    for msg in reversed(messages):
+        if str(msg.get("role", "")).casefold() != "assistant":
+            continue
+        text = _vibe_content_text(msg.get("content")).strip()
+        if text:
+            return text
+    return fallback.strip()
+
+
+def _walk_dicts(value: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_dicts(child)
+
+
+def vibe_usage_and_cost(messages: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, float | None]:
+    usage: dict[str, Any] | None = None
+    cost: float | None = None
+    for obj in _walk_dicts(messages):
+        candidate = obj.get("usage") or obj.get("tokens")
+        if isinstance(candidate, dict):
+            normalized = normalize_usage(candidate, source="provider_reported")
+            if normalized.get("source") != "missing":
+                usage = candidate
+        for key in ("cost_usd", "total_cost_usd", "total_cost", "cost"):
+            value = obj.get(key)
+            if isinstance(value, dict):
+                normalized_cost = normalize_cost(value, source="provider_reported")
+                if normalized_cost.get("source") != "missing" and isinstance(normalized_cost.get("total_cost"), (int, float)):
+                    cost = float(normalized_cost["total_cost"])
+                    break
+            elif _num(value) is not None:
+                cost = float(value)
+                break
+    return usage, cost
+
+
+def vibe_trace_text(messages: list[dict[str, Any]], stdout: str) -> str:
+    return jsonl_from_records(messages) if messages else coerce_text(stdout)
+
+
+def vibe_skill_tool_evidence(stdout: str, skill_names: list[str]) -> list[str]:
+    """Detect Vibe's native `skill` tool calls from json/jsonl messages."""
+    names = set(skill_names)
+    evidence: list[str] = []
+    for msg in parse_vibe_messages(stdout):
+        for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            if str(fn.get("name") or tc.get("name") or "") != "skill":
+                continue
+            args = fn.get("arguments") or tc.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args_obj = json.loads(args)
+                except json.JSONDecodeError:
+                    args_obj = {"name": args}
+            else:
+                args_obj = args if isinstance(args, dict) else {}
+            invoked = str(args_obj.get("name") or args_obj.get("skill") or "")
+            if invoked in names:
+                evidence.append(f"Vibe skill tool invoked: {invoked}")
+    return evidence[:5]
+
+
+def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | None = None,
+                    timeout: int = DEFAULT_RUNNER_TIMEOUT_S, cwd: str | Path | None = None,
+                    output: str = "streaming", tools: Iterable[str] | None = VIBE_READ_ONLY_TOOLS,
+                    auto_approve: bool = True, max_turns: int | None = None,
+                    max_price: float | None = None, max_tokens: int | None = None) -> dict[str, Any]:
+    if cwd is None:
+        with tempfile.TemporaryDirectory(prefix="vibe-invoke-") as td:
+            return vibe_cli_invoke(prompt, model=model, vibe_cmd=vibe_cmd, timeout=timeout, cwd=Path(td),
+                                   output=output, tools=tools, auto_approve=auto_approve,
+                                   max_turns=max_turns, max_price=max_price, max_tokens=max_tokens)
+    workspace = Path(cwd)
+    env, env_meta = vibe_env_for_workspace(workspace, model)
+    try:
+        argv = build_vibe_cli_argv(vibe_cmd, prompt=prompt, cwd=workspace, output=output, tools=tools,
+                                   auto_approve=auto_approve, max_turns=max_turns,
+                                   max_price=max_price, max_tokens=max_tokens)
+    except ValueError as exc:
+        return {"answer": "", "stdout": "", "stderr": str(exc), "returncode": 127,
+                "timed_out": False, "elapsed_ms": 0, "usage": None, "cost_usd": None,
+                "model": model, "trace_text": "", "environment": env_meta}
+    result = run_argv_capture(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
+    messages = parse_vibe_messages(result.stdout)
+    answer = vibe_final_answer(messages, result.stdout)
+    usage, cost = vibe_usage_and_cost(messages)
+    return {
+        "answer": answer,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "returncode": result.returncode,
+        "timed_out": result.timed_out,
+        "elapsed_ms": result.elapsed_ms,
+        "usage": usage,
+        "cost_usd": cost,
+        "model": model,
+        "trace_text": vibe_trace_text(messages, result.stdout),
+        "environment": {**env_meta, "command": " ".join(shlex.quote(a) for a in redact_vibe_prompt_arg(argv)), "cwd": "<isolated workspace>"},
+    }
+
+
 class AgentBackend:
     name = "agent"
 
@@ -3895,36 +4144,22 @@ class CodexBackend(AgentBackend):
     name = "codex"
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> RunnerOutcome:
-        cmd = str(options.get("codex_cmd") or "codex exec --json")
-        try:
-            argv = shlex.split(cmd)
-        except ValueError as exc:
-            return RunnerOutcome(provider="codex", answer="", returncode=127, stderr=f"invalid --codex-cmd: {exc}", model=request.model, environment={"runner": "codex", "command": "<invalid --codex-cmd>", "cwd": "<isolated workspace>"})
-        if not argv:
-            argv = ["codex", "exec"]
-        if "--json" not in argv:
-            argv.append("--json")
-        if request.model:
-            argv += ["--model", request.model]
-        if "--skip-git-repo-check" not in argv:
-            argv.append("--skip-git-repo-check")
-        if "--ephemeral" not in argv:
-            argv.append("--ephemeral")
-        if "--ignore-user-config" not in argv:
-            argv.append("--ignore-user-config")
-        if "--ignore-rules" not in argv:
-            argv.append("--ignore-rules")
-        if "--sandbox" not in argv:
-            argv += ["--sandbox", "read-only"]
-        if "-" not in argv:
-            argv.append("-")
-        result = run_argv_capture(argv, input_text=request.prompt, cwd=request.workspace, timeout=request.timeout_s)
+        result = codex_cli_invoke(
+            request.prompt,
+            model=request.model,
+            codex_cmd=str(options.get("codex_cmd") or "codex exec --json"),
+            timeout=request.timeout_s,
+            cwd=request.workspace,
+            output_schema=None,
+            sandbox="read-only",
+            json_events=True,
+        )
         return RunnerOutcome(
-            provider="codex", answer=None if result.stdout.strip() else "",
-            returncode=result.returncode, timed_out=result.timed_out, timeout_s=request.timeout_s,
-            elapsed_ms=result.elapsed_ms, stderr=result.stderr,
-            trace_text=result.stdout if result.stdout.strip() else "", model=request.model,
-            environment={"runner": "codex", "command": " ".join(shlex.quote(a) for a in argv), "cwd": "<isolated workspace>"})
+            provider="codex", answer=result.get("answer"),
+            returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)), timeout_s=request.timeout_s,
+            elapsed_ms=result.get("elapsed_ms") or 0, stderr=result.get("stderr", ""),
+            trace_text=result.get("trace_text") or "", model=request.model,
+            environment={"runner": "codex", **dict(result.get("environment") or {})})
 
 
 class ClaudeBackend(AgentBackend):
@@ -3940,10 +4175,34 @@ class ClaudeBackend(AgentBackend):
             timeout_s=request.timeout_s, elapsed_ms=result.get("elapsed_ms") or 0, stderr=result.get("stderr", ""),
             usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
             metadata_extra={"cost_usd": claude_metrics.get("cost_usd")}, metrics_extra=metrics_extra,
-            environment={"runner": "claude", "command": "claude -p --output-format json", "cwd": "<isolated workspace>"})
+            environment={"runner": "claude", "command": "claude -p --output-format json --no-session-persistence", "cwd": "<isolated workspace>"})
 
 
-AGENT_BACKENDS: dict[str, AgentBackend] = {"claude": ClaudeBackend(), "codex": CodexBackend()}
+class VibeBackend(AgentBackend):
+    name = "vibe"
+
+    def invoke_answer(self, request: InvocationRequest, **options: Any) -> RunnerOutcome:
+        result = vibe_cli_invoke(
+            request.prompt,
+            model=request.model,
+            vibe_cmd=str(options.get("vibe_cmd") or VIBE_DEFAULT_CMD),
+            timeout=request.timeout_s,
+            cwd=request.workspace,
+            output="streaming",
+            tools=VIBE_READ_ONLY_TOOLS,
+            auto_approve=True,
+        )
+        env = dict(result.get("environment") or {})
+        return RunnerOutcome(
+            provider="vibe", answer=result.get("answer") or "",
+            returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
+            timeout_s=request.timeout_s, elapsed_ms=result.get("elapsed_ms") or 0, stderr=result.get("stderr", ""),
+            usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
+            trace_text=result.get("trace_text") or "",
+            environment={"runner": "vibe", **env})
+
+
+AGENT_BACKENDS: dict[str, AgentBackend] = {"claude": ClaudeBackend(), "codex": CodexBackend(), "vibe": VibeBackend()}
 
 
 def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, **options: Any) -> int:
@@ -3979,7 +4238,8 @@ def run_agent(args: argparse.Namespace) -> int:
         die(f"unknown agent backend {agent!r}; expected one of {sorted(AGENT_BACKENDS)}")
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), AGENT_BACKENDS[agent],
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
-                           claude_bin=getattr(args, "claude_bin", None), codex_cmd=getattr(args, "codex_cmd", None))
+                           claude_bin=getattr(args, "claude_bin", None), codex_cmd=getattr(args, "codex_cmd", None),
+                           vibe_cmd=getattr(args, "vibe_cmd", None))
 
 
 def run_codex(args: argparse.Namespace) -> int:
@@ -4052,7 +4312,7 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
     a shell string — so there is no shell-quoting seam between the harness and
     the model. If no cwd is supplied, run in an empty temporary directory rather
     than inheriting the harness repo cwd."""
-    argv = [claude_bin, "-p", "--output-format", "json"]
+    argv = [claude_bin, "-p", "--output-format", "json", "--no-session-persistence"]
     if model:
         argv += ["--model", model]
     if extra_args:
@@ -4233,17 +4493,28 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
         argv += ["--sandbox", sandbox]
     with tempfile.TemporaryDirectory(prefix="codex-invoke-") as td:
         tmp = Path(td)
+        env, env_meta = codex_env_for_home(tmp / "codex-home")
         invoke_cwd = Path(cwd) if cwd is not None else tmp / "cwd"
         invoke_cwd.mkdir(parents=True, exist_ok=True)
         last_message = tmp / "last-message.json"
-        argv += ["--output-last-message", str(last_message)]
+        if "--output-last-message" in argv:
+            idx = argv.index("--output-last-message")
+            if idx + 1 < len(argv):
+                supplied = Path(argv[idx + 1])
+                last_message = supplied if supplied.is_absolute() else invoke_cwd / supplied
+        else:
+            argv += ["--output-last-message", str(last_message)]
         if output_schema is not None:
             schema_path = tmp / "schema.json"
             write_json(schema_path, codex_structured_output_schema(output_schema))
-            argv += ["--output-schema", str(schema_path)]
-        argv.append("-")
-        result = run_argv_capture(argv, input_text=prompt, cwd=invoke_cwd, timeout=timeout)
-        final_text = last_message.read_text(encoding="utf-8", errors="replace") if last_message.exists() else result.stdout
+            if "--output-schema" not in argv:
+                argv += ["--output-schema", str(schema_path)]
+        if "-" not in argv:
+            argv.append("-")
+        result = run_argv_capture(argv, input_text=prompt, cwd=invoke_cwd, env=env, timeout=timeout)
+        last_message_found = last_message.exists()
+        final_text = last_message.read_text(encoding="utf-8", errors="replace") if last_message_found else None
+    command = " ".join(shlex.quote(a) for a in argv)
     usage: dict[str, Any] = {}
     cost_usd = None
     if result.stdout.strip():
@@ -4265,6 +4536,7 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
         "usage": usage,
         "cost_usd": cost_usd,
         "model": f"codex/{model}" if model else "codex/default",
+        "environment": {**env_meta, "command": command, "cwd": "<isolated workspace>"},
     }
 
 
@@ -4814,8 +5086,9 @@ def sanitized_run_copy(run_base: Path, dest: Path) -> Path | None:
 
 def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, transcripts_dir: Path | None = None,
                        repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude",
-                       judge_backend: str = "claude", codex_cmd: str = "codex exec", schema_enforcement: str = "report",
-                       include_trajectory: bool = False, explore: bool = False) -> dict[str, Any]:
+                       judge_backend: str = "claude", codex_cmd: str = "codex exec", vibe_cmd: str = VIBE_DEFAULT_CMD,
+                       schema_enforcement: str = "report", include_trajectory: bool = False,
+                       explore: bool = False) -> dict[str, Any]:
     output_path = Path(task.get("output_path", ""))
     output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
     # A task without an explicit run_base has no run dir to inspect. Do NOT let an
@@ -4854,24 +5127,35 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     judge_usage = None
     usage_source = "provider_reported"
     judge_model_label = judge_model
+    assertion_schema = verdict_schema_for(task.get("assertion", {}))
     try:
         if judge_cmd:
             proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
             stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
         elif judge_backend == "codex":
-            res = codex_cli_invoke(prompt, model=judge_model, codex_cmd=codex_cmd, output_schema=verdict_schema_for(task.get("assertion", {})), cwd=explore_hint)
-            stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
+            res = codex_cli_invoke(prompt, model=judge_model, codex_cmd=codex_cmd, output_schema=assertion_schema, cwd=explore_hint)
+            stdout, stderr, returncode = res.get("answer") or "", res.get("stderr", "") or "", res.get("returncode")
             cost_usd = res.get("cost_usd")
             judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
             usage_source = "trace_normalized" if judge_usage else "provider_reported"
             judge_model_label = str(res.get("model") or f"codex/{judge_model or 'default'}")
+        elif judge_backend == "vibe":
+            res = vibe_cli_invoke(prompt, model=judge_model, vibe_cmd=vibe_cmd, output="json", tools=VIBE_NO_TOOLS, cwd=explore_hint)
+            stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
+            cost_usd = res.get("cost_usd")
+            judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
+            judge_model_label = f"vibe/{judge_model or 'default'}"
         elif judge_model:
-            res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin, extra_args=extra_args, cwd=explore_hint)
+            claude_extra_args = list(extra_args or [])
+            if explore_dir is None:
+                claude_extra_args += ["--tools", ""]
+            claude_extra_args += ["--json-schema", json.dumps(assertion_schema, separators=(",", ":"))]
+            res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin, extra_args=claude_extra_args, cwd=explore_hint)
             stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
             cost_usd = res.get("cost_usd")
             judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
         else:
-            raise ValueError("run_one_judge_task needs a judge_cmd, a native judge_model, or judge_backend='codex'")
+            raise ValueError("run_one_judge_task needs a judge_cmd, a native judge_model, or judge_backend='codex'/'vibe'")
     finally:
         # The sanitized copy is scratch; the judge has already run against it.
         if explore_root is not None:
@@ -5316,8 +5600,8 @@ def judge_command(args: argparse.Namespace) -> int:
     manifest_for_judge = validate_manifest(Path(args.manifest))
     judge_backend = getattr(args, "judge_backend", None) or ("cmd" if judge_cmd else "claude")
     panel = effective_judge_models(manifest_for_judge, getattr(args, "judge_panel", None), getattr(args, "judge_model", None))
-    if judge_backend == "codex" and not panel:
-        panel = [None]  # use Codex CLI's configured default model
+    if judge_backend in {"codex", "vibe"} and not panel:
+        panel = [None]  # use the CLI's configured default model
     schema_enforcement = "strict" if getattr(args, "strict_judge_schema", False) else ((manifest_for_judge.get("judge") or {}).get("schema_enforcement") or "report")
     include_trajectory = getattr(args, "judge_trajectory", False)
     explore = getattr(args, "judge_explore", False)
@@ -5329,6 +5613,7 @@ def judge_command(args: argparse.Namespace) -> int:
         die("--judge-explore is for the native claude judge backend only")
     claude_bin = getattr(args, "claude_bin", None) or "claude"
     codex_cmd = getattr(args, "codex_cmd", None) or "codex exec"
+    vibe_cmd = getattr(args, "vibe_cmd", None) or VIBE_DEFAULT_CMD
     tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
     transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
     repeat = max(1, int(getattr(args, "judge_runs", 1)))
@@ -5345,7 +5630,7 @@ def judge_command(args: argparse.Namespace) -> int:
             if judge_backend == "cmd":
                 members = [merge_repeated_judge_rows([run_one_judge_task(task, judge_cmd, transcripts, i, judge_backend="cmd", schema_enforcement=schema_enforcement, include_trajectory=include_trajectory) for i in range(1, repeat + 1)])]
             else:
-                members = [merge_repeated_judge_rows([run_one_judge_task(task, None, transcripts, i, judge_model=model, claude_bin=claude_bin, judge_backend=judge_backend, codex_cmd=codex_cmd, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory, explore=explore) for i in range(1, repeat + 1)]) for model in panel]
+                members = [merge_repeated_judge_rows([run_one_judge_task(task, None, transcripts, i, judge_model=model, claude_bin=claude_bin, judge_backend=judge_backend, codex_cmd=codex_cmd, vibe_cmd=vibe_cmd, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory, explore=explore) for i in range(1, repeat + 1)]) for model in panel]
             fh.write(json.dumps(merge_cross_judge_rows(members, quorum=quorum), ensure_ascii=False) + "\n")
     finally:
         if out:
@@ -9388,13 +9673,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
-    p = sub.add_parser("run-agent", help="run prepared tasks through a registered native agent backend (claude or codex)")
+    p = sub.add_parser("run-agent", help="run prepared tasks through a registered native agent backend (claude, codex, or vibe)")
     p.add_argument("--agent", required=True, choices=sorted(AGENT_BACKENDS), help="native backend to use")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable for --agent claude")
     p.add_argument("--codex-cmd", default="codex exec --json", help="argv-style Codex command prefix for --agent codex answer runs; shell metacharacters are not interpreted")
+    p.add_argument("--vibe-cmd", default=VIBE_DEFAULT_CMD, help="argv-style Vibe command prefix for --agent vibe answer runs; the harness adds --prompt/--output/--workdir and shell metacharacters are not interpreted")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")
@@ -9425,10 +9711,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-cmd", help="shell command that reads a judge prompt on stdin and emits JSON on stdout (any provider)")
-    p.add_argument("--judge-backend", choices=["claude", "codex", "cmd"], help="native judge backend; defaults to cmd when --judge-cmd is supplied, otherwise claude")
-    p.add_argument("--judge-model", help="judge model id for the selected native backend; with --judge-backend codex this is a Codex/OpenAI model")
+    p.add_argument("--judge-backend", choices=["claude", "codex", "vibe", "cmd"], help="native judge backend; defaults to cmd when --judge-cmd is supplied, otherwise claude")
+    p.add_argument("--judge-model", help="judge model id for the selected native backend; with --judge-backend codex this is a Codex/OpenAI model; with vibe this is passed as VIBE_ACTIVE_MODEL")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable when using the claude judge backend")
     p.add_argument("--codex-cmd", default="codex exec", help="argv-style Codex command prefix for --judge-backend codex; the harness adds --json/--output-last-message/--output-schema and shell metacharacters are not interpreted")
+    p.add_argument("--vibe-cmd", default=VIBE_DEFAULT_CMD, help="argv-style Vibe command prefix for --judge-backend vibe; the harness adds --prompt/--output/--workdir and shell metacharacters are not interpreted")
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
     p.add_argument("--strict-judge-schema", action="store_true", help="fail a judge verdict whose JSON violates its canonical schema (default: surface violations in a schema_errors field only)")
     p.add_argument("--judge-trajectory", action="store_true", help="also give the judge the run's normalized trajectory (events/metrics) and a denylisted artifact inventory, not just the final output (G1)")

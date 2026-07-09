@@ -10,8 +10,8 @@ covered through its adapter contract and shared path-evidence detector.
 Live (manual): RUN_AGENT_INVOKE_SMOKE=1 runs one cheap invocation for every
 supported live trigger adapter/model to verify auth/network/process plumbing.
 RUN_TRIGGER_SMOKE=1 runs the fuller Claude trigger matrix across haiku, sonnet,
-and opus; RUN_CODEX_TRIGGER_SMOKE=1 and RUN_PI_TRIGGER_SMOKE=1 run the same
-trigger path for those adapters:
+and opus; RUN_CODEX_TRIGGER_SMOKE=1, RUN_PI_TRIGGER_SMOKE=1, and
+RUN_VIBE_TRIGGER_SMOKE=1 run the same trigger path for those adapters:
 
     RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v
     RUN_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix -v
@@ -22,6 +22,7 @@ observed trigger-eval runs and at least one autonomous load.
 """
 import json
 import os
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -459,6 +460,63 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertEqual(codex_action.default, tm.DEFAULT_CODEX_CMD)
 
 
+class VibeAdapterTests(unittest.TestCase):
+    """Mistral Vibe trigger support without a live API key."""
+
+    def test_vibe_is_registered_and_declares_matrix_capability(self):
+        self.assertIn("vibe", tm.ADAPTERS)
+        cap = tm.matrix_capabilities()["vibe"]
+        self.assertTrue(cap.autonomous_trigger)
+        self.assertTrue(cap.trigger_ablation)
+        parser = tm.build_arg_parser()
+        agent_action = next(a for a in parser._actions if "--agent" in getattr(a, "option_strings", ()))
+        self.assertIn("vibe", agent_action.choices)
+        vibe_action = next(a for a in parser._actions if "--vibe-cmd" in getattr(a, "option_strings", ()))
+        self.assertEqual(vibe_action.default, tm.VIBE_DEFAULT_CMD)
+
+    def test_vibe_mounts_project_agent_skills(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tree = root / "tree"
+            skill = tree / "demo-root"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: demo-reviewer\n---\n", encoding="utf-8")
+            copied = tm.VibeAdapter().mount(tree, root / "workspace")
+        self.assertEqual(copied[0].parts[-4:], ("workspace", ".agents", "skills", "demo-root", "SKILL.md")[-4:])
+        self.assertIn(".agents", str(copied[0]))
+
+    def test_vibe_detects_native_skill_tool_call(self):
+        stream = json.dumps({"role": "assistant", "tool_calls": [{"function": {"name": "skill", "arguments": json.dumps({"name": "demo-reviewer"})}}]})
+        triggered, evidence = tm.VibeAdapter().detect(stream, ["demo-reviewer"], [])
+        self.assertTrue(triggered)
+        self.assertIn("Vibe skill tool invoked: demo-reviewer", evidence)
+        other = json.dumps({"role": "assistant", "tool_calls": [{"function": {"name": "skill", "arguments": json.dumps({"name": "other"})}}]})
+        self.assertEqual(tm.VibeAdapter().detect(other, ["demo-reviewer"], []), (False, []))
+
+    def test_vibe_invoke_uses_isolated_home_model_env_and_prompt_arg(self):
+        seen = {}
+
+        def fake_run(argv, *, cwd, env, timeout, input_text=None):
+            seen.update({"argv": argv, "cwd": cwd, "env": env, "timeout": timeout, "input_text": input_text})
+            return {"stdout": json.dumps({"role": "assistant", "content": "ok"}) + "\n", "stderr": "", "returncode": 0,
+                    "timed_out": False, "elapsed_ms": 1, "observation_complete": True}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.VibeAdapter, "_run_argv", staticmethod(fake_run)):
+            workspace = Path(td) / "workspace"
+            workspace.mkdir()
+            result = tm.VibeAdapter(vibe_cmd=f"{sys.executable} fake_vibe.py", max_turns=4).invoke("raw trigger query", "mistral-small", workspace, 12)
+        self.assertIn("--prompt", seen["argv"])
+        self.assertEqual(seen["argv"][seen["argv"].index("--prompt") + 1], "raw trigger query")
+        self.assertIn("--output", seen["argv"])
+        self.assertIn("--workdir", seen["argv"])
+        self.assertIn("--enabled-tools", seen["argv"])
+        self.assertIn("skill", seen["argv"])
+        self.assertEqual(seen["input_text"], "")
+        self.assertEqual(seen["env"]["VIBE_ACTIVE_MODEL"], "mistral-small")
+        self.assertTrue(str(seen["env"]["VIBE_HOME"]).endswith(".vibe-home"))
+        self.assertTrue(result["config_isolated"])
+
+
 def _csv_env(name, default):
     raw = os.environ.get(name)
     if raw is None:
@@ -501,6 +559,7 @@ class AgentInvokeSmokeTests(unittest.TestCase):
                     agent_name,
                     claude_bin=os.environ.get("CLAUDE_INVOKE_SMOKE_BIN", "claude"),
                     codex_cmd=os.environ.get("CODEX_INVOKE_SMOKE_CMD", tm.DEFAULT_CODEX_CMD),
+                    vibe_cmd=os.environ.get("VIBE_INVOKE_SMOKE_CMD", tm.VIBE_DEFAULT_CMD),
                     max_turns=int(os.environ.get("CLAUDE_INVOKE_SMOKE_MAX_TURNS", "1")),
                 )
                 models = _live_invoke_smoke_models(agent_name, adapter)
@@ -564,6 +623,7 @@ class AgentInvokeSmokeConfigTests(unittest.TestCase):
             "CLAUDE_INVOKE_SMOKE_MODELS": "",
             "CODEX_INVOKE_SMOKE_MODEL": "",
             "PI_INVOKE_SMOKE_MODEL": "",
+            "VIBE_INVOKE_SMOKE_MODEL": "",
         }
         with mock.patch.dict(os.environ, clean_env, clear=False):
             for key in clean_env:
@@ -573,10 +633,11 @@ class AgentInvokeSmokeConfigTests(unittest.TestCase):
                 name: _live_invoke_smoke_models(name, tm.adapter_instance(name))
                 for name in agents
             }
-        self.assertEqual(agents, ["claude", "codex", "pi"])
+        self.assertEqual(agents, ["claude", "codex", "pi", "vibe"])
         self.assertEqual(models["claude"], ["haiku", "sonnet", "opus"])
         self.assertEqual(models["codex"], [None])
         self.assertEqual(models["pi"], [None])
+        self.assertEqual(models["vibe"], [None])
 
     def test_advertised_live_smoke_envs_are_consumed_by_tests(self):
         test_source = Path(__file__).read_text(encoding="utf-8")
@@ -631,6 +692,23 @@ class PiMatrixSmokeTests(unittest.TestCase):
         self.assertFalse(incomplete, f"broken runs (crash/timeout), not trigger signal: {incomplete}")
         self.assertTrue(any(r["triggered"] for r in report["results"]),
                         "no Pi run loaded the skill — detection, auth, or mounting is broken")
+
+
+@unittest.skipUnless(os.environ.get("RUN_VIBE_TRIGGER_SMOKE") == "1",
+                     "manual smoke: set RUN_VIBE_TRIGGER_SMOKE=1 (needs vibe CLI + MISTRAL_API_KEY, spends tokens)")
+class VibeMatrixSmokeTests(unittest.TestCase):
+    def test_vibe_matrix_end_to_end(self):
+        runs = int(os.environ.get("VIBE_TRIGGER_SMOKE_RUNS", "1"))
+        model = os.environ.get("VIBE_TRIGGER_SMOKE_MODEL")
+        report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["vibe"],
+                               models=[model] if model else [None], runs_per_query=runs,
+                               timeout=300, workers=1,
+                               vibe_cmd=os.environ.get("VIBE_TRIGGER_SMOKE_CMD", tm.VIBE_DEFAULT_CMD))
+        tm.print_matrix(report["matrix"])
+        incomplete = [r for r in report["results"] if not r["observation_complete"]]
+        self.assertFalse(incomplete, f"broken runs (crash/timeout), not trigger signal: {incomplete}")
+        self.assertTrue(any(r["triggered"] for r in report["results"]),
+                        "no Vibe run loaded the skill — detection, auth, or mounting is broken")
 
 
 if __name__ == "__main__":

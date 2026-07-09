@@ -51,7 +51,7 @@ The point of the adapter work is not only feature parity. The refactor should ma
 
 | Surface | Current Claude behavior |
 |---|---|
-| Answer runs | `skill-benchmark run-claude` runs prepared rows through `claude -p --output-format json`. |
+| Answer runs | `skill-benchmark run-claude` runs prepared rows through `claude -p --output-format json --no-session-persistence`. |
 | Workspace isolation | Each row runs in a temp workspace with only prepared skill/input files mounted. |
 | Variants | Supports `with_skill`, `without_skill`, `old_skill`, and materialized `ablation:<id>` via prepared rows. |
 | Output contract | Writes `output.md`, `metadata.json`, normalized `events.json`/`metrics.json` where available. |
@@ -59,11 +59,11 @@ The point of the adapter work is not only feature parity. The refactor should ma
 | Failure semantics | Nonzero/timeout produces a failure body and metadata that `execution_valid` excludes from quality scoring while cost still counts. |
 | Native judge | `skill-benchmark judge --judge-model <claude-model>` invokes Claude directly and captures judge cost/usage. |
 | Judge transcripts | `--transcripts` records exact prompt, stdout, stderr, and parsed result per judge task. |
-| Judge schema | Uses canonical verdict schemas; `--strict-judge-schema` can fail closed. |
+| Judge schema | Passes the canonical verdict schema to Claude via `--json-schema`; `--strict-judge-schema` remains the harness-side fail-closed backstop. |
 | Judge repeats | `--judge-runs` majority-votes pass/fail and medians scores. |
 | Judge panels | `--judge-panel` aggregates multiple Claude models into consensus verdicts with agreement metadata. |
 | Judge trajectory | `--judge-trajectory` passes normalized trajectory, metrics, and artifact inventory. |
-| Tool-using judge | `--judge-explore` gives the native Claude judge a sanitized run copy with read-only tools. |
+| Tool-using judge | `--judge-explore` gives the native Claude judge a sanitized run copy with read-only tools; non-explore native Claude judges pass `--tools ""`. |
 | Robustness | `judge-robustness` uses the same Claude native backend for order-flip and negative controls. |
 | Autonomous trigger | `skill-trigger-matrix --agent claude` launches headless Claude Code subagents. |
 | Trigger mounting | Project skills mounted under `.claude/skills`. |
@@ -75,8 +75,8 @@ The point of the adapter work is not only feature parity. The refactor should ma
 
 | Surface | Codex today | Needed for Claude parity |
 |---|---|---|
-| Answer runs | `run-codex` uses `codex exec --json` and parses final trace message. | Also use `--output-last-message` for simpler final answer capture while retaining `--json` for trace. |
-| Workspace isolation | Temp workspace via prepared rows. | Keep; add adapter conformance tests shared with Claude. |
+| Answer runs | `run-codex` / `run-agent --agent codex` use `codex exec --json --output-last-message <file>`: final answer from the sidecar file, JSONL retained as trace. | Keep; expand parser fixtures as event names evolve. |
+| Workspace isolation | Temp workspace via prepared rows plus isolated `CODEX_HOME` seeded only with portable auth/config. | Keep; add adapter conformance tests shared with Claude. |
 | Variants | Prepared-row variants and materialized ablations work. | Keep. |
 | Trace artifacts | Codex JSONL normalized. | Expand parser fixtures for current event names and usage/cost events. |
 | Token usage | Supported when stream reports it. | Make coverage explicit in `AgentCapabilities`. |
@@ -85,7 +85,7 @@ The point of the adapter work is not only feature parity. The refactor should ma
 | Judge schema | Implemented via `codex exec --output-schema <schema.json>` with a provider-compatible strict copy of the canonical verdict schema. | Keep harness-side schema validation as a fail-closed backstop. |
 | Judge transcripts | Native transcripts stamp backend/model plus parsed usage/cost when present. | Expand cost coverage if Codex emits price/cost events. |
 | Judge trajectory/explore | Generic `--judge-cmd` can receive prompt text only; no native sanitized tool access. | Add read-only workspace policy if Codex can inspect a sanitized run dir safely. |
-| Autonomous trigger | `skill-trigger-matrix --agent codex` mounts `.codex/skills` and runs `codex exec --json`. | Verify against current Codex skill-discovery docs and add model matrix defaults. |
+| Autonomous trigger | `skill-trigger-matrix --agent codex` mounts `$CODEX_HOME/skills` (implemented as workspace `.codex/skills`) and runs `codex exec --json` with isolated `CODEX_HOME`. | Add model matrix defaults if Codex exposes stable aliases. |
 | Tool replay | None for native Codex CLI. | Implement through MCP/tool-host boundary or keep unsupported in native path and offer `run-subagent`/MCP replay. |
 
 ### Codex CLI reference impact
@@ -95,13 +95,13 @@ The Codex CLI reference materially lowers the native-judge implementation cost:
 - `codex exec --output-last-message <file>` writes the final assistant response to a file, so a judge backend does not need to extract the verdict from event JSONL.
 - `codex exec --output-schema <schema.json>` lets the harness pass the canonical per-assertion verdict schema to Codex.
 - `codex exec --json` remains useful for trace/usage telemetry, but should not be treated as the verdict stream.
-- `codex exec --model <model>`, `--skip-git-repo-check`, `--ephemeral`, `--sandbox`, `--ignore-rules`, and `--cd` provide the controls needed for isolated eval execution.
+- `codex exec --model <model>`, `--skip-git-repo-check`, `--ephemeral`, `--sandbox`, `--ignore-user-config`, `--ignore-rules`, `--cd`, and isolated `CODEX_HOME` provide the controls needed for isolated eval execution.
 
 A minimal native Codex judge can be:
 
 1. Render the existing judge prompt.
 2. Write `verdict_schema_for(assertion)` to a temp schema file.
-3. Run `codex exec --model <model> --skip-git-repo-check --ephemeral --sandbox read-only --output-schema schema.json --output-last-message verdict.json -` with prompt on stdin.
+3. Run `CODEX_HOME=$TMP/codex-home codex exec --model <model> --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules --sandbox read-only --output-schema schema.json --output-last-message verdict.json -` with prompt on stdin.
 4. Parse `verdict.json` with the existing `extract_json_object` / schema checks.
 5. Optionally also run with `--json` or a sidecar trace capture if usage/cost is needed.
 
@@ -168,7 +168,7 @@ Gemini is a strong candidate for real trigger measurement because it has native 
 
 External facts from Mistral Vibe README:
 
-- Noninteractive mode: `vibe --prompt "..."` or piped input.
+- Noninteractive mode: `vibe --prompt "..."`; the harness passes prompt text as the option argument because headless stdin prompt mode is not reliable without a tty.
 - Output modes: `--output text|json|streaming`.
 - Cost/usage controls: `--max-price`, `--max-tokens`.
 - Agent profiles: `default`, `plan`, `accept-edits`, `auto-approve`, custom agents; `--auto-approve` / `--yolo` for unattended runs.
@@ -179,49 +179,46 @@ External facts from Mistral Vibe README:
 
 ### Vibe answer runner
 
-Implement `VibeBackend.invoke_answer` with a temp `VIBE_HOME` and project workspace:
+Implemented in `VibeBackend.invoke_answer`: the harness runs Vibe with a temp `VIBE_HOME` and project workspace:
 
 ```bash
-VIBE_HOME="$TMP/vibe-home" vibe \
+VIBE_HOME="$TMP/vibe-home" VIBE_ACTIVE_MODEL="$MODEL" vibe \
   --prompt "$PROMPT" \
   --output streaming \
-  --agent plan \
+  --workdir "$WORKSPACE" \
+  --trust \
   --auto-approve \
-  --enabled-tools read \
-  --enabled-tools grep \
-  --max-turns "$N" \
-  --max-price "$BUDGET" \
-  --max-tokens "$TOKENS"
+  --enabled-tools skill \
+  --enabled-tools read_file \
+  --enabled-tools grep
 ```
 
 Adapter choices:
 
 - For answer runs, use forced-load prepared-row prompting and copied skill/input files.
-- Prefer `--output streaming` for trace normalization; use `--output json` as a simpler fallback for final answers.
+- Use `--output streaming` for trace normalization; JSON-list output is accepted by the parser for tests/fallbacks.
 - Normalize Vibe messages/tool calls into existing event shapes.
-- Parse usage/cost if present in JSON/streaming output; otherwise mark cost `missing` or estimate.
+- Current Vibe `json`/`streaming` output is `LLMMessage` data and does not export `AgentStats`, so usage/cost are explicit `missing` unless a future CLI adds fields or the harness estimates them.
 
 ### Vibe judge backend
 
-Use `vibe --prompt "$JUDGE_PROMPT" --output json --agent plan --enabled-tools none/read-only` once the exact syntax for disabling all tools is validated. Since judge prompts already contain candidate output and rubric, the safest judge profile is read-only/no-tools.
-
-If JSON output returns all messages rather than just final text, the adapter must extract the final assistant message and parse it as verdict JSON.
+Implemented with `vibe --prompt "$PROMPT" --output json --enabled-tools re:^$`. Since judge prompts already contain candidate output and rubric, the judge profile disables tools entirely. Vibe JSON output returns messages rather than just final text, so the adapter extracts the final assistant message and parses it as verdict JSON; harness-side schema validation remains the gate.
 
 ### Vibe autonomous trigger
 
-Vibe is also a strong candidate for trigger measurement because it natively discovers Agent Skills:
+Vibe trigger measurement is implemented because it natively discovers Agent Skills:
 
-- Mount skill under workspace `.agents/skills/<skill-name>` for cross-agent standard compatibility, or `.vibe/skills/<skill-name>` if `.agents` discovery is insufficient.
+- Mount skills under workspace `.agents/skills/<skill-name>` for cross-agent standard compatibility.
 - Isolate `VIBE_HOME` to avoid global skills and config bleed.
-- Use a trusted temp project or trust-file setup so headless runs do not prompt.
+- Use `--workdir` plus `--trust` so headless runs do not prompt.
 - Run raw trigger queries with no forced-load instruction.
-- Detect activation from any Vibe skill activation event if present; otherwise path evidence from reading the activated skill's `SKILL.md`.
+- Detect activation from native `skill` tool calls by skill name; fall back to path evidence from reading the mounted `SKILL.md`.
 
 ### Vibe risks/open questions
 
-- Need fixture/live smoke for the exact streaming JSON schema.
-- Need a reliable way to suppress or auto-approve skill activation prompts without permitting unsafe writes.
-- Need to confirm how model selection is configured (`active_model` in agent config vs CLI flag) and how usage/cost are emitted.
+- Token-backed smoke should be rerun after Vibe CLI or provider changes; the harness has live-smoke tests gated by `RUN_AGENT_INVOKE_SMOKE=1` and `RUN_VIBE_TRIGGER_SMOKE=1`.
+- Vibe 2.19.1 exposes `--auto-approve`, `--trust`, and tool allowlists; the adapter uses read-only tools for answer/trigger and no tools for judging.
+- Model selection is handled with `VIBE_ACTIVE_MODEL`; current usage/cost telemetry is absent from CLI output and normalized as explicit `missing`.
 
 ## Shared adapter interface
 
@@ -340,14 +337,14 @@ Live smoke tests remain opt-in by env var, one per adapter:
    - Parses optional JSONL telemetry when present.
    - Capability row now advertises native judge support.
 3. **Shared judge backend CLI** — initial implementation done.
-   - `--judge-backend claude|codex|cmd` selects the backend.
+   - `--judge-backend claude|codex|vibe|cmd` selects the backend.
    - `--judge-cmd` remains `backend=cmd` for arbitrary providers.
 4. **Gemini adapter**
    - Answer runner and judge first (`--output-format json|stream-json`).
    - Trigger adapter after headless Agent Skills activation is proven.
-5. **Mistral Vibe adapter**
-   - Answer runner and judge first (`--output json|streaming`).
-   - Trigger adapter via `.agents/skills` once activation evidence is observable.
+5. **Mistral Vibe adapter** — implemented with local/fake contracts and token-backed smoke evidence for Vibe 2.19.1.
+   - Answer runner and judge use `--output json|streaming` and isolated `VIBE_HOME`.
+   - Trigger adapter mounts `.agents/skills` and detects native `skill` tool calls with path fallback.
 6. **Tool replay generalization**
    - Prefer MCP as the common tool-host boundary for agents that support it.
    - Keep native CLI runners replay-free unless their tool calls can be mediated through harness-owned tools.
@@ -357,5 +354,5 @@ Live smoke tests remain opt-in by env var, one per adapter:
 - The harness can list every registered agent and its surfaces from one registry.
 - Claude behavior remains byte-compatible at the run-output/report level.
 - Codex supports native judging without a handwritten shell wrapper.
-- Gemini and Vibe have documented adapter plans tied to their published CLI surfaces.
+- Gemini has a documented adapter plan; Vibe has implemented native answer, judge, and trigger surfaces tied to its published CLI.
 - A new agent can be added by implementing protocols plus conformance tests, without editing grading, benchmarking, ablation, or trigger core logic.

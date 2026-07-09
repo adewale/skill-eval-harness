@@ -79,6 +79,18 @@ AGENT_CAPABILITIES: dict[str, AgentCapabilities] = {
         live_smoke_env=None,
         notes="Jetty supports answer-path export/run/import; autonomous trigger and judge export/import remain separate Jetty TODOs.",
     ),
+    "vibe": AgentCapabilities(
+        answer_runner=True,
+        autonomous_trigger=True,
+        trigger_ablation=True,
+        trace_artifacts=True,
+        token_usage=False,
+        dollar_cost="missing",
+        judge_backend=True,
+        tool_replay=False,
+        live_smoke_env="RUN_VIBE_TRIGGER_SMOKE",
+        notes="Mistral Vibe support uses isolated VIBE_HOME, programmatic JSON/streaming output, Agent Skills discovery from .agents/skills, and VIBE_ACTIVE_MODEL for model selection. Current Vibe JSON/streaming output does not export usage/cost telemetry, so both are explicit missing unless a future CLI adds fields.",
+    ),
     "subagent": AgentCapabilities(
         answer_runner=True,
         autonomous_trigger=False,

@@ -71,6 +71,12 @@ from skill_benchmark import (
     run_argv_with_timeout,
     safe_trace_label,
     stream_usage_and_cost,
+    build_vibe_cli_argv,
+    codex_env_for_home,
+    seed_vibe_home,
+    vibe_skill_tool_evidence,
+    VIBE_DEFAULT_CMD,
+    VIBE_READ_ONLY_TOOLS,
     write_json,
     write_trace_artifacts,
 )
@@ -78,10 +84,9 @@ from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_m
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
-DEFAULT_CODEX_CMD = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral"
+DEFAULT_CODEX_CMD = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules"
 INVOKE_RESULT_KEYS = ("stdout", "stderr", "returncode", "timed_out", "elapsed_ms", "observation_complete")
-INVOKE_RESULT_METADATA_KEYS = ("config_isolated", "config_isolation_warning")
-CODEX_HOME_FILES = ("auth.json", "config.toml")
+INVOKE_RESULT_METADATA_KEYS = ("config_isolated", "config_isolation_warning", "vibe_env_file_copied")
 CLAUDE_PORTABLE_AUTH_FILES = (".credentials.json",)
 SENSITIVE_WORKSPACE_FILES = (
     ".trigger-config/.credentials.json",
@@ -90,6 +95,7 @@ SENSITIVE_WORKSPACE_FILES = (
     ".pi-config/auth.json",
     ".pi-config/settings.json",
     ".pi-config/APPEND_SYSTEM.md",
+    ".vibe-home/.env",
 )
 
 
@@ -124,20 +130,6 @@ def validate_invoke_result(agent: str, result: dict[str, Any]) -> dict[str, Any]
     if missing:
         raise KeyError(f"{agent}.invoke missing required result key(s): {', '.join(missing)}")
     return result
-
-
-def seed_codex_home(codex_home: Path) -> None:
-    """Copy Codex auth/config into an isolated CODEX_HOME, but not user skills."""
-    codex_home.mkdir(parents=True, exist_ok=True)
-    source = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-    for name in CODEX_HOME_FILES:
-        src = source / name
-        dst = codex_home / name
-        if not src.is_file():
-            continue
-        if src.resolve() == dst.resolve():
-            continue
-        shutil.copy2(src, dst)
 
 
 def seed_claude_config_dir(config_dir: Path, source_config: Path | None = None) -> bool:
@@ -338,10 +330,7 @@ class CodexAdapter(AgentAdapter):
         if model:
             argv += ["--model", model]
         argv.append(query)
-        env = os.environ.copy()
-        codex_home = workspace / ".codex"
-        seed_codex_home(codex_home)
-        env["CODEX_HOME"] = str(codex_home)
+        env, _ = codex_env_for_home(workspace / ".codex")
         return self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
 
 
@@ -362,6 +351,47 @@ class PiAdapter(AgentAdapter):
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(workspace / ".pi-config")
         return self._run_argv(pi_argv(query, model), cwd=workspace, env=env, timeout=timeout)
+
+
+class VibeAdapter(AgentAdapter):
+    """Mistral Vibe trigger adapter. Vibe natively discovers Agent Skills from
+    project `.agents/skills`, so the trigger matrix can measure real autonomous
+    skill loading rather than a forced-load answer prompt."""
+
+    name = "vibe"
+    default_models: list[str | None] = [None]
+
+    def __init__(self, vibe_cmd: str = VIBE_DEFAULT_CMD, max_turns: int = 6) -> None:
+        self.vibe_cmd = vibe_cmd
+        self.max_turns = max_turns
+
+    def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
+        return self._mount_tree(tree_dir, workspace / ".agents" / "skills")
+
+    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
+        env = os.environ.copy()
+        seeded = seed_vibe_home(workspace / ".vibe-home")
+        env["VIBE_HOME"] = str(workspace / ".vibe-home")
+        if model:
+            env["VIBE_ACTIVE_MODEL"] = model
+        try:
+            argv = build_vibe_cli_argv(self.vibe_cmd, prompt=query, cwd=workspace, output="streaming",
+                                       tools=VIBE_READ_ONLY_TOOLS, auto_approve=True,
+                                       max_turns=self.max_turns)
+        except ValueError as exc:
+            return {"stdout": "", "stderr": str(exc), "returncode": 127, "timed_out": False,
+                    "elapsed_ms": 0, "observation_complete": False,
+                    "config_isolated": True, "vibe_env_file_copied": seeded.get("vibe_env_file_copied", False)}
+        result = self._run_argv(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
+        result["config_isolated"] = True
+        result["vibe_env_file_copied"] = bool(seeded.get("vibe_env_file_copied", False))
+        return result
+
+    def detect(self, stdout: str, skill_names: list[str], copied: list[Path]) -> tuple[bool, list[str]]:
+        evidence = vibe_skill_tool_evidence(stdout, skill_names)
+        if evidence:
+            return True, evidence
+        return super().detect(stdout, skill_names, copied)
 
 
 class StubAdapter(AgentAdapter):
@@ -394,15 +424,17 @@ class StubAdapter(AgentAdapter):
                 "elapsed_ms": 0, "observation_complete": True}
 
 
-ADAPTERS: dict[str, type[AgentAdapter]] = {"claude": ClaudeAdapter, "codex": CodexAdapter, "pi": PiAdapter, "stub": StubAdapter}
+ADAPTERS: dict[str, type[AgentAdapter]] = {"claude": ClaudeAdapter, "codex": CodexAdapter, "pi": PiAdapter, "vibe": VibeAdapter, "stub": StubAdapter}
 
 
-def adapter_instance(name: str, *, claude_bin: str = "claude", codex_cmd: str | None = None, max_turns: int = 6) -> AgentAdapter:
+def adapter_instance(name: str, *, claude_bin: str = "claude", codex_cmd: str | None = None, vibe_cmd: str | None = None, max_turns: int = 6) -> AgentAdapter:
     adapter_cls = ADAPTERS[name]
     if adapter_cls is ClaudeAdapter:
         return ClaudeAdapter(claude_bin=claude_bin, max_turns=max_turns)
     if adapter_cls is CodexAdapter:
         return CodexAdapter(codex_cmd=codex_cmd or DEFAULT_CODEX_CMD)
+    if adapter_cls is VibeAdapter:
+        return VibeAdapter(vibe_cmd=vibe_cmd or VIBE_DEFAULT_CMD, max_turns=max_turns)
     return adapter_cls()
 
 
@@ -590,8 +622,8 @@ def print_matrix(matrix: list[dict[str, Any]]) -> None:
 def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str],
                models: list[str] | None, runs_per_query: int, timeout: int, workers: int,
                claude_bin: str = "claude", codex_cmd: str | None = None,
-               max_turns: int = 6, trace_runs: Path | None = None,
-               ablation: str | None = None) -> dict[str, Any]:
+               vibe_cmd: str | None = None, max_turns: int = 6,
+               trace_runs: Path | None = None, ablation: str | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     repo_root = repo_root_for_manifest(manifest_path)
     reject_duplicates(agents, "--agent")
@@ -608,7 +640,7 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         if ablation and not cap.trigger_ablation:
             raise SystemExit(f"agent {name!r} does not support trigger ablations")
         capability_rows[name] = cap
-        adapter = adapter_instance(name, claude_bin=claude_bin, codex_cmd=codex_cmd, max_turns=max_turns)
+        adapter = adapter_instance(name, claude_bin=claude_bin, codex_cmd=codex_cmd, vibe_cmd=vibe_cmd, max_turns=max_turns)
         if adapter.name != name:
             raise SystemExit(f"ADAPTERS[{name!r}] returned adapter with name {adapter.name!r}; set the adapter's name to {name!r}")
         adapters.append(adapter)
@@ -688,6 +720,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--claude-bin", default="claude")
     ap.add_argument("--codex-cmd", default=DEFAULT_CODEX_CMD,
                     help="codex adapter command prefix; the raw query is appended as the final argv item")
+    ap.add_argument("--vibe-cmd", default=VIBE_DEFAULT_CMD,
+                    help="vibe adapter command prefix; the raw query is passed as the --prompt argument")
     ap.add_argument("--trace-runs", help="optional directory for per-run trace.jsonl/events.json/metrics.json artifacts for every selected agent")
     ap.add_argument("--ablation", help="materialize this discovery/trigger-population ablation id and trigger-test the altered skill")
     ap.add_argument("--out", required=True)
@@ -706,7 +740,7 @@ def main() -> int:
     report = run_matrix(manifest_path, rows, agents=args.agent or ["claude"], models=args.model,
                         runs_per_query=args.runs_per_query, timeout=args.timeout, workers=args.workers,
                         claude_bin=args.claude_bin, codex_cmd=args.codex_cmd,
-                        max_turns=args.max_turns,
+                        vibe_cmd=args.vibe_cmd, max_turns=args.max_turns,
                         trace_runs=Path(args.trace_runs) if args.trace_runs else None,
                         ablation=args.ablation)
     write_json(Path(args.out), report)

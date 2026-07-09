@@ -229,6 +229,44 @@ class VerdictSchemaTests(unittest.TestCase):
         self.assertEqual(row["judge_backend"], "codex")
         self.assertEqual(row["usage_normalized"]["total_tokens"], 5)
 
+    def test_native_vibe_judge_parses_final_assistant_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            task = self._task(td)
+            fake = Path(td) / "vibe_stub.py"
+            fake.write_text(
+                "import json, os, pathlib, sys\n"
+                "prompt = sys.argv[sys.argv.index('--prompt') + 1]\n"
+                "assert '--prompt' in sys.argv\n"
+                "assert '--output' in sys.argv and 'json' in sys.argv\n"
+                "assert '--enabled-tools' in sys.argv and 're:^$' in sys.argv\n"
+                "assert os.environ.get('VIBE_ACTIVE_MODEL') == 'mistral-large'\n"
+                "assert pathlib.Path(os.environ['VIBE_HOME']).is_dir()\n"
+                "assert 'Return only JSON' in prompt\n"
+                "json.dump([{'role': 'assistant', 'content': json.dumps({'passed': True, 'score': 1, 'rationale': 'vibe ok'}),"
+                " 'usage': {'input_tokens': 3, 'output_tokens': 4}}], sys.stdout)\n",
+                encoding="utf-8")
+            row = sb.run_one_judge_task(task, judge_backend="vibe", judge_model="mistral-large", vibe_cmd=f"{sys.executable} {fake}")
+        self.assertTrue(row["passed"])
+        self.assertEqual(row["judge_model"], "vibe/mistral-large")
+        self.assertEqual(row["judge_backend"], "vibe")
+        self.assertEqual(row["usage_normalized"]["total_tokens"], 7)
+
+    def test_native_vibe_judge_default_cwd_is_isolated_from_repo(self):
+        with tempfile.TemporaryDirectory() as td:
+            task = self._task(td)
+            cwd_file = Path(td) / "vibe-cwd.txt"
+            fake = Path(td) / "vibe_stub.py"
+            fake.write_text(
+                "import json, os, pathlib, sys\n"
+                "pathlib.Path(sys.argv[1]).write_text(os.getcwd())\n"
+                "json.dump([{'role': 'assistant', 'content': json.dumps({'passed': True, 'score': 1, 'rationale': 'ok'})}], sys.stdout)\n",
+                encoding="utf-8")
+            row = sb.run_one_judge_task(task, judge_backend="vibe", judge_model="mistral", vibe_cmd=f"{sys.executable} {fake} {cwd_file}")
+            self.assertTrue(row["passed"])
+            invoked_cwd = Path(cwd_file.read_text(encoding="utf-8"))
+            self.assertFalse((invoked_cwd / "skill_benchmark.py").exists(), invoked_cwd)
+            self.assertNotEqual(invoked_cwd.resolve(), ROOT.resolve())
+
     def test_native_codex_judge_default_cwd_is_isolated_from_repo(self):
         with tempfile.TemporaryDirectory() as td:
             task = self._task(td)
@@ -738,6 +776,7 @@ class ToolUsingJudgeTests(unittest.TestCase):
         self.assertIn("--add-dir", probe["argv"])                          # tools were armed
         self.assertIn("--allowedTools", probe["argv"])
         self.assertEqual(probe["argv"][probe["argv"].index("--allowedTools") + 1], "Read,Grep,Glob,LS")
+        self.assertIn("--json-schema", probe["argv"])
         self.assertIn("output.md", probe["seen"])                          # judge saw the real output...
         for oracle in self.ORACLE:
             self.assertNotIn(oracle, probe["seen"])                        # ...but NEVER the answer key
@@ -756,6 +795,9 @@ class ToolUsingJudgeTests(unittest.TestCase):
         self.assertTrue(row["passed"])
         self.assertIsNone(probe["add_dir"])                                # off -> no directory handed over
         self.assertNotIn("--add-dir", probe["argv"])
+        self.assertIn("--tools", probe["argv"])
+        self.assertEqual(probe["argv"][probe["argv"].index("--tools") + 1], "")
+        self.assertIn("--json-schema", probe["argv"])
         self.assertNotEqual(probe["cwd"], os.getcwd())                     # native judges never inherit repo cwd
         self.assertIn("claude-invoke-cwd-", probe["cwd"])                 # isolated empty cwd by construction
 

@@ -27,7 +27,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 
 1. **Describe cases** in `evals/shared-benchmark.json`: prompt, split, fixture files, variants, assertions, and ablations.
 2. **Prepare tasks** with `skill-benchmark prepare`; generation rows omit `expected_behavior` and judge rubrics unless you explicitly request them.
-3. **Run tasks** with Claude, Codex, Jetty, or any runner that writes the run-output contract; Pi support is currently trigger-focused plus workspace-specific smoke tooling.
+3. **Run tasks** with Claude, Codex, Mistral Vibe, Jetty, or any runner that writes the run-output contract; Pi support is currently trigger-focused plus workspace-specific smoke tooling.
 4. **Grade outputs** with deterministic assertions: string, regex, file, JSON field, and opt-in `script` oracles.
 5. **Inspect the report** for pass rates, flaky repeated runs, no-lift cases, saturated assertions, judge tasks, and trigger/no-trigger results.
 
@@ -40,7 +40,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 - Activation: does the skill load on its own? `skill-trigger-matrix` reports autonomous trigger rates per (agent × model), split by should-fire / should-not-fire.
 - Cost as a signal: normalized token/dollar telemetry per run, a suite cost ledger, and lift-per-dollar (`cost-summary`, `token-overhead`).
 - Interop: Anthropic-style exports, static/served HTML review pages, and Jetty runbook-mode import/export.
-- Judge plumbing: `judge`/`rubric` assertions can be exported or run through native Claude/Codex backends (`--judge-backend`) or a user-supplied `--judge-cmd`; the harness does not choose a model for you.
+- Judge plumbing: `judge`/`rubric` assertions can be exported or run through native Claude/Codex/Vibe backends (`--judge-backend`) or a user-supplied `--judge-cmd`; the harness does not choose a model for you.
 
 ## Contents
 
@@ -176,6 +176,8 @@ skill-benchmark --help
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
 | `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
 | `docs/agent-backend-interface-spec.md` | Draft spec for turning Claude/Codex/Gemini/Vibe support into a shared agent backend interface: parity matrix, judge backends, trigger adapters, telemetry, and tool replay. |
+| `docs/agent-cli-control-plane.md` | The shared native-CLI control plane: process invocation, config isolation, tool policy, final-answer channels, schemas, telemetry, and where Claude/Codex/Vibe intentionally differ. |
+| `docs/agent-cli-tradeoffs.md` | Claude/Codex/Vibe trade-offs: which CLI surfaces are strong or weak, Vibe-only gaps, and what missing schema/telemetry/prompt controls mean for eval reports. |
 | `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
 | `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
@@ -414,9 +416,9 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 
 | Command | What it does |
 |---|---|
-| `skill-benchmark run-codex` | Drive prepared rows through `codex exec --json`; save trace, events, metrics, answer. |
+| `skill-benchmark run-codex` | Drive prepared rows through isolated `codex exec --json --output-last-message`; save trace, events, metrics, answer. |
 | `skill-benchmark run-claude` | Drive `claude -p --output-format json`, capturing real per-run cost + token usage. |
-| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude` or `--agent codex`); compatibility wrappers delegate here. |
+| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, or `--agent vibe`); compatibility wrappers delegate here. |
 | `skill-benchmark run-subagent` | In-process backend seam: any provider via `--agent-cmd`, tool replay, multi-turn `turns`. |
 | `skill-benchmark import-trace` | Normalize a raw JSONL trace into `events.json`/`metrics.json` for process/efficiency checks. |
 
@@ -470,6 +472,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 
 - **Anthropic skill-creator**: use `grade --write-grading-files` and `export-anthropic` for compatible `grading.json`/`benchmark.json` shapes.
 - **Pi**: use `examples/adewale-workspace/run_pi_smoke.py` for the Adewale multi-repo smoke workflow and `skill-pi-trigger-eval` for autonomous trigger checks.
+- **Mistral Vibe**: use `run-agent --agent vibe`, `judge --judge-backend vibe`, and `skill-trigger-matrix --agent vibe`. The harness isolates `VIBE_HOME`, passes `--model` as `VIBE_ACTIVE_MODEL`, mounts trigger skills under `.agents/skills`, and requires `MISTRAL_API_KEY` (or a copied `.env` from the current `VIBE_HOME`, falling back to `~/.vibe/.env`) for live runs.
 - **Other runners**: use `prepare` JSONL as the import format and write results back to the run output contract.
 - **Jetty**: use `export-jetty`, `run-jetty`, and `import-jetty-results` for REST runbook-mode execution. Live response shapes still need token-backed smoke validation before treating Jetty runs as production evidence.
 
@@ -503,7 +506,7 @@ skill-eval-harness/
 ├── pyproject.toml
 ├── skill_benchmark.py          # the CLI, grading, reporting, and runner adapters
 ├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
-├── run_trigger_matrix.py       # activation matrix across agents × models (claude/pi/stub adapters)
+├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance value objects
 ├── docs/                       # architecture, abstractions, vocabulary, specs, guides (see the map above)
 ├── .github/
