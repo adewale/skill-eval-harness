@@ -12,11 +12,13 @@
       "prompt": "Review this change: it adds a new HTTP endpoint with no test. Give me your review.",
       "expected_behavior": [
         "Label the finding's severity (Blocking / Minor / Clean).",
-        "Follow the review checklist and cite the file and line."
+        "Follow the review checklist and cite the file and line.",
+        "Justify the finding: say why it matters and name the concrete gap."
       ],
       "assertions": [
         {"name": "severity-label", "type": "contains_any", "values": ["Blocking", "Minor", "Clean"]},
-        {"name": "cite-checklist", "type": "contains_any", "values": ["file and line"]}
+        {"name": "cite-checklist", "type": "contains_any", "values": ["file and line"]},
+        {"name": "actionable-review", "type": "judge", "severity": "gate", "prompt": "Does the review justify why its finding matters and name the concrete gap (the endpoint ships without a test)? A bare severity label with no reason, or a rubber-stamp 'looks fine', must fail."}
       ],
       "tags": ["demo"]
     },

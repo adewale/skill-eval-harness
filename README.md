@@ -168,6 +168,7 @@ skill-benchmark --help
 | `docs/did-my-skill-edit-regress.md` | The edit → re-run → diff loop: the within-run `ablation_regressions` block (assertion-level, significance-gated) and cross-iteration `render-viewer --previous-workspace` diffs over the `iteration-N/` convention. |
 | `docs/which-model-should-my-skill-target.md` | Ranking model tiers by lift: `prepare --models` fan-out, the `by_model` / `model_analysis` blocks, and reading real lift vs. base-model saturation per tier. |
 | `docs/why-did-this-run-fail.md` | Debugging one failing run: the `error-analysis` taxonomy + review queue, then the run dir (`output.md`/`metadata.json`), mapped to a failure class and a manifest-or-skill decision. |
+| `docs/can-i-trust-my-judge.md` | Calibrating a judge before believing its numbers: `judge-robustness` (order-flip + negative controls), `judge-alignment` (human labels, Cohen's kappa, precision/recall), and `compare-judges` (does the lift survive a judge swap?). |
 | `docs/eval-framework-roadmap-spec.md` | The implemented eval-framework roadmap: goals, abstractions, and tests per feature (CF.1–CF.4, buckets 1–4, migration). |
 | `docs/migrating-evals.md` | Upgrading a manifest between versions (v1 → v2): what `migrate` stamps and the judgment calls it leaves. |
 | `docs/vocabulary.md` | Glossary of harness terms: variants, splits, models, ablations, assertions, severity/oracle tiers, graded scoring, cost telemetry, trace artifacts, and report flags. |

@@ -127,6 +127,8 @@ skill-benchmark judge-alignment \
 
 It reports `agreement`, **Cohen's `cohen_kappa`** (chance-corrected, so an imbalanced label set can't flatter the judge) with a `kappa_interpretation` band, and `precision`/`recall`/`f1` plus the `confusion` matrix. Below `--min-labels` (default 50) matched labels it warns that the metrics are unstable. Fully model-free — it grades a judge you already ran.
 
+The end-to-end calibration loop over this command, `compare-judges`, and `judge-robustness` — runnable offline on the demo — is [`can-i-trust-my-judge.md`](can-i-trust-my-judge.md).
+
 ## Error analysis (open coding → axial taxonomy)
 
 `error-analysis` turns a `benchmark.json` into the "look at your data" surface: an open-coding **review queue** (one row per failing/errored run, anchored on its *first* upstream failure, with an open `note` slot) and an axial **failure taxonomy** (first-failures counted by category, so the few dominant buckets are visible), alongside the report's own case-flag histogram. Model-free.

@@ -20,6 +20,7 @@ title is the question; the body is the loop that answers it, runnable on
 | Did my skill edit regress anything? | [`did-my-skill-edit-regress.md`](did-my-skill-edit-regress.md) |
 | Which model should my skill target? | [`which-model-should-my-skill-target.md`](which-model-should-my-skill-target.md) |
 | Why did this run fail? | [`why-did-this-run-fail.md`](why-did-this-run-fail.md) |
+| Can I trust my judge? | [`can-i-trust-my-judge.md`](can-i-trust-my-judge.md) |
 | How do I upgrade a v1 manifest to v2? | [`migrating-evals.md`](migrating-evals.md) |
 
 The unwritten ones are tracked in [`TODO.md`](../TODO.md) under "User journeys the

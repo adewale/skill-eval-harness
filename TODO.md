@@ -336,9 +336,14 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       the `error-analysis` open-coding queue + failure taxonomy, then the run dir
       (`output.md`/`metadata.json`), mapped to a failure class and a manifest-or-skill decision.
       Runnable offline on `examples/demo-skill` (real 2026-07-06 taxonomy/queue over the failing arms).
-- [ ] **"Can I trust my judge?"** — `judge-alignment` (human labels, kappa, precision/recall),
-      `compare-judges` (judge-sensitivity), and `--judge-runs` repetition exist; no doc walks
-      labeling a sample and deciding whether the judge is usable.
+- [x] **"Can I trust my judge?"** — [`docs/can-i-trust-my-judge.md`](docs/can-i-trust-my-judge.md):
+      stability (`judge-robustness` order-flip + negative controls), accuracy vs. human labels
+      (`judge-alignment`: kappa over raw agreement, precision/recall), and conclusion-sensitivity
+      (`compare-judges` lift diff), with `--judge-runs`/`--judge-panel` as the repetition tools.
+      Runnable offline: the demo gained a gate-severity `judge` assertion plus `stub_judge.py`
+      (careful and `--lenient` rubber-stamp modes), so the whole loop — including the
+      rubber-stamp's kappa-0.0 / control-leak-1.0 / lift-erosion signature — runs with no model
+      (real 2026-07-09 output; guarded by `tests/test_example_demo.py`).
 - [x] **"How do I gate my skill repo's CI on this?"** — [`docs/gating-ci-on-evals.md`](docs/gating-ci-on-evals.md):
       the two-gate recipe (`report --format junit|github` for regressions +
       `audit-manifest --fail-on-blockers` for manifest trust), a workflow file, and the
