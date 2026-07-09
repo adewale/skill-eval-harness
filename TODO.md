@@ -4,6 +4,15 @@ Detailed spec: [`docs/jetty-support-spec.md`](docs/jetty-support-spec.md).
 
 Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-api.jetty.io/v1/chat/completions`, trajectory recording, sandboxed runbook execution, agent runtimes, workflow steps, and `simple_judge` evaluation. The spec is grounded in Jetty public docs plus `github.com/jettyio/jettyio-skills` (`skills/jetty/SKILL.md`, `skills/jetty/references/agents-and-models.md`, and `skills/create-runbook/SKILL.md`). To keep the first implementation simple, target REST runbook mode first: `export-jetty`, `run-jetty`, `import-jetty-results`; no MCP dependency, no streaming, no custom images, and no Jetty judge export until execution/import works.
 
+## Current status and production-readiness gap
+
+Current support is an adapter scaffold, not production-proven Jetty evidence. The harness can export deterministic runbook payloads, dry-run them, submit/poll through a REST client, and import mocked trajectory-shaped results. The missing step is token-backed contract validation against real Jetty responses; until then the main risk is mock-reality drift.
+
+- [ ] Mark README/docs examples clearly: Jetty is optional and live response shapes remain unverified until the first token-backed smoke passes.
+- [ ] Capture redacted live responses as committed contract fixtures for file upload, chat-completion submit, trajectory poll, artifact list/download, failed/timeout status, and rate-limit response.
+- [ ] Update `JettyClient`, `execute_jetty_payloads`, and `import_jetty_results` to consume the real response shapes, not only the current mocked inline-artifact shape.
+- [ ] Promote Jetty evidence to production-grade only after `export-jetty -> run-jetty -> import-jetty-results -> benchmark` passes on one fixture-free and one fixture-backed demo case.
+
 ## API adapter
 
 - [x] Add `export-jetty` command that converts prepared task rows into Jetty chat-completion payloads.
@@ -40,15 +49,18 @@ Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-a
 - [x] Handle non-streaming Jetty responses.
 - [x] Persist Jetty trajectory IDs in run records as soon as submit returns them.
 - [x] Retry transient 429/5xx API failures with bounded backoff.
-- [ ] Support concurrency limits and rate-limit handling.
+- [ ] Support concurrency limits and rate-limit handling: bounded worker pool, `Retry-After` support, jittered backoff, and no unbounded in-flight submissions.
+- [ ] Add a resumable run ledger so an interrupted suite can resume submitted trajectory IDs instead of resubmitting tasks.
 - [x] Support dry-run payload loading without submission.
-- [ ] Handle streaming Jetty responses.
+- [ ] Handle streaming Jetty responses when/if needed by the production API.
 
 ## Importing results
 
 - [x] Add `import-jetty-results` command.
 - [x] Import final assistant output into `runs/<case_id>/<variant>/run-<n>/output.md` when repeated, or the existing one-run layout.
 - [x] Import generated artifacts into `outputs/` when present in trajectory records.
+- [ ] Support non-inline artifact contracts if production Jetty returns artifact IDs, URLs, signed download links, nested output blocks, or workspace-relative paths instead of `{path, content}` objects.
+- [ ] Fail closed with clear metadata when a completed trajectory has no importable `/app/results/output.md` artifact.
 - [x] Normalize Jetty metrics into `metadata.json`: `elapsed_ms`, `input_tokens`, `output_tokens`, `total_tokens`, `model`, `total_tool_calls`, `errors_encountered`.
 - [x] Preserve raw Jetty metadata: `jetty_trajectory_id`, `jetty_collection`, `jetty_task`, `jetty_agent`, `trace_url`, `jetty_raw`.
 - [x] Keep local deterministic grading unchanged after import.
@@ -59,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:4607`, merged in `grade_case_variant:5629`).
+threshold, evidence}` (`load_judge_results:4890`, merged in `grade_case_variant:5980`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -94,6 +106,8 @@ threshold, evidence}` (`load_judge_results:4607`, merged in `grade_case_variant:
 - [x] Add importer round-trip test: Jetty result JSON -> harness run layout -> `benchmark`.
 - [x] Add hidden-prompt/answer-key safety test proving answer keys are not uploaded in executor payloads.
 - [x] Add README quick start for the current mocked/dry-run Jetty path.
+- [ ] Add opt-in live smoke gated by `RUN_JETTY_SMOKE=1` and `JETTY_API_TOKEN`; never run it in default CI.
+- [ ] Live smoke should exercise one fixture-free tune case, one fixture-backed tune case, and one cheap failure/timeout path if Jetty exposes one.
 - [ ] Add README live-smoke notes after API behavior is verified with a real account.
 
 ## Open questions to verify against current Jetty docs/API
@@ -131,24 +145,28 @@ shared backend protocols and conformance tests, not one-off grading or benchmark
 
 ## Mistral Vibe
 
-- [ ] Add a native Mistral Vibe answer backend (`run-agent --agent vibe`) with isolated `VIBE_HOME`
+Mistral support should mean first-class Vibe CLI support, not a raw chat-completions call: raw Mistral API can be used today through `--judge-cmd`, but it cannot measure Agent Skills discovery/loading. Vibe is the useful target because it exposes noninteractive runs, Agent Skills discovery, tool controls, and `MISTRAL_API_KEY` auth.
+
+- [x] Validate the local Vibe CLI contract (`vibe 2.19.1` installed): noninteractive prompt syntax (`--prompt "$PROMPT"`; headless stdin prompt mode is not reliable without a tty), `--output json|streaming`, `--enabled-tools re:^$` no-tools mode, `--workdir`, `--trust`, isolated `VIBE_HOME` outside the model workdir, and `VIBE_ACTIVE_MODEL`.
+- [x] Add a native Mistral Vibe answer backend (`run-agent --agent vibe`) with isolated `VIBE_HOME` outside the model workdir
       or equivalent config, project workspace setup, answer extraction from Vibe JSON/stream output,
       usage/cost normalization when available, and the same native failure artifact contract as
       Claude/Codex/Gemini.
-- [ ] Add a native Mistral Vibe judge backend (`judge --judge-backend vibe`) using the canonical
+- [x] Add a native Mistral Vibe judge backend (`judge --judge-backend vibe`) using the canonical
       verdict schema and strict-schema gate; preserve raw transcripts and normalized usage/cost
       blocks for every verdict.
-- [ ] Add a Mistral Vibe autonomous trigger adapter for `skill-trigger-matrix --agent vibe`: mount
+- [x] Add a Mistral Vibe autonomous trigger adapter for `skill-trigger-matrix --agent vibe`: mount
       skills under `.agents/skills` or Vibe's native skill path, detect explicit skill activation
       events where possible, fall back to mounted-path evidence, and add `RUN_VIBE_TRIGGER_SMOKE`.
-- [ ] Add Vibe offline conformance fixtures matching the Gemini fixture set, including tool-call /
+- [x] Add Vibe offline conformance fixtures matching the Gemini fixture set, including tool-call /
       skill-activation evidence and missing-telemetry cases.
+- [x] Run token-backed Vibe live smokes after `MISTRAL_API_KEY` is available: direct no-tools prompt, `run-agent --agent vibe`, native `judge --judge-backend vibe`, `RUN_AGENT_INVOKE_SMOKE=1`, and `RUN_VIBE_TRIGGER_SMOKE=1` passed on 2026-07-09; Vibe usage/cost telemetry was absent and normalized as explicit `missing`.
 
 ## Cross-provider registry/docs
 
-- [ ] Extend `agent_capabilities.py`, `docs/agent-parity.md`, CLI help, README command tables, and
-      smoke-test environment documentation as each Gemini/Vibe surface lands.
-- [ ] Add a registry/conformance guard that fails when a backend is partially registered (for
+- [x] Extend `agent_capabilities.py`, `docs/agent-parity.md`, CLI help, README command tables, and
+      smoke-test environment documentation for Vibe.
+- [x] Add a registry/conformance guard that fails when a backend is partially registered (for
       example `run-agent` supports it but parity docs or capability rows do not).
 - [ ] Keep `--judge-cmd` as the escape hatch for arbitrary providers while first-class Gemini/Vibe
       support moves through the native backend registry.

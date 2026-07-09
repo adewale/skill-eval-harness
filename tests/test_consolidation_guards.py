@@ -140,6 +140,10 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         for name, cap in ac.AGENT_CAPABILITIES.items():
             self.assertIn(cap.dollar_cost, sb.COST_SOURCES, name)
 
+    def test_invocation_request_is_answer_runner_only(self):
+        fields = set(sb.InvocationRequest.__dataclass_fields__)
+        self.assertEqual(fields, {"prompt", "workspace", "model", "timeout_s"})
+
     def test_agent_capability_registry_matches_registered_surfaces(self):
         for name in tm.ADAPTERS:
             self.assertIn(name, ac.AGENT_CAPABILITIES)
@@ -156,6 +160,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         judge_parser = subs.choices["judge"]
         judge_backend_action = next(a for a in judge_parser._actions if "--judge-backend" in getattr(a, "option_strings", ()))
         native_judges = set(judge_backend_action.choices) - {"cmd"}
+        self.assertEqual(native_judges, set(sb.JUDGE_BACKENDS))
         self.assertEqual(native_judges, {name for name, cap in ac.AGENT_CAPABILITIES.items() if cap.judge_backend})
 
 
@@ -198,6 +203,7 @@ class TimeoutConventionTests(unittest.TestCase):
         self.assertIs(sb.RunnerOutcome("codex").failure_marker, am.CODEX_FAILURE)
         self.assertIs(sb.RunnerOutcome("claude").failure_marker, am.CLAUDE_FAILURE)
         self.assertIs(sb.RunnerOutcome("subagent").failure_marker, am.CLAUDE_FAILURE)
+        self.assertIs(sb.RunnerOutcome("vibe").failure_marker, am.VIBE_FAILURE)
         for marker in am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values():
             self.assertIn(marker, am.RUNNER_FAILURE_MARKERS)
 

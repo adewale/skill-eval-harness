@@ -7,6 +7,7 @@ All notable public changes are listed here. Release tags are the source of truth
 - Hardening: consolidate native subprocess handling so spawn failures become failed observations instead of crashes, isolate the Pi trigger runner cwd like the trigger matrix, validate trigger eval-set booleans at the JSON boundary, and add capability/publish-workflow conformance guards.
 - Documentation: reconcile stale ablation, evidence-class, assertion-family, agent-parity, and demo walkthrough prose with the current materialized-ablation/significance behavior.
 - Packaging: add a PyPI trusted-publishing workflow (`.github/workflows/publish.yml`) for tokenless release uploads from GitHub Actions, publish `skill-eval-harness==0.5.1` to PyPI, and update README install examples to prefer PyPI.
+- Native agents: add first-class Mistral Vibe answer/judge/trigger support, harden Codex/Vibe CLI homes so credential-bearing files live outside model workdirs, and document current Vibe telemetry/schema gaps.
 
 ## v0.5.1 — 2026-07-08
 

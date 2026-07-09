@@ -51,7 +51,7 @@ skill-benchmark import-trace \
 
 ## Run Codex JSONL tasks
 
-`run-codex` is a compatibility wrapper for `run-agent --agent codex`. It executes prepared rows through a command compatible with `codex exec --json`, saves `trace.jsonl`, normalizes events/metrics, extracts the final answer into `output.md`, and records nonzero/timeouts as failed run artifacts:
+`run-codex` is a compatibility wrapper for `run-agent --agent codex`. It executes prepared rows through a command compatible with `codex exec --json`, adds `--output-last-message <file>` for final-answer capture, saves JSONL as `trace.jsonl`, normalizes events/metrics, runs with isolated `CODEX_HOME` outside the model workdir, and records nonzero/timeouts as failed run artifacts:
 
 ```bash
 skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl
@@ -215,7 +215,7 @@ skill-benchmark suggest-cases --benchmark benchmark.json --manifest evals/shared
 
 ## Judge backends
 
-Run deferred `judge`/`rubric` assertions with either a native backend (`--judge-backend claude` or `--judge-backend codex`) or a shell command (`--judge-cmd`) that reads one grading prompt from stdin and emits JSON on stdout. The prompt contains the original case prompt, `expected_behavior`, `review_rubric`, the assertion, and the saved candidate output.
+Run deferred `judge`/`rubric` assertions with either a native backend (`--judge-backend claude`, `--judge-backend codex`, or `--judge-backend vibe`) or a shell command (`--judge-cmd`) that reads one grading prompt from stdin and emits JSON on stdout. The prompt contains the original case prompt, `expected_behavior`, `review_rubric`, the assertion, and the saved candidate output.
 
 ```bash
 skill-benchmark judge ../repo/evals/shared-benchmark.json \
@@ -234,6 +234,13 @@ skill-benchmark judge ../repo/evals/shared-benchmark.json \
 
 skill-benchmark judge ../repo/evals/shared-benchmark.json \
   --runs ../repo/eval-runs/latest \
+  --judge-backend vibe \
+  --judge-model mistral-large-latest \
+  --transcripts judge-transcripts-vibe \
+  --out judge-results.vibe.jsonl
+
+skill-benchmark judge ../repo/evals/shared-benchmark.json \
+  --runs ../repo/eval-runs/latest \
   --judge-cmd 'claude -p' \
   --transcripts judge-transcripts \
   --out judge-results.jsonl
@@ -244,7 +251,7 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --out benchmark.json
 ```
 
-Native Claude uses `claude -p --output-format json`; native Codex uses `codex exec --output-last-message <file> --output-schema <schema.json>` so verdict parsing reads the final assistant message rather than the event JSONL stream. Native judges run from an explicit working directory: a sanitized run-copy when tool exploration is enabled, otherwise a fresh empty temp directory so they cannot accidentally read the harness repo cwd. For Codex/OpenAI structured output, the harness adapts the canonical verdict schema into a strict provider schema (`additionalProperties:false`; optional fields become nullable) while still validating the returned verdict against the canonical schema. A shell judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting. `--transcripts` saves the exact prompt, stdout, stderr, and parsed result for each judge task.
+Native Claude uses `claude -p --output-format json --no-session-persistence`; tool-free judges add `--tools ""`, and every native Claude judge passes the harness verdict schema through `--json-schema`. Native Codex uses isolated `CODEX_HOME` outside the model workdir plus `codex exec --output-last-message <file> --output-schema <schema.json>` so verdict parsing reads the final assistant message rather than the event JSONL stream. Native Vibe uses isolated `VIBE_HOME` outside the model workdir plus `vibe --prompt "$PROMPT" --output json` with tools disabled (`--enabled-tools re:^$`) and reads the final assistant message as the verdict JSON; `--judge-model` is passed through `VIBE_ACTIVE_MODEL`. Native judges run from an explicit working directory: a sanitized run-copy when tool exploration is enabled, otherwise a fresh empty temp directory so they cannot accidentally read the harness repo cwd. For Codex/OpenAI structured output, the harness adapts the canonical verdict schema into a strict provider schema (`additionalProperties:false`; optional fields become nullable) while still validating the returned verdict against the canonical schema. Vibe does not expose provider-enforced schema here, so harness-side schema validation is the gate. A shell judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting. `--transcripts` saves the exact prompt, stdout, stderr, and parsed result for each judge task.
 
 ## Audit manifest quality
 
@@ -437,7 +444,7 @@ skill-trigger-matrix ../repo/evals/shared-benchmark.json \
   --out trigger-matrix.json
 ```
 
-For each (agent, model) cell this mounts the skill where that agent discovers skills autonomously (never forcing the load), runs the manifest's `kind: "trigger"` cases the requested number of times, and reports per-cell trigger rates split by should-fire / should-not-fire polarity. The `claude` adapter spawns headless Claude Code subagents and defaults to haiku, sonnet, and opus; `--agent codex`, `--agent pi`, and the offline `--agent stub` are included. Additional agents register through an `AgentAdapter` subclass plus an `AGENT_CAPABILITIES` row. The tuning loop that consumes these rates is [`tuning-skill-activation.md`](tuning-skill-activation.md); manual live smoke tests wrap the same path (`RUN_TRIGGER_SMOKE=1` for Claude, `RUN_CODEX_TRIGGER_SMOKE=1` for Codex, `RUN_PI_TRIGGER_SMOKE=1` for Pi). For a cheaper auth/network/process check that invokes every supported live adapter/model without asserting trigger behavior, run `RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v`.
+For each (agent, model) cell this mounts the skill where that agent discovers skills autonomously (never forcing the load), runs the manifest's `kind: "trigger"` cases the requested number of times, and reports per-cell trigger rates split by should-fire / should-not-fire polarity. The `claude` adapter spawns headless Claude Code subagents and defaults to haiku, sonnet, and opus; `--agent codex`, `--agent pi`, `--agent vibe`, and the offline `--agent stub` are included. Codex keeps credential-bearing `CODEX_HOME` outside the model workdir and exposes only `$CODEX_HOME/skills` as an extra read root. The Vibe adapter mounts skills under `.agents/skills`, keeps `VIBE_HOME` outside the model workdir, runs `vibe --prompt "$QUERY" --output streaming`, and detects native `skill` tool calls by skill name with path-evidence fallback. Additional agents register through an `AgentAdapter` subclass plus an `AGENT_CAPABILITIES` row. The tuning loop that consumes these rates is [`tuning-skill-activation.md`](tuning-skill-activation.md); manual live smoke tests wrap the same path (`RUN_TRIGGER_SMOKE=1` for Claude, `RUN_CODEX_TRIGGER_SMOKE=1` for Codex, `RUN_PI_TRIGGER_SMOKE=1` for Pi, `RUN_VIBE_TRIGGER_SMOKE=1` for Vibe). For a cheaper auth/network/process check that invokes every supported live adapter/model without asserting trigger behavior, run `RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v`.
 
 ## Pi trigger evals
 

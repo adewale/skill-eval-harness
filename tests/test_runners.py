@@ -97,8 +97,9 @@ class SubagentRunnerTests(unittest.TestCase):
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["returncode"], 1)
 
-    def test_subagent_is_a_registered_workspace_builder(self):
-        self.assertIn("subagent", sb.WORKSPACE_BUILDERS)
+    def test_agent_backends_are_registered_workspace_builders(self):
+        for name in ("subagent", "codex", "claude", "vibe"):
+            self.assertIn(name, sb.WORKSPACE_BUILDERS)
 
 
 class ToolReplayTests(unittest.TestCase):
@@ -203,7 +204,7 @@ class D1_FailureMarkerOwnerTests(unittest.TestCase):
 
     def test_writer_constants_are_exactly_the_detector_markers(self):
         import ablation_model as am
-        self.assertEqual((am.CODEX_FAILURE, am.JETTY_FAILURE, am.CLAUDE_FAILURE, am.TIMEOUT_FAILURE), am.RUNNER_FAILURE_MARKERS)
+        self.assertEqual((am.CODEX_FAILURE, am.JETTY_FAILURE, am.CLAUDE_FAILURE, am.VIBE_FAILURE, am.TIMEOUT_FAILURE), am.RUNNER_FAILURE_MARKERS)
 
     def test_each_formatted_failure_body_is_non_executable(self):
         import ablation_model as am
@@ -293,8 +294,10 @@ class RunnerOutcomeContractTests(unittest.TestCase):
 
             fake_codex = root / "fake_codex.py"
             fake_codex.write_text(
-                "import json, sys\n_ = sys.stdin.read()\n"
-                "print(json.dumps({'role': 'assistant', 'content': 'token from codex',"
+                "import json, pathlib, sys\n_ = sys.stdin.read()\n"
+                "assert '--output-last-message' in sys.argv\n"
+                "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token from codex')\n"
+                "print(json.dumps({'role': 'assistant', 'content': 'trace from codex',"
                 " 'usage': {'input_tokens': 4, 'output_tokens': 6}}))\n",
                 encoding="utf-8")
             codex_runs = root / "codex-runs"
@@ -339,8 +342,15 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             tasks, run_dir = self._one_with_skill_task(root)
             fake_codex = root / "fake_codex.py"
             fake_codex.write_text(
-                "import json, sys\n_ = sys.stdin.read()\n"
-                "print(json.dumps({'role': 'assistant', 'content': 'token from codex'}))\n",
+                "import json, pathlib, sys\n_ = sys.stdin.read()\n"
+                "assert '--output-last-message' in sys.argv\n"
+                "assert '--ignore-user-config' in sys.argv and '--ignore-rules' in sys.argv\n"
+                "codex_home = pathlib.Path(__import__('os').environ['CODEX_HOME'])\n"
+                "assert codex_home.is_dir()\n"
+                "assert not codex_home.is_relative_to(pathlib.Path.cwd())\n"
+                "assert not (pathlib.Path.cwd() / '.codex' / 'auth.json').exists()\n"
+                "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token from codex')\n"
+                "print(json.dumps({'role': 'assistant', 'content': 'trace from codex'}))\n",
                 encoding="utf-8")
             codex_runs = root / "agent-codex"
             sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(codex_runs), model="gpt-mini",
@@ -427,6 +437,101 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertNotIn("LEAKED FROM TRACE", text)
             self.assertTrue(text.lstrip().startswith(am.CLAUDE_FAILURE))
             self.assertFalse(am.execution_valid({"returncode": 0}, text))
+
+    def test_run_agent_dispatches_registered_vibe_backend(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            fake_vibe = root / "fake_vibe.py"
+            fake_vibe.write_text(
+                "import json, os, pathlib, sys\n"
+                "prompt = sys.argv[sys.argv.index('--prompt') + 1]\n"
+                "assert '--prompt' in sys.argv\n"
+                "assert '--output' in sys.argv\n"
+                "assert '--workdir' in sys.argv\n"
+                "assert '--trust' in sys.argv\n"
+                "assert os.environ.get('VIBE_ACTIVE_MODEL') == 'mistral-test'\n"
+                "workdir = pathlib.Path(sys.argv[sys.argv.index('--workdir') + 1])\n"
+                "vibe_home = pathlib.Path(os.environ['VIBE_HOME'])\n"
+                "assert vibe_home.is_dir()\n"
+                "assert not vibe_home.is_relative_to(workdir)\n"
+                "assert not (workdir / '.vibe-home' / '.env').exists()\n"
+                "assert 'Task prompt:' in prompt\n"
+                "print(json.dumps({'role': 'assistant', 'content': 'token from vibe',"
+                " 'usage': {'input_tokens': 5, 'output_tokens': 7}, 'cost_usd': 0.02}))\n",
+                encoding="utf-8")
+            runs = root / "vibe-runs"
+            sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model="mistral-test",
+                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=f"{sys.executable} {fake_vibe}", timeout=30))
+            base = runs / run_dir
+            self.assertIn("token from vibe", (base / "output.md").read_text(encoding="utf-8"))
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["provider"], "vibe")
+            self.assertEqual(meta["model"], "mistral-test")
+            self.assertEqual(meta["usage_normalized"]["total_tokens"], 12)
+            self.assertEqual(meta["cost_normalized"]["total_cost"], 0.02)
+            env = json.loads((base / "environment.json").read_text(encoding="utf-8"))
+            self.assertTrue(env["config_isolated"])
+            self.assertTrue(env["vibe_home_outside_workdir"])
+            self.assertEqual(env["vibe_home"], "<isolated VIBE_HOME outside workdir>")
+            self.assertIn("--prompt '<prompt>'", env["command"])
+            self.assertNotIn("Task prompt:", env["command"])
+
+    def test_vibe_success_without_usage_writes_explicit_missing_telemetry(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            fake_vibe = root / "fake_vibe_no_usage.py"
+            fake_vibe.write_text(
+                "import json\n"
+                "print(json.dumps({'role': 'assistant', 'content': 'token from vibe'}))\n",
+                encoding="utf-8")
+            runs = root / "vibe-runs"
+            sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model="mistral-test",
+                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=f"{sys.executable} {fake_vibe}", timeout=30))
+            base = runs / run_dir
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["provider"], "vibe")
+            self.assertEqual(meta["usage_normalized"], {"source": "missing"})
+            self.assertEqual(meta["cost_normalized"], {"source": "missing"})
+
+    def test_vibe_home_seeding_copies_only_env_file_not_user_skills(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source-vibe"
+            (source / "skills" / "personal").mkdir(parents=True)
+            (source / ".env").write_text("MISTRAL_API_KEY=secret\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"VIBE_HOME": str(source)}, clear=True):
+                meta = sb.seed_vibe_home(root / "isolated-vibe")
+            self.assertTrue(meta["vibe_env_file_copied"])
+            self.assertEqual((root / "isolated-vibe" / ".env").read_text(encoding="utf-8"), "MISTRAL_API_KEY=secret\n")
+            self.assertFalse((root / "isolated-vibe" / "skills").exists())
+
+    def test_vibe_parser_handles_json_and_streaming_messages(self):
+        json_text = json.dumps([
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "final", "usage": {"prompt_tokens": 1, "completion_tokens": 2}},
+        ])
+        messages = sb.parse_vibe_messages(json_text)
+        self.assertEqual(sb.vibe_final_answer(messages), "final")
+        usage, _ = sb.vibe_usage_and_cost(messages)
+        self.assertEqual(sb.normalize_usage(usage, source="provider_reported")["total_tokens"], 3)
+        streaming = json.dumps({"role": "assistant", "content": "streamed"}) + "\n"
+        self.assertEqual(sb.vibe_final_answer(sb.parse_vibe_messages(streaming)), "streamed")
+
+    def test_vibe_missing_binary_uses_vibe_failure_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            runs = root / "runs"
+            sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model=None,
+                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=str(root / "missing-vibe"), timeout=30))
+            base = runs / run_dir
+            text = (base / "output.md").read_text(encoding="utf-8")
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertTrue(text.lstrip().startswith(sb.VIBE_FAILURE))
+            self.assertEqual(meta["returncode"], 127)
+            self.assertFalse(sb.execution_valid(meta, text))
 
     def test_codex_empty_output_writes_explicit_missing_telemetry(self):
         # The PR's headline consistency fix: an empty Codex run now goes through the
