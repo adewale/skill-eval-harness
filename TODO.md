@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:4879`, merged in `grade_case_variant:5914`).
+threshold, evidence}` (`load_judge_results:4890`, merged in `grade_case_variant:5980`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -147,8 +147,8 @@ shared backend protocols and conformance tests, not one-off grading or benchmark
 
 Mistral support should mean first-class Vibe CLI support, not a raw chat-completions call: raw Mistral API can be used today through `--judge-cmd`, but it cannot measure Agent Skills discovery/loading. Vibe is the useful target because it exposes noninteractive runs, Agent Skills discovery, tool controls, and `MISTRAL_API_KEY` auth.
 
-- [x] Validate the local Vibe CLI contract (`vibe 2.19.1` installed): noninteractive prompt syntax (`--prompt "$PROMPT"`; headless stdin prompt mode is not reliable without a tty), `--output json|streaming`, `--enabled-tools re:^$` no-tools mode, `--workdir`, `--trust`, isolated `VIBE_HOME`, and `VIBE_ACTIVE_MODEL`.
-- [x] Add a native Mistral Vibe answer backend (`run-agent --agent vibe`) with isolated `VIBE_HOME`
+- [x] Validate the local Vibe CLI contract (`vibe 2.19.1` installed): noninteractive prompt syntax (`--prompt "$PROMPT"`; headless stdin prompt mode is not reliable without a tty), `--output json|streaming`, `--enabled-tools re:^$` no-tools mode, `--workdir`, `--trust`, isolated `VIBE_HOME` outside the model workdir, and `VIBE_ACTIVE_MODEL`.
+- [x] Add a native Mistral Vibe answer backend (`run-agent --agent vibe`) with isolated `VIBE_HOME` outside the model workdir
       or equivalent config, project workspace setup, answer extraction from Vibe JSON/stream output,
       usage/cost normalization when available, and the same native failure artifact contract as
       Claude/Codex/Gemini.

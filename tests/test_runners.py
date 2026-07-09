@@ -97,8 +97,9 @@ class SubagentRunnerTests(unittest.TestCase):
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["returncode"], 1)
 
-    def test_subagent_is_a_registered_workspace_builder(self):
-        self.assertIn("subagent", sb.WORKSPACE_BUILDERS)
+    def test_agent_backends_are_registered_workspace_builders(self):
+        for name in ("subagent", "codex", "claude", "vibe"):
+            self.assertIn(name, sb.WORKSPACE_BUILDERS)
 
 
 class ToolReplayTests(unittest.TestCase):
@@ -344,7 +345,10 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 "import json, pathlib, sys\n_ = sys.stdin.read()\n"
                 "assert '--output-last-message' in sys.argv\n"
                 "assert '--ignore-user-config' in sys.argv and '--ignore-rules' in sys.argv\n"
-                "assert 'CODEX_HOME' in __import__('os').environ\n"
+                "codex_home = pathlib.Path(__import__('os').environ['CODEX_HOME'])\n"
+                "assert codex_home.is_dir()\n"
+                "assert not codex_home.is_relative_to(pathlib.Path.cwd())\n"
+                "assert not (pathlib.Path.cwd() / '.codex' / 'auth.json').exists()\n"
                 "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token from codex')\n"
                 "print(json.dumps({'role': 'assistant', 'content': 'trace from codex'}))\n",
                 encoding="utf-8")
@@ -447,7 +451,11 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 "assert '--workdir' in sys.argv\n"
                 "assert '--trust' in sys.argv\n"
                 "assert os.environ.get('VIBE_ACTIVE_MODEL') == 'mistral-test'\n"
-                "assert pathlib.Path(os.environ['VIBE_HOME']).is_dir()\n"
+                "workdir = pathlib.Path(sys.argv[sys.argv.index('--workdir') + 1])\n"
+                "vibe_home = pathlib.Path(os.environ['VIBE_HOME'])\n"
+                "assert vibe_home.is_dir()\n"
+                "assert not vibe_home.is_relative_to(workdir)\n"
+                "assert not (workdir / '.vibe-home' / '.env').exists()\n"
                 "assert 'Task prompt:' in prompt\n"
                 "print(json.dumps({'role': 'assistant', 'content': 'token from vibe',"
                 " 'usage': {'input_tokens': 5, 'output_tokens': 7}, 'cost_usd': 0.02}))\n",
@@ -464,8 +472,28 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(meta["cost_normalized"]["total_cost"], 0.02)
             env = json.loads((base / "environment.json").read_text(encoding="utf-8"))
             self.assertTrue(env["config_isolated"])
+            self.assertTrue(env["vibe_home_outside_workdir"])
+            self.assertEqual(env["vibe_home"], "<isolated VIBE_HOME outside workdir>")
             self.assertIn("--prompt '<prompt>'", env["command"])
             self.assertNotIn("Task prompt:", env["command"])
+
+    def test_vibe_success_without_usage_writes_explicit_missing_telemetry(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            fake_vibe = root / "fake_vibe_no_usage.py"
+            fake_vibe.write_text(
+                "import json\n"
+                "print(json.dumps({'role': 'assistant', 'content': 'token from vibe'}))\n",
+                encoding="utf-8")
+            runs = root / "vibe-runs"
+            sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model="mistral-test",
+                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=f"{sys.executable} {fake_vibe}", timeout=30))
+            base = runs / run_dir
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["provider"], "vibe")
+            self.assertEqual(meta["usage_normalized"], {"source": "missing"})
+            self.assertEqual(meta["cost_normalized"], {"source": "missing"})
 
     def test_vibe_home_seeding_copies_only_env_file_not_user_skills(self):
         with tempfile.TemporaryDirectory() as td:

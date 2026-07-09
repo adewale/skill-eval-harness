@@ -10,7 +10,7 @@ runs every (agent, model, query) cell `--runs-per-query` times, and reports a
 per-cell trigger rate. You tune the skill description against that matrix; see
 docs/tuning-skill-activation.md for the loop.
 
-Four adapters ship:
+Five adapters ship:
 
 - `claude`  — Claude Code CLI subagents (`claude -p`), defaulting to the
               haiku / sonnet / opus aliases. The skill mounts as a project
@@ -19,10 +19,14 @@ Four adapters ship:
               SKILL.md. It uses an isolated CLAUDE_CONFIG_DIR when auth can be
               copied, otherwise preserves the normal Claude config so
               OAuth/keychain logins still work.
-- `codex`   — Codex CLI (`codex exec --json` by default), mounted in the
-              Codex project-skill directory and detected through the shared
+- `codex`   — Codex CLI (`codex exec --json` by default), with skills mounted
+              under an isolated external `$CODEX_HOME/skills` and exposed as a
+              skills-only read root. It is detected through the shared
               path-evidence detector. Override the command with `--codex-cmd`
               when a local wrapper or a newer CLI surface is needed.
+- `vibe`    — Mistral Vibe CLI (`vibe --prompt ...`), with skills mounted under
+              workspace `.agents/skills` and `VIBE_HOME` isolated outside the
+              model workdir. Native `skill` tool calls are primary evidence.
 - `pi`      — the Pi coding agent, same mount/detect approach as
               run_pi_trigger_eval.py (which remains a compatibility wrapper
               for the Pi-only entry point).
@@ -54,7 +58,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from agent_capabilities import AGENT_CAPABILITIES
 from skill_benchmark import (
@@ -73,7 +77,7 @@ from skill_benchmark import (
     stream_usage_and_cost,
     build_vibe_cli_argv,
     codex_env_for_home,
-    seed_vibe_home,
+    vibe_env_for_home,
     vibe_skill_tool_evidence,
     VIBE_DEFAULT_CMD,
     VIBE_READ_ONLY_TOOLS,
@@ -86,7 +90,11 @@ from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Pr
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
 DEFAULT_CODEX_CMD = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules"
 INVOKE_RESULT_KEYS = ("stdout", "stderr", "returncode", "timed_out", "elapsed_ms", "observation_complete")
-INVOKE_RESULT_METADATA_KEYS = ("config_isolated", "config_isolation_warning", "vibe_env_file_copied")
+INVOKE_RESULT_METADATA_KEYS = (
+    "config_isolated", "config_isolation_warning",
+    "codex_home_files_copied", "codex_home_outside_workdir",
+    "vibe_env_file_copied", "vibe_home_outside_workdir",
+)
 CLAUDE_PORTABLE_AUTH_FILES = (".credentials.json",)
 SENSITIVE_WORKSPACE_FILES = (
     ".trigger-config/.credentials.json",
@@ -97,6 +105,7 @@ SENSITIVE_WORKSPACE_FILES = (
     ".pi-config/APPEND_SYSTEM.md",
     ".vibe-home/.env",
 )
+SENSITIVE_ENV_VARS = ("MISTRAL_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN")
 
 
 def mounted_skill_names(copied: list[Path]) -> list[str]:
@@ -174,20 +183,44 @@ def _json_secret_values(value: Any) -> list[str]:
     return []
 
 
-def workspace_secret_values(workspace: Path) -> list[str]:
+def _text_secret_values(text: str) -> list[str]:
     secrets: list[str] = []
-    for rel in SENSITIVE_WORKSPACE_FILES:
-        path = workspace / rel
+    if len(text.strip()) >= 8:
+        secrets.append(text)
+    try:
+        secrets.extend(_json_secret_values(json.loads(text)))
+    except json.JSONDecodeError:
+        secrets.extend(m.group(1) for m in re.finditer(r"""["']([^"']{8,})["']""", text))
+        for line in text.splitlines():
+            if "=" not in line or line.lstrip().startswith("#"):
+                continue
+            _, value = line.split("=", 1)
+            value = value.strip().strip('"\'')
+            if len(value) >= 8:
+                secrets.append(value)
+    return secrets
+
+
+def _secret_values_from_files(paths: Iterable[Path]) -> list[str]:
+    secrets: list[str] = []
+    for path in paths:
         if not path.is_file():
             continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if len(text.strip()) >= 8:
-            secrets.append(text)
-        try:
-            secrets.extend(_json_secret_values(json.loads(text)))
-        except json.JSONDecodeError:
-            secrets.extend(m.group(1) for m in re.finditer(r"""["']([^"']{8,})["']""", text))
+        secrets.extend(_text_secret_values(path.read_text(encoding="utf-8", errors="replace")))
+    return secrets
+
+
+def workspace_secret_values(workspace: Path) -> list[str]:
+    secrets = _secret_values_from_files(workspace / rel for rel in SENSITIVE_WORKSPACE_FILES)
     # Longest first handles whole-file redaction before nested token values.
+    return sorted({s for s in secrets if s}, key=len, reverse=True)
+
+
+def ambient_secret_values() -> list[str]:
+    secrets = [value for name in SENSITIVE_ENV_VARS if len(value := os.environ.get(name, "")) >= 8]
+    codex_source = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    vibe_source = Path(os.environ.get("VIBE_HOME", str(Path.home() / ".vibe")))
+    secrets.extend(_secret_values_from_files((codex_source / "auth.json", codex_source / "config.toml", vibe_source / ".env")))
     return sorted({s for s in secrets if s}, key=len, reverse=True)
 
 
@@ -319,19 +352,33 @@ class CodexAdapter(AgentAdapter):
     def __init__(self, codex_cmd: str = DEFAULT_CODEX_CMD) -> None:
         self.codex_cmd = codex_cmd
 
+    @staticmethod
+    def _codex_home(workspace: Path) -> Path:
+        return workspace.parent / f"{workspace.name}-codex-home"
+
     def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
-        # The documented Codex adapter seam uses project-local skills. Keeping
-        # this in one method makes CLI churn a single adapter change, not a
-        # trigger-runner fork.
-        return self._mount_tree(tree_dir, workspace / ".codex" / "skills")
+        # Codex discovers skills from $CODEX_HOME/skills. Keep that home outside
+        # the model workspace so copied auth/config files are not in the cwd tree;
+        # invoke() grants the skills directory only via --add-dir.
+        return self._mount_tree(tree_dir, self._codex_home(workspace) / "skills")
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
         argv = shlex.split(self.codex_cmd)
+        codex_home = self._codex_home(workspace)
+        skills_dir = codex_home / "skills"
+        if "--add-dir" not in argv:
+            argv += ["--add-dir", str(skills_dir)]
         if model:
             argv += ["--model", model]
         argv.append(query)
-        env, _ = codex_env_for_home(workspace / ".codex")
-        return self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
+        env, meta = codex_env_for_home(codex_home)
+        try:
+            result = self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
+        finally:
+            shutil.rmtree(codex_home, ignore_errors=True)
+        result.update({k: v for k, v in meta.items() if k != "codex_home"})
+        result["codex_home_outside_workdir"] = True
+        return result
 
 
 class PiAdapter(AgentAdapter):
@@ -369,22 +416,22 @@ class VibeAdapter(AgentAdapter):
         return self._mount_tree(tree_dir, workspace / ".agents" / "skills")
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
-        env = os.environ.copy()
-        seeded = seed_vibe_home(workspace / ".vibe-home")
-        env["VIBE_HOME"] = str(workspace / ".vibe-home")
-        if model:
-            env["VIBE_ACTIVE_MODEL"] = model
-        try:
-            argv = build_vibe_cli_argv(self.vibe_cmd, prompt=query, cwd=workspace, output="streaming",
-                                       tools=VIBE_READ_ONLY_TOOLS, auto_approve=True,
-                                       max_turns=self.max_turns)
-        except ValueError as exc:
-            return {"stdout": "", "stderr": str(exc), "returncode": 127, "timed_out": False,
-                    "elapsed_ms": 0, "observation_complete": False,
-                    "config_isolated": True, "vibe_env_file_copied": seeded.get("vibe_env_file_copied", False)}
-        result = self._run_argv(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
+        with tempfile.TemporaryDirectory(prefix=f"{workspace.name}-vibe-home-") as vibe_home:
+            env, env_meta = vibe_env_for_home(Path(vibe_home), model)
+            try:
+                argv = build_vibe_cli_argv(self.vibe_cmd, prompt=query, cwd=workspace, output="streaming",
+                                           tools=VIBE_READ_ONLY_TOOLS, auto_approve=True,
+                                           max_turns=self.max_turns)
+            except ValueError as exc:
+                return {"stdout": "", "stderr": str(exc), "returncode": 127, "timed_out": False,
+                        "elapsed_ms": 0, "observation_complete": False,
+                        "config_isolated": True,
+                        "vibe_env_file_copied": env_meta.get("vibe_env_file_copied", False),
+                        "vibe_home_outside_workdir": True}
+            result = self._run_argv(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
         result["config_isolated"] = True
-        result["vibe_env_file_copied"] = bool(seeded.get("vibe_env_file_copied", False))
+        result["vibe_env_file_copied"] = bool(env_meta.get("vibe_env_file_copied", False))
+        result["vibe_home_outside_workdir"] = True
         return result
 
     def detect(self, stdout: str, skill_names: list[str], copied: list[Path]) -> tuple[bool, list[str]]:
@@ -496,7 +543,7 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
         names = mounted_skill_names(copied)
         result = validate_invoke_result(adapter.name, adapter.invoke(query, model, workspace, timeout))
         stdout = str(result["stdout"])
-        secrets = workspace_secret_values(workspace)
+        secrets = workspace_secret_values(workspace) + ambient_secret_values()
         triggered, evidence = adapter.detect(stdout, names, copied)
     redacted_stdout = redact_sensitive_text(stdout, secrets)
     redacted_evidence = [redact_sensitive_text(str(item), secrets) for item in evidence]
@@ -716,7 +763,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--runs-per-query", type=int, default=3, help="repetitions per (agent, model, query); a trigger RATE needs repetition (default 3)")
     ap.add_argument("--timeout", type=int, default=240)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--max-turns", type=int, default=6, help="claude adapter: turns the model gets to load the skill (its observation window)")
+    ap.add_argument("--max-turns", type=int, default=6, help="claude/vibe adapters: turns the model gets to load the skill (its observation window)")
     ap.add_argument("--claude-bin", default="claude")
     ap.add_argument("--codex-cmd", default=DEFAULT_CODEX_CMD,
                     help="codex adapter command prefix; the raw query is appended as the final argv item")

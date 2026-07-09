@@ -3809,6 +3809,7 @@ def register_workspace_builder(name: str, builder: Any) -> None:
 
 register_workspace_builder("codex", build_skill_workspace)     # run-codex
 register_workspace_builder("claude", build_skill_workspace)    # run-claude shares the workspace builder
+register_workspace_builder("vibe", build_skill_workspace)      # run-agent --agent vibe shares the workspace builder
 register_workspace_builder("jetty", jetty_upload_workspace)    # export-jetty upload surface
 
 
@@ -3847,8 +3848,6 @@ class InvocationRequest:
     workspace: Path
     model: str | None
     timeout_s: int
-    output_schema: dict[str, Any] | None = None
-    mode: str = "answer"
 
 
 @_dataclass(frozen=True)
@@ -3917,7 +3916,11 @@ def codex_env_for_home(codex_home: Path) -> tuple[dict[str, str], dict[str, Any]
     env = os.environ.copy()
     seeded = seed_codex_home(codex_home)
     env["CODEX_HOME"] = seeded["codex_home"]
-    return env, seeded
+    # Do not persist the scratch auth/config path into run artifacts. It is not
+    # model-visible for answer/judge runs, but it is still a credential-bearing
+    # directory and should not become a handle for later artifact readers.
+    meta = {**seeded, "codex_home": "<isolated CODEX_HOME outside workdir>"}
+    return env, meta
 
 
 def seed_vibe_home(vibe_home: Path) -> dict[str, Any]:
@@ -3938,13 +3941,20 @@ def seed_vibe_home(vibe_home: Path) -> dict[str, Any]:
     return {"vibe_home": str(vibe_home), "vibe_env_file_copied": copied_env}
 
 
-def vibe_env_for_workspace(workspace: Path, model: str | None = None) -> tuple[dict[str, str], dict[str, Any]]:
+def vibe_env_for_home(vibe_home: Path, model: str | None = None) -> tuple[dict[str, str], dict[str, Any]]:
     env = os.environ.copy()
-    seeded = seed_vibe_home(workspace / ".vibe-home")
+    seeded = seed_vibe_home(vibe_home)
     env["VIBE_HOME"] = seeded["vibe_home"]
     if model:
         env["VIBE_ACTIVE_MODEL"] = model
-    return env, {**seeded, "config_isolated": True, **({"active_model_env": "VIBE_ACTIVE_MODEL"} if model else {})}
+    meta = {
+        **seeded,
+        "vibe_home": "<isolated VIBE_HOME outside workdir>",
+        "vibe_home_outside_workdir": True,
+        "config_isolated": True,
+        **({"active_model_env": "VIBE_ACTIVE_MODEL"} if model else {}),
+    }
+    return env, meta
 
 
 def build_vibe_cli_argv(vibe_cmd: str | None = None, *, prompt: str, cwd: Path | str | None = None,
@@ -4105,16 +4115,17 @@ def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | No
                                    output=output, tools=tools, auto_approve=auto_approve,
                                    max_turns=max_turns, max_price=max_price, max_tokens=max_tokens)
     workspace = Path(cwd)
-    env, env_meta = vibe_env_for_workspace(workspace, model)
-    try:
-        argv = build_vibe_cli_argv(vibe_cmd, prompt=prompt, cwd=workspace, output=output, tools=tools,
-                                   auto_approve=auto_approve, max_turns=max_turns,
-                                   max_price=max_price, max_tokens=max_tokens)
-    except ValueError as exc:
-        return {"answer": "", "stdout": "", "stderr": str(exc), "returncode": 127,
-                "timed_out": False, "elapsed_ms": 0, "usage": None, "cost_usd": None,
-                "model": model, "trace_text": "", "environment": env_meta}
-    result = run_argv_capture(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
+    with tempfile.TemporaryDirectory(prefix="vibe-home-") as vibe_home:
+        env, env_meta = vibe_env_for_home(Path(vibe_home), model)
+        try:
+            argv = build_vibe_cli_argv(vibe_cmd, prompt=prompt, cwd=workspace, output=output, tools=tools,
+                                       auto_approve=auto_approve, max_turns=max_turns,
+                                       max_price=max_price, max_tokens=max_tokens)
+        except ValueError as exc:
+            return {"answer": "", "stdout": "", "stderr": str(exc), "returncode": 127,
+                    "timed_out": False, "elapsed_ms": 0, "usage": None, "cost_usd": None,
+                    "model": model, "trace_text": "", "environment": env_meta}
+        result = run_argv_capture(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
     messages = parse_vibe_messages(result.stdout)
     answer = vibe_final_answer(messages, result.stdout)
     usage, cost = vibe_usage_and_cost(messages)
@@ -4222,7 +4233,7 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             ws = Path(wd)
             skill_rel, input_rel = build_skill_workspace(pt, ws)
             prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
-            outcome = backend.invoke_answer(InvocationRequest(prompt=prompt, workspace=ws, model=row_model, timeout_s=timeout, mode="answer"), **options)
+            outcome = backend.invoke_answer(InvocationRequest(prompt=prompt, workspace=ws, model=row_model, timeout_s=timeout), **options)
         outcome.metadata_extra = {**prov_extra, **(outcome.metadata_extra or {})}
         env = dict(outcome.environment or {})
         env.setdefault("runner", backend.name)
@@ -5084,6 +5095,67 @@ def sanitized_run_copy(run_base: Path, dest: Path) -> Path | None:
     return dest
 
 
+def claude_judge_invoke(prompt: str, *, judge_model: str | None, claude_bin: str,
+                        assertion_schema: dict[str, Any], extra_args: list[str] | None,
+                        explore_hint: str | None, **_: Any) -> dict[str, Any]:
+    if not judge_model:
+        raise ValueError("native Claude judge requires judge_model")
+    claude_extra_args = list(extra_args or [])
+    if explore_hint is None:
+        claude_extra_args += ["--tools", ""]
+    claude_extra_args += ["--json-schema", json.dumps(assertion_schema, separators=(",", ":"))]
+    res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin,
+                            extra_args=claude_extra_args, cwd=explore_hint)
+    return {
+        "stdout": res.get("answer", ""),
+        "stderr": res.get("stderr", "") or "",
+        "returncode": res.get("returncode"),
+        "cost_usd": res.get("cost_usd"),
+        "usage": res.get("usage") if isinstance(res.get("usage"), dict) else None,
+        "usage_source": "provider_reported",
+        "judge_model_label": judge_model,
+    }
+
+
+def codex_judge_invoke(prompt: str, *, judge_model: str | None, codex_cmd: str,
+                       assertion_schema: dict[str, Any], explore_hint: str | None,
+                       **_: Any) -> dict[str, Any]:
+    res = codex_cli_invoke(prompt, model=judge_model, codex_cmd=codex_cmd,
+                           output_schema=assertion_schema, cwd=explore_hint)
+    usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
+    return {
+        "stdout": res.get("answer") or "",
+        "stderr": res.get("stderr", "") or "",
+        "returncode": res.get("returncode"),
+        "cost_usd": res.get("cost_usd"),
+        "usage": usage,
+        "usage_source": "trace_normalized" if usage else "provider_reported",
+        "judge_model_label": str(res.get("model") or f"codex/{judge_model or 'default'}"),
+    }
+
+
+def vibe_judge_invoke(prompt: str, *, judge_model: str | None, vibe_cmd: str,
+                      explore_hint: str | None, **_: Any) -> dict[str, Any]:
+    res = vibe_cli_invoke(prompt, model=judge_model, vibe_cmd=vibe_cmd, output="json",
+                          tools=VIBE_NO_TOOLS, cwd=explore_hint)
+    return {
+        "stdout": res.get("answer", ""),
+        "stderr": res.get("stderr", "") or "",
+        "returncode": res.get("returncode"),
+        "cost_usd": res.get("cost_usd"),
+        "usage": res.get("usage") if isinstance(res.get("usage"), dict) else None,
+        "usage_source": "provider_reported",
+        "judge_model_label": f"vibe/{judge_model or 'default'}",
+    }
+
+
+JUDGE_BACKENDS = {
+    "claude": claude_judge_invoke,
+    "codex": codex_judge_invoke,
+    "vibe": vibe_judge_invoke,
+}
+
+
 def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, transcripts_dir: Path | None = None,
                        repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude",
                        judge_backend: str = "claude", codex_cmd: str = "codex exec", vibe_cmd: str = VIBE_DEFAULT_CMD,
@@ -5119,10 +5191,10 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         prompt = judge_prompt(task, output_text, trajectory=events, metrics=read_metrics_base(run_base), artifacts=judge_artifact_inventory(run_base), explore_dir=explore_hint)
     else:
         prompt = judge_prompt(task, output_text, explore_dir=explore_hint)
-    # Three judge backends, one verdict shape. A shell `judge_cmd` remains the
-    # universal escape hatch; native Claude captures provider cost directly;
-    # native Codex uses --output-last-message/--output-schema so stdout JSONL is
-    # telemetry, not the verdict stream.
+    # Native judge backends share a registry-owned invocation seam. A shell
+    # `judge_cmd` remains the universal escape hatch; native Codex uses
+    # --output-last-message/--output-schema so stdout JSONL is telemetry, not
+    # the verdict stream.
     cost_usd = None
     judge_usage = None
     usage_source = "provider_reported"
@@ -5132,30 +5204,24 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         if judge_cmd:
             proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
             stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
-        elif judge_backend == "codex":
-            res = codex_cli_invoke(prompt, model=judge_model, codex_cmd=codex_cmd, output_schema=assertion_schema, cwd=explore_hint)
-            stdout, stderr, returncode = res.get("answer") or "", res.get("stderr", "") or "", res.get("returncode")
+        elif judge_backend in JUDGE_BACKENDS:
+            res = JUDGE_BACKENDS[judge_backend](
+                prompt,
+                judge_model=judge_model,
+                claude_bin=claude_bin,
+                codex_cmd=codex_cmd,
+                vibe_cmd=vibe_cmd,
+                assertion_schema=assertion_schema,
+                extra_args=extra_args,
+                explore_hint=explore_hint,
+            )
+            stdout, stderr, returncode = res["stdout"], res["stderr"], res["returncode"]
             cost_usd = res.get("cost_usd")
             judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
-            usage_source = "trace_normalized" if judge_usage else "provider_reported"
-            judge_model_label = str(res.get("model") or f"codex/{judge_model or 'default'}")
-        elif judge_backend == "vibe":
-            res = vibe_cli_invoke(prompt, model=judge_model, vibe_cmd=vibe_cmd, output="json", tools=VIBE_NO_TOOLS, cwd=explore_hint)
-            stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
-            cost_usd = res.get("cost_usd")
-            judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
-            judge_model_label = f"vibe/{judge_model or 'default'}"
-        elif judge_model:
-            claude_extra_args = list(extra_args or [])
-            if explore_dir is None:
-                claude_extra_args += ["--tools", ""]
-            claude_extra_args += ["--json-schema", json.dumps(assertion_schema, separators=(",", ":"))]
-            res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin, extra_args=claude_extra_args, cwd=explore_hint)
-            stdout, stderr, returncode = res.get("answer", ""), res.get("stderr", "") or "", res.get("returncode")
-            cost_usd = res.get("cost_usd")
-            judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
+            usage_source = str(res.get("usage_source") or usage_source)
+            judge_model_label = str(res.get("judge_model_label") or judge_model_label)
         else:
-            raise ValueError("run_one_judge_task needs a judge_cmd, a native judge_model, or judge_backend='codex'/'vibe'")
+            raise ValueError(f"unknown native judge backend {judge_backend!r}; choose one of {', '.join(sorted(JUDGE_BACKENDS))} or use --judge-cmd")
     finally:
         # The sanitized copy is scratch; the judge has already run against it.
         if explore_root is not None:
@@ -5600,7 +5666,7 @@ def judge_command(args: argparse.Namespace) -> int:
     manifest_for_judge = validate_manifest(Path(args.manifest))
     judge_backend = getattr(args, "judge_backend", None) or ("cmd" if judge_cmd else "claude")
     panel = effective_judge_models(manifest_for_judge, getattr(args, "judge_panel", None), getattr(args, "judge_model", None))
-    if judge_backend in {"codex", "vibe"} and not panel:
+    if judge_backend in (set(JUDGE_BACKENDS) - {"claude"}) and not panel:
         panel = [None]  # use the CLI's configured default model
     schema_enforcement = "strict" if getattr(args, "strict_judge_schema", False) else ((manifest_for_judge.get("judge") or {}).get("schema_enforcement") or "report")
     include_trajectory = getattr(args, "judge_trajectory", False)
@@ -9711,7 +9777,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-cmd", help="shell command that reads a judge prompt on stdin and emits JSON on stdout (any provider)")
-    p.add_argument("--judge-backend", choices=["claude", "codex", "vibe", "cmd"], help="native judge backend; defaults to cmd when --judge-cmd is supplied, otherwise claude")
+    p.add_argument("--judge-backend", choices=sorted([*JUDGE_BACKENDS, "cmd"]), help="native judge backend; defaults to cmd when --judge-cmd is supplied, otherwise claude")
     p.add_argument("--judge-model", help="judge model id for the selected native backend; with --judge-backend codex this is a Codex/OpenAI model; with vibe this is passed as VIBE_ACTIVE_MODEL")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable when using the claude judge backend")
     p.add_argument("--codex-cmd", default="codex exec", help="argv-style Codex command prefix for --judge-backend codex; the harness adds --json/--output-last-message/--output-schema and shell metacharacters are not interpreted")

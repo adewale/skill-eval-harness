@@ -370,7 +370,7 @@ class CodexAdapterTests(unittest.TestCase):
         prose = json.dumps({"type": "message", "content": "I would use demo-reviewer."})
         self.assertEqual(tm.CodexAdapter().detect(prose, ["demo-reviewer"], [mounted]), (False, []))
 
-    def test_codex_invoke_appends_raw_query_and_model(self):
+    def test_codex_invoke_appends_raw_query_model_and_external_skill_dir(self):
         seen = {}
 
         def fake_run(argv, *, cwd, env, timeout):
@@ -380,10 +380,17 @@ class CodexAdapterTests(unittest.TestCase):
 
         with mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
             with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"CODEX_HOME": str(Path(td) / "source-codex")}):
-                tm.CodexAdapter(codex_cmd="codex exec --json").invoke("raw trigger query", "o4-mini", Path(td), 12)
-        self.assertEqual(seen["argv"], ["codex", "exec", "--json", "--model", "o4-mini", "raw trigger query"])
-        self.assertTrue(str(seen["env"]["CODEX_HOME"]).endswith(".codex"))
+                workspace = Path(td) / "workspace"
+                workspace.mkdir()
+                result = tm.CodexAdapter(codex_cmd="codex exec --json").invoke("raw trigger query", "o4-mini", workspace, 12)
+        self.assertEqual(seen["argv"][:3], ["codex", "exec", "--json"])
+        self.assertIn("--add-dir", seen["argv"])
+        skill_dir = Path(seen["argv"][seen["argv"].index("--add-dir") + 1])
+        self.assertEqual(skill_dir, Path(seen["env"]["CODEX_HOME"]) / "skills")
+        self.assertFalse(Path(seen["env"]["CODEX_HOME"]).is_relative_to(seen["cwd"]))
+        self.assertEqual(seen["argv"][-3:], ["--model", "o4-mini", "raw trigger query"])
         self.assertEqual(seen["timeout"], 12)
+        self.assertTrue(result["codex_home_outside_workdir"])
         self.assertIs(tm.CodexAdapter()._run_argv, tm.run_argv_with_timeout)
 
     def test_codex_invoke_seeds_auth_without_copying_user_skills(self):
@@ -395,6 +402,8 @@ class CodexAdapterTests(unittest.TestCase):
             seen["config"] = (codex_home / "config.toml").read_text(encoding="utf-8")
             seen["mounted_skills_survive"] = (codex_home / "skills" / "demo").is_dir()
             seen["user_skills_not_copied"] = not (codex_home / "skills" / "personal").exists()
+            seen["workspace_auth_present"] = (Path(cwd) / ".codex" / "auth.json").exists()
+            seen["workspace_config_present"] = (Path(cwd) / ".codex" / "config.toml").exists()
             return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False,
                     "elapsed_ms": 1, "observation_complete": True}
 
@@ -405,13 +414,44 @@ class CodexAdapterTests(unittest.TestCase):
             (source / "auth.json").write_text('{"token":"t"}', encoding="utf-8")
             (source / "config.toml").write_text("model = 'm'\n", encoding="utf-8")
             workspace = root / "run"
-            (workspace / ".codex" / "skills" / "demo").mkdir(parents=True)
+            workspace.mkdir()
+            tree = root / "tree"
+            (tree / "demo").mkdir(parents=True)
+            (tree / "demo" / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+            adapter = tm.CodexAdapter(codex_cmd="codex exec --json")
+            adapter.mount(tree, workspace)
             with mock.patch.dict(os.environ, {"CODEX_HOME": str(source)}):
-                tm.CodexAdapter(codex_cmd="codex exec --json").invoke("q", None, workspace, 12)
+                result = adapter.invoke("q", None, workspace, 12)
         self.assertEqual(seen["auth"], '{"token":"t"}')
         self.assertEqual(seen["config"], "model = 'm'\n")
         self.assertTrue(seen["mounted_skills_survive"])
         self.assertTrue(seen["user_skills_not_copied"])
+        self.assertTrue(result["codex_home_outside_workdir"])
+        self.assertFalse(seen["workspace_auth_present"])
+        self.assertFalse(seen["workspace_config_present"])
+
+    def test_run_cell_query_redacts_ambient_env_secrets(self):
+        class LeakyAdapter(tm.AgentAdapter):
+            name = "stub"
+
+            def mount(self, tree_dir, workspace):
+                return self._mount_tree(tree_dir, workspace / "skills")
+
+            def invoke(self, query, model, workspace, timeout):
+                secret = os.environ["MISTRAL_API_KEY"]
+                return {"stdout": f"leaked {secret}\n", "stderr": f"err {secret}", "returncode": 0,
+                        "timed_out": False, "elapsed_ms": 1, "observation_complete": True}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"MISTRAL_API_KEY": "ambient-secret-token"}):
+            tree = Path(td) / "tree"
+            skill = tree / "demo"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+            row = tm.run_cell_query(LeakyAdapter(), tree, "q", False, None, 12, trace_dir=Path(td) / "trace")
+            trace_text = (Path(row["trace_dir"]) / "trace.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("ambient-secret-token", row["stderr"])
+        self.assertEqual(row["stderr"], "err [REDACTED]")
+        self.assertNotIn("ambient-secret-token", trace_text)
 
     def test_run_cell_query_requires_invoke_contract(self):
         class BrokenAdapter(tm.AgentAdapter):
@@ -498,6 +538,8 @@ class VibeAdapterTests(unittest.TestCase):
 
         def fake_run(argv, *, cwd, env, timeout, input_text=None):
             seen.update({"argv": argv, "cwd": cwd, "env": env, "timeout": timeout, "input_text": input_text})
+            seen["vibe_home_inside_workdir"] = Path(env["VIBE_HOME"]).is_relative_to(Path(cwd))
+            seen["workspace_vibe_env_present"] = (Path(cwd) / ".vibe-home" / ".env").exists()
             return {"stdout": json.dumps({"role": "assistant", "content": "ok"}) + "\n", "stderr": "", "returncode": 0,
                     "timed_out": False, "elapsed_ms": 1, "observation_complete": True}
 
@@ -513,8 +555,10 @@ class VibeAdapterTests(unittest.TestCase):
         self.assertIn("skill", seen["argv"])
         self.assertEqual(seen["input_text"], "")
         self.assertEqual(seen["env"]["VIBE_ACTIVE_MODEL"], "mistral-small")
-        self.assertTrue(str(seen["env"]["VIBE_HOME"]).endswith(".vibe-home"))
+        self.assertFalse(seen["vibe_home_inside_workdir"])
+        self.assertFalse(seen["workspace_vibe_env_present"])
         self.assertTrue(result["config_isolated"])
+        self.assertTrue(result["vibe_home_outside_workdir"])
 
 
 def _csv_env(name, default):

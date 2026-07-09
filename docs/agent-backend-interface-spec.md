@@ -76,7 +76,7 @@ The point of the adapter work is not only feature parity. The refactor should ma
 | Surface | Codex today | Needed for Claude parity |
 |---|---|---|
 | Answer runs | `run-codex` / `run-agent --agent codex` use `codex exec --json --output-last-message <file>`: final answer from the sidecar file, JSONL retained as trace. | Keep; expand parser fixtures as event names evolve. |
-| Workspace isolation | Temp workspace via prepared rows plus isolated `CODEX_HOME` seeded only with portable auth/config. | Keep; add adapter conformance tests shared with Claude. |
+| Workspace isolation | Temp workspace via prepared rows plus isolated `CODEX_HOME` outside the model workdir, seeded only with portable auth/config. | Keep; add adapter conformance tests shared with Claude. |
 | Variants | Prepared-row variants and materialized ablations work. | Keep. |
 | Trace artifacts | Codex JSONL normalized. | Expand parser fixtures for current event names and usage/cost events. |
 | Token usage | Supported when stream reports it. | Make coverage explicit in `AgentCapabilities`. |
@@ -85,7 +85,7 @@ The point of the adapter work is not only feature parity. The refactor should ma
 | Judge schema | Implemented via `codex exec --output-schema <schema.json>` with a provider-compatible strict copy of the canonical verdict schema. | Keep harness-side schema validation as a fail-closed backstop. |
 | Judge transcripts | Native transcripts stamp backend/model plus parsed usage/cost when present. | Expand cost coverage if Codex emits price/cost events. |
 | Judge trajectory/explore | Generic `--judge-cmd` can receive prompt text only; no native sanitized tool access. | Add read-only workspace policy if Codex can inspect a sanitized run dir safely. |
-| Autonomous trigger | `skill-trigger-matrix --agent codex` mounts `$CODEX_HOME/skills` (implemented as workspace `.codex/skills`) and runs `codex exec --json` with isolated `CODEX_HOME`. | Add model matrix defaults if Codex exposes stable aliases. |
+| Autonomous trigger | `skill-trigger-matrix --agent codex` mounts `$CODEX_HOME/skills` in an external scratch home, exposes only that skills directory as an extra read root, and runs `codex exec --json` with isolated `CODEX_HOME`. | Add model matrix defaults if Codex exposes stable aliases. |
 | Tool replay | None for native Codex CLI. | Implement through MCP/tool-host boundary or keep unsupported in native path and offer `run-subagent`/MCP replay. |
 
 ### Codex CLI reference impact
@@ -146,7 +146,7 @@ A native Gemini judge can use:
 gemini -p "$JUDGE_PROMPT" --model "$MODEL" --output-format json --approval-mode=plan --sandbox
 ```
 
-Then parse `response` as the verdict JSON. If Gemini does not enforce an external JSON schema, keep enforcement in the harness exactly as today (`verdict_schema_for` + `--strict-judge-schema`). If Gemini adds schema-constrained output, wire it through the same `output_schema` hook as Codex.
+Then parse `response` as the verdict JSON. If Gemini does not enforce an external JSON schema, keep enforcement in the harness exactly as today (`verdict_schema_for` + `--strict-judge-schema`). If Gemini adds schema-constrained output, wire it through the same native judge schema path as Codex.
 
 ### Gemini autonomous trigger
 
@@ -179,7 +179,7 @@ External facts from Mistral Vibe README:
 
 ### Vibe answer runner
 
-Implemented in `VibeBackend.invoke_answer`: the harness runs Vibe with a temp `VIBE_HOME` and project workspace:
+Implemented in `VibeBackend.invoke_answer`: the harness runs Vibe with a temp `VIBE_HOME` outside the model workdir and a project workspace:
 
 ```bash
 VIBE_HOME="$TMP/vibe-home" VIBE_ACTIVE_MODEL="$MODEL" vibe \
@@ -209,7 +209,7 @@ Implemented with `vibe --prompt "$PROMPT" --output json --enabled-tools re:^$`. 
 Vibe trigger measurement is implemented because it natively discovers Agent Skills:
 
 - Mount skills under workspace `.agents/skills/<skill-name>` for cross-agent standard compatibility.
-- Isolate `VIBE_HOME` to avoid global skills and config bleed.
+- Isolate `VIBE_HOME` outside the model workdir to avoid global skills/config bleed and keep copied `.env` out of readable project paths.
 - Use `--workdir` plus `--trust` so headless runs do not prompt.
 - Run raw trigger queries with no forced-load instruction.
 - Detect activation from native `skill` tool calls by skill name; fall back to path evidence from reading the mounted `SKILL.md`.
@@ -233,9 +233,7 @@ class InvocationRequest:
     workspace: Path
     model: str | None
     timeout_s: int
-    output_schema: dict[str, Any] | None = None
     allowed_tools: list[str] | None = None
-    mode: Literal["answer", "judge", "trigger"] = "answer"
     metadata: dict[str, Any] = field(default_factory=dict)
 
 @dataclass(frozen=True)
@@ -269,6 +267,8 @@ class AgentBackend(Protocol):
     def final_answer(self, result: InvocationResult) -> str: ...
 
 class JudgeBackend(Protocol):
+    # Verdict schema, tool policy, and exploration options belong here rather
+    # than on answer-runner InvocationRequest.
     def judge(self, task: JudgeTask, model: str | None, options: JudgeOptions) -> JudgeResult: ...
 
 class TriggerBackend(Protocol):

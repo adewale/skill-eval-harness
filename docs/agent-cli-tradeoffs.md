@@ -17,9 +17,9 @@ Related docs:
 | Token telemetry | Strong: provider envelope | Partial: JSONL usage events when emitted | Missing in current CLI output | Vibe cannot participate in token-efficiency comparisons yet. Report explicit missing, never zero. |
 | Dollar cost | Strong: provider-reported `total_cost_usd` | Missing unless wrapper/estimator supplies it | Missing in current CLI output | Cost-per-signal is strongest for Claude, partial for Codex, absent for Vibe. |
 | Prompt transport | stdin in print mode | stdin or prompt arg | prompt arg required for reliable headless mode | Vibe prompts appear in process argv; we redact saved metadata but cannot remove OS-level argv exposure. |
-| Config isolation | Good; `--no-session-persistence`; `--bare` possible with API-key auth | Good; isolated `CODEX_HOME`, `--ephemeral`, `--ignore-user-config`, `--ignore-rules` | Good; isolated `VIBE_HOME`, but programmatic runs still write logs/session data under it | Vibe isolation is acceptable, but lacks a no-session-persistence equivalent. Scratch homes should be treated as sensitive artifacts. |
+| Config isolation | Good; `--no-session-persistence`; `--bare` possible with API-key auth | Good; isolated `CODEX_HOME` outside the model workdir, `--ephemeral`, `--ignore-user-config`, `--ignore-rules` | Good; isolated `VIBE_HOME` outside the model workdir, but programmatic runs still write logs/session data under it | Scratch homes are credential-bearing artifacts; they must stay outside model-readable workdirs and be deleted after runs. |
 | Tool policy | Mature: `--tools`, `--allowedTools` | Sandbox/approval-policy oriented | Allowlist/denylist oriented: `--enabled-tools`, `--disabled-tools` | We need provider-specific tool-policy adapters, not one generic “read-only tools” flag. |
-| Skill discovery | `.claude/skills` plus `Skill` tool evidence | `$CODEX_HOME/skills`; path evidence | `.agents/skills` / `.vibe/skills` plus `skill` tool evidence | Vibe is strong for autonomous Agent Skills measurement. This is the reason to support Vibe instead of raw Mistral API. |
+| Skill discovery | `.claude/skills` plus `Skill` tool evidence | `$CODEX_HOME/skills` exposed as a skills-only extra read root; path evidence | `.agents/skills` / `.vibe/skills` plus `skill` tool evidence | Vibe is strong for autonomous Agent Skills measurement. This is the reason to support Vibe instead of raw Mistral API. |
 | Tool replay | Available through harness subagent path, not native CLI | Not native in harness | Not native in harness | Native CLI runs are measurement surfaces, not replayable deterministic tool-host runs. |
 | Live smoke reliability | Blocked by Claude quota/auth when unavailable | Depends on Codex auth/model | Passed with `MISTRAL_API_KEY` for Vibe 2.19.1 | Vibe is live-proven for the current CLI, but should be re-smoked after CLI/provider upgrades. |
 
@@ -91,13 +91,13 @@ Vibe can isolate `VIBE_HOME`, but the CLI still writes config/log/session materi
 
 Harness behavior:
 
-- Every run gets an isolated `.vibe-home` inside the temp workspace.
+- Every run gets an isolated `VIBE_HOME` scratch directory outside the model workdir.
 - Only `.env` is copied when needed; user skills/config are never copied.
 
 Implication:
 
-- Isolation is good enough for eval correctness, but scratch homes are potentially sensitive and should not be published raw.
-- The trigger runner redacts known sensitive workspace files; new Vibe files may need future redaction if output expands.
+- Isolation is good enough for eval correctness only if credential homes stay outside model-readable trees.
+- Scratch homes are potentially sensitive and should be deleted after runs and never published raw.
 
 ### 6. Judge exploration is not implemented for Vibe
 

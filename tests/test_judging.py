@@ -213,8 +213,12 @@ class VerdictSchemaTests(unittest.TestCase):
             task = self._task(td)
             fake = Path(td) / "codex_stub.py"
             fake.write_text(
-                "import json, pathlib, sys\n"
+                "import json, os, pathlib, sys\n"
                 "_ = sys.stdin.read()\n"
+                "codex_home = pathlib.Path(os.environ['CODEX_HOME'])\n"
+                "assert codex_home.is_dir()\n"
+                "assert not codex_home.is_relative_to(pathlib.Path.cwd())\n"
+                "assert not (pathlib.Path.cwd() / '.codex' / 'auth.json').exists()\n"
                 "out = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
                 "schema = json.loads(pathlib.Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())\n"
                 "assert schema['additionalProperties'] is False\n"
@@ -240,7 +244,11 @@ class VerdictSchemaTests(unittest.TestCase):
                 "assert '--output' in sys.argv and 'json' in sys.argv\n"
                 "assert '--enabled-tools' in sys.argv and 're:^$' in sys.argv\n"
                 "assert os.environ.get('VIBE_ACTIVE_MODEL') == 'mistral-large'\n"
-                "assert pathlib.Path(os.environ['VIBE_HOME']).is_dir()\n"
+                "cwd = pathlib.Path.cwd()\n"
+                "vibe_home = pathlib.Path(os.environ['VIBE_HOME'])\n"
+                "assert vibe_home.is_dir()\n"
+                "assert not vibe_home.is_relative_to(cwd)\n"
+                "assert not (cwd / '.vibe-home' / '.env').exists()\n"
                 "assert 'Return only JSON' in prompt\n"
                 "json.dump([{'role': 'assistant', 'content': json.dumps({'passed': True, 'score': 1, 'rationale': 'vibe ok'}),"
                 " 'usage': {'input_tokens': 3, 'output_tokens': 4}}], sys.stdout)\n",

@@ -133,9 +133,9 @@ editor. This boundary is the main extension seam in the codebase.
 
 A runner consumes task rows and produces the contract. The repo ships seven paths plus a
 generic one: Pi smoke (`examples/adewale-workspace/run_pi_smoke.py`), Pi trigger
-(`run_pi_trigger_eval.py`), Codex (`run_codex:4245`), Claude (`run_claude:4363`, capturing real
-per-run cost), Mistral Vibe (`run-agent --agent vibe`, using isolated `VIBE_HOME`), the in-process
-subagent runner (`run_subagent:5501`, which hosts record/replay tool I/O via `ToolReplayStore`),
+(`run_pi_trigger_eval.py`), Codex (`run_codex:4256`), Claude (`run_claude:4374`, capturing real
+per-run cost), Mistral Vibe (`run-agent --agent vibe`, using isolated `VIBE_HOME` outside the workdir), the in-process
+subagent runner (`run_subagent:5567`, which hosts record/replay tool I/O via `ToolReplayStore`),
 Jetty (`JettyClient:2217` and the export/run/import commands), and any runner that writes the
 contract directly. Each runner registers a workspace builder so
 one cross-runner invariant proves its `without_skill` arm is skill-free (CF.2). The harness

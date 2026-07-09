@@ -69,11 +69,13 @@ it):
 RUN_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix -v
 RUN_CODEX_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.CodexMatrixSmokeTests -v
 RUN_PI_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.PiMatrixSmokeTests -v
+RUN_VIBE_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.VibeMatrixSmokeTests -v
 RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v
 ```
 
-Codex is now a shipped matrix adapter too. It mounts the same canonical skill tree
-under the Codex project skill directory, runs the raw query through `codex exec --json`,
+Codex and Vibe are shipped matrix adapters too. Codex mounts the same canonical skill tree
+under external `$CODEX_HOME/skills`, exposes only that skills directory as an extra read root,
+runs the raw query through `codex exec --json`,
 and uses the same mounted-path evidence detector as Pi/stub:
 
 ```bash
@@ -85,7 +87,7 @@ skill-trigger-matrix examples/demo-skill/evals/shared-benchmark.json \
 
 Use `--trace-runs DIR` to write `trace.jsonl`/`events.json`/`metrics.json` per run, and
 `--ablation ID` to measure a materialized discovery/trigger-population ablation through
-any selected adapter, including Codex.
+any selected adapter, including Codex or Vibe.
 
 ## Reading the matrix
 
@@ -134,7 +136,7 @@ Each rule below exists because its violation produced a wrong number at least on
 
 `run_trigger_matrix.py` treats an agent as three operations: mount the skill tree
 where that agent discovers skills, run it headless on the raw query, detect load
-evidence in its event stream. Claude Code, Codex, Pi, and the offline stub ship as
+evidence in its event stream. Claude Code, Codex, Vibe, Pi, and the offline stub ship as
 adapters. `docs/agent-parity.md` is the capability table for which surfaces each
 agent currently supports.
 

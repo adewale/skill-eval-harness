@@ -137,7 +137,7 @@ The installed commands are:
 |---|---|
 | `skill-benchmark` | Validate manifests, prepare tasks, grade outputs, compare variants, run judges, and import/export runner formats. |
 | `skill-pi-trigger-eval` | Runs Pi without forced `--skill` and checks whether the model loads the skill from stream events. |
-| `skill-trigger-matrix` | Measures autonomous skill activation per (agent, model) cell — Claude Code subagents on haiku/sonnet/opus by default, Pi and an offline stub included, other agents via an adapter subclass. |
+| `skill-trigger-matrix` | Measures autonomous skill activation per (agent, model) cell — Claude, Codex, Pi, Vibe, and an offline stub are built in; additional agents register via an adapter subclass plus capability row. |
 
 ### Local development
 
