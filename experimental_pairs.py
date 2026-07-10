@@ -8,9 +8,17 @@ metric is computed.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, Iterable, Literal, Mapping
 
 ArmName = Literal["with_skill", "without_skill"]
+
+
+class ExperimentalPopulation(str, Enum):
+    ANSWER = "answer"
+    TRIGGER = "trigger"
+    JUDGE = "judge"
+    STATIC = "static"
 
 
 @dataclass(frozen=True, order=True)
@@ -27,17 +35,26 @@ class ExperimentalPairKey:
             raise ValueError("pair model must be null or a non-empty string")
         if isinstance(self.run_number, bool) or not isinstance(self.run_number, int) or self.run_number < 1:
             raise ValueError("pair run_number must be a positive integer")
-        if not isinstance(self.population, str) or not self.population.strip():
-            raise ValueError("pair population must be a non-empty string")
+        try:
+            object.__setattr__(self, "population", ExperimentalPopulation(self.population).value)
+        except ValueError as exc:
+            raise ValueError(f"unknown experimental population: {self.population!r}") from exc
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any], *, population: str) -> "ExperimentalPairKey":
         if "case_id" not in row:
             raise ValueError("experimental row is missing case_id")
+        if not isinstance(row["case_id"], str):
+            raise ValueError("experimental row case_id must be a string")
         if "run_number" not in row:
             raise ValueError("experimental row is missing run_number")
+        row_population = row.get("population")
+        if row_population is not None and row_population != population:
+            raise ValueError(
+                f"experimental row population {row_population!r} conflicts with {population!r}"
+            )
         model = row.get("model")
-        return cls(str(row["case_id"]), model, row["run_number"], population)
+        return cls(row["case_id"], model, row["run_number"], population)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,8 +74,12 @@ class ExperimentalArm:
     blocked_reason: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.key, ExperimentalPairKey):
+            raise TypeError("experimental arm key must be ExperimentalPairKey")
         if self.arm not in ("with_skill", "without_skill"):
             raise ValueError(f"unknown experimental arm: {self.arm!r}")
+        if not isinstance(self.eligible, bool):
+            raise TypeError("experimental arm eligible must be boolean")
         if self.eligible and self.blocked_reason is not None:
             raise ValueError("eligible arm cannot carry a blocked reason")
         if not self.eligible and (not isinstance(self.blocked_reason, str) or not self.blocked_reason):
@@ -86,6 +107,8 @@ class BlockedExperimentalPair:
     reason: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.key, ExperimentalPairKey):
+            raise TypeError("blocked pair key must be ExperimentalPairKey")
         if not isinstance(self.reason, str) or not self.reason:
             raise ValueError("blocked experimental pair requires a reason")
 

@@ -33,4 +33,9 @@ if "cite the file and line" in skill:                    # only in references/ch
 if len(lines) == 1:
     lines.append("Looks fine to me; no concerns.")        # no skill mounted -> fails both assertions
 
-print("\n".join(lines))
+answer = "\n".join(lines)
+if "--output-last-message" in sys.argv:
+    output_path = sys.argv[sys.argv.index("--output-last-message") + 1]
+    open(output_path, "w", encoding="utf-8").write(answer)
+else:
+    print(answer)

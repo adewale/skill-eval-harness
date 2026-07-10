@@ -115,6 +115,16 @@ class ExperimentalPairingIntegrationTests(unittest.TestCase):
                 self.assertEqual(summary["pairing"]["eligible_pairs"], 0)
                 self.assertEqual(summary["pairing"]["blocked_pairs"], 2)
 
+    def test_out_of_range_rates_are_blocked_not_reported_as_impossible_lift(self):
+        for invalid in (-0.001, 1.001, float("nan"), float("inf"), True):
+            with self.subTest(invalid=invalid):
+                rows = [self.row("with_skill", rate=invalid),
+                        self.row("without_skill", rate=0.0)]
+                summary = sb.build_paired_summary(rows)
+                self.assertIsNone(summary["absolute_delta"])
+                self.assertEqual(summary["pairing"]["eligible_pairs"], 0)
+                self.assertEqual(summary["pairing"]["blocked_pairs"], 1)
+
     def test_duplicate_repetition_arm_fails_before_aggregation(self):
         rows = [self.row("with_skill"), self.row("with_skill"), self.row("without_skill", rate=0.0)]
         with self.assertRaisesRegex(ValueError, "duplicate experimental arm"):

@@ -40,9 +40,20 @@ class ProvenanceSchemaTests(unittest.TestCase):
         a = self.prov()
         self.assertTrue(a.matches(self.prov()))                         # same identity
         self.assertFalse(a.matches(self.prov(id="other")))             # different id
-        self.assertFalse(a.matches(self.prov(population="trigger")))   # different population
+        with self.assertRaises(ValueError):
+            self.prov(population="trigger")                              # population is derived from components
         diff_target = self.prov(components=(am.Component("instructions", "section", "skills/x/SKILL.md", {"heading": "## OTHER"}),))
         self.assertFalse(a.matches(diff_target))                       # different component target
+
+    def test_component_target_is_recursively_immutable(self):
+        source = {"heading": "## H", "nested": {"items": ["a"]}}
+        component = am.Component("instructions", "section", "skills/x/SKILL.md", source)
+        source["nested"]["items"].append("mutated")
+        self.assertEqual(component.target["nested"]["items"], ("a",))
+        with self.assertRaises(TypeError):
+            component.target["nested"]["x"] = 1
+        with self.assertRaises(ValueError):
+            am.Component("instructions", "section", "s", {"bad": {"set"}})
 
     def test_removed_bytes_is_recorded_but_not_part_of_identity(self):
         a = self.prov(components=(am.Component("instructions", "section", "skills/x/SKILL.md", {"heading": "## H"}, removed_bytes=42),))
@@ -113,6 +124,18 @@ class StrictFromDictTests(unittest.TestCase):
             component = dict(self.GOOD["components"][0], **mutation)
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 am.Component.from_dict(component)
+
+    def test_materialized_provenance_requires_edit_and_component_population(self):
+        with self.assertRaisesRegex(ValueError, "edited tree"):
+            am.Provenance.from_dict(dict(self.GOOD, skill_hash="C", parent_skill_hash="C"))
+        discovery = {"class": "discovery", "mechanism": "frontmatter_field",
+                     "skill_root": "skills/x/SKILL.md", "target": {"field": "description"}}
+        with self.assertRaisesRegex(ValueError, "population"):
+            am.Provenance.from_dict(dict(self.GOOD, components=[discovery]))
+        with self.assertRaisesRegex(ValueError, "mix"):
+            am.Provenance.from_dict(dict(self.GOOD, components=[self.GOOD["components"][0], discovery]))
+        with self.assertRaisesRegex(ValueError, "only valid for the answer"):
+            am.InstructionSimulated.from_dict({"id": "a", "population": "trigger"})
 
     def test_instruction_simulated_rejects_scalar_regressions_and_untyped_removed_component(self):
         with self.assertRaises(ValueError):

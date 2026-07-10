@@ -218,6 +218,25 @@ class Mechanism(str, Enum):
     PREPROCESS = "preprocess"
 
 
+class _FrozenDict(dict):
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("frozen component target cannot be mutated")
+
+    __setitem__ = __delitem__ = __ior__ = clear = pop = popitem = setdefault = update = _immutable
+
+
+def _freeze_json(value: Any, label: str) -> Any:
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise ValueError(f"{label} object keys must be strings")
+        return _FrozenDict({key: _freeze_json(item, label) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item, label) for item in value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise ValueError(f"{label} must contain only JSON-compatible values")
+
+
 def _nonempty_identifier(value: Any, label: str, *, slug: bool = False) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a non-empty string")
@@ -248,7 +267,7 @@ class Component:
         object.__setattr__(self, "skill_root", _nonempty_identifier(self.skill_root, "Component.skill_root"))
         if not isinstance(self.target, dict):
             raise ValueError("Component.target must be an object")
-        object.__setattr__(self, "target", dict(self.target))
+        object.__setattr__(self, "target", _freeze_json(self.target, "Component.target"))
         if self.removed_bytes is not None and (
             isinstance(self.removed_bytes, bool) or not isinstance(self.removed_bytes, int) or self.removed_bytes < 0
         ):
@@ -273,6 +292,13 @@ class Component:
                    skill_root=_require(d, "skill_root", str, "Component"),
                    target=_require(d, "target", dict, "Component"),
                    removed_bytes=rb)
+
+
+def _component_population(components: tuple[Component, ...], label: str) -> Population:
+    classes = {component.cls for component in components}
+    if ComponentClass.DISCOVERY in classes and classes != {ComponentClass.DISCOVERY}:
+        raise ValueError(f"{label} cannot mix discovery and answer-population components")
+    return Population.TRIGGER if classes == {ComponentClass.DISCOVERY} else Population.ANSWER
 
 
 @dataclass(frozen=True)
@@ -301,8 +327,12 @@ class Provenance:
             raise ValueError("Provenance.identity must be TreeIdentity")
         _nonempty_identifier(self.identity.canonical, "Provenance.parent_skill_hash")
         _nonempty_identifier(self.identity.edited, "Provenance.skill_hash")
+        if not self.identity.is_edited:
+            raise ValueError("Provenance must attest an edited tree")
         if not isinstance(self.components, tuple) or not self.components or not all(isinstance(c, Component) for c in self.components):
             raise ValueError("Provenance.components must be a non-empty tuple of Component")
+        if population is not _component_population(self.components, "Provenance"):
+            raise ValueError("Provenance.population contradicts its component classes")
         object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "population", population)
 
@@ -319,9 +349,8 @@ class Provenance:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Provenance":
         # Strict at the JSON boundary: a runner that drops id/mode/population/either
-        # hash, or records a malformed component, is rejected here instead of yielding
-        # a None-filled Provenance the verifier has to special-case. (An empty-but-
-        # present components list is allowed — non-emptiness is a semantic concern.)
+        # hash, empty/mixed components, or a malformed component is rejected here
+        # instead of yielding a partial Provenance the verifier has to special-case.
         comps = _require(d, "components", list, "Provenance")
         return cls(
             id=_require(d, "id", str, "Provenance"),
@@ -367,6 +396,8 @@ class ExpectedProvenance:
             raise ValueError("ExpectedProvenance mode must be materialized or invalid_skill")
         if not isinstance(self.components, tuple) or not self.components or not all(isinstance(c, Component) for c in self.components):
             raise ValueError("ExpectedProvenance.components must be non-empty")
+        if population is not _component_population(self.components, "ExpectedProvenance"):
+            raise ValueError("ExpectedProvenance.population contradicts its component classes")
         object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "population", population)
 
@@ -390,9 +421,12 @@ class InstructionSimulated:
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _nonempty_identifier(self.id, "InstructionSimulated.id", slug=True))
         try:
-            object.__setattr__(self, "population", Population(self.population))
+            population = Population(self.population)
         except ValueError as exc:
             raise ValueError(f"InstructionSimulated has unknown population: {exc}") from exc
+        if population is not Population.ANSWER:
+            raise ValueError("InstructionSimulated is only valid for the answer population")
+        object.__setattr__(self, "population", population)
         if self.removed_component is not None and (
             not isinstance(self.removed_component, str) or not self.removed_component.strip()
         ):
@@ -500,6 +534,8 @@ class MaterializedArm:
             raise ValueError("a MaterializedArm must carry provenance")
         if self.arm.identity is None or not self.arm.identity.is_edited:
             raise ValueError("a MaterializedArm must have an edited tree (edited != canonical)")
+        if self.arm.identity != self.arm.provenance.identity:
+            raise ValueError("MaterializedArm tree identity must match its provenance")
         if self.arm.provenance.mode == "materialized" and not self.arm.blind:
             raise ValueError("a materialized ablation arm must be blind")
 
@@ -612,6 +648,8 @@ class PreparedTask:
         if (isinstance(self.run_number, bool) or not isinstance(self.run_number, int)
                 or self.run_number < 1):
             raise ValueError("PreparedTask.run_number must be a positive integer")
+        if self.kind == "trigger":
+            raise ValueError("PreparedTask is answer-population only; trigger cases use autonomous runners")
         if not isinstance(self.variant_truth, str) or not self.variant_truth:
             raise ValueError("PreparedTask.variant must be non-empty")
         if self.variant_truth not in {"with_skill", "without_skill", "old_skill"} and not is_ablation_variant(self.variant_truth):
@@ -627,6 +665,13 @@ class PreparedTask:
         if self.is_ablation:
             if self.ablation is None or self.ablation.id != ablation_id_of(self.variant_truth):
                 raise ValueError("ablation task requires a matching typed ablation record")
+            if self.ablation.population is not Population.ANSWER:
+                raise ValueError("answer task cannot carry trigger-population ablation provenance")
+            if isinstance(self.ablation, Provenance):
+                if not self.skill_paths:
+                    raise ValueError("materialized ablation task requires mounted skill paths")
+                if self.skill_tree_hash != self.ablation.identity.canonical:
+                    raise ValueError("materialized task canonical hash must match provenance parent")
         elif self.ablation is not None:
             raise ValueError("non-ablation task cannot carry ablation provenance")
         if self.skill_tree_hash is not None and (not isinstance(self.skill_tree_hash, str) or not self.skill_tree_hash):
@@ -696,6 +741,8 @@ class PreparedTask:
     def from_row(cls, row: dict[str, Any]) -> "PreparedTask":
         if not isinstance(row, dict):
             raise ValueError("PreparedTask row must be an object")
+        if "run_number" not in row:
+            raise ValueError("PreparedTask row is missing run_number")
         rec = ablation_record_from_dict(row["ablation"]) if row.get("ablation") else None
         answer_key = {k: row[k] for k in ("expected_behavior", "review_rubric") if k in row} or None
         collections: dict[str, tuple[str, ...]] = {}
@@ -709,7 +756,7 @@ class PreparedTask:
             split=row.get("split"),
             kind=row.get("kind", "behavior"),
             variant_truth=str(row.get("variant")),
-            run_number=row.get("run_number", 1),
+            run_number=row.get("run_number"),
             skill_name=row.get("skill_name"),
             repo_root=row.get("repo_root"),
             skill_paths=collections["skill_paths"],

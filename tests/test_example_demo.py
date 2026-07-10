@@ -21,9 +21,9 @@ class DemoExampleTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(prefix="demo-eval-")
         self.addCleanup(tmp.cleanup)
         td = Path(tmp.name)
-        # 5 runs per arm so the deterministic regression clears the confirmation
-        # significance gate (feature 1); a single shot would read INDETERMINATE.
-        rows = sb.prepared_task_rows(mp, manifest, include_ablations=True, ablation_dir=str(td / "abl"), runs_per_variant=5)
+        # 6 matched runs per arm clear the two-sided paired sign-flip floor
+        # (2/2^6 = 0.03125); fewer unanimous pairs stay INDETERMINATE.
+        rows = sb.prepared_task_rows(mp, manifest, include_ablations=True, ablation_dir=str(td / "abl"), runs_per_variant=6)
         (td / "tasks.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
         stub = f"{sys.executable} {DEMO / 'stub_runner.py'}"
         sb.run_codex(argparse.Namespace(tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"), codex_cmd=stub, timeout=120))

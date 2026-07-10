@@ -1,7 +1,7 @@
 """Strict discriminated judge verdicts and stored-result boundary parsing."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import math
 import statistics
@@ -31,7 +31,7 @@ def _passed(value: Any) -> bool:
 @dataclass(frozen=True)
 class BooleanVerdict:
     passed: bool
-    kind: VerdictKind = VerdictKind.BOOLEAN
+    kind: VerdictKind = field(default=VerdictKind.BOOLEAN, init=False)
 
     def __post_init__(self) -> None:
         _passed(self.passed)
@@ -42,7 +42,7 @@ class ScoredVerdict:
     score: float
     threshold: float
     passed: bool
-    kind: VerdictKind = VerdictKind.SCORED
+    kind: VerdictKind = field(default=VerdictKind.SCORED, init=False)
 
     def __post_init__(self) -> None:
         score, threshold = _number(self.score, "score"), _number(self.threshold, "threshold")
@@ -58,7 +58,7 @@ class DimensionVerdict:
     score: float
     threshold: float
     passed: bool
-    kind: VerdictKind = VerdictKind.DIMENSIONS
+    kind: VerdictKind = field(default=VerdictKind.DIMENSIONS, init=False)
 
     def __post_init__(self) -> None:
         if not self.dimension_scores or len({name for name, _ in self.dimension_scores}) != len(self.dimension_scores):
@@ -90,7 +90,7 @@ class DynamicVerdict:
     minimum_criteria: int
     score: float
     passed: bool
-    kind: VerdictKind = VerdictKind.DYNAMIC
+    kind: VerdictKind = field(default=VerdictKind.DYNAMIC, init=False)
 
     def __post_init__(self) -> None:
         if (isinstance(self.minimum_criteria, bool) or not isinstance(self.minimum_criteria, int)
@@ -98,6 +98,8 @@ class DynamicVerdict:
             raise ValueError("minimum_criteria must be a positive integer")
         if not self.criteria or len({name for name, _ in self.criteria}) != len(self.criteria):
             raise ValueError("dynamic criteria names must be non-empty and unique")
+        if self.minimum_criteria > len(self.criteria):
+            raise ValueError("minimum_criteria cannot exceed the number of criteria")
         for name, met in self.criteria:
             if not isinstance(name, str) or not name or not isinstance(met, bool):
                 raise ValueError("dynamic criteria require non-empty names and boolean met")
@@ -113,7 +115,7 @@ class DynamicVerdict:
 class ConsensusVerdict:
     passed: bool
     score: float | None = None
-    kind: VerdictKind = VerdictKind.CONSENSUS
+    kind: VerdictKind = field(default=VerdictKind.CONSENSUS, init=False)
 
     def __post_init__(self) -> None:
         _passed(self.passed)
@@ -124,7 +126,20 @@ class ConsensusVerdict:
 JudgeVerdict: TypeAlias = BooleanVerdict | ScoredVerdict | DimensionVerdict | DynamicVerdict | ConsensusVerdict
 
 
-def verdict_from_dict(raw: Mapping[str, Any], *, strict_stored: bool = True) -> JudgeVerdict:
+_SEMANTIC_FIELDS = frozenset({
+    "passed", "score", "threshold", "dimension_scores", "criteria", "minimum_criteria",
+})
+_ALLOWED_FIELDS = {
+    VerdictKind.BOOLEAN: frozenset({"passed"}),
+    VerdictKind.SCORED: frozenset({"passed", "score", "threshold"}),
+    VerdictKind.DIMENSIONS: frozenset({"passed", "score", "threshold", "dimension_scores"}),
+    VerdictKind.DYNAMIC: frozenset({"passed", "score", "criteria", "minimum_criteria"}),
+    VerdictKind.CONSENSUS: frozenset({"passed", "score"}),
+}
+
+
+def verdict_from_dict(raw: Mapping[str, Any], *, strict_stored: bool = True,
+                      expected_dimensions: tuple[str, ...] | None = None) -> JudgeVerdict:
     if not isinstance(raw, Mapping):
         raise TypeError("judge verdict must be an object")
     explicit = raw.get("verdict_kind")
@@ -148,9 +163,15 @@ def verdict_from_dict(raw: Mapping[str, Any], *, strict_stored: bool = True) -> 
             kind = VerdictKind.BOOLEAN
         else:
             raise ValueError("judge verdict has no recognized payload")
+    present_semantic = {
+        key for key in (set(raw) & _SEMANTIC_FIELDS)
+        if not (key == "score" and raw.get(key) is None)
+        and not (key == "threshold" and kind is VerdictKind.BOOLEAN and raw.get("score") is None)
+    }
+    foreign_fields = sorted(present_semantic - _ALLOWED_FIELDS[kind])
+    if foreign_fields:
+        raise ValueError(f"{kind.value} verdict cannot carry fields: {', '.join(foreign_fields)}")
     if kind is VerdictKind.BOOLEAN:
-        if raw.get("score") is not None or has_dims or has_dynamic:
-            raise ValueError("boolean verdict cannot carry scored payload")
         return BooleanVerdict(_passed(raw.get("passed")))
     if kind is VerdictKind.SCORED:
         if raw.get("threshold") is None:
@@ -166,7 +187,11 @@ def verdict_from_dict(raw: Mapping[str, Any], *, strict_stored: bool = True) -> 
         dims = raw.get("dimension_scores")
         if not isinstance(dims, Mapping):
             raise ValueError("dimension_scores must be an object")
-        pairs = tuple((str(name), _number(value, f"dimension {name}")) for name, value in dims.items())
+        pairs = tuple((name, _number(value, f"dimension {name}")) for name, value in dims.items())
+        if not all(isinstance(name, str) and name for name, _ in pairs):
+            raise ValueError("dimension names must be non-empty strings")
+        if expected_dimensions is not None and set(name for name, _ in pairs) != set(expected_dimensions):
+            raise ValueError("dimension_scores must exactly match the declared dimensions")
         normalized = round(statistics.mean((value - 1) / 4 for _, value in pairs), 4) if pairs else float("nan")
         threshold = raw.get("threshold")
         if threshold is None:
@@ -207,8 +232,12 @@ def verdict_fields(verdict: JudgeVerdict) -> dict[str, Any]:
     return out
 
 
-def validated_result_row(raw: Mapping[str, Any]) -> dict[str, Any]:
+def validated_result_row(raw: Mapping[str, Any], *,
+                         expected_dimensions: tuple[str, ...] | None = None) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise TypeError("judge result row must be an object")
-    verdict = verdict_from_dict(raw, strict_stored=True)
-    return {**dict(raw), **verdict_fields(verdict)}
+    verdict = verdict_from_dict(
+        raw, strict_stored=True, expected_dimensions=expected_dimensions)
+    nonsemantic = {key: value for key, value in raw.items()
+                   if key not in _SEMANTIC_FIELDS and key != "verdict_kind"}
+    return {**nonsemantic, **verdict_fields(verdict)}

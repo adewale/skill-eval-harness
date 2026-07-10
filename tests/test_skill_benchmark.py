@@ -40,7 +40,11 @@ class SkillBenchmarkTests(unittest.TestCase):
         polluted_paired = sb.build_paired_summary(polluted)
         self.assertEqual(polluted_paired["absolute_delta"], clean_paired["absolute_delta"])
         self.assertEqual(polluted_paired["pairing"]["blocked_reason_counts"], {"missing_without_skill": 1})
-        self.assertEqual(sb.build_slice_summary(polluted, variants), sb.build_slice_summary(clean, variants))
+        clean_slices = sb.build_slice_summary(clean, variants)
+        polluted_slices = sb.build_slice_summary(polluted, variants)
+        self.assertEqual(polluted_slices["domain"]["d"]["lift"], clean_slices["domain"]["d"]["lift"])
+        self.assertEqual(polluted_slices["success_goals"]["g"]["lift"], clean_slices["success_goals"]["g"]["lift"])
+        self.assertEqual(polluted_slices["domain"]["d"]["pairing"]["blocked_pairs"], 1)
         self.assertEqual(sb.mean_rate([good, crashed]), sb.mean_rate([good]))
         self.assertEqual(sb.mean_rate([good, crashed]), 1.0)   # the crash did not drag it to 0.5
 
@@ -297,7 +301,7 @@ class SkillBenchmarkTests(unittest.TestCase):
     def test_pi_message_end_trace_normalizes_usage_and_skill_load(self):
         assistant = {"role": "assistant", "content": [{"type": "text", "text": "alpha beta"}], "usage": {"input": 10, "output": 5, "totalTokens": 15}}
         records = [
-            {"type": "tool_use", "tool_input": {"path": "/tmp/demo/skill/SKILL.md"}},
+            {"type": "tool_use", "status": "completed", "tool_input": {"path": "/tmp/demo/skill/SKILL.md"}},
             {"type": "message_end", "message": assistant},
             {"type": "agent_end", "messages": [assistant]},
         ]
@@ -338,8 +342,8 @@ class SkillBenchmarkTests(unittest.TestCase):
                     "usage": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12},
                     "elapsed_ms": 34,
                     "events": [
-                        {"type": "tool_call", "tool_input": {"path": "/tmp/demo/skill/SKILL.md"}},
-                        {"type": "exec_command", "command": "python -m unittest"},
+                        {"type": "tool_call", "status": "completed", "tool_input": {"path": "/tmp/demo/skill/SKILL.md"}},
+                        {"type": "exec_command", "status": "completed", "command": "python -m unittest"},
                     ],
                 },
                 "artifacts": [
@@ -369,6 +373,33 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertIn("JETTY FAILURE", (runs / "case-1" / "without_skill" / "output.md").read_text(encoding="utf-8"))
             report = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"])
             self.assertEqual(report["summary"]["with_skill"]["mean_objective_pass_rate"], 1.0)
+
+    def test_import_jetty_rejects_unsafe_missing_and_duplicate_execution_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            base = {
+                "harness": {"case_id": "case-1", "variant": "with_skill", "run_number": 1,
+                            "run_dir": "../escape"},
+                "status": "failed", "jetty": {"model": "m"}, "artifacts": [],
+            }
+            path = root / "jetty.jsonl"
+            cases = [
+                [base],
+                [{**base, "harness": {k: v for k, v in base["harness"].items() if k != "run_number"}}],
+                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}},
+                 {**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}}],
+                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"},
+                  "status": "completed",
+                  "artifacts": [{"path": "output.md", "content": "answer"}]}],
+            ]
+            for records in cases:
+                with self.subTest(records=records):
+                    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+                    with self.assertRaises(SystemExit):
+                        sb.import_jetty_results(SimpleNamespace(
+                            manifest=str(manifest), jetty_runs=str(path), runs=str(root / "runs")))
+            self.assertFalse((root / "escape").exists())
 
     def test_import_jetty_persists_ablation_provenance_into_metadata(self):
         # The harness-only ablation provenance must land in the run metadata so the
@@ -556,9 +587,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             (run_dir / "output.md").write_text("alpha beta", encoding="utf-8")
             trace = run_dir / "trace.jsonl"
             rows = [
-                {"type": "file_read", "path": str(root / "repo" / "skill" / "SKILL.md")},
-                {"type": "exec_command", "command": "npm install", "duration_ms": 1000},
-                {"type": "exec_command", "command": "npm test", "duration_ms": 1200},
+                {"type": "file_read", "status": "completed", "path": str(root / "repo" / "skill" / "SKILL.md")},
+                {"type": "exec_command", "status": "completed", "command": "npm install", "duration_ms": 1000},
+                {"type": "exec_command", "status": "completed", "command": "npm test", "duration_ms": 1200},
                 {"type": "usage", "usage": {"input_tokens": 80, "output_tokens": 20, "total_tokens": 100}},
             ]
             trace.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
@@ -803,7 +834,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             fake.write_text(
                 "import json, sys\n"
                 "_prompt = sys.stdin.read()\n"
-                "print(json.dumps({'type': 'exec_command', 'command': 'npm test'}))\n"
+                "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+                "open(out, 'w', encoding='utf-8').write('alpha beta')\n"
+                "print(json.dumps({'type': 'exec_command', 'status': 'completed', 'command': 'npm test'}))\n"
                 "print(json.dumps({'role': 'assistant', 'content': 'alpha beta'}))\n",
                 encoding="utf-8",
             )
@@ -834,6 +867,18 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertIn("parse_errors", metrics)
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["returncode"], 2)
+
+    def test_run_codex_rejects_duplicate_task_identity_before_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            row = sb.prepared_task_rows(manifest, sb.load_json(manifest))[0]
+            tasks = root / "tasks.jsonl"
+            tasks.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(root / "runs"),
+                                             codex_cmd=str(root / "must-not-run"), timeout=5))
+            self.assertFalse((root / "runs").exists())
 
     def test_run_codex_rejects_unsafe_run_dir(self):
         with tempfile.TemporaryDirectory() as td:

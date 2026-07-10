@@ -184,8 +184,9 @@ class ReadinessRunSignalTests(unittest.TestCase):
     signal — the anti-slop case an objective-only eval would miss)."""
 
     def _res(self, cid, variant, obj, comb):
-        return {"case_id": cid, "variant": variant, "objective_pass_rate": obj,
-                "combined_pass_rate": comb, "missing_output": False, "execution_valid": True}
+        return {"case_id": cid, "variant": variant, "run_number": 1,
+                "objective_pass_rate": obj, "combined_pass_rate": comb,
+                "missing_output": False, "execution_valid": True}
 
     def test_run_signals_classify_cases(self):
         report = {"results": [
@@ -199,6 +200,13 @@ class ReadinessRunSignalTests(unittest.TestCase):
         sig = sb.readiness_run_signals(report)
         self.assertEqual(sig["base_saturated_cases"], ["base"])
         self.assertEqual(sig["qualitative_only_cases"], ["qual"])
+
+    def test_unmatched_models_do_not_create_readiness_comparisons(self):
+        left = {**self._res("c", "with_skill", 1.0, 1.0), "model": "a"}
+        right = {**self._res("c", "without_skill", 1.0, 1.0), "model": "b"}
+        signals = sb.readiness_run_signals({"results": [left, right]})
+        self.assertEqual(signals["base_saturated_cases"], [])
+        self.assertEqual(signals["qualitative_only_cases"], [])
 
     def test_objective_only_is_static_and_base_saturated_blocks(self):
         with tempfile.TemporaryDirectory() as td:
@@ -215,10 +223,12 @@ class ReadinessRunSignalTests(unittest.TestCase):
             self.assertEqual(r["base_saturated_cases"], [])            # no run data => empty
             # with run data showing obj is base-saturated, it becomes a blocker
             bench = {"results": [
-                {"case_id": "obj", "variant": "with_skill", "objective_pass_rate": 1.0,
-                 "combined_pass_rate": 1.0, "missing_output": False, "execution_valid": True},
-                {"case_id": "obj", "variant": "without_skill", "objective_pass_rate": 1.0,
-                 "combined_pass_rate": 1.0, "missing_output": False, "execution_valid": True}]}
+                {"case_id": "obj", "variant": "with_skill", "run_number": 1,
+                 "objective_pass_rate": 1.0, "combined_pass_rate": 1.0,
+                 "missing_output": False, "execution_valid": True},
+                {"case_id": "obj", "variant": "without_skill", "run_number": 1,
+                 "objective_pass_rate": 1.0, "combined_pass_rate": 1.0,
+                 "missing_output": False, "execution_valid": True}]}
             r2 = sb.eval_readiness(sb.validate_manifest(p), p, benchmark_report=bench)
             self.assertEqual(r2["base_saturated_cases"], ["obj"])
             self.assertTrue(any("base-saturated" in b for b in r2["blockers"]))
@@ -549,8 +559,10 @@ class CapabilityRegressionIntentTests(unittest.TestCase):
     @staticmethod
     def _rows(case_id, intent, w, n):
         return [
-            {"case_id": case_id, "variant": "with_skill", "objective_pass_rate": w, "combined_pass_rate": w, "eval_intent": intent},
-            {"case_id": case_id, "variant": "without_skill", "objective_pass_rate": n, "combined_pass_rate": n, "eval_intent": intent},
+            {"case_id": case_id, "variant": "with_skill", "run_number": 1,
+             "objective_pass_rate": w, "combined_pass_rate": w, "eval_intent": intent},
+            {"case_id": case_id, "variant": "without_skill", "run_number": 1,
+             "objective_pass_rate": n, "combined_pass_rate": n, "eval_intent": intent},
         ]
 
     def _write_manifest(self, td, cases):

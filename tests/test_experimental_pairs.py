@@ -15,6 +15,7 @@ class ExperimentalPairKeyTests(unittest.TestCase):
             ("c", "m", 0, "answer"),
             ("c", "m", True, "answer"),
             ("c", "m", 1, ""),
+            ("c", "m", 1, "answr"),
         ]
         for args in invalid:
             with self.subTest(args=args), self.assertRaises(ValueError):
@@ -77,13 +78,21 @@ class PairConstructionTests(unittest.TestCase):
             ep.ExperimentalArm(key, "without_skill", {}, False, None)
         with self.assertRaises(ValueError):
             ep.ExperimentalArm(key, "ablation", {})
+        with self.assertRaises(TypeError):
+            ep.ExperimentalArm(None, "with_skill", {})  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            ep.ExperimentalArm(key, "with_skill", {}, eligible=1)  # type: ignore[arg-type]
 
-    def test_rows_reject_duplicate_and_missing_identity(self):
+    def test_rows_reject_duplicate_missing_and_coerced_identity(self):
         row = {"case_id": "c", "model": "m", "run_number": 1, "variant": "with_skill"}
         with self.assertRaises(ValueError):
             ep.pairs_from_rows([row, row], population="answer")
         with self.assertRaisesRegex(ValueError, "run_number"):
             ep.pairs_from_rows([{k: v for k, v in row.items() if k != "run_number"}], population="answer")
+        with self.assertRaisesRegex(ValueError, "case_id must be a string"):
+            ep.pairs_from_rows([{**row, "case_id": 1}], population="answer")
+        with self.assertRaisesRegex(ValueError, "population.*conflicts"):
+            ep.pairs_from_rows([{**row, "population": "trigger"}], population="answer")
 
 
 if __name__ == "__main__":

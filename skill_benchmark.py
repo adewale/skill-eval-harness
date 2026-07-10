@@ -41,7 +41,7 @@ import telemetry as telemetry_domain
 import experimental_pairs as pair_domain
 
 from judge_verdict import BooleanVerdict, ConsensusVerdict, validated_result_row, verdict_fields, verdict_from_dict
-from jetty_contracts import JettyObservation, ProtocolInvalid, lifecycle_from_status
+from jetty_contracts import JettyObservation, ProtocolInvalid, lifecycle_from_record, lifecycle_from_status
 from trace_contracts import EventState, event_is_completed, parse_event_state
 from trigger_contracts import (
     InvocationOutcome,
@@ -451,11 +451,15 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
     if dims is not None:
         if not isinstance(dims, list) or not dims:
             die(f"{where} graded_dimensions must be a non-empty list")
+        names = []
         for k, dim in enumerate(dims):
             if not isinstance(dim, dict) or not isinstance(dim.get("name"), str) or not dim.get("name"):
                 die(f"{where} graded_dimensions[{k}] needs a string name")
             if not isinstance(dim.get("rubric"), str) or not dim.get("rubric"):
                 die(f"{where} graded_dimensions[{k}] needs an anchored string rubric")
+            names.append(dim["name"])
+        if len(set(names)) != len(names):
+            die(f"{where} graded_dimensions names must be unique")
     dyn = assertion.get("dynamic_rubric")
     if dyn is not None:
         if not isinstance(dyn, dict) or not isinstance(dyn.get("instruction"), str) or not dyn.get("instruction"):
@@ -2316,11 +2320,15 @@ class JettyClient:
         last: dict[str, Any] = {}
         while time.time() <= deadline:
             last = self._json_request("GET", path)
-            lifecycle = lifecycle_from_status(last.get("status", last.get("state")), error=last.get("error"))
+            lifecycle = lifecycle_from_record(last)
             if lifecycle.terminal:
                 last["provider_status"] = lifecycle.raw_status
-                last["status"] = lifecycle.status
-                last["lifecycle"] = lifecycle.to_dict()
+                canonical = lifecycle_from_status(
+                    lifecycle.status,
+                    error=(lifecycle.reason if isinstance(lifecycle, ProtocolInvalid) else last.get("error")),
+                )
+                last["status"] = canonical.status
+                last["lifecycle"] = canonical.to_dict()
                 return last
             time.sleep(poll_interval_s)
         lifecycle = lifecycle_from_status("timeout")
@@ -2365,8 +2373,7 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
             if not trajectory_id:
                 raise RuntimeError(f"Jetty submit response did not include trajectory_id: {submission}")
             trajectory = client.poll(collection, task_name, trajectory_id, timeout_s=timeout_s, poll_interval_s=poll_interval_s)
-            lifecycle = lifecycle_from_status(
-                trajectory.get("status", trajectory.get("state")), error=trajectory.get("error"))
+            lifecycle = lifecycle_from_record(trajectory)
             yield {
                 "harness": harness,
                 "status": lifecycle.status,
@@ -2582,16 +2589,41 @@ def import_jetty_results(args: argparse.Namespace) -> int:
     validate_manifest(Path(args.manifest))
     runs = Path(args.runs)
     records = load_jsonl(Path(args.jetty_runs))
+    validated_records: list[tuple[dict[str, Any], dict[str, Any], Path]] = []
+    seen_identities: set[tuple[str, str | None, str, int, str]] = set()
+    seen_destinations: set[Path] = set()
     for record in records:
-        harness = record.get("harness", {})
+        harness = record.get("harness")
+        if not isinstance(harness, dict):
+            die("invalid Jetty result: harness must be an object")
+        case_id, variant, run_number = harness.get("case_id"), harness.get("variant"), harness.get("run_number")
+        if not isinstance(case_id, str) or not case_id:
+            die("invalid Jetty result: harness.case_id must be a non-empty string")
+        if (not isinstance(variant, str) or
+                (variant not in {"with_skill", "without_skill", "old_skill"} and not is_ablation_variant(variant))):
+            die("invalid Jetty result: harness.variant is not an execution arm")
+        if isinstance(run_number, bool) or not isinstance(run_number, int) or run_number < 1:
+            die("invalid Jetty result: harness.run_number must be a positive integer")
+        model = (record.get("jetty") or {}).get("model") if isinstance(record.get("jetty"), dict) else None
+        if model is not None and (not isinstance(model, str) or not model):
+            die("invalid Jetty result: jetty.model must be null or a non-empty string")
+        identity = (case_id, model, variant, run_number, "answer")
+        if identity in seen_identities:
+            die(f"duplicate Jetty result identity: {identity}")
+        seen_identities.add(identity)
         run_dir = harness.get("run_dir")
-        if run_dir:
-            base = runs / str(run_dir)
-        else:
-            case_id = str(harness.get("case_id", "unknown-case"))
-            variant = str(harness.get("variant", "unknown-variant"))
-            run_number = int(harness.get("run_number", 1) or 1)
-            base = runs / case_id / variant if run_number == 1 else runs / case_id / variant / f"run-{run_number}"
+        if run_dir is not None and (not isinstance(run_dir, str) or not run_dir):
+            die("invalid Jetty result: harness.run_dir must be a non-empty string")
+        relative = run_dir or (f"{case_id}/{variant}" if run_number == 1 else f"{case_id}/{variant}/run-{run_number}")
+        base = safe_child_path(runs, relative)
+        if base in seen_destinations:
+            die(f"duplicate Jetty result destination: {relative}")
+        seen_destinations.add(base)
+        lifecycle = lifecycle_from_record(record)
+        if lifecycle.successful and (not isinstance(record.get("trajectory_id"), str) or not record.get("trajectory_id")):
+            die("invalid Jetty result: successful trajectory requires trajectory_id")
+        validated_records.append((record, harness, base))
+    for record, harness, base in validated_records:
         base.mkdir(parents=True, exist_ok=True)
         write_json(base / "jetty_raw.json", record)
         artifacts = record.get("artifacts") or []
@@ -3434,6 +3466,16 @@ def raw_trace_value(record: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def raw_trace_has_key(record: dict[str, Any], *keys: str) -> bool:
+    if any(key in record for key in keys):
+        return True
+    for container_key in ["message", "delta", "data", "item", "tool_input", "input", "details"]:
+        nested = record.get(container_key)
+        if isinstance(nested, dict) and any(key in nested for key in keys):
+            return True
+    return False
+
+
 def stringify_trace_value(value: Any) -> str:
     if value is None:
         return ""
@@ -3498,7 +3540,9 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     command = stringify_trace_value(raw_trace_value(record, "command", "cmd", "args"))
     content = stringify_trace_value(raw_trace_value(record, "content", "text", "message"))
     raw_status = raw_trace_value(record, "status", "state")
-    parsed_state = parse_event_state(raw_status, raw_type=top_type or item_type)
+    parsed_state = parse_event_state(
+        raw_status, raw_type=top_type or item_type,
+        status_present=raw_trace_has_key(record, "status", "state"))
     status = parsed_state.state.value
     # Unknown session/lifecycle events are not tool calls. Defaulting them to
     # tool_call inflated Pi's process telemetry even when its trace had no
@@ -4009,8 +4053,8 @@ def write_runner_outcome(run_dir: Path, outcome: AnswerOutcome) -> tuple[dict[st
         metadata, a failure marker in the body) and no runner can hand-roll a body
         that slips a crashed run past execution_valid().
 
-    A None answer is derived from the parsed trace (the Codex path); a string
-    answer is used verbatim."""
+    `Completed` always carries a non-empty final answer; raw traces are telemetry,
+    never a fallback candidate answer."""
     run_dir.mkdir(parents=True, exist_ok=True)
     context = outcome_context(outcome)
     trace_text = context.trace_text
@@ -4047,8 +4091,6 @@ def write_runner_outcome(run_dir: Path, outcome: AnswerOutcome) -> tuple[dict[st
         environment=dict(context.environment) if context.environment is not None else None,
         write_metadata=True, write_raw_trace=bool(trace_text),
     )
-    if isinstance(outcome, Completed) and answer is None:
-        answer = final_answer_from_events(events) or trace_text.strip()
     marker = RUNNER_FAILURE_MARKER_BY_PROVIDER[context.provider.value]
     if isinstance(outcome, TimedOut):
         body = (f"{TIMEOUT_FAILURE}: {outcome.reason}]\n" if outcome.reason
@@ -4090,6 +4132,8 @@ def build_skill_workspace(pt: PreparedTask, ws: Path) -> tuple[list[str], list[s
     copier, so their file surfaces are identical apart from the declared edit. The
     PreparedTask is the sole authority — variant and skill paths are read off it, not
     re-derived from a raw row."""
+    if not isinstance(pt, PreparedTask):
+        raise TypeError("build_skill_workspace requires a validated PreparedTask")
     ws.mkdir(parents=True, exist_ok=True)
     skill_rel: list[str] = []
     if pt.variant_truth != "without_skill":
@@ -4157,6 +4201,8 @@ register_workspace_builder("jetty", jetty_upload_workspace)    # export-jetty up
 
 
 def build_task_prompt(pt: PreparedTask, skill_paths: list[str] | None = None, input_files: list[str] | None = None) -> str:
+    if not isinstance(pt, PreparedTask):
+        raise TypeError("build_task_prompt requires a validated PreparedTask")
     file_note = "\n".join(f"- {p}" for p in (input_files or [])) if input_files else "- none"
     if pt.variant_truth == "without_skill":
         skill_note = "Do not use any skill. No skill files are present in this workspace."
@@ -4566,13 +4612,27 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
     `run-agent` command exposes it directly. Provider-specific code returns a
     RunnerOutcome; this loop owns PreparedTask handling, workspace construction,
     provenance, and the run-output contract."""
+    validated: list[tuple[dict[str, Any], PreparedTask, str | None, Path]] = []
+    seen_identities: set[tuple[str, str | None, str, int, str]] = set()
+    seen_destinations: set[Path] = set()
     for task in tasks:
         try:
             pt = PreparedTask.from_row(task)
         except (TypeError, ValueError) as exc:
             die(f"invalid prepared task: {exc}")
         row_model = task.get("model") or model
+        if row_model is not None and (not isinstance(row_model, str) or not row_model):
+            die("invalid prepared task: model must be null or a non-empty string")
+        identity = (pt.case_id, row_model, pt.variant_truth, pt.run_number, "answer")
+        if identity in seen_identities:
+            die(f"duplicate prepared task identity: {identity}")
+        seen_identities.add(identity)
         base = safe_child_path(runs, pt.run_dir)
+        if base in seen_destinations:
+            die(f"duplicate prepared task run_dir: {pt.run_dir}")
+        seen_destinations.add(base)
+        validated.append((task, pt, row_model, base))
+    for task, pt, row_model, base in validated:
         base.mkdir(parents=True, exist_ok=True)
         prov_extra = {
             "population": "answer",
@@ -5234,14 +5294,18 @@ def load_result_rows(path: Path, *, id_keys: tuple[str, ...], label: str) -> lis
         return []
     if text.startswith("["):
         data = json.loads(text)
-        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+        if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+            die(f"{label} must contain only result objects")
+        return data
     try:
         rows = [json.loads(line) for line in text.splitlines() if line.strip()]
     except json.JSONDecodeError:
         rows = [json.loads(text)]   # one pretty-printed object spanning lines
     if len(rows) == 1 and isinstance(rows[0], dict) and not any(k in rows[0] for k in id_keys):
         rows = rows[0].get("results", [])
-    return [row for row in rows if isinstance(row, dict)]
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        die(f"{label} must contain only result objects")
+    return rows
 
 
 def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
@@ -5397,7 +5461,8 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
 def judge_verdict_passed(verdict: dict[str, Any], *, default_threshold: float = 1) -> bool:
     """Compatibility shim over the typed verdict parser for raw model output."""
     candidate = dict(verdict)
-    if candidate.get("score") is not None and candidate.get("threshold") is None:
+    if (candidate.get("score") is not None and candidate.get("threshold") is None
+            and candidate.get("verdict_kind") not in {"consensus", "dynamic"}):
         candidate["threshold"] = default_threshold
     try:
         return verdict_from_dict(candidate, strict_stored=False).passed
@@ -5625,7 +5690,9 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         if "dimension_scores" in graded_payload:
             threshold = graded_entry.get("threshold")
     else:
-        passed = judge_verdict_passed({**parsed, "threshold": threshold})
+        plain_payload = ({**parsed, "threshold": threshold}
+                         if parsed.get("score") is not None else parsed)
+        passed = judge_verdict_passed(plain_payload)
     evidence = parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or parse_error or "judge command completed"
     row = {
         **graded_payload,
@@ -5643,8 +5710,8 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         "usage_normalized": normalize_usage(judge_usage, source=usage_source),
         "cost_normalized": normalize_cost(cost_usd, source="provider_reported", pricing_model=judge_model_label),
         "passed": passed and returncode == 0 and parse_error is None,
-        "score": score,
-        "threshold": threshold,
+        **({"score": score} if score is not None else {}),
+        **({"threshold": threshold} if score is not None and "criteria" not in graded_payload else {}),
         "evidence": evidence,
         "returncode": returncode,
         "stderr": stderr[:4000] if stderr else "",
@@ -5691,8 +5758,11 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         first["score"] = statistics.median(scores)
     first["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
     first["judge_runs"] = rows
-    first.update(verdict_fields(ConsensusVerdict(bool(first["passed"]), first.get("score"))))
-    return first
+    consensus = ConsensusVerdict(bool(first["passed"]), first.get("score"))
+    for key in ("threshold", "dimension_scores", "criteria", "minimum_criteria"):
+        first.pop(key, None)
+    first.update(verdict_fields(consensus))
+    return validated_result_row(first)
 
 
 def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = None) -> dict[str, Any]:
@@ -5754,8 +5824,10 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
         out["cost_usd"] = sum(member_cost)
         out["cost_normalized"] = normalize_cost(out["cost_usd"], source="provider_reported", pricing_model="consensus")
     out["judge_panel"] = rows
+    for key in ("threshold", "dimension_scores", "criteria", "minimum_criteria"):
+        out.pop(key, None)
     out.update(verdict_fields(ConsensusVerdict(bool(passed), median_score)))
-    return out
+    return validated_result_row(out)
 
 
 def effective_judge_model(manifest: dict[str, Any], cli_model: str | None) -> str | None:
@@ -6335,8 +6407,14 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
     dims = assertion.get("graded_dimensions")
     dyn = assertion.get("dynamic_rubric")
     if dims and isinstance(judged.get("dimension_scores"), dict):
-        raw = {str(k): float(v) for k, v in judged["dimension_scores"].items() if isinstance(v, (int, float))}
-        normalized = {k: max(0.0, min(1.0, (v - 1.0) / 4.0)) for k, v in raw.items()}
+        expected_names = {str(item.get("name")) for item in dims if isinstance(item, dict)}
+        if set(judged["dimension_scores"]) != expected_names:
+            raise ValueError("dimension_scores must exactly match the declared dimensions")
+        raw = {str(k): float(v) for k, v in judged["dimension_scores"].items()
+               if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        if set(raw) != expected_names or not all(math.isfinite(v) and 1 <= v <= 5 for v in raw.values()):
+            raise ValueError("dimension scores must be finite numbers in [1,5]")
+        normalized = {k: (v - 1.0) / 4.0 for k, v in raw.items()}
         score = round(statistics.mean(normalized.values()), 4) if normalized else None
         threshold_raw = assertion.get("threshold", 4)
         threshold = max(0.0, min(1.0, (float(threshold_raw) - 1.0) / 4.0))
@@ -6951,6 +7029,8 @@ def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> pair_d
         value = row.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             return False, f"missing_{key}"
+        if key in {"objective_pass_rate", "combined_pass_rate", "graded_score"} and not 0 <= float(value) <= 1:
+            return False, f"invalid_{key}"
         return True, None
     return pair_domain.pairs_from_rows(results, population="answer", eligibility=eligibility)
 
@@ -7142,16 +7222,12 @@ def build_paired_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
-def slice_lift_fields(block: dict[str, Any], overall_lift: float | None) -> dict[str, Any]:
-    """Slice-lift concentration (roadmap 3.2, the macro-eval metric one level
-    up from per-case lift): slice lift ÷ overall lift. A failure or gain
-    confined to one slice scores a high ratio there."""
-    w = (block.get("with_skill") or {}).get("mean_objective_pass_rate")
-    n = (block.get("without_skill") or {}).get("mean_objective_pass_rate")
-    if w is None or n is None:
-        return {}
-    lift = w - n
-    fields: dict[str, Any] = {"lift": round(lift, 4)}
+def slice_lift_fields(paired: dict[str, Any], overall_lift: float | None) -> dict[str, Any]:
+    """Slice lift from validated pairs, plus concentration versus overall lift."""
+    lift = paired.get("absolute_delta")
+    if not isinstance(lift, (int, float)):
+        return {"pairing": paired.get("pairing", {})}
+    fields: dict[str, Any] = {"lift": round(float(lift), 4), "pairing": paired.get("pairing", {})}
     if overall_lift:
         fields["lift_concentration"] = round(lift / overall_lift, 4)
     return fields
@@ -7170,14 +7246,15 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
     overall_lift = (build_paired_summary(results) or {}).get("absolute_delta")
     for field in ["domain", "difficulty", "trigger_type"]:
         for value in sorted({str(r.get(field)) for r in results if r.get(field)}):
-            block = {v: slice_stats(everything.where(**{field: value, "variant": v})) for v in variants}
-            block.update(slice_lift_fields(block, overall_lift))
+            slice_rows = everything.matching(lambda r, f=field, expected=value: str(r.get(f)) == expected).all
+            block = {v: slice_stats(ResultSet(slice_rows).where(variant=v)) for v in variants}
+            block.update(slice_lift_fields(build_paired_summary(slice_rows), overall_lift))
             out[field][value] = block
     goals = sorted({str(goal) for r in results for goal in (r.get("success_goals") or [])})
     for goal in goals:
         in_goal = everything.matching(lambda r, g=goal: g in (r.get("success_goals") or []))
         block = {v: slice_stats(in_goal.where(variant=v)) for v in variants}
-        block.update(slice_lift_fields(block, overall_lift))
+        block.update(slice_lift_fields(build_paired_summary(in_goal.all), overall_lift))
         out["success_goals"][goal] = block
     return out
 
@@ -7271,11 +7348,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
     # Repeated runs are collapsed symmetrically into per-(case, variant) pass
     # RATES for each assertion and for the objective score — so with_skill and
     # the ablation arm are treated identically (no all-pass-vs-one-fail asymmetry).
-    assertion_runs: dict[tuple[str, str], dict[str, list[bool]]] = {}
-    rate_runs: dict[tuple[str, str], list[float]] = {}
-    combined_rate_runs: dict[tuple[str, str], list[float]] = {}
     measured_variants: set[str] = set()
-    measured_cv: set[tuple[str, str]] = set()
     coverage: dict[str, dict[str, int]] = {}
     recorded_prov: dict[str, list[dict[str, Any]]] = {}
     measured_runs: dict[str, int] = {}
@@ -7304,36 +7377,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         # collected so the ablation's parent hash can be paired against it.
         measured_runs[variant] = measured_runs.get(variant, 0) + 1
         recorded_tree_hash.setdefault(variant, []).append(meta.get("skill_tree_hash"))
-        key = (r.get("case_id"), variant)
         measured_variants.add(variant)
-        measured_cv.add(key)
-        amap = assertion_runs.setdefault(key, {})
-        for a in list(r.get("assertions", [])) + list(r.get("qualitative_assertions", [])):
-            name = a.get("name")
-            if name is not None:
-                amap.setdefault(name, []).append(bool(a.get("passed")))
-        rate = r.get("objective_pass_rate")
-        if rate is not None:
-            rate_runs.setdefault(key, []).append(rate)
-        # Combined rate (objective + qualitative) so a judge/rubric regression also
-        # counts as a score drop; fall back to the objective rate when absent.
-        crate = r.get("combined_pass_rate")
-        if crate is None:
-            crate = r.get("objective_pass_rate")
-        if crate is not None:
-            combined_rate_runs.setdefault(key, []).append(crate)
-
-    def pass_rate(case_id: str, variant: str, name: str) -> float | None:
-        vals = assertion_runs.get((case_id, variant), {}).get(name)
-        return (sum(vals) / len(vals)) if vals else None
-
-    def mean_rate_cv(case_id: str, variant: str) -> float | None:
-        vals = rate_runs.get((case_id, variant))
-        return (sum(vals) / len(vals)) if vals else None
-
-    def combined_rate(case_id: str, variant: str) -> float | None:
-        vals = combined_rate_runs.get((case_id, variant))
-        return (sum(vals) / len(vals)) if vals else None
 
     out = []
     for ablation in manifest.get("ablations", []):
@@ -7379,6 +7423,60 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         entry["provenance_verified"] = prov_ok
         if not prov_ok:
             entry["provenance_note"] = prov_note
+
+        # Causal ablation evidence uses exact case/model/repetition pairs. The
+        # ablation arm is adapted to the pair constructor's treatment slot only
+        # for identity construction; payloads retain their original variant.
+        ablation_pair_rows = [r for r in results if r.get("variant") == "with_skill"] + [
+            {**r, "variant": "without_skill", "_ablation_variant": variant}
+            for r in results if r.get("variant") == variant
+        ]
+        def ablation_eligibility(row: dict[str, Any]) -> tuple[bool, str | None]:
+            if not scorable_run(row):
+                return False, "unscorable_arm"
+            rate = row.get("combined_pass_rate", row.get("objective_pass_rate"))
+            if (isinstance(rate, bool) or not isinstance(rate, (int, float))
+                    or not math.isfinite(float(rate)) or not 0 <= float(rate) <= 1):
+                return False, "invalid_combined_pass_rate"
+            return True, None
+
+        ablation_pairing = pair_domain.pairs_from_rows(
+            ablation_pair_rows, population="answer", eligibility=ablation_eligibility)
+        pairs_by_case_model: dict[tuple[str, str | None], list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+        for pair in ablation_pairing.pairs:
+            pairs_by_case_model[(pair.key.case_id, pair.key.model)].append(pair)
+        entry["pairing"] = ablation_pairing.diagnostics()
+
+        def assertion_value(row: dict[str, Any], name: str) -> bool | None:
+            matches = [a.get("passed") for a in list(row.get("assertions", [])) + list(row.get("qualitative_assertions", []))
+                       if a.get("name") == name]
+            return matches[0] if len(matches) == 1 and isinstance(matches[0], bool) else None
+
+        def paired_assertion_rates(pairs: list[pair_domain.ExperimentalPair], name: str) -> tuple[float | None, float | None, int]:
+            observations = []
+            for pair in pairs:
+                left = assertion_value(pair.with_skill.payload, name)
+                right = assertion_value(pair.without_skill.payload, name)
+                if left is not None and right is not None:
+                    observations.append((left, right))
+            if not observations:
+                return None, None, 0
+            return (sum(left for left, _ in observations) / len(observations),
+                    sum(right for _, right in observations) / len(observations),
+                    len(observations))
+
+        def paired_combined_deltas(pairs: list[pair_domain.ExperimentalPair]) -> list[float]:
+            deltas = []
+            for pair in pairs:
+                left = pair.with_skill.payload.get("combined_pass_rate", pair.with_skill.payload.get("objective_pass_rate"))
+                right = pair.without_skill.payload.get("combined_pass_rate", pair.without_skill.payload.get("objective_pass_rate"))
+                if (isinstance(left, (int, float)) and not isinstance(left, bool)
+                        and isinstance(right, (int, float)) and not isinstance(right, bool)
+                        and math.isfinite(float(left)) and math.isfinite(float(right))
+                        and 0 <= float(left) <= 1 and 0 <= float(right) <= 1):
+                    deltas.append(float(left) - float(right))
+            return deltas
+
         regressions = []
         for spec in ablation.get("expected_regressions", []):
             if not isinstance(spec, dict):
@@ -7391,49 +7489,59 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             # score drop from case B, and a qualitative-only regression still counts
             # because the score is the combined rate, not objective-only.
             evidence = []
-            confirmed_cases = []
+            assertion_coverage_gaps: list[dict[str, Any]] = []
+            confirmed_cases: list[str] = []
+            confirmed_cohorts: list[tuple[str, str | None]] = []
             score_regressed = None
             for cid in cases:
-                case_flips = []
-                for name in names:
-                    w, a = pass_rate(cid, "with_skill", name), pass_rate(cid, variant, name)
-                    if w is not None and a is not None and a < w:   # symmetric paired rate drop
-                        ev = {"case": cid, "assertion": name, "with_skill_rate": w, "ablation_rate": a}
-                        evidence.append(ev)
-                        case_flips.append(ev)
-                wr, ar = combined_rate(cid, "with_skill"), combined_rate(cid, variant)
-                case_score_dropped = wr is not None and ar is not None and ar < wr
-                if wr is not None and ar is not None:
-                    score_regressed = bool(score_regressed) or (ar < wr)
-                if case_flips and case_score_dropped:
-                    confirmed_cases.append(cid)
-            # A confirmation is only meaningful if BOTH arms actually produced a
-            # graded run for at least one cited case. Otherwise the comparison
-            # rests on missing output and must not be reported as confirmed/refuted.
-            measured_pairs = [cid for cid in cases if (cid, "with_skill") in measured_cv and (cid, variant) in measured_cv]
-            # Feature 1: a confirmation must survive a significance test on the
-            # REPLICATED runs, not just a mean drop on one shot. The test runs PER
-            # CASE — runs of different cases have different baselines and are NOT
-            # exchangeable, so pooling them across cases both (a) lets a breadth of
-            # single-shot cases fake significance and (b) flattens a real regression
-            # on heterogeneous baselines. Each confirmed case's with_skill vs
-            # ablation runs are tested on their own; the regression is significant
-            # iff at least one confirmed case clears the bar. The exact-permutation
-            # floor means a case needs >= 4 runs per arm to ever reach p <= 0.05
-            # (C(8,4)=70 -> min p=0.0286), so a single-shot case can never confirm.
-            per_case_sig = {
-                cid: two_sample_permutation_significance(
-                    combined_rate_runs.get((cid, "with_skill"), []),
-                    combined_rate_runs.get((cid, variant), []))
-                for cid in confirmed_cases
-            }
+                for (pair_case, pair_model), matched in sorted(pairs_by_case_model.items(), key=lambda item: str(item[0])):
+                    if pair_case != cid:
+                        continue
+                    case_flips = []
+                    for name in names:
+                        w, a, assertion_pairs = paired_assertion_rates(matched, name)
+                        if assertion_pairs != len(matched):
+                            gap = {"case": cid, "assertion": name,
+                                   "observed_pairs": assertion_pairs, "expected_pairs": len(matched)}
+                            if pair_model is not None:
+                                gap["model"] = pair_model
+                            assertion_coverage_gaps.append(gap)
+                            continue
+                        if w is not None and a is not None and a < w:
+                            ev = {"case": cid, "assertion": name, "with_skill_rate": w,
+                                  "ablation_rate": a, "paired_observations": assertion_pairs}
+                            if pair_model is not None:
+                                ev["model"] = pair_model
+                            evidence.append(ev)
+                            case_flips.append(ev)
+                    score_deltas = paired_combined_deltas(matched)
+                    case_score_dropped = (len(score_deltas) == len(matched)
+                                          and statistics.mean(score_deltas) > 0)
+                    if score_deltas:
+                        score_regressed = bool(score_regressed) or case_score_dropped
+                    if case_flips and case_score_dropped:
+                        if cid not in confirmed_cases:
+                            confirmed_cases.append(cid)
+                        confirmed_cohorts.append((cid, pair_model))
+            # A confirmation is meaningful only for exact matched identities.
+            measured_pairs = [cid for cid in cases
+                              if any(pair_case == cid for pair_case, _ in pairs_by_case_model)]
+            per_case_sig = {}
+            for cid, cohort_model in confirmed_cohorts:
+                matched = pairs_by_case_model[(cid, cohort_model)]
+                label = cid if cohort_model is None else f"{cid}@{cohort_model}"
+                per_case_sig[label] = sign_flip_significance(paired_combined_deltas(matched))
             significance = {
-                "method": "per-case-two-sample-permutation",
+                "method": "per-case-model-paired-sign-flip",
                 "significant_at_0_05": any(s.get("significant_at_0_05") for s in per_case_sig.values()),
                 "min_p_value": min((s["p_value"] for s in per_case_sig.values() if s.get("p_value") is not None), default=None),
                 "by_case": per_case_sig,
-            } if confirmed_cases else None
-            reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names, "score_regressed": score_regressed, "evidence": evidence, "measured_cases": measured_pairs, "confirmed_cases": confirmed_cases, "significance": significance}
+            } if confirmed_cohorts else None
+            reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names,
+                   "score_regressed": score_regressed, "evidence": evidence,
+                   "assertion_coverage_gaps": assertion_coverage_gaps,
+                   "measured_cases": measured_pairs, "confirmed_cases": confirmed_cases,
+                   "significance": significance}
             # The verdict goes through the EvidenceClass guard: CONFIRMED_CAUSAL is
             # reachable only with verified provenance, coverage, and an observed
             # regression (a cited case with BOTH a named flip and a same-case score
@@ -7442,7 +7550,11 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 evidence_class = EvidenceClass.INDETERMINATE
                 reg["note"] = "invalid-skill experiment: a parser/validation rejection is not evidence of a behavioral regression"
             else:
-                evidence_class = causal_confirmation(provenance_verified=prov_ok, has_coverage=bool(measured_pairs), regression_observed=bool(confirmed_cases))
+                evidence_class = causal_confirmation(
+                    provenance_verified=prov_ok,
+                    has_coverage=bool(measured_pairs) and not assertion_coverage_gaps,
+                    regression_observed=bool(confirmed_cases),
+                )
                 # Significance gate (feature 1): an OBSERVED regression that is not
                 # significant across replicates is downgraded to INDETERMINATE — not
                 # REFUTED, which would wrongly claim "no regression". This is where a
@@ -7451,9 +7563,11 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 if evidence_class is EvidenceClass.CONFIRMED_CAUSAL and not (significance and significance.get("significant_at_0_05")):
                     evidence_class = EvidenceClass.INDETERMINATE
                     p = (significance or {}).get("min_p_value")
-                    reg["note"] = f"regression observed but not significant per case across replicates (min p={p}); a case needs >= 4 runs per arm to confirm"
+                    reg["note"] = f"regression observed but not significant per case across replicates (min p={p}); a case needs >= 6 matched pairs to confirm"
                 elif not prov_ok:
                     reg["note"] = f"provenance unverified: {prov_note}"
+                elif assertion_coverage_gaps:
+                    reg["note"] = "insufficient assertion coverage across matched repetitions"
                 elif not measured_pairs:
                     reg["note"] = "insufficient coverage: no cited case has a graded run in both with_skill and the ablation arm (missing output?)"
             reg["evidence_class"] = evidence_class.value
@@ -7690,11 +7804,16 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
     Coverage separates missing telemetry from zero spend."""
     rows = []
     for result in results:
+        run_number = result.get("run_number")
+        if isinstance(run_number, bool) or not isinstance(run_number, int) or run_number < 1:
+            raise ValueError("cost result row requires a positive integer run_number")
+        if not isinstance(result.get("case_id"), str) or not result.get("case_id"):
+            raise ValueError("cost result row requires a non-empty string case_id")
         facts = bind_telemetry_pair_identity(
-            result_cost_facts(result), case_id=result["case_id"], run_number=int(result.get("run_number", 1)),
+            result_cost_facts(result), case_id=result["case_id"], run_number=run_number,
             variant=result["variant"], model=result.get("model"), population="answer")
         rows.append({**facts, "case_id": result["case_id"], "variant": result["variant"],
-                     "run_number": result.get("run_number", 1), "model": result.get("model"),
+                     "run_number": run_number, "model": result.get("model"),
                      "missing_output": result.get("missing_output"),
                      "execution_valid": result.get("execution_valid", True)})
     totals = {
@@ -7957,15 +8076,15 @@ def build_benchmark_report(
     case_ids = sorted({r["case_id"] for r in results})
     everything = ResultSet(results)
     for cid in case_ids:
-        by_var_case = everything.where(case_id=cid).by_variant()   # scorable + grouped, never hand-rolled
-        ws_rows = by_var_case.get("with_skill", [])
-        ns_rows = by_var_case.get("without_skill", [])
-        if not ws_rows or not ns_rows:
+        case_rows = everything.where(case_id=cid).all
+        by_var_case = ResultSet(case_rows).by_variant()
+        pairing = _metric_pair_construction(case_rows, "objective_pass_rate")
+        if not pairing.pairs:
             continue
-        w_rates = [r["objective_pass_rate"] for r in ws_rows if r["objective_pass_rate"] is not None]
-        n_rates = [r["objective_pass_rate"] for r in ns_rows if r["objective_pass_rate"] is not None]
-        w_rate = statistics.mean(w_rates) if w_rates else None
-        n_rate = statistics.mean(n_rates) if n_rates else None
+        ws_rows = [pair.with_skill.payload for pair in pairing.pairs]
+        ns_rows = [pair.without_skill.payload for pair in pairing.pairs]
+        w_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ws_rows)
+        n_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ns_rows)
         flags = []
         if w_rate == 1 and n_rate == 1:
             flags.append("saturated/non-discriminating")
@@ -7992,7 +8111,9 @@ def build_benchmark_report(
         if floor_hits:
             flags.append(f"below-reference-floor: {', '.join(floor_hits)}")
         if flags:
-            case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate, "without_skill": n_rate, "eval_intent": ws_rows[0].get("eval_intent", "capability")})
+            case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate,
+                               "without_skill": n_rate, "pairing": pairing.diagnostics(),
+                               "eval_intent": ws_rows[0].get("eval_intent", "capability")})
 
     # 1.7: per case, how much of the pass rate rests on strong oracles. A case
     # passing mostly on demo/live tiers looks solid while resting on weak checks.
@@ -9600,37 +9721,50 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
                          don't move) yet combined with > without: the whole signal
                          is carried by the judge. An objective-only eval would call
                          this skill useless (the anti-slop case)."""
-    obj: dict[Any, dict[str, list]] = {}
-    comb: dict[Any, dict[str, list]] = {}
+    rows = benchmark_report.get("results", []) or []
     intent: dict[Any, str] = {}
-    for r in benchmark_report.get("results", []) or []:
-        if not scorable_run(r):
-            continue
-        cid, v = r.get("case_id"), r.get("variant")
-        intent.setdefault(cid, r.get("eval_intent", "capability"))
-        if r.get("objective_pass_rate") is not None:
-            obj.setdefault(cid, {}).setdefault(v, []).append(r["objective_pass_rate"])
-        cr = r.get("combined_pass_rate")
+    for row in rows:
+        intent.setdefault(row.get("case_id"), row.get("eval_intent", "capability"))
+    pairing = pair_domain.pairs_from_rows(
+        rows, population="answer",
+        eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
+    )
+
+    def combined_value(row: dict[str, Any]) -> float | None:
+        value = row.get("combined_pass_rate")
         # Soft judges live in graded_score, not combined; the qualitative signal
         # this function looks for rides whichever channel the judge fed.
-        if cr is None or (r.get("combined_total") == r.get("objective_total") and isinstance(r.get("graded_score"), (int, float))):
-            blended = [x for x in (cr, r.get("graded_score")) if isinstance(x, (int, float))]
-            cr = statistics.mean(blended) if blended else r.get("objective_pass_rate")
-        if cr is not None:
-            comb.setdefault(cid, {}).setdefault(v, []).append(cr)
+        if value is None or (row.get("combined_total") == row.get("objective_total")
+                             and isinstance(row.get("graded_score"), (int, float))):
+            blended = [x for x in (value, row.get("graded_score")) if isinstance(x, (int, float))]
+            value = statistics.mean(blended) if blended else row.get("objective_pass_rate")
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    by_case: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    for pair in pairing.pairs:
+        by_case[pair.key.case_id].append(pair)
     base_saturated, base_saturated_expected, qualitative_only = [], [], []
-    for cid, cv in comb.items():
-        cw, cn = _mean_or_none(cv.get("with_skill")), _mean_or_none(cv.get("without_skill"))
-        if cw is None or cn is None:
+    for cid, pairs in by_case.items():
+        combined = [(combined_value(pair.with_skill.payload), combined_value(pair.without_skill.payload))
+                    for pair in pairs]
+        combined = [(left, right) for left, right in combined if left is not None and right is not None]
+        if not combined:
             continue
+        cw = statistics.mean(left for left, _ in combined)
+        cn = statistics.mean(right for _, right in combined)
         if abs(cw - cn) <= eps:
-            # G5: a saturated regression guard is holding (expected), not a blocker.
             (base_saturated_expected if intent.get(cid) == "regression" else base_saturated).append(cid)
             continue
-        ow = _mean_or_none(obj.get(cid, {}).get("with_skill"))
-        on = _mean_or_none(obj.get(cid, {}).get("without_skill"))
-        if ow is not None and on is not None and abs(ow - on) <= eps and cw > cn + eps:
-            qualitative_only.append(cid)
+        objective = [(pair.with_skill.payload.get("objective_pass_rate"),
+                      pair.without_skill.payload.get("objective_pass_rate")) for pair in pairs]
+        objective = [(float(left), float(right)) for left, right in objective
+                     if isinstance(left, (int, float)) and not isinstance(left, bool)
+                     and isinstance(right, (int, float)) and not isinstance(right, bool)]
+        if objective:
+            ow = statistics.mean(left for left, _ in objective)
+            on = statistics.mean(right for _, right in objective)
+            if abs(ow - on) <= eps and cw > cn + eps:
+                qualitative_only.append(cid)
     return {"base_saturated_cases": sorted(base_saturated, key=str),
             "base_saturated_expected_cases": sorted(base_saturated_expected, key=str),
             "qualitative_only_cases": sorted(qualitative_only, key=str)}

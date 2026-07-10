@@ -233,6 +233,18 @@ class PerModelAnalysisTests(unittest.TestCase):
         self.assertTrue(analysis["ranking"][0]["significant_at_0_05"])
         self.assertEqual(analysis["lift_losers"], ["m-flat"])
 
+    def test_unmatched_models_cannot_produce_slice_lift(self):
+        base = {"case_id": "c", "run_number": 1, "domain": "docs",
+                "missing_output": False, "execution_valid": True, "metadata": {}}
+        rows = [
+            {**base, "variant": "with_skill", "model": "a", "objective_pass_rate": 0.0},
+            {**base, "variant": "without_skill", "model": "b", "objective_pass_rate": 1.0},
+        ]
+        domain = sb.build_slice_summary(rows, ["with_skill", "without_skill"])["domain"]["docs"]
+        self.assertNotIn("lift", domain)
+        self.assertEqual(domain["pairing"]["eligible_pairs"], 0)
+        self.assertEqual(domain["pairing"]["blocked_pairs"], 2)
+
     def test_no_model_axis_yields_empty_analysis(self):
         self.assertEqual(sb.model_analysis_from_paired({"absolute_delta": 0.5}), {})
 

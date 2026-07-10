@@ -332,6 +332,16 @@ def result_row(case_id: str, variant: str, *, cost: float | None, tokens: int | 
 
 
 class CostSummaryTests(unittest.TestCase):
+    def test_paired_cost_does_not_invent_missing_repetition_identity(self):
+        rows = [
+            {"case_id": "c", "variant": "with_skill", "objective_pass_rate": 1.0,
+             "missing_output": False, "execution_valid": True, "metadata": {}},
+            {"case_id": "c", "variant": "without_skill", "objective_pass_rate": 0.0,
+             "missing_output": False, "execution_valid": True, "metadata": {}},
+        ]
+        with self.assertRaisesRegex(ValueError, "run_number"):
+            sb.build_cost_summary(rows)
+
     def test_ledger_totals_coverage_and_paired_delta(self):
         results = [
             result_row("c1", "with_skill", cost=0.30, tokens=300),

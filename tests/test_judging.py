@@ -890,6 +890,8 @@ class StrictJudgeVerdictTests(unittest.TestCase):
             {"dimension_scores": {"d": 6}, "score": 1, "threshold": 1, "passed": True},
             {"criteria": [{"name": "a", "met": "yes"}], "minimum_criteria": 1,
              "score": 1, "passed": True},
+            {"criteria": [{"name": "a", "met": True}], "minimum_criteria": 2,
+             "score": 1, "passed": False},
         ]
         for row in invalid:
             with self.subTest(row=row), self.assertRaises((TypeError, ValueError)):
@@ -902,6 +904,7 @@ class StrictJudgeVerdictTests(unittest.TestCase):
             [{"passed": True}],
             [{**valid, "id": "other"}],
             [{**valid, "passed": "false"}],
+            [valid, "not-an-object"],
         ]
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "verdicts.json"
@@ -910,6 +913,32 @@ class StrictJudgeVerdictTests(unittest.TestCase):
                     path.write_text(json.dumps(rows), encoding="utf-8")
                     with self.assertRaises(SystemExit):
                         sb.load_judge_results(str(path))
+
+    def test_explicit_verdict_kind_rejects_foreign_payload_fields(self):
+        invalid = [
+            {"verdict_kind": "scored", "score": 1, "threshold": 1, "passed": True,
+             "dimension_scores": {"unexpected": 5}},
+            {"verdict_kind": "consensus", "passed": True,
+             "criteria": [{"name": "x", "met": True}]},
+            {"verdict_kind": "dynamic", "criteria": [{"name": "x", "met": True}],
+             "minimum_criteria": 1, "score": 1, "passed": True, "threshold": 0.5},
+        ]
+        for row in invalid:
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                jv.validated_result_row(row)
+        with self.assertRaises(TypeError):
+            jv.ScoredVerdict(1, 1, True, jv.VerdictKind.BOOLEAN)
+
+    def test_dimension_verdict_must_match_declared_dimension_set_at_merge(self):
+        assertion = {"name": "quality", "type": "judge", "graded_dimensions": [
+            {"name": "clarity"}, {"name": "craft"},
+        ]}
+        wrong = {"dimension_scores": {"unexpected": 5}, "score": 1.0,
+                 "threshold": 0.5, "passed": True}
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            sb.merged_qualitative_entry(assertion, wrong, "j")
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            jv.validated_result_row(wrong, expected_dimensions=("clarity", "craft"))
 
     def test_dynamic_and_dimension_verdicts_round_trip(self):
         dimensions = jv.validated_result_row({

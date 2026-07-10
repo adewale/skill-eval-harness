@@ -8,7 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import math
-from types import MappingProxyType
 from typing import Any, Mapping, TypeAlias
 
 
@@ -28,12 +27,40 @@ def _finite_nonnegative(value: Any, label: str, *, integer: bool = False) -> int
     return value
 
 
+class FrozenDict(dict):
+    """JSON-serializable recursively immutable mapping."""
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("frozen mapping cannot be mutated")
+
+    __setitem__ = __delitem__ = __ior__ = clear = pop = popitem = setdefault = update = _immutable
+
+
+def _freeze_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return FrozenDict({str(key): _freeze_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"outcome context contains non-JSON value {type(value).__name__}")
+
+
 def _freeze_mapping(value: Mapping[str, Any] | None, label: str) -> Mapping[str, Any]:
     if value is None:
-        return MappingProxyType({})
+        return FrozenDict()
     if not isinstance(value, Mapping):
         raise TypeError(f"{label} must be a mapping")
-    return MappingProxyType(dict(value))
+    return _freeze_value(value)
+
+
+def _validate_usage(value: Any, label: str) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _validate_usage(item, f"{label}.{key}")
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must contain only numeric measurements")
+    _finite_nonnegative(value, label)
 
 
 @dataclass(frozen=True)
@@ -66,12 +93,8 @@ class OutcomeContext:
         if self.usage is not None:
             if not isinstance(self.usage, Mapping):
                 raise TypeError("usage must be a mapping or None")
-            for key, value in self.usage.items():
-                if isinstance(value, (int, float)):
-                    _finite_nonnegative(value, f"usage.{key}")
-                elif isinstance(value, bool):
-                    raise ValueError(f"usage.{key} cannot be boolean")
-            object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
+            _validate_usage(self.usage, "usage")
+            object.__setattr__(self, "usage", _freeze_mapping(self.usage, "usage"))
         object.__setattr__(self, "metadata_extra", _freeze_mapping(self.metadata_extra, "metadata_extra"))
         object.__setattr__(self, "metrics_extra", _freeze_mapping(self.metrics_extra, "metrics_extra"))
         if self.environment is not None:
@@ -91,14 +114,18 @@ class OutcomeContext:
 @dataclass(frozen=True)
 class Completed:
     context: OutcomeContext
-    answer: str | None
+    answer: str
     returncode: int = 0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.context, OutcomeContext):
+            raise TypeError("Completed context must be OutcomeContext")
         if self.returncode != 0:
             raise ValueError("Completed returncode must be 0")
-        if self.answer is not None and not isinstance(self.answer, str):
-            raise TypeError("Completed answer must be string or None")
+        if not isinstance(self.answer, str):
+            raise TypeError("Completed answer must be a string")
+        if not self.answer:
+            raise ValueError("Completed answer cannot be empty")
 
 
 @dataclass(frozen=True)
@@ -109,6 +136,8 @@ class TimedOut:
     returncode: int = 124
 
     def __post_init__(self) -> None:
+        if not isinstance(self.context, OutcomeContext):
+            raise TypeError("TimedOut context must be OutcomeContext")
         if self.returncode != 124:
             raise ValueError("TimedOut returncode must be 124")
         if self.timeout_s is not None and (isinstance(self.timeout_s, bool) or not isinstance(self.timeout_s, int) or self.timeout_s <= 0):
@@ -124,6 +153,8 @@ class SpawnFailed:
     returncode: int = 127
 
     def __post_init__(self) -> None:
+        if not isinstance(self.context, OutcomeContext):
+            raise TypeError("SpawnFailed context must be OutcomeContext")
         if self.returncode != 127:
             raise ValueError("SpawnFailed returncode must be 127")
         if not isinstance(self.reason, str) or not self.reason.strip():
@@ -138,6 +169,8 @@ class ProviderFailed:
     answer: str = ""
 
     def __post_init__(self) -> None:
+        if not isinstance(self.context, OutcomeContext):
+            raise TypeError("ProviderFailed context must be OutcomeContext")
         if isinstance(self.returncode, bool) or not isinstance(self.returncode, int) or self.returncode in {0, 124, 127}:
             raise ValueError("ProviderFailed requires a non-zero non-timeout spawned returncode")
         if self.reason is not None and (not isinstance(self.reason, str) or not self.reason.strip()):
@@ -187,6 +220,8 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
         return SpawnFailed(context, reason=error or stderr or "process spawn failed")
     if code != 0 or error:
         return ProviderFailed(context, returncode=code if code != 0 else 1, reason=error, answer=answer or "")
+    if not answer:
+        return ProviderFailed(context, returncode=1, reason="provider produced no final answer")
     return Completed(context, answer=answer)
 
 
