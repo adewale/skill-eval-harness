@@ -170,7 +170,7 @@ Per the review checklist, cite the file and line for each finding.
 ```
 
 So the row is real, the assertion is right, and the correct action is **none** — do not
-touch the manifest. A baseline that failed here would mean the case is leak-saturated
+touch the manifest. A baseline that *passed* here would mean the case is leak-saturated
 (the answer is echo-able from the prompt), which is the *opposite* problem.
 
 ## Three diagnoses that look identical in the queue

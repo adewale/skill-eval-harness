@@ -194,7 +194,9 @@ hides the signal:
 
 - **Lift**: `with_skill` minus `without_skill` per case. No lift means the case does not
   discriminate; add a harder fixture or an artifact-level check.
-- **Saturated**: both arms pass everything. Weak evidence, though not a skill failure.
+- **Saturated**: every `with_skill` run passes. Weak evidence of lift, though not a skill
+  failure; when the baseline passes everything too, the case is base-saturated and
+  measures nothing.
 - **Flaky**: repeated runs disagree. Investigate before trusting the number.
 - **With-skill-failed**: the skill made things worse. This is the highest-priority flag.
 - **Missing output**: not measured, which differs from measured-and-failed. Excluded from
