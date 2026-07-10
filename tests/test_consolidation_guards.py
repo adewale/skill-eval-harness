@@ -300,6 +300,9 @@ class PackagingWorkflowTests(unittest.TestCase):
         pre_publish = text[:publish_index]
         self.assertIn("pip install dist/*.whl", pre_publish)
         self.assertIn("importlib.metadata.version", pre_publish)
+        self.assertIn("Verify release tag matches package version", pre_publish)
+        self.assertIn('tag != f"v{version}"', pre_publish)
+        self.assertIn("github.event.release.tag_name || github.ref", pre_publish)
         for command in ("skill-benchmark --help", "skill-pi-trigger-eval --help", "skill-trigger-matrix --help"):
             self.assertIn(command, pre_publish)
 

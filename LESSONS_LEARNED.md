@@ -386,6 +386,7 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 - Require the exact expected fixture set: one positive and one negative trigger query, each once, with no duplicate or substituted row able to satisfy the check.
 - Reject an empty agent selection. Short-circuit an agent after failed `prepare`/run/benchmark prerequisites, and place every invocation in a unique attempt directory so stale artifacts can never spend provider budget.
 - Persist `smoke.json` and all attempt artifacts. Auth/config/model failures are valuable capability findings (for example, missing `MISTRAL_API_KEY` or a small model that does not activate a skill), not results to hide or silently convert to N/A.
+- Inspect the telemetry envelope, not only pass rates. A successful provider call can have provider-reported usage/cost and no trace; in that state tool, command, file, retry, and skill-invocation measurements must remain unavailable rather than become zeros.
 
 ## 2026-07-10 — Independent audit should attack the rollback paths
 
@@ -429,7 +430,7 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 
 ## 2026-07-10 — An upgrade guide must follow the artifacts, not only the manifest
 
-**Problem:** The planned 0.6.0 release keeps manifest versions 1 and 2 compatible, but that fact alone understates the upgrade. Saved judge rows, paired results, Jetty records, trigger fixtures, Codex wrappers, and telemetry reports now cross stricter boundaries; a user could pass manifest validation and still see rejected inputs or changed denominators.
+**Problem:** The 0.6.0 release keeps manifest versions 1 and 2 compatible, but that fact alone understates the upgrade. Saved judge rows, paired results, Jetty records, trigger fixtures, Codex wrappers, and telemetry reports now cross stricter boundaries; a user could pass manifest validation and still see rejected inputs or changed denominators.
 
 **Lesson:** Package, manifest, and artifact migrations are separate operations. Release notes name what changed; an upgrade runbook must tell a user which files to preserve, which dry run to inspect, why a report can change, and how to return to the exact prior evidence.
 

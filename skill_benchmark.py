@@ -3970,8 +3970,12 @@ def write_trace_artifacts(
     # for identity/basis but must not let an explicit `source: missing` erase a
     # usable trace-normalized observation.
     envelope_input = {**(metadata or {}), **metrics}
-    if isinstance(envelope_input.get("observation_complete"), bool):
-        envelope_input["trace_observation_complete"] = envelope_input["observation_complete"]
+    # Process completion and trace completeness are separate evidence. A
+    # successful provider call with no trace can support provider usage/cost,
+    # but it cannot prove that zero tools or commands ran. Conversely, a failed
+    # process cannot promote a syntactically valid partial trace to complete.
+    if envelope_input.get("observation_complete") is False:
+        envelope_input["trace_observation_complete"] = False
     # A crash/timeout can leave a syntactically valid partial JSONL trace. Keep
     # its legacy debugging fields, but v3 must not present trace-derived usage
     # or cost as complete measurement evidence. Provider-reported blocks remain

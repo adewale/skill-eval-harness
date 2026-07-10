@@ -16,13 +16,30 @@ jobs:
     environment: pypi
 
     steps:
-      - name: Check out repository
+      - name: Check out release tag
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          if tag != f"v{version}":
+              raise SystemExit(f"release tag {tag!r} does not match package version {version!r}")
+          PY
 
       - name: Build distributions
         run: |

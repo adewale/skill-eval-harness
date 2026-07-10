@@ -63,7 +63,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 > uv tool install skill-eval-harness
 > ```
 >
-> For exact reproducibility, pin the current release: `uv tool install skill-eval-harness==0.5.1`.
+> For exact reproducibility, pin the current release: `uv tool install skill-eval-harness==0.6.0`.
 
 Run these from a skill repo that has `evals/shared-benchmark.json`:
 
@@ -116,7 +116,7 @@ skill-benchmark --help
 skill-pi-trigger-eval --help
 
 # Pin a release exactly:
-uv tool install skill-eval-harness==0.5.1
+uv tool install skill-eval-harness==0.6.0
 
 # One-shot without installing globally:
 uvx --from skill-eval-harness skill-benchmark --help
@@ -209,7 +209,7 @@ Each skill repo owns an `evals/shared-benchmark.json` manifest. Add a `harness` 
   "harness": {
     "name": "skill-eval-harness",
     "url": "https://github.com/adewale/skill-eval-harness",
-    "version": ">=0.5.1"
+    "version": ">=0.6.0"
   },
   "skill_paths": ["skills/good-pr/SKILL.md"],
   "variants": ["with_skill", "without_skill"],
