@@ -240,7 +240,8 @@ class PerModelAnalysisTests(unittest.TestCase):
         results = []
         for case_id, domain, w, n in [("c1", "docs", 1.0, 0.0), ("c2", "testing", 0.5, 0.5)]:
             for variant, rate in [("with_skill", w), ("without_skill", n)]:
-                results.append({"case_id": case_id, "variant": variant, "domain": domain, "missing_output": False,
+                results.append({"case_id": case_id, "variant": variant, "run_number": 1,
+                                "domain": domain, "missing_output": False,
                                 "execution_valid": True, "objective_pass_rate": rate, "metadata": {}})
         summary = sb.build_slice_summary(results, ["with_skill", "without_skill"])
         docs = summary["domain"]["docs"]

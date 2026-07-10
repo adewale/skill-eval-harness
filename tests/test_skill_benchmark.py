@@ -26,16 +26,20 @@ class SkillBenchmarkTests(unittest.TestCase):
         # affect ANY report view. Adding a crashed with_skill run (rate 0.0) must
         # leave the paired delta, every slice mean, and mean_rate unchanged — if a
         # view forgot the scorable predicate, the 0.0 would drag its rate down.
-        def row(variant, rate, valid=True):
-            return {"case_id": "c1", "variant": variant, "objective_pass_rate": rate,
+        def row(variant, rate, valid=True, run_number=1):
+            return {"case_id": "c1", "variant": variant, "run_number": run_number,
+                    "objective_pass_rate": rate,
                     "combined_pass_rate": rate, "missing_output": False, "execution_valid": valid,
                     "domain": "d", "success_goals": ["g"],
                     "assertions": [{"name": "a", "passed": rate >= 1.0}], "qualitative_assertions": []}
         good, base = row("with_skill", 1.0), row("without_skill", 0.0)
-        crashed = row("with_skill", 0.0, valid=False)
+        crashed = row("with_skill", 0.0, valid=False, run_number=2)
         clean, polluted = [good, base], [good, crashed, base]
         variants = ["with_skill", "without_skill"]
-        self.assertEqual(sb.build_paired_summary(polluted), sb.build_paired_summary(clean))
+        clean_paired = sb.build_paired_summary(clean)
+        polluted_paired = sb.build_paired_summary(polluted)
+        self.assertEqual(polluted_paired["absolute_delta"], clean_paired["absolute_delta"])
+        self.assertEqual(polluted_paired["pairing"]["blocked_reason_counts"], {"missing_without_skill": 1})
         self.assertEqual(sb.build_slice_summary(polluted, variants), sb.build_slice_summary(clean, variants))
         self.assertEqual(sb.mean_rate([good, crashed]), sb.mean_rate([good]))
         self.assertEqual(sb.mean_rate([good, crashed]), 1.0)   # the crash did not drag it to 0.5
@@ -417,7 +421,8 @@ class SkillBenchmarkTests(unittest.TestCase):
                     raise AssertionError("non-executable payload should not upload")
 
             records = list(sb.execute_jetty_payloads([row], client=ShouldNotCallClient()))
-            self.assertEqual(records[0]["status"], "failed")
+            self.assertEqual(records[0]["status"], "protocol_invalid")
+            self.assertEqual(records[0]["lifecycle"]["kind"], "protocol_invalid")
             self.assertIn("non-executable", records[0]["error"])
 
     def test_pi_smoke_workspace_omits_skill_for_without_skill(self):

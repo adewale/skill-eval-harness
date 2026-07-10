@@ -95,6 +95,41 @@ class PassAtKTests(unittest.TestCase):
         self.assertEqual(rel["by_variant"]["with_skill"]["all_runs_pass_rate"], 1.0)
 
 
+class ExperimentalPairingIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def row(variant, *, model="m", run_number=1, rate=1.0):
+        return {
+            "case_id": "c", "model": model, "run_number": run_number,
+            "variant": variant, "objective_pass_rate": rate,
+            "missing_output": False, "execution_valid": True,
+        }
+
+    def test_mismatched_repetition_or_model_cannot_create_lift(self):
+        for right in [
+            self.row("without_skill", run_number=2, rate=0.0),
+            self.row("without_skill", model="other", rate=0.0),
+        ]:
+            with self.subTest(right=right):
+                summary = sb.build_paired_summary([self.row("with_skill"), right])
+                self.assertIsNone(summary["absolute_delta"])
+                self.assertEqual(summary["pairing"]["eligible_pairs"], 0)
+                self.assertEqual(summary["pairing"]["blocked_pairs"], 2)
+
+    def test_duplicate_repetition_arm_fails_before_aggregation(self):
+        rows = [self.row("with_skill"), self.row("with_skill"), self.row("without_skill", rate=0.0)]
+        with self.assertRaisesRegex(ValueError, "duplicate experimental arm"):
+            sb.build_paired_summary(rows)
+
+    def test_unmatched_arm_is_not_averaged_into_reliability(self):
+        rows = [
+            self.row("with_skill", run_number=1), self.row("without_skill", run_number=1, rate=0.0),
+            self.row("with_skill", run_number=2, rate=0.0),
+        ]
+        summary = sb.build_paired_reliability(rows)
+        self.assertEqual(summary["by_case"]["c@m"]["with_skill"], {"n": 1, "c": 1})
+        self.assertEqual(summary["pairing"]["blocked_pairs"], 1)
+
+
 class PairedReliabilityLiftTests(unittest.TestCase):
     """G6 — paired with_skill − without_skill lift on pass@k / pass^k, the sliver
     of the reliability item (#5) that build_reliability leaves per-arm."""
@@ -103,7 +138,8 @@ class PairedReliabilityLiftTests(unittest.TestCase):
     def _arm(case_id, variant, n, c, model=None):
         rows = []
         for i in range(n):
-            r = {"case_id": case_id, "variant": variant, "objective_pass_rate": 1.0 if i < c else 0.0}
+            r = {"case_id": case_id, "variant": variant, "run_number": i + 1,
+                 "objective_pass_rate": 1.0 if i < c else 0.0}
             if model is not None:
                 r["model"] = model
             rows.append(r)

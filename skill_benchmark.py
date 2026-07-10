@@ -38,8 +38,10 @@ from typing import Any, Iterable
 
 import yaml
 import telemetry as telemetry_domain
+import experimental_pairs as pair_domain
 
 from judge_verdict import BooleanVerdict, ConsensusVerdict, validated_result_row, verdict_fields, verdict_from_dict
+from jetty_contracts import JettyObservation, ProtocolInvalid, lifecycle_from_status
 from trace_contracts import EventState, event_is_completed, parse_event_state
 from trigger_contracts import (
     InvocationOutcome,
@@ -2314,14 +2316,17 @@ class JettyClient:
         last: dict[str, Any] = {}
         while time.time() <= deadline:
             last = self._json_request("GET", path)
-            status = str(last.get("status", last.get("state", "unknown"))).lower()
-            if status in JETTY_TERMINAL_SUCCESS | JETTY_TERMINAL_FAILURE:
-                return last
-            if status not in JETTY_PENDING:
-                last["status"] = status or "unknown"
+            lifecycle = lifecycle_from_status(last.get("status", last.get("state")), error=last.get("error"))
+            if lifecycle.terminal:
+                last["provider_status"] = lifecycle.raw_status
+                last["status"] = lifecycle.status
+                last["lifecycle"] = lifecycle.to_dict()
                 return last
             time.sleep(poll_interval_s)
-        last["status"] = "timeout"
+        lifecycle = lifecycle_from_status("timeout")
+        last["provider_status"] = last.get("status", last.get("state"))
+        last["status"] = lifecycle.status
+        last["lifecycle"] = lifecycle.to_dict()
         return last
 
 
@@ -2329,12 +2334,14 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
     for row in payloads:
         harness = row.get("harness", {})
         if harness.get("executable") is False:
+            lifecycle = ProtocolInvalid("", "payload is non-executable; missing hidden prompt content or dry-run placeholder")
             yield {
                 "harness": harness,
-                "status": "failed",
+                "status": lifecycle.status,
+                "lifecycle": lifecycle.to_dict(),
                 "trajectory_id": None,
                 "jetty": row.get("jetty_request", {}).get("jetty", {}),
-                "error": "payload is non-executable; missing hidden prompt content or dry-run placeholder",
+                "error": lifecycle.reason,
                 "artifacts": [],
             }
             continue
@@ -2358,16 +2365,12 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
             if not trajectory_id:
                 raise RuntimeError(f"Jetty submit response did not include trajectory_id: {submission}")
             trajectory = client.poll(collection, task_name, trajectory_id, timeout_s=timeout_s, poll_interval_s=poll_interval_s)
-            status = str(trajectory.get("status", trajectory.get("state", "unknown"))).lower()
-            if status in JETTY_TERMINAL_SUCCESS:
-                normalized_status = "completed"
-            elif status in JETTY_TERMINAL_FAILURE:
-                normalized_status = "failed" if status != "timeout" else "timeout"
-            else:
-                normalized_status = "unknown"
+            lifecycle = lifecycle_from_status(
+                trajectory.get("status", trajectory.get("state")), error=trajectory.get("error"))
             yield {
                 "harness": harness,
-                "status": normalized_status,
+                "status": lifecycle.status,
+                "lifecycle": lifecycle.to_dict(),
                 "trajectory_id": trajectory_id,
                 "jetty": {
                     "collection": collection,
@@ -2383,9 +2386,11 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
                 "artifacts": trajectory.get("artifacts", trajectory.get("outputs", [])) if isinstance(trajectory, dict) else [],
             }
         except Exception as exc:
+            lifecycle = lifecycle_from_status("failed", error=exc)
             yield {
                 "harness": harness,
-                "status": "failed",
+                "status": lifecycle.status,
+                "lifecycle": lifecycle.to_dict(),
                 "trajectory_id": trajectory_id,
                 "jetty": {
                     "collection": collection,
@@ -2530,6 +2535,8 @@ def jsonl_from_records(records: list[dict[str, Any]]) -> str:
 
 
 def normalized_jetty_metadata(record: dict[str, Any], *, success: bool) -> dict[str, Any]:
+    observation = JettyObservation.from_record(record, has_output=success)
+    success = observation.success
     jetty = record.get("jetty", {}) if isinstance(record.get("jetty"), dict) else {}
     trajectory = record.get("trajectory", {}) if isinstance(record.get("trajectory"), dict) else {}
     usage = trajectory.get("usage", {}) if isinstance(trajectory.get("usage"), dict) else {}
@@ -2552,7 +2559,10 @@ def normalized_jetty_metadata(record: dict[str, Any], *, success: bool) -> dict[
         "total_tool_calls": tool_calls,
         "errors_encountered": 0 if success else 1,
         "returncode": 0 if success else 1,
-        "timed_out": record.get("status") == "timeout",
+        "timed_out": observation.timed_out,
+        "jetty_lifecycle": observation.lifecycle.kind,
+        **({"jetty_protocol_error": observation.lifecycle.reason}
+           if isinstance(observation.lifecycle, ProtocolInvalid) else {}),
         "jetty_trajectory_id": trajectory_id,
         "jetty_collection": collection,
         "jetty_task": task,
@@ -2588,7 +2598,9 @@ def import_jetty_results(args: argparse.Namespace) -> int:
         if not artifacts and isinstance(record.get("trajectory"), dict):
             artifacts = record["trajectory"].get("artifacts", record["trajectory"].get("outputs", [])) or []
         artifacts = [a for a in artifacts if isinstance(a, dict)]
-        success = str(record.get("status", "")).lower() == "completed" and find_output_artifact(artifacts) is not None
+        observation = JettyObservation.from_record(
+            record, has_output=find_output_artifact(artifacts) is not None)
+        success = observation.success
         if success:
             for artifact in artifacts:
                 write_artifact(base, artifact)
@@ -4553,7 +4565,10 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
     RunnerOutcome; this loop owns PreparedTask handling, workspace construction,
     provenance, and the run-output contract."""
     for task in tasks:
-        pt = PreparedTask.from_row(task)
+        try:
+            pt = PreparedTask.from_row(task)
+        except (TypeError, ValueError) as exc:
+            die(f"invalid prepared task: {exc}")
         row_model = task.get("model") or model
         base = safe_child_path(runs, pt.run_dir)
         base.mkdir(parents=True, exist_ok=True)
@@ -6927,19 +6942,29 @@ def build_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
     return {"by_case_variant": by_case_variant, "by_variant": by_variant_summary}
 
 
+def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> pair_domain.PairConstruction:
+    def eligibility(row: dict[str, Any]) -> tuple[bool, str | None]:
+        if not scorable_run(row):
+            return False, "unscorable_arm"
+        value = row.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return False, f"missing_{key}"
+        return True, None
+    return pair_domain.pairs_from_rows(results, population="answer", eligibility=eligibility)
+
+
 def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pass_rate") -> tuple[list[float], list[float], list[dict[str, Any]]]:
-    """Per-case paired with/without rates over one pairing population.
-    ResultSet.by_case_variant() applies the scorable predicate and the grouping
-    for us — the view cannot forget to exclude infra failures."""
-    by_case_variant = ResultSet(results).by_case_variant()
+    """Per-case rates computed only from validated repetition-level pairs."""
+    construction = _metric_pair_construction(results, key)
+    grouped: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    for pair in construction.pairs:
+        grouped[pair.key.case_id].append(pair)
     paired_with_rates: list[float] = []
     paired_without_rates: list[float] = []
     negative_cases: list[dict[str, Any]] = []
-    for case_id, by_variant in sorted(by_case_variant.items()):
-        w = mean_rate(by_variant.get("with_skill", []), key)
-        n = mean_rate(by_variant.get("without_skill", []), key)
-        if w is None or n is None:
-            continue
+    for case_id, pairs in sorted(grouped.items()):
+        w = statistics.mean(float(pair.with_skill.payload[key]) for pair in pairs)
+        n = statistics.mean(float(pair.without_skill.payload[key]) for pair in pairs)
         paired_with_rates.append(w)
         paired_without_rates.append(n)
         if w < n:
@@ -6957,20 +6982,17 @@ def _reliability_counts(rows: list[dict[str, Any]]) -> tuple[int, int]:
 
 
 def paired_case_counts(results: list[dict[str, Any]]) -> list[tuple[str, tuple[int, int], tuple[int, int]]]:
-    """Per-case paired (n, c) success counts for with_skill vs without_skill —
-    the integer companion to paired_case_rates. pass@k / pass^k need the raw
-    success count c, which a mean rate cannot recover, so this returns counts.
-    Same scorable-filtered grouping (ResultSet.by_case_variant) and success
-    predicate as build_reliability; a case is dropped unless both arms have at
-    least one scorable run."""
-    by_case_variant = ResultSet(results).by_case_variant()
+    """Per-case success counts over the same validated repetition-level pairs."""
+    construction = _metric_pair_construction(results, "objective_pass_rate")
+    grouped: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    for pair in construction.pairs:
+        grouped[pair.key.case_id].append(pair)
     pairs: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
-    for case_id, by_variant in sorted(by_case_variant.items()):
-        nw, cw = _reliability_counts(by_variant.get("with_skill", []))
-        nn, cn = _reliability_counts(by_variant.get("without_skill", []))
-        if nw == 0 or nn == 0:
-            continue
-        pairs.append((str(case_id), (nw, cw), (nn, cn)))
+    for case_id, matched in sorted(grouped.items()):
+        nw = nn = len(matched)
+        cw = sum(1 for pair in matched if float(pair.with_skill.payload["objective_pass_rate"]) >= 1.0 - 1e-12)
+        cn = sum(1 for pair in matched if float(pair.without_skill.payload["objective_pass_rate"]) >= 1.0 - 1e-12)
+        pairs.append((case_id, (nw, cw), (nn, cn)))
     return pairs
 
 
@@ -7030,6 +7052,7 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         graded_with.extend(gw)
         graded_without.extend(gn)
     out = paired_block_from_rates(all_with, all_without, all_negative)
+    out["pairing"] = _metric_pair_construction(results, "objective_pass_rate").diagnostics()
     if graded_with:
         # The graded channel (roadmap 2.2): how much better, after the binary
         # ceiling. Vetoed runs carry no graded_score, so a critical failure can
@@ -7111,6 +7134,7 @@ def build_paired_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
         pool = unlabeled if models else results
         all_pairs.extend(paired_case_counts(pool))
     out = paired_reliability_block(all_pairs)
+    out["pairing"] = _metric_pair_construction(results, "objective_pass_rate").diagnostics()
     if by_model:
         out["by_model"] = by_model
     return out
@@ -7686,15 +7710,24 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
     by_case = group_spend(rows, lambda r: r["case_id"])
     paired_cost_delta: dict[str, Any] = {}
     deltas_by_currency: dict[str, list[float]] = collections.defaultdict(list)
+    cost_pairing = pair_domain.pairs_from_rows(rows, population="answer")
+    complete_by_case: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    blocked_by_case: dict[str, list[str]] = collections.defaultdict(list)
+    for pair in cost_pairing.pairs:
+        complete_by_case[pair.key.case_id].append(pair)
+    for blocked_pair in cost_pairing.blocked:
+        blocked_by_case[blocked_pair.key.case_id].append(blocked_pair.reason)
     for case_id in by_case:
-        with_rows = {(r.get("model"), r.get("run_number", 1)): r for r in rows if r["case_id"] == case_id and r["variant"] == "with_skill"}
-        without_rows = {(r.get("model"), r.get("run_number", 1)): r for r in rows if r["case_id"] == case_id and r["variant"] == "without_skill"}
-        comparisons = [telemetry_domain.compare_cost_pair(
-            _cost_measurement(with_rows[key]), _cost_measurement(without_rows[key]),
-            left_scorable=scorable_run(with_rows[key]), right_scorable=scorable_run(without_rows[key]))
-                       for key in sorted(set(with_rows) & set(without_rows), key=str)]
+        comparisons = []
+        for pair in complete_by_case.get(case_id, []):
+            with_row = pair.with_skill.payload
+            without_row = pair.without_skill.payload
+            comparisons.append(telemetry_domain.compare_cost_pair(
+                _cost_measurement(with_row), _cost_measurement(without_row),
+                left_scorable=scorable_run(with_row), right_scorable=scorable_run(without_row)))
         comparable = [c for c in comparisons if c.availability == telemetry_domain.COMPARABLE]
-        blocked = [str(c.reason) for c in comparisons if c.availability == telemetry_domain.BLOCKED]
+        blocked = blocked_by_case.get(case_id, []) + [
+            str(c.reason) for c in comparisons if c.availability == telemetry_domain.BLOCKED]
         if comparable:
             by_currency: dict[str, list[Any]] = collections.defaultdict(list)
             for comparison in comparable:
@@ -7720,9 +7753,7 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
                 }
         else:
             paired_cost_delta[case_id] = {
-                "availability": "blocked",
-                "delta": None,
-                "eligible_pairs": 0,
+                "availability": "blocked", "delta": None, "eligible_pairs": 0,
                 "blocked_pairs": len(blocked),
                 "blocked_reason_counts": dict(collections.Counter(blocked or ["missing_pair"])),
             }
@@ -7735,6 +7766,7 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
         "by_variant": by_variant,
         "by_case": by_case,
         "paired_cost_delta": paired_cost_delta,
+        "pairing": cost_pairing.diagnostics(),
         # A bare paired delta is USD-only; foreign-currency results retain their
         # own units rather than being silently labelled dollars.
         "mean_paired_cost_delta": round(statistics.mean(deltas_by_currency["USD"]), 6) if deltas_by_currency.get("USD") else None,
@@ -9168,21 +9200,26 @@ def profile_skill_report(
 
 
 def paired_run_bases(runs: Path, case_id: str, with_variant: str, without_variant: str):
-    """Yield model-aware paired runs without overwriting same-number models."""
+    """Yield run bases through the same validated identity constructor as reports."""
     for model, model_root in discover_case_model_roots(runs, case_id, [with_variant, without_variant]):
         with_dir = model_root / with_variant
         without_dir = model_root / without_variant
         with_runs = discover_run_bases_under(with_dir) if with_dir.exists() else []
         without_runs = discover_run_bases_under(without_dir) if without_dir.exists() else []
-        with_by_run = {run_number: base for run_number, base in with_runs}
-        without_by_run = {run_number: base for run_number, base in without_runs}
-        if len(with_runs) == len(without_runs) == 1 and with_runs[0][0] == without_runs[0][0]:
-            # Preserve the historical one-off pairing fallback only when the
-            # recorded repetition key agrees on both arms.
-            yield model, with_runs[0][0], with_runs[0][1], without_runs[0][1]
-            continue
-        for run_number in sorted(set(with_by_run) | set(without_by_run)):
-            yield model, run_number, with_by_run.get(run_number), without_by_run.get(run_number)
+        arms = []
+        bases: dict[tuple[int, str], Path] = {}
+        for arm, discovered in (("with_skill", with_runs), ("without_skill", without_runs)):
+            for run_number, base in discovered:
+                key = pair_domain.ExperimentalPairKey(case_id, model, run_number, "answer")
+                bases[(run_number, arm)] = base
+                arms.append(pair_domain.ExperimentalArm(key, arm, base))
+        construction = pair_domain.construct_pairs(arms)
+        for pair in construction.pairs:
+            yield model, pair.key.run_number, pair.with_skill.payload, pair.without_skill.payload
+        for blocked in construction.blocked:
+            yield (model, blocked.key.run_number,
+                   bases.get((blocked.key.run_number, "with_skill")),
+                   bases.get((blocked.key.run_number, "without_skill")))
 
 
 def paired_token_overhead_report(
