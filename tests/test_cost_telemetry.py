@@ -197,6 +197,38 @@ class RunnerStampTests(unittest.TestCase):
         self.assertEqual(empty_usage, {"source": "missing"})
         self.assertEqual(empty_cost, {"source": "missing"})
 
+    def test_pi_terminal_usage_is_not_counted_once_per_lifecycle_event(self):
+        usage = {"input": 10, "output": 3, "cacheRead": 2, "totalTokens": 15,
+                 "cost": {"total": 0.015}}
+        assistant = {"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": usage}
+        records = [
+            {"type": "session"}, {"type": "agent_start"},
+            {"type": "message_end", "message": assistant},
+            {"type": "turn_end", "message": assistant},
+            {"type": "agent_end", "messages": [assistant]},
+        ]
+        stream = "\n".join(json.dumps(record) for record in records)
+        normalized_usage, normalized_cost = sb.stream_usage_and_cost(stream, source="pi")
+        self.assertEqual(normalized_usage["total_tokens"], 15)
+        self.assertEqual(normalized_cost["total_cost"], 0.015)
+        _, metrics = sb.normalize_trace_records(records, source="pi")
+        self.assertEqual(metrics["total_tokens"], 15)
+        self.assertEqual(metrics["tool_calls"], 0)
+
+    def test_non_pi_lifecycle_records_keep_their_existing_delta_semantics(self):
+        usage = {"input": 10, "output": 3, "totalTokens": 15}
+        assistant = {"role": "assistant", "usage": usage}
+        records = [
+            {"type": "message_end", "message": assistant},
+            {"type": "turn_end", "message": assistant},
+            {"type": "agent_end", "messages": [assistant]},
+        ]
+        stream = "\n".join(json.dumps(record) for record in records)
+        normalized_usage, _ = sb.stream_usage_and_cost(stream, source="codex")
+        self.assertEqual(normalized_usage["total_tokens"], 30)
+        _, metrics = sb.normalize_trace_records(records, source="codex")
+        self.assertEqual(metrics["total_tokens"], 30)
+
     def test_stream_usage_and_cost_tolerates_non_finite_json_numbers(self):
         usage, cost = sb.stream_usage_and_cost('{"type":"result","usage":{"input_tokens":1e999},"total_cost_usd":NaN}')
         self.assertEqual(usage, {"source": "missing"})

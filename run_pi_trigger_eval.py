@@ -33,6 +33,7 @@ from skill_benchmark import (
     load_manifest_source,
     materialize_trigger_ablation,
     mount_skill_tree,
+    pi_stream_terminal_error,
     repo_root_for_manifest,
     run_argv_with_timeout,
     safe_trace_label,
@@ -86,6 +87,21 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
     return mount_skill_tree(Path(tree), skills_dir), {"mode": "baseline", "skill_tree_hash": canonical_skill_tree_hash(repo_root, manifest)}
 
 
+def pi_terminal_error(raw_text: str) -> str | None:
+    """Compatibility name for the shared Pi stream terminal-error parser."""
+    return pi_stream_terminal_error(raw_text)
+
+
+def pi_invoke_result(run: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Pi's process result into a trustworthy observation state."""
+    result = dict(run)
+    provider_error = pi_terminal_error(str(result.get("stdout") or ""))
+    if provider_error:
+        result["provider_error"] = provider_error
+        result["observation_complete"] = False
+    return result
+
+
 def pi_argv(query: str, model: str | None = None) -> list[str]:
     """THE Pi CLI invocation for trigger evals — isolated JSON-stream mode with
     read-only tools. The trigger matrix's Pi adapter uses this same argv, so the
@@ -125,13 +141,13 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
         copied, abl_prov = copy_skill_to_config(manifest_path, manifest, config_dir, ablation_id=ablation)
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(config_dir)
-        run = run_argv_with_timeout(pi_argv(query, model), cwd=config_dir, env=env, timeout=timeout)
+        run = pi_invoke_result(run_argv_with_timeout(pi_argv(query, model), cwd=config_dir, env=env, timeout=timeout))
         stdout, stderr = run["stdout"], run["stderr"]
         returncode, timed_out, elapsed_ms = run["returncode"], run["timed_out"], run["elapsed_ms"]
         triggered, evidence = detect_trigger(stdout, copied)
         # Trigger runs now persist token/cost telemetry like the answer paths
         # (issue #21): parsed off the same Pi JSON stream the detector reads.
-        usage_normalized, cost_normalized = stream_usage_and_cost(stdout)
+        usage_normalized, cost_normalized = stream_usage_and_cost(stdout, source="pi")
         is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
         # The materialized ablation's provenance goes through Provenance (one
         # schema); the canonical (parent) tree hash is recorded on BOTH arms under
@@ -154,7 +170,7 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             # autonomous-trigger outcome. The harness does not yet pair baseline vs
             # ablation here, so do not read a "pass" as a provenance-verified
             # causal ablation result (unlike the answer-population path).
-            "pass": returncode == 0 and triggered == should_trigger,
+            "pass": bool(run.get("observation_complete", returncode == 0 and not timed_out)) and triggered == should_trigger,
             "measurement": EvidenceClass.RAW_MEASUREMENT.value,
             "elapsed_ms": elapsed_ms,
             "observation_complete": bool(run.get("observation_complete", returncode == 0 and not timed_out)),
@@ -167,6 +183,8 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             "skill_tree_hash": skill_tree_hash,
             "stderr": stderr[-1000:] if stderr else "",
         }
+        if isinstance(run.get("provider_error"), str):
+            result["provider_error"] = run["provider_error"]
         if trace_dir is not None:
             write_trigger_trace_artifacts(trace_dir, stdout, result)
         return result

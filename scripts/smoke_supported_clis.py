@@ -25,7 +25,8 @@ DEFAULT_MODELS = {
     "claude": os.environ.get("SMOKE_CLAUDE_MODEL", "haiku"),
     "codex": os.environ.get("SMOKE_CODEX_MODEL", "gpt-5.4-mini"),
     "vibe": os.environ.get("SMOKE_VIBE_MODEL", "devstral-small-latest"),
-    "pi": os.environ.get("SMOKE_PI_MODEL", "mistral/ministral-3b-latest"),
+    # The Pi default uses the authenticated Codex provider; override if unavailable.
+    "pi": os.environ.get("SMOKE_PI_MODEL", "openai-codex/gpt-5.4-mini"),
 }
 ANSWER_AGENTS = ("claude", "codex", "vibe")
 SMOKE_TRIGGER_EXPECTATIONS = (

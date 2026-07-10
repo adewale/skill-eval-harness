@@ -31,6 +31,9 @@ class SupportedCliSmokeTests(unittest.TestCase):
             self.assertEqual({case["id"] for case in triggers}, {"trig-pos-review-change", "trig-neg-unrelated-question"})
             self.assertTrue((manifest_path.parent.parent / "skills" / "demo" / "SKILL.md").exists())
 
+    def test_pi_default_uses_the_codex_provider(self):
+        self.assertEqual(smoke.DEFAULT_MODELS["pi"], "openai-codex/gpt-5.4-mini")
+
     def test_trigger_assessment_requires_the_exact_positive_and_negative_fixture_rows(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pi-trigger.json"

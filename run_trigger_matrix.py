@@ -84,13 +84,14 @@ from skill_benchmark import (
     write_json,
     write_trace_artifacts,
 )
-from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_manifest, pi_argv, skill_name_from_manifest, seed_config_dir, validate_trigger_rows
+from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_manifest, pi_argv, pi_invoke_result, skill_name_from_manifest, seed_config_dir, validate_trigger_rows
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
 DEFAULT_CODEX_CMD = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules"
 INVOKE_RESULT_KEYS = ("stdout", "stderr", "returncode", "timed_out", "elapsed_ms", "observation_complete")
 INVOKE_RESULT_METADATA_KEYS = (
+    "provider_error",
     "config_isolated", "config_isolation_warning",
     "codex_home_files_copied", "codex_home_outside_workdir",
     "vibe_env_file_copied", "vibe_home_outside_workdir",
@@ -397,7 +398,7 @@ class PiAdapter(AgentAdapter):
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(workspace / ".pi-config")
-        return self._run_argv(pi_argv(query, model), cwd=workspace, env=env, timeout=timeout)
+        return pi_invoke_result(self._run_argv(pi_argv(query, model), cwd=workspace, env=env, timeout=timeout))
 
 
 class VibeAdapter(AgentAdapter):
@@ -551,7 +552,7 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
     redacted_stderr = redact_sensitive_text(str(result["stderr"] or ""), secrets)
     telemetry_error = None
     try:
-        usage, cost = stream_usage_and_cost(stdout)
+        usage, cost = stream_usage_and_cost(stdout, source=adapter.name)
     except Exception as exc:
         telemetry_error = f"{type(exc).__name__}: {exc}"
         usage, cost = {"source": "missing"}, {"source": "missing"}
