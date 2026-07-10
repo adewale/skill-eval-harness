@@ -443,13 +443,16 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 
 ## 2026-07-10 — Evidence channels form a product, not a success ladder
 
-**Problem:** A successful subprocess was allowed to certify an absent trace. The same audit found the pattern elsewhere: malformed Claude bytes became an answer, Vibe tool events became an answer, failed Jetty events became complete operation telemetry, one observed judge cost became complete panel spend, and an empty events file became command coverage.
+**Problem:** A successful subprocess was allowed to certify an absent trace. The same audit found the pattern elsewhere: malformed Claude bytes became an answer, Vibe tool events became an answer, failed Jetty events became complete operation telemetry, one observed judge cost became complete panel spend, an empty events file became command coverage, and internally contradictory budget-history fields could establish an estimate.
 
-**Lesson:** Process exit, provider response, trace, and artifact durability are independent evidence channels. Success on one axis cannot upgrade another. A decision that needs several channels must derive its eligibility from their product.
+**Lesson:** Process exit, provider response, trace, artifact durability, and aggregate coverage are independent evidence channels. Success on one axis cannot upgrade another. A decision that needs several channels must derive its eligibility from their product.
 
 **Rule:**
-- Represent each channel explicitly as complete, incomplete, or unknown. Derive operation evidence only when process, provider response, and trace are all complete.
+- Represent process, provider-response, trace, and artifact-set state explicitly as complete, incomplete, or unknown. Derive operation evidence only when process, provider response, and trace are all complete.
 - Preserve actual process facts. A zero-exit protocol failure keeps return code zero and carries a separate failed provider-response state.
-- Reserve derived evidence keys so caller extras cannot overwrite them. Parse malformed provider output into diagnostics, never into an answer/verdict fallback.
-- Commit run artifacts with a last-written digest inventory. New readers require a valid commit marker before treating the artifact set as complete.
-- Test the full finite state product and the monotonicity rule: changing one axis to complete must not change another axis or make a multi-axis claim eligible by itself.
+- Treat legacy generic completion as provider-response evidence only. Without explicit process or trace facts, those channels stay unknown; compatibility is not permission to invent provenance.
+- Reserve derived evidence keys so caller extras cannot overwrite them. Parse malformed provider output into diagnostics, never into an answer/verdict fallback. A reporting mode may retain diagnostics, but it must not let a schema-invalid verdict pass.
+- Keep partial aggregates partial. One observed panel cost is a known subtotal, not the panel total; a cached scalar may establish a budget estimate only when its aggregate value, observed count, and coverage agree.
+- Build run artifacts in a staging directory, write the digest inventory last, and atomically replace the destination. Restore the prior committed run if installation fails; stale or mixed-generation files must never look like one durable observation.
+- Verify the producer-owned inventory when reading. Files added later by downstream grading do not retroactively invalidate the committed producer set, while legacy directories without a marker remain readable with artifact-set state unknown.
+- Test the full finite-state product and the monotonicity rule: changing one axis to complete must not change another axis or make a multi-axis claim eligible by itself. Add provider-shaped malformed-wire, tamper, stale-file, and fault-injected rollback cases—not only happy paths.
