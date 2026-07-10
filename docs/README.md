@@ -54,6 +54,7 @@ the [README](../README.md#commands) carries the grouped index.
 Design records for shipped or in-flight subsystems:
 [`skill-ablation-spec.md`](skill-ablation-spec.md),
 [`trace-aware-eval-spec.md`](trace-aware-eval-spec.md),
+[`telemetry-availability-and-comparability-spec.md`](telemetry-availability-and-comparability-spec.md),
 [`eval-framework-roadmap-spec.md`](eval-framework-roadmap-spec.md),
 [`jetty-support-spec.md`](jetty-support-spec.md), and
 [`agent-backend-interface-spec.md`](agent-backend-interface-spec.md).

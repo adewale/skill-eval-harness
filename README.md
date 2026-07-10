@@ -178,8 +178,9 @@ skill-benchmark --help
 | `docs/academic-grounding.md` | The research constructs behind the harness's terms, with citations; meshes the workflow, measurement, and theory layers. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
 | `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
+| `docs/telemetry-availability-and-comparability-spec.md` | Proposed system-wide contract and implementation plan for measured-zero, unavailable, partial, and blocked telemetry/comparisons. |
 | `docs/agent-backend-interface-spec.md` | Draft spec for turning Claude/Codex/Gemini/Vibe support into a shared agent backend interface: parity matrix, judge backends, trigger adapters, telemetry, and tool replay. |
-| `docs/agent-cli-control-plane.md` | The shared native-CLI control plane: process invocation, config isolation, tool policy, final-answer channels, schemas, telemetry, and where Claude/Codex/Vibe intentionally differ. |
+| `docs/agent-cli-control-plane.md` | The shared native-CLI control plane: process invocation, config isolation, tool policy, final-answer channels, schemas, telemetry, where Claude/Codex/Vibe intentionally differ, and the cheap comprehensive live-smoke command. |
 | `docs/agent-cli-tradeoffs.md` | Claude/Codex/Vibe trade-offs: which CLI surfaces are strong or weak, Vibe-only gaps, and what missing schema/telemetry/prompt controls mean for eval reports. |
 | `docs/agent-parity.md` | The per-agent support matrix: which answer/judge/trigger surfaces Claude, Codex, Vibe, Pi, Jetty, subagent, and the stub each cover, with live-smoke status per backend. |
 | `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
@@ -188,6 +189,7 @@ skill-benchmark --help
 | `TODO.md` | Status tracker: the eval-framework roadmap (implemented, bar two `(TODO-native)` items), the remaining Jetty adapter work (streaming/concurrency, live API validation, judge export, per-variant overrides, the `swap:<id>` ablation follow-on), the agent-backend parity follow-ups (Gemini CLI open; Vibe done), and the migration/user-journey doc backlog. |
 | `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two answer-path materialized ablations, one discovery ablation for trigger examples, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per answer-path ablation; exercised by `tests/test_example_demo.py`. Also carries should-fire/should-not-fire trigger cases for `skill-trigger-matrix` (offline via `--agent stub`; live smoke via `RUN_TRIGGER_SMOKE=1`). Start here. |
 | `examples/adewale-workspace/` | Adewale-specific Pi smoke runner and cross-repo aggregate report (the trigger runners are the top-level `skill-pi-trigger-eval` and `skill-trigger-matrix`). |
+| `scripts/smoke_supported_clis.py` | Opt-in, low-cost smoke across native Claude/Codex/Vibe answer paths and Pi trigger path using a disposable demo-skill eval. |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
 
 ## Manifest format
@@ -444,8 +446,9 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 
 | Command | What it does |
 |---|---|
-| `skill-benchmark cost-summary` | Suite cost ledger: coverage, totals, by variant/case/runner, top spenders, cost-quality findings. |
-| `skill-benchmark token-overhead` | Static footprint vs. runtime lift-per-token and lift-per-dollar. |
+| `skill-benchmark cost-summary` | Suite cost ledger: complete/partial/unavailable totals, coverage, by variant/case/runner, top spenders, cost-quality findings. |
+| `skill-benchmark migrate-telemetry` | Dry-run or atomically upgrade saved run artifacts to the availability-aware telemetry v3 envelope. |
+| `skill-benchmark token-overhead` | Static footprint vs. runtime lift-per-token and lift-per-dollar, with blocked reasons for incompatible pairs. |
 | `skill-benchmark profile-skill` | `SKILL.md`/reference token counts, module counts, oversize warnings (static, offline). |
 
 **Scale, trend, iteration**
@@ -486,6 +489,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, validation commands, and eval-safety rules. The short version:
 
 ```bash
+pip install -e ".[test]"
 python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```
@@ -528,6 +532,7 @@ skill-eval-harness/
 ## Development
 
 ```bash
+pip install -e ".[test]"
 python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```

@@ -424,7 +424,7 @@ class VibeAdapter(AgentAdapter):
                                            max_turns=self.max_turns)
             except ValueError as exc:
                 return {"stdout": "", "stderr": str(exc), "returncode": 127, "timed_out": False,
-                        "elapsed_ms": 0, "observation_complete": False,
+                        "elapsed_ms": None, "observation_complete": False,
                         "config_isolated": True,
                         "vibe_env_file_copied": env_meta.get("vibe_env_file_copied", False),
                         "vibe_home_outside_workdir": True}
@@ -468,7 +468,7 @@ class StubAdapter(AgentAdapter):
                     {"type": "tool_use", "name": "Read", "input": {"file_path": str(skill_md)}}]}}))
         lines.append(json.dumps({"type": "result", "subtype": "success"}))
         return {"stdout": "\n".join(lines) + "\n", "stderr": "", "returncode": 0, "timed_out": False,
-                "elapsed_ms": 0, "observation_complete": True}
+                "elapsed_ms": None, "observation_complete": True}
 
 
 ADAPTERS: dict[str, type[AgentAdapter]] = {"claude": ClaudeAdapter, "codex": CodexAdapter, "pi": PiAdapter, "vibe": VibeAdapter, "stub": StubAdapter}
@@ -511,6 +511,7 @@ def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger
                        exc: BaseException, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     message = f"{type(exc).__name__}: {exc}"
     row: dict[str, Any] = {
+        "population": "trigger",
         "agent": agent,
         "model": model,
         "query": query,
@@ -520,7 +521,7 @@ def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger
         "observation_complete": False,
         "returncode": None,
         "timed_out": False,
-        "elapsed_ms": 0,
+        "elapsed_ms": None,
         "evidence": [],
         "usage_normalized": {"source": "missing"},
         "cost_normalized": {"source": "missing"},
@@ -556,6 +557,7 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
         usage, cost = {"source": "missing"}, {"source": "missing"}
     observation_complete = bool(result["observation_complete"])
     row = {
+        "population": "trigger",
         "agent": adapter.name,
         "model": model,
         "query": query,
@@ -581,6 +583,7 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
     if trace_dir is not None:
         row["trace_dir"] = str(trace_dir)
         trace_metadata = {
+            "population": "trigger",
             "provider": adapter.name,
             "model": model,
             "returncode": row["returncode"],

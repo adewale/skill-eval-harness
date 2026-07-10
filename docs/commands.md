@@ -312,19 +312,19 @@ Probes a judge's stability before you trust its verdicts (model-touching; opt-in
 
 ## Cost telemetry (tokens and dollars)
 
-Cost is a first-class eval signal (issue #21). Every runner path — Pi smoke, Pi trigger, `run-codex`, `run-claude`, `run-subagent`, the judge wrapper, and the Jetty importer — writes two normalized blocks into run metadata beside the raw provider fields (which are preserved unchanged for audit):
+Cost is a first-class eval signal. Every runner path — Pi smoke, Pi trigger, `run-codex`, `run-claude`, `run-subagent`, the judge wrapper, and the Jetty importer — writes legacy-compatible normalized blocks beside raw provider fields **and** an availability-aware telemetry v3 envelope into both `metadata.json` and `metrics.json`.
 
 - `usage_normalized`: alias-normalized token counts (`input`/`prompt_tokens`/`totalTokens`/cache/reasoning variants) with a `source` — `provider_reported` (relayed from the provider), `trace_normalized` (summed from normalized trace events), `estimated`, `missing`, or `not_applicable`.
-- `cost_normalized`: dollar cost with `currency`, per-part costs when reported, and a `source` — `provider_reported`, `trace_normalized`, and `price_table_estimated` are never conflated, and **missing cost is marked `missing`, never written as zero**. Provider-reported blocks always beat trace-derived ones; offline/stub runs carry explicit `missing` markers.
+- `cost_normalized`: legacy-compatible dollar block with `currency`, per-part costs, and a source. Its v3 counterpart separates provenance (`provider_reported`, `trace_normalized`, `price_table_estimated`, or `legacy_unverified`) from availability (`available`, `unavailable`, or `not_applicable`). A measured `$0` is available; unknown cost is never zero.
 
 Consumers of the blocks:
 
-- `benchmark`/`aggregate` emit `cost_summary`: coverage (how many runs actually carried telemetry), operational totals (**every run counts here, including execution errors — a timed-out run still cost money — while quality rates keep excluding them**), per-variant token/cost stats (mean/median/p90), per-case spend, paired `with - without` cost deltas, ablation marginal cost and cost per confirmed regression, and judge spend as its own line (never folded into model-under-test cost).
+- `benchmark`/`aggregate` emit `cost_summary`: availability-aware coverage and operational totals (**every run counts here, including execution errors — a timed-out run still cost money — while quality rates keep excluding them**). A mixed set renders a partial known subtotal, not a false total. Per-variant stats, per-case spend, paired deltas, ablation marginal cost, and judge spend retain their basis/provenance.
 - `cost-summary` writes the standalone suite ledger (`--out cost-summary.json`, `--md cost-summary.md`): coverage, totals, by variant/case/runner, top expensive cases and ablation arms, and `cost_quality_findings` when a `--benchmark` report is joined.
 - `suite-run` projects spend **before any model call** from previous ledgers (`--cost-history <dir>`, per-run medians) or a static assumption (`--assumed-tokens-per-run`), and gates on `--max-estimated-tokens` / `--max-estimated-cost-usd` — failing closed when a dollar cap is set but no dollar estimate exists — unless `--allow-over-budget`.
 - `audit-manifest --runs` adds cost-quality findings above `--expensive-case-usd` (default $1): `expensive-saturated-case`, `expensive-no-lift-case`, `high-cost-judge-only-case`, `ablation-high-spend-no-structured-regression`, and `high-footprint-low-lift-skill`.
 
-Interpretation rule: `provider_reported` numbers are a direct provider envelope; `trace_normalized` reconstructs usage or cost from event streams; `missing` means the run truly carried no telemetry — fix the runner path rather than treating it as free. The keep/trim/cut walkthrough is [`is-my-skill-worth-its-tokens.md`](is-my-skill-worth-its-tokens.md).
+Interpretation rule: `provider_reported` numbers are a direct provider envelope; `trace_normalized` reconstructs usage or cost from event streams; `unavailable` means the run carried no usable telemetry — fix the runner path rather than treating it as free. Lift-per-dollar is emitted only for scorable, basis-compatible paired costs with a strictly positive incremental cost; otherwise JSON/Markdown report a blocked reason. The complete contract and migration policy are in [`telemetry-availability-and-comparability-spec.md`](telemetry-availability-and-comparability-spec.md).
 
 ```bash
 skill-benchmark cost-summary \
@@ -334,6 +334,15 @@ skill-benchmark cost-summary \
   --out cost-summary.json \
   --md cost-summary.md
 ```
+
+Upgrade existing run directories without guessing provenance:
+
+```bash
+skill-benchmark migrate-telemetry --runs ../repo/eval-runs/latest --check
+skill-benchmark migrate-telemetry --runs ../repo/eval-runs/latest
+```
+
+The first command is byte-preserving; the second atomically adds schema v3 envelopes and any missing sibling artifact. Legacy numeric values are labelled `legacy_unverified` and do not qualify for causal lift-per-dollar comparisons.
 
 ## Profile skill size and references
 

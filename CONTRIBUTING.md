@@ -11,13 +11,14 @@ uv tool install --editable .
 skill-benchmark --help
 ```
 
-The only runtime dependency is PyYAML (declared in `pyproject.toml`, used to parse skill frontmatter); install it with `pip install -e .` before running tests. CI installs the package this way.
+The only runtime dependency is PyYAML (declared in `pyproject.toml`, used to parse skill frontmatter). Install test dependencies with `pip install -e ".[test]"` before running tests; CI uses that same extra.
 
 ## Validation
 
 Run these before opening a PR:
 
 ```sh
+pip install -e ".[test]"
 python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```

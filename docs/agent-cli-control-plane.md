@@ -65,3 +65,28 @@ This is intentionally a **control-plane abstraction**, not a lowest-common-denom
 - Telemetry coverage is provider-specific and must be reported, not normalized away.
 
 The rule for future CLIs is: implement the shared contracts, but do not pretend their control surface is identical. Add a capability row, a native answer backend if possible, a trigger adapter only after autonomous skill discovery is proven, and fake/offline conformance tests for prompt transport, config isolation, final answer extraction, telemetry, and failure semantics.
+
+## Cheap comprehensive live smoke
+
+[`scripts/smoke_supported_clis.py`](../scripts/smoke_supported_clis.py) is the
+explicitly opt-in, lowest-cost integration smoke. It builds a disposable one-answer
+paired eval from the bundled demo skill, then runs the native answer path for Claude,
+Codex, and Vibe plus Pi's native trigger path (one positive and one negative trigger
+query). Each invocation creates a unique `attempt-*` child for task rows and artifacts, then
+writes the top-level `smoke.json` with that artifact path; it never deletes or reuses a
+caller-owned directory.
+
+```bash
+./.venv/bin/python scripts/smoke_supported_clis.py \
+  --live \
+  --out-dir /tmp/skill-eval-cli-smoke-$(date +%Y%m%d-%H%M%S)
+```
+
+`--live` is required because this spends provider budget. Defaults are intentionally
+small (`haiku`, `gpt-5.4-mini`, `devstral-small-latest`, and
+`mistral/ministral-3b-latest`); override any model with
+`--claude-model`, `--codex-model`, `--vibe-model`, or `--pi-model` (or the matching
+`SMOKE_*_MODEL` environment variable). Jetty is an API/import surface, not a local
+CLI; retain its separate token-backed smoke. The command exits nonzero unless every selected
+CLI completes its artifact contract and the demo fixtures pass, so incomplete or substituted
+trigger rows and failed provider runs are never reported as a smoke success.

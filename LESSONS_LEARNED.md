@@ -361,3 +361,39 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 - Run live parity checks with the smallest models first, and record quota/auth/config failures as eval-run artifacts rather than losing the row.
 
 **Follow-up from PR audit:** these failures were exactly what Correctness by Construction is meant to prevent. The fix was not another scatter of checks; it moved invariants into the adapter boundary: native subprocess calls require an explicit cwd, all native invocations share one process-group timeout/spawn-failure contract, and provider-specific schema conversion constructs a strict schema before Codex ever sees it. Tests now try to reach the invalid states directly: repo-cwd inheritance, missing executable with no artifact, and graded-dimension schemas without strict object constraints.
+
+## 2026-07-10 — Telemetry is evidence, not a nullable number
+
+**Problem:** Normalized telemetry made several materially different states look alike: absent data could be treated as zero, partial traces could support a negative process assertion, legacy numeric fields looked as trustworthy as provider evidence, and unlike currency/basis/model arms could flow into a lift-per-dollar ratio.
+
+**Lesson:** A number becomes decision evidence only with an explicit observation state, provenance, and comparison basis. “No value,” “not applicable,” “known subtotal,” “measured zero,” and “blocked comparison” must remain different states all the way to the report.
+
+**Rule:**
+- Use the schema-v3 typed telemetry envelope as the canonical interior: `available`, `unavailable`, and `not_applicable` measurements; complete/partial aggregates; and comparable/blocked pair results.
+- Never coerce missing telemetry to zero. Preserve a real zero as available evidence, expose partial aggregates only as `known_*` subtotals, and fail process/efficiency assertions closed when trace observation is incomplete.
+- Require matching case/run/model/population/billing/provenance evidence before causal deltas or lift ratios; legacy telemetry stays readable as `legacy_unverified` but cannot establish a causal comparison.
+- Treat currency as a unit, not a display label: preserve object currencies, bucket non-USD amounts, populate dollar fields only from USD evidence, and never use foreign-currency rows in a USD historical-cost denominator without an explicit FX policy.
+- Migration is a data transaction: stage replacements, track which files actually moved/installed, restore only those files on failure, and fault-inject every rename boundary in tests.
+
+## 2026-07-10 — A live smoke passes only when its artifacts pass
+
+**Problem:** The first comprehensive CLI smoke returned success because harness subprocesses exited zero, even when Vibe artifacts contained authentication failures and Pi missed the positive trigger. Its generated trigger fixture initially lacked an explicit negative expectation; persistent output paths also risked running stale tasks after a failed prepare.
+
+**Lesson:** Process exit status proves only that the harness command ran. A smoke is useful only when it validates the semantic artifact contract and its declared fixture population.
+
+**Rule:**
+- Make paid live checks explicit (`--live`) and start with the smallest models, but make failure honest: inspect `execution_valid`, observation completeness, treatment assertions, and trigger pass rows rather than trusting the wrapper's exit code.
+- Require the exact expected fixture set: one positive and one negative trigger query, each once, with no duplicate or substituted row able to satisfy the check.
+- Reject an empty agent selection. Short-circuit an agent after failed `prepare`/run/benchmark prerequisites, and place every invocation in a unique attempt directory so stale artifacts can never spend provider budget.
+- Persist `smoke.json` and all attempt artifacts. Auth/config/model failures are valuable capability findings (for example, missing `MISTRAL_API_KEY` or a small model that does not activate a skill), not results to hide or silently convert to N/A.
+
+## 2026-07-10 — Independent audit should attack the rollback paths
+
+**Problem:** A broad green suite initially missed migration data loss on a second rename failure, a false singleton pairing, cross-currency USD budget dilution, and several smoke false-success paths. These were found by independent reviewers constructing adversarial states rather than by happy-path checks.
+
+**Lesson:** Cross-cutting contracts need adversarial review after implementation, especially where an apparently harmless fallback changes the meaning of evidence.
+
+**Rule:**
+- Split audits by domain integrity, producer/CLI integration, and test/CI quality; give reviewers the PR diff and ask for executable counterexamples.
+- Turn every confirmed finding into a regression test at the boundary: failed second backup, non-finite payload, mixed currency, mismatched run key, partial timeout trace, empty smoke selection, missing polarity row, and failed prerequisite.
+- Re-run the full suite, clean-install test command, packaging build, whitespace/doc-reference guards, and a targeted re-audit after fixes. A passing unit suite alone is not release evidence for a schema, migration, or live-control-plane change.

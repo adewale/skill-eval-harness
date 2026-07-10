@@ -76,6 +76,20 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         self.assertNotEqual(Path(seen["cwd"]).resolve(), ROOT.resolve())
 
 
+    def test_pi_timeout_with_parseable_partial_trace_is_not_telemetry_complete(self):
+        def timed_out(*args, **kwargs):
+            return {"stdout": json.dumps({"type": "command", "command": "partial"}) + "\n",
+                    "stderr": "timeout", "returncode": 124, "timed_out": True,
+                    "elapsed_ms": 10, "observation_complete": False}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tr, "run_argv_with_timeout", side_effect=timed_out):
+            trace_dir = Path(td) / "trace"
+            tr.run_query(DEMO_MANIFEST, "ordinary chat", False, 1, None, trace_dir=trace_dir)
+            meta = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
+        self.assertFalse(meta["observation_complete"])
+        self.assertEqual(meta["telemetry"]["measurements"]["commands"]["availability"], "unavailable")
+
+
 class StubMatrixOfflineTests(unittest.TestCase):
     def test_demo_manifest_has_both_polarities(self):
         rows = demo_trigger_rows()
@@ -108,6 +122,8 @@ class StubMatrixOfflineTests(unittest.TestCase):
             self.assertTrue((trace_dir / "metrics.json").is_file())
             meta = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["provider"], "stub")
+            self.assertEqual(meta["population"], "trigger")
+            self.assertEqual(meta["telemetry"]["population"], "trigger")
             self.assertEqual(meta["measurement"], "raw_measurement")
             self.assertEqual(report["results"][0]["measurement"], "raw_measurement")
             self.assertTrue(trace_dir.is_relative_to(trace_root))
