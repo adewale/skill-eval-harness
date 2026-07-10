@@ -79,9 +79,20 @@ class SupportedCliSmokeTests(unittest.TestCase):
                 "metadata": {
                     "observation_complete": True,
                     "trace_observation_complete": False,
-                    "telemetry": {"schema_version": 3, "measurements": {
-                        key: {"availability": availability} for key in trace_keys
-                    }},
+                    "telemetry": {
+                        "schema_version": 3,
+                        "observation_evidence": {
+                            "schema_version": 1,
+                            "process": {"state": "complete"},
+                            "provider_response": {"state": "complete"},
+                            "trace": {"state": "incomplete"},
+                            "artifact_set": {"state": "complete"},
+                            "operation_evidence_complete": False,
+                        },
+                        "measurements": {
+                            key: {"availability": availability} for key in trace_keys
+                        },
+                    },
                 },
             }
 

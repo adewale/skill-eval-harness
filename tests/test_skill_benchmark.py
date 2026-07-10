@@ -626,8 +626,15 @@ class SkillBenchmarkTests(unittest.TestCase):
                 base = runs / "case-1" / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text("alpha beta", encoding="utf-8")
-                sb.write_trace_artifacts(base, json.dumps({"type": "message", "role": "assistant", "content": "done"}),
-                                         source="test", extra_metrics={"skill_invoked": invoked, "skill_invocation_evidence": [variant] if invoked else []}, write_metadata=True)
+                sb.write_trace_artifacts(
+                    base, json.dumps({"type": "message", "role": "assistant", "content": "done"}),
+                    source="test",
+                    extra_metrics={"skill_invoked": invoked,
+                                   "skill_invocation_evidence": [variant] if invoked else []},
+                    write_metadata=True,
+                    process_observation_complete=True,
+                    provider_response_complete=True,
+                )
             report = sb.build_benchmark_report(manifest, runs)
             by_variant = {r["variant"]: r for r in report["results"]}
             self.assertEqual(by_variant["with_skill"]["objective_total"], 1)

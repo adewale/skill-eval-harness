@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 from agent_capabilities import SMOKE_TARGETS  # noqa: E402
 from skill_benchmark import invoke_argv_with_timeout  # noqa: E402
 from trigger_contracts import TriggerObservation  # noqa: E402
+from telemetry import ObservationEvidence  # noqa: E402
 
 DEFAULT_MODELS = {name: target.resolved_model(os.environ) for name, target in SMOKE_TARGETS.items()}
 ANSWER_AGENTS = tuple(name for name, target in SMOKE_TARGETS.items() if target.population == "answer")
@@ -114,10 +115,16 @@ def assess_answer_benchmark(path: Path, agent: str, report: dict[str, Any]) -> b
                     and isinstance(measurements, Mapping)):
                 telemetry_ok = False
                 break
-            trace_complete = metadata.get("trace_observation_complete") is True
-            expected = "available" if trace_complete else "unavailable"
-            if any(not isinstance(measurements.get(key), Mapping)
-                   or measurements[key].get("availability") != expected for key in trace_keys):
+            try:
+                evidence = ObservationEvidence.from_dict(envelope.get("observation_evidence"))
+            except (TypeError, ValueError):
+                telemetry_ok = False
+                break
+            expected = "available" if evidence.operation_complete else "unavailable"
+            if (not evidence.artifact_complete
+                    or any(not isinstance(measurements.get(key), Mapping)
+                           or measurements[key].get("availability") != expected
+                           for key in trace_keys)):
                 telemetry_ok = False
                 break
         report["checks"].append({"label": f"{agent}:artifact-contract", "passed": executions_ok,

@@ -4,6 +4,10 @@ All notable public changes are listed here. Release tags are the source of truth
 
 ## Unreleased
 
+- Evidence boundaries: add a typed four-axis observation contract for process exit, provider response, trace, and committed artifact set. Full-run operation evidence exists only when process, provider response, and trace are independently complete; callers cannot overwrite derived evidence fields. New answer and Jetty run directories carry a digest inventory in `artifact-commit.json`, written last and verified when artifacts are read.
+- Fail-closed adapters: malformed zero-exit Claude envelopes and Vibe streams without a final assistant message remain diagnostics rather than candidate answers; actual subprocess return codes are preserved separately from provider-response failure. Failed Jetty trajectories cannot certify operation telemetry, and empty legacy `events.json` files no longer count as command evidence.
+- Judges and budgets: schema-invalid newly produced judge output fails in both report and strict modes; incomplete judge-panel cost is a partial known subtotal rather than complete spend; suite budget history is accepted only when v3 scalar totals, aggregate values, and coverage counts agree.
+
 ## v0.6.0 — 2026-07-10
 
 - Telemetry: keep successful provider completion separate from trace completeness. Provider-reported usage and cost remain available when a CLI returns no trace, while tool/command/file/error/retry/skill-invocation measurements stay unavailable instead of becoming false zeros. The live release smoke now checks this schema-v3 invariant.

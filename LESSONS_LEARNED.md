@@ -440,3 +440,16 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 - Give manifest migration and telemetry migration different names and commands. Do not let a version-1 → version-2 manifest guide stand in for a package upgrade.
 - Make rollback restore whole artifacts rather than delete newly added fields. The old report must be reproducible from the same bytes it originally read.
 - Add the version-specific section to the single upgrade runbook before the release tag, then verify every install command against the published package before marking the release complete.
+
+## 2026-07-10 — Evidence channels form a product, not a success ladder
+
+**Problem:** A successful subprocess was allowed to certify an absent trace. The same audit found the pattern elsewhere: malformed Claude bytes became an answer, Vibe tool events became an answer, failed Jetty events became complete operation telemetry, one observed judge cost became complete panel spend, and an empty events file became command coverage.
+
+**Lesson:** Process exit, provider response, trace, and artifact durability are independent evidence channels. Success on one axis cannot upgrade another. A decision that needs several channels must derive its eligibility from their product.
+
+**Rule:**
+- Represent each channel explicitly as complete, incomplete, or unknown. Derive operation evidence only when process, provider response, and trace are all complete.
+- Preserve actual process facts. A zero-exit protocol failure keeps return code zero and carries a separate failed provider-response state.
+- Reserve derived evidence keys so caller extras cannot overwrite them. Parse malformed provider output into diagnostics, never into an answer/verdict fallback.
+- Commit run artifacts with a last-written digest inventory. New readers require a valid commit marker before treating the artifact set as complete.
+- Test the full finite state product and the monotonicity rule: changing one axis to complete must not change another axis or make a multi-axis claim eligible by itself.

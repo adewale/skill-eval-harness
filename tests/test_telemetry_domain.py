@@ -13,11 +13,69 @@ from telemetry import (
     Comparison,
     Measurement,
     Money,
+    ObservationEvidence,
+    EVIDENCE_COMPLETE,
+    EVIDENCE_INCOMPLETE,
+    EVIDENCE_UNKNOWN,
     aggregate_money_by_currency,
     aggregate_numeric,
     compare_cost_pair,
     lift_per_dollar,
+    measurement_from_envelope_or_nonnegative,
 )
+
+
+class ObservationEvidenceTests(unittest.TestCase):
+    def test_full_state_product_never_promotes_an_independent_axis(self):
+        states = (EVIDENCE_COMPLETE, EVIDENCE_INCOMPLETE, EVIDENCE_UNKNOWN)
+        for process in states:
+            for provider in states:
+                for trace in states:
+                    for artifacts in states:
+                        with self.subTest(process=process, provider=provider,
+                                          trace=trace, artifacts=artifacts):
+                            evidence = ObservationEvidence(process, provider, trace, artifacts)
+                            self.assertEqual(
+                                evidence.operation_complete,
+                                process == provider == trace == EVIDENCE_COMPLETE,
+                            )
+                            self.assertEqual(
+                                evidence.artifact_complete,
+                                artifacts == EVIDENCE_COMPLETE,
+                            )
+                            self.assertEqual(
+                                ObservationEvidence.from_dict(evidence.to_dict()), evidence)
+
+    def test_wire_cannot_override_derived_operation_completeness(self):
+        wire = ObservationEvidence(
+            EVIDENCE_COMPLETE, EVIDENCE_INCOMPLETE,
+            EVIDENCE_COMPLETE, EVIDENCE_COMPLETE).to_dict()
+        wire["operation_evidence_complete"] = True
+        with self.assertRaisesRegex(ValueError, "contradicts"):
+            ObservationEvidence.from_dict(wire)
+
+    def test_legacy_generic_completion_cannot_certify_process_or_trace(self):
+        evidence = ObservationEvidence.from_run({"observation_complete": True})
+        self.assertEqual(evidence.provider_response, EVIDENCE_COMPLETE)
+        self.assertEqual(evidence.process, EVIDENCE_UNKNOWN)
+        self.assertEqual(evidence.trace, EVIDENCE_UNKNOWN)
+        self.assertFalse(evidence.operation_complete)
+
+    def test_available_operation_scalar_cannot_override_incomplete_evidence(self):
+        evidence = ObservationEvidence(
+            EVIDENCE_COMPLETE, EVIDENCE_INCOMPLETE,
+            EVIDENCE_COMPLETE, EVIDENCE_COMPLETE)
+        raw = {"telemetry": {
+            "schema_version": 3,
+            "observation_evidence": evidence.to_dict(),
+            "measurements": {"commands": {
+                "availability": "available", "value": 0,
+                "provenance": "trace_normalized",
+            }},
+        }}
+        measurement = measurement_from_envelope_or_nonnegative(raw, "commands")
+        self.assertEqual(measurement.availability, "unavailable")
+        self.assertEqual(measurement.reason, "provider_response_incomplete")
 
 
 class MeasurementModelTests(unittest.TestCase):

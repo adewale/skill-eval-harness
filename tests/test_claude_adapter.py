@@ -31,11 +31,17 @@ class ParseClaudeEnvelopeTests(unittest.TestCase):
         self.assertEqual(p["usage"]["total_tokens"], 10)          # derived
         self.assertEqual(p["usage"]["cache_read_tokens"], 9)
 
-    def test_tolerates_non_envelope(self):
+    def test_non_envelope_is_diagnostic_not_answer_evidence(self):
         p = sb.parse_claude_cli_json("just raw text, not json")
-        self.assertEqual(p["answer"], "just raw text, not json")
+        self.assertEqual(p["answer"], "")
+        self.assertEqual(p["raw_response"], "just raw text, not json")
         self.assertIsNone(p["cost_usd"])
         self.assertIsNotNone(p["parse_error"])
+
+    def test_non_string_result_is_protocol_error_not_answer(self):
+        p = sb.parse_claude_cli_json(json.dumps({"result": {"message": "diagnostic"}}))
+        self.assertEqual(p["answer"], "")
+        self.assertEqual(p["parse_error"], "claude result must be a string")
 
     def test_tolerates_fenced_json_envelope(self):
         out = "```json\n" + json.dumps({"result": "x", "total_cost_usd": 0.01, "usage": {}}) + "\n```"
@@ -103,6 +109,28 @@ class RunClaudeAdapterTests(unittest.TestCase):
             meta = json.loads((base / "metadata.json").read_text())
             self.assertEqual(meta["returncode"], 1)
             self.assertTrue(text.lstrip().startswith(sb.CLAUDE_FAILURE))
+            self.assertFalse(sb.execution_valid(meta, text))
+
+    def test_zero_exit_malformed_envelope_is_protocol_failure(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            malformed = td / "malformed_claude.py"
+            malformed.write_text("#!/usr/bin/env python3\nprint('plain diagnostic, not an envelope')\n",
+                                 encoding="utf-8")
+            malformed.chmod(malformed.stat().st_mode | stat.S_IXUSR)
+            _, runs, run_dir = self._run(td)
+            sb.run_claude(argparse.Namespace(
+                tasks=str(td / "tasks.jsonl"), runs=str(runs),
+                model="claude-haiku-4-5-20251001", claude_bin=str(malformed), timeout=60))
+            base = runs / run_dir
+            text = (base / "output.md").read_text(encoding="utf-8")
+            meta = sb.read_metadata_base(base)
+            self.assertEqual(meta["returncode"], 0)
+            self.assertTrue(meta["process_observation_complete"])
+            self.assertFalse(meta["provider_response_complete"])
+            self.assertTrue(meta["artifact_set_complete"])
+            self.assertTrue(text.lstrip().startswith(sb.CLAUDE_FAILURE))
+            self.assertNotIn("plain diagnostic", text)
             self.assertFalse(sb.execution_valid(meta, text))
 
     def test_benchmark_totals_cost(self):

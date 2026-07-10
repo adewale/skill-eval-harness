@@ -195,8 +195,8 @@ class VerdictSchemaTests(unittest.TestCase):
             strict_row = sb.run_one_judge_task(task, judge_cmd=cmd, schema_enforcement="strict")
         self.assertIn("schema_errors", report_row)   # violation surfaced in both modes
         self.assertIn("schema_errors", strict_row)
-        self.assertTrue(report_row["passed"])         # report: verdict resolves exactly as today (score>=threshold)
-        self.assertFalse(strict_row["passed"])        # strict: forced closed via the parse-error channel
+        self.assertFalse(report_row["passed"])        # report surfaces diagnostics but cannot promote malformed evidence
+        self.assertFalse(strict_row["passed"])        # strict is also fail-closed
 
     def test_wellformed_verdict_stays_clean_and_default_is_report(self):
         with tempfile.TemporaryDirectory() as td:
@@ -490,6 +490,20 @@ class CrossJudgeConsensusTests(unittest.TestCase):
     def test_cost_is_panel_summed_once(self):
         out = sb.merge_cross_judge_rows([self._row("m1", True, 5, cost=0.10), self._row("m2", True, 5, cost=0.20)])
         self.assertAlmostEqual(out["cost_usd"], 0.30)          # summed on the top row, not double-counted
+
+    def test_partial_panel_cost_remains_a_known_subtotal_not_complete_spend(self):
+        rows = [
+            {**self._row("m1", True, 5, cost=0.10),
+             "cost_normalized": {"currency": "USD", "total_cost": 0.10,
+                                 "source": "provider_reported"}},
+            {**self._row("m2", True, 5), "cost_normalized": {"source": "missing"}},
+        ]
+        out = sb.merge_cross_judge_rows(rows)
+        self.assertIsNone(out["cost_usd"])
+        self.assertEqual(out["cost_normalized"], {"source": "missing"})
+        self.assertEqual(out["cost_aggregate"]["USD"]["availability"], "partial")
+        self.assertEqual(out["cost_aggregate"]["USD"]["known_subtotal"], "0.1")
+        self.assertEqual(out["cost_aggregate"]["USD"]["unavailable_count"], 1)
 
     def test_panel_rejects_duplicate_models_and_mixed_task_ids(self):
         with self.assertRaises(ValueError):

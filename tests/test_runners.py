@@ -190,6 +190,14 @@ class ClosedRunnerOutcomeTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises((TypeError, ValueError)):
                 rc.OutcomeContext(**kwargs)
 
+    def test_context_rejects_derived_evidence_overrides(self):
+        for field in ("metadata_extra", "metrics_extra"):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "derived evidence"):
+                rc.OutcomeContext(
+                    provider="codex",
+                    **{field: {"trace_observation_complete": True}},
+                )
+
     def test_context_and_outcome_are_recursively_immutable(self):
         source = {"x": 1, "nested": {"value": 2}, "items": [{"value": 3}]}
         context = rc.OutcomeContext(provider="codex", metadata_extra=source)
@@ -486,9 +494,10 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             sb.write_runner_outcome(base, outcome)
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             text = (base / "output.md").read_text(encoding="utf-8")
-            self.assertEqual(meta["returncode"], 1)
+            self.assertEqual(meta["returncode"], 0)  # actual process exit is preserved
+            self.assertFalse(meta["provider_response_complete"])
             self.assertNotIn(trace, text)
-            self.assertFalse(sb.execution_valid(meta, text))
+            self.assertFalse(sb.execution_valid(sb.read_metadata_base(base), text))
 
     def test_write_runner_outcome_encodes_timeout_uniformly(self):
         # One timeout encoding for every provider: timed_out + returncode 124, a
@@ -504,6 +513,54 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertTrue(text.lstrip().startswith(am.CLAUDE_FAILURE))
             self.assertNotIn("None", text)
             self.assertFalse(am.execution_valid(meta, text))
+
+    def test_atomic_run_replacement_drops_stale_provider_artifacts(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            sb.write_runner_outcome(
+                base, am.RunnerOutcome(provider="subagent", answer="first", returncode=0,
+                                       trace_text=json.dumps({"type": "usage", "usage": {"input_tokens": 1}})))
+            self.assertTrue((base / "trace.jsonl").exists())
+            (base / "grading.json").write_text("stale", encoding="utf-8")
+            sb.write_runner_outcome(
+                base, am.RunnerOutcome(provider="subagent", answer="second", returncode=0))
+            self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "second")
+            self.assertFalse((base / "trace.jsonl").exists())
+            self.assertFalse((base / "grading.json").exists())
+            self.assertTrue(sb.read_metadata_base(base)["artifact_set_complete"])
+
+    def test_atomic_run_replacement_restores_previous_commit_on_install_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            sb.write_runner_outcome(
+                base, am.RunnerOutcome(provider="subagent", answer="old", returncode=0))
+            real_replace = os.replace
+
+            def fail_stage_install(src, dst):
+                if ".artifact-stage-" in Path(src).name and Path(dst) == base:
+                    raise OSError("simulated install failure")
+                return real_replace(src, dst)
+
+            with mock.patch.object(sb.os, "replace", side_effect=fail_stage_install), \
+                 self.assertRaisesRegex(OSError, "install failure"):
+                sb.write_runner_outcome(
+                    base, am.RunnerOutcome(provider="subagent", answer="new", returncode=0))
+            self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "old")
+            self.assertTrue(sb.read_metadata_base(base)["artifact_set_complete"])
+
+    def test_artifact_commit_is_required_and_detects_post_commit_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            sb.write_runner_outcome(
+                base, am.RunnerOutcome(provider="subagent", answer="hi", returncode=0))
+            text = (base / "output.md").read_text(encoding="utf-8")
+            committed = sb.read_metadata_base(base)
+            self.assertTrue(committed["artifact_set_complete"])
+            self.assertTrue(am.execution_valid(committed, text))
+            (base / "output.md").write_text("tampered", encoding="utf-8")
+            tampered = sb.read_metadata_base(base)
+            self.assertFalse(tampered["artifact_set_complete"])
+            self.assertFalse(am.execution_valid(tampered, "tampered"))
 
     def test_write_runner_outcome_marks_missing_telemetry_explicit(self):
         # No provider usage/cost and no trace → explicit missing, never zero/absent.
@@ -540,8 +597,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertNotIn("LEAKED FROM TRACE", text)
             self.assertTrue(text.lstrip().startswith(am.CLAUDE_FAILURE))
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
-            self.assertEqual(meta["returncode"], 1)
-            self.assertFalse(am.execution_valid(meta, text))
+            self.assertEqual(meta["returncode"], 0)  # protocol failure does not rewrite process evidence
+            self.assertFalse(meta["provider_response_complete"])
+            self.assertFalse(am.execution_valid(sb.read_metadata_base(base), text))
 
     def test_run_agent_dispatches_registered_vibe_backend(self):
         with tempfile.TemporaryDirectory() as td:
@@ -623,6 +681,8 @@ class RunnerOutcomeContractTests(unittest.TestCase):
         self.assertEqual(sb.normalize_usage(usage, source="provider_reported")["total_tokens"], 3)
         streaming = json.dumps({"role": "assistant", "content": "streamed"}) + "\n"
         self.assertEqual(sb.vibe_final_answer(sb.parse_vibe_messages(streaming)), "streamed")
+        self.assertEqual(sb.vibe_final_answer([{"role": "tool", "content": "trace only"}]), "")
+        self.assertEqual(sb.vibe_final_answer([{"role": "assistant", "content": {"error": "bad shape"}}]), "")
 
     def test_vibe_missing_binary_uses_vibe_failure_marker(self):
         with tempfile.TemporaryDirectory() as td:

@@ -79,6 +79,7 @@ the interior. Each external boundary has one parser and a closed value:
 ```text
 prepared row -> PreparedTaskDraft -> PreparedTask
 provider result -> Completed | TimedOut | SpawnFailed | ProviderFailed
+run evidence -> process × provider-response × trace × artifact-set state
 judge row -> Boolean | Scored | Dimension | Dynamic | Consensus verdict
 trace status -> Completed | InProgress | Failed | Unknown
 Jetty status -> Queued | Running | Succeeded | Failed | TimedOut | ProtocolInvalid
@@ -86,8 +87,12 @@ result arms -> ExperimentalPair | BlockedExperimentalPair
 ```
 
 Booleans such as execution success, verdict pass, Jetty success, and comparability are derived from
-those variants. When a persisted row is read back, its parser re-establishes the invariant rather
-than trusting fields that happened to serialize together. The detailed inventory and residual risks
+those variants. `ObservationEvidence` keeps process exit, provider response, trace, and artifact-set
+state independent (`complete | incomplete | unknown`); full-run operation evidence requires the
+first three to be complete. A zero-exit protocol failure therefore preserves return code zero while
+remaining unscorable, and a valid answer with no trace can carry provider usage/cost without
+claiming zero commands. When a persisted row is read back, its parser re-establishes the invariant
+rather than trusting fields that happened to serialize together. The detailed inventory and residual risks
 are in [`correctness-by-construction-audit.md`](correctness-by-construction-audit.md).
 
 ## The runner boundary
@@ -118,7 +123,7 @@ flowchart TB
     PI -.-> RAW
     CX -.-> RAW
     JT -.-> RAW
-    NORM --> CONTRACT[(Run-output contract\noutput.md + metadata\n+ events/metrics)]
+    NORM --> CONTRACT[(Run-output contract\noutput.md + metadata\n+ events/metrics\n+ artifact-commit.json)]
 
     CONTRACT --> GR[grade reads from disk]
 ```
@@ -127,8 +132,10 @@ Each runner emits its own event shape. `normalize_trace_records` collapses those
 one schema-versioned `events.json` and `metrics.json` so a process assertion like
 `command_order` reads the same fields no matter who produced the run. Lifecycle status is parsed
 into a closed event state first; only completed operations count as commands, tools, reads, writes,
-or skill invocation. When the evidence is missing or unknown, the assertion fails rather than
-guessing from the answer text.
+or skill invocation. Caller extras cannot overwrite the derived evidence fields. New runner and
+Jetty artifact sets write `artifact-commit.json` last with the required-file inventory and SHA-256
+digests; readers classify a missing or stale marker as an incomplete artifact set. When evidence is
+missing or unknown, the assertion fails rather than guessing from the answer text.
 
 ## How a judge defers
 

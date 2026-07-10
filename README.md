@@ -361,7 +361,14 @@ runs/<case_id>/<variant>/run-1/trace.jsonl       # raw runner event stream
 runs/<case_id>/<variant>/run-1/events.json       # normalized events used by process assertions
 runs/<case_id>/<variant>/run-1/metrics.json      # tokens, commands, tool calls, elapsed time, retries
 runs/<case_id>/<variant>/run-1/environment.json  # runner/model/sandbox details where available
+runs/<case_id>/<variant>/run-1/artifact-commit.json # required-file SHA-256 inventory, written last by current runners
 ```
+
+Current answer and Jetty writers record independent process, provider-response, trace,
+and artifact-set evidence. Tool/command/file/retry/skill measurements are available only
+when the first three channels are complete; readers derive artifact completeness by
+verifying `artifact-commit.json`. Legacy directories without a marker remain readable but
+cannot acquire committed-artifact provenance.
 
 `metadata.json` is optional, but include what your runner can capture:
 

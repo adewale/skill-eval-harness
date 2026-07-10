@@ -78,6 +78,10 @@ def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:
         return False
     if m.get("timed_out") or m.get("timeout"):
         return False
+    if m.get("provider_response_complete") is False:
+        return False
+    if m.get("artifact_contract_version") == 1 and m.get("artifact_set_complete") is not True:
+        return False
     return not (text or "").lstrip().startswith(RUNNER_FAILURE_MARKERS)
 
 
@@ -104,6 +108,7 @@ RUNNER_FAILURE_MARKER_BY_PROVIDER = {
 from runner_contracts import (
     AnswerOutcome, Completed, OutcomeContext, Provider, ProviderFailed, RunnerOutcome,
     SpawnFailed, TimedOut, outcome_context, outcome_with_context,
+    process_observation_complete, provider_response_complete,
 )
 
 

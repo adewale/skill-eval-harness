@@ -81,6 +81,8 @@ from ablation_model import (
     TimedOut,
     outcome_context,
     outcome_with_context,
+    process_observation_complete,
+    provider_response_complete,
     TIMEOUT_FAILURE,
     TreeIdentity,
     causal_confirmation,
@@ -2566,6 +2568,9 @@ def normalized_jetty_metadata(record: dict[str, Any], *, success: bool) -> dict[
         "errors_encountered": 0 if success else 1,
         "returncode": 0 if success else 1,
         "timed_out": observation.timed_out,
+        "observation_complete": success,
+        "process_observation_complete": not observation.timed_out,
+        "provider_response_complete": success,
         "jetty_lifecycle": observation.lifecycle.kind,
         **({"jetty_protocol_error": observation.lifecycle.reason}
            if isinstance(observation.lifecycle, ProtocolInvalid) else {}),
@@ -2625,7 +2630,11 @@ def import_jetty_results(args: argparse.Namespace) -> int:
             die("invalid Jetty result: successful trajectory requires non-blank trajectory_id")
         validated_records.append((record, harness, base))
     for record, harness, base in validated_records:
-        base.mkdir(parents=True, exist_ok=True)
+        destination = base
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        base = Path(tempfile.mkdtemp(prefix=f".{destination.name}.artifact-stage-",
+                                     dir=destination.parent))
+        (base / ARTIFACT_COMMIT_NAME).unlink(missing_ok=True)
         write_json(base / "jetty_raw.json", record)
         artifacts = record.get("artifacts") or []
         if not artifacts and isinstance(record.get("trajectory"), dict):
@@ -2647,6 +2656,7 @@ def import_jetty_results(args: argparse.Namespace) -> int:
             "run_number": harness.get("run_number", 1),
             "variant": harness.get("variant"),
             "billing_scope": "run",
+            "artifact_contract_version": ARTIFACT_CONTRACT_VERSION,
         })
         # Persist the harness-only ablation provenance into the run metadata so the
         # benchmark report can VERIFY (mode/population/skill_hash/components) that a
@@ -2664,7 +2674,12 @@ def import_jetty_results(args: argparse.Namespace) -> int:
             metadata=meta,
             environment={"runner": "jetty", "jetty": record.get("jetty", {}), "trajectory_id": record.get("trajectory_id")},
             write_metadata=True,
+            process_observation_complete=not observation.timed_out,
+            provider_response_complete=success,
+            artifact_set_complete=None,
         )
+        write_artifact_commit(base)
+        _install_staged_run(destination, base)
     return 0
 
 
@@ -2821,20 +2836,40 @@ def read_output(runs: Path, case_id: str, variant: str) -> tuple[str | None, Pat
     return read_output_base(base)
 
 
+def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str, Any]:
+    if data.get("artifact_contract_version") != ARTIFACT_CONTRACT_VERSION:
+        return data
+    committed = artifact_commit_valid(base)
+    current = telemetry_domain.ObservationEvidence.from_run(data)
+    evidence = telemetry_domain.ObservationEvidence(
+        current.process, current.provider_response, current.trace,
+        telemetry_domain.ObservationEvidence.state(committed),
+    )
+    enriched = dict(data)
+    enriched["artifact_set_complete"] = committed
+    enriched["observation_evidence"] = evidence.to_dict()
+    envelope = enriched.get("telemetry")
+    if isinstance(envelope, dict):
+        envelope = dict(envelope)
+        envelope["observation_evidence"] = evidence.to_dict()
+        enriched["telemetry"] = envelope
+    return enriched
+
+
 def read_metadata_base(base: Path) -> dict[str, Any]:
     for name in ["metadata.json", "timing.json", "metrics.json"]:
         p = base / name
         if p.exists():
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
-                return data if isinstance(data, dict) else {}
+                return _with_committed_artifact_state(base, data) if isinstance(data, dict) else {}
             except json.JSONDecodeError:
                 return {"metadata_error": f"invalid JSON in {name}"}
     p = base / "outputs" / "metrics.json"
     if p.exists():
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
+            return _with_committed_artifact_state(base, data) if isinstance(data, dict) else {}
         except json.JSONDecodeError:
             return {"metadata_error": "invalid JSON in outputs/metrics.json"}
     return {}
@@ -2878,7 +2913,7 @@ def read_metrics_base(base: Path) -> dict[str, Any]:
         data = read_json_dict_or_list(base / rel)
         if isinstance(data, dict) and not data.get("_error"):
             merged.update(data)
-    return merged
+    return _with_committed_artifact_state(base, merged)
 
 
 def command_text(event: dict[str, Any]) -> str:
@@ -3272,6 +3307,12 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
         raw = measurements.get(key) if isinstance(measurements, dict) else None
         if not isinstance(raw, dict):
             return True, None
+        if key in {"tool_calls", "commands", "file_reads", "file_writes",
+                   "errors", "retries", "repeated_command_max", "skill_invoked"}:
+            measurement = telemetry_domain.measurement_from_envelope_or_nonnegative(metrics, key)
+            if measurement.availability == telemetry_domain.AVAILABLE:
+                return True, None
+            return False, f"missing {key} evidence ({measurement.reason})"
         if raw.get("availability") == telemetry_domain.AVAILABLE:
             return True, None
         return False, f"missing {key} evidence ({raw.get('reason', raw.get('availability', 'unavailable'))})"
@@ -3939,7 +3980,15 @@ def write_trace_artifacts(
     out_metrics: Path | None = None,
     write_raw_trace: bool = True,
     pi_stream: PiStream | None = None,
+    process_observation_complete: bool | None = None,
+    provider_response_complete: bool | None = None,
+    artifact_set_complete: bool | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    for label, value in (("process_observation_complete", process_observation_complete),
+                         ("provider_response_complete", provider_response_complete),
+                         ("artifact_set_complete", artifact_set_complete)):
+        if value is not None and not isinstance(value, bool):
+            raise TypeError(f"{label} must be boolean or None")
     run_dir.mkdir(parents=True, exist_ok=True)
     if write_raw_trace:
         (run_dir / "trace.jsonl").write_text(trace_text, encoding="utf-8")
@@ -3952,11 +4001,43 @@ def write_trace_artifacts(
         metrics["parse_errors"] = parse_errors[:20]
         metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
     # A trace-derived count is observed only when at least one valid event was
-    # captured and parsing completed. Runners may override this with their own
-    # process-level observation state (for example a spawn failure).
-    metrics["trace_observation_complete"] = bool(records) and not parse_errors
+    # captured and parsing completed. Completion is derived here and reserved:
+    # arbitrary caller metrics cannot promote an absent trace.
+    trace_observation_complete = bool(records) and not parse_errors
+    reserved = {
+        "trace_observation_complete", "process_observation_complete",
+        "provider_response_complete", "operation_observation_complete",
+        "artifact_set_complete", "observation_evidence", "telemetry",
+        "telemetry_schema_version",
+    }
+    collisions = reserved & set(extra_metrics or {})
+    if collisions:
+        raise ValueError(f"extra_metrics cannot override derived evidence: {', '.join(sorted(collisions))}")
     if extra_metrics:
         metrics.update(extra_metrics)
+    generic_complete = metrics.get("observation_complete")
+    if not isinstance(generic_complete, bool):
+        generic_complete = (metadata or {}).get("observation_complete")
+    if process_observation_complete is None:
+        explicit = (metadata or {}).get("process_observation_complete")
+        process_observation_complete = explicit if isinstance(explicit, bool) else generic_complete if isinstance(generic_complete, bool) else None
+    if provider_response_complete is None:
+        explicit = (metadata or {}).get("provider_response_complete")
+        provider_response_complete = explicit if isinstance(explicit, bool) else generic_complete if isinstance(generic_complete, bool) else None
+    evidence = telemetry_domain.ObservationEvidence(
+        telemetry_domain.ObservationEvidence.state(process_observation_complete),
+        telemetry_domain.ObservationEvidence.state(provider_response_complete),
+        telemetry_domain.ObservationEvidence.state(trace_observation_complete),
+        telemetry_domain.ObservationEvidence.state(artifact_set_complete),
+    )
+    metrics.update({
+        "trace_observation_complete": trace_observation_complete,
+        "process_observation_complete": process_observation_complete,
+        "provider_response_complete": provider_response_complete,
+        "operation_observation_complete": evidence.operation_complete,
+        "artifact_set_complete": artifact_set_complete,
+        "observation_evidence": evidence.to_dict(),
+    })
     # Telemetry precedence: an explicit provider/estimated/not-applicable block
     # supplied by a runner wins over a trace-derived block. Both artifacts then
     # receive the same v3 envelope, including an explicit unavailable state when
@@ -3970,17 +4051,14 @@ def write_trace_artifacts(
     # for identity/basis but must not let an explicit `source: missing` erase a
     # usable trace-normalized observation.
     envelope_input = {**(metadata or {}), **metrics}
-    # Process completion and trace completeness are separate evidence. A
-    # successful provider call with no trace can support provider usage/cost,
-    # but it cannot prove that zero tools or commands ran. Conversely, a failed
-    # process cannot promote a syntactically valid partial trace to complete.
-    if envelope_input.get("observation_complete") is False:
-        envelope_input["trace_observation_complete"] = False
+    # Process, provider response, trace, and artifact-set completeness are
+    # independent axes. The typed evidence value above is the only owner of
+    # operation completeness; no generic success boolean promotes another axis.
     # A crash/timeout can leave a syntactically valid partial JSONL trace. Keep
     # its legacy debugging fields, but v3 must not present trace-derived usage
     # or cost as complete measurement evidence. Provider-reported blocks remain
     # valid independent observations.
-    if envelope_input.get("trace_observation_complete") is not True:
+    if not evidence.operation_complete:
         for key in ("usage_normalized", "cost_normalized"):
             block = envelope_input.get(key)
             if isinstance(block, dict) and block.get("source") == "trace_normalized":
@@ -4014,13 +4092,25 @@ def import_trace(args: argparse.Namespace) -> int:
     trace = Path(args.trace)
     run_dir = Path(args.run_dir)
     trace_text = trace.read_text(encoding="utf-8", errors="replace")
+    existing = read_metadata_base(run_dir)
+    output_text, _ = read_output_base(run_dir)
+    provider_complete = output_text is not None and execution_valid(existing, output_text)
+    returncode = existing.get("returncode")
+    process_complete = (
+        isinstance(returncode, int) and not isinstance(returncode, bool)
+        and returncode not in {124, 127}
+    ) if returncode is not None else provider_complete
     write_trace_artifacts(
         run_dir,
         trace_text,
         source=getattr(args, "source", "generic"),
+        metadata={**existing, "observation_complete": provider_complete,
+                  "evidence_provenance": "legacy_import_inferred"},
         # v3 requires a paired metadata/metrics envelope; importing a trace is
         # a producer, not a metrics-only convenience path.
         write_metadata=True,
+        process_observation_complete=process_complete,
+        provider_response_complete=provider_complete,
         out_events=Path(args.out_events) if getattr(args, "out_events", None) else None,
         out_metrics=Path(args.out_metrics) if getattr(args, "out_metrics", None) else None,
         write_raw_trace=False,
@@ -4040,7 +4130,85 @@ def final_answer_from_events(events: dict[str, Any]) -> str:
     return ""
 
 
-def write_runner_outcome(run_dir: Path, outcome: AnswerOutcome) -> tuple[dict[str, Any], dict[str, Any]]:
+ARTIFACT_COMMIT_NAME = "artifact-commit.json"
+ARTIFACT_CONTRACT_VERSION = 1
+ARTIFACT_REQUIRED_FILES = ("output.md", "events.json", "metrics.json", "metadata.json")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_artifact_commit(run_dir: Path) -> None:
+    """Write the commit marker last; absence means an interrupted artifact set."""
+    missing = [name for name in ARTIFACT_REQUIRED_FILES if not (run_dir / name).is_file()]
+    if missing:
+        raise ValueError(f"cannot commit incomplete artifact set: {', '.join(missing)}")
+    inventory = {
+        path.relative_to(run_dir).as_posix(): _file_sha256(path)
+        for path in sorted(run_dir.rglob("*"))
+        if path.is_file() and path.name != ARTIFACT_COMMIT_NAME
+    }
+    write_json(run_dir / ARTIFACT_COMMIT_NAME, {
+        "schema_version": ARTIFACT_CONTRACT_VERSION,
+        "required_files": list(ARTIFACT_REQUIRED_FILES),
+        "inventory_sha256": inventory,
+    })
+
+
+def artifact_commit_valid(run_dir: Path) -> bool:
+    path = run_dir / ARTIFACT_COMMIT_NAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw, dict) or raw.get("schema_version") != ARTIFACT_CONTRACT_VERSION:
+        return False
+    required = raw.get("required_files")
+    inventory = raw.get("inventory_sha256")
+    if required != list(ARTIFACT_REQUIRED_FILES) or not isinstance(inventory, dict):
+        return False
+    if any(not isinstance(name, str) or not isinstance(digest, str)
+           or Path(name).is_absolute() or ".." in Path(name).parts
+           for name, digest in inventory.items()):
+        return False
+    if any(name not in inventory for name in ARTIFACT_REQUIRED_FILES):
+        return False
+    try:
+        return all(
+            (run_dir / name).is_file() and _file_sha256(run_dir / name) == digest
+            for name, digest in inventory.items())
+    except OSError:
+        return False
+
+
+def _install_staged_run(run_dir: Path, staged: Path) -> None:
+    """Atomically replace one run directory, restoring the old set on failure."""
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix=f".{run_dir.name}.artifact-backup-",
+                                   dir=run_dir.parent))
+    backup.rmdir()
+    moved_old = False
+    try:
+        if run_dir.exists():
+            os.replace(run_dir, backup)
+            moved_old = True
+        os.replace(staged, run_dir)
+    except OSError:
+        if moved_old and backup.exists() and not run_dir.exists():
+            os.replace(backup, run_dir)
+        raise
+    else:
+        if backup.exists():
+            shutil.rmtree(backup)
+
+
+def _write_runner_outcome_files(run_dir: Path, outcome: AnswerOutcome,
+                                sidecars: Path | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """The ONE exhaustive adapter from a closed answer outcome to disk, shared by
     every answer runner (codex/claude/subagent). Provider-specific work — spawning
     the tool and parsing its wire format — happens in the runner; everything from
@@ -4061,6 +4229,7 @@ def write_runner_outcome(run_dir: Path, outcome: AnswerOutcome) -> tuple[dict[st
     `Completed` always carries a non-empty final answer; raw traces are telemetry,
     never a fallback candidate answer."""
     run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / ARTIFACT_COMMIT_NAME).unlink(missing_ok=True)
     context = outcome_context(outcome)
     trace_text = context.trace_text
     if isinstance(outcome, Completed):
@@ -4083,6 +4252,7 @@ def write_runner_outcome(run_dir: Path, outcome: AnswerOutcome) -> tuple[dict[st
         "returncode": returncode,
         "timed_out": timed_out,
         "stderr": context.stderr,
+        "artifact_contract_version": ARTIFACT_CONTRACT_VERSION,
         "usage_normalized": usage_block,
         "cost_normalized": cost_block,
         **({"elapsed_ms": elapsed} if elapsed is not None else {}),
@@ -4095,6 +4265,9 @@ def write_runner_outcome(run_dir: Path, outcome: AnswerOutcome) -> tuple[dict[st
         extra_metrics=extra_metrics,
         environment=dict(context.environment) if context.environment is not None else None,
         write_metadata=True, write_raw_trace=bool(trace_text),
+        process_observation_complete=process_observation_complete(outcome),
+        provider_response_complete=provider_response_complete(outcome),
+        artifact_set_complete=None,
     )
     marker = RUNNER_FAILURE_MARKER_BY_PROVIDER[context.provider.value]
     if isinstance(outcome, TimedOut):
@@ -4115,7 +4288,29 @@ def write_runner_outcome(run_dir: Path, outcome: AnswerOutcome) -> tuple[dict[st
     else:
         body = answer
     (run_dir / "output.md").write_text(body, encoding="utf-8")
+    if sidecars is not None and sidecars.is_dir():
+        for child in sidecars.iterdir():
+            destination = run_dir / child.name
+            if child.is_dir():
+                shutil.copytree(child, destination)
+            else:
+                shutil.copy2(child, destination)
+    write_artifact_commit(run_dir)
     return events, metrics
+
+
+def write_runner_outcome(run_dir: Path, outcome: AnswerOutcome,
+                         *, sidecars: Path | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    staged = Path(tempfile.mkdtemp(prefix=f".{run_dir.name}.artifact-stage-",
+                                   dir=run_dir.parent))
+    try:
+        result = _write_runner_outcome_files(staged, outcome, sidecars)
+        _install_staged_run(run_dir, staged)
+        return result
+    finally:
+        if staged.exists():
+            shutil.rmtree(staged)
 
 
 def safe_child_path(root: Path, relative: str) -> Path:
@@ -4424,17 +4619,18 @@ def _vibe_content_text(content: Any) -> str:
             elif isinstance(item, str):
                 parts.append(item)
         return "\n".join(parts)
-    return "" if content is None else str(content)
+    return ""
 
 
-def vibe_final_answer(messages: list[dict[str, Any]], fallback: str = "") -> str:
+def vibe_final_answer(messages: list[dict[str, Any]]) -> str:
+    """Return only a validated assistant message; trace bytes are not answers."""
     for msg in reversed(messages):
         if str(msg.get("role", "")).casefold() != "assistant":
             continue
         text = _vibe_content_text(msg.get("content")).strip()
         if text:
             return text
-    return fallback.strip()
+    return ""
 
 
 def _walk_dicts(value: Any) -> Iterable[dict[str, Any]]:
@@ -4521,10 +4717,11 @@ def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | No
                     "model": model, "trace_text": "", "environment": env_meta}
         result = run_argv_capture(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
     messages = parse_vibe_messages(result.stdout)
-    answer = vibe_final_answer(messages, result.stdout)
+    answer = vibe_final_answer(messages)
     usage, cost = vibe_usage_and_cost(messages)
     return {
         "answer": answer,
+        "provider_error": None if answer or result.returncode != 0 else "Vibe stream has no final assistant message",
         "stdout": result.stdout,
         "stderr": result.stderr,
         "returncode": result.returncode,
@@ -4578,6 +4775,7 @@ class ClaudeBackend(AgentBackend):
             provider="claude", answer=result.get("answer") or "",
             returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
             timeout_s=request.timeout_s, elapsed_ms=result.get("elapsed_ms") if isinstance(result.get("elapsed_ms"), (int, float)) else None, stderr=result.get("stderr", ""),
+            error=result.get("parse_error"), trace_text=result.get("raw_response") or "",
             usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
             metadata_extra={"cost_usd": claude_metrics.get("cost_usd")}, metrics_extra=metrics_extra,
             environment={"runner": "claude", "command": "claude -p --output-format json --no-session-persistence", "cwd": "<isolated workspace>"})
@@ -4602,6 +4800,7 @@ class VibeBackend(AgentBackend):
             provider="vibe", answer=result.get("answer") or "",
             returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
             timeout_s=request.timeout_s, elapsed_ms=result.get("elapsed_ms") if isinstance(result.get("elapsed_ms"), (int, float)) else None, stderr=result.get("stderr", ""),
+            error=result.get("provider_error"),
             usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
             trace_text=result.get("trace_text") or "",
             environment={"runner": "vibe", **env})
@@ -4703,18 +4902,20 @@ CLAUDE_USAGE_KEYS = {
 
 
 def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
-    """Pure parser for the `claude -p --output-format json` envelope. Returns
-    {answer, cost_usd, usage, parse_error}. Tolerant: if the envelope isn't JSON
-    (e.g. --output-format text slipped through), the raw stdout IS the answer and
-    cost/usage are absent — never raises, so a runner never crashes on a verdict."""
+    """Parse the `claude -p --output-format json` envelope.
+
+    Malformed protocol bytes remain diagnostics and can never become a final
+    answer merely because the subprocess exited zero.
+    """
     text = stdout if isinstance(stdout, str) else ""
     try:
         env = extract_json_object(text)
     except Exception as exc:  # noqa: BLE001
-        return {"answer": text, "cost_usd": None, "usage": {}, "parse_error": str(exc)}
+        return {"answer": "", "raw_response": text, "cost_usd": None,
+                "usage": {}, "parse_error": str(exc)}
     if not isinstance(env, dict) or "result" not in env:
-        # Valid JSON but not the -p envelope; treat the whole thing as the answer.
-        return {"answer": text, "cost_usd": None, "usage": {}, "parse_error": "not a claude -p json envelope"}
+        return {"answer": "", "raw_response": text, "cost_usd": None,
+                "usage": {}, "parse_error": "not a claude -p json envelope"}
     raw_usage = env.get("usage") if isinstance(env.get("usage"), dict) else {}
     usage: dict[str, int] = {}
     for norm, aliases in CLAUDE_USAGE_KEYS.items():
@@ -4726,11 +4927,13 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     if "input_tokens" in usage and "output_tokens" in usage:
         usage.setdefault("total_tokens", usage["input_tokens"] + usage["output_tokens"])
     cost = env.get("total_cost_usd")
+    result = env.get("result")
+    result_error = None if isinstance(result, str) else "claude result must be a string"
     return {
-        "answer": env.get("result") or "",
+        "answer": result if isinstance(result, str) else "",
         "cost_usd": cost if isinstance(cost, (int, float)) else None,
         "usage": usage,
-        "parse_error": None,
+        "parse_error": result_error,
         "is_error": bool(env.get("is_error")),
         "api_error_status": env.get("api_error_status"),
     }
@@ -5475,7 +5678,7 @@ def judge_verdict_passed(verdict: dict[str, Any], *, default_threshold: float = 
         return False
 
 
-JUDGE_RESERVED_FILES = {"output.md", "events.json", "metrics.json", "metadata.json", "timing.json", "environment.json", "trace.jsonl", "result.json"}
+JUDGE_RESERVED_FILES = {"output.md", "events.json", "metrics.json", "metadata.json", "timing.json", "environment.json", "trace.jsonl", "result.json", ARTIFACT_COMMIT_NAME}
 # Never expose a grader answer key / rubric to a blind judge (G1 leakage guard).
 JUDGE_LEAK_MARKERS = ("grading", "answer", "rubric", "expected", "gold")
 
@@ -5669,12 +5872,11 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         parsed = {}
         parse_error = str(exc)
     assertion = task.get("assertion", {})
-    # G4: validate the verdict SHAPE against its canonical schema. extract_json_object
-    # accepts any JSON object, so a wrong-keys verdict (no `passed`, a graded verdict
-    # with no dimension_scores) would be silently coerced downstream. `report` (default)
-    # only surfaces the violation in schema_errors; `strict` fails it closed.
+    # Validate every newly produced verdict before it can establish pass/fail.
+    # `report` controls whether diagnostics are surfaced, not whether malformed
+    # provider evidence is accepted; both modes fail closed.
     schema_errors = json_schema_errors(parsed, verdict_schema_for(assertion)) if (parse_error is None and isinstance(parsed, dict)) else []
-    if schema_errors and schema_enforcement == "strict":
+    if schema_errors:
         parse_error = "verdict schema: " + "; ".join(schema_errors[:5])
     threshold = assertion.get("threshold", parsed.get("threshold", 1))
     score = parsed.get("score")
@@ -5824,10 +6026,19 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
     out["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
     out["agreement"] = {"concur": concur, "n": n, "concur_fraction": round(concur / n, 4),
                         "unanimous": concur in (0, n), "unresolved": unresolved}
-    member_cost = [r.get("cost_usd") for r in rows if isinstance(r.get("cost_usd"), (int, float))]
-    if member_cost:
-        out["cost_usd"] = sum(member_cost)
-        out["cost_normalized"] = normalize_cost(out["cost_usd"], source="provider_reported", pricing_model="consensus")
+    member_cost = [telemetry_domain.measurement_from_envelope_or_cost(
+        row, source="judge", population="judge") for row in rows]
+    cost_buckets = telemetry_domain.aggregate_money_by_currency(member_cost)
+    out["cost_aggregate"] = {currency: aggregate.to_dict()
+                             for currency, aggregate in cost_buckets.items()}
+    usd = cost_buckets.get("USD")
+    if usd is not None and usd.availability == telemetry_domain.COMPLETE and len(cost_buckets) == 1:
+        out["cost_usd"] = float(usd.value)
+        out["cost_normalized"] = normalize_cost(
+            out["cost_usd"], source="provider_reported", pricing_model="consensus")
+    else:
+        out["cost_usd"] = None
+        out["cost_normalized"] = {"source": "missing"}
     out["judge_panel"] = rows
     for key in ("threshold", "dimension_scores", "criteria", "minimum_criteria"):
         out.pop(key, None)
@@ -5943,7 +6154,8 @@ def run_subagent_tasks(
         pt = PreparedTask.from_row(task)
         row_model = task.get("model") or model
         base = safe_child_path(runs, pt.run_dir)
-        base.mkdir(parents=True, exist_ok=True)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        sidecars = Path(tempfile.mkdtemp(prefix=f".{base.name}.sidecars-", dir=base.parent))
         prov_extra = {
             "population": "answer",
             "case_id": pt.case_id,
@@ -5953,7 +6165,11 @@ def run_subagent_tasks(
             **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
             **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {}),
         }
-        store = ToolReplayStore(base / "tool-replay.json", mode) if mode != "off" else None
+        replay_path = sidecars / "tool-replay.json"
+        existing_replay = base / "tool-replay.json"
+        if mode in {"replay", "strict", "auto"} and existing_replay.is_file():
+            shutil.copy2(existing_replay, replay_path)
+        store = ToolReplayStore(replay_path, mode) if mode != "off" else None
 
         def tool_executor(tool: str, payload: Any) -> Any:
             live = (live_tools or {}).get(tool)
@@ -5982,7 +6198,7 @@ def run_subagent_tasks(
                         sent = prompt if n == 1 else turn_prompt
                         outcome = agent_fn(prompt=sent, workspace=ws, model=row_model, tool_executor=tool_executor, history=list(history)) or {}
                         turn_answer = str(outcome.get("answer") or "")
-                        turn_dir = base / f"turn-{n}"
+                        turn_dir = sidecars / f"turn-{n}"
                         turn_dir.mkdir(parents=True, exist_ok=True)
                         (turn_dir / "output.md").write_text(turn_answer, encoding="utf-8")
                         history.append({"prompt": sent, "answer": turn_answer})
@@ -6020,7 +6236,10 @@ def run_subagent_tasks(
             metadata_extra={"tool_replay_mode": mode, **prov_extra},
             metrics_extra={k: v for k, v in (raw_usage or {}).items() if isinstance(v, (int, float))},
             diagnose_returncode=False)
-        write_runner_outcome(base, ro)
+        try:
+            write_runner_outcome(base, ro, sidecars=sidecars)
+        finally:
+            shutil.rmtree(sidecars, ignore_errors=True)
     return 0
 
 
@@ -6822,12 +7041,23 @@ def telemetry_for_result(result: dict[str, Any]) -> dict[str, bool]:
     metrics_exists = (base / "metrics.json").exists()
     events, _ = read_events_base(base) if events_exists else (None, None)
     has_skill_event = bool(events and any(e.get("type") == "skill_load" for e in events))
+    has_command_event = bool(events and command_events(events))
     envelope = metrics.get("telemetry") if isinstance(metrics.get("telemetry"), dict) else {}
     measurements = envelope.get("measurements") if isinstance(envelope, dict) else {}
 
     def observed(key: str, fallback: bool) -> bool:
         measurement = measurements.get(key) if isinstance(measurements, dict) else None
         if isinstance(measurement, dict):
+            if key in {"commands", "skill_invoked"}:
+                try:
+                    evidence_raw = envelope.get("observation_evidence")
+                    evidence = (telemetry_domain.ObservationEvidence.from_dict(evidence_raw)
+                                if isinstance(evidence_raw, dict)
+                                else telemetry_domain.ObservationEvidence.from_run(metrics))
+                except (TypeError, ValueError):
+                    return False
+                if not evidence.operation_complete:
+                    return False
             return measurement.get("availability") == telemetry_domain.AVAILABLE
         return fallback
 
@@ -6836,7 +7066,7 @@ def telemetry_for_result(result: dict[str, Any]) -> dict[str, bool]:
         "events": events_exists,
         "metrics": metrics_exists,
         "tokens": observed("total_tokens", metric_number(metrics, "total_tokens") is not None),
-        "commands": observed("commands", metric_number(metrics, "commands", "command_count") is not None or events_exists),
+        "commands": observed("commands", metric_number(metrics, "commands", "command_count") is not None or has_command_event),
         "skill_invocation": observed("skill_invoked", isinstance(metrics.get("skill_invoked"), bool) or has_skill_event),
     }
 
@@ -10590,6 +10820,29 @@ def _run_suite_tier(scope: dict[str, Any], out_dir: Path) -> list[dict[str, Any]
     return commands
 
 
+def _validated_complete_history_value(totals: dict[str, Any], key: str,
+                                      expected_count: int) -> float | None:
+    """Read a complete aggregate only when its scalar/counts agree exactly."""
+    aggregate = totals.get(f"{key}_aggregate")
+    scalar = totals.get(key)
+    if (not isinstance(aggregate, dict)
+            or aggregate.get("availability") != telemetry_domain.COMPLETE
+            or aggregate.get("observed_count") != expected_count
+            or aggregate.get("unavailable_count") != 0
+            or aggregate.get("not_applicable_count") != 0
+            or isinstance(scalar, bool) or not isinstance(scalar, (int, float))
+            or not math.isfinite(float(scalar)) or float(scalar) < 0):
+        return None
+    value = aggregate.get("value")
+    try:
+        aggregate_value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(aggregate_value) or aggregate_value < 0 or aggregate_value != float(scalar):
+        return None
+    return float(scalar)
+
+
 def suite_cost_estimate(scope: dict[str, Any], *, history_dir: Path | None = None, assumed_tokens_per_run: float = 30000.0, assumed_cost_per_run_usd: float | None = None) -> dict[str, Any]:
     """Preflight cost projection (issue #21): historical per-run medians from
     previous cost-summary ledgers when available, otherwise a static
@@ -10616,16 +10869,18 @@ def suite_cost_estimate(scope: dict[str, Any], *, history_dir: Path | None = Non
                 continue
             coverage = doc.get("coverage") or {}
             doc_totals = doc.get("totals") or {}
-            seen = coverage.get("runs_seen") or 0
-            if not seen:
+            seen = coverage.get("runs_seen")
+            if isinstance(seen, bool) or not isinstance(seen, int) or seen <= 0:
                 continue
-            if (doc_totals.get("total_tokens_availability") == telemetry_domain.COMPLETE
-                    and isinstance(doc_totals.get("total_tokens"), (int, float))):
-                token_rates.append(doc_totals["total_tokens"] / seen)
-            costed = coverage.get("runs_with_dollar_cost") or 0
-            if (doc_totals.get("total_cost_usd_availability") == telemetry_domain.COMPLETE
-                    and costed and isinstance(doc_totals.get("total_cost_usd"), (int, float))):
-                cost_rates.append(doc_totals["total_cost_usd"] / costed)
+            tokens = _validated_complete_history_value(doc_totals, "total_tokens", seen)
+            if tokens is not None:
+                token_rates.append(tokens / seen)
+            costed = coverage.get("runs_with_dollar_cost")
+            if isinstance(costed, bool) or not isinstance(costed, int) or costed <= 0 or costed > seen:
+                continue
+            cost = _validated_complete_history_value(doc_totals, "total_cost_usd", costed)
+            if cost is not None:
+                cost_rates.append(cost / costed)
         if token_rates:
             per_run_tokens = statistics.median(token_rates)
             basis = "cost_history_median"

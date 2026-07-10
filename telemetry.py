@@ -32,6 +32,118 @@ PROVENANCE = {
 }
 CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
+EVIDENCE_COMPLETE = "complete"
+EVIDENCE_INCOMPLETE = "incomplete"
+EVIDENCE_UNKNOWN = "unknown"
+_EVIDENCE_STATES = {EVIDENCE_COMPLETE, EVIDENCE_INCOMPLETE, EVIDENCE_UNKNOWN}
+
+
+@dataclass(frozen=True)
+class ObservationEvidence:
+    """Independent observation channels for one run.
+
+    A complete channel never promotes another channel. Full-run operation
+    evidence exists only when process exit, provider response, and trace are all
+    independently complete. Artifact completeness is committed separately after
+    the required files are durable.
+    """
+
+    process: str = EVIDENCE_UNKNOWN
+    provider_response: str = EVIDENCE_UNKNOWN
+    trace: str = EVIDENCE_UNKNOWN
+    artifact_set: str = EVIDENCE_UNKNOWN
+
+    def __post_init__(self) -> None:
+        for label, value in (("process", self.process),
+                             ("provider_response", self.provider_response),
+                             ("trace", self.trace),
+                             ("artifact_set", self.artifact_set)):
+            if value not in _EVIDENCE_STATES:
+                raise ValueError(f"unknown {label} evidence state {value!r}")
+
+    @staticmethod
+    def state(value: bool | None) -> str:
+        if value is True:
+            return EVIDENCE_COMPLETE
+        if value is False:
+            return EVIDENCE_INCOMPLETE
+        return EVIDENCE_UNKNOWN
+
+    @property
+    def operation_complete(self) -> bool:
+        return all(value == EVIDENCE_COMPLETE for value in (
+            self.process, self.provider_response, self.trace))
+
+    @property
+    def operation_incomplete_reason(self) -> str:
+        if self.process != EVIDENCE_COMPLETE:
+            return "process_observation_incomplete"
+        if self.provider_response != EVIDENCE_COMPLETE:
+            return "provider_response_incomplete"
+        if self.trace != EVIDENCE_COMPLETE:
+            return "trace_observation_incomplete"
+        return "operation_observation_complete"
+
+    @property
+    def artifact_complete(self) -> bool:
+        return self.artifact_set == EVIDENCE_COMPLETE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "process": {"state": self.process},
+            "provider_response": {"state": self.provider_response},
+            "trace": {"state": self.trace},
+            "artifact_set": {"state": self.artifact_set},
+            "operation_evidence_complete": self.operation_complete,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ObservationEvidence":
+        if not isinstance(raw, Mapping) or raw.get("schema_version") != 1:
+            raise ValueError("observation evidence must use schema_version 1")
+        values: dict[str, str] = {}
+        for key in ("process", "provider_response", "trace", "artifact_set"):
+            block = raw.get(key)
+            if not isinstance(block, Mapping):
+                raise ValueError(f"observation evidence {key} must be an object")
+            values[key] = str(block.get("state"))
+        evidence = cls(**values)
+        if raw.get("operation_evidence_complete") is not evidence.operation_complete:
+            raise ValueError("operation completeness contradicts its evidence channels")
+        return evidence
+
+    @classmethod
+    def from_run(cls, raw: Mapping[str, Any]) -> "ObservationEvidence":
+        explicit = raw.get("observation_evidence")
+        if isinstance(explicit, Mapping):
+            return cls.from_dict(explicit)
+        # Compatibility adapter for pre-contract artifacts. The generic field
+        # described answer/provider completeness; it cannot certify process or
+        # trace state. Derive process exit only from actual process fields and
+        # leave absent trace evidence unknown rather than preserving the old
+        # cross-channel promotion.
+        generic = raw.get("observation_complete")
+        process = raw.get("process_observation_complete")
+        provider = raw.get("provider_response_complete")
+        trace = raw.get("trace_observation_complete")
+        if not isinstance(process, bool):
+            returncode = raw.get("returncode")
+            timed_out = raw.get("timed_out") is True or raw.get("timeout") is True
+            if timed_out or returncode in {124, 127}:
+                process = False
+            elif isinstance(returncode, int) and not isinstance(returncode, bool):
+                process = True
+            else:
+                process = None
+        if not isinstance(provider, bool):
+            provider = generic if isinstance(generic, bool) else None
+        if not isinstance(trace, bool):
+            trace = None
+        artifact = raw.get("artifact_set_complete")
+        return cls(cls.state(process), cls.state(provider), cls.state(trace),
+                   cls.state(artifact if isinstance(artifact, bool) else None))
+
 
 def _decimal(value: Any) -> Decimal:
     """Parse a finite non-negative money scalar without accepting bool/NaN."""
@@ -499,24 +611,23 @@ def telemetry_envelope(raw: Mapping[str, Any] | None, *, source: str | None = No
         "elapsed_ms": measurement_from_nonnegative(raw.get("elapsed_ms", raw.get("duration_ms")),
                                                      unavailable_reason="missing_elapsed_ms", basis=basis).to_dict(),
     }
-    # Trace-derived counts/bools are trustworthy only when a complete trace was
-    # observed. Their old flat fields remain for assertion compatibility, while
-    # v3 prevents an empty/malformed trace from looking like zero activity.
-    trace_complete = raw.get("trace_observation_complete")
-    if not isinstance(trace_complete, bool):
-        # Legacy callers used observation_complete for trace completeness. New
-        # artifacts carry both process and trace state, so the trace-specific
-        # field takes precedence when present.
-        trace_complete = raw.get("observation_complete")
+    # Trace-derived counts/bools support complete-run claims only when process,
+    # provider response, and trace are independently complete. A successful
+    # provider response cannot promote an absent trace, and a parseable partial
+    # trace from a failed process cannot promote the process outcome.
+    observation_evidence = ObservationEvidence.from_run(raw)
+    operation_complete = observation_evidence.operation_complete
     for key in ("tool_calls", "commands", "file_reads", "file_writes", "errors", "retries", "repeated_command_max"):
-        if trace_complete is True:
+        if operation_complete:
             measurements[key] = measurement_from_nonnegative(raw.get(key), unavailable_reason=f"missing_{key}", basis=basis).to_dict()
         else:
-            measurements[key] = Measurement.unavailable("trace_observation_incomplete", basis=basis).to_dict()
-    if trace_complete is True and isinstance(raw.get("skill_invoked"), bool):
+            measurements[key] = Measurement.unavailable(
+                observation_evidence.operation_incomplete_reason, basis=basis).to_dict()
+    if operation_complete and isinstance(raw.get("skill_invoked"), bool):
         measurements["skill_invoked"] = Measurement.available(raw["skill_invoked"], provenance="trace_normalized", basis=basis).to_dict()
     else:
-        measurements["skill_invoked"] = Measurement.unavailable("trace_observation_incomplete", basis=basis).to_dict()
+        measurements["skill_invoked"] = Measurement.unavailable(
+            observation_evidence.operation_incomplete_reason, basis=basis).to_dict()
     if legacy_unverified:
         # Normalized v1/v2 fields can be useful historical observations but do
         # not establish the provider/billing basis needed for causal ratios.
@@ -532,6 +643,7 @@ def telemetry_envelope(raw: Mapping[str, Any] | None, *, source: str | None = No
         "schema_version": 3,
         "population": basis["population"],
         "basis": {key: value for key, value in basis.items() if value is not None},
+        "observation_evidence": observation_evidence.to_dict(),
         "measurements": measurements,
     }
 
@@ -556,6 +668,20 @@ def measurement_from_envelope_or_nonnegative(raw: Mapping[str, Any], key: str, *
     """Read a v3 local metric (duration/count) or adapt a legacy scalar."""
     envelope = raw.get("telemetry")
     if isinstance(envelope, Mapping) and envelope.get("schema_version") == 3:
+        operation_keys = {
+            "tool_calls", "commands", "file_reads", "file_writes",
+            "errors", "retries", "repeated_command_max", "skill_invoked",
+        }
+        if key in operation_keys:
+            try:
+                evidence_raw = envelope.get("observation_evidence")
+                evidence = (ObservationEvidence.from_dict(evidence_raw)
+                            if isinstance(evidence_raw, Mapping)
+                            else ObservationEvidence.from_run(raw))
+            except ValueError:
+                return Measurement.unavailable("invalid_observation_evidence")
+            if not evidence.operation_complete:
+                return Measurement.unavailable(evidence.operation_incomplete_reason)
         measurements = envelope.get("measurements")
         if isinstance(measurements, Mapping) and isinstance(measurements.get(key), Mapping):
             try:
