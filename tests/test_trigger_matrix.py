@@ -76,6 +76,52 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         self.assertNotEqual(Path(seen["cwd"]).resolve(), ROOT.resolve())
 
 
+    def test_pi_json_provider_error_cannot_pass_a_negative_trigger(self):
+        provider_error = json.dumps({
+            "type": "agent_end", "willRetry": False,
+            "messages": [{"role": "assistant", "content": [], "stopReason": "error",
+                          "errorMessage": "Mistral API error (400): Invalid model",
+                          "usage": {"input": 7, "output": 2, "totalTokens": 9,
+                                    "cost": {"total": 0.009}}}],
+        })
+
+        def failed_provider(*args, **kwargs):
+            return {"stdout": provider_error + "\n", "stderr": "", "returncode": 0, "timed_out": False,
+                    "elapsed_ms": 1, "observation_complete": True}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tr, "run_argv_with_timeout", side_effect=failed_provider):
+            trace_dir = Path(td) / "trace"
+            result = tr.run_query(DEMO_MANIFEST, "ordinary chat", False, 12, None, trace_dir=trace_dir)
+            artifacts = [
+                json.loads((trace_dir / name).read_text(encoding="utf-8"))
+                for name in ("metrics.json", "metadata.json")
+            ]
+        self.assertFalse(result["observation_complete"])
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["usage_normalized"], {"source": "missing"})
+        self.assertEqual(result["cost_normalized"], {"source": "missing"})
+        self.assertIn("Invalid model", result["provider_error"])
+        for artifact in artifacts:
+            self.assertEqual(artifact["usage_normalized"], {"source": "missing"})
+            self.assertEqual(artifact["cost_normalized"], {"source": "missing"})
+            measurements = artifact["telemetry"]["measurements"]
+            self.assertEqual(measurements["total_tokens"]["availability"], "unavailable")
+            self.assertEqual(measurements["cost"]["availability"], "unavailable")
+
+    def test_pi_adapter_propagates_json_provider_error_as_incomplete(self):
+        provider_error = json.dumps({
+            "type": "agent_end", "willRetry": False,
+            "messages": [{"stopReason": "error", "errorMessage": "provider rejected model"}],
+        })
+        run = {"stdout": provider_error, "stderr": "", "returncode": 0, "timed_out": False,
+               "elapsed_ms": 1, "observation_complete": True}
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.PiAdapter, "_run_argv", staticmethod(lambda *args, **kwargs: run)):
+            workspace = Path(td) / "workspace"
+            workspace.mkdir()
+            result = tm.PiAdapter().invoke("ordinary chat", None, workspace, 12)
+        self.assertFalse(result["observation_complete"])
+        self.assertEqual(result["provider_error"], "provider rejected model")
+
     def test_pi_timeout_with_parseable_partial_trace_is_not_telemetry_complete(self):
         def timed_out(*args, **kwargs):
             return {"stdout": json.dumps({"type": "command", "command": "partial"}) + "\n",

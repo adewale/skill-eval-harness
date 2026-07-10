@@ -83,10 +83,11 @@ caller-owned directory.
 ```
 
 `--live` is required because this spends provider budget. Defaults are intentionally
-small (`haiku`, `gpt-5.4-mini`, `devstral-small-latest`, and
-`mistral/ministral-3b-latest`); override any model with
+small (`haiku`, `gpt-5.4-mini`, `devstral-small-latest`, and Pi's
+`openai-codex/gpt-5.4-mini`); override any model with
 `--claude-model`, `--codex-model`, `--vibe-model`, or `--pi-model` (or the matching
-`SMOKE_*_MODEL` environment variable). Jetty is an API/import surface, not a local
+`SMOKE_*_MODEL` environment variable). Pi's Codex-backed default requires Pi's OpenAI Codex
+authentication. Jetty is an API/import surface, not a local
 CLI; retain its separate token-backed smoke. The command exits nonzero unless every selected
 CLI completes its artifact contract and the demo fixtures pass, so incomplete or substituted
 trigger rows and failed provider runs are never reported as a smoke success.

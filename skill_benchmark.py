@@ -3447,7 +3447,10 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     command = stringify_trace_value(raw_trace_value(record, "command", "cmd", "args"))
     content = stringify_trace_value(raw_trace_value(record, "content", "text", "message"))
     status = str(raw_trace_value(record, "status", "state") or "completed")
-    event_type = "tool_call"
+    # Unknown session/lifecycle events are not tool calls. Defaulting them to
+    # tool_call inflated Pi's process telemetry even when its trace had no
+    # model tool use at all.
+    event_type = "event"
     name = stringify_trace_value(raw_trace_value(record, "tool", "tool_name", "name"))
     if "skill" in raw_type and ("load" in raw_type or "read" in raw_type):
         event_type = "skill_load"
@@ -3456,6 +3459,8 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     elif "command" in raw_type or "exec" in raw_type or command:
         event_type = "command"
         name = name or "bash"
+    elif "tool" in raw_type or raw_trace_value(record, "tool", "tool_name", "tool_call_id") is not None:
+        event_type = "tool_call"
     elif "file_write" in raw_type or "write" in raw_type or "edit" in raw_type:
         event_type = "file_write"
     elif "file_read" in raw_type or "read" in raw_type:
@@ -3554,26 +3559,37 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
     commands = [command_text(e) for e in command_events(events)]
     token_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     elapsed_ms = 0.0
-    for record, event in zip(records, events):
-        usage = raw_trace_value(record, "usage", "tokens")
-        if isinstance(usage, dict):
-            input_tokens = usage_number(usage, "input_tokens")
-            output_tokens = usage_number(usage, "output_tokens")
-            total_tokens = usage_number(usage, "total_tokens")
-            if total_tokens is None and input_tokens is not None and output_tokens is not None:
-                total_tokens = input_tokens + output_tokens
-            for key, value in [("input_tokens", input_tokens), ("output_tokens", output_tokens), ("total_tokens", total_tokens)]:
-                if isinstance(value, (int, float)):
-                    token_totals[key] += value
-        duration = _num(raw_trace_value(record, "duration_ms", "elapsed_ms"))
-        if duration is not None:
-            elapsed_ms += duration
-        tokens = event.get("tokens")
-        if isinstance(tokens, dict) and not isinstance(usage, dict):
-            for key in token_totals:
-                value = tokens.get(key)
-                if isinstance(value, (int, float)):
-                    token_totals[key] += value
+    is_pi = source.casefold() == "pi"
+    pi_error = _pi_terminal_error(records) if is_pi else None
+    pi_terminal_usage = _pi_terminal_usage(records) if is_pi and not pi_error else None
+    if pi_terminal_usage is not None:
+        # Pi repeats final cumulative usage on message_end, turn_end, and
+        # agent_end. It is one response, not several token deltas.
+        for key in token_totals:
+            value = usage_number(pi_terminal_usage, key)
+            if value is not None:
+                token_totals[key] = value
+    elif not pi_error:
+        for record, event in zip(records, events):
+            usage = raw_trace_value(record, "usage", "tokens")
+            if isinstance(usage, dict):
+                input_tokens = usage_number(usage, "input_tokens")
+                output_tokens = usage_number(usage, "output_tokens")
+                total_tokens = usage_number(usage, "total_tokens")
+                if total_tokens is None and input_tokens is not None and output_tokens is not None:
+                    total_tokens = input_tokens + output_tokens
+                for key, value in [("input_tokens", input_tokens), ("output_tokens", output_tokens), ("total_tokens", total_tokens)]:
+                    if isinstance(value, (int, float)):
+                        token_totals[key] += value
+            duration = _num(raw_trace_value(record, "duration_ms", "elapsed_ms"))
+            if duration is not None:
+                elapsed_ms += duration
+            tokens = event.get("tokens")
+            if isinstance(tokens, dict) and not isinstance(usage, dict):
+                for key in token_totals:
+                    value = tokens.get(key)
+                    if isinstance(value, (int, float)):
+                        token_totals[key] += value
     skill_events = [e for e in events if e.get("type") == "skill_load" or event_mentions_skill_file(e)]
     metrics: dict[str, Any] = {
         "schema_version": 2,
@@ -3607,6 +3623,59 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
         metrics["otel"] = otel_usage
     event_doc = {"schema_version": 2, "source": source, "events": events}
     return event_doc, metrics
+
+
+def _pi_terminal_error(records: list[dict[str, Any]]) -> str | None:
+    """Read Pi's terminal provider status from its retrying JSON stream."""
+    last_agent_end: dict[str, Any] | None = None
+    fallback: dict[str, Any] | None = None
+    for record in records:
+        event_type = str(record.get("type") or "")
+        if event_type == "agent_end":
+            last_agent_end = record
+        elif event_type == "turn_end":
+            fallback = record
+
+    def error_from(record: dict[str, Any] | None) -> str | None:
+        if not isinstance(record, dict):
+            return None
+        candidates: list[Any] = [record.get("message")]
+        messages = record.get("messages")
+        if isinstance(messages, list) and messages:
+            candidates.append(messages[-1])
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            error = candidate.get("errorMessage") or candidate.get("error")
+            if isinstance(error, str) and error.strip():
+                return error.strip()
+            if str(candidate.get("stopReason") or "").casefold() == "error":
+                return "Pi provider ended the turn with stopReason:error"
+        return None
+
+    return error_from(last_agent_end) or error_from(fallback)
+
+
+def pi_stream_terminal_error(raw_text: str) -> str | None:
+    """Public Pi JSON boundary: provider errors cannot become zero telemetry."""
+    records = [record for record in iter_json_objects(raw_text) if isinstance(record, dict)]
+    return _pi_terminal_error(records)
+
+
+def _pi_terminal_usage(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return Pi's one final cumulative usage block, if this is a Pi stream."""
+    for record in reversed(records):
+        event_type = str(record.get("type") or "")
+        if event_type not in {"agent_end", "turn_end", "message_end"}:
+            continue
+        candidates: list[Any] = [record.get("message")]
+        messages = record.get("messages")
+        if isinstance(messages, list) and messages:
+            candidates.append(messages[-1])
+        for message in candidates:
+            if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                return message["usage"]
+    return None
 
 
 def _stream_usage_doc(record: dict[str, Any]) -> dict[str, Any] | None:
@@ -3648,12 +3717,22 @@ def _cost_value_from_record(record: dict[str, Any]) -> Any:
     return None
 
 
-def stream_usage_and_cost(raw_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def stream_usage_and_cost(raw_text: str, *, source: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """usage_normalized/cost_normalized straight from a runner's raw JSONL
     stream (issue #21). Prefer final cumulative result/completion usage when a
     provider emits it; otherwise sum per-event usage deltas. Missing stays
-    marked."""
+    marked. Pi's terminal events receive their special cumulative semantics
+    only when the caller identifies the stream as Pi."""
     records = [obj for obj in iter_json_objects(raw_text) if isinstance(obj, dict)]
+    is_pi = str(source or "").casefold() == "pi"
+    if is_pi and _pi_terminal_error(records):
+        return {"source": "missing"}, {"source": "missing"}
+    pi_terminal_usage = _pi_terminal_usage(records) if is_pi else None
+    if pi_terminal_usage is not None:
+        return (
+            normalize_usage(pi_terminal_usage, source="trace_normalized"),
+            normalize_cost(pi_terminal_usage.get("cost"), source="trace_normalized"),
+        )
     cumulative_usage: list[dict[str, Any]] = []
     for record in records:
         if not _is_cumulative_usage_record(record):
