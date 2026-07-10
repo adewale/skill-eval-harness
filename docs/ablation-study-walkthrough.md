@@ -111,7 +111,7 @@ python3 -c "import json,skill_benchmark as sb; from pathlib import Path; print(s
 # run the arms with your runner
 HARNESS=/path/to/skill_benchmark.py
 python3 $HARNESS prepare evals/shared-benchmark.json --split tune --include-ablations \
-  --ablation-dir /tmp/abl --runs-per-variant 4 --out /tmp/tasks.jsonl
+  --ablation-dir /tmp/abl --runs-per-variant 6 --out /tmp/tasks.jsonl
 python3 $HARNESS run-codex --tasks /tmp/tasks.jsonl --runs /tmp/runs --codex-cmd "claude -p"
 python3 - <<'PY' > /tmp/ablation-variants.args
 import json

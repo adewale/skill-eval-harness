@@ -1,11 +1,28 @@
 # Correctness-by-construction audit
 
-This audit distinguishes invariants now enforced structurally from remaining places where
-free-form dictionaries or strings can still represent contradictory states.
+This audit records the invariants that are now enforced structurally at the harness's trust
+boundaries. Raw provider/task/result dictionaries remain wire formats; code parses them into frozen,
+closed domain values before it makes execution, grading, comparison, or causal claims.
 
-## Applied to autonomous-trigger evaluation
+## Construction rule
 
-The trigger path now has one internal state pipeline:
+```text
+untrusted wire data
+  -> strict parser / smart constructor
+  -> one closed domain variant
+  -> derived booleans and numeric claims
+  -> validated persisted row
+```
+
+The rule has three consequences:
+
+1. mutually exclusive states are variants, not independently writable booleans;
+2. identities and units are validated before values are paired or aggregated; and
+3. persisted JSON is parsed again when it crosses back into the process.
+
+## Autonomous-trigger observations
+
+The trigger path has one internal state pipeline:
 
 ```text
 subprocess bytes
@@ -17,85 +34,155 @@ subprocess bytes
 ```
 
 - `InvocationOutcome` is a frozen, closed state machine. Completion, timeout, spawn failure,
-  process failure, provider failure, and harness failure are mutually exclusive. A non-zero
-  completion requires the explicit bounded-agent-window transition.
-- `PiStream` parses provider status and cumulative telemetry together. A complete process with
-  a terminal provider error, malformed JSON stream, or no terminal agent event becomes a failed
-  observation. Failed streams cannot carry numeric usage or cost.
+  process failure, provider failure, protocol failure, and harness failure are mutually exclusive.
+- `PiStream` parses provider status and cumulative telemetry together. A complete process with a
+  terminal provider error, malformed JSON stream, or no final non-retrying `agent_end` is failed.
+  Failed streams cannot carry numeric usage or cost.
 - `TriggerDetection.triggered` is derived from typed evidence. Unknown lifecycle events are not
   evidence, and callers cannot independently set a trigger boolean.
 - `TriggerObservation.pass` is derived from invocation completeness, expected polarity, and
-  detection. Incomplete observations are structurally forbidden from carrying measured usage or
-  cost.
-- Persisted rows are parsed back through `TriggerObservation.from_row` before the live smoke trusts
-  them. This re-establishes the internal contract at the disk boundary.
-- Smoke targets and default models live in the capability registry. Blank environment overrides
-  resolve to the registered fallback instead of creating an empty model identifier.
+  detection. Incomplete observations cannot carry measured usage or cost.
+- Persisted rows are parsed through `TriggerObservation.from_row` before live smoke trusts them.
 
-Recorded, sanitized Pi JSONL fixtures cover successful cumulative lifecycle events and an exit-zero
-terminal provider error. The finite invocation-state and trigger truth tables are exhaustively tested.
+Recorded, sanitized Pi JSONL fixtures cover success, an exit-zero provider error, retry then
+success, and exhausted retries. Exhaustive finite-state and trigger truth tables guard the boundary.
 
-## Next candidates
+## Paired experimental identity
 
-### P0: paired experimental identity
+`experimental_pairs.py` owns `ExperimentalPairKey(case_id, model, run_number, population)` and the
+only constructor for `ExperimentalPair`.
 
-`build_paired_summary`, `paired_case_rates`, and ablation regression aggregation still average arms
-before proving that the same case, model, repetition, population, and skill revision exist on both
-sides. Introduce a validated `ExperimentalPairKey` and a discriminated result such as
-`CompletePair | MissingLeft | MissingRight | DuplicateIdentity | PopulationMismatch`. Compute lift,
-reliability, and causal confirmation from `CompletePair` values only.
+- A complete pair contains exactly one `with_skill` and one `without_skill` arm with the same key.
+- Missing arms and ineligible arms become explicit `BlockedExperimentalPair` values.
+- A duplicate arm for one identity raises before aggregation; it can no longer overwrite an earlier
+  row in a dictionary.
+- Lift, graded lift, paired reliability, paired cost, token-overhead run discovery, slice/case
+  comparative flags, readiness comparisons, and answer-population ablation confirmation consume the
+  validated construction. Pairing diagnostics expose eligible/blocked counts and reasons.
+- Telemetry comparisons add the stricter measurement-basis check (including provenance, currency,
+  billing scope, and recorded revision fields) before a numeric delta or ratio exists.
 
-**Illegal state today:** two different models or disjoint repetition sets can contribute to a value
-called “paired.”
+This prevents cross-model, cross-repetition, and cross-population rows from contributing to a value
+called paired. Older result rows without a model remain in the explicit unlabeled-model population;
+a missing repetition identity is rejected rather than inferred from file order.
 
-### P0: answer-runner outcomes
+## Answer-runner outcomes
 
-`RunnerOutcome` and the answer backends still use a mutable optional-field bag. Replace it with a
-frozen union such as `Completed | TimedOut | SpawnFailed | ProviderFailed`, a closed provider enum,
-and typed telemetry. Make artifact writing consume that union without mutating it.
+`runner_contracts.py` replaces the mutable answer-runner outcome bag with the frozen union:
 
-**Illegal state today:** timeout with return code zero, success with both answer and error, unknown
-provider falling through a known-provider failure policy, or non-finite elapsed/cost values.
+```text
+Completed | TimedOut | SpawnFailed | ProviderFailed
+```
 
-### P1: imported judge verdicts
+`OutcomeContext` owns the closed provider enum, recursively freezes JSON-shaped context, and
+validates finite non-negative elapsed time, usage, and cost. `Completed` requires a non-empty final
+answer; raw trace bytes are never promoted to candidate output. Timeout return code 124, spawn return code 127, normal completion return code 0,
+and provider failure are mutually exclusive. `write_runner_outcome` exhaustively adapts the union to
+artifacts; backends cannot repair or mutate status booleans while writing files. `RunnerOutcome`
+remains only as a strict compatibility factory that constructs one of the four variants.
 
-`load_judge_results` and `judge_verdict_passed` consume untyped rows and use truthiness in places.
-Add strict discriminated verdicts for boolean, scored, dimension-scored, and dynamic-rubric results;
-reject duplicate task IDs and contradictory score/threshold/pass fields.
+## Imported judge verdicts
 
-**Illegal state today:** `{"passed": "false"}` can behave as passing, and duplicate contradictory
-verdicts can resolve by file order.
+`judge_verdict.py` parses judge rows into one of:
 
-### P1: prepared execution tasks
+```text
+BooleanVerdict | ScoredVerdict | DimensionVerdict | DynamicVerdict | ConsensusVerdict
+```
 
-`PreparedTask.from_row` currently permits partial prompt fixtures and executable tasks through the
-same type. Split `PreparedTaskDraft` from a validated `PreparedTask`; require closed variant/split/kind
-values, a positive repetition, non-empty identifiers, and a safe relative run path.
+- `passed` is a real JSON boolean; strings and integer truthiness are rejected.
+- Scored verdicts derive pass from finite `score >= threshold` and reject a contradictory stored
+  boolean.
+- Dimension verdicts validate non-empty names, the 1–5 score range, normalized aggregate, and
+  threshold; when merged against an assertion, the supplied names must exactly match its declared
+  dimension set.
+- Dynamic verdicts require uniquely named boolean criteria, a valid minimum, and an aggregate that
+  agrees with the criteria.
+- Stored result loading rejects missing, conflicting, and duplicate task IDs. Repetition/panel
+  merging requires one task identity; panel models must be non-empty and unique. Consensus is
+  serialized as its own verdict kind.
+- Provider output that violates semantic invariants is retained only as diagnostic raw payload; the
+  stored verdict is one valid failed boolean verdict.
 
-**Illegal state today:** a value typed as prepared can contain missing IDs, an unknown variant, a
-string run number, or an unsafe run directory.
+## Draft versus executable tasks
 
-### P2: Jetty lifecycle
+`PreparedTaskDraft` is the permissive planning value. It can render or inspect a partial task but
+cannot be passed to a runner. `PreparedTaskDraft.validate()` / `PreparedTask.from_row()` is the only
+transition to executable `PreparedTask`.
 
-Parse provider aliases once into a closed `JettyState`, then use lifecycle-specific values:
-`Pending`, `Completed` (requiring trajectory/output), `Failed` (requiring a reason), `TimedOut`,
-`DryRun`, and `ProtocolError`.
+The executable type requires non-empty identifiers, a closed split and execution variant, an
+explicit positive integer repetition, list-of-string path fields, a safe non-root relative run
+directory, no skill paths on `without_skill`, and matching typed ablation provenance/tree identity. Runner boundaries convert
+constructor failures to explicit CLI input errors instead of starting a subprocess. The author-facing
+case `kind` remains descriptive; the closed execution population is derived separately as answer or
+trigger.
 
-**Illegal state today:** completed without output, failed without an error, or unknown provider state
-with apparently complete artifacts.
+## Jetty lifecycle
 
-### P2: normalized trace-event lifecycle
+`jetty_contracts.py` maps provider aliases once into the closed lifecycle:
 
-Event type is now conservative, but event status remains a loose string with an optimistic completed
-default. Add `Completed | InProgress | Failed | Unknown` and let each provider adapter state whether
-emission itself proves completion.
+```text
+Queued | Running | Succeeded | Failed | TimedOut | ProtocolInvalid
+```
 
-**Illegal state today:** missing or misspelled event status can be consumed as a completed command.
+The poller, executor, importer, trace writer, and normalized metadata consume that state. Timeout is
+not an ordinary provider failure, and success requires a non-empty trajectory identity. Unknown/missing states and a stored lifecycle discriminator that
+conflicts with the compatibility `status` field become `ProtocolInvalid`. A completed trajectory is
+successful only when it also contains `output.md`; completed-without-output therefore fails closed as
+a protocol error and cannot receive return code zero.
 
-### P2: ablation provenance vocabulary
+Dry-run payload generation is planning, not a Jetty execution lifecycle. Non-executable submitted
+payloads are protocol-invalid rather than ordinary provider failures.
 
-Close remaining provenance strings (`mode`, population, component class, mechanism) with enums and
-non-empty identifier types. Give each provenance variant its own constructor.
+## Normalized trace-event lifecycle
 
-**Illegal state today:** semantically unknown modes or populations can serialize as valid-looking
-attestations.
+`trace_contracts.py` owns `EventState`:
+
+```text
+COMPLETED | IN_PROGRESS | FAILED | UNKNOWN
+```
+
+`parse_event_state` records whether state came from provider status, an intrinsically terminal/start
+event kind, explicit legacy adaptation, or remained unknown. Missing/misspelled status is never
+optimistically completed. Command grading, tool/file counts, skill-invocation metrics, and retry
+logic consume completed events only. Start/end fixture pairs prove a real operation counts once;
+unknown lifecycle records cannot become phantom tool calls.
+
+## Ablation provenance vocabulary
+
+Answer-population ablation confirmation uses the same exact case/model/repetition pairs, requires
+symmetric named-assertion coverage, and applies a paired sign-flip test to per-pair score deltas.
+Fewer than six unanimous matched pairs cannot clear the two-sided p≤0.05 floor.
+
+`ablation_model.py` closes provenance over `AblationMode`, `Population`, `ComponentClass`, and
+`Mechanism`. Strict wire parsers reject unknown strings, booleans masquerading as scalar values,
+missing required fields, unsafe/non-slug identifiers, unedited materialized trees, mixed component
+populations, and population/component contradictions.
+Mode-specific constructors preserve the distinction between materialized, instruction-simulated,
+and invalid-skill experiments. `MaterializedArm` still requires a genuinely edited tree and matching
+provenance, so a canonical tree cannot be labeled as a materialized removal.
+
+## Test proof
+
+The suite uses four complementary proof styles:
+
+- exhaustive state/truth tables for finite lifecycle and verdict combinations;
+- model-gap tests that directly attempt contradictory constructors;
+- sanitized provider-shaped fixtures at external protocol boundaries; and
+- integration tests that feed mismatched models/repetitions, duplicates, missing arms, malformed
+  verdicts, incomplete traces, and completed-without-output Jetty records through real consumers.
+
+Live provider checks remain explicit `--live`; deterministic CI does not require credentials or
+network access.
+
+## Residual risks
+
+These constructions make the represented states stronger; they do not invent evidence a provider or
+legacy artifact never recorded. In particular:
+
+- legacy rows may lack revision/configuration provenance even when their case/model/run key is
+  present; telemetry comparison remains blocked when its required basis is absent;
+- Jetty aliases and response shapes still need token-backed live validation before production claims;
+- `RunnerOutcome` is retained as a compatibility factory, so new code should construct the explicit
+  union variants directly; and
+- provider payload dictionaries are preserved for diagnostics, but no downstream decision should
+  bypass the typed adapter to read them directly.

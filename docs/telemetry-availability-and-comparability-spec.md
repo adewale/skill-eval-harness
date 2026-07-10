@@ -1,8 +1,9 @@
 # Telemetry availability and comparability
 
-> **Status:** proposed implementation plan. This supersedes the informal rule that
+> **Status:** implemented in schema v3. This supersedes the informal rule that
 > missing telemetry is “marked, never zero” with a complete measurement contract
 > for producers, artifacts, reports, comparisons, exports, and budget decisions.
+> Legacy artifacts remain readable as `legacy_unverified`, not silently comparable.
 >
 > **Related:** [`architecture.md`](architecture.md),
 > [`trace-aware-eval-spec.md`](trace-aware-eval-spec.md),
@@ -11,15 +12,15 @@
 
 ## Why this exists
 
-The current per-run normalizers correctly distinguish a missing cost or token value
-from a measured zero. Some downstream folds do not: an empty sum, a display fallback,
-or `value or 0` can turn unknown telemetry into free spend, zero latency, or a valid
-looking efficiency result. The same risk applies beyond dollars: trace-derived counts,
-artifact evidence, durations, grades, estimates, rankings, budgets, and exported
-reports all need to distinguish **observed zero** from **not observed**.
+The earlier per-run normalizers distinguished a missing cost or token value from a measured
+zero, but some downstream folds did not: an empty sum, display fallback, or `value or 0`
+could turn unknown telemetry into free spend, zero latency, or a valid-looking efficiency
+result. Schema v3 closes that gap across trace-derived counts, artifact evidence, durations,
+estimates, rankings, budgets, and exported reports by keeping **observed zero** distinct from
+**not observed**.
 
-The goal is not to make every field optional. It is to make each observed quantity and
-each claim derived from one explicit about what evidence supports it.
+The goal is not to make every field optional. It is to give each observed quantity and
+each derived claim one explicit state describing what evidence supports it.
 
 ## Goals and non-goals
 
@@ -47,7 +48,7 @@ each claim derived from one explicit about what evidence supports it.
 
 ## Canonical domain model
 
-`telemetry.py` will own frozen domain objects, smart constructors, the wire parser,
+`telemetry.py` owns frozen domain objects, smart constructors, the wire parser,
 legacy adaptation, aggregation, comparison, and presentation helpers. Raw JSON is
 accepted only at the boundary and is converted before the rest of the harness uses it.
 
@@ -165,22 +166,18 @@ It owns:
 6. pair matching, comparison, and ratio construction; and
 7. JSON/Markdown display helpers.
 
-`skill_benchmark.py`, `run_pi_trigger_eval.py`, and `run_trigger_matrix.py` become
-consumers of this API. Direct reads of `usage_normalized`, `cost_normalized`,
-`cost_usd`, `total_tokens`, and telemetry-specific `metric_number(... ) or 0` fallbacks
-outside the boundary adapter are removed.
+`skill_benchmark.py`, `run_pi_trigger_eval.py`, and `run_trigger_matrix.py` consume this API.
+Compatibility fields (`usage_normalized`, `cost_normalized`, `cost_usd`, `total_tokens`) are read
+through boundary adapters; derived comparisons and aggregates do not use `... or 0` fallbacks.
 
-### Registries
+### Coverage contracts
 
-Two registries make complete application enforceable:
-
-- **Signal registry:** unit, applicability, allowed provenance, required basis fields,
-  and display policy for every telemetry signal.
-- **Surface registry:** every CLI/backend/export is declared as a telemetry producer,
-  consumer, presentation surface, pass-through, or telemetry-free command.
-
-Tests derive expected coverage from argparse/backend registries, so adding a new CLI or
-agent without a telemetry decision fails deterministically.
+Signal rules (unit, applicability, provenance, basis, and rendering) live in the typed
+constructors and comparison policies. Agent telemetry support is declared per signal in
+`agent_capabilities.AGENT_CAPABILITIES`; conformance tests require every registered answer/judge/
+trigger backend to have a capability row and every capability row to declare all telemetry fields.
+CLI integration tests cover artifact-producing and consuming commands. There is no separate
+all-command telemetry surface registry.
 
 ### Artifacts
 
@@ -189,42 +186,44 @@ both `metadata.json` and `metrics.json`; raw provider data remains preserved for
 A writer records precedence and parser errors as data. Metadata/metrics must agree on
 the normalized envelope.
 
-## Implementation sequence
+## Implemented sequence
+
+The phases below are complete; they are retained as the migration/audit record.
 
 ### Phase 0 — decisions, inventory, and characterization
 
-- Publish this contract and decide supported currencies, FX policy, provenance
+- [x] Publish this contract and decide supported currencies, FX policy, provenance
   equivalence rules, required basis fields, and deprecation timing.
-- Inventory all raw telemetry reads, empty sums, `or 0` fallbacks, rank keys, and
+- [x] Inventory all raw telemetry reads, empty sums, `or 0` fallbacks, rank keys, and
   inline delta/ratio arithmetic.
-- Capture reviewed golden fixtures for complete legacy inputs only. Do not characterize
+- [x] Capture reviewed golden fixtures for complete legacy inputs only. Do not characterize
   existing unknown-to-zero behavior as compatibility.
 
 ### Phase 1 — typed boundary and regression tests
 
-- Add `telemetry.py`, schema v3, smart constructors, legacy parser, aggregate types,
+- [x] Add `telemetry.py`, schema v3, smart constructors, legacy parser, aggregate types,
   comparison policy, and presentation helpers.
-- Add focused failing tests for each known defect before changing behavior.
-- Retain temporary compatibility re-exports while producer and consumer paths migrate.
+- [x] Add focused failing tests for each known defect before changing behavior.
+- [x] Retain compatibility fields while producer and consumer paths migrate.
 
 ### Phase 2 — migrate every producer
 
-Route these paths through the canonical artifact writer:
+The following paths route through the canonical artifact writer:
 
 - `run-agent`, `run-claude`, `run-codex`, `run-subagent`, and `run-jetty`;
 - `import-jetty-results` and `import-trace`;
 - native/shell/consensus judge paths;
 - `skill-pi-trigger-eval` and `skill-trigger-matrix`.
 
-`RunnerOutcome`, judge outcomes, and agent capabilities carry structured telemetry and
-basis rather than loose `float | None` cost fields and provider dictionaries. The
+The runner/judge adapters validate finite raw telemetry in their closed outcome/verdict
+contexts, and the canonical artifact writer constructs the structured telemetry basis. The
 capability registry describes support per signal, including why a signal is unavailable.
 
 ### Phase 3 — migrate every consumer and derived claim
 
-Replace hand-written folds in benchmark reports, aggregate reports, suite cost ledgers,
+Hand-written folds were replaced in benchmark reports, aggregate reports, suite cost ledgers,
 variant summaries, audit findings, historical estimates, trends, exports, and pairwise
-analysis. In particular migrate:
+analysis, including:
 
 - `benchmark`, `aggregate`, `cost-summary`, and `token-overhead`;
 - `audit-manifest`, `suite-run`, and `trend`;
@@ -237,14 +236,14 @@ available.
 
 ### Phase 4 — compatibility, documentation, and removal of bypasses
 
-- Add `migrate-telemetry --check|--write` (or an explicit telemetry mode on `migrate`)
+- [x] Add `migrate-telemetry --check|--write`
   with atomic writes, dry-run output, backups, and idempotence.
-- Read old artifacts through the adapter. Legacy numeric values are
+- [x] Read old artifacts through the adapter. Legacy numeric values are
   `legacy_unverified` and are not eligible for causal ratios unless repaired with a
   trustworthy basis.
-- Update command help, examples, vocabulary, architecture, backend interface docs, and
+- [x] Update command help, examples, vocabulary, architecture, backend interface docs, and
   user journeys. Document `0`, unavailable, N/A, partial, and blocked rendering.
-- Remove duplicate downstream missing/zero checks only after the boundary and its tests
+- [x] Remove duplicate downstream missing/zero checks only after the boundary and its tests
   prove the invariant.
 
 ## CLI matrix
@@ -283,13 +282,13 @@ telemetry helpers.
 The fast suite must remain deterministic: no live credentials, sleeps, wall-clock
 assertions, weak truthy-only oracles, or mock-only integration tests.
 
-## Acceptance criteria
+## Acceptance invariants
 
-The implementation is complete only when:
+The implementation is maintained against these invariants:
 
 1. no telemetry consumer bypasses the canonical parser/typed domain;
 2. every registered producer writes a valid v3 envelope and metadata/metrics agree;
-3. every CLI/backend/export is represented in the surface registry;
+3. every registered agent backend is represented in the capability registry, with explicit telemetry support;
 4. measured zero, unavailable, not-applicable, partial, and blocked states render
    differently in JSON and human-facing output;
 5. no aggregate labels a partial numeric as a total;

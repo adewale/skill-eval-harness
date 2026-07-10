@@ -3,7 +3,7 @@
 [![CI](https://github.com/adewale/skill-eval-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/adewale/skill-eval-harness/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Skill Eval Harness is a Python CLI that measures the **causal lift** of an Agent Skill: it runs the same case with and without the skill, then reports what changed, what passed, and whether the eval leaked its own answer. It reads `evals/shared-benchmark.json`, emits answer-key-safe task rows, grades files under `eval-runs/` locally and deterministically — no model call in the grade path — and writes benchmark reports you can diff across variants.
+Skill Eval Harness is a Python CLI that measures the **causal lift** of an Agent Skill: it runs the same case, model, and repetition with and without the skill, validates that exact experimental identity, then reports what changed, what passed, and whether the eval leaked its own answer. It reads `evals/shared-benchmark.json`, emits answer-key-safe task rows, grades files under `eval-runs/` locally and deterministically — no model call in the grade path — and writes benchmark reports you can diff across variants.
 
 General eval frameworks (openai/evals, vitest-evals, viteval) score one output against a rubric. This one measures the *difference the skill makes*, and spends its surface area on keeping that difference honest: paired with/without comparison, `tune`/`holdout`/`holdback` split discipline, leakage lint, materialized ablations with provenance gates, and per-model lift. None of those frameworks have them, and they are what make a reported number trustworthy rather than merely green.
 
@@ -33,8 +33,8 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 
 ## What the CLI owns
 
-- Causal lift: `with_skill` vs `without_skill` (plus optional `old_skill` and `ablation:<id>`), with paired significance and per-model lift.
-- Split discipline: `tune`, `holdout`, and `holdback` stay separate, so you can't tune on your test set.
+- Causal lift: exact `(case, model, repetition, population)` `with_skill` vs `without_skill` pairs (plus optional `old_skill` and `ablation:<id>`), with blocked-pair diagnostics, paired significance, and per-model lift.
+- Split discipline: `tune`, `holdout`, and `holdback` are explicit filters/report labels. The CLI prevents accidental all-split mixing; private `prompt_ref` storage and when to run hidden splits remain user-owned policy.
 - Local grading: deterministic assertions run without model calls.
 - Eval hygiene: leakage lint, manifest audit, trigger checks, repeated-run stats, and fixture recommendations.
 - Activation: does the skill load on its own? `skill-trigger-matrix` reports autonomous trigger rates per (agent × model), split by should-fire / should-not-fire.
@@ -178,7 +178,7 @@ skill-benchmark --help
 | `docs/academic-grounding.md` | The research constructs behind the harness's terms, with citations; meshes the workflow, measurement, and theory layers. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
 | `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
-| `docs/telemetry-availability-and-comparability-spec.md` | Proposed system-wide contract and implementation plan for measured-zero, unavailable, partial, and blocked telemetry/comparisons. |
+| `docs/telemetry-availability-and-comparability-spec.md` | Implemented schema-v3 contract for measured-zero, unavailable, partial, and blocked telemetry/comparisons, including legacy migration. |
 | `docs/agent-backend-interface-spec.md` | Draft spec for turning Claude/Codex/Gemini/Vibe support into a shared agent backend interface: parity matrix, judge backends, trigger adapters, telemetry, and tool replay. |
 | `docs/agent-cli-control-plane.md` | The shared native-CLI control plane: process invocation, config isolation, tool policy, final-answer channels, schemas, telemetry, where Claude/Codex/Vibe intentionally differ, and the cheap comprehensive live-smoke command. |
 | `docs/agent-cli-tradeoffs.md` | Claude/Codex/Vibe trade-offs: which CLI surfaces are strong or weak, Vibe-only gaps, and what missing schema/telemetry/prompt controls mean for eval reports. |
@@ -186,7 +186,7 @@ skill-benchmark --help
 | `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
 | `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
-| `docs/correctness-by-construction-audit.md` | The typed trigger-state construction now enforced and the prioritized remaining illegal-state candidates. |
+| `docs/correctness-by-construction-audit.md` | The closed trigger, experimental-pair, answer-outcome, judge-verdict, prepared-task, Jetty, trace, and ablation-provenance constructions, their proof tests, and residual risks. |
 | `TODO.md` | Status tracker: the eval-framework roadmap (implemented, bar two `(TODO-native)` items), the remaining Jetty adapter work (streaming/concurrency, live API validation, judge export, per-variant overrides, the `swap:<id>` ablation follow-on), the agent-backend parity follow-ups (Gemini CLI open; Vibe done), and the migration/user-journey doc backlog. |
 | `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two answer-path materialized ablations, one discovery ablation for trigger examples, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per answer-path ablation; exercised by `tests/test_example_demo.py`. Also carries should-fire/should-not-fire trigger cases for `skill-trigger-matrix` (offline via `--agent stub`; live smoke via `RUN_TRIGGER_SMOKE=1`). Start here. |
 | `examples/adewale-workspace/` | Adewale-specific Pi smoke runner and cross-repo aggregate report (the trigger runners are the top-level `skill-pi-trigger-eval` and `skill-trigger-matrix`). |
@@ -395,7 +395,7 @@ skill-benchmark materialize-ablations ../repo/evals/shared-benchmark.json \
 
 Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree (every manifest root, identical surface to `with_skill`, differing only by the declared edit). Mechanisms are `frontmatter_field`, `section` (fence-aware), `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, `asset`, and `preprocess` (inline `` !`command` ``), composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`. Materialized arms are blind: the model-visible input is identical to `with_skill` (the hypothesis lives only in harness metadata).
 
-The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), the autonomous-trigger runners (`skill-trigger-matrix --ablation <id>` with any registered adapter, or `run_pi_trigger_eval.py --ablation <id>`) trigger-test a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the autonomous-trigger runners. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision **and** the replicated regression clears a significance test (a two-sided permutation test run **per case** over that case's per-run scores; a regression is significant iff at least one confirmed case clears p≤0.05). Because the exact permutation discretizes, a case needs **≥4 runs per arm** to ever reach significance (`C(8,4)=70` → minimum p `2/70≈0.029`); a single-shot (or 3-per-arm) ablation ties at a p it cannot pass and is reported `INDETERMINATE`, never confirmed. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
+The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), the autonomous-trigger runners (`skill-trigger-matrix --ablation <id>` with any registered adapter, or `run_pi_trigger_eval.py --ablation <id>`) trigger-test a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the autonomous-trigger runners. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision **and** the replicated regression clears a significance test (a two-sided paired sign-flip test run **per (case, model)** over exact repetition-level deltas; a regression is significant iff at least one confirmed cohort clears p≤0.05). Because the exact test discretizes, a cohort needs **≥6 matched pairs** to ever reach significance (`2/2^6=0.03125`; five pairs floor at `0.0625`); fewer pairs are reported `INDETERMINATE`, never confirmed. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
 
 **Evidence asymmetry (discovery vs answer).** The two paths do not yet have equal evidentiary strength:
 
@@ -517,7 +517,14 @@ skill-eval-harness/
 ├── skill_benchmark.py          # the CLI, grading, reporting, and runner adapters
 ├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
 ├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
-├── ablation_model.py           # typed ablation/provenance value objects
+├── ablation_model.py           # typed ablation/provenance/task value objects
+├── experimental_pairs.py       # exact pair identities and blocked-pair construction
+├── runner_contracts.py         # closed answer-runner outcome union
+├── judge_verdict.py            # strict imported/stored judge verdict variants
+├── jetty_contracts.py          # closed Jetty lifecycle and observation contract
+├── trace_contracts.py          # normalized event lifecycle contract
+├── trigger_contracts.py        # autonomous-trigger invocation/detection/observation contract
+├── telemetry.py                # schema-v3 availability/provenance/comparison domain
 ├── docs/                       # architecture, abstractions, vocabulary, specs, guides (see the map above)
 ├── .github/
 │   ├── PULL_REQUEST_TEMPLATE.md
@@ -538,7 +545,7 @@ python3 -m py_compile *.py examples/adewale-workspace/*.py
 python3 -m unittest discover tests -v
 ```
 
-The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics (`test_stats.py`), runner adapters (`test_runners.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus three executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), and relative-link resolution across the docs (`test_doc_links.py`). Shared fixture builders live in `tests/helpers.py`.
+The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics and pair identity (`test_stats.py`, `test_experimental_pairs.py`), runner/Jetty adapters and lifecycle contracts (`test_runners.py`, `test_jetty_contracts.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus three executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), and relative-link resolution across the docs (`test_doc_links.py`). Shared fixture builders live in `tests/helpers.py`.
 
 ## Source checked
 

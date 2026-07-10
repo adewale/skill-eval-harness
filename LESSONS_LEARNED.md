@@ -410,3 +410,19 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 - Derive `triggered` from typed evidence and `pass` from `TriggerObservation`; never accept either as an independent internal input.
 - Re-parse persisted rows at the disk trust boundary before a smoke trusts them. Types protect only the interior; wire artifacts must re-establish the contract.
 - Exhaust the finite state/truth tables and keep sanitized provider fixtures. Happy-path mocks do not prove an external protocol parser.
+
+## 2026-07-10 — Pair first, derive second, serialize last
+
+**Problem:** Several paths still let contradictory or incomparable facts coexist after the trigger pipeline was fixed. Pairing averaged arms before proving repetition/model/population identity; runner results could combine timeout, return code, answer, and error; imported judge rows trusted truthiness and file order; partial task rows had the same type as executable tasks; Jetty and trace statuses were open strings; and ablation provenance accepted open vocabularies.
+
+**Lesson:** Validation at each `if` is weaker than making the downstream function accept only a value whose constructor already proves the invariant. Identity is part of a measurement, lifecycle is a sum type, and booleans such as “passed” or “successful” should be derived views—not additional state to synchronize.
+
+**Rule:**
+- Construct exact experimental identities before arithmetic. One `(case, model, repetition, population)` key admits one arm of each kind; missing/ineligible arms are blocked data, and duplicates are errors rather than last-write-wins.
+- Model mutually exclusive outcomes as frozen variants and make artifact writers exhaustive over them. Keep compatibility factories only at old call boundaries; new code constructs the explicit variant.
+- Parse stored verdicts and provider states when they enter the process, then revalidate them when read from disk. A typed interior does not make JSON trustworthy by osmosis.
+- Separate permissive drafts from executable values. Rendering a partial task is not permission to spawn a model with it.
+- Count lifecycle operations only when completion is proven. A start event, missing status, or unknown alias is observation uncertainty—not a zero-cost completed tool call.
+- Preserve protocol failure as its own state. Jetty completed-without-output and a conflicting discriminator are not ordinary model failures, and timeout is not provider failure.
+- Close domain vocabularies at the parser. Unknown ablation modes, populations, component classes, and mechanisms must fail where they cross the boundary, not survive as valid-looking provenance.
+- Test the model gap directly: enumerate finite state tables, attempt every contradictory constructor, inject duplicate/mismatched identities, and use sanitized provider-shaped fixtures. Coverage of lines is not proof that illegal combinations are unrepresentable.

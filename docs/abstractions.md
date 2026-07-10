@@ -35,11 +35,12 @@ changing the core shape.
 
 ## Case
 
-A case is one scenario: an `id`, a `split`, a `kind` (`behavior` or `trigger`), the `prompt`
-or a private `prompt_ref`, optional fixture `files`, `expected_behavior` notes, the
+A case is one scenario: an `id`, a `split`, a descriptive `kind` (for example `behavior`,
+`negative`, `adversarial`, or `trigger`), the `prompt` or a private `prompt_ref`, optional fixture `files`, `expected_behavior` notes, the
 `assertions`, and a taxonomy the report slices on (`domain`, `difficulty`, `trigger_type`,
-`success_goals`). `iter_cases` filters by split so iteration never sees holdout or holdback
-prompts.
+`success_goals`). `iter_cases` filters by the explicitly requested split. The CLI keeps split
+outputs distinct; authors/CI still control when hidden splits are run and whether prompts live in
+private `prompt_ref` files.
 
 ## Variant
 
@@ -52,10 +53,10 @@ skill files, or the comparison means nothing.
 
 ## Split
 
-`tune`, `holdout`, and `holdback` keep iteration honest. Tune cases are visible while you
-edit. Holdout cases stay private until end-of-round scoring. Holdback cases stay out of the
-skill, the docs, and even the eval descriptions until after scoring, which is how the
-harness detects memorization. `prepare` refuses to emit a hidden case with no
+`tune`, `holdout`, and `holdback` label the intended evaluation phase. Tune cases are for
+iteration; holdout is intended for end-of-round scoring; holdback is intended to remain outside the
+skill/docs/eval descriptions until after scoring. The harness filters and reports these labels but
+does not provide access control—repositories and CI must keep private material private. `prepare` refuses to emit a hidden case with no
 `prompt_ref` unless you pass `--allow-missing-prompts` for dry-run planning.
 
 ## Assertion
@@ -109,9 +110,15 @@ beside the raw lift.
 rows (the `model` axis, from `prepare --models`, adds a run-dir segment only when two or more
 models run, so single-model layouts are unchanged). Each row carries the `prompt`, the absolute
 `input_files`, the `skill_paths`, the `instruction` for its arm, and the `run_dir` it must
-write to. Generation rows omit
-`expected_behavior` and rubrics unless you pass `--include-answer-key`, so a runner cannot
-accidentally feed the answer key to the model under test.
+write to. Generation rows omit `expected_behavior` and rubrics unless you pass
+`--include-answer-key`, so a runner cannot accidentally feed the answer key to the model under
+test.
+
+There are two in-process types. `PreparedTaskDraft` may hold partial planning data but is never
+executable. `PreparedTaskDraft.validate()` / `PreparedTask.from_row()` constructs a strict
+`PreparedTask`: identifiers and paths are validated, split and execution variant are closed,
+repetition is positive, `run_dir` is safe and relative, and `without_skill` cannot carry skill
+paths. Every native runner and Jetty exporter requires the executable type.
 
 ## Run-output contract
 
@@ -131,24 +138,31 @@ editor. This boundary is the main extension seam in the codebase.
 
 ## Runner / adapter
 
-A runner consumes task rows and produces the contract. The repo ships seven paths plus a
-generic one: Pi smoke (`examples/adewale-workspace/run_pi_smoke.py`), Pi trigger
-(`run_pi_trigger_eval.py`), Codex (`run_codex:4546`), Claude (`run_claude:4664`, capturing real
+An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:4673`), Claude (`run_claude:4791`, capturing real
 per-run cost), Mistral Vibe (`run-agent --agent vibe`, using isolated `VIBE_HOME` outside the workdir), the in-process
-subagent runner (`run_subagent:5865`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:2225` and the export/run/import commands), and any runner that writes the
-contract directly. Each runner registers a workspace builder so
-one cross-runner invariant proves its `without_skill` arm is skill-free (CF.2). The harness
-calls no model itself; it reads what the runner left behind.
+subagent runner (`run_subagent:6043`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:2248` and the export/run/import commands), and any runner that writes the
+contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
+proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
+read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
+observations plus optional traces rather than answer grades.
+
+Native answer backends return the frozen `Completed | TimedOut | SpawnFailed | ProviderFailed`
+union from `runner_contracts.py`. `OutcomeContext` validates provider, telemetry, and elapsed-time
+fields; `write_runner_outcome` exhaustively writes the disk contract. A backend therefore cannot
+independently set timeout, return code, answer, and failure into a contradictory bag. The harness
+calls no model during grading; it reads what the runner left behind.
 
 ## Trace normalization
 
 Runners disagree on event shape. Codex emits `command_execution` and `turn.completed`; Pi
 emits `message_end` usage aliases; Jetty emits trajectory records. `normalize_trace_record`
 and `normalize_trace_records` collapse these into one schema-versioned `events.json` plus
-`metrics.json`, tagged with the source. Process and efficiency assertions read the normalized
-form, never the raw prose, because inferring tool use from answer text is how false evidence
-gets in.
+`metrics.json`, tagged with the source. `trace_contracts.EventState` first classifies each event as
+completed, in-progress, failed, or unknown; only completed operations contribute command/tool/file
+counts. Process and efficiency assertions read the normalized form, never the raw prose, because
+inferring tool use from answer text is how false evidence gets in.
 
 ## Judge plumbing
 
@@ -159,7 +173,10 @@ candidate output into a prompt — including the anchored dimensions or dynamic-
 instruction for a graded assertion; `run_one_judge_task` pipes it to the `--judge-cmd` you
 supply or to a native `--judge-backend` (`claude`, `codex`, or `vibe`) plus `--judge-model`;
 `merge_repeated_judge_rows` majority-votes pass/fail and medians scores across repeats. The
-harness picks no model. A judge result is `{judge_task_id, passed, score, evidence}` — plus
+harness picks no model. At the result boundary, `judge_verdict.py` parses one strict variant:
+boolean, scored, dimension-scored, dynamic-rubric, or consensus. Pass is derived from the typed
+payload; duplicate IDs and contradictory score/threshold/pass rows are rejected. The serialized
+row still carries `{judge_task_id, verdict_kind, passed, score, evidence}` — plus
 `dimension_scores`/`criteria` for a graded verdict and normalized `usage_normalized`/
 `cost_normalized` for judge spend — merged back at grade time.
 
@@ -173,12 +190,15 @@ a re-grade cheap and deterministic.
 
 ## Benchmark report
 
-`build_benchmark_report` turns result rows into the artifact you read.
-`build_paired_summary` computes per-case lift (`with_skill` minus `without_skill`,
-normalized gain, and a flag when the skill hurts). `build_slice_summary` breaks results down
+`build_benchmark_report` turns result rows into the artifact you read. Before arithmetic,
+`experimental_pairs.py` constructs exact `(case, model, repetition, population)` identities and
+requires one eligible arm of each kind. `build_paired_summary` computes per-case lift
+(`with_skill` minus `without_skill`, normalized gain, and a flag when the skill hurts) only from
+those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplicate arms fail.
+`build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:371`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:390`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 ## What changes when you extend the tool

@@ -470,7 +470,7 @@ This creates a temporary `PI_CODING_AGENT_DIR`, copies the skill under `skills/`
 
 ## Jetty adapter
 
-Jetty support is optional, and its live response shapes still need token-backed smoke validation before a Jetty run counts as production evidence (see [`jetty-support-spec.md`](jetty-support-spec.md)). The harness exports runbook-mode chat-completion payloads, Jetty executes them, and `import-jetty-results` copies `output.md`, artifacts, and metadata back into the normal run layout.
+Jetty support is optional, and its live response shapes still need token-backed smoke validation before a Jetty run counts as production evidence (see [`jetty-support-spec.md`](jetty-support-spec.md)). The harness exports runbook-mode chat-completion payloads, Jetty executes them, and `import-jetty-results` copies `output.md`, artifacts, and metadata back into the normal run layout. Provider status aliases parse into queued/running/succeeded/failed/timed-out/protocol-invalid states; unknown status and completed-without-`output.md` fail closed as protocol-invalid rather than ordinary model failures.
 
 ```bash
 # Export runbook-mode Jetty chat-completion payloads. No network calls.

@@ -16,8 +16,8 @@ The shared abstraction is therefore **not** “send prompt, get text.” It is:
 | Layer | Shared harness concept | Why it exists |
 |---|---|---|
 | Process boundary | `InvocationRequest` / `InvocationResult` | Every native backend must declare prompt, model, workspace, timeout, argv/env/cwd behavior, stdout/stderr/returncode, and timeout state. |
-| Answer result | `RunnerOutcome` | Provider-specific code returns a normalized answer/trace/telemetry/error shape; the writer owns the on-disk contract. |
-| Run artifacts | `write_runner_outcome()` | One writer produces `output.md`, `metadata.json`, `events.json`, `metrics.json`, and optional `trace.jsonl`, so failure markers, timeout return code, and missing telemetry cannot drift by provider. |
+| Answer result | `Completed | TimedOut | SpawnFailed | ProviderFailed` (`RunnerOutcome` is the strict compatibility factory) | Provider-specific code returns one frozen semantic state with validated context; timeout/return code/answer/error cannot contradict. |
+| Run artifacts | `write_runner_outcome()` | One exhaustive adapter consumes the outcome union and produces `output.md`, `metadata.json`, `events.json`, `metrics.json`, and optional `trace.jsonl`, so failure markers, timeout return code, and missing telemetry cannot drift by provider. |
 | Capabilities | `agent_capabilities.AGENT_CAPABILITIES` | A row states which surfaces are real for each agent: answer runner, trigger adapter, judge backend, trace artifacts, usage/cost telemetry, tool replay, and live-smoke gate. |
 | Trigger adapter | `AgentAdapter.mount/invoke/detect` | Autonomous trigger evals mount the same canonical/materialized skill tree, run raw user trigger prompts, and detect activation without forced-load answer scaffolding. |
 | Judge path | `JUDGE_BACKENDS` registry or `--judge-cmd` | Native backends use provider-specific schema/final-answer channels where available; `--judge-cmd` remains the universal stdin→stdout JSON escape hatch. |

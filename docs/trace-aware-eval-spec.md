@@ -2,7 +2,7 @@
 
 Status: v0.4.1 implementation note, with later follow-on items now shipped (see below). The shipped slice covers three things: trace artifacts, trace-backed assertions, and runner adapters. Concretely, the harness can import traces, run Codex JSONL tasks, normalize observed Pi/Codex shapes plus documented/mocked Jetty trajectory shapes, write Pi smoke and Pi trigger trace artifacts, scope assertions by variant, and report process/efficiency evidence alongside outcome scores. This plan uses the subset of ideas from OpenAI's `eval-skills` article, SkillsBench, and Anthropic's `skill-creator` that fit the existing harness model.
 
-> **Superseded in part by [`eval-framework-roadmap-spec.md`](eval-framework-roadmap-spec.md) (implemented).** Several items once listed here as follow-on work have since shipped: OpenTelemetry GenAI normalization (`events.json`/`metrics.json` are now `schema_version: 2` with `gen_ai.*` attributes; version-1 files still grade), the in-process subagent runner with record/replay tool I/O, and the viewer's serve mode with `feedback.json` capture. The Phase checkboxes below are reconciled; the still-open items (live Jetty token validation, expanded leakage lint, OpenCode/Gemini adapters) remain genuinely open.
+> **Superseded in part by [`eval-framework-roadmap-spec.md`](eval-framework-roadmap-spec.md) (implemented).** Several items once listed here as follow-on work have since shipped: OpenTelemetry GenAI normalization (`events.json`/`metrics.json` are now `schema_version: 2` with `gen_ai.*` attributes; version-1 files still grade), the in-process subagent runner with record/replay tool I/O, output-side contamination lint, and the viewer's serve mode with `feedback.json` capture. The Phase checkboxes below are reconciled; live Jetty token validation and OpenCode/Gemini adapters remain open.
 
 ## Design principle
 
@@ -121,7 +121,17 @@ Required normalized fields:
 - `index`
 - `type`
 - `status`
+- `state_source`
 - `raw_ref` when a raw trace exists
+
+`status` is the serialized form of `trace_contracts.EventState`: `completed`, `in_progress`,
+`failed`, or `unknown`. The adapter records whether the state came from an explicit provider
+status, an intrinsically terminal/start event kind, explicit legacy adaptation, or remained
+unknown. Missing/misspelled status is never optimistically completed. A provider event kind may prove state
+only when the status field is absent; a present null or wrong-typed status is malformed/unknown and
+cannot be upgraded by the kind. Command grading and derived
+tool/command/file/skill counters consume completed events only, so a start event counts zero and a
+start/end pair counts once.
 
 Recommended fields:
 
@@ -325,7 +335,9 @@ Dataset/oracle audit work should continue as warnings and report hygiene before 
 
 ## Structured judge results
 
-Keep the current judge-command model: the harness exports prompts and reads user-supplied model output. Add optional schema validation around judge results:
+The harness keeps the judge-command model: it exports prompts and reads user-supplied model output.
+Canonical boolean/scored/dimension/dynamic verdict schemas are validated locally; strict mode turns
+schema errors into failed verdicts:
 
 ```json
 {
@@ -339,7 +351,7 @@ Keep the current judge-command model: the harness exports prompts and reads user
 }
 ```
 
-Future manifest shape:
+A custom per-assertion schema remains a possible follow-on beyond the shipped canonical shapes:
 
 ```json
 {
@@ -350,11 +362,11 @@ Future manifest shape:
 }
 ```
 
-Schema validation should be local and deterministic. It should not select a judge model or make live calls by default.
+Schema validation is local and deterministic. It does not select a judge model or make live calls by default.
 
 ## Skill profile audit
 
-Add an optional `profile-skill` command or `audit-manifest` section that reports:
+The shipped `profile-skill` command reports:
 
 - `SKILL.md` size and approximate token count;
 - number of referenced files;
