@@ -1,0 +1,4 @@
+{"type":"agent_start"}
+{"type":"agent_end","willRetry":true,"messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"transient provider failure"}]}
+{"type":"agent_start"}
+{"type":"agent_end","willRetry":false,"messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"final provider failure","usage":{"input":4,"output":0,"totalTokens":4,"cost":{"total":0.004}}}]}

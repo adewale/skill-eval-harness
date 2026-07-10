@@ -32,6 +32,7 @@ from unittest import mock
 from agent_capabilities import AGENT_CAPABILITIES
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
+from trigger_contracts import InvocationOutcome, InvocationState
 
 ROOT = Path(__file__).resolve().parents[1]
 DEMO_MANIFEST = ROOT / "examples" / "demo-skill" / "evals" / "shared-benchmark.json"
@@ -40,6 +41,10 @@ DEMO_MANIFEST = ROOT / "examples" / "demo-skill" / "evals" / "shared-benchmark.j
 def demo_trigger_rows():
     manifest = tm.load_manifest(DEMO_MANIFEST)
     return tm.cases_from_manifest(manifest, "tune")
+
+
+def completed_invocation(stdout: str) -> InvocationOutcome:
+    return InvocationOutcome.from_process(stdout=stdout, stderr="", returncode=0, elapsed_ms=1)
 
 
 class TriggerRowBoundaryTests(unittest.TestCase):
@@ -65,10 +70,12 @@ class TriggerRowBoundaryTests(unittest.TestCase):
 
         def fake_run(argv, *, cwd, env, timeout):
             seen.update({"argv": argv, "cwd": str(cwd), "config_dir": env["PI_CODING_AGENT_DIR"], "timeout": timeout})
-            return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False,
-                    "elapsed_ms": 1, "observation_complete": True}
+            return InvocationOutcome.from_process(
+                stdout=json.dumps({"type": "agent_end", "messages": [{"stopReason": "stop"}]}) + "\n",
+                stderr="", returncode=0, elapsed_ms=1,
+            )
 
-        with mock.patch.object(tr, "run_argv_with_timeout", side_effect=fake_run):
+        with mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=fake_run):
             result = tr.run_query(DEMO_MANIFEST, "ordinary chat", False, 12, None)
         self.assertTrue(result["pass"])
         self.assertEqual(seen["cwd"], seen["config_dir"])
@@ -86,16 +93,20 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         })
 
         def failed_provider(*args, **kwargs):
-            return {"stdout": provider_error + "\n", "stderr": "", "returncode": 0, "timed_out": False,
-                    "elapsed_ms": 1, "observation_complete": True}
+            return InvocationOutcome.from_process(
+                stdout=provider_error + "\n", stderr="", returncode=0, elapsed_ms=1,
+            )
 
-        with tempfile.TemporaryDirectory() as td, mock.patch.object(tr, "run_argv_with_timeout", side_effect=failed_provider):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=failed_provider), \
+             mock.patch.object(tr.PiStream, "parse", wraps=tr.PiStream.parse) as parse_stream:
             trace_dir = Path(td) / "trace"
             result = tr.run_query(DEMO_MANIFEST, "ordinary chat", False, 12, None, trace_dir=trace_dir)
             artifacts = [
                 json.loads((trace_dir / name).read_text(encoding="utf-8"))
                 for name in ("metrics.json", "metadata.json")
             ]
+        self.assertEqual(parse_stream.call_count, 1)
         self.assertFalse(result["observation_complete"])
         self.assertFalse(result["pass"])
         self.assertEqual(result["usage_normalized"], {"source": "missing"})
@@ -119,16 +130,42 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             workspace = Path(td) / "workspace"
             workspace.mkdir()
             result = tm.PiAdapter().invoke("ordinary chat", None, workspace, 12)
-        self.assertFalse(result["observation_complete"])
-        self.assertEqual(result["provider_error"], "provider rejected model")
+        self.assertFalse(result.observation_complete)
+        self.assertEqual(result.provider_error, "provider rejected model")
+
+    def test_pi_matrix_detection_and_telemetry_share_one_parsed_stream(self):
+        def successful_pi(*args, cwd, **kwargs):
+            skill = Path(cwd) / ".pi-config" / "skills" / "demo" / "SKILL.md"
+            assistant = {"role": "assistant", "stopReason": "stop",
+                         "usage": {"input": 4, "output": 1, "totalTokens": 5}}
+            stdout = "\n".join([
+                json.dumps({"type": "tool_execution_start", "toolName": "read", "args": {"path": str(skill)}}),
+                json.dumps({"type": "agent_end", "messages": [assistant]}),
+            ]) + "\n"
+            return InvocationOutcome.from_process(
+                stdout=stdout, stderr="", returncode=0, elapsed_ms=1,
+            )
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.PiAdapter, "_run_argv", staticmethod(successful_pi)), \
+             mock.patch.object(tm.PiStream, "parse", wraps=tm.PiStream.parse) as parse_stream:
+            tree = Path(td) / "tree"
+            skill = tree / "demo"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+            row = tm.run_cell_query(tm.PiAdapter(), tree, "review this", True, None, 12)
+        self.assertEqual(parse_stream.call_count, 1)
+        self.assertTrue(row["triggered"])
+        self.assertEqual(row["usage_normalized"]["total_tokens"], 5)
 
     def test_pi_timeout_with_parseable_partial_trace_is_not_telemetry_complete(self):
         def timed_out(*args, **kwargs):
-            return {"stdout": json.dumps({"type": "command", "command": "partial"}) + "\n",
-                    "stderr": "timeout", "returncode": 124, "timed_out": True,
-                    "elapsed_ms": 10, "observation_complete": False}
+            return InvocationOutcome.from_process(
+                stdout=json.dumps({"type": "command", "command": "partial"}) + "\n",
+                stderr="timeout", returncode=124, elapsed_ms=10,
+            )
 
-        with tempfile.TemporaryDirectory() as td, mock.patch.object(tr, "run_argv_with_timeout", side_effect=timed_out):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=timed_out):
             trace_dir = Path(td) / "trace"
             tr.run_query(DEMO_MANIFEST, "ordinary chat", False, 1, None, trace_dir=trace_dir)
             meta = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
@@ -155,6 +192,10 @@ class StubMatrixOfflineTests(unittest.TestCase):
             self.assertEqual((s["should_not_trigger"]["passed"], s["should_not_trigger"]["total"]), (2, 2), cell["model"])
             self.assertEqual(s["incomplete_observations"], 0)
         self.assertEqual(report["summary"]["pass_rate"], 1.0)
+        for row in report["results"]:
+            self.assertEqual(row["usage_normalized"], {"source": "not_applicable"})
+            self.assertEqual(row["cost_normalized"], {"source": "not_applicable"})
+            self.assertIsInstance(row["elapsed_ms"], int)
 
     def test_trace_runs_are_written_for_matrix_agents(self):
         with tempfile.TemporaryDirectory() as td:
@@ -336,9 +377,9 @@ class ClaudeDetectionTests(unittest.TestCase):
     def test_skill_tool_use_by_name_is_trigger_evidence(self):
         stream = json.dumps({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Skill", "input": {"skill": "demo-reviewer", "args": "..."}}]}})
-        triggered, evidence = self._adapter().detect(stream, ["demo-reviewer"], [])
-        self.assertTrue(triggered)
-        self.assertIn("Skill tool invoked: demo-reviewer", evidence)
+        detection = self._adapter().detect(completed_invocation(stream), ["demo-reviewer"], [])
+        self.assertTrue(detection.triggered)
+        self.assertIn("Skill tool invoked: demo-reviewer", detection.legacy_evidence)
 
     def test_other_skills_and_plain_answers_are_not_evidence(self):
         stream = "\n".join([
@@ -347,19 +388,34 @@ class ClaudeDetectionTests(unittest.TestCase):
             json.dumps({"type": "assistant", "message": {"content": [
                 {"type": "text", "text": "I would use the demo-reviewer skill here."}]}}),
         ])
-        triggered, _ = self._adapter().detect(stream, ["demo-reviewer"], [])
-        self.assertFalse(triggered, "a different skill firing, or the name in prose, is not load evidence")
+        detection = self._adapter().detect(completed_invocation(stream), ["demo-reviewer"], [])
+        self.assertFalse(detection.triggered, "a different skill firing, or the name in prose, is not load evidence")
 
     def test_reading_the_mounted_skill_md_is_fallback_evidence(self):
         mounted = Path("/tmp/trigger-x/.claude/skills/demo-reviewer/SKILL.md")
         stream = json.dumps({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Read", "input": {"file_path": str(mounted)}}]}})
-        triggered, _ = self._adapter().detect(stream, ["demo-reviewer"], [mounted])
-        self.assertTrue(triggered)
+        detection = self._adapter().detect(completed_invocation(stream), ["demo-reviewer"], [mounted])
+        self.assertTrue(detection.triggered)
 
     def test_max_turns_is_a_completed_observation_window(self):
         self.assertEqual(tm.ClaudeAdapter._result_subtype(
             json.dumps({"type": "result", "subtype": "error_max_turns"})), "error_max_turns")
+
+    def test_max_turns_subtype_does_not_reclassify_timeout_or_spawn_failure(self):
+        stdout = json.dumps({"type": "result", "subtype": "error_max_turns"})
+        for returncode, state in ((124, InvocationState.TIMED_OUT), (127, InvocationState.SPAWN_FAILED)):
+            def fake_run(*args, _returncode=returncode, **kwargs):
+                return InvocationOutcome.from_process(
+                    stdout=stdout, stderr="failure", returncode=_returncode, elapsed_ms=3,
+                )
+
+            with self.subTest(returncode=returncode), \
+                 tempfile.TemporaryDirectory() as td, \
+                 mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)), \
+                 mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
+                result = tm.ClaudeAdapter().invoke("q", "haiku", Path(td), 1)
+            self.assertIs(result.state, state)
 
     def test_mounted_skill_names_read_frontmatter(self):
         with tempfile.TemporaryDirectory() as td:
@@ -387,8 +443,8 @@ class ClaudeDetectionTests(unittest.TestCase):
                 result = tm.ClaudeAdapter().invoke("q", "haiku", root / "run", 12)
         self.assertEqual(seen["credentials"], '{"token":"t"}')
         self.assertTrue(str(seen["config_dir"]).endswith(".trigger-config"))
-        self.assertTrue(result["config_isolated"])
-        self.assertNotIn("config_isolation_warning", result)
+        self.assertTrue(result.metadata["config_isolated"])
+        self.assertNotIn("config_isolation_warning", result.metadata)
 
     def test_claude_invoke_preserves_nonportable_oauth_config(self):
         seen = {}
@@ -407,8 +463,8 @@ class ClaudeDetectionTests(unittest.TestCase):
                 result = tm.ClaudeAdapter().invoke("q", "haiku", workspace, 12)
         self.assertEqual(seen["config_dir"], str(source))
         self.assertFalse((workspace / ".trigger-config").exists())
-        self.assertFalse(result["config_isolated"])
-        self.assertIn("personal config may influence", result["config_isolation_warning"])
+        self.assertFalse(result.metadata["config_isolated"])
+        self.assertIn("personal config may influence", result.metadata["config_isolation_warning"])
 
 
 class CodexAdapterTests(unittest.TestCase):
@@ -426,11 +482,11 @@ class CodexAdapterTests(unittest.TestCase):
     def test_codex_uses_shared_path_evidence_detector(self):
         mounted = Path("/tmp/trigger-x/.codex/skills/demo-reviewer/SKILL.md")
         stream = json.dumps({"type": "command", "command": ["bash", "-lc", f"cat {mounted}"]})
-        triggered, evidence = tm.CodexAdapter().detect(stream, ["demo-reviewer"], [mounted])
-        self.assertTrue(triggered)
-        self.assertTrue(evidence)
+        detection = tm.CodexAdapter().detect(completed_invocation(stream), ["demo-reviewer"], [mounted])
+        self.assertTrue(detection.triggered)
+        self.assertTrue(detection.evidence)
         prose = json.dumps({"type": "message", "content": "I would use demo-reviewer."})
-        self.assertEqual(tm.CodexAdapter().detect(prose, ["demo-reviewer"], [mounted]), (False, []))
+        self.assertFalse(tm.CodexAdapter().detect(completed_invocation(prose), ["demo-reviewer"], [mounted]).triggered)
 
     def test_codex_invoke_appends_raw_query_model_and_external_skill_dir(self):
         seen = {}
@@ -452,8 +508,8 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertFalse(Path(seen["env"]["CODEX_HOME"]).is_relative_to(seen["cwd"]))
         self.assertEqual(seen["argv"][-3:], ["--model", "o4-mini", "raw trigger query"])
         self.assertEqual(seen["timeout"], 12)
-        self.assertTrue(result["codex_home_outside_workdir"])
-        self.assertIs(tm.CodexAdapter()._run_argv, tm.run_argv_with_timeout)
+        self.assertTrue(result.metadata["codex_home_outside_workdir"])
+        self.assertIs(tm.CodexAdapter()._run_argv, tm.invoke_argv_with_timeout)
 
     def test_codex_invoke_seeds_auth_without_copying_user_skills(self):
         seen = {}
@@ -488,7 +544,7 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertEqual(seen["config"], "model = 'm'\n")
         self.assertTrue(seen["mounted_skills_survive"])
         self.assertTrue(seen["user_skills_not_copied"])
-        self.assertTrue(result["codex_home_outside_workdir"])
+        self.assertTrue(result.metadata["codex_home_outside_workdir"])
         self.assertFalse(seen["workspace_auth_present"])
         self.assertFalse(seen["workspace_config_present"])
 
@@ -502,17 +558,27 @@ class CodexAdapterTests(unittest.TestCase):
             def invoke(self, query, model, workspace, timeout):
                 secret = os.environ["MISTRAL_API_KEY"]
                 return {"stdout": f"leaked {secret}\n", "stderr": f"err {secret}", "returncode": 0,
-                        "timed_out": False, "elapsed_ms": 1, "observation_complete": True}
+                        "timed_out": False, "elapsed_ms": 1, "observation_complete": True,
+                        "debug": {"auth": secret}}
 
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"MISTRAL_API_KEY": "ambient-secret-token"}):
             tree = Path(td) / "tree"
             skill = tree / "demo"
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
-            row = tm.run_cell_query(LeakyAdapter(), tree, "q", False, None, 12, trace_dir=Path(td) / "trace")
+            row = tm.run_cell_query(
+                LeakyAdapter(), tree, "q", False, None, 12,
+                trace_dir=Path(td) / "trace",
+                metadata={"external": {"token": "ambient-secret-token"}},
+            )
             trace_text = (Path(row["trace_dir"]) / "trace.jsonl").read_text(encoding="utf-8")
+            trace_metadata = json.loads((Path(row["trace_dir"]) / "metadata.json").read_text(encoding="utf-8"))
         self.assertNotIn("ambient-secret-token", row["stderr"])
         self.assertEqual(row["stderr"], "err [REDACTED]")
+        self.assertEqual(row["debug"], {"auth": "[REDACTED]"})
+        self.assertEqual(row["external"], {"token": "[REDACTED]"})
+        self.assertEqual(trace_metadata["debug"], {"auth": "[REDACTED]"})
+        self.assertEqual(trace_metadata["external"], {"token": "[REDACTED]"})
         self.assertNotIn("ambient-secret-token", trace_text)
 
     def test_run_cell_query_requires_invoke_contract(self):
@@ -589,11 +655,11 @@ class VibeAdapterTests(unittest.TestCase):
 
     def test_vibe_detects_native_skill_tool_call(self):
         stream = json.dumps({"role": "assistant", "tool_calls": [{"function": {"name": "skill", "arguments": json.dumps({"name": "demo-reviewer"})}}]})
-        triggered, evidence = tm.VibeAdapter().detect(stream, ["demo-reviewer"], [])
-        self.assertTrue(triggered)
-        self.assertIn("Vibe skill tool invoked: demo-reviewer", evidence)
+        detection = tm.VibeAdapter().detect(completed_invocation(stream), ["demo-reviewer"], [])
+        self.assertTrue(detection.triggered)
+        self.assertIn("Vibe skill tool invoked: demo-reviewer", detection.legacy_evidence)
         other = json.dumps({"role": "assistant", "tool_calls": [{"function": {"name": "skill", "arguments": json.dumps({"name": "other"})}}]})
-        self.assertEqual(tm.VibeAdapter().detect(other, ["demo-reviewer"], []), (False, []))
+        self.assertFalse(tm.VibeAdapter().detect(completed_invocation(other), ["demo-reviewer"], []).triggered)
 
     def test_vibe_invoke_uses_isolated_home_model_env_and_prompt_arg(self):
         seen = {}
@@ -619,8 +685,8 @@ class VibeAdapterTests(unittest.TestCase):
         self.assertEqual(seen["env"]["VIBE_ACTIVE_MODEL"], "mistral-small")
         self.assertFalse(seen["vibe_home_inside_workdir"])
         self.assertFalse(seen["workspace_vibe_env_present"])
-        self.assertTrue(result["config_isolated"])
-        self.assertTrue(result["vibe_home_outside_workdir"])
+        self.assertTrue(result.metadata["config_isolated"])
+        self.assertTrue(result.metadata["vibe_home_outside_workdir"])
 
 
 def _csv_env(name, default):
@@ -687,29 +753,29 @@ class AgentInvokeSmokeTests(unittest.TestCase):
                             adapter.invoke(query, model, workspace, timeout),
                         )
                     row.update({
-                        "returncode": result["returncode"],
-                        "timed_out": result["timed_out"],
-                        "observation_complete": result["observation_complete"],
-                        "elapsed_ms": result["elapsed_ms"],
-                        "stdout_bytes": len(str(result["stdout"])),
-                        "stdout_tail": str(result["stdout"])[-300:],
-                        "stderr_tail": str(result["stderr"])[-300:],
+                        "returncode": result.returncode,
+                        "timed_out": result.timed_out,
+                        "observation_complete": result.observation_complete,
+                        "elapsed_ms": result.elapsed_ms,
+                        "stdout_bytes": len(result.stdout),
+                        "stdout_tail": result.stdout[-300:],
+                        "stderr_tail": result.stderr[-300:],
                         "mounted_paths": len(copied),
                     })
                     ok = (
-                        not result["timed_out"] and
-                        result["returncode"] == 0 and
-                        result["observation_complete"] and
-                        bool(str(result["stdout"]).strip())
+                        not result.timed_out and
+                        result.returncode == 0 and
+                        result.observation_complete and
+                        bool(result.stdout.strip())
                     )
                     row["ok"] = ok
                     if not ok:
                         failures.append(
-                            f"{agent_name}/{model_label}: returncode={result['returncode']} "
-                            f"timed_out={result['timed_out']} observation_complete={result['observation_complete']} "
-                            f"stdout_bytes={len(str(result['stdout']))} "
-                            f"stdout_tail={str(result['stdout'])[-300:]!r} "
-                            f"stderr_tail={str(result['stderr'])[-300:]!r}"
+                            f"{agent_name}/{model_label}: returncode={result.returncode} "
+                            f"timed_out={result.timed_out} observation_complete={result.observation_complete} "
+                            f"stdout_bytes={len(result.stdout)} "
+                            f"stdout_tail={result.stdout[-300:]!r} "
+                            f"stderr_tail={result.stderr[-300:]!r}"
                         )
                 except Exception as exc:
                     row.update({"ok": False, "error": repr(exc)})

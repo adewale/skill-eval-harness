@@ -1,0 +1,5 @@
+{"type":"session","version":1}
+{"type":"agent_start"}
+{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Provider API error (400): invalid model","usage":{"input":7,"output":2,"totalTokens":9,"cost":{"total":0.009}}}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Provider API error (400): invalid model","usage":{"input":7,"output":2,"totalTokens":9,"cost":{"total":0.009}}}}
+{"type":"agent_end","willRetry":false,"messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Provider API error (400): invalid model","usage":{"input":7,"output":2,"totalTokens":9,"cost":{"total":0.009}}}]}

@@ -291,12 +291,14 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertEqual(json.loads(without_task_json)["skill_files"], [])
 
     def test_pi_message_end_trace_normalizes_usage_and_skill_load(self):
+        assistant = {"role": "assistant", "content": [{"type": "text", "text": "alpha beta"}], "usage": {"input": 10, "output": 5, "totalTokens": 15}}
         records = [
             {"type": "tool_use", "tool_input": {"path": "/tmp/demo/skill/SKILL.md"}},
-            {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "alpha beta"}], "usage": {"input": 10, "output": 5, "totalTokens": 15}}},
+            {"type": "message_end", "message": assistant},
+            {"type": "agent_end", "messages": [assistant]},
         ]
         events, metrics = sb.normalize_trace_records(records, source="pi")
-        self.assertEqual([e["type"] for e in events["events"]], ["skill_load", "message"])
+        self.assertEqual([e["type"] for e in events["events"]], ["skill_load", "message", "event"])
         self.assertEqual(metrics["total_tokens"], 15)
         self.assertTrue(metrics["skill_invoked"])
 
@@ -448,6 +450,7 @@ class SkillBenchmarkTests(unittest.TestCase):
             stdout = "\n".join([
                 json.dumps({"type": "tool_use", "tool_input": {"path": "/tmp/pi-trigger/skills/demo/SKILL.md"}}),
                 json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 3, "output": 2, "totalTokens": 5}}}),
+                json.dumps({"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 3, "output": 2, "totalTokens": 5}}]}),
             ]) + "\n"
             result = {"query": "demo", "should_trigger": True, "triggered": True, "pass": True, "elapsed_ms": 50, "returncode": 0, "timed_out": False, "evidence": ["/tmp/pi-trigger/skills/demo/SKILL.md"]}
             tr.write_trigger_trace_artifacts(run_dir, stdout, result)

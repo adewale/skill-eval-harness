@@ -14,21 +14,21 @@ import json
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODELS = {
-    "claude": os.environ.get("SMOKE_CLAUDE_MODEL", "haiku"),
-    "codex": os.environ.get("SMOKE_CODEX_MODEL", "gpt-5.4-mini"),
-    "vibe": os.environ.get("SMOKE_VIBE_MODEL", "devstral-small-latest"),
-    # The Pi default uses the authenticated Codex provider; override if unavailable.
-    "pi": os.environ.get("SMOKE_PI_MODEL", "openai-codex/gpt-5.4-mini"),
-}
-ANSWER_AGENTS = ("claude", "codex", "vibe")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from agent_capabilities import SMOKE_TARGETS  # noqa: E402
+from skill_benchmark import invoke_argv_with_timeout  # noqa: E402
+from trigger_contracts import TriggerObservation  # noqa: E402
+
+DEFAULT_MODELS = {name: target.resolved_model(os.environ) for name, target in SMOKE_TARGETS.items()}
+ANSWER_AGENTS = tuple(name for name, target in SMOKE_TARGETS.items() if target.population == "answer")
 SMOKE_TRIGGER_EXPECTATIONS = (
     ("Review this code change and label the severity of each finding.", True),
     ("What is the capital of France?", False),
@@ -80,18 +80,19 @@ def make_smoke_repo(root: Path) -> Path:
 
 
 def run(command: list[str], *, cwd: Path, report: dict[str, Any], label: str) -> bool:
-    started = time.monotonic()
-    entry: dict[str, Any] = {"label": label, "command": command, "cwd": str(cwd)}
-    try:
-        completed = subprocess.run(command, cwd=cwd, text=True, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, timeout=300, check=False)
-        entry.update({"returncode": completed.returncode, "elapsed_seconds": round(time.monotonic() - started, 3),
-                      "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-4000:]})
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        entry.update({"returncode": None, "elapsed_seconds": round(time.monotonic() - started, 3),
-                      "error": f"{type(exc).__name__}: {exc}"})
+    outcome = invoke_argv_with_timeout(command, cwd=cwd, timeout=300)
+    entry: dict[str, Any] = {
+        "label": label,
+        "command": command,
+        "cwd": str(cwd),
+        "state": outcome.state.value,
+        "returncode": outcome.returncode,
+        "elapsed_seconds": round(outcome.elapsed_ms / 1000, 3),
+        "stdout": outcome.stdout[-4000:],
+        "stderr": outcome.stderr[-4000:],
+    }
     report["commands"].append(entry)
-    return entry.get("returncode") == 0
+    return outcome.observation_complete
 
 
 def assess_answer_benchmark(path: Path, agent: str, report: dict[str, Any]) -> bool:
@@ -113,23 +114,32 @@ def assess_answer_benchmark(path: Path, agent: str, report: dict[str, Any]) -> b
         return False
 
 
-def assess_trigger_report(path: Path, report: dict[str, Any]) -> bool:
+def assess_trigger_report(path: Path, report: dict[str, Any], agent: str = "pi") -> bool:
     try:
         trigger = json.loads(path.read_text(encoding="utf-8"))
         rows = trigger["results"]
+        if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
+            raise ValueError("trigger results must be a list of objects")
         actual_polarities = [(row.get("query"), row.get("should_trigger")) for row in rows]
         expected_polarities = list(SMOKE_TRIGGER_EXPECTATIONS)
         exact_fixture = (len(rows) == len(expected_polarities)
                          and sorted(actual_polarities) == sorted(expected_polarities))
-        observed = exact_fixture and all(row.get("observation_complete") and row.get("returncode") == 0 for row in rows)
-        expected = exact_fixture and all(row.get("pass") is True for row in rows)
-        report["checks"].append({"label": "pi:observation-contract", "passed": observed,
+        observations = (
+            [TriggerObservation.from_row(row, default_agent=agent) for row in rows]
+            if exact_fixture else []
+        )
+        observed = exact_fixture and all(
+            observation.invocation.observation_complete and observation.invocation.returncode == 0
+            for observation in observations
+        )
+        expected = exact_fixture and all(observation.passed for observation in observations)
+        report["checks"].append({"label": f"{agent}:observation-contract", "passed": observed,
                                  "detail": "exactly one complete positive and one complete negative trigger observation"})
-        report["checks"].append({"label": "pi:demo-trigger-fixture", "passed": expected,
+        report["checks"].append({"label": f"{agent}:demo-trigger-fixture", "passed": expected,
                                  "detail": "the demo skill triggers only on its positive query"})
         return observed and expected
-    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        report["checks"].append({"label": "pi:observation-contract", "passed": False,
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        report["checks"].append({"label": f"{agent}:observation-contract", "passed": False,
                                  "detail": f"could not read trigger report: {type(exc).__name__}: {exc}"})
         return False
 
@@ -138,11 +148,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", required=True, help="persistent directory for tasks, run artifacts, reports, and smoke.json; never cleaned by this command")
     parser.add_argument("--live", action="store_true", help="required acknowledgement before any model CLI is invoked")
-    parser.add_argument("--agents", default="claude,codex,vibe,pi", help="comma-separated subset of claude,codex,vibe,pi")
-    parser.add_argument("--claude-model", default=DEFAULT_MODELS["claude"])
-    parser.add_argument("--codex-model", default=DEFAULT_MODELS["codex"])
-    parser.add_argument("--vibe-model", default=DEFAULT_MODELS["vibe"])
-    parser.add_argument("--pi-model", default=DEFAULT_MODELS["pi"])
+    supported = ",".join(SMOKE_TARGETS)
+    parser.add_argument("--agents", default=supported, help=f"comma-separated subset of {supported}")
+    for name in SMOKE_TARGETS:
+        parser.add_argument(f"--{name}-model", default=DEFAULT_MODELS[name])
     parser.add_argument("--timeout", type=int, default=90, help="per harness CLI invocation timeout in seconds")
     return parser.parse_args()
 
@@ -150,7 +159,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     agents = tuple(item.strip() for item in args.agents.split(",") if item.strip())
-    unknown = sorted(set(agents) - {*ANSWER_AGENTS, "pi"})
+    unknown = sorted(set(agents) - set(SMOKE_TARGETS))
     if unknown:
         raise SystemExit(f"unknown smoke agent(s): {', '.join(unknown)}")
     if not agents:
@@ -167,7 +176,7 @@ def main() -> int:
     work = attempt_dir / "work"
     work.mkdir()
     manifest = make_smoke_repo(work)
-    models = {name: getattr(args, f"{name}_model") for name in (*ANSWER_AGENTS, "pi")}
+    models = {name: getattr(args, f"{name}_model") for name in SMOKE_TARGETS}
     report: dict[str, Any] = {
         "kind": "supported-cli-live-smoke",
         "generated_at": int(time.time()),
@@ -192,14 +201,14 @@ def main() -> int:
                                        "error": f"{agent} executable not found"})
             all_ok = False
             continue
-        if agent == "pi":
-            trigger_report = attempt_dir / "pi-trigger.json"
+        if SMOKE_TARGETS[agent].population == "trigger":
+            trigger_report = attempt_dir / f"{agent}-trigger.json"
             all_ok &= run([
-                python, trigger, str(manifest), "--agent", "pi", "--model", models["pi"],
+                python, trigger, str(manifest), "--agent", agent, "--model", models[agent],
                 "--runs-per-query", "1", "--timeout", str(args.timeout), "--trace-runs", str(attempt_dir / "pi-traces"),
                 "--out", str(trigger_report),
-            ], cwd=work, report=report, label="pi:trigger")
-            all_ok &= assess_trigger_report(trigger_report, report)
+            ], cwd=work, report=report, label=f"{agent}:trigger")
+            all_ok &= assess_trigger_report(trigger_report, report, agent)
             continue
         tasks = attempt_dir / f"{agent}.tasks.jsonl"
         runs = attempt_dir / f"{agent}.runs"

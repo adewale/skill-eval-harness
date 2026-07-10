@@ -61,7 +61,8 @@ Design records for shipped or in-flight subsystems:
 
 ## Audits
 
-Point-in-time findings: [`repo-effectiveness-audit.md`](repo-effectiveness-audit.md).
+Point-in-time findings: [`repo-effectiveness-audit.md`](repo-effectiveness-audit.md) and
+[`correctness-by-construction-audit.md`](correctness-by-construction-audit.md).
 
 ## Adding a user journey
 

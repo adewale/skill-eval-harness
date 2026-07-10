@@ -174,7 +174,11 @@ class OTelNormalizationTests(unittest.TestCase):
         self.assertEqual(otel["process.exit_code"], 0)
 
     def test_usage_lands_in_otel_metrics(self):
-        records = [{"type": "usage", "usage": {"input_tokens": 100, "output_tokens": 40}}]
+        usage = {"input_tokens": 100, "output_tokens": 40, "total_tokens": 140}
+        records = [
+            {"type": "usage", "usage": usage},
+            {"type": "agent_end", "messages": [{"role": "assistant", "usage": usage}]},
+        ]
         events_doc, metrics = sb.normalize_trace_records(records, source="pi")
         self.assertEqual(metrics["otel"], {"gen_ai.usage.input_tokens": 100, "gen_ai.usage.output_tokens": 40})
         self.assertEqual(events_doc["events"][0]["otel"]["gen_ai.usage.input_tokens"], 100)

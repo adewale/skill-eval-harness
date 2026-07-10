@@ -66,6 +66,21 @@ This is intentionally a **control-plane abstraction**, not a lowest-common-denom
 
 The rule for future CLIs is: implement the shared contracts, but do not pretend their control surface is identical. Add a capability row, a native answer backend if possible, a trigger adapter only after autonomous skill discovery is proven, and fake/offline conformance tests for prompt transport, config isolation, final answer extraction, telemetry, and failure semantics.
 
+## Typed trigger state pipeline
+
+Autonomous-trigger runners do not pass independent `returncode`, `timed_out`,
+`observation_complete`, `triggered`, and `pass` booleans internally. The typed pipeline is:
+
+```text
+InvocationOutcome -> provider stream -> TriggerDetection -> TriggerObservation
+```
+
+`InvocationOutcome` is a closed completion state. Pi parses its JSONL once into `PiStream`, where
+terminal errors, protocol completeness, and cumulative usage are resolved together. Triggered is
+derived from typed evidence, and pass is derived from a complete invocation plus the expected
+polarity. An incomplete observation cannot contain numeric usage or cost. JSON report rows are wire
+artifacts only and are parsed back through the same contract before the live smoke trusts them.
+
 ## Cheap comprehensive live smoke
 
 [`scripts/smoke_supported_clis.py`](../scripts/smoke_supported_clis.py) is the
@@ -86,8 +101,9 @@ caller-owned directory.
 small (`haiku`, `gpt-5.4-mini`, `devstral-small-latest`, and Pi's
 `openai-codex/gpt-5.4-mini`); override any model with
 `--claude-model`, `--codex-model`, `--vibe-model`, or `--pi-model` (or the matching
-`SMOKE_*_MODEL` environment variable). Pi's Codex-backed default requires Pi's OpenAI Codex
-authentication. Jetty is an API/import surface, not a local
+`SMOKE_*_MODEL` environment variable). These targets live in the capability registry; a blank
+environment override falls back to the registered model instead of producing an empty model ID.
+Pi's Codex-backed default requires Pi's OpenAI Codex authentication. Jetty is an API/import surface, not a local
 CLI; retain its separate token-backed smoke. The command exits nonzero unless every selected
 CLI completes its artifact contract and the demo fixtures pass, so incomplete or substituted
 trigger rows and failed provider runs are never reported as a smoke success.
