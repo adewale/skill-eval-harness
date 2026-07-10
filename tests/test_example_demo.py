@@ -47,5 +47,68 @@ class DemoExampleTests(unittest.TestCase):
         self.assertEqual(s["without_skill"]["objective_pass_rate"]["mean"], 0.0)   # no skill -> both fail
 
 
+class DemoJudgeTests(unittest.TestCase):
+    """Pins the stub-judge pair's calibration signature that
+    docs/can-i-trust-my-judge.md pastes: the careful judge aligns with the human
+    labels and rejects the negative controls; the --lenient rubber-stamp leaks
+    every control and scores kappa 0.0 despite 0.5 raw agreement."""
+
+    VARIANTS = ["with_skill", "without_skill", "ablation:no-severity", "ablation:no-checklist"]
+    # The human gold labels the journey doc records for the four c-review arms.
+    HUMAN = {
+        "with_skill": True,
+        "without_skill": False,
+        "ablation:no-severity": False,
+        "ablation:no-checklist": True,
+    }
+
+    def _judge_rows(self, lenient: bool):
+        mp = DEMO / "evals" / "shared-benchmark.json"
+        manifest = sb.validate_manifest(mp)
+        tmp = tempfile.TemporaryDirectory(prefix="demo-judge-")
+        self.addCleanup(tmp.cleanup)
+        td = Path(tmp.name)
+        rows = sb.prepared_task_rows(mp, manifest, include_ablations=True, ablation_dir=str(td / "abl"))
+        rows = [r for r in rows if r["variant"] in self.VARIANTS]
+        (td / "tasks.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        sb.run_codex(argparse.Namespace(tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"),
+                                        codex_cmd=f"{sys.executable} {DEMO / 'stub_runner.py'}", timeout=120))
+        tasks = sb.collect_judge_tasks(mp, td / "runs", variants=self.VARIANTS)
+        self.assertEqual(len(tasks), 4)   # one actionable-review task per c-review arm
+        cmd = f"{sys.executable} {DEMO / 'stub_judge.py'}" + (" --lenient" if lenient else "")
+        verdicts = [sb.run_one_judge_task(t, cmd, None, 1) for t in tasks]
+        return tasks, verdicts, td
+
+    @staticmethod
+    def _keyed(rows):
+        return {r["judge_task_id"]: r for r in rows}
+
+    def test_careful_judge_aligns_and_rejects_controls(self):
+        tasks, verdicts, td = self._judge_rows(lenient=False)
+        human = {t["judge_task_id"]: {"passed": self.HUMAN[t["variant"]]} for t in tasks}
+        align = sb.judge_alignment_report(human, self._keyed(verdicts), min_labels=4)
+        self.assertEqual(align["cohen_kappa"], 1.0)
+        self.assertEqual(align["confusion"], {"tp": 2, "fp": 0, "fn": 0, "tn": 2})
+        robust = sb.judge_robustness_report(tasks, tmp_dir=td,
+                                            judge_cmd=f"{sys.executable} {DEMO / 'stub_judge.py'}")
+        self.assertEqual(robust["summary"]["order_flip_consistency"], 1.0)
+        self.assertEqual(robust["summary"]["control_leak_rate"], 0.0)
+        self.assertEqual(robust["findings"], [])
+
+    def test_lenient_judge_is_caught_by_both_probes(self):
+        tasks, verdicts, td = self._judge_rows(lenient=True)
+        human = {t["judge_task_id"]: {"passed": self.HUMAN[t["variant"]]} for t in tasks}
+        align = sb.judge_alignment_report(human, self._keyed(verdicts), min_labels=4)
+        self.assertEqual(align["agreement"], 0.5)      # right whenever the answer deserves to pass...
+        self.assertEqual(align["cohen_kappa"], 0.0)    # ...but no better than chance once corrected
+        self.assertEqual(align["recall"], 1.0)
+        self.assertEqual(align["precision"], 0.5)
+        robust = sb.judge_robustness_report(tasks, tmp_dir=td,
+                                            judge_cmd=f"{sys.executable} {DEMO / 'stub_judge.py'} --lenient")
+        self.assertEqual(robust["summary"]["control_leak_rate"], 1.0)
+        kinds = {f["kind"] for f in robust["findings"]}
+        self.assertEqual(kinds, {"passes-empty-control", "passes-master-key-control"})
+
+
 if __name__ == "__main__":
     unittest.main()

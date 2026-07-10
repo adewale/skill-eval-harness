@@ -11,8 +11,9 @@ useful gate has two independent jobs, and they key on different things:
 1. **Did the graded outputs regress?** — turn `benchmark.json` into a CI-native
    pass/fail with `report --format junit|github`.
 2. **Is the manifest itself strong enough to trust the green?** — `audit-manifest
-   --fail-on-blockers` fails when the suite has structural blockers (no hidden split,
-   no negatives, an instruction-simulated ablation masquerading as evidence).
+   --fail-on-blockers` fails when the suite has structural blockers (no adversarial
+   coverage, a leak-saturated case, an instruction-simulated ablation masquerading
+   as evidence).
 
 Neither calls a model. Both run in the same offline path the demo uses, so your CI
 never needs an API key to grade.
@@ -96,10 +97,11 @@ with a readiness block reporting:
 ```
 
 `--fail-on-blockers` keys on `readiness.blockers` — the structural problems that make a
-green meaningless: no hidden `holdout`/`holdback` split (you tuned on your test set), no
-negative or adversarial cases, a leak-saturated case (an assertion the base model passes
-from the prompt alone), or an ablation that is only *instruction-simulated* and so can
-never confirm a causal regression. The demo has none, so it gates clean.
+green meaningless: no adversarial cases (nothing tests whether the skill holds under
+pressure), a leak-saturated case (an assertion the base model passes from the prompt
+alone), an ablation that is only *instruction-simulated* and so can never confirm a
+causal regression, or — once run data is supplied — a base-saturated case. The demo has
+none, so it gates clean.
 
 Note the distinction the exit code draws: `audit-manifest` *also* emitted eight
 `findings` at `recommended`/`required` severity on this same run (missing domain tags,
@@ -135,9 +137,10 @@ blow its budget — the operational half of the same gate.
   paired scores) tells you which. Gate on *confirmed* regressions, not on a one-run dip;
   a case needs ≥4 runs per arm to ever clear significance.
 - **`audit-manifest --fail-on-blockers` exits non-zero** → read the `blockers` list. A
-  `missing-hidden-splits` blocker means you have no held-out cases and every "pass" is
-  potentially memorized tuning. A `leak-saturated` blocker means an assertion passes from
-  the prompt alone. Fix the manifest, not the threshold.
+  `leak-saturated` blocker means an assertion passes from the prompt alone; a
+  no-adversarial blocker means nothing tests the skill under pressure. Fix the
+  manifest, not the threshold. (Missing hidden splits surface as a `required`
+  *finding*, not a blocker — advice the exit code deliberately does not fail on.)
 - **JUnit shows `errors` > 0 (not `failures`)** → runs crashed or timed out. These are
   execution errors, not quality failures; they poison the denominator. Re-run before you
   read the gate.

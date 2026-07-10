@@ -150,11 +150,12 @@ skill-benchmark --help
 
 ## Documentation map
 
-[`docs/README.md`](docs/README.md) groups these by kind (user journeys, concepts, specs, audits) and holds the convention for adding a new user-journey walkthrough.
+[`docs/README.md`](docs/README.md) groups these by kind (user journeys, concepts, reference, specs, audits) and holds the convention for adding a new user-journey walkthrough.
 
 | File | Use it for |
 |---|---|
 | `README.md` | Manifest shape, run layout, and the command index. |
+| `docs/README.md` | The docs index: journeys/concepts/reference/specs grouping and the convention for adding a user-journey walkthrough. |
 | `docs/commands.md` | Full per-command reference: flags, examples, and output shapes for every subcommand. |
 | `CHANGELOG.md` | Release history and unreleased repo-surface changes. |
 | `CONTRIBUTING.md` | Local setup, validation commands, and eval-safety rules. |
@@ -168,9 +169,11 @@ skill-benchmark --help
 | `docs/did-my-skill-edit-regress.md` | The edit → re-run → diff loop: the within-run `ablation_regressions` block (assertion-level, significance-gated) and cross-iteration `render-viewer --previous-workspace` diffs over the `iteration-N/` convention. |
 | `docs/which-model-should-my-skill-target.md` | Ranking model tiers by lift: `prepare --models` fan-out, the `by_model` / `model_analysis` blocks, and reading real lift vs. base-model saturation per tier. |
 | `docs/why-did-this-run-fail.md` | Debugging one failing run: the `error-analysis` taxonomy + review queue, then the run dir (`output.md`/`metadata.json`), mapped to a failure class and a manifest-or-skill decision. |
+| `docs/can-i-trust-my-judge.md` | Calibrating a judge before believing its numbers: `judge-robustness` (order-flip + negative controls), `judge-alignment` (human labels, Cohen's kappa, precision/recall), and `compare-judges` (does the lift survive a judge swap?). |
 | `docs/eval-framework-roadmap-spec.md` | The implemented eval-framework roadmap: goals, abstractions, and tests per feature (CF.1–CF.4, buckets 1–4, migration). |
 | `docs/migrating-evals.md` | Upgrading a manifest between versions (v1 → v2): what `migrate` stamps and the judgment calls it leaves. |
-| `docs/vocabulary.md` | Glossary of harness terms: variants, splits, models, ablations, assertions, severity/oracle tiers, graded scoring, cost telemetry, trace artifacts, and report flags. |
+| `docs/porting-existing-evals.md` | Arriving from another framework: `dataset_files` + a template case carry the rows across, then the paired baseline, splits, leakage lint, and the `audit-manifest` punch list supply what the old suite had no slot for. |
+| `docs/vocabulary.md` | Glossary of harness terms: variants, splits, models, ablations, assertions, severity/oracle tiers, graded scoring, cost telemetry, trace artifacts, agent/judge backends, judge calibration, reliability, contamination, and report flags. |
 | `docs/evals-are-not-tests.md` | Why a skill eval is not a unit test, and what that changes about reading results. |
 | `docs/academic-grounding.md` | The research constructs behind the harness's terms, with citations; meshes the workflow, measurement, and theory layers. |
 | `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
@@ -178,10 +181,11 @@ skill-benchmark --help
 | `docs/agent-backend-interface-spec.md` | Draft spec for turning Claude/Codex/Gemini/Vibe support into a shared agent backend interface: parity matrix, judge backends, trigger adapters, telemetry, and tool replay. |
 | `docs/agent-cli-control-plane.md` | The shared native-CLI control plane: process invocation, config isolation, tool policy, final-answer channels, schemas, telemetry, and where Claude/Codex/Vibe intentionally differ. |
 | `docs/agent-cli-tradeoffs.md` | Claude/Codex/Vibe trade-offs: which CLI surfaces are strong or weak, Vibe-only gaps, and what missing schema/telemetry/prompt controls mean for eval reports. |
+| `docs/agent-parity.md` | The per-agent support matrix: which answer/judge/trigger surfaces Claude, Codex, Vibe, Pi, Jetty, subagent, and the stub each cover, with live-smoke status per backend. |
 | `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
 | `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
-| `TODO.md` | Status tracker: the eval-framework roadmap (implemented, bar two `(TODO-native)` items) and the remaining Jetty adapter work — streaming/concurrency, live API validation, judge export, per-variant overrides, and the `swap:<id>` ablation follow-on. |
+| `TODO.md` | Status tracker: the eval-framework roadmap (implemented, bar two `(TODO-native)` items), the remaining Jetty adapter work (streaming/concurrency, live API validation, judge export, per-variant overrides, the `swap:<id>` ablation follow-on), the agent-backend parity follow-ups (Gemini CLI open; Vibe done), and the migration/user-journey doc backlog. |
 | `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two answer-path materialized ablations, one discovery ablation for trigger examples, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per answer-path ablation; exercised by `tests/test_example_demo.py`. Also carries should-fire/should-not-fire trigger cases for `skill-trigger-matrix` (offline via `--agent stub`; live smoke via `RUN_TRIGGER_SMOKE=1`). Start here. |
 | `examples/adewale-workspace/` | Adewale-specific Pi smoke runner and cross-repo aggregate report (the trigger runners are the top-level `skill-pi-trigger-eval` and `skill-trigger-matrix`). |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
@@ -388,7 +392,7 @@ skill-benchmark materialize-ablations ../repo/evals/shared-benchmark.json \
 
 Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree (every manifest root, identical surface to `with_skill`, differing only by the declared edit). Mechanisms are `frontmatter_field`, `section` (fence-aware), `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, `asset`, and `preprocess` (inline `` !`command` ``), composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`. Materialized arms are blind: the model-visible input is identical to `with_skill` (the hypothesis lives only in harness metadata).
 
-The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), `run_pi_trigger_eval.py --ablation <id>` trigger-tests a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the trigger adapter. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision **and** the replicated regression clears a significance test (a two-sided permutation test run **per case** over that case's per-run scores; a regression is significant iff at least one confirmed case clears p≤0.05). Because the exact permutation discretizes, a case needs **≥4 runs per arm** to ever reach significance (`C(8,4)=70` → minimum p `2/70≈0.029`); a single-shot (or 3-per-arm) ablation ties at a p it cannot pass and is reported `INDETERMINATE`, never confirmed. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
+The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), the autonomous-trigger runners (`skill-trigger-matrix --ablation <id>` with any registered adapter, or `run_pi_trigger_eval.py --ablation <id>`) trigger-test a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the autonomous-trigger runners. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision **and** the replicated regression clears a significance test (a two-sided permutation test run **per case** over that case's per-run scores; a regression is significant iff at least one confirmed case clears p≤0.05). Because the exact permutation discretizes, a case needs **≥4 runs per arm** to ever reach significance (`C(8,4)=70` → minimum p `2/70≈0.029`); a single-shot (or 3-per-arm) ablation ties at a p it cannot pass and is reported `INDETERMINATE`, never confirmed. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
 
 **Evidence asymmetry (discovery vs answer).** The two paths do not yet have equal evidentiary strength:
 
@@ -408,6 +412,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 |---|---|
 | `skill-benchmark validate` | Check manifest shape, fixture paths, regex, oracle paths, and prompt-leakage. |
 | `skill-benchmark prepare` | Emit answer-key-safe task rows per case/variant/run (`--include-ablations` materializes ablated trees). |
+| `skill-benchmark materialize-ablations` | Write the declared ablated skill trees to disk without preparing tasks — inspect or diff an ablation before spending a run on it. |
 | `skill-benchmark grade` | Score saved outputs into per-run rows; emit pending judge tasks. |
 | `skill-benchmark benchmark` | Aggregate into variant summaries, paired lift + significance, by-model, cost, and case flags. |
 | `skill-benchmark render-viewer` | Static or `--serve`d review page with embedded artifacts and iteration diffs. |

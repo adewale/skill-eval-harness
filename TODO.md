@@ -8,7 +8,7 @@ Jetty is an OpenAI-compatible workflow/agent platform with `POST https://flows-a
 
 Current support is an adapter scaffold, not production-proven Jetty evidence. The harness can export deterministic runbook payloads, dry-run them, submit/poll through a REST client, and import mocked trajectory-shaped results. The missing step is token-backed contract validation against real Jetty responses; until then the main risk is mock-reality drift.
 
-- [ ] Mark README/docs examples clearly: Jetty is optional and live response shapes remain unverified until the first token-backed smoke passes.
+- [x] Mark README/docs examples clearly: Jetty is optional and live response shapes remain unverified until the first token-backed smoke passes (README "optional; see the Jetty adapter" + `docs/commands.md` Jetty section opener).
 - [ ] Capture redacted live responses as committed contract fixtures for file upload, chat-completion submit, trajectory poll, artifact list/download, failed/timeout status, and rate-limit response.
 - [ ] Update `JettyClient`, `execute_jetty_payloads`, and `import_jetty_results` to consume the real response shapes, not only the current mocked inline-artifact shape.
 - [ ] Promote Jetty evidence to production-grade only after `export-jetty -> run-jetty -> import-jetty-results -> benchmark` passes on one fixture-free and one fixture-backed demo case.
@@ -168,8 +168,10 @@ Mistral support should mean first-class Vibe CLI support, not a raw chat-complet
       smoke-test environment documentation for Vibe.
 - [x] Add a registry/conformance guard that fails when a backend is partially registered (for
       example `run-agent` supports it but parity docs or capability rows do not).
-- [ ] Keep `--judge-cmd` as the escape hatch for arbitrary providers while first-class Gemini/Vibe
-      support moves through the native backend registry.
+
+Standing invariant (not a tickable task): `--judge-cmd` stays the escape hatch for arbitrary
+providers while first-class backends move through the native registry — the code documents it
+as "the universal escape hatch" and `judge` points unknown backends at it.
 
 ---
 
@@ -336,14 +338,23 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       the `error-analysis` open-coding queue + failure taxonomy, then the run dir
       (`output.md`/`metadata.json`), mapped to a failure class and a manifest-or-skill decision.
       Runnable offline on `examples/demo-skill` (real 2026-07-06 taxonomy/queue over the failing arms).
-- [ ] **"Can I trust my judge?"** — `judge-alignment` (human labels, kappa, precision/recall),
-      `compare-judges` (judge-sensitivity), and `--judge-runs` repetition exist; no doc walks
-      labeling a sample and deciding whether the judge is usable.
+- [x] **"Can I trust my judge?"** — [`docs/can-i-trust-my-judge.md`](docs/can-i-trust-my-judge.md):
+      stability (`judge-robustness` order-flip + negative controls), accuracy vs. human labels
+      (`judge-alignment`: kappa over raw agreement, precision/recall), and conclusion-sensitivity
+      (`compare-judges` lift diff), with `--judge-runs`/`--judge-panel` as the repetition tools.
+      Runnable offline: the demo gained a gate-severity `judge` assertion plus `stub_judge.py`
+      (careful and `--lenient` rubber-stamp modes), so the whole loop — including the
+      rubber-stamp's kappa-0.0 / control-leak-1.0 / lift-erosion signature — runs with no model
+      (real 2026-07-09 output; guarded by `tests/test_example_demo.py`).
 - [x] **"How do I gate my skill repo's CI on this?"** — [`docs/gating-ci-on-evals.md`](docs/gating-ci-on-evals.md):
       the two-gate recipe (`report --format junit|github` for regressions +
       `audit-manifest --fail-on-blockers` for manifest trust), a workflow file, and the
       "gate on lift/named regressions, not raw pass count" reading guide. Runnable offline on
       `examples/demo-skill` (real 2026-07-05 report/junit/readiness output).
-- [ ] **"How do I port my existing evals into the harness?"** — `prepare` JSONL as the import
-      seam, YAML manifests, and the Jetty/trace importers exist; `docs/migrating-evals.md`
-      only covers v1→v2 manifests, not arriving from another framework's suite.
+- [x] **"How do I port my existing evals into the harness?"** — [`docs/porting-existing-evals.md`](docs/porting-existing-evals.md):
+      `dataset_files` JSONL + one template case as the mechanical seam, then the additions the
+      source framework had no slot for (paired baseline, splits, leakage-safe assertions),
+      with `audit-manifest` findings as the post-port punch list and the run layout /
+      `import-trace` path for already-recorded outputs. Runnable offline against the demo
+      skill (real 2026-07-10 lint/lift/audit output), including the leakage lint firing on a
+      genuinely leaky ported row.

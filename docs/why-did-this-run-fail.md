@@ -170,7 +170,7 @@ Per the review checklist, cite the file and line for each finding.
 ```
 
 So the row is real, the assertion is right, and the correct action is **none** — do not
-touch the manifest. A baseline that failed here would mean the case is leak-saturated
+touch the manifest. A baseline that *passed* here would mean the case is leak-saturated
 (the answer is echo-able from the prompt), which is the *opposite* problem.
 
 ## Three diagnoses that look identical in the queue
@@ -253,7 +253,7 @@ This journey explains failures the harness **already graded** on the cases you h
 cannot diagnose a failure mode you wrote no assertion for — if the skill did something bad
 that no check looks for, no row in the queue will mark it. And it does not tell you whether
 the *judge* that graded a qualitative assertion is itself trustworthy: a false red from a
-miscalibrated judge looks, in the queue, exactly like a true one. That is the
-judge-alignment journey, still unwritten (tracked in [`../TODO.md`](../TODO.md)) — until
-it lands, treat a judge-sourced first-failure as a lead to open the `output.md` on, not a
+miscalibrated judge looks, in the queue, exactly like a true one. That is
+[`can-i-trust-my-judge.md`](can-i-trust-my-judge.md) — until you have run its calibration
+loop, treat a judge-sourced first-failure as a lead to open the `output.md` on, not a
 verdict.

@@ -2,7 +2,7 @@
 
 This page is the canonical glossary: each term is defined here once, with the place it shows up in a manifest, a command, or a report. The other concept docs apply a lens to these terms rather than redefine them — [`abstractions.md`](abstractions.md) the engineering shape, [`academic-grounding.md`](academic-grounding.md) the research construct, [`evals-are-not-tests.md`](evals-are-not-tests.md) how to read the number — so when a definition changes, it changes here and the lenses follow. (The README still defines a term inline where you first meet it in a workflow; that is reference-at-use, not a second home for the definition.)
 
-Terms are grouped by what they describe: the units you evaluate, the comparison structure, the things you assert, the artifacts a run produces, and the signals a report flags.
+Terms are grouped by what they describe: the units you evaluate, the comparison structure, the things you assert, the artifacts a run produces, the runners and judges that produce and grade them, and the signals a report flags.
 
 ## Units of evaluation
 
@@ -75,7 +75,7 @@ Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger
 
 **Efficiency assertion** — a budget check over `metrics.json` or `metadata.json`: `total_tokens_le`, `elapsed_seconds_le`, `command_count_le`.
 
-**Qualitative assertion** — a `judge` or `rubric` check (or the `factuality` preset, a canned anchored rubric) that the harness cannot grade by string matching. A `judge` assertion may carry anchored `graded_dimensions` (per-dimension 1–5 scores) or a `dynamic_rubric` (the judge drafts case-specific criteria, then grades against them). These are deferred into `judge-tasks.jsonl` and resolved either by a user-supplied `--judge-cmd` or by merging `--judge-results`. The harness never picks a model for you.
+**Qualitative assertion** — a `judge` or `rubric` check (or the `factuality` preset, a canned anchored rubric) that the harness cannot grade by string matching. A `judge` assertion may carry anchored `graded_dimensions` (per-dimension 1–5 scores) or a `dynamic_rubric` (the judge drafts case-specific criteria, then grades against them). These are deferred into `judge-tasks.jsonl` and resolved by a judge backend (`--judge-cmd`, `--judge-model`, or `--judge-backend`) or by merging pre-computed `--judge-results`. The harness never picks a model for you.
 
 **Severity** — how a failed assertion counts, declared per assertion (or defaulted by type): `critical` (an absorbing barrier — one failure vetoes the run, collapses every rate to 0.0, and is excluded from every mean), `gate` (carries the pass rate; the default for objective checks), or `soft` (feeds only the per-run graded score and never moves a pass rate; the default for `judge`/`similarity`). `--strict` promotes soft to gate.
 
@@ -83,13 +83,17 @@ Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger
 
 **Variant-scoped assertion** — an assertion restricted to specific arms via `variants` / `only_variants` / `except_variants`. Process checks need this: `skill_invoked=true` belongs to `with_skill`, and `skill_invoked=false` belongs to `without_skill`, so an unscoped skill-load requirement would wrongly penalize the baseline.
 
+**Assertion dependency (`depends_on`)** — an assertion may name prerequisite assertions; when a prerequisite fails or is itself skipped, the dependent is SKIPPED — out of every denominator and out of the critical veto — rather than counted as a failure. Skip is not zero: a dependent that never ran is "not measured", so an upstream miss cannot double-count as two failures. Cycles and unknown targets are rejected at validation.
+
+**Eval intent** — what a case exists to show, declared per case as `eval_intent`: `capability` (the default — the case measures lift and participates in saturation/no-lift/staleness signals) or `regression` (the case pins behavior the skill must not lose; it reports under `regression_guards_holding`, is exempt from staleness and suggestion pruning, and its saturation is the goal, not a warning).
+
 ## Run artifacts
 
 **`output.md`** — the final answer a run produced. Objective and qualitative assertions read it.
 
 **`metadata.json`** — optional per-run telemetry: elapsed time, token counts, model name, and the normalized cost blocks below.
 
-**`usage_normalized` / `cost_normalized`** — the normalized token and dollar blocks every runner writes into a run's metadata/metrics, alongside the raw provider fields. Each carries a `source` provenance (`provider_reported`, `trace_normalized`, `price_table_estimated`, `missing`, or `not_applicable`) — missing telemetry is marked, never written as zero — so the report can total real spend and disclose coverage separately from quality.
+**`usage_normalized` / `cost_normalized`** — the normalized token and dollar blocks every runner writes into a run's metadata/metrics, alongside the raw provider fields. Each carries a `source` provenance: `provider_reported`, `trace_normalized`, `missing`, or `not_applicable`, plus `estimated` for usage and `price_table_estimated` for cost. Missing telemetry is marked, never written as zero — so the report can total real spend and disclose coverage separately from quality.
 
 **Trace artifacts** — what a trace-aware runner writes so process and efficiency assertions have evidence:
 
@@ -99,6 +103,22 @@ Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger
 - `environment.json` — runner, model, and sandbox details where available.
 
 The normalized shapes are an adapter boundary: Pi, Codex, and Jetty emit different raw events, so each shape gets fixture tests rather than an assumed common schema.
+
+## Runners and judges
+
+**Agent backend** — a registered native runner for one agent CLI, dispatched by `run-agent --agent <name>`. The registry (`AGENT_BACKENDS`) currently holds `claude`, `codex`, and `vibe`; `run-codex` and `run-claude` are compatibility wrappers over the same path. Every backend writes the same run-output contract, and a conformance guard fails the suite if a backend is registered on one surface (answer, judge, trigger) but missing from the capability rows (`agent_capabilities.py`) or the parity doc ([`agent-parity.md`](agent-parity.md)).
+
+**Workspace isolation** — every arm of a case runs in a fresh isolated workspace built by one shared builder: `with_skill` gets the (real or ablated) skill tree mounted, `without_skill` gets no skill files at all, so the baseline cannot read the skill from disk. Credential-bearing runner homes (`CODEX_HOME`, `VIBE_HOME`) live outside the model's working directory. This is the CF.2 invariant: baseline isolation is enforced by construction and covered by a cross-runner test, because a baseline that can see the skill silently destroys lift.
+
+**Judge backend** — how a deferred qualitative assertion gets its verdict. `--judge-cmd` is the universal escape hatch (any shell command: prompt on stdin, JSON verdict on stdout); `--judge-backend claude|codex|vibe` selects a native adapter (with `--judge-model` picking the model; the native paths capture the judge's real dollar cost). Every verdict records its `judge_model`, and judge spend is its own ledger line in `cost_summary`, never folded into the model under test.
+
+**Judge task** — one deferred qualitative check on one run, keyed by `judge_task_id` (`case::variant::run-n::assertion`, with a model segment when the model axis is fanned). `grade` emits pending tasks to `judge-tasks.jsonl`; verdicts merge back by the same key, which is also how human labels pair with verdicts in `judge-alignment`.
+
+**Judge repetition / panel** — the two merges that stabilize a judge's verdict. `--judge-runs N` repeats each task and majority-merges `passed` (median for scores), killing within-judge noise; `--judge-panel` (repeated) runs several judge models and folds them into one consensus verdict with an `agreement` block, an optional `--quorum`, and even ties reported as `unresolved` rather than silently resolved.
+
+**Judge alignment** — a judge's accuracy against human labels as ground truth: `judge-alignment` reports raw agreement, Cohen's kappa (chance-corrected, so an imbalanced label set cannot flatter the judge), precision/recall/F1, and the confusion matrix, and warns below `--min-labels` matched labels. Distinct from judge-sensitivity (below): two judges can agree and both be wrong.
+
+**Judge robustness** — a judge's stability under probes it must not fail: `judge-robustness` re-judges with the rubric order flipped (`order_flip_consistency`) and feeds negative controls — an empty output and a master-key prompt injection — that a sound judge must reject (`control_leak_rate`). Model-touching and opt-in; it never runs in the grade path. The calibration walkthrough over alignment, robustness, and sensitivity is [`can-i-trust-my-judge.md`](can-i-trust-my-judge.md).
 
 ## Report signals
 
@@ -118,7 +138,7 @@ These are flags a `benchmark` report raises so you read pass rates correctly.
 
 **Leakage** — an assertion value appears literally in the prompt, so a weak answer can pass by echoing the task. `validate` warns on this; `--strict-leakage` turns the warning into a failure once you have replaced the weak check. Leakage is an annotation artifact (Gururangan et al. 2018) in eval clothing — a surface cue that lets a model be right for the wrong reasons (McCoy et al. 2019) without exercising the skill.
 
-**Trigger / no-trigger** — whether a skill should load for a given query. A trigger case asserts autonomous skill *discovery*, detected from copied temp skill paths in the trace, not from the final answer and not from a bare skill name. Trigger behavior depends on the discovery-layer frontmatter (`description`/`when_to_use`), so a **discovery-population** ablation is measured *on* trigger cases — through `run_pi_trigger_eval.py --ablation`, which observes autonomous loading — while **answer-population** ablations (instructions/resource/runtime/preprocess) skip trigger cases. The forced-load generic runners never measure discovery ablations.
+**Trigger / no-trigger** — whether a skill should load for a given query. A trigger case asserts autonomous skill *discovery*, detected from copied temp skill paths in the trace, not from the final answer and not from a bare skill name. Trigger behavior depends on the discovery-layer frontmatter (`description`/`when_to_use`), so a **discovery-population** ablation is measured *on* trigger cases — through the autonomous-trigger runners, `skill-trigger-matrix --ablation` (any registered adapter) or the deeper Pi tool `run_pi_trigger_eval.py --ablation`, both of which observe autonomous loading — while **answer-population** ablations (instructions/resource/runtime/preprocess) skip trigger cases. The forced-load generic runners never measure discovery ablations.
 
 **Missing output** — a case/variant that was never run. It is marked `missing_output` and excluded from no-lift and saturation comparisons, because "not measured" is not "measured and failed."
 
@@ -126,13 +146,19 @@ These are flags a `benchmark` report raises so you read pass rates correctly.
 
 **Cost** — real dollars a run spent, normalized into `cost_normalized` by every runner that reports it (`run-claude` and `run-subagent` capture provider cost; Pi smoke/trigger parse it from the stream; Jetty from the trajectory). The benchmark report carries a `cost_summary` ledger — operational totals over *all* runs (execution errors included: they were still paid for), per-variant mean/median/p90, paired cost deltas, ablation marginal cost and cost per confirmed regression, and judge spend as its own line. The standalone `cost-summary` command writes the suite ledger (JSON + markdown) with top spenders and spend-without-signal findings; `suite-run` projects spend before any model call and gates on `--max-estimated-cost-usd` / `--max-estimated-tokens`; `token-overhead` adds dollar deltas and lift-per-dollar. Cost sits next to lift, never mixed into it.
 
-**Base-saturated** — a case whose *measured* `with_skill` and `without_skill` combined pass rates are equal: the base model does it with or without the skill, so the case measures nothing. Surfaced by `eval-readiness` from run data as a blocker. (Contrast **leak-saturated**, which is a static property of the prompt.)
+**Base-saturated** — a case whose *measured* `with_skill` and `without_skill` combined pass rates are equal: the base model does it with or without the skill, so the case measures nothing. Surfaced as a blocker in the readiness block of `audit-manifest --runs`. (Contrast **leak-saturated**, which is a static property of the prompt.)
 
-**Qualitative-only** — a case whose objective pass rates are flat across arms but whose *combined* (judge-inclusive) score lifts with the skill: the skill's value is qualitative, and an objective-only reading would call it useless. Surfaced by `eval-readiness` from run data. **Objective-only** is the static cousin: a behaviour case with no judge assertion, so it can only ever measure objective compliance.
+**Qualitative-only** — a case whose objective pass rates are flat across arms but whose *combined* (judge-inclusive) score lifts with the skill: the skill's value is qualitative, and an objective-only reading would call it useless. Surfaced in the readiness block of `audit-manifest --runs`. **Objective-only** is the static cousin: a behaviour case with no judge assertion, so it can only ever measure objective compliance.
+
+**Readiness** — `audit-manifest`'s verdict on whether a suite is worth paying to run, collapsed into an explicit `blockers` list (instruction-simulated ablations, leak-saturated cases, no adversarial coverage; with `--runs`, base-saturated cases). `--fail-on-blockers` turns the verdict into a CI gate. Readiness is about the *eval's* trustworthiness, not the skill's quality — a ready manifest can still measure a bad skill.
+
+**Reliability (pass@k / pass^k)** — unbiased estimates from repeated runs of "at least one of k runs passes" (pass@k) and "all k runs pass" (pass^k), per (case, variant) with a pooled per-variant headline, plus `paired_lift`: the with−without delta on each, sign-flip tested. pass@k reads as best-case capability, pass^k as dependability; a skill can raise one and not the other.
+
+**Contamination** — output-side evidence that a case was answered from memory rather than worked: the `contamination` command checks verbatim n-gram containment between output and answer key (`ngram_containment`), a per-case `canary` GUID tripwire that must never appear in an output, and a `released_at` vs `--model-cutoff` gate for cases older than the model's training data. Model-free; `--fail-on-contamination` gates CI.
 
 ## Populations and evidence
 
-**Population** — which axis a measurement is on. **Answer** population: given a task, does the output meet the assertions (a paired `with_skill` vs `without_skill` comparison; the benchmark report stamps `population: "answer"`). **Trigger / discovery** population: does the skill *load on its own* for a prompt (a single arm, measured by `run_pi_trigger_eval.py`). The two are graded differently (a NO_TRIGGER case *passes by the skill not firing*), so their pass-rates are not comparable — the benchmark report excludes trigger cases and lists them under `skipped_trigger_cases`.
+**Population** — which axis a measurement is on. **Answer** population: given a task, does the output meet the assertions (a paired `with_skill` vs `without_skill` comparison; the benchmark report stamps `population: "answer"`). **Trigger / discovery** population: does the skill *load on its own* for a prompt (a single arm, measured by the autonomous-trigger runners `skill-trigger-matrix` and `run_pi_trigger_eval.py`). The two are graded differently (a NO_TRIGGER case *passes by the skill not firing*), so their pass-rates are not comparable — the benchmark report excludes trigger cases and lists them under `skipped_trigger_cases`.
 
 **Evidence class** — how much a number is worth. `EvidenceClass` has five members: `confirmed_causal` (a provenance-gated paired ablation comparison — `causal_confirmation` is the only door to it), `refuted`, `raw_measurement` (a single-arm measurement, no pairing), `indeterminate` (measured, but provenance, coverage, execution validity, or statistical significance is insufficient — not confirmed and not refuted), and `unmeasured` (no scorable runs). The trigger report spells its report-level label `raw_autonomous_trigger_measurement` — read it as the trigger-path spelling of `raw_measurement` (its per-result `measurement` field uses the enum value directly).
 

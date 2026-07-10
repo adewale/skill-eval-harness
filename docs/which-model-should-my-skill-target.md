@@ -119,9 +119,10 @@ the weakest tier you support sets the bound, and a skill's value is a property o
   easy to expose the lift." The `saturated/non-discriminating` and `no objective lift`
   flags exist to keep those apart — harder cases can move a saturated tier off the
   ceiling and reveal lift that was always there.
-- **Evidence class:** this is a `raw` paired lift comparison — the same class as the
-  benchmark's `paired_summary`, not the provenance-gated `CONFIRMED_CAUSAL` an ablation
-  earns. It ranks tiers; it does not causally attribute the lift to any one component.
+- **Evidence class:** this is an unconfirmed paired lift comparison — the same standing
+  as the benchmark's `paired_summary`, not the provenance-gated `CONFIRMED_CAUSAL` an
+  ablation earns. (`raw_measurement` proper is the single-arm trigger-path label.) It
+  ranks tiers; it does not causally attribute the lift to any one component.
 
 ## Where this stops
 

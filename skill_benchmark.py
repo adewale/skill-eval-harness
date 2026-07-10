@@ -4,10 +4,10 @@
 The grading and aggregation path intentionally does not call a model: it prepares
 paired tasks, grades saved outputs with deterministic assertions, emits judge
 tasks for subjective checks, and aggregates timing/token/cost/pass-rate data. The
-explicit runner and judge commands DO call a model — `run-codex`/`run-claude`
-(and `run-jetty`) to generate outputs, and `judge` (via `--judge-cmd` or, natively,
-`--judge-model`) to grade them. Everything from `grade`/`benchmark` onward is
-model-free and reproducible from saved artifacts.
+explicit runner and judge commands DO call a model — `run-agent --agent claude|codex|vibe`
+(compatibility wrappers `run-codex`/`run-claude`, plus `run-jetty`) to generate outputs,
+and `judge` (via `--judge-cmd`, or natively `--judge-model`/`--judge-backend`) to grade
+them. Everything from `grade`/`benchmark` onward is model-free and reproducible from saved artifacts.
 """
 from __future__ import annotations
 

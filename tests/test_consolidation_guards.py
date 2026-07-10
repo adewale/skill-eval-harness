@@ -163,6 +163,14 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertEqual(native_judges, set(sb.JUDGE_BACKENDS))
         self.assertEqual(native_judges, {name for name, cap in ac.AGENT_CAPABILITIES.items() if cap.judge_backend})
 
+    def test_every_capability_row_appears_in_the_parity_doc(self):
+        # The parity doc renders the capability registry for humans; a backend
+        # registered in code but absent from the doc is the drift the registry
+        # guard above cannot see.
+        parity = (ROOT / "docs" / "agent-parity.md").read_text(encoding="utf-8").lower()
+        for name in ac.AGENT_CAPABILITIES:
+            self.assertIn(name.lower(), parity, f"docs/agent-parity.md must cover the registered backend {name!r}")
+
 
 class TimeoutConventionTests(unittest.TestCase):
     """One timeout encoding: timed_out=True (the flag execution_valid keys on)

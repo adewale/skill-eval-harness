@@ -19,6 +19,12 @@ discovery-population ablation for autonomous trigger examples.
 the isolated workspace, so removing a piece really changes the output — the
 regression is genuine, not scripted into the runner.
 
+The `c-review` case also carries one qualitative assertion (`actionable-review`,
+`severity: "gate"`), judged offline by `stub_judge.py` — a deterministic judge with a
+careful default mode and a `--lenient` rubber-stamp mode that exists to be caught. The
+judge-calibration loop over that pair (`judge-robustness`, `judge-alignment`,
+`compare-judges`) is [`docs/can-i-trust-my-judge.md`](../../docs/can-i-trust-my-judge.md).
+
 ## Run it
 
 ```bash
@@ -43,7 +49,8 @@ python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/demo-runs \
   --variant ablation:no-severity --variant ablation:no-checklist
 ```
 
-You should see `with_skill` pass both assertions, `without_skill` fail both, and each
+You should see `with_skill` pass both objective assertions, `without_skill` fail both
+(the `actionable-review` judge assertion stays deferred until you run `judge`), and each
 ablation arm fail exactly the one assertion whose guidance it removed — each reported
 as an `expected_regression_confirmed` because the ablation is **materialized** (a real
 edited tree, blind, with verified provenance) and the four repeated runs clear the

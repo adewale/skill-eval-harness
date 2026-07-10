@@ -46,7 +46,8 @@ branch.
   ablation (the largest/most-central component).
 - **This is a spot check.** Single behavioral case (or 3 safety cases) per skill,
   judge verdicts are noisy. Under the harness's own gates almost all of it is
-  RAW_MEASUREMENT, not CONFIRMED_CAUSAL. The three strongest signals were re-run
+  INDETERMINATE (measured, but unreplicated single shots cannot clear the
+  significance gate), not CONFIRMED_CAUSAL. The three strongest signals were re-run
   **5× per arm** to separate signal from noise — and that mattered (below).
 
 ## Results
@@ -82,8 +83,8 @@ Re-running the three "interesting" rows **5× per arm** overturned two of them:
   false-positive pressure is elsewhere in the skill. This is the one behavioral result
   robust enough (large effect) to act on.
 - **The good-readme and testing "findings" were n=1 artifacts** — they evaporated at
-  n=5. The lesson is the harness's own thesis: single-shot judged ablations are
-  RAW_MEASUREMENT; the confirmation gate (verified provenance + an *observed,
+  n=5. The lesson is the harness's own thesis: single-shot judged ablations stay
+  INDETERMINATE; the confirmation gate (verified provenance + an *observed,
   replicated* regression on a cited assertion) would refuse to mark these
   CONFIRMED_CAUSAL.
 - **Half the skills are saturated on these cases** — base Claude already does the

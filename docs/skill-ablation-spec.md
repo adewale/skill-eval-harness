@@ -299,8 +299,10 @@ executor must be changed to consume it:
 - **Pi trigger** (`run_pi_trigger_eval.py:copy_skill_to_config`) is the
   autonomous-trigger adapter: `--ablation <id>` materializes a discovery ablation
   and mounts the altered tree so the eval measures whether it still loads. It
-  rejects answer-population ablations. Discovery ablations are measured **only**
-  here — the forced-load generic runners cannot observe autonomous loading.
+  rejects answer-population ablations. Discovery ablations are measured only on the
+  autonomous-trigger path — here, or through `skill-trigger-matrix --ablation` with
+  any registered adapter; the forced-load generic runners cannot observe autonomous
+  loading.
 - **Jetty** (`build_jetty_payload` + `JettyClient.upload`) uploads individual
   files with a basename-only `remote_path_hint` (duplicate `SKILL.md` basenames
   collide) and `read_bytes` per file (no recursion). It must recursively
