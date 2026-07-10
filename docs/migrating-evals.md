@@ -7,6 +7,10 @@ new field is optional with a behavior-preserving default, so an unmigrated
 manifest keeps grading identically — migration makes the defaults explicit and
 opts into the new measurement, it never rescues a broken suite.
 
+This guide covers version upgrades of a manifest that already lives here. If you
+are arriving from another framework's suite, that is a different journey:
+[`porting-existing-evals.md`](porting-existing-evals.md).
+
 ## Version 1 → 2
 
 ### What changed (all additive)

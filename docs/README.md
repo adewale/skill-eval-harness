@@ -22,10 +22,12 @@ title is the question; the body is the loop that answers it, runnable on
 | Why did this run fail? | [`why-did-this-run-fail.md`](why-did-this-run-fail.md) |
 | Can I trust my judge? | [`can-i-trust-my-judge.md`](can-i-trust-my-judge.md) |
 | How do I upgrade a v1 manifest to v2? | [`migrating-evals.md`](migrating-evals.md) |
+| How do I port my existing evals into the harness? | [`porting-existing-evals.md`](porting-existing-evals.md) |
 
-The unwritten ones are tracked in [`TODO.md`](../TODO.md) under "User journeys the
-code supports but the docs don't walk" — each names the machinery that already
-exists, so writing the journey is documentation work, not feature work.
+The backlog that produced these lives in [`TODO.md`](../TODO.md) under "User journeys
+the code supports but the docs don't walk"; it is currently empty. When a new journey
+earns a slot there, each entry names the machinery that already exists, so writing
+the journey is documentation work, not feature work.
 
 ## Concepts
 
