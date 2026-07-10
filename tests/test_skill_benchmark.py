@@ -392,6 +392,9 @@ class SkillBenchmarkTests(unittest.TestCase):
                 [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"},
                   "status": "completed",
                   "artifacts": [{"path": "output.md", "content": "answer"}]}],
+                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"},
+                  "status": "completed", "trajectory_id": "   ",
+                  "artifacts": [{"path": "output.md", "content": "answer"}]}],
             ]
             for records in cases:
                 with self.subTest(records=records):

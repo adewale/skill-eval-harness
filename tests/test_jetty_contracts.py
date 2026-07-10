@@ -77,13 +77,20 @@ class JettyObservationTests(unittest.TestCase):
         failed_with_output = jc.JettyObservation.from_record({"status": "failed"}, has_output=True)
         self.assertFalse(failed_with_output.success)
 
-    def test_success_without_trajectory_id_is_protocol_invalid(self):
-        missing = jc.JettyObservation.from_record({"status": "completed"}, has_output=True)
-        self.assertFalse(missing.success)
-        self.assertIsInstance(missing.lifecycle, jc.ProtocolInvalid)
-        self.assertIn("trajectory_id", missing.lifecycle.reason)
+    def test_success_without_nonblank_trajectory_id_is_protocol_invalid(self):
+        for trajectory_id in (None, "", "   "):
+            record = {"status": "completed"}
+            if trajectory_id is not None:
+                record["trajectory_id"] = trajectory_id
+            with self.subTest(trajectory_id=trajectory_id):
+                missing = jc.JettyObservation.from_record(record, has_output=True)
+                self.assertFalse(missing.success)
+                self.assertIsInstance(missing.lifecycle, jc.ProtocolInvalid)
+                self.assertIn("trajectory_id", missing.lifecycle.reason)
         with self.assertRaisesRegex(ValueError, "trajectory_id"):
             jc.JettyObservation(jc.Succeeded("completed"), True)
+        with self.assertRaisesRegex(ValueError, "trajectory_id"):
+            jc.JettyObservation(jc.Succeeded("completed"), True, "   ")
 
     def test_timeout_cannot_be_ordinary_provider_failure(self):
         timeout = jc.JettyObservation.from_record({"status": "timeout"}, has_output=False)

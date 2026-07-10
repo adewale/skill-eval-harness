@@ -203,8 +203,9 @@ class JettyObservation:
             raise TypeError("JettyObservation lifecycle must be JettyLifecycle")
         if not isinstance(self.has_output, bool):
             raise TypeError("JettyObservation has_output must be boolean")
-        if self.trajectory_id is not None and (not isinstance(self.trajectory_id, str) or not self.trajectory_id):
-            raise ValueError("JettyObservation trajectory_id must be non-empty or None")
+        if self.trajectory_id is not None and (
+                not isinstance(self.trajectory_id, str) or not self.trajectory_id.strip()):
+            raise ValueError("JettyObservation trajectory_id must be non-blank or None")
         if self.lifecycle.successful and self.trajectory_id is None:
             raise ValueError("successful Jetty observation requires trajectory_id")
 
@@ -212,7 +213,8 @@ class JettyObservation:
     def from_record(cls, record: Mapping[str, Any], *, has_output: bool) -> "JettyObservation":
         lifecycle = lifecycle_from_record(record)
         trajectory_id = record.get("trajectory_id")
-        if lifecycle.successful and (not isinstance(trajectory_id, str) or not trajectory_id):
+        if lifecycle.successful and (
+                not isinstance(trajectory_id, str) or not trajectory_id.strip()):
             lifecycle = ProtocolInvalid(
                 lifecycle.raw_status,
                 "completed Jetty trajectory did not contain trajectory_id",
@@ -223,7 +225,8 @@ class JettyObservation:
                 lifecycle.raw_status,
                 "completed Jetty trajectory did not contain output.md",
             )
-        return cls(lifecycle, has_output, trajectory_id if isinstance(trajectory_id, str) and trajectory_id else None)
+        return cls(lifecycle, has_output,
+                   trajectory_id if isinstance(trajectory_id, str) and trajectory_id.strip() else None)
 
     @property
     def success(self) -> bool:

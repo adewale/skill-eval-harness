@@ -88,6 +88,16 @@ class PassAtKTests(unittest.TestCase):
         self.assertAlmostEqual(rel["by_variant"]["with_skill"]["mean_pass_at_1"], 0.75)
         self.assertEqual(rel["by_variant"]["with_skill"]["all_runs_pass_rate"], 0.0)  # not every run passed
 
+    def test_invalid_external_rates_do_not_become_reliability_successes(self):
+        results = [
+            {"case_id": "c", "variant": "with_skill", "run_number": 1,
+             "objective_pass_rate": 2.0},
+            {"case_id": "c", "variant": "with_skill", "run_number": 2,
+             "objective_pass_rate": 1.0},
+        ]
+        entry = sb.build_reliability(results)["by_case_variant"]["c"]["with_skill"]
+        self.assertEqual((entry["n"], entry["c"]), (1, 1))
+
     def test_all_runs_pass_rate_reaches_one(self):
         # the c==n side of all_runs_pass_rate (a constant-0.0 mutation must be caught)
         results = [{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0} for _ in range(3)]

@@ -518,6 +518,7 @@ skill-eval-harness/
 ├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
 ├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance/task value objects
+├── agent_capabilities.py       # backend capability and smoke-target registry
 ├── experimental_pairs.py       # exact pair identities and blocked-pair construction
 ├── runner_contracts.py         # closed answer-runner outcome union
 ├── judge_verdict.py            # strict imported/stored judge verdict variants

@@ -2620,8 +2620,10 @@ def import_jetty_results(args: argparse.Namespace) -> int:
             die(f"duplicate Jetty result destination: {relative}")
         seen_destinations.add(base)
         lifecycle = lifecycle_from_record(record)
-        if lifecycle.successful and (not isinstance(record.get("trajectory_id"), str) or not record.get("trajectory_id")):
-            die("invalid Jetty result: successful trajectory requires trajectory_id")
+        if lifecycle.successful and (
+                not isinstance(record.get("trajectory_id"), str)
+                or not record.get("trajectory_id", "").strip()):
+            die("invalid Jetty result: successful trajectory requires non-blank trajectory_id")
         validated_records.append((record, harness, base))
     for record, harness, base in validated_records:
         base.mkdir(parents=True, exist_ok=True)
@@ -6995,7 +6997,11 @@ def build_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
     variant_all_pass: dict[str, list[float]] = {}
     for case_id, by_variant in sorted(by_cv.items()):
         for variant, rows in sorted(by_variant.items()):
-            rates = [r.get("objective_pass_rate") for r in rows if r.get("objective_pass_rate") is not None]
+            rates = [float(r["objective_pass_rate"]) for r in rows
+                     if isinstance(r.get("objective_pass_rate"), (int, float))
+                     and not isinstance(r.get("objective_pass_rate"), bool)
+                     and math.isfinite(float(r["objective_pass_rate"]))
+                     and 0 <= float(r["objective_pass_rate"]) <= 1]
             n = len(rates)
             if n == 0:
                 continue
@@ -9738,7 +9744,8 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
                              and isinstance(row.get("graded_score"), (int, float))):
             blended = [x for x in (value, row.get("graded_score")) if isinstance(x, (int, float))]
             value = statistics.mean(blended) if blended else row.get("objective_pass_rate")
-        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+        return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
 
     by_case: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
     for pair in pairing.pairs:
@@ -9759,7 +9766,9 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
                       pair.without_skill.payload.get("objective_pass_rate")) for pair in pairs]
         objective = [(float(left), float(right)) for left, right in objective
                      if isinstance(left, (int, float)) and not isinstance(left, bool)
-                     and isinstance(right, (int, float)) and not isinstance(right, bool)]
+                     and isinstance(right, (int, float)) and not isinstance(right, bool)
+                     and math.isfinite(float(left)) and math.isfinite(float(right))
+                     and 0 <= float(left) <= 1 and 0 <= float(right) <= 1]
         if objective:
             ow = statistics.mean(left for left, _ in objective)
             on = statistics.mean(right for _, right in objective)

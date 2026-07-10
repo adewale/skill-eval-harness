@@ -208,6 +208,13 @@ class ReadinessRunSignalTests(unittest.TestCase):
         self.assertEqual(signals["base_saturated_cases"], [])
         self.assertEqual(signals["qualitative_only_cases"], [])
 
+    def test_out_of_range_rates_do_not_become_readiness_signals(self):
+        rows = [self._res("c", "with_skill", 2.0, 2.0),
+                self._res("c", "without_skill", 2.0, 2.0)]
+        signals = sb.readiness_run_signals({"results": rows})
+        self.assertEqual(signals["base_saturated_cases"], [])
+        self.assertEqual(signals["qualitative_only_cases"], [])
+
     def test_objective_only_is_static_and_base_saturated_blocks(self):
         with tempfile.TemporaryDirectory() as td:
             rp = Path(td) / "repo"; _skill(rp)
