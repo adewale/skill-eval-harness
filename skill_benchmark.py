@@ -67,6 +67,7 @@ from ablation_model import (
     VIBE_FAILURE,
     MaterializedArm,
     PreparedTask,
+    PreparedTaskDraft,
     OutcomeContext,
     ProviderFailed,
     Provenance,
@@ -4553,12 +4554,12 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
     for task in tasks:
         pt = PreparedTask.from_row(task)
         row_model = task.get("model") or model
-        base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
+        base = safe_child_path(runs, pt.run_dir)
         base.mkdir(parents=True, exist_ok=True)
         prov_extra = {
             "population": "answer",
             "case_id": pt.case_id,
-            "run_number": task.get("run_number", 1),
+            "run_number": pt.run_number,
             "variant": pt.variant_truth,
             "billing_scope": "run",
             **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
@@ -5807,12 +5808,12 @@ def run_subagent_tasks(
     for task in tasks:
         pt = PreparedTask.from_row(task)
         row_model = task.get("model") or model
-        base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
+        base = safe_child_path(runs, pt.run_dir)
         base.mkdir(parents=True, exist_ok=True)
         prov_extra = {
             "population": "answer",
             "case_id": pt.case_id,
-            "run_number": task.get("run_number", 1),
+            "run_number": pt.run_number,
             "variant": pt.variant_truth,
             "billing_scope": "run",
             **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),

@@ -1602,13 +1602,13 @@ class AblationReviewFixesTests(unittest.TestCase):
             base = {"skill_paths": [str(skill / "SKILL.md")], "input_files": [], "prompt": "x"}
             with tempfile.TemporaryDirectory() as w1:
                 ws = Path(w1)
-                sk, _ = sb.build_skill_workspace(sb.PreparedTask.from_row({**base, "variant": "without_skill"}), ws)
+                sk, _ = sb.build_skill_workspace(sb.PreparedTaskDraft.from_row({**base, "variant": "without_skill"}), ws)
                 self.assertEqual(sk, [])                       # without_skill mounts no skill
                 self.assertFalse((ws / "skills").exists())
-                self.assertIn("Do not use any skill", sb.build_task_prompt(sb.PreparedTask.from_row({"variant": "without_skill", "prompt": "x"}), sk, []))
+                self.assertIn("Do not use any skill", sb.build_task_prompt(sb.PreparedTaskDraft.from_row({"variant": "without_skill", "prompt": "x"}), sk, []))
             with tempfile.TemporaryDirectory() as w2:
                 ws = Path(w2)
-                sk, _ = sb.build_skill_workspace(sb.PreparedTask.from_row({**base, "variant": "with_skill"}), ws)
+                sk, _ = sb.build_skill_workspace(sb.PreparedTaskDraft.from_row({**base, "variant": "with_skill"}), ws)
                 self.assertTrue(sk and (ws / sk[0]).exists())  # skill mounted inside the isolated workspace
                 self.assertTrue(sk[0].startswith("skills/"))   # workspace-relative, not the original repo path
 
@@ -1621,7 +1621,7 @@ class AblationReviewFixesTests(unittest.TestCase):
             "ablation": {"id": "no-rp", "mode": "instruction_simulated", "population": "answer", "removed_component": "regression-proof"},
             "instruction": "Use the good-pr skill, but simulate this ablation: remove/ignore regression-proof. Expected regression to watch for: accepts weak tests.",
         }
-        sim_prompt = sb.build_task_prompt(sb.PreparedTask.from_row(sim), skills, [])
+        sim_prompt = sb.build_task_prompt(sb.PreparedTaskDraft.from_row(sim), skills, [])
         self.assertIn("simulate this ablation", sim_prompt)
         self.assertIn("regression-proof", sim_prompt)
         # materialized: the on-disk skill is already altered -> blind, no hypothesis text.
@@ -1632,8 +1632,8 @@ class AblationReviewFixesTests(unittest.TestCase):
                          "components": [{"class": "instructions", "mechanism": "section", "skill_root": "skills/root-0/SKILL.md", "target": {"heading": "## H"}}]},
             "instruction": "Use the skill under test (good-pr). Its files are provided in your workspace ...",
         }
-        mat_prompt = sb.build_task_prompt(sb.PreparedTask.from_row(mat), skills, [])
-        with_prompt = sb.build_task_prompt(sb.PreparedTask.from_row({"variant": "with_skill", "prompt": "Review.", "instruction": "x"}), skills, [])
+        mat_prompt = sb.build_task_prompt(sb.PreparedTaskDraft.from_row(mat), skills, [])
+        with_prompt = sb.build_task_prompt(sb.PreparedTaskDraft.from_row({"variant": "with_skill", "prompt": "Review.", "instruction": "x"}), skills, [])
         self.assertNotIn("simulate", mat_prompt)
         self.assertNotIn("ignore/remove", mat_prompt)
         self.assertNotIn("regression-proof", mat_prompt)
@@ -2237,6 +2237,31 @@ class PreparedTaskTests(unittest.TestCase):
     reads it — and the two DISTINCT blinds are both honored: the experiment-blind
     (materialized -> present as with_skill) and the path-hygiene blind (any ablation
     -> opaque upload token)."""
+
+    def test_draft_can_be_partial_but_execution_validation_is_strict(self):
+        draft = am.PreparedTaskDraft.from_row({"variant": "with_skill", "prompt": "review"})
+        self.assertEqual(draft.prompt, "review")
+        with self.assertRaises(ValueError):
+            draft.validate()
+
+    def test_invalid_execution_rows_are_unconstructible(self):
+        base = {
+            "case_id": "c", "split": "tune", "kind": "behavior", "variant": "with_skill",
+            "run_number": 1, "skill_name": "s", "repo_root": "/repo",
+            "skill_paths": ["skills/s/SKILL.md"], "input_files": [],
+            "run_dir": "c/with_skill/run-1", "instruction": "", "prompt": "p", "tags": [],
+        }
+        mutations = [
+            {"case_id": ""}, {"split": "other"}, {"variant": "unknown"},
+            {"run_number": 0}, {"run_number": True}, {"run_number": "1"},
+            {"run_dir": "../escape"}, {"run_dir": "/absolute"}, {"run_dir": "."},
+            {"skill_paths": "not-a-list"},
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), self.assertRaises((TypeError, ValueError)):
+                am.PreparedTask.from_row({**base, **mutation})
+        with self.assertRaises(ValueError):
+            am.PreparedTask.from_row({**base, "variant": "without_skill"})
 
     def mat_row(self):
         prov = am.Provenance(id="no-rp", mode="materialized", population="answer",

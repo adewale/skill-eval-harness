@@ -32,6 +32,7 @@ import re
 import statistics
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
 
@@ -513,6 +514,62 @@ class MaterializedArm:
 
 
 @dataclass(frozen=True)
+class PreparedTaskDraft:
+    """Partial task data for prompt/workspace construction; never executable."""
+
+    row: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.row, dict):
+            raise TypeError("PreparedTaskDraft row must be an object")
+        object.__setattr__(self, "row", dict(self.row))
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "PreparedTaskDraft":
+        return cls(row)
+
+    def validate(self) -> "PreparedTask":
+        return PreparedTask.from_row(self.row)
+
+    @property
+    def variant_truth(self) -> str:
+        return str(self.row.get("variant") or "")
+
+    @property
+    def prompt(self) -> str:
+        return str(self.row.get("prompt") or "")
+
+    @property
+    def instruction(self) -> str:
+        return str(self.row.get("instruction") or "")
+
+    @property
+    def skill_paths(self) -> tuple[str, ...]:
+        return tuple(self.row.get("skill_paths") or ())
+
+    @property
+    def input_files(self) -> tuple[str, ...]:
+        return tuple(self.row.get("input_files") or ())
+
+    @property
+    def ablation(self) -> Optional[AblationRecord]:
+        raw = self.row.get("ablation")
+        return ablation_record_from_dict(raw) if isinstance(raw, dict) else None
+
+    @property
+    def is_ablation(self) -> bool:
+        return is_ablation_variant(self.variant_truth)
+
+    @property
+    def is_materialized_ablation(self) -> bool:
+        return isinstance(self.ablation, Provenance)
+
+    @property
+    def is_blind(self) -> bool:
+        return self.is_materialized_ablation
+
+
+@dataclass(frozen=True)
 class PreparedTask:
     """One (case, variant, run) unit of work. It OWNS blinding: the only
     model-facing variant comes from its Arm, so a blind arm cannot leak the
@@ -543,6 +600,41 @@ class PreparedTask:
     ablation: Optional[AblationRecord] = None
     skill_tree_hash: Optional[str] = None
     answer_key: Optional[dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        for label, value in (("case_id", self.case_id), ("kind", self.kind),
+                             ("skill_name", self.skill_name), ("repo_root", self.repo_root),
+                             ("run_dir", self.run_dir)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"PreparedTask.{label} must be non-empty")
+        if self.split not in {"tune", "holdout", "holdback"}:
+            raise ValueError("PreparedTask.split must be tune, holdout, or holdback")
+        if (isinstance(self.run_number, bool) or not isinstance(self.run_number, int)
+                or self.run_number < 1):
+            raise ValueError("PreparedTask.run_number must be a positive integer")
+        if not isinstance(self.variant_truth, str) or not self.variant_truth:
+            raise ValueError("PreparedTask.variant must be non-empty")
+        if self.variant_truth not in {"with_skill", "without_skill", "old_skill"} and not is_ablation_variant(self.variant_truth):
+            raise ValueError("PreparedTask.variant is not a supported execution arm")
+        run_path = Path(self.run_dir)
+        if run_path.is_absolute() or run_path == Path(".") or ".." in run_path.parts:
+            raise ValueError("PreparedTask.run_dir must be a safe non-root relative path")
+        for label, values in (("skill_paths", self.skill_paths), ("input_files", self.input_files), ("tags", self.tags)):
+            if not isinstance(values, tuple) or not all(isinstance(item, str) for item in values):
+                raise ValueError(f"PreparedTask.{label} must be a tuple of strings")
+        if self.variant_truth == "without_skill" and self.skill_paths:
+            raise ValueError("without_skill task cannot carry skill paths")
+        if self.is_ablation:
+            if self.ablation is None or self.ablation.id != ablation_id_of(self.variant_truth):
+                raise ValueError("ablation task requires a matching typed ablation record")
+        elif self.ablation is not None:
+            raise ValueError("non-ablation task cannot carry ablation provenance")
+        if self.skill_tree_hash is not None and (not isinstance(self.skill_tree_hash, str) or not self.skill_tree_hash):
+            raise ValueError("skill_tree_hash must be non-empty or None")
+        if not isinstance(self.instruction, str) or not isinstance(self.prompt, str):
+            raise ValueError("instruction and prompt must be strings")
+        if self.answer_key is not None and not isinstance(self.answer_key, dict):
+            raise ValueError("answer_key must be an object or None")
 
     # --- typed predicates: one definition each, shared by every exporter ---
     @property
@@ -602,8 +694,16 @@ class PreparedTask:
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "PreparedTask":
+        if not isinstance(row, dict):
+            raise ValueError("PreparedTask row must be an object")
         rec = ablation_record_from_dict(row["ablation"]) if row.get("ablation") else None
         answer_key = {k: row[k] for k in ("expected_behavior", "review_rubric") if k in row} or None
+        collections: dict[str, tuple[str, ...]] = {}
+        for key in ("skill_paths", "input_files", "tags"):
+            raw = row.get(key, [])
+            if not isinstance(raw, (list, tuple)) or not all(isinstance(item, str) for item in raw):
+                raise ValueError(f"PreparedTask row field {key!r} must be a list of strings")
+            collections[key] = tuple(raw)
         return cls(
             case_id=row.get("case_id"),
             split=row.get("split"),
@@ -612,12 +712,12 @@ class PreparedTask:
             run_number=row.get("run_number", 1),
             skill_name=row.get("skill_name"),
             repo_root=row.get("repo_root"),
-            skill_paths=tuple(row.get("skill_paths") or ()),
-            input_files=tuple(row.get("input_files") or ()),
+            skill_paths=collections["skill_paths"],
+            input_files=collections["input_files"],
             run_dir=row.get("run_dir"),
             instruction=row.get("instruction", ""),
             prompt=row.get("prompt", ""),
-            tags=tuple(row.get("tags") or ()),
+            tags=collections["tags"],
             ablation=rec,
             skill_tree_hash=row.get("skill_tree_hash"),
             answer_key=answer_key,
