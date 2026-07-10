@@ -2205,7 +2205,10 @@ class AblationRecordTests(unittest.TestCase):
 
     def test_record_is_a_closed_discriminated_set(self):
         mat = am.ablation_record_from_dict({"id": "x", "mode": "materialized", "population": "answer",
-                                            "skill_hash": "E", "parent_skill_hash": "C", "components": []})
+                                            "skill_hash": "E", "parent_skill_hash": "C", "components": [
+                                                {"class": "instructions", "mechanism": "section",
+                                                 "skill_root": "skills/x/SKILL.md", "target": {"heading": "## H"}}
+                                            ]})
         sim = am.ablation_record_from_dict({"id": "x", "mode": "instruction_simulated", "population": "answer"})
         self.assertIsInstance(mat, am.Provenance)
         self.assertIsInstance(sim, am.InstructionSimulated)

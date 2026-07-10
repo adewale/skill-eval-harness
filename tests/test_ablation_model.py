@@ -94,11 +94,31 @@ class StrictFromDictTests(unittest.TestCase):
             am.Component.from_dict({"class": "instructions", "mechanism": "section",
                                     "skill_root": "s", "target": "not-a-dict"})
 
-    def test_empty_components_is_allowed(self):
-        # Present and correctly typed; non-emptiness is a semantic concern for the
-        # materializer/verifier, not the parse (a recorded record may legitimately
-        # carry an empty component list — see the closed-set test in test_cbc).
-        self.assertEqual(am.Provenance.from_dict(dict(self.GOOD, components=[])).components, ())
+    def test_empty_components_cannot_attest_a_materialized_edit(self):
+        with self.assertRaises(ValueError):
+            am.Provenance.from_dict(dict(self.GOOD, components=[]))
+
+    def test_closed_provenance_vocabularies_and_identifiers(self):
+        for mutation in (
+            {"id": ""}, {"id": "not a slug"}, {"mode": "imaginary"},
+            {"mode": "instruction_simulated"}, {"population": "judge"},
+            {"skill_hash": ""}, {"parent_skill_hash": ""},
+        ):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                am.Provenance.from_dict(dict(self.GOOD, **mutation))
+        for mutation in (
+            {"class": "other"}, {"mechanism": "other"}, {"skill_root": ""},
+            {"removed_bytes": -1}, {"removed_bytes": True},
+        ):
+            component = dict(self.GOOD["components"][0], **mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                am.Component.from_dict(component)
+
+    def test_instruction_simulated_rejects_scalar_regressions_and_untyped_removed_component(self):
+        with self.assertRaises(ValueError):
+            am.InstructionSimulated.from_dict({"id": "a", "population": "answer", "expected_regressions": "abc"})
+        with self.assertRaises(ValueError):
+            am.InstructionSimulated.from_dict({"id": "a", "population": "answer", "removed_component": 3})
 
     def test_instruction_simulated_requires_id_and_population(self):
         self.assertEqual(am.InstructionSimulated.from_dict({"id": "a", "population": "answer"}).id, "a")

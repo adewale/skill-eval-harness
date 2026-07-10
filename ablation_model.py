@@ -28,6 +28,7 @@ adopt it without a cycle.
 from __future__ import annotations
 
 import hashlib
+import re
 import statistics
 from dataclasses import dataclass, field
 from enum import Enum
@@ -253,20 +254,75 @@ def causal_confirmation(*, provenance_verified: bool, has_coverage: bool, regres
 # Provenance — one schema, enforced by construction.
 # --------------------------------------------------------------------------- #
 
+
+class AblationMode(str, Enum):
+    MATERIALIZED = "materialized"
+    INVALID_SKILL = "invalid_skill"
+    INSTRUCTION_SIMULATED = "instruction_simulated"
+
+
+class Population(str, Enum):
+    ANSWER = "answer"
+    TRIGGER = "trigger"
+
+
+class ComponentClass(str, Enum):
+    DISCOVERY = "discovery"
+    RUNTIME = "runtime"
+    INSTRUCTIONS = "instructions"
+    RESOURCE = "resource"
+    PREPROCESS = "preprocess"
+
+
+class Mechanism(str, Enum):
+    FRONTMATTER_FIELD = "frontmatter_field"
+    SECTION = "section"
+    LIST_ITEM = "list_item"
+    PATCH = "patch"
+    REFERENCE = "reference"
+    SCRIPT = "script"
+    ASSET = "asset"
+    PREPROCESS = "preprocess"
+
+
+def _nonempty_identifier(value: Any, label: str, *, slug: bool = False) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+    normalized = value.strip()
+    if slug and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", normalized):
+        raise ValueError(f"{label} must be a slug")
+    return normalized
+
+
 @dataclass(frozen=True)
 class Component:
     """One declared removal. `fingerprint` is the identity used for verification
     (class + mechanism + skill_root + target); `removed_bytes` is recorded for
     reporting but is NOT part of the identity."""
 
-    cls: str
-    mechanism: str
+    cls: ComponentClass
+    mechanism: Mechanism
     skill_root: str
     target: dict[str, Any]
     removed_bytes: int | None = None
 
+    def __post_init__(self) -> None:
+        try:
+            object.__setattr__(self, "cls", ComponentClass(self.cls))
+            object.__setattr__(self, "mechanism", Mechanism(self.mechanism))
+        except ValueError as exc:
+            raise ValueError(f"Component has unknown class/mechanism: {exc}") from exc
+        object.__setattr__(self, "skill_root", _nonempty_identifier(self.skill_root, "Component.skill_root"))
+        if not isinstance(self.target, dict):
+            raise ValueError("Component.target must be an object")
+        object.__setattr__(self, "target", dict(self.target))
+        if self.removed_bytes is not None and (
+            isinstance(self.removed_bytes, bool) or not isinstance(self.removed_bytes, int) or self.removed_bytes < 0
+        ):
+            raise ValueError("Component.removed_bytes must be a non-negative integer")
+
     def fingerprint(self) -> dict[str, Any]:
-        return {"class": self.cls, "mechanism": self.mechanism, "skill_root": self.skill_root, "target": self.target}
+        return {"class": self.cls.value, "mechanism": self.mechanism.value, "skill_root": self.skill_root, "target": self.target}
 
     def as_dict(self) -> dict[str, Any]:
         d = self.fingerprint()
@@ -277,8 +333,8 @@ class Component:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Component":
         rb = d.get("removed_bytes") if isinstance(d, dict) else None
-        if rb is not None and not isinstance(rb, int):
-            raise ValueError(f"Component: field 'removed_bytes' must be int, got {type(rb).__name__}")
+        if rb is not None and (isinstance(rb, bool) or not isinstance(rb, int) or rb < 0):
+            raise ValueError("Component: field 'removed_bytes' must be a non-negative int")
         return cls(cls=_require(d, "class", str, "Component"),
                    mechanism=_require(d, "mechanism", str, "Component"),
                    skill_root=_require(d, "skill_root", str, "Component"),
@@ -294,16 +350,34 @@ class Provenance:
     the one identity check the report uses to gate a confirmation."""
 
     id: str
-    mode: str               # "materialized" | "invalid_skill"
-    population: str         # "answer" | "trigger"
+    mode: AblationMode
+    population: Population
     identity: TreeIdentity
     components: tuple[Component, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _nonempty_identifier(self.id, "Provenance.id", slug=True))
+        try:
+            mode = AblationMode(self.mode)
+            population = Population(self.population)
+        except ValueError as exc:
+            raise ValueError(f"Provenance has unknown mode/population: {exc}") from exc
+        if mode not in {AblationMode.MATERIALIZED, AblationMode.INVALID_SKILL}:
+            raise ValueError("Provenance mode must attest a materialized tree")
+        if not isinstance(self.identity, TreeIdentity):
+            raise ValueError("Provenance.identity must be TreeIdentity")
+        _nonempty_identifier(self.identity.canonical, "Provenance.parent_skill_hash")
+        _nonempty_identifier(self.identity.edited, "Provenance.skill_hash")
+        if not isinstance(self.components, tuple) or not self.components or not all(isinstance(c, Component) for c in self.components):
+            raise ValueError("Provenance.components must be a non-empty tuple of Component")
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "population", population)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
-            "mode": self.mode,
-            "population": self.population,
+            "mode": self.mode.value,
+            "population": self.population.value,
             "skill_hash": self.identity.edited,
             "parent_skill_hash": self.identity.canonical,
             "components": [c.as_dict() for c in self.components],
@@ -330,16 +404,38 @@ class Provenance:
     # of it once drifted independently across three test files).
     SCHEMA_KEYS = frozenset({"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
 
-    def matches(self, expected: "Provenance") -> bool:
-        """Exact identity match (id / mode / population / component fingerprints).
-        Tree hashes are compared separately via `identity.same_revision_as`, so a
-        legitimate re-materialization with a new edited hash does not fail here."""
+    def matches(self, expected: "Provenance | ExpectedProvenance") -> bool:
+        """Exact declared identity match; tree revision is checked separately."""
         return (
             self.id == expected.id
             and self.mode == expected.mode
             and self.population == expected.population
             and [c.fingerprint() for c in self.components] == [c.fingerprint() for c in expected.components]
         )
+
+
+@dataclass(frozen=True)
+class ExpectedProvenance:
+    """Manifest declaration to compare with an attestation; it has no fake hashes."""
+
+    id: str
+    mode: AblationMode
+    population: Population
+    components: tuple[Component, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _nonempty_identifier(self.id, "ExpectedProvenance.id", slug=True))
+        try:
+            mode = AblationMode(self.mode)
+            population = Population(self.population)
+        except ValueError as exc:
+            raise ValueError(f"ExpectedProvenance has unknown mode/population: {exc}") from exc
+        if mode not in {AblationMode.MATERIALIZED, AblationMode.INVALID_SKILL}:
+            raise ValueError("ExpectedProvenance mode must be materialized or invalid_skill")
+        if not isinstance(self.components, tuple) or not self.components or not all(isinstance(c, Component) for c in self.components):
+            raise ValueError("ExpectedProvenance.components must be non-empty")
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "population", population)
 
 
 @dataclass(frozen=True)
@@ -352,14 +448,29 @@ class InstructionSimulated:
     longer drift apart one hand-built key at a time."""
 
     id: str
-    population: str
+    population: Population
     removed_component: Optional[str] = None
     expected_regressions: tuple[str, ...] = ()
 
-    MODE = "instruction_simulated"
+    MODE = AblationMode.INSTRUCTION_SIMULATED
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _nonempty_identifier(self.id, "InstructionSimulated.id", slug=True))
+        try:
+            object.__setattr__(self, "population", Population(self.population))
+        except ValueError as exc:
+            raise ValueError(f"InstructionSimulated has unknown population: {exc}") from exc
+        if self.removed_component is not None and (
+            not isinstance(self.removed_component, str) or not self.removed_component.strip()
+        ):
+            raise ValueError("InstructionSimulated.removed_component must be a non-empty string or None")
+        if not isinstance(self.expected_regressions, tuple) or not all(
+            isinstance(item, str) and item for item in self.expected_regressions
+        ):
+            raise ValueError("InstructionSimulated.expected_regressions must be a tuple of strings")
 
     def as_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"id": self.id, "mode": self.MODE, "population": self.population}
+        d: dict[str, Any] = {"id": self.id, "mode": self.MODE.value, "population": self.population.value}
         if self.removed_component is not None:
             d["removed_component"] = self.removed_component
         if self.expected_regressions:
@@ -368,15 +479,21 @@ class InstructionSimulated:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "InstructionSimulated":
+        removed = d.get("removed_component") if isinstance(d, dict) else None
+        if removed is not None and not isinstance(removed, str):
+            raise ValueError("InstructionSimulated: removed_component must be string or null")
+        regressions = d.get("expected_regressions", []) if isinstance(d, dict) else []
+        if not isinstance(regressions, list) or not all(isinstance(item, str) for item in regressions):
+            raise ValueError("InstructionSimulated: expected_regressions must be a list of strings")
         return cls(id=_require(d, "id", str, "InstructionSimulated"),
                    population=_require(d, "population", str, "InstructionSimulated"),
-                   removed_component=(d.get("removed_component") if isinstance(d, dict) else None),
-                   expected_regressions=tuple((d.get("expected_regressions") if isinstance(d, dict) else None) or ()))
+                   removed_component=removed,
+                   expected_regressions=tuple(regressions))
 
 
 # The CLOSED set of records that can describe an ablation on a prepared row.
 AblationRecord = Union[Provenance, InstructionSimulated]
-_MATERIALIZED_MODES = ("materialized", "invalid_skill")
+_MATERIALIZED_MODES = (AblationMode.MATERIALIZED.value, AblationMode.INVALID_SKILL.value)
 
 
 def ablation_record_from_dict(d: dict[str, Any]) -> AblationRecord:
@@ -387,7 +504,7 @@ def ablation_record_from_dict(d: dict[str, Any]) -> AblationRecord:
     mode = (d or {}).get("mode")
     if mode in _MATERIALIZED_MODES:
         return Provenance.from_dict(d)
-    if mode == InstructionSimulated.MODE:
+    if mode == InstructionSimulated.MODE.value:
         return InstructionSimulated.from_dict(d)
     raise ValueError(f"unknown ablation record mode: {mode!r}")
 

@@ -50,9 +50,14 @@ from ablation_model import (
     Arm,
     CLAUDE_FAILURE,
     CODEX_FAILURE,
+    AblationMode,
     Component,
+    ComponentClass,
     EvidenceClass,
+    ExpectedProvenance,
     InstructionSimulated,
+    Mechanism,
+    Population,
     ablation_id_of,
     is_ablation_variant,
     JETTY_FAILURE,
@@ -920,8 +925,8 @@ VIBE_NO_TOOLS = ("re:^$",)
 # ---------------------------------------------------------------------------
 
 ABLATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-COMPONENT_CLASSES = {"discovery", "runtime", "instructions", "resource", "preprocess"}
-SKILL_MECHANISMS = {"frontmatter_field", "section", "list_item", "patch", "reference", "script", "asset", "preprocess"}
+COMPONENT_CLASSES = {item.value for item in ComponentClass}
+SKILL_MECHANISMS = {item.value for item in Mechanism}
 # Which component classes each mechanism is allowed to declare (a declared class
 # is not trusted blindly — a section may not claim class: discovery to route to
 # trigger cases).
@@ -7097,7 +7102,7 @@ def _expected_component(comp: dict[str, Any], skill_paths: list[str]) -> Compone
                      skill_root=root, target=comp.get("target", {}))
 
 
-def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], measured_count: int, expected: Provenance, ws_tree_hashes: list[Any]) -> tuple[bool, str]:
+def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], measured_count: int, expected: ExpectedProvenance, ws_tree_hashes: list[Any]) -> tuple[bool, str]:
     """Confirm only when the provenance the RUNNERS actually recorded proves, for
     EVERY measured run, that the declared materialized ablation was mounted against
     the same skill revision as the with_skill arm. Each recorded record is parsed
@@ -7121,9 +7126,9 @@ def _verify_recorded_ablation_provenance(provs: list[dict[str, Any]], measured_c
         if p.id != expected.id:
             return False, f"recorded ablation id {p.id!r} != {expected.id!r}"
         if p.mode != expected.mode:
-            return False, f"recorded mode {p.mode!r} != expected {expected.mode!r} (run may not have mounted a materialized ablation)"
+            return False, f"recorded mode {p.mode.value!r} != expected {expected.mode.value!r} (run may not have mounted a materialized ablation)"
         if p.population != expected.population:
-            return False, f"recorded population {p.population!r} != manifest-derived {expected.population!r}"
+            return False, f"recorded population {p.population.value!r} != manifest-derived {expected.population.value!r}"
         if not p.identity.edited:
             return False, "recorded provenance is missing skill_hash"
         if not p.identity.canonical:
@@ -7253,11 +7258,10 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         # have recorded the same canonical parent hash.
         # The expected provenance built from the manifest (hashes are unknown to the
         # report and ignored by matches(); they are compared as a TreeIdentity).
-        expected_prov = Provenance(
+        expected_prov = ExpectedProvenance(
             id=aid,
-            mode="invalid_skill" if invalid else "materialized",
-            population=expected_pop,
-            identity=TreeIdentity(canonical="", edited=""),
+            mode=AblationMode.INVALID_SKILL if invalid else AblationMode.MATERIALIZED,
+            population=Population(expected_pop),
             components=tuple(_expected_component(c, manifest.get("skill_paths", [])) for c in ablation_components(ablation)),
         )
         prov_ok, prov_note = _verify_recorded_ablation_provenance(
