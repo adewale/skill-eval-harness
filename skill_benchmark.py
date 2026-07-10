@@ -2234,14 +2234,13 @@ def replace_placeholders(value: Any, mapping: dict[str, str]) -> Any:
 
 
 def extract_trajectory_id(response: dict[str, Any]) -> str | None:
-    for key in ["trajectory_id", "trajectoryId", "id"]:
-        if response.get(key):
-            return str(response[key])
-    jetty = response.get("jetty")
-    if isinstance(jetty, dict):
+    for container in (response, response.get("jetty")):
+        if not isinstance(container, dict):
+            continue
         for key in ["trajectory_id", "trajectoryId", "id"]:
-            if jetty.get(key):
-                return str(jetty[key])
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     return None
 
 

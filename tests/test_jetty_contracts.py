@@ -54,6 +54,31 @@ class JettyLifecycleTruthTableTests(unittest.TestCase):
 
 
 class JettyBoundaryIntegrationTests(unittest.TestCase):
+    def test_executor_rejects_blank_submitted_trajectory_id_before_poll(self):
+        class Client:
+            polled = False
+
+            def submit(self, request):
+                return {"trajectory_id": "   "}
+
+            def poll(self, *args, **kwargs):
+                self.polled = True
+                raise AssertionError("blank trajectory id must not be polled")
+
+        client = Client()
+        payload = {
+            "harness": {"executable": True},
+            "jetty_request": {"model": "m", "messages": [], "jetty": {
+                "collection": "c", "task": "t", "agent": "claude-code",
+                "model_provider": "anthropic", "snapshot": "s"}},
+            "upload_plan": {"files": []},
+        }
+        record = list(sb.execute_jetty_payloads([payload], client=client))[0]
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["lifecycle"]["kind"], "failed")
+        self.assertIn("trajectory_id", record["error"])
+        self.assertFalse(client.polled)
+
     def test_poller_preserves_status_state_conflict_as_protocol_invalid(self):
         class Client(sb.JettyClient):
             def __init__(self):
