@@ -69,6 +69,33 @@ class SupportedCliSmokeTests(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 SmokeTarget(*args)
 
+    def test_answer_assessment_rejects_trace_zeros_when_trace_is_incomplete(self):
+        def row(availability):
+            trace_keys = ("tool_calls", "commands", "file_reads", "file_writes",
+                          "errors", "retries", "repeated_command_max", "skill_invoked")
+            return {
+                "variant": "with_skill", "execution_valid": True,
+                "missing_output": False, "objective_pass_rate": 1.0,
+                "metadata": {
+                    "observation_complete": True,
+                    "trace_observation_complete": False,
+                    "telemetry": {"schema_version": 3, "measurements": {
+                        key: {"availability": availability} for key in trace_keys
+                    }},
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "benchmark.json"
+            for availability, expected in (("available", False), ("unavailable", True)):
+                with self.subTest(availability=availability):
+                    path.write_text(json.dumps({"results": [row(availability)]}), encoding="utf-8")
+                    report = {"checks": []}
+                    self.assertIs(smoke.assess_answer_benchmark(path, "claude", report), expected)
+                    telemetry = next(check for check in report["checks"]
+                                     if check["label"] == "claude:telemetry-contract")
+                    self.assertIs(telemetry["passed"], expected)
+
     def test_trigger_assessment_requires_the_exact_positive_and_negative_fixture_rows(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pi-trigger.json"

@@ -103,11 +103,30 @@ def assess_answer_benchmark(path: Path, agent: str, report: dict[str, Any]) -> b
         executions_ok = bool(results) and all(row.get("execution_valid") and not row.get("missing_output") for row in results)
         treatment = [row for row in results if row.get("variant") == "with_skill"]
         treatment_ok = bool(treatment) and all(row.get("objective_pass_rate") == 1.0 for row in treatment)
+        trace_keys = ("tool_calls", "commands", "file_reads", "file_writes",
+                      "errors", "retries", "repeated_command_max", "skill_invoked")
+        telemetry_ok = bool(results)
+        for row in results:
+            metadata = row.get("metadata")
+            envelope = metadata.get("telemetry") if isinstance(metadata, Mapping) else None
+            measurements = envelope.get("measurements") if isinstance(envelope, Mapping) else None
+            if not (isinstance(envelope, Mapping) and envelope.get("schema_version") == 3
+                    and isinstance(measurements, Mapping)):
+                telemetry_ok = False
+                break
+            trace_complete = metadata.get("trace_observation_complete") is True
+            expected = "available" if trace_complete else "unavailable"
+            if any(not isinstance(measurements.get(key), Mapping)
+                   or measurements[key].get("availability") != expected for key in trace_keys):
+                telemetry_ok = False
+                break
         report["checks"].append({"label": f"{agent}:artifact-contract", "passed": executions_ok,
                                  "detail": "all paired arms execution-valid"})
         report["checks"].append({"label": f"{agent}:treatment-fixture", "passed": treatment_ok,
                                  "detail": "with_skill meets the deterministic demo assertion"})
-        return executions_ok and treatment_ok
+        report["checks"].append({"label": f"{agent}:telemetry-contract", "passed": telemetry_ok,
+                                 "detail": "schema-v3 trace measurements match trace completeness"})
+        return executions_ok and treatment_ok and telemetry_ok
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
         report["checks"].append({"label": f"{agent}:artifact-contract", "passed": False,
                                  "detail": f"could not read benchmark: {type(exc).__name__}: {exc}"})

@@ -502,7 +502,12 @@ def telemetry_envelope(raw: Mapping[str, Any] | None, *, source: str | None = No
     # Trace-derived counts/bools are trustworthy only when a complete trace was
     # observed. Their old flat fields remain for assertion compatibility, while
     # v3 prevents an empty/malformed trace from looking like zero activity.
-    trace_complete = raw.get("observation_complete", raw.get("trace_observation_complete"))
+    trace_complete = raw.get("trace_observation_complete")
+    if not isinstance(trace_complete, bool):
+        # Legacy callers used observation_complete for trace completeness. New
+        # artifacts carry both process and trace state, so the trace-specific
+        # field takes precedence when present.
+        trace_complete = raw.get("observation_complete")
     for key in ("tool_calls", "commands", "file_reads", "file_writes", "errors", "retries", "repeated_command_max"):
         if trace_complete is True:
             measurements[key] = measurement_from_nonnegative(raw.get(key), unavailable_reason=f"missing_{key}", basis=basis).to_dict()

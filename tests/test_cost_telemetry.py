@@ -103,6 +103,35 @@ class RunnerStampTests(unittest.TestCase):
             self.assertEqual(bare_meta["usage_normalized"], {"source": "missing"})
             self.assertEqual(bare_meta["cost_normalized"], {"source": "missing"})
 
+    def test_successful_provider_call_without_trace_keeps_trace_counts_unavailable(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run"
+            sb.write_trace_artifacts(
+                run_dir, "", source="claude",
+                metadata={
+                    "provider": "claude",
+                    "observation_complete": True,
+                    "usage_normalized": {
+                        "input_tokens": 2, "output_tokens": 1, "total_tokens": 3,
+                        "source": "provider_reported",
+                    },
+                    "cost_normalized": {
+                        "currency": "USD", "total_cost": 0.01,
+                        "source": "provider_reported",
+                    },
+                },
+            )
+            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+            measurements = metrics["telemetry"]["measurements"]
+            self.assertFalse(metrics["trace_observation_complete"])
+            self.assertEqual(measurements["total_tokens"]["availability"], "available")
+            self.assertEqual(measurements["cost"]["availability"], "available")
+            for key in ("tool_calls", "commands", "file_reads", "file_writes",
+                        "errors", "retries", "repeated_command_max", "skill_invoked"):
+                with self.subTest(key=key):
+                    self.assertEqual(measurements[key]["availability"], "unavailable")
+                    self.assertEqual(measurements[key]["reason"], "trace_observation_incomplete")
+
     def test_trace_derived_usage_is_stamped_when_no_provider_block(self):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "run"

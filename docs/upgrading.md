@@ -4,10 +4,6 @@ Each section covers one released-version boundary. Follow every section after yo
 
 ## 0.5.1 → 0.6.0
 
-> **Release status:** 0.6.0 is not published yet. This guide describes the upgrade
-> from the current PyPI release, 0.5.1, to the code planned for 0.6.0. Keep using
-> `skill-eval-harness==0.5.1` until the `v0.6.0` tag and PyPI release exist.
-
 Most version-1 and version-2 manifests continue to validate without edits. The
 upgrade risk is in saved artifacts and custom adapters: 0.6.0 rejects identities,
 verdicts, lifecycle states, and telemetry comparisons that 0.5.1 could accept or
@@ -27,8 +23,7 @@ python -m venv .venv-0.6
 .venv-0.6/bin/python -m pip install skill-eval-harness==0.6.0
 ```
 
-Run these installation commands only after 0.6.0 appears on PyPI. A fresh virtual
-environment keeps the old CLI usable while the new report is checked.
+A fresh virtual environment keeps the old CLI usable while the new report is checked.
 
 ### What remains compatible
 
