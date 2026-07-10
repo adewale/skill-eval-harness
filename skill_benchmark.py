@@ -3648,14 +3648,16 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
                     value = tokens.get(key)
                     if isinstance(value, (int, float)):
                         token_totals[key] += value
-    skill_events = [e for e in events if e.get("type") == "skill_load" or event_mentions_skill_file(e)]
+    completed_events = [event for event in events if event_is_completed(event)]
+    skill_events = [e for e in completed_events if e.get("type") == "skill_load" or event_mentions_skill_file(e)]
     metrics: dict[str, Any] = {
         "schema_version": 2,
         "source": source,
-        "tool_calls": sum(1 for e in events if e.get("type") == "tool_call") + len(command_events(events)),
+        "tool_calls": (sum(1 for e in completed_events if e.get("type") in {"tool_call", "skill_load"})
+                       + len(command_events(events))),
         "commands": len(commands),
-        "file_reads": sum(1 for e in events if e.get("type") in {"file_read", "skill_load"}),
-        "file_writes": sum(1 for e in events if e.get("type") == "file_write"),
+        "file_reads": sum(1 for e in completed_events if e.get("type") in {"file_read", "skill_load"}),
+        "file_writes": sum(1 for e in completed_events if e.get("type") == "file_write"),
         "errors": sum(1 for e in events if e.get("type") == "error"),
         "retries": 0,
         "repeated_command_max": repeated_command_max(commands),
