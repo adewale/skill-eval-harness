@@ -39,6 +39,7 @@ from typing import Any, Iterable
 import yaml
 import telemetry as telemetry_domain
 
+from judge_verdict import BooleanVerdict, ConsensusVerdict, validated_result_row, verdict_fields, verdict_from_dict
 from trace_contracts import EventState, event_is_completed, parse_event_state
 from trigger_contracts import (
     InvocationOutcome,
@@ -5227,14 +5228,27 @@ def load_result_rows(path: Path, *, id_keys: tuple[str, ...], label: str) -> lis
 
 
 def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
+    """Strict stored-verdict boundary: IDs are unique and verdicts are coherent."""
     if not path:
         return {}
     rows = load_result_rows(Path(path), id_keys=("judge_task_id", "id"), label="judge results")
     lookup: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        jid = row.get("judge_task_id") or row.get("id")
-        if jid:
-            lookup[str(jid)] = row
+    positions: dict[str, int] = {}
+    for position, row in enumerate(rows, 1):
+        primary, legacy = row.get("judge_task_id"), row.get("id")
+        if primary is not None and legacy is not None and str(primary) != str(legacy):
+            die(f"judge results row {position}: conflicting judge_task_id and id")
+        jid = primary if primary is not None else legacy
+        if not isinstance(jid, str) or not jid.strip():
+            die(f"judge results row {position}: missing non-empty judge_task_id")
+        if jid in lookup:
+            die(f"judge results duplicate id {jid!r} at rows {positions[jid]} and {position}")
+        try:
+            validated = validated_result_row(row)
+        except (TypeError, ValueError) as exc:
+            die(f"judge results row {position} ({jid}): {exc}")
+        lookup[jid] = validated
+        positions[jid] = position
     return lookup
 
 
@@ -5364,19 +5378,14 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
 
 
 def judge_verdict_passed(verdict: dict[str, Any], *, default_threshold: float = 1) -> bool:
-    """Single owner for 'did this judge verdict pass'. A verdict may state a
-    boolean `passed` (with no numeric `score`, so `score` can be null), or only a
-    numeric `score` to compare against a `threshold`. Reading `passed` first and
-    guarding the score against None keeps a null score from ever reaching a
-    `>=` comparison — the bug that crashed the merge when the eager default of
-    `dict.get("passed", score >= threshold)` was evaluated on `score is None`."""
-    if "passed" in verdict:
-        return bool(verdict.get("passed"))
-    score = verdict.get("score")
-    threshold = verdict.get("threshold", default_threshold)
-    if isinstance(score, (int, float)) and isinstance(threshold, (int, float)):
-        return score >= threshold
-    return False
+    """Compatibility shim over the typed verdict parser for raw model output."""
+    candidate = dict(verdict)
+    if candidate.get("score") is not None and candidate.get("threshold") is None:
+        candidate["threshold"] = default_threshold
+    try:
+        return verdict_from_dict(candidate, strict_stored=False).passed
+    except (TypeError, ValueError):
+        return False
 
 
 JUDGE_RESERVED_FILES = {"output.md", "events.json", "metrics.json", "metadata.json", "timing.json", "environment.json", "trace.jsonl", "result.json"}
@@ -5587,6 +5596,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         graded_payload["dimension_scores"] = parsed["dimension_scores"]
     if assertion.get("dynamic_rubric") and isinstance(parsed.get("criteria"), list):
         graded_payload["criteria"] = parsed["criteria"]
+        graded_payload["minimum_criteria"] = max(1, int((assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)))
     if graded_payload:
         # Graded shapes (roadmap 2.2): the verdict comes from the SAME owner the
         # merge uses (merged_qualitative_entry), and the graded payload rides
@@ -5595,6 +5605,8 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         graded_entry = merged_qualitative_entry(assertion, parsed, task["judge_task_id"])
         passed = bool(graded_entry.get("passed"))
         score = graded_entry.get("score")
+        if "dimension_scores" in graded_payload:
+            threshold = graded_entry.get("threshold")
     else:
         passed = judge_verdict_passed({**parsed, "threshold": threshold})
     evidence = parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or parse_error or "judge command completed"
@@ -5622,6 +5634,19 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     }
     if schema_errors:
         row["schema_errors"] = schema_errors
+    try:
+        row = validated_result_row(row)
+    except (TypeError, ValueError) as exc:
+        # Provider/model output can violate its own verdict semantics even after
+        # schema validation (for example passed=true below threshold). Preserve
+        # the raw payload diagnostically but store one valid failed verdict.
+        raw_payload = {key: row.pop(key) for key in ("dimension_scores", "criteria", "minimum_criteria") if key in row}
+        row.pop("score", None)
+        row.pop("threshold", None)
+        row.update(verdict_fields(BooleanVerdict(False)))
+        row["verdict_validation_error"] = str(exc)
+        if raw_payload:
+            row["raw_verdict_payload"] = raw_payload
     if transcripts_dir:
         safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", task["judge_task_id"])
         dest = transcripts_dir / safe / f"run-{repeat_index}"
@@ -5637,6 +5662,10 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
 def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if len(rows) == 1:
         return rows[0]
+    ids = {row.get("judge_task_id") for row in rows}
+    explicit_kinds = {row.get("verdict_kind") for row in rows if row.get("verdict_kind") is not None}
+    if len(ids) != 1 or None in ids or len(explicit_kinds) > 1:
+        raise ValueError("judge repeats must share one task id and verdict kind")
     scores = [r.get("score") for r in rows if isinstance(r.get("score"), (int, float))]
     passed_count = sum(1 for r in rows if r.get("passed"))
     first = dict(rows[0])
@@ -5645,6 +5674,7 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         first["score"] = statistics.median(scores)
     first["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
     first["judge_runs"] = rows
+    first.update(verdict_fields(ConsensusVerdict(bool(first["passed"]), first.get("score"))))
     return first
 
 
@@ -5663,6 +5693,15 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
     stays byte-identical)."""
     if len(rows) == 1:
         return rows[0]
+    ids = {row.get("judge_task_id") for row in rows}
+    models = [row.get("judge_model") for row in rows]
+    explicit_kinds = {row.get("verdict_kind") for row in rows if row.get("verdict_kind") is not None}
+    if len(ids) != 1 or None in ids:
+        raise ValueError("judge panel rows must share one task id")
+    if any(not isinstance(model, str) or not model for model in models) or len(set(models)) != len(models):
+        raise ValueError("judge panel models must be non-empty and unique")
+    if len(explicit_kinds) > 1:
+        raise ValueError("judge panel rows must share one verdict kind")
     n = len(rows)
     concur = sum(1 for r in rows if r.get("passed"))
     scores = [r.get("score") for r in rows if isinstance(r.get("score"), (int, float))]
@@ -5698,6 +5737,7 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
         out["cost_usd"] = sum(member_cost)
         out["cost_normalized"] = normalize_cost(out["cost_usd"], source="provider_reported", pricing_model="consensus")
     out["judge_panel"] = rows
+    out.update(verdict_fields(ConsensusVerdict(bool(passed), median_score)))
     return out
 
 

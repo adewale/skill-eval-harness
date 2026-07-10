@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import skill_benchmark as sb
+import judge_verdict as jv
 import run_pi_trigger_eval as tr
 import ablation_model as am
 from helpers import (
@@ -490,6 +491,13 @@ class CrossJudgeConsensusTests(unittest.TestCase):
         out = sb.merge_cross_judge_rows([self._row("m1", True, 5, cost=0.10), self._row("m2", True, 5, cost=0.20)])
         self.assertAlmostEqual(out["cost_usd"], 0.30)          # summed on the top row, not double-counted
 
+    def test_panel_rejects_duplicate_models_and_mixed_task_ids(self):
+        with self.assertRaises(ValueError):
+            sb.merge_cross_judge_rows([self._row("m1", True, 4), self._row("m1", True, 4)])
+        with self.assertRaises(ValueError):
+            sb.merge_cross_judge_rows([self._row("m1", True, 4),
+                                       {**self._row("m2", True, 4), "judge_task_id": "other"}])
+
     def test_effective_judge_models_precedence(self):
         self.assertEqual(sb.effective_judge_models({}, ["a", "b"], "x"), ["a", "b"])                       # cli panel wins
         self.assertEqual(sb.effective_judge_models({"judge": {"panel": ["p1", "p2"]}}, None, None), ["p1", "p2"])
@@ -866,6 +874,54 @@ class ToolUsingJudgeTests(unittest.TestCase):
                                    judge_explore=True, quorum=None, transcripts=None, out=None)
             with self.assertRaises(SystemExit):
                 sb.judge_command(args)
+
+
+class StrictJudgeVerdictTests(unittest.TestCase):
+    def test_verdict_kinds_derive_pass_and_reject_contradictions(self):
+        scored = jv.verdict_from_dict({"score": 1, "threshold": 1, "passed": True})
+        self.assertIsInstance(scored, jv.ScoredVerdict)
+        self.assertTrue(scored.passed)
+        invalid = [
+            {"passed": "false"},
+            {"score": True, "threshold": 1, "passed": True},
+            {"score": float("nan"), "threshold": 1, "passed": False},
+            {"score": 0, "threshold": 1, "passed": True},
+            {"score": 1, "passed": True},
+            {"dimension_scores": {"d": 6}, "score": 1, "threshold": 1, "passed": True},
+            {"criteria": [{"name": "a", "met": "yes"}], "minimum_criteria": 1,
+             "score": 1, "passed": True},
+        ]
+        for row in invalid:
+            with self.subTest(row=row), self.assertRaises((TypeError, ValueError)):
+                jv.verdict_from_dict(row)
+
+    def test_stored_result_loader_rejects_duplicate_missing_and_conflicting_ids(self):
+        valid = {"judge_task_id": "j", "passed": True, "score": None}
+        cases = [
+            [valid, valid],
+            [{"passed": True}],
+            [{**valid, "id": "other"}],
+            [{**valid, "passed": "false"}],
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "verdicts.json"
+            for rows in cases:
+                with self.subTest(rows=rows):
+                    path.write_text(json.dumps(rows), encoding="utf-8")
+                    with self.assertRaises(SystemExit):
+                        sb.load_judge_results(str(path))
+
+    def test_dynamic_and_dimension_verdicts_round_trip(self):
+        dimensions = jv.validated_result_row({
+            "judge_task_id": "d", "dimension_scores": {"clarity": 5, "craft": 3},
+            "score": 0.75, "threshold": 0.5, "passed": True,
+        })
+        self.assertEqual(dimensions["verdict_kind"], "dimensions")
+        dynamic = jv.validated_result_row({
+            "judge_task_id": "x", "criteria": [{"name": "a", "met": True}],
+            "minimum_criteria": 1, "score": 1.0, "passed": True,
+        })
+        self.assertEqual(dynamic["verdict_kind"], "dynamic")
 
 
 class JudgeVerdictPassedTests(unittest.TestCase):
