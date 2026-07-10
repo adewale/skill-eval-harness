@@ -225,10 +225,10 @@ class TimeoutConventionTests(unittest.TestCase):
     def test_runner_failure_markers_have_one_provider_map(self):
         # A provider is bound to its failure marker in exactly one place, and the
         # subagent reuses the Claude marker (its backend IS Claude).
-        self.assertIs(sb.RunnerOutcome("codex").failure_marker, am.CODEX_FAILURE)
-        self.assertIs(sb.RunnerOutcome("claude").failure_marker, am.CLAUDE_FAILURE)
-        self.assertIs(sb.RunnerOutcome("subagent").failure_marker, am.CLAUDE_FAILURE)
-        self.assertIs(sb.RunnerOutcome("vibe").failure_marker, am.VIBE_FAILURE)
+        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["codex"], am.CODEX_FAILURE)
+        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["claude"], am.CLAUDE_FAILURE)
+        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["subagent"], am.CLAUDE_FAILURE)
+        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["vibe"], am.VIBE_FAILURE)
         for marker in am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values():
             self.assertIn(marker, am.RUNNER_FAILURE_MARKERS)
 

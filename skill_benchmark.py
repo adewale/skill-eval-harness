@@ -48,8 +48,10 @@ from trigger_contracts import (
 )
 from ablation_model import (
     AblationRecord,
+    AnswerOutcome,
     Arm,
     CLAUDE_FAILURE,
+    Completed,
     CODEX_FAILURE,
     AblationMode,
     Component,
@@ -65,9 +67,16 @@ from ablation_model import (
     VIBE_FAILURE,
     MaterializedArm,
     PreparedTask,
+    OutcomeContext,
+    ProviderFailed,
     Provenance,
     ResultSet,
+    RUNNER_FAILURE_MARKER_BY_PROVIDER,
     RunnerOutcome,
+    SpawnFailed,
+    TimedOut,
+    outcome_context,
+    outcome_with_context,
     TIMEOUT_FAILURE,
     TreeIdentity,
     causal_confirmation,
@@ -3966,8 +3975,8 @@ def final_answer_from_events(events: dict[str, Any]) -> str:
     return ""
 
 
-def write_runner_outcome(run_dir: Path, outcome: RunnerOutcome) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The ONE adapter from a RunnerOutcome to the on-disk run contract, shared by
+def write_runner_outcome(run_dir: Path, outcome: AnswerOutcome) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The ONE exhaustive adapter from a closed answer outcome to disk, shared by
     every answer runner (codex/claude/subagent). Provider-specific work — spawning
     the tool and parsing its wire format — happens in the runner; everything from
     here down is identical for all providers:
@@ -3987,42 +3996,62 @@ def write_runner_outcome(run_dir: Path, outcome: RunnerOutcome) -> tuple[dict[st
     A None answer is derived from the parsed trace (the Codex path); a string
     answer is used verbatim."""
     run_dir.mkdir(parents=True, exist_ok=True)
-    trace_text = outcome.trace_text or ""
-    timed_out = bool(outcome.timed_out)
-    returncode = 124 if timed_out else outcome.returncode
-    usage_block = normalize_usage(outcome.usage, source="provider_reported")
-    cost_block = normalize_cost(outcome.cost_usd, source="provider_reported", pricing_model=outcome.model)
-    elapsed = outcome.elapsed_ms
-    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(float(elapsed)) or elapsed < 0:
-        elapsed = None
+    context = outcome_context(outcome)
+    trace_text = context.trace_text
+    if isinstance(outcome, Completed):
+        returncode, timed_out, answer = 0, False, outcome.answer
+    elif isinstance(outcome, TimedOut):
+        returncode, timed_out, answer = 124, True, ""
+    elif isinstance(outcome, SpawnFailed):
+        returncode, timed_out, answer = 127, False, ""
+    elif isinstance(outcome, ProviderFailed):
+        returncode, timed_out, answer = outcome.returncode, False, outcome.answer
+    else:  # pragma: no cover - closed union exhaustiveness guard
+        raise TypeError(f"unsupported answer outcome {type(outcome).__name__}")
+    usage_block = normalize_usage(dict(context.usage) if context.usage is not None else None, source="provider_reported")
+    cost_block = normalize_cost(context.cost_usd, source="provider_reported", pricing_model=context.model)
+    elapsed = context.elapsed_ms
     metadata = {
-        **outcome.metadata_extra,
-        "provider": outcome.provider,
-        "model": outcome.model,
+        **dict(context.metadata_extra),
+        "provider": context.provider.value,
+        "model": context.model,
         "returncode": returncode,
         "timed_out": timed_out,
-        "stderr": outcome.stderr,
+        "stderr": context.stderr,
         "usage_normalized": usage_block,
         "cost_normalized": cost_block,
-        **({"elapsed_ms": int(elapsed)} if elapsed is not None else {}),
+        **({"elapsed_ms": elapsed} if elapsed is not None else {}),
     }
-    extra_metrics = {**outcome.metrics_extra, "returncode": returncode,
-                     "observation_complete": returncode == 0 and not timed_out,
-                     **({"elapsed_ms": int(elapsed)} if elapsed is not None else {})}
+    extra_metrics = {**dict(context.metrics_extra), "returncode": returncode,
+                     "observation_complete": isinstance(outcome, Completed),
+                     **({"elapsed_ms": elapsed} if elapsed is not None else {})}
     events, metrics = write_trace_artifacts(
-        run_dir,
-        trace_text,
-        source=outcome.provider,
-        metadata=metadata,
+        run_dir, trace_text, source=context.provider.value, metadata=metadata,
         extra_metrics=extra_metrics,
-        environment=outcome.environment,
-        write_metadata=True,
-        write_raw_trace=bool(trace_text),
+        environment=dict(context.environment) if context.environment is not None else None,
+        write_metadata=True, write_raw_trace=bool(trace_text),
     )
-    answer = outcome.answer
-    if answer is None:   # Codex: the answer is the final trace message, known only now.
+    if isinstance(outcome, Completed) and answer is None:
         answer = final_answer_from_events(events) or trace_text.strip()
-    (run_dir / "output.md").write_text(outcome.output_body(answer), encoding="utf-8")
+    marker = RUNNER_FAILURE_MARKER_BY_PROVIDER[context.provider.value]
+    if isinstance(outcome, TimedOut):
+        body = (f"{TIMEOUT_FAILURE}: {outcome.reason}]\n" if outcome.reason
+                else f"{marker}: timed out after {outcome.timeout_s}s]\n" if outcome.timeout_s is not None
+                else f"{marker}: timed out]\n")
+    elif isinstance(outcome, SpawnFailed):
+        body = f"{marker}: {outcome.reason}]\n"
+    elif isinstance(outcome, ProviderFailed):
+        if outcome.reason:
+            body = f"{marker}: {outcome.reason}]\n"
+        elif context.diagnose_returncode:
+            body = f"{marker}: returncode={outcome.returncode}]\n\n{answer}\n\nstderr:\n{context.stderr}"
+        else:
+            body = f"{marker}: no output produced]\n"
+    elif not answer:
+        body = f"{marker}: no output produced]\n"
+    else:
+        body = answer
+    (run_dir / "output.md").write_text(body, encoding="utf-8")
     return events, metrics
 
 
@@ -4445,14 +4474,14 @@ def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | No
 class AgentBackend:
     name = "agent"
 
-    def invoke_answer(self, request: InvocationRequest, **options: Any) -> RunnerOutcome:
+    def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         raise NotImplementedError
 
 
 class CodexBackend(AgentBackend):
     name = "codex"
 
-    def invoke_answer(self, request: InvocationRequest, **options: Any) -> RunnerOutcome:
+    def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         result = codex_cli_invoke(
             request.prompt,
             model=request.model,
@@ -4474,7 +4503,7 @@ class CodexBackend(AgentBackend):
 class ClaudeBackend(AgentBackend):
     name = "claude"
 
-    def invoke_answer(self, request: InvocationRequest, **options: Any) -> RunnerOutcome:
+    def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         result = claude_cli_invoke(request.prompt, model=request.model, claude_bin=str(options.get("claude_bin") or "claude"), timeout=request.timeout_s, cwd=str(request.workspace))
         claude_metrics = claude_run_metrics(result)
         metrics_extra = {k: v for k, v in claude_metrics.items() if k not in ("schema_version", "source")}
@@ -4490,7 +4519,7 @@ class ClaudeBackend(AgentBackend):
 class VibeBackend(AgentBackend):
     name = "vibe"
 
-    def invoke_answer(self, request: InvocationRequest, **options: Any) -> RunnerOutcome:
+    def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         result = vibe_cli_invoke(
             request.prompt,
             model=request.model,
@@ -4540,11 +4569,14 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             skill_rel, input_rel = build_skill_workspace(pt, ws)
             prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             outcome = backend.invoke_answer(InvocationRequest(prompt=prompt, workspace=ws, model=row_model, timeout_s=timeout), **options)
-        outcome.metadata_extra = {**prov_extra, **(outcome.metadata_extra or {})}
-        env = dict(outcome.environment or {})
+        context = outcome_context(outcome)
+        env = dict(context.environment or {})
         env.setdefault("runner", backend.name)
         env["variant"] = pt.variant_truth
-        outcome.environment = env
+        outcome = outcome_with_context(
+            outcome,
+            context.enriched(metadata={**prov_extra, **dict(context.metadata_extra)}, environment=env),
+        )
         write_runner_outcome(base, outcome)
     return 0
 

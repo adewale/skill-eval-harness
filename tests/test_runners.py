@@ -24,6 +24,7 @@ from unittest import mock
 
 import skill_benchmark as sb
 import trace_contracts as tc
+import runner_contracts as rc
 import run_pi_trigger_eval as tr
 import ablation_model as am
 from helpers import (
@@ -158,6 +159,39 @@ class ToolReplayTests(unittest.TestCase):
             replayer = sb.ToolReplayStore(store_path, "auto")
             self.assertEqual(replayer.mode, "replay")
             self.assertEqual(replayer.resolve("t", {"x": 1}), "out")
+
+
+class ClosedRunnerOutcomeTests(unittest.TestCase):
+    def test_outcome_variants_make_contradictory_states_unconstructible(self):
+        context = rc.OutcomeContext(provider=rc.Provider.CODEX, elapsed_ms=0)
+        with self.assertRaises(ValueError):
+            rc.Completed(context, answer="x", returncode=1)
+        with self.assertRaises(ValueError):
+            rc.TimedOut(context, returncode=0)
+        with self.assertRaises(ValueError):
+            rc.ProviderFailed(context, returncode=0)
+        with self.assertRaises(ValueError):
+            rc.SpawnFailed(context, reason="x", returncode=1)
+        with self.assertRaises(ValueError):
+            rc.RunnerOutcome(provider="codex", answer="", returncode=0, timed_out=True)
+
+    def test_context_rejects_unknown_provider_and_invalid_measurements(self):
+        for kwargs in (
+            {"provider": "unknown"}, {"provider": "codex", "elapsed_ms": -1},
+            {"provider": "codex", "elapsed_ms": float("nan")},
+            {"provider": "codex", "cost_usd": float("inf")},
+            {"provider": "codex", "usage": {"input_tokens": -1}},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises((TypeError, ValueError)):
+                rc.OutcomeContext(**kwargs)
+
+    def test_context_and_outcome_are_immutable(self):
+        context = rc.OutcomeContext(provider="codex", metadata_extra={"x": 1})
+        outcome = rc.Completed(context, answer="ok")
+        with self.assertRaises(TypeError):
+            context.metadata_extra["x"] = 2  # type: ignore[index]
+        with self.assertRaises((AttributeError, TypeError)):
+            outcome.answer = "changed"  # type: ignore[misc]
 
 
 class TraceEventStateTests(unittest.TestCase):

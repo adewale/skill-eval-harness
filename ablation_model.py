@@ -100,78 +100,10 @@ RUNNER_FAILURE_MARKER_BY_PROVIDER = {
 }
 
 
-@dataclass
-class RunnerOutcome:
-    """The result of ONE runner invocation, provider-agnostic. Each runner does
-    only provider-specific work — spawn the tool, parse its wire format — and
-    hands back a RunnerOutcome; write_runner_outcome() adapts it onto the on-disk
-    run contract (output.md, metadata.json, events.json, metrics.json,
-    trace.jsonl) the SAME way for every provider. That is the point: timeout
-    encoding, failure-body marking, and usage/cost normalization get one owner
-    instead of one hand-rolled copy per runner (the drift that let the Codex
-    empty-output path skip the normalized cost/usage blocks the others wrote).
-
-    Field conventions:
-      * `answer=None` means "derive the answer from the trace" (the Codex path,
-        whose answer IS the final trace message); a string — even "" — is used
-        verbatim, so a provider that already knows its answer never gets one
-        silently reconstructed from events.
-      * `error` carries a runner-side exception string (the subagent seam). When
-        set on a timeout it selects TIMEOUT_FAILURE over the provider marker,
-        preserving the subagent's distinct timeout body.
-      * `trace_text` is the raw provider JSONL (Codex stdout, or subagent records
-        re-serialized); None/"" means no trace and no trace.jsonl is written.
-      * `usage`/`cost_usd` are the provider-REPORTED numbers; the writer turns
-        them into usage_normalized/cost_normalized blocks (or explicit missing).
-      * `metadata_extra`/`metrics_extra` carry provider-specific fields the writer
-        passes through verbatim (e.g. Claude's top-level token counts, the
-        ablation/skill_tree_hash provenance)."""
-
-    provider: str
-    answer: Optional[str] = None
-    returncode: Optional[int] = None
-    timed_out: bool = False
-    elapsed_ms: Optional[int] = None
-    stderr: str = ""
-    error: Optional[str] = None
-    timeout_s: Optional[int] = None
-    trace_text: Optional[str] = None
-    usage: Optional[dict[str, Any]] = None
-    cost_usd: Optional[float] = None
-    model: Optional[str] = None
-    metadata_extra: dict[str, Any] = field(default_factory=dict)
-    metrics_extra: dict[str, Any] = field(default_factory=dict)
-    environment: Optional[dict[str, Any]] = None
-    # CLI runners (codex/claude) diagnose a crash in the body with the returncode
-    # and captured stderr; the subagent seam diagnoses via `error`/empty instead
-    # and never had a returncode body, so it sets this False to keep that shape.
-    diagnose_returncode: bool = True
-
-    @property
-    def failure_marker(self) -> str:
-        return RUNNER_FAILURE_MARKER_BY_PROVIDER.get(self.provider, CLAUDE_FAILURE)
-
-    def output_body(self, answer: str) -> str:
-        """The output.md body for this run: the real answer, or a synthetic
-        failure body execution_valid() will reject. `answer` is passed in because
-        the Codex answer is only known after its trace is parsed (see the writer).
-        A timeout carrying an error string uses the TIMEOUT marker; a bare timeout
-        uses the provider marker plus the deadline — the exact bodies the codex,
-        claude, and subagent runners each wrote before this became one owner."""
-        marker = self.failure_marker
-        if self.timed_out:
-            if self.error:
-                return f"{TIMEOUT_FAILURE}: {self.error}]\n"
-            if self.timeout_s is not None:
-                return f"{marker}: timed out after {self.timeout_s}s]\n"
-            return f"{marker}: timed out]\n"
-        if self.error:
-            return f"{marker}: {self.error}]\n"
-        if self.diagnose_returncode and self.returncode not in (0, None):
-            return f"{marker}: returncode={self.returncode}]\n\n{answer}\n\nstderr:\n{self.stderr}"
-        if not answer:
-            return f"{marker}: no output produced]\n"
-        return answer
+from runner_contracts import (
+    AnswerOutcome, Completed, OutcomeContext, Provider, ProviderFailed, RunnerOutcome,
+    SpawnFailed, TimedOut, outcome_context, outcome_with_context,
+)
 
 
 # --------------------------------------------------------------------------- #
