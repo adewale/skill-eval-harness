@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import skill_benchmark as sb
+import trace_contracts as tc
 import run_pi_trigger_eval as tr
 import ablation_model as am
 from helpers import (
@@ -157,6 +158,32 @@ class ToolReplayTests(unittest.TestCase):
             replayer = sb.ToolReplayStore(store_path, "auto")
             self.assertEqual(replayer.mode, "replay")
             self.assertEqual(replayer.resolve("t", {"x": 1}), "out")
+
+
+class TraceEventStateTests(unittest.TestCase):
+    def test_status_parser_is_closed_and_positive(self):
+        for raw, expected in (("done", tc.EventState.COMPLETED), ("running", tc.EventState.IN_PROGRESS),
+                              ("failed", tc.EventState.FAILED), ("typo", tc.EventState.UNKNOWN),
+                              (None, tc.EventState.UNKNOWN)):
+            with self.subTest(raw=raw):
+                self.assertIs(tc.parse_event_state(raw).state, expected)
+        self.assertFalse(tc.event_is_completed({"type": "command"}))
+        self.assertFalse(tc.event_is_completed({"type": "command", "status": "failed"}))
+        self.assertFalse(tc.event_is_completed({"type": "command", "status": "typo"}))
+        self.assertTrue(tc.event_is_completed({"type": "command", "status": "completed"}))
+
+    def test_raw_terminal_kind_can_prove_completion_during_normalization(self):
+        event = sb.normalize_trace_record({"type": "item.completed", "item": {"type": "command_execution", "command": "echo ok"}}, source="codex", index=1, line=1)
+        self.assertEqual(event["status"], "completed")
+        self.assertEqual(event["state_source"], "provider_event_kind")
+        self.assertEqual(len(sb.command_events([event])), 1)
+
+    def test_unknown_and_failed_commands_do_not_satisfy_command_filters(self):
+        events = [
+            {"type": "command", "status": "unknown", "input_summary": "unsafe"},
+            {"type": "command", "status": "failed", "input_summary": "unsafe"},
+        ]
+        self.assertEqual(sb.command_events(events), [])
 
 
 class OTelNormalizationTests(unittest.TestCase):

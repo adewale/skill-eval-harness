@@ -39,6 +39,7 @@ from typing import Any, Iterable
 import yaml
 import telemetry as telemetry_domain
 
+from trace_contracts import EventState, event_is_completed, parse_event_state
 from trigger_contracts import (
     InvocationOutcome,
     TraceEventKind,
@@ -2805,6 +2806,13 @@ def read_events_base(base: Path) -> tuple[list[dict[str, Any]] | None, str | Non
     events = data.get("events") if isinstance(data, dict) else data
     if not isinstance(events, list) or not all(isinstance(e, dict) for e in events):
         return None, "events.json must contain an events list"
+    if isinstance(data, dict) and data.get("schema_version") == 1:
+        events = [
+            ({**event, "status": EventState.COMPLETED.value,
+              "state_source": "legacy_assumed_completed"}
+             if event.get("status") is None else event)
+            for event in events
+        ]
     return events, None
 
 
@@ -2837,10 +2845,8 @@ def command_text(event: dict[str, Any]) -> str:
 
 
 def command_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # Codex and other runners can emit both start and completion records for the
-    # same command. Process assertions care about commands that actually ran, so
-    # ignore in-progress start notifications when a status is present.
-    return [e for e in events if e.get("type") == "command" and str(e.get("status", "completed")).casefold() not in {"in_progress", "started", "running"}]
+    """Commands proven completed; failed/unknown/start events never satisfy execution."""
+    return [e for e in events if e.get("type") == "command" and event_is_completed(e)]
 
 
 def event_mentions_skill_file(event: dict[str, Any]) -> bool:
@@ -3259,7 +3265,7 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
             # command_events deliberately excludes).
             completed_calls = [e for e in events
                                if e.get("type") in {"command", "tool_call"}
-                               and str(e.get("status", "completed")).casefold() not in {"in_progress", "started", "running"}]
+                               and event_is_completed(e)]
             tool = assertion.get("tool")
             if tool:
                 tool_folded = str(tool).casefold()
@@ -3468,7 +3474,9 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     path = stringify_trace_value(raw_trace_value(record, "path", "file"))
     command = stringify_trace_value(raw_trace_value(record, "command", "cmd", "args"))
     content = stringify_trace_value(raw_trace_value(record, "content", "text", "message"))
-    status = str(raw_trace_value(record, "status", "state") or "completed")
+    raw_status = raw_trace_value(record, "status", "state")
+    parsed_state = parse_event_state(raw_status, raw_type=top_type or item_type)
+    status = parsed_state.state.value
     # Unknown session/lifecycle events are not tool calls. Defaulting them to
     # tool_call inflated Pi's process telemetry even when its trace had no
     # model tool use at all.
@@ -3499,8 +3507,11 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
         "index": index,
         "type": event_type.value,
         "status": status,
+        "state_source": parsed_state.source.value,
         "raw_ref": {"file": "trace.jsonl", "line": line},
     }
+    if isinstance(raw_status, str) and raw_status.casefold() != status:
+        event["raw_status"] = raw_status
     role = raw_trace_value(record, "role")
     if not role and "agent_message" in raw_type:
         role = "assistant"
