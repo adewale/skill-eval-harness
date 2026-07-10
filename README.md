@@ -155,6 +155,7 @@ skill-benchmark --help
 | File | Use it for |
 |---|---|
 | `README.md` | Manifest shape, run layout, and the command index. |
+| `docs/README.md` | The docs index: journeys/concepts/reference/specs grouping and the convention for adding a user-journey walkthrough. |
 | `docs/commands.md` | Full per-command reference: flags, examples, and output shapes for every subcommand. |
 | `CHANGELOG.md` | Release history and unreleased repo-surface changes. |
 | `CONTRIBUTING.md` | Local setup, validation commands, and eval-safety rules. |
@@ -411,6 +412,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 |---|---|
 | `skill-benchmark validate` | Check manifest shape, fixture paths, regex, oracle paths, and prompt-leakage. |
 | `skill-benchmark prepare` | Emit answer-key-safe task rows per case/variant/run (`--include-ablations` materializes ablated trees). |
+| `skill-benchmark materialize-ablations` | Write the declared ablated skill trees to disk without preparing tasks — inspect or diff an ablation before spending a run on it. |
 | `skill-benchmark grade` | Score saved outputs into per-run rows; emit pending judge tasks. |
 | `skill-benchmark benchmark` | Aggregate into variant summaries, paired lift + significance, by-model, cost, and case flags. |
 | `skill-benchmark render-viewer` | Static or `--serve`d review page with embedded artifacts and iteration diffs. |
