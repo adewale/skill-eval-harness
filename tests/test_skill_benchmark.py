@@ -554,7 +554,8 @@ class SkillBenchmarkTests(unittest.TestCase):
                 {"type": "usage", "usage": {"input_tokens": 80, "output_tokens": 20, "total_tokens": 100}},
             ]
             trace.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-            sb.import_trace(SimpleNamespace(source="codex", trace=str(trace), run_dir=str(run_dir), out_events=None, out_metrics=None, write_metadata=True))
+            sb.import_trace(SimpleNamespace(source="codex", trace=str(trace), run_dir=str(run_dir), out_events=None, out_metrics=None, write_metadata=False))
+            self.assertTrue((run_dir / "metadata.json").is_file())
             events = json.loads((run_dir / "events.json").read_text(encoding="utf-8"))
             metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
             self.assertEqual([e["type"] for e in events["events"]][:3], ["skill_load", "command", "command"])
@@ -583,7 +584,8 @@ class SkillBenchmarkTests(unittest.TestCase):
                 base = runs / "case-1" / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text("alpha beta", encoding="utf-8")
-                sb.write_trace_artifacts(base, "", source="test", extra_metrics={"skill_invoked": invoked, "skill_invocation_evidence": [variant] if invoked else []}, write_metadata=True)
+                sb.write_trace_artifacts(base, json.dumps({"type": "message", "role": "assistant", "content": "done"}),
+                                         source="test", extra_metrics={"skill_invoked": invoked, "skill_invocation_evidence": [variant] if invoked else []}, write_metadata=True)
             report = sb.build_benchmark_report(manifest, runs)
             by_variant = {r["variant"]: r for r in report["results"]}
             self.assertEqual(by_variant["with_skill"]["objective_total"], 1)
@@ -673,9 +675,15 @@ class SkillBenchmarkTests(unittest.TestCase):
                 base.mkdir(parents=True)
                 (base / "output.md").write_text("alpha beta", encoding="utf-8")
                 (base / "metrics.json").write_text(json.dumps({
-                    "total_tokens": total,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "billing_scope": "run",
+                    "usage_normalized": {
+                        "total_tokens": total,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "source": "provider_reported",
+                    },
                     "skill_invoked": variant == "with_skill",
                 }), encoding="utf-8")
             report = sb.paired_token_overhead_report(manifest, runs=runs)
@@ -685,6 +693,66 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertEqual(report["pairs"][0]["objective_delta"], 0.0)
             self.assertEqual(report["pairs"][0]["objective_lift_per_1k_total_tokens"], 0.0)
             self.assertGreater(report["summary"]["static_skill_tokens"], 0)
+
+    def test_token_overhead_pairs_each_model_root_without_overwriting_same_run_number(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            runs = root / "repo" / "eval-runs" / "latest"
+            for model, with_tokens, without_tokens in [("model-a", 150, 50), ("model-b", 220, 100)]:
+                for variant, tokens in [("with_skill", with_tokens), ("without_skill", without_tokens)]:
+                    base = runs / "case-1" / model / variant
+                    base.mkdir(parents=True)
+                    (base / "output.md").write_text("alpha beta", encoding="utf-8")
+                    (base / "metrics.json").write_text(json.dumps({
+                        "provider": "test-provider", "model": model, "billing_scope": "run",
+                        "usage_normalized": {"total_tokens": tokens, "source": "provider_reported"},
+                    }), encoding="utf-8")
+            report = sb.paired_token_overhead_report(manifest, runs=runs)
+        self.assertEqual(report["summary"]["paired_runtime_rows"], 2)
+        self.assertEqual({pair["model"] for pair in report["pairs"]}, {"model-a", "model-b"})
+        self.assertEqual({pair["total_token_delta"] for pair in report["pairs"]}, {100, 120})
+
+    def test_pairing_refuses_singleton_arms_with_different_run_numbers(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td)
+            with_dir = runs / "case" / "with_skill" / "run-2"
+            without_dir = runs / "case" / "without_skill" / "run-1"
+            with_dir.mkdir(parents=True)
+            without_dir.mkdir(parents=True)
+            pairs = list(sb.paired_run_bases(runs, "case", "with_skill", "without_skill"))
+        self.assertEqual([(run, left is None, right is None) for _, run, left, right in pairs],
+                         [(1, True, False), (2, False, True)])
+
+    def test_token_overhead_reports_missing_and_unscorable_pairs_as_blocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            runs = root / "repo" / "eval-runs" / "latest"
+            with_base = runs / "case-1" / "with_skill"
+            with_base.mkdir(parents=True)
+            (with_base / "output.md").write_text("alpha beta", encoding="utf-8")
+            (with_base / "metrics.json").write_text(json.dumps({
+                "provider": "test-provider", "model": "test-model", "billing_scope": "run",
+                "usage_normalized": {"total_tokens": 10, "source": "provider_reported"},
+            }), encoding="utf-8")
+            missing_report = sb.paired_token_overhead_report(manifest, runs=runs)
+            self.assertEqual(missing_report["pairs"], [])
+            self.assertEqual(missing_report["blocked_pairs"][0]["pair_status"]["reason"], "missing_right")
+            self.assertEqual(missing_report["summary"]["cost_delta_coverage"]["blocked_reason_counts"], {"missing_right": 1})
+
+            without_base = runs / "case-1" / "without_skill"
+            without_base.mkdir(parents=True)
+            # Empty output is an unscorable arm, but it remains an auditable blocked pair.
+            (without_base / "output.md").write_text("", encoding="utf-8")
+            (without_base / "metrics.json").write_text(json.dumps({
+                "provider": "test-provider", "model": "test-model", "billing_scope": "run", "returncode": 1,
+                "usage_normalized": {"total_tokens": 5, "source": "provider_reported"},
+            }), encoding="utf-8")
+            unscorable_report = sb.paired_token_overhead_report(manifest, runs=runs)
+        self.assertEqual(unscorable_report["pairs"], [])
+        self.assertEqual(unscorable_report["blocked_pairs"][0]["pair_status"]["reason"], "unscorable_arm")
+        self.assertEqual(unscorable_report["summary"]["cost_delta_coverage"]["blocked_reason_counts"], {"unscorable_arm": 1})
 
     def test_command_assertions_match_command_inputs_not_outputs(self):
         with tempfile.TemporaryDirectory() as td:

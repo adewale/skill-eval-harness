@@ -130,7 +130,7 @@ class RunnerOutcome:
     answer: Optional[str] = None
     returncode: Optional[int] = None
     timed_out: bool = False
-    elapsed_ms: int = 0
+    elapsed_ms: Optional[int] = None
     stderr: str = ""
     error: Optional[str] = None
     timeout_s: Optional[int] = None

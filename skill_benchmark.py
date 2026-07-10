@@ -12,6 +12,7 @@ them. Everything from `grade`/`benchmark` onward is model-free and reproducible 
 from __future__ import annotations
 
 import argparse
+import collections
 import copy
 import difflib
 import hashlib
@@ -36,6 +37,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
+import telemetry as telemetry_domain
 
 from ablation_model import (
     AblationRecord,
@@ -2571,6 +2573,13 @@ def import_jetty_results(args: argparse.Namespace) -> int:
             (base / "output.md").write_text(f"{JETTY_FAILURE}: trajectory failed before producing output]\n", encoding="utf-8")
         meta = artifact_metadata(artifacts)
         meta.update(normalized_jetty_metadata(record, success=success))
+        meta.update({
+            "population": "answer",
+            "case_id": harness.get("case_id"),
+            "run_number": harness.get("run_number", 1),
+            "variant": harness.get("variant"),
+            "billing_scope": "run",
+        })
         # Persist the harness-only ablation provenance into the run metadata so the
         # benchmark report can VERIFY (mode/population/skill_hash/components) that a
         # materialized ablation was actually mounted — never trusting the manifest
@@ -2675,7 +2684,12 @@ def discover_on_disk_run_rows(manifest: dict[str, Any], runs: Path) -> list[dict
             for run_number, base in discover_run_bases_under(vdir):
                 merged = read_metrics_base(base)
                 facts = run_cost_facts(merged)
-                facts["elapsed_ms"] = metric_number(merged, "elapsed_ms")
+                elapsed_measurement = telemetry_domain.measurement_from_envelope_or_nonnegative(
+                    merged, "elapsed_ms", source=str(merged.get("provider") or merged.get("trace_source") or ""))
+                facts["elapsed_ms_measurement"] = elapsed_measurement
+                facts["elapsed_ms"] = elapsed_measurement.value if elapsed_measurement.availability == telemetry_domain.AVAILABLE else None
+                facts = bind_telemetry_pair_identity(
+                    facts, case_id=case["id"], run_number=run_number, variant=variant, model=model, population="answer")
                 rows.append({
                     "case_id": case["id"],
                     "variant": variant,
@@ -3050,7 +3064,13 @@ def normalize_cost(raw: Any, *, source: str = "provider_reported", currency: str
         return {"source": "not_applicable"}
     total = _num(raw)
     parts: dict[str, float] = {}
+    resolved_currency = currency
     if isinstance(raw, dict):
+        if raw.get("currency") is not None:
+            raw_currency = raw.get("currency")
+            if not isinstance(raw_currency, str) or not re.fullmatch(r"[A-Z]{3}", raw_currency):
+                return {"source": "missing"}
+            resolved_currency = raw_currency
         for key in ("total_cost", "total_cost_usd", "cost_usd", "total", "cost", "amount"):
             total = _num(raw.get(key))
             if total is not None:
@@ -3065,7 +3085,7 @@ def normalize_cost(raw: Any, *, source: str = "provider_reported", currency: str
             total = sum(parts.values())
     if total is None:
         return {"source": "missing"}
-    out: dict[str, Any] = {"currency": currency, **{k: round(v, 6) for k, v in parts.items()}, "total_cost": round(total, 6), "source": source}
+    out: dict[str, Any] = {"currency": resolved_currency, **{k: round(v, 6) for k, v in parts.items()}, "total_cost": round(total, 6), "source": source}
     if pricing_model:
         out["pricing_model"] = pricing_model
     if pricing_table_version:
@@ -3076,35 +3096,70 @@ def normalize_cost(raw: Any, *, source: str = "provider_reported", currency: str
 
 
 def run_cost_facts(merged: dict[str, Any]) -> dict[str, Any]:
-    """ONE reader for a run's usage/cost facts. Prefers the normalized blocks;
-    pre-#21 runs fall back to the legacy flat fields, so old run dirs keep
-    reporting. Returns tokens (or None), cost_usd (or None), and each source."""
-    usage_block = merged.get("usage_normalized")
-    if isinstance(usage_block, dict) and usage_block.get("source") not in (None, "missing", "not_applicable"):
-        tokens = {key: usage_block.get(key) for key in USAGE_ALIASES if isinstance(usage_block.get(key), (int, float))}
-        usage_source = str(usage_block.get("source"))
+    """ONE reader for a run's usage/cost facts.
+
+    New v3 artifacts are parsed through :mod:`telemetry`; old normalized/flat
+    fields are adapted at this boundary and labelled ``legacy_unverified``. The
+    scalar compatibility fields are populated only for available measurements,
+    so callers cannot confuse unavailable telemetry with zero.
+    """
+    basis = telemetry_domain.basis_from_run(merged, source=str(merged.get("provider") or merged.get("runner") or ""))
+    envelope = merged.get("telemetry")
+
+    def v3_or_usage(key: str):
+        if isinstance(envelope, dict) and envelope.get("schema_version") == 3:
+            measurements = envelope.get("measurements")
+            if isinstance(measurements, dict) and isinstance(measurements.get(key), dict):
+                try:
+                    return telemetry_domain.Measurement.from_dict(measurements[key])
+                except ValueError:
+                    return telemetry_domain.Measurement.unavailable(f"invalid_v3_{key}", basis=basis)
+        return telemetry_domain.measurement_from_usage_block(
+            merged.get("usage_normalized"), key,
+            legacy_value=metric_number(merged, key), basis=basis,
+        )
+
+    input_measurement = v3_or_usage("input_tokens")
+    output_measurement = v3_or_usage("output_tokens")
+    total_measurement = v3_or_usage("total_tokens")
+    if isinstance(envelope, dict) and envelope.get("schema_version") == 3:
+        measurements = envelope.get("measurements")
+        if isinstance(measurements, dict) and isinstance(measurements.get("cost"), dict):
+            try:
+                cost_measurement = telemetry_domain.Measurement.from_dict(measurements["cost"])
+            except ValueError:
+                cost_measurement = telemetry_domain.Measurement.unavailable("invalid_v3_cost", basis=basis)
+        else:
+            cost_measurement = telemetry_domain.measurement_from_cost_block(
+                merged.get("cost_normalized"), legacy_value=metric_number(merged, "cost_usd", "cost"), basis=basis)
     else:
-        tokens = {}
-        for key in ("input_tokens", "output_tokens", "total_tokens"):
-            value = metric_number(merged, key)
-            if value is not None:
-                tokens[key] = int(value)
-        usage_source = "legacy_fields" if tokens else str((usage_block or {}).get("source", "missing"))
-    cost_block = merged.get("cost_normalized")
-    if isinstance(cost_block, dict) and isinstance(cost_block.get("total_cost"), (int, float)):
-        cost_usd = float(cost_block["total_cost"])
-        cost_source = str(cost_block.get("source"))
-    else:
-        legacy = metric_number(merged, "cost_usd", "cost")
-        cost_usd = float(legacy) if legacy is not None else None
-        cost_source = "legacy_fields" if cost_usd is not None else str((cost_block or {}).get("source", "missing"))
+        cost_measurement = telemetry_domain.measurement_from_cost_block(
+            merged.get("cost_normalized"), legacy_value=metric_number(merged, "cost_usd", "cost"), basis=basis)
+
+    def value_of(measurement):
+        return measurement.value if measurement.availability == telemetry_domain.AVAILABLE else None
+
+    def source_of(measurement) -> str:
+        if measurement.availability == telemetry_domain.AVAILABLE:
+            # Keep the historical scalar reader label stable; the typed
+            # measurement still records the stricter legacy_unverified fact.
+            return "legacy_fields" if measurement.provenance == "legacy_unverified" else str(measurement.provenance)
+        return "not_applicable" if measurement.availability == telemetry_domain.NOT_APPLICABLE else "missing"
+
+    cost = value_of(cost_measurement)
+    cost_usd = float(cost.amount) if isinstance(cost, telemetry_domain.Money) and cost.currency == "USD" else None
     return {
-        "input_tokens": tokens.get("input_tokens"),
-        "output_tokens": tokens.get("output_tokens"),
-        "total_tokens": tokens.get("total_tokens"),
+        "input_tokens": value_of(input_measurement),
+        "output_tokens": value_of(output_measurement),
+        "total_tokens": value_of(total_measurement),
         "cost_usd": cost_usd,
-        "usage_source": usage_source,
-        "cost_source": cost_source,
+        "cost_currency": cost.currency if isinstance(cost, telemetry_domain.Money) else None,
+        "usage_source": source_of(total_measurement),
+        "cost_source": source_of(cost_measurement),
+        "input_tokens_measurement": input_measurement,
+        "output_tokens_measurement": output_measurement,
+        "total_tokens_measurement": total_measurement,
+        "cost_measurement": cost_measurement,
     }
 
 
@@ -3120,6 +3175,39 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
     metrics = dict(metadata or {})
     metrics.update(read_metrics_base(run_base))
     ci = bool(assertion.get("ci", True))
+    envelope = metrics.get("telemetry") if isinstance(metrics.get("telemetry"), dict) else None
+
+    def require_v3_measurement(key: str) -> tuple[bool, str | None]:
+        """Fail closed when v3 says the trace observation was incomplete.
+
+        Old artifacts have no envelope and retain the historical event/metric
+        fallback. New artifacts must not let their legacy flat zero counters
+        override an explicit unavailable measurement.
+        """
+        measurements = envelope.get("measurements") if isinstance(envelope, dict) else None
+        raw = measurements.get(key) if isinstance(measurements, dict) else None
+        if not isinstance(raw, dict):
+            return True, None
+        if raw.get("availability") == telemetry_domain.AVAILABLE:
+            return True, None
+        return False, f"missing {key} evidence ({raw.get('reason', raw.get('availability', 'unavailable'))})"
+
+    required_signal = {
+        "skill_invoked": "skill_invoked",
+        "command_ran": "commands",
+        "command_not_ran": "commands",
+        "command_order": "commands",
+        "tool_call": "tool_calls",
+        "tool_count_le": "tool_calls",
+        "no_repeated_command_loop": "repeated_command_max",
+        "total_tokens_le": "total_tokens",
+        "elapsed_seconds_le": "elapsed_ms",
+        "command_count_le": "commands",
+    }.get(atype)
+    if required_signal:
+        observed, evidence_error = require_v3_measurement(required_signal)
+        if not observed:
+            return False, str(evidence_error)
 
     if atype == "skill_invoked":
         expected = bool(assertion.get("expected", True))
@@ -3546,17 +3634,17 @@ def _sum_stream_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
     return normalize_usage(totals if totals else None, source="trace_normalized")
 
 
-def _cost_value_from_record(record: dict[str, Any]) -> float | None:
+def _cost_value_from_record(record: dict[str, Any]) -> Any:
+    """Return a validated raw cost value without discarding object currency."""
     raw = raw_trace_value(record, "cost", "cost_usd", "total_cost_usd")
     if raw is None:
         usage_obj = _stream_usage_doc(record)
         if isinstance(usage_obj, dict):
             raw = usage_obj.get("cost", usage_obj.get("cost_usd"))
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-        return _num(raw)
+        return raw if _num(raw) is not None else None
     if isinstance(raw, dict):
-        value = normalize_cost(raw).get("total_cost")
-        return _num(value)
+        return raw if normalize_cost(raw).get("source") != "missing" else None
     return None
 
 
@@ -3592,9 +3680,16 @@ def stream_usage_and_cost(raw_text: str) -> tuple[dict[str, Any], dict[str, Any]
         cost = cumulative_cost[-1]
         return usage, cost
     cost_values = [_cost_value_from_record(record) for record in records]
-    cost_total = sum(value for value in cost_values if value is not None)
-    cost_found = any(value is not None for value in cost_values)
-    cost = normalize_cost(round(cost_total, 6) if cost_found else None, source="trace_normalized")
+    cost_blocks = [normalize_cost(value, source="trace_normalized") for value in cost_values if value is not None]
+    cost_blocks = [block for block in cost_blocks if block.get("source") != "missing"]
+    currencies = {str(block.get("currency")) for block in cost_blocks}
+    if len(currencies) == 1:
+        currency = next(iter(currencies))
+        cost_total = sum(float(block["total_cost"]) for block in cost_blocks)
+        cost = normalize_cost({"amount": round(cost_total, 6), "currency": currency}, source="trace_normalized")
+    else:
+        # A trace that mixes units has no total without an explicit FX policy.
+        cost = {"source": "missing"}
     return usage, cost
 
 
@@ -3619,16 +3714,43 @@ def write_trace_artifacts(
     if parse_errors:
         metrics["parse_errors"] = parse_errors[:20]
         metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
+    # A trace-derived count is observed only when at least one valid event was
+    # captured and parsing completed. Runners may override this with their own
+    # process-level observation state (for example a spawn failure).
+    metrics["trace_observation_complete"] = bool(records) and not parse_errors
     if extra_metrics:
         metrics.update(extra_metrics)
-    # Telemetry precedence (issue #21): a provider-reported (or explicit
-    # not_applicable) block handed in by the runner beats the trace-derived one
-    # in BOTH artifacts; and every metadata.json leaves here with explicit
-    # blocks — missing telemetry is marked, never silently absent or zero.
+    # Telemetry precedence: an explicit provider/estimated/not-applicable block
+    # supplied by a runner wins over a trace-derived block. Both artifacts then
+    # receive the same v3 envelope, including an explicit unavailable state when
+    # no value was observed. A missing trace can never become numeric zero.
     for key in ("usage_normalized", "cost_normalized"):
         block = (metadata or {}).get(key)
         if isinstance(block, dict) and block.get("source") in {"provider_reported", "trace_normalized", "price_table_estimated", "estimated", "not_applicable"}:
             metrics[key] = block
+        metrics.setdefault(key, {"source": "missing"})
+    # Metrics contains the resolved usage/cost precedence. Metadata is useful
+    # for identity/basis but must not let an explicit `source: missing` erase a
+    # usable trace-normalized observation.
+    envelope_input = {**(metadata or {}), **metrics}
+    if isinstance(envelope_input.get("observation_complete"), bool):
+        envelope_input["trace_observation_complete"] = envelope_input["observation_complete"]
+    # A crash/timeout can leave a syntactically valid partial JSONL trace. Keep
+    # its legacy debugging fields, but v3 must not present trace-derived usage
+    # or cost as complete measurement evidence. Provider-reported blocks remain
+    # valid independent observations.
+    if envelope_input.get("trace_observation_complete") is not True:
+        for key in ("usage_normalized", "cost_normalized"):
+            block = envelope_input.get(key)
+            if isinstance(block, dict) and block.get("source") == "trace_normalized":
+                envelope_input[key] = {"source": "missing"}
+    envelope = telemetry_domain.telemetry_envelope(
+        envelope_input,
+        source=source,
+        population=str(envelope_input.get("population") or "answer"),
+    )
+    metrics["telemetry_schema_version"] = 3
+    metrics["telemetry"] = envelope
     write_json(out_events or run_dir / "events.json", events)
     write_json(out_metrics or run_dir / "metrics.json", metrics)
     if environment:
@@ -3640,6 +3762,8 @@ def write_trace_artifacts(
         existing.update({k: v for k, v in metrics.items() if k not in {"schema_version", "source"}})
         existing.setdefault("usage_normalized", {"source": "missing"})
         existing.setdefault("cost_normalized", {"source": "missing"})
+        existing["telemetry_schema_version"] = 3
+        existing["telemetry"] = envelope
         existing["trace_source"] = source
         write_json(run_dir / "metadata.json", existing)
     return events, metrics
@@ -3653,7 +3777,9 @@ def import_trace(args: argparse.Namespace) -> int:
         run_dir,
         trace_text,
         source=getattr(args, "source", "generic"),
-        write_metadata=getattr(args, "write_metadata", False),
+        # v3 requires a paired metadata/metrics envelope; importing a trace is
+        # a producer, not a metrics-only convenience path.
+        write_metadata=True,
         out_events=Path(args.out_events) if getattr(args, "out_events", None) else None,
         out_metrics=Path(args.out_metrics) if getattr(args, "out_metrics", None) else None,
         write_raw_trace=False,
@@ -3699,18 +3825,23 @@ def write_runner_outcome(run_dir: Path, outcome: RunnerOutcome) -> tuple[dict[st
     returncode = 124 if timed_out else outcome.returncode
     usage_block = normalize_usage(outcome.usage, source="provider_reported")
     cost_block = normalize_cost(outcome.cost_usd, source="provider_reported", pricing_model=outcome.model)
+    elapsed = outcome.elapsed_ms
+    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(float(elapsed)) or elapsed < 0:
+        elapsed = None
     metadata = {
         **outcome.metadata_extra,
         "provider": outcome.provider,
         "model": outcome.model,
         "returncode": returncode,
         "timed_out": timed_out,
-        "elapsed_ms": int(outcome.elapsed_ms),
         "stderr": outcome.stderr,
         "usage_normalized": usage_block,
         "cost_normalized": cost_block,
+        **({"elapsed_ms": int(elapsed)} if elapsed is not None else {}),
     }
-    extra_metrics = {**outcome.metrics_extra, "elapsed_ms": int(outcome.elapsed_ms), "returncode": returncode}
+    extra_metrics = {**outcome.metrics_extra, "returncode": returncode,
+                     "observation_complete": returncode == 0 and not timed_out,
+                     **({"elapsed_ms": int(elapsed)} if elapsed is not None else {})}
     events, metrics = write_trace_artifacts(
         run_dir,
         trace_text,
@@ -4123,7 +4254,7 @@ def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | No
                                        max_price=max_price, max_tokens=max_tokens)
         except ValueError as exc:
             return {"answer": "", "stdout": "", "stderr": str(exc), "returncode": 127,
-                    "timed_out": False, "elapsed_ms": 0, "usage": None, "cost_usd": None,
+                    "timed_out": False, "elapsed_ms": None, "usage": None, "cost_usd": None,
                     "model": model, "trace_text": "", "environment": env_meta}
         result = run_argv_capture(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
     messages = parse_vibe_messages(result.stdout)
@@ -4168,7 +4299,7 @@ class CodexBackend(AgentBackend):
         return RunnerOutcome(
             provider="codex", answer=result.get("answer"),
             returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)), timeout_s=request.timeout_s,
-            elapsed_ms=result.get("elapsed_ms") or 0, stderr=result.get("stderr", ""),
+            elapsed_ms=result.get("elapsed_ms") if isinstance(result.get("elapsed_ms"), (int, float)) else None, stderr=result.get("stderr", ""),
             trace_text=result.get("trace_text") or "", model=request.model,
             environment={"runner": "codex", **dict(result.get("environment") or {})})
 
@@ -4183,7 +4314,7 @@ class ClaudeBackend(AgentBackend):
         return RunnerOutcome(
             provider="claude", answer=result.get("answer") or "",
             returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
-            timeout_s=request.timeout_s, elapsed_ms=result.get("elapsed_ms") or 0, stderr=result.get("stderr", ""),
+            timeout_s=request.timeout_s, elapsed_ms=result.get("elapsed_ms") if isinstance(result.get("elapsed_ms"), (int, float)) else None, stderr=result.get("stderr", ""),
             usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
             metadata_extra={"cost_usd": claude_metrics.get("cost_usd")}, metrics_extra=metrics_extra,
             environment={"runner": "claude", "command": "claude -p --output-format json --no-session-persistence", "cwd": "<isolated workspace>"})
@@ -4207,7 +4338,7 @@ class VibeBackend(AgentBackend):
         return RunnerOutcome(
             provider="vibe", answer=result.get("answer") or "",
             returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
-            timeout_s=request.timeout_s, elapsed_ms=result.get("elapsed_ms") or 0, stderr=result.get("stderr", ""),
+            timeout_s=request.timeout_s, elapsed_ms=result.get("elapsed_ms") if isinstance(result.get("elapsed_ms"), (int, float)) else None, stderr=result.get("stderr", ""),
             usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
             trace_text=result.get("trace_text") or "",
             environment={"runner": "vibe", **env})
@@ -4228,7 +4359,15 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
         row_model = task.get("model") or model
         base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
         base.mkdir(parents=True, exist_ok=True)
-        prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
+        prov_extra = {
+            "population": "answer",
+            "case_id": pt.case_id,
+            "run_number": task.get("run_number", 1),
+            "variant": pt.variant_truth,
+            "billing_scope": "run",
+            **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
+            **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {}),
+        }
         with tempfile.TemporaryDirectory(prefix=f"{backend.name}-ws-") as wd:
             ws = Path(wd)
             skill_rel, input_rel = build_skill_workspace(pt, ws)
@@ -5471,7 +5610,15 @@ def run_subagent_tasks(
         row_model = task.get("model") or model
         base = safe_child_path(runs, str(pt.run_dir or f"{pt.case_id or 'case'}/{pt.variant_truth or 'variant'}"))
         base.mkdir(parents=True, exist_ok=True)
-        prov_extra = {**({"ablation": pt.ablation.as_dict()} if pt.ablation else {}), **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {})}
+        prov_extra = {
+            "population": "answer",
+            "case_id": pt.case_id,
+            "run_number": task.get("run_number", 1),
+            "variant": pt.variant_truth,
+            "billing_scope": "run",
+            **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
+            **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {}),
+        }
         store = ToolReplayStore(base / "tool-replay.json", mode) if mode != "off" else None
 
         def tool_executor(tool: str, payload: Any) -> Any:
@@ -6234,15 +6381,25 @@ def grade_case_variant(
 def anthropic_grading_json(result: dict[str, Any]) -> dict[str, Any]:
     expectations = expectation_texts(result)
     meta = result.get("metadata", {}) or {}
-    elapsed = metric_number(meta, "elapsed_ms")
-    if elapsed is None:
-        elapsed = metric_number(meta, "duration_ms")
-    timing = {}
-    if elapsed is not None:
-        timing["executor_duration_seconds"] = round(elapsed / 1000, 3)
-        timing["total_duration_seconds"] = round(elapsed / 1000, 3)
-    if metric_number(meta, "total_tokens") is not None:
-        timing["total_tokens"] = int(metric_number(meta, "total_tokens") or 0)
+    elapsed = telemetry_domain.measurement_from_envelope_or_nonnegative(meta, "elapsed_ms")
+    tokens = telemetry_domain.measurement_from_envelope_or_usage(meta, "total_tokens")
+    tool_calls = telemetry_domain.measurement_from_envelope_or_nonnegative(meta, "tool_calls")
+    timing: dict[str, Any] = {}
+    telemetry_status: dict[str, Any] = {}
+    if elapsed.availability == telemetry_domain.AVAILABLE:
+        timing["executor_duration_seconds"] = round(float(elapsed.value) / 1000, 3)
+        timing["total_duration_seconds"] = round(float(elapsed.value) / 1000, 3)
+    else:
+        telemetry_status["timing"] = elapsed.to_dict()
+    if tokens.availability == telemetry_domain.AVAILABLE:
+        timing["total_tokens"] = int(tokens.value)
+    else:
+        telemetry_status["total_tokens"] = tokens.to_dict()
+    execution_metrics: dict[str, Any] = {}
+    if tool_calls.availability == telemetry_domain.AVAILABLE:
+        execution_metrics["total_tool_calls"] = int(tool_calls.value)
+    else:
+        telemetry_status["total_tool_calls"] = tool_calls.to_dict()
     total = result.get("combined_total", result.get("objective_total", 0))
     passed = result.get("combined_passed", result.get("objective_passed", 0))
     return {
@@ -6253,13 +6410,8 @@ def anthropic_grading_json(result: dict[str, Any]) -> dict[str, Any]:
             "total": total,
             "pass_rate": result.get("combined_pass_rate", result.get("objective_pass_rate")),
         },
-        "execution_metrics": {
-            "tool_calls": meta.get("tool_calls", {}),
-            "total_tool_calls": meta.get("total_tool_calls", 0),
-            "errors_encountered": meta.get("errors_encountered", 0),
-            "output_chars": meta.get("output_chars", 0),
-            "transcript_chars": meta.get("transcript_chars", 0),
-        },
+        "execution_metrics": execution_metrics,
+        "telemetry": telemetry_status,
         "timing": timing,
         "claims": [],
         "user_notes_summary": {"uncertainties": [], "needs_review": [], "workarounds": []},
@@ -6330,13 +6482,22 @@ def telemetry_for_result(result: dict[str, Any]) -> dict[str, bool]:
     metrics_exists = (base / "metrics.json").exists()
     events, _ = read_events_base(base) if events_exists else (None, None)
     has_skill_event = bool(events and any(e.get("type") == "skill_load" for e in events))
+    envelope = metrics.get("telemetry") if isinstance(metrics.get("telemetry"), dict) else {}
+    measurements = envelope.get("measurements") if isinstance(envelope, dict) else {}
+
+    def observed(key: str, fallback: bool) -> bool:
+        measurement = measurements.get(key) if isinstance(measurements, dict) else None
+        if isinstance(measurement, dict):
+            return measurement.get("availability") == telemetry_domain.AVAILABLE
+        return fallback
+
     return {
         "trace": (base / "trace.jsonl").exists(),
         "events": events_exists,
         "metrics": metrics_exists,
-        "tokens": metric_number(metrics, "total_tokens") is not None,
-        "commands": metric_number(metrics, "commands", "command_count") is not None or events_exists,
-        "skill_invocation": isinstance(metrics.get("skill_invoked"), bool) or has_skill_event,
+        "tokens": observed("total_tokens", metric_number(metrics, "total_tokens") is not None),
+        "commands": observed("commands", metric_number(metrics, "commands", "command_count") is not None or events_exists),
+        "skill_invocation": observed("skill_invoked", isinstance(metrics.get("skill_invoked"), bool) or has_skill_event),
     }
 
 
@@ -7047,6 +7208,11 @@ def p90(values: list[float]) -> float | None:
 
 
 def cost_stats(values: list[float]) -> dict[str, Any]:
+    """Statistics for already-observed values.
+
+    New report paths pair this with ``measurement_stats`` below so the scalar
+    statistics cannot hide whether other runs were unavailable.
+    """
     clean = [float(v) for v in values if v is not None]
     if not clean:
         return {"sum": None, "mean": None, "median": None, "p90": None, "n": 0}
@@ -7059,23 +7225,146 @@ def cost_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
+def _row_measurement(row: dict[str, Any], key: str):
+    measurement = row.get(f"{key}_measurement")
+    if isinstance(measurement, telemetry_domain.Measurement):
+        return measurement
+    return telemetry_domain.measurement_from_nonnegative(
+        row.get(key), unavailable_reason=f"missing_{key}",
+        basis=telemetry_domain.basis_from_run(row, source=str(row.get("runner") or "")),
+    )
+
+
+def _cost_measurement(row: dict[str, Any]):
+    measurement = row.get("cost_measurement")
+    if isinstance(measurement, telemetry_domain.Measurement):
+        return measurement
+    return telemetry_domain.measurement_from_cost_block(
+        None, legacy_value=row.get("cost_usd"),
+        basis=telemetry_domain.basis_from_run(row, source=str(row.get("runner") or "")),
+    )
+
+
+def _numeric_aggregate_fields(name: str, aggregate: telemetry_domain.Aggregate[Any]) -> dict[str, Any]:
+    """Expose an additive status object plus safe compatibility scalar fields."""
+    out: dict[str, Any] = {
+        name: aggregate.scalar_if_complete(),
+        f"{name}_aggregate": aggregate.to_dict(),
+        f"{name}_availability": aggregate.availability,
+    }
+    if aggregate.availability == telemetry_domain.PARTIAL:
+        out[f"known_{name}"] = aggregate.known_subtotal
+    return out
+
+
+def _money_aggregate_fields(measurements: list[telemetry_domain.Measurement[Any]]) -> dict[str, Any]:
+    buckets = telemetry_domain.aggregate_money_by_currency(measurements)
+    usd = buckets.get("USD")
+    if usd is None:
+        unknown = buckets.get("unknown")
+        if unknown is not None:
+            usd = unknown
+        else:
+            usd = telemetry_domain.Aggregate(
+                telemetry_domain.UNAVAILABLE,
+                unavailable_count=0,
+                reason_counts={"currency_mismatch": sum(a.observed_count for a in buckets.values())},
+            )
+    fields = _numeric_aggregate_fields("total_cost_usd", usd)
+    # Decimal wire values stay exact inside the status object; compatibility
+    # scalars remain JSON numbers only when the aggregate is complete.
+    if fields["total_cost_usd"] is not None:
+        fields["total_cost_usd"] = float(fields["total_cost_usd"])
+    if "known_total_cost_usd" in fields:
+        fields["known_total_cost_usd"] = float(fields["known_total_cost_usd"])
+    fields["cost_by_currency"] = {currency: aggregate.to_dict() for currency, aggregate in buckets.items()}
+    return fields
+
+
+def measurement_stats(measurements: list[telemetry_domain.Measurement[Any]]) -> dict[str, Any]:
+    """Stats plus availability; a partial set has a known sum, never a total."""
+    aggregate = telemetry_domain.aggregate_numeric(measurements)
+    values = [float(m.value) for m in measurements if m.availability == telemetry_domain.AVAILABLE]
+    out = cost_stats(values)
+    out["availability"] = aggregate.availability
+    out["aggregate"] = aggregate.to_dict()
+    if aggregate.availability != telemetry_domain.COMPLETE:
+        for key in ("sum", "mean", "median", "p90"):
+            out[key] = None
+        if aggregate.availability == telemetry_domain.PARTIAL:
+            out["known_sum"] = float(aggregate.known_subtotal)
+    return out
+
+
+def money_measurement_stats(measurements: list[telemetry_domain.Measurement[Any]], currency: str = "USD") -> dict[str, Any]:
+    buckets = telemetry_domain.aggregate_money_by_currency(measurements)
+    aggregate = buckets.get(currency) or buckets.get("unknown")
+    if aggregate is None:
+        aggregate = telemetry_domain.Aggregate(telemetry_domain.UNAVAILABLE, reason_counts={"currency_mismatch": 1})
+    values = [float(m.value.amount) for m in measurements
+              if m.availability == telemetry_domain.AVAILABLE and isinstance(m.value, telemetry_domain.Money)
+              and m.value.currency == currency]
+    out = cost_stats(values)
+    out["availability"] = aggregate.availability
+    out["aggregate"] = aggregate.to_dict()
+    if aggregate.availability != telemetry_domain.COMPLETE:
+        for key in ("sum", "mean", "median", "p90"):
+            out[key] = None
+        if aggregate.availability == telemetry_domain.PARTIAL:
+            out["known_sum"] = float(aggregate.known_subtotal)
+    return out
+
+
 def result_cost_facts(result: dict[str, Any]) -> dict[str, Any]:
     merged = dict(result.get("metadata", {}) or {})
     merged.update(read_metrics_base(Path(result.get("run_base", ""))))
     facts = run_cost_facts(merged)
-    facts["elapsed_ms"] = metric_number(merged, "elapsed_ms")
+    elapsed_measurement = telemetry_domain.measurement_from_envelope_or_nonnegative(
+        merged, "elapsed_ms", source=str(merged.get("provider") or merged.get("runner") or ""))
+    facts["elapsed_ms_measurement"] = elapsed_measurement
+    facts["elapsed_ms"] = elapsed_measurement.value if elapsed_measurement.availability == telemetry_domain.AVAILABLE else None
     return facts
 
 
+def bind_telemetry_pair_identity(facts: dict[str, Any], *, case_id: str, run_number: int,
+                                  variant: str | None = None, model: str | None = None,
+                                  population: str = "answer") -> dict[str, Any]:
+    """Attach identity known by the report/discovery layer to immutable facts."""
+    updates = {"case_id": case_id, "run_number": run_number, "variant": variant,
+               "model": model, "population": population}
+    out = dict(facts)
+    for key in ("input_tokens_measurement", "output_tokens_measurement", "total_tokens_measurement",
+                "cost_measurement", "elapsed_ms_measurement"):
+        measurement = out.get(key)
+        if isinstance(measurement, telemetry_domain.Measurement):
+            out[key] = telemetry_domain.with_basis(measurement, **updates)
+    for key, measurement_key in (("input_tokens", "input_tokens_measurement"),
+                                 ("output_tokens", "output_tokens_measurement"),
+                                 ("total_tokens", "total_tokens_measurement"),
+                                 ("cost_usd", "cost_measurement"),
+                                 ("elapsed_ms", "elapsed_ms_measurement")):
+        measurement = out.get(measurement_key)
+        if isinstance(measurement, telemetry_domain.Measurement):
+            value = measurement.value if measurement.availability == telemetry_domain.AVAILABLE else None
+            if key == "cost_usd" and isinstance(value, telemetry_domain.Money):
+                out[key] = float(value.amount) if value.currency == "USD" else None
+            else:
+                out[key] = value
+    return out
+
+
 def spend_of(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """One spend slot — {runs, total_tokens, total_cost_usd} — over cost-fact
-    rows. Missing telemetry contributes nothing (never a fake zero row). THE
-    accumulator behind every by-case/by-variant/by-runner/ablation spend view
-    in both cost ledgers (previously five hand-rolled folds)."""
+    """Availability-aware spend for one group.
+
+    ``total_*`` is populated only when every run has a compatible observation.
+    Partial groups expose ``known_total_*`` and an aggregate status instead of
+    calling a subtotal a total or turning an empty fold into zero.
+    """
+    token_aggregate = telemetry_domain.aggregate_numeric([_row_measurement(r, "total_tokens") for r in rows])
     return {
         "runs": len(rows),
-        "total_tokens": int(sum(r["total_tokens"] for r in rows if r.get("total_tokens") is not None)),
-        "total_cost_usd": round(sum(r["cost_usd"] for r in rows if r.get("cost_usd") is not None), 6),
+        **_numeric_aggregate_fields("total_tokens", token_aggregate),
+        **_money_aggregate_fields([_cost_measurement(r) for r in rows]),
     }
 
 
@@ -7087,27 +7376,45 @@ def group_spend(rows: list[dict[str, Any]], key_fn) -> dict[str, dict[str, Any]]
 
 
 def cost_coverage_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Coverage separates missing telemetry from zero spend — identical keys in
-    the benchmark cost_summary and the standalone suite ledger by construction."""
+    """Coverage separates measured zero, unavailable, and N/A telemetry."""
     runs_seen = len(rows)
-    with_usage = sum(1 for r in rows if r.get("total_tokens") is not None)
-    with_cost = sum(1 for r in rows if r.get("cost_usd") is not None)
-    return {
+    usage = [_row_measurement(r, "total_tokens") for r in rows]
+    costs = [_cost_measurement(r) for r in rows]
+    with_usage = sum(1 for m in usage if m.availability == telemetry_domain.AVAILABLE)
+    with_any_cost = sum(1 for m in costs if m.availability == telemetry_domain.AVAILABLE)
+    with_usd_cost = sum(1 for m in costs if m.availability == telemetry_domain.AVAILABLE
+                        and isinstance(m.value, telemetry_domain.Money) and m.value.currency == "USD")
+    with_non_usd_cost = with_any_cost - with_usd_cost
+    na_usage = sum(1 for m in usage if m.availability == telemetry_domain.NOT_APPLICABLE)
+    na_cost = sum(1 for m in costs if m.availability == telemetry_domain.NOT_APPLICABLE)
+    out = {
         "runs_seen": runs_seen,
         "runs_with_token_usage": with_usage,
-        "runs_with_dollar_cost": with_cost,
-        "runs_missing_usage": runs_seen - with_usage,
-        "runs_missing_cost": runs_seen - with_cost,
+        # Dollar coverage is intentionally USD-only: suite budget estimates
+        # consume this denominator alongside total_cost_usd.
+        "runs_with_dollar_cost": with_usd_cost,
+        "runs_with_non_usd_cost": with_non_usd_cost,
+        "runs_missing_usage": runs_seen - with_usage - na_usage,
+        "runs_missing_cost": runs_seen - with_any_cost - na_cost,
     }
+    if na_usage:
+        out["runs_not_applicable_usage"] = na_usage
+    if na_cost:
+        out["runs_not_applicable_cost"] = na_cost
+    return out
 
 
 def cost_totals_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    input_aggregate = telemetry_domain.aggregate_numeric([_row_measurement(r, "input_tokens") for r in rows])
+    output_aggregate = telemetry_domain.aggregate_numeric([_row_measurement(r, "output_tokens") for r in rows])
+    total_aggregate = telemetry_domain.aggregate_numeric([_row_measurement(r, "total_tokens") for r in rows])
+    elapsed_aggregate = telemetry_domain.aggregate_numeric([_row_measurement(r, "elapsed_ms") for r in rows])
     return {
-        "input_tokens": int(sum(r["input_tokens"] for r in rows if r.get("input_tokens") is not None)),
-        "output_tokens": int(sum(r["output_tokens"] for r in rows if r.get("output_tokens") is not None)),
-        "total_tokens": int(sum(r["total_tokens"] for r in rows if r.get("total_tokens") is not None)),
-        "total_cost_usd": round(sum(r["cost_usd"] for r in rows if r.get("cost_usd") is not None), 6),
-        "elapsed_ms_sum": int(sum(r["elapsed_ms"] for r in rows if r.get("elapsed_ms") is not None)),
+        **_numeric_aggregate_fields("input_tokens", input_aggregate),
+        **_numeric_aggregate_fields("output_tokens", output_aggregate),
+        **_numeric_aggregate_fields("total_tokens", total_aggregate),
+        **_money_aggregate_fields([_cost_measurement(r) for r in rows]),
+        **_numeric_aggregate_fields("elapsed_ms_sum", elapsed_aggregate),
     }
 
 
@@ -7116,9 +7423,15 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
     design: EVERY run counts here, including execution errors — a timed-out
     run still cost money — while quality rates elsewhere keep excluding them.
     Coverage separates missing telemetry from zero spend."""
-    rows = [{**result_cost_facts(r), "case_id": r["case_id"], "variant": r["variant"],
-             "missing_output": r.get("missing_output"), "execution_valid": r.get("execution_valid", True)}
-            for r in results]
+    rows = []
+    for result in results:
+        facts = bind_telemetry_pair_identity(
+            result_cost_facts(result), case_id=result["case_id"], run_number=int(result.get("run_number", 1)),
+            variant=result["variant"], model=result.get("model"), population="answer")
+        rows.append({**facts, "case_id": result["case_id"], "variant": result["variant"],
+                     "run_number": result.get("run_number", 1), "model": result.get("model"),
+                     "missing_output": result.get("missing_output"),
+                     "execution_valid": result.get("execution_valid", True)})
     totals = {
         **cost_totals_block(rows),
         "execution_errors": sum(1 for r in rows if not r.get("missing_output") and not r.get("execution_valid", True)),
@@ -7128,32 +7441,71 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
         vrows = [r for r in rows if r["variant"] == variant]
         by_variant[variant] = {
             "runs": len(vrows),
-            "tokens": cost_stats([r["total_tokens"] for r in vrows if r.get("total_tokens") is not None]),
-            "cost_usd": cost_stats([r["cost_usd"] for r in vrows if r.get("cost_usd") is not None]),
+            "tokens": measurement_stats([_row_measurement(r, "total_tokens") for r in vrows]),
+            "cost_usd": money_measurement_stats([_cost_measurement(r) for r in vrows]),
         }
     by_case = group_spend(rows, lambda r: r["case_id"])
     paired_cost_delta: dict[str, Any] = {}
-    deltas = []
+    deltas_by_currency: dict[str, list[float]] = collections.defaultdict(list)
     for case_id in by_case:
-        with_costs = [r["cost_usd"] for r in rows if r["case_id"] == case_id and r["variant"] == "with_skill" and r.get("cost_usd") is not None]
-        without_costs = [r["cost_usd"] for r in rows if r["case_id"] == case_id and r["variant"] == "without_skill" and r.get("cost_usd") is not None]
-        if with_costs and without_costs:
-            delta = statistics.mean(with_costs) - statistics.mean(without_costs)
-            paired_cost_delta[case_id] = {"with_skill": round(statistics.mean(with_costs), 6), "without_skill": round(statistics.mean(without_costs), 6), "delta": round(delta, 6)}
-            deltas.append(delta)
+        with_rows = {(r.get("model"), r.get("run_number", 1)): r for r in rows if r["case_id"] == case_id and r["variant"] == "with_skill"}
+        without_rows = {(r.get("model"), r.get("run_number", 1)): r for r in rows if r["case_id"] == case_id and r["variant"] == "without_skill"}
+        comparisons = [telemetry_domain.compare_cost_pair(
+            _cost_measurement(with_rows[key]), _cost_measurement(without_rows[key]),
+            left_scorable=scorable_run(with_rows[key]), right_scorable=scorable_run(without_rows[key]))
+                       for key in sorted(set(with_rows) & set(without_rows), key=str)]
+        comparable = [c for c in comparisons if c.availability == telemetry_domain.COMPARABLE]
+        blocked = [str(c.reason) for c in comparisons if c.availability == telemetry_domain.BLOCKED]
+        if comparable:
+            by_currency: dict[str, list[Any]] = collections.defaultdict(list)
+            for comparison in comparable:
+                by_currency[comparison.value.currency].append(comparison)
+            for currency, currency_comparisons in by_currency.items():
+                deltas_by_currency[currency].append(statistics.mean(float(c.value.amount) for c in currency_comparisons))
+            if len(by_currency) == 1:
+                currency, currency_comparisons = next(iter(by_currency.items()))
+                values = [float(c.value.amount) for c in currency_comparisons]
+                delta = statistics.mean(values)
+                paired_cost_delta[case_id] = {
+                    "availability": "comparable", "currency": currency,
+                    "delta": round(delta, 6), "eligible_pairs": len(comparable),
+                    "blocked_pairs": len(blocked), "blocked_reason_counts": dict(collections.Counter(blocked)),
+                }
+            else:
+                paired_cost_delta[case_id] = {
+                    "availability": "blocked", "delta": None, "reason": "mixed_currency_pairs",
+                    "by_currency": {currency: {"delta": round(statistics.mean(float(c.value.amount) for c in cs), 6),
+                                                "eligible_pairs": len(cs)} for currency, cs in by_currency.items()},
+                    "eligible_pairs": len(comparable), "blocked_pairs": len(blocked),
+                    "blocked_reason_counts": dict(collections.Counter(blocked)),
+                }
+        else:
+            paired_cost_delta[case_id] = {
+                "availability": "blocked",
+                "delta": None,
+                "eligible_pairs": 0,
+                "blocked_pairs": len(blocked),
+                "blocked_reason_counts": dict(collections.Counter(blocked or ["missing_pair"])),
+            }
     ablation_spend = spend_of([r for r in rows if is_ablation_variant(r.get("variant", ""))])
     ablation_cost = ablation_spend["total_cost_usd"]
     out: dict[str, Any] = {
+        "telemetry_schema_version": 3,
         "coverage": cost_coverage_block(rows),
         "totals": totals,
         "by_variant": by_variant,
         "by_case": by_case,
         "paired_cost_delta": paired_cost_delta,
-        "mean_paired_cost_delta": round(statistics.mean(deltas), 6) if deltas else None,
+        # A bare paired delta is USD-only; foreign-currency results retain their
+        # own units rather than being silently labelled dollars.
+        "mean_paired_cost_delta": round(statistics.mean(deltas_by_currency["USD"]), 6) if deltas_by_currency.get("USD") else None,
+        "mean_paired_cost_delta_basis": {"currency": "USD"} if deltas_by_currency.get("USD") else None,
+        "mean_paired_cost_delta_by_currency": {currency: round(statistics.mean(values), 6)
+                                                  for currency, values in sorted(deltas_by_currency.items())},
         "ablations": {
             **ablation_spend,
             "confirmed_regressions": confirmed_regressions,
-            "cost_per_confirmed_regression": round(ablation_cost / confirmed_regressions, 6) if confirmed_regressions and ablation_cost else None,
+            "cost_per_confirmed_regression": round(ablation_cost / confirmed_regressions, 6) if confirmed_regressions and ablation_cost is not None else None,
         },
     }
     if judge_results:
@@ -7177,11 +7529,16 @@ def judge_cost_usd(row: dict[str, Any]) -> float | None:
 
 
 def judge_cost_block(judge_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    costs = [c for c in (judge_cost_usd(row) for row in judge_results.values()) if c is not None]
+    measurements = [
+        telemetry_domain.measurement_from_envelope_or_cost(
+            row, source=str(row.get("provider") or "judge"), population="judge")
+        for row in judge_results.values()
+    ]
+    available = sum(1 for measurement in measurements if measurement.availability == telemetry_domain.AVAILABLE)
     return {
         "verdicts": len(judge_results),
-        "verdicts_with_cost": len(costs),
-        "total_cost_usd": round(sum(costs), 6) if costs else None,
+        "verdicts_with_cost": available,
+        **_money_aggregate_fields(measurements),
     }
 
 
@@ -7232,19 +7589,18 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     # Timing/token/command central tendencies describe SCORABLE runs, matching
     # the pass-rate block above — a timed-out run's full duration must not drag
     # the mean (the failure count is disclosed separately as execution_errors).
-    merged_metrics = []
-    for r in scorable_rows:
-        merged = dict(r.get("metadata", {}) or {})
-        merged.update(read_metrics_base(Path(r.get("run_base", ""))))
-        merged_metrics.append(merged)
-    elapsed = [metric_number(m, "elapsed_ms") for m in merged_metrics]
-    tokens = [metric_number(m, "total_tokens") for m in merged_metrics]
-    commands = [metric_number(m, "commands", "command_count") for m in merged_metrics]
-    costs = [metric_number(m, "cost_usd") for m in merged_metrics]
-    elapsed = [x for x in elapsed if x is not None]
-    tokens = [x for x in tokens if x is not None]
-    commands = [x for x in commands if x is not None]
-    costs = [x for x in costs if x is not None]
+    facts = [result_cost_facts(r) for r in scorable_rows]
+    command_measurements = []
+    for row in scorable_rows:
+        merged = dict(row.get("metadata", {}) or {})
+        merged.update(read_metrics_base(Path(row.get("run_base", ""))))
+        command_measurements.append(telemetry_domain.measurement_from_envelope_or_nonnegative(merged, "commands"))
+    elapsed_measurements = [fact["elapsed_ms_measurement"] for fact in facts]
+    token_measurements = [fact["total_tokens_measurement"] for fact in facts]
+    cost_measurements = [fact["cost_measurement"] for fact in facts]
+    cost_total = _money_aggregate_fields(cost_measurements)
+    elapsed = [m.value for m in elapsed_measurements if m.availability == telemetry_domain.AVAILABLE]
+    tokens = [m.value for m in token_measurements if m.availability == telemetry_domain.AVAILABLE]
     return {
         "cases": len({r["case_id"] for r in rows}),
         "runs": len(rows),
@@ -7258,13 +7614,16 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "combined_pass_rate": stats(combined_rates),
         "process_pass_rate": stats(process_rates),
         "efficiency_pass_rate": stats(efficiency_rates),
-        "elapsed_ms": stats(elapsed),
-        "total_tokens": stats(tokens),
-        "command_count": stats(commands),
+        "elapsed_ms": measurement_stats(elapsed_measurements),
+        "total_tokens": measurement_stats(token_measurements),
+        "command_count": measurement_stats(command_measurements),
         # Real dollar cost, when a runner recorded it (the Claude adapter does).
-        # Sum, not mean: "what did this arm cost to run" — over scorable runs only.
-        "cost_usd_total": round(sum(costs), 6) if costs else None,
-        "cost_usd": stats(costs),
+        # A partial set has a named known subtotal, never a false total.
+        "cost_usd_total": cost_total["total_cost_usd"],
+        "cost_usd_total_aggregate": cost_total["total_cost_usd_aggregate"],
+        **({"known_cost_usd_total": cost_total["known_total_cost_usd"]}
+           if "known_total_cost_usd" in cost_total else {}),
+        "cost_usd": money_measurement_stats(cost_measurements),
         "telemetry_availability": telemetry_summary(rows),
         # Backward-compatible fields used by smoke_report.py callers.
         "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
@@ -7457,14 +7816,24 @@ def junit_xml_from_report(report: dict[str, Any]) -> str:
         ET.SubElement(props, "property", {"name": key, "value": "" if value is None else f"{value:.4f}"})
     failures = 0
     total_time = 0.0
+    missing_time = 0
     for r in results:
-        elapsed_ms = metric_number(r.get("metadata", {}) or {}, "elapsed_ms") or 0.0
-        total_time += elapsed_ms / 1000.0
-        tc = ET.SubElement(suite, "testcase", {
+        elapsed = telemetry_domain.measurement_from_envelope_or_nonnegative(
+            r.get("metadata", {}) or {}, "elapsed_ms")
+        attrs = {
             "classname": f"{skill}.{r.get('case_id')}",
             "name": f"{r.get('variant')}/run-{r.get('run_number', 1)}",
-            "time": f"{elapsed_ms / 1000.0:.3f}",
-        })
+        }
+        if elapsed.availability == telemetry_domain.AVAILABLE:
+            total_time += float(elapsed.value) / 1000.0
+            attrs["time"] = f"{float(elapsed.value) / 1000.0:.3f}"
+        else:
+            missing_time += 1
+            ET.SubElement(props, "property", {
+                "name": f"telemetry.elapsed_ms.{r.get('case_id')}.{r.get('variant')}.run-{r.get('run_number', 1)}",
+                "value": elapsed.availability if elapsed.availability != telemetry_domain.UNAVAILABLE else f"unavailable:{elapsed.reason}",
+            })
+        tc = ET.SubElement(suite, "testcase", attrs)
         lines = result_failure_lines(r)
         if lines:
             failures += 1
@@ -7473,7 +7842,10 @@ def junit_xml_from_report(report: dict[str, Any]) -> str:
     suite.set("tests", str(len(results)))
     suite.set("failures", str(failures))
     suite.set("errors", "0")
-    suite.set("time", f"{total_time:.3f}")
+    if missing_time:
+        ET.SubElement(props, "property", {"name": "telemetry.elapsed_ms.aggregate", "value": "partial"})
+    else:
+        suite.set("time", f"{total_time:.3f}")
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(suite, encoding="unicode")
 
 
@@ -7544,11 +7916,12 @@ def aggregate(args: argparse.Namespace) -> int:
             runs = Path(args.runs)
         reports.append(build_benchmark_report(manifest_path, runs, args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False)))
 
-    cross_totals: dict[str, float] = {}
-    for r in reports:
-        for key, value in (r.get("cost_summary", {}).get("totals") or {}).items():
-            if isinstance(value, (int, float)):
-                cross_totals[key] = cross_totals.get(key, 0) + value
+    # Re-aggregate run facts rather than summing report scalars: a partial
+    # per-skill known subtotal is not a complete cross-skill total.
+    cross_rows = [
+        {**result_cost_facts(row), "case_id": row.get("case_id"), "variant": row.get("variant")}
+        for report in reports for row in report.get("results", [])
+    ]
     aggregate_summary: dict[str, Any] = {
         "skills": len(reports),
         "case_variant_rows": sum(len(r["results"]) for r in reports),
@@ -7556,7 +7929,8 @@ def aggregate(args: argparse.Namespace) -> int:
         "by_skill": {r["skill_name"]: r["summary"] for r in reports},
         # Cross-skill spend ledger (issue #21): which skills dominate the bill.
         "cost_summary": {
-            "totals": {k: (round(v, 6) if isinstance(v, float) else v) for k, v in cross_totals.items()},
+            "coverage": cost_coverage_block(cross_rows),
+            "totals": cost_totals_block(cross_rows),
             "by_skill": {r["skill_name"]: (r.get("cost_summary", {}).get("totals") or {}) for r in reports},
         },
         "flags": [
@@ -7591,23 +7965,35 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
     runs = []
     for r in report["results"]:
         meta = r.get("metadata", {}) or {}
-        elapsed_ms = metric_number(meta, "elapsed_ms", "duration_ms") or 0.0
-        tokens = metric_number(meta, "total_tokens") or 0.0
+        elapsed = telemetry_domain.measurement_from_envelope_or_nonnegative(meta, "elapsed_ms")
+        tokens = telemetry_domain.measurement_from_envelope_or_usage(meta, "total_tokens")
+        tool_calls = telemetry_domain.measurement_from_envelope_or_nonnegative(meta, "tool_calls")
+        result = {
+            "pass_rate": r.get("combined_pass_rate") if r.get("combined_pass_rate") is not None else r.get("objective_pass_rate", 0.0),
+            "passed": r.get("combined_passed", r.get("objective_passed", 0)),
+            "failed": r.get("combined_total", r.get("objective_total", 0)) - r.get("combined_passed", r.get("objective_passed", 0)),
+            "total": r.get("combined_total", r.get("objective_total", 0)),
+        }
+        availability: dict[str, Any] = {}
+        if elapsed.availability == telemetry_domain.AVAILABLE:
+            result["time_seconds"] = round(float(elapsed.value) / 1000, 3)
+        else:
+            availability["time_seconds"] = elapsed.to_dict()
+        if tokens.availability == telemetry_domain.AVAILABLE:
+            result["tokens"] = int(tokens.value)
+        else:
+            availability["tokens"] = tokens.to_dict()
+        if tool_calls.availability == telemetry_domain.AVAILABLE:
+            result["tool_calls"] = int(tool_calls.value)
+        else:
+            availability["tool_calls"] = tool_calls.to_dict()
         runs.append({
             "eval_id": r["case_id"],
             "eval_name": r["case_id"],
             "configuration": r["variant"],
             "run_number": r.get("run_number", 1),
-            "result": {
-                "pass_rate": r.get("combined_pass_rate") if r.get("combined_pass_rate") is not None else r.get("objective_pass_rate", 0.0),
-                "passed": r.get("combined_passed", r.get("objective_passed", 0)),
-                "failed": r.get("combined_total", r.get("objective_total", 0)) - r.get("combined_passed", r.get("objective_passed", 0)),
-                "total": r.get("combined_total", r.get("objective_total", 0)),
-                "time_seconds": round(elapsed_ms / 1000, 3),
-                "tokens": int(tokens),
-                "tool_calls": int(meta.get("total_tool_calls", 0) or 0),
-                "errors": int(meta.get("errors_encountered", 0) or (1 if meta.get("returncode", 0) else 0)),
-            },
+            "result": result,
+            "telemetry": availability,
             "expectations": expectation_texts(r),
             "notes": [],
         })
@@ -7617,19 +8003,27 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
         pr = summary.get("combined_pass_rate") or summary.get("objective_pass_rate") or {}
         tm = summary.get("elapsed_ms") or {}
         tk = summary.get("total_tokens") or {}
+        def copied_stats(values: dict[str, Any], *, divide: float = 1.0) -> dict[str, Any]:
+            out = {key: (float(values[key]) / divide if isinstance(values.get(key), (int, float)) else None)
+                   for key in ("mean", "stddev", "min", "max")}
+            if values.get("availability") not in (None, telemetry_domain.COMPLETE):
+                out["availability"] = values.get("availability")
+            return out
+
         run_summary[variant] = {
-            "pass_rate": {"mean": pr.get("mean", 0.0) or 0.0, "stddev": pr.get("stddev", 0.0) or 0.0, "min": pr.get("min", 0.0) or 0.0, "max": pr.get("max", 0.0) or 0.0},
-            "time_seconds": {"mean": ((tm.get("mean") or 0.0) / 1000), "stddev": ((tm.get("stddev") or 0.0) / 1000), "min": ((tm.get("min") or 0.0) / 1000), "max": ((tm.get("max") or 0.0) / 1000)},
-            "tokens": {"mean": tk.get("mean", 0.0) or 0.0, "stddev": tk.get("stddev", 0.0) or 0.0, "min": tk.get("min", 0.0) or 0.0, "max": tk.get("max", 0.0) or 0.0},
+            "pass_rate": copied_stats(pr),
+            "time_seconds": copied_stats(tm, divide=1000),
+            "tokens": copied_stats(tk),
         }
     configs = [k for k in run_summary.keys() if k != "delta"]
     if len(configs) >= 2:
         a, b = configs[0], configs[1]
-        run_summary["delta"] = {
-            "pass_rate": f"{run_summary[a]['pass_rate']['mean'] - run_summary[b]['pass_rate']['mean']:+.2f}",
-            "time_seconds": f"{run_summary[a]['time_seconds']['mean'] - run_summary[b]['time_seconds']['mean']:+.1f}",
-            "tokens": f"{run_summary[a]['tokens']['mean'] - run_summary[b]['tokens']['mean']:+.0f}",
-        }
+        deltas = {}
+        for key, digits in (("pass_rate", 2), ("time_seconds", 1), ("tokens", 0)):
+            left = run_summary[a][key]["mean"]
+            right = run_summary[b][key]["mean"]
+            deltas[key] = f"{left - right:+.{digits}f}" if left is not None and right is not None else None
+        run_summary["delta"] = deltas
     return {
         "metadata": {
             "skill_name": report.get("skill_name", "<skill-name>"),
@@ -8022,6 +8416,96 @@ def migrate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def migrate_telemetry_command(args: argparse.Namespace) -> int:
+    """Upgrade run artifacts to the additive, idempotent telemetry v3 envelope."""
+    runs = Path(args.runs)
+    if not runs.is_dir():
+        die(f"runs directory does not exist: {runs}")
+    bases = sorted({p.parent for name in ("metadata.json", "metrics.json") for p in runs.rglob(name)})
+    changed: list[str] = []
+    unchanged: list[str] = []
+    for base in bases:
+        docs: dict[str, dict[str, Any]] = {}
+        for name in ("metadata.json", "metrics.json"):
+            path = base / name
+            if not path.exists():
+                continue
+            data = read_json_dict_or_list(path)
+            if isinstance(data, dict) and not data.get("_error"):
+                docs[name] = dict(data)
+        if not docs:
+            continue
+        merged: dict[str, Any] = {}
+        for name in ("metadata.json", "metrics.json"):
+            merged.update(docs.get(name, {}))
+        source = str(merged.get("provider") or merged.get("runner") or merged.get("trace_source") or "legacy")
+        envelope = telemetry_domain.telemetry_envelope(
+            merged, source=source, population=str(merged.get("population") or "answer"),
+            legacy_unverified=not (isinstance(merged.get("telemetry"), dict)
+                                   and merged["telemetry"].get("schema_version") == 3),
+        )
+        updated: dict[str, dict[str, Any]] = {}
+        for name in ("metadata.json", "metrics.json"):
+            # A v3 run contract always has both consumers' artifacts. For an old
+            # one-file run, mirror the audit fields rather than inventing metrics.
+            next_data = dict(docs.get(name, merged))
+            next_data.setdefault("usage_normalized", {"source": "missing"})
+            next_data.setdefault("cost_normalized", {"source": "missing"})
+            next_data["telemetry_schema_version"] = 3
+            next_data["telemetry"] = envelope
+            updated[name] = next_data
+        if all((base / name).exists() and updated[name] == docs.get(name) for name in updated):
+            unchanged.append(str(base))
+            continue
+        changed.append(str(base))
+        if not getattr(args, "check", False):
+            staged: list[tuple[Path, Path]] = []
+            backups: list[tuple[Path, Path]] = []
+            installed: list[Path] = []
+            try:
+                for name, data in updated.items():
+                    path = base / name
+                    tmp = path.with_suffix(path.suffix + ".telemetry-v3.tmp")
+                    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                    staged.append((path, tmp))
+                # Keep recoverable siblings until every replacement succeeds;
+                # an interrupted migration cannot strand metadata ahead of metrics.
+                for path, _ in staged:
+                    if path.exists():
+                        backup = path.with_suffix(path.suffix + ".telemetry-v3.bak")
+                        os.replace(path, backup)
+                        backups.append((path, backup))
+                for path, tmp in staged:
+                    os.replace(tmp, path)
+                    installed.append(path)
+            except OSError:
+                # Only delete replacements that were actually installed. A
+                # later failed backup must leave an untouched sibling intact.
+                for path in installed:
+                    path.unlink(missing_ok=True)
+                for path, backup in reversed(backups):
+                    if backup.exists():
+                        os.replace(backup, path)
+                raise
+            else:
+                for _, backup in backups:
+                    backup.unlink(missing_ok=True)
+            finally:
+                for _, tmp in staged:
+                    tmp.unlink(missing_ok=True)
+    report = {
+        "telemetry_schema_version": 3,
+        "runs": str(runs),
+        "mode": "check" if getattr(args, "check", False) else "write",
+        "run_dirs_seen": len(bases),
+        "changed": len(changed),
+        "unchanged": len(unchanged),
+        "changed_run_dirs": changed,
+    }
+    emit_report(report, getattr(args, "out", None))
+    return 0
+
+
 def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict[str, Any] | None = None, judge_results: dict[str, dict[str, Any]] | None = None, top_n: int = 10) -> dict[str, Any]:
     """The standalone suite cost ledger (issue #21's cost-summary.json): walks
     the run tree per manifest case — every variant directory found on disk,
@@ -8031,9 +8515,17 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
     by_variant = group_spend(rows, lambda r: r["variant"])
     by_runner = group_spend(rows, lambda r: str(r.get("runner") or "unknown"))
     by_case = group_spend(rows, lambda r: r["case_id"])
-    expensive_cases = sorted(by_case.items(), key=lambda kv: (-(kv[1]["total_cost_usd"] or 0), -kv[1]["total_tokens"], kv[0]))[:top_n]
+    # Unknown/partial spend is not cheap spend. Only complete compatible USD
+    # totals are ranked; partial rows remain visible in by_case/by_variant.
+    expensive_cases = sorted(
+        ((key, value) for key, value in by_case.items() if value.get("total_cost_usd") is not None),
+        key=lambda kv: (-float(kv[1]["total_cost_usd"]), -int(kv[1].get("total_tokens") or 0), kv[0]),
+    )[:top_n]
     ablation_spend = group_spend([r for r in rows if is_ablation_variant(r["variant"])], lambda r: r["variant"])
-    top_ablations = sorted(ablation_spend.items(), key=lambda kv: (-(kv[1]["total_cost_usd"] or 0), -kv[1]["total_tokens"], kv[0]))[:top_n]
+    top_ablations = sorted(
+        ((key, value) for key, value in ablation_spend.items() if value.get("total_cost_usd") is not None),
+        key=lambda kv: (-float(kv[1]["total_cost_usd"]), -int(kv[1].get("total_tokens") or 0), kv[0]),
+    )[:top_n]
     findings: list[dict[str, Any]] = []
     if benchmark_report:
         flagged = {flag.get("case_id"): flag.get("flags", []) for flag in benchmark_report.get("case_flags", [])}
@@ -8050,8 +8542,10 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
                     "total_tokens": spend["total_tokens"],
                     "total_cost_usd": spend["total_cost_usd"],
                 })
-        findings.sort(key=lambda f: (-(f.get("total_cost_usd") or 0), str(f.get("case_id"))))
+        findings.sort(key=lambda f: (-float(f["total_cost_usd"]), str(f.get("case_id")))
+                      if f.get("total_cost_usd") is not None else (float("inf"), str(f.get("case_id"))))
     ledger: dict[str, Any] = {
+        "telemetry_schema_version": 3,
         "generated_at": int(time.time()),
         "manifest": str(manifest_path),
         "skill_name": manifest.get("skill_name"),
@@ -8071,31 +8565,40 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
 
 
 def cost_ledger_markdown(ledger: dict[str, Any]) -> str:
+    """Render availability-aware ledger cells without numeric fallbacks."""
     totals = ledger.get("totals", {})
     coverage = ledger.get("coverage", {})
+
+    def show(slot: dict[str, Any], name: str, prefix: str = "") -> str:
+        aggregate = slot.get(f"{name}_aggregate")
+        if isinstance(aggregate, dict):
+            return telemetry_domain.display_aggregate(aggregate, prefix=prefix)
+        value = slot.get(name)
+        return f"{prefix}{value}" if value is not None else "— unavailable"
+
     lines = [
         f"# Cost summary — {ledger.get('skill_name')}",
         "",
         f"Runs: {coverage.get('runs_seen')} (usage on {coverage.get('runs_with_token_usage')}, dollars on {coverage.get('runs_with_dollar_cost')}; missing usage {coverage.get('runs_missing_usage')}, missing cost {coverage.get('runs_missing_cost')})",
         "",
-        f"**Totals:** {totals.get('total_tokens'):,} tokens (in {totals.get('input_tokens'):,} / out {totals.get('output_tokens'):,}), ${totals.get('total_cost_usd')} provider-reported, {totals.get('elapsed_ms_sum')} ms summed",
+        f"**Totals:** {show(totals, 'total_tokens')} tokens (in {show(totals, 'input_tokens')} / out {show(totals, 'output_tokens')}), {show(totals, 'total_cost_usd', '$')}, {show(totals, 'elapsed_ms_sum')} ms summed",
         "",
         "| Variant | Runs | Tokens | Cost USD |",
         "|---|---:|---:|---:|",
     ]
     for variant, slot in ledger.get("by_variant", {}).items():
-        lines.append(f"| {variant} | {slot['runs']} | {slot['total_tokens']:,} | {slot['total_cost_usd']} |")
+        lines.append(f"| {variant} | {slot['runs']} | {show(slot, 'total_tokens')} | {show(slot, 'total_cost_usd', '$')} |")
     if ledger.get("top_expensive_cases"):
         lines += ["", "## Top expensive cases", "", "| Case | Runs | Tokens | Cost USD |", "|---|---:|---:|---:|"]
         for row in ledger["top_expensive_cases"]:
-            lines.append(f"| {row['case_id']} | {row['runs']} | {row['total_tokens']:,} | {row['total_cost_usd']} |")
+            lines.append(f"| {row['case_id']} | {row['runs']} | {show(row, 'total_tokens')} | {show(row, 'total_cost_usd', '$')} |")
     if ledger.get("cost_quality_findings"):
         lines += ["", "## Cost-quality findings", ""]
         for f in ledger["cost_quality_findings"]:
-            lines.append(f"- `{f.get('case_id')}`: {', '.join(f.get('flags', []))} — {f.get('total_tokens'):,} tokens, ${f.get('total_cost_usd')}")
+            lines.append(f"- `{f.get('case_id')}`: {', '.join(f.get('flags', []))} — {show(f, 'total_tokens')} tokens, {show(f, 'total_cost_usd', '$')}")
     if ledger.get("judge"):
         j = ledger["judge"]
-        lines += ["", f"Judge spend (separate from model under test): {j.get('verdicts')} verdicts, ${j.get('total_cost_usd')}"]
+        lines += ["", f"Judge spend (separate from model under test): {j.get('verdicts')} verdicts, {show(j, 'total_cost_usd', '$')}"]
     return "\n".join(lines) + "\n"
 
 
@@ -8425,6 +8928,24 @@ def profile_skill_report(
     }
 
 
+def paired_run_bases(runs: Path, case_id: str, with_variant: str, without_variant: str):
+    """Yield model-aware paired runs without overwriting same-number models."""
+    for model, model_root in discover_case_model_roots(runs, case_id, [with_variant, without_variant]):
+        with_dir = model_root / with_variant
+        without_dir = model_root / without_variant
+        with_runs = discover_run_bases_under(with_dir) if with_dir.exists() else []
+        without_runs = discover_run_bases_under(without_dir) if without_dir.exists() else []
+        with_by_run = {run_number: base for run_number, base in with_runs}
+        without_by_run = {run_number: base for run_number, base in without_runs}
+        if len(with_runs) == len(without_runs) == 1 and with_runs[0][0] == without_runs[0][0]:
+            # Preserve the historical one-off pairing fallback only when the
+            # recorded repetition key agrees on both arms.
+            yield model, with_runs[0][0], with_runs[0][1], without_runs[0][1]
+            continue
+        for run_number in sorted(set(with_by_run) | set(without_by_run)):
+            yield model, run_number, with_by_run.get(run_number), without_by_run.get(run_number)
+
+
 def paired_token_overhead_report(
     manifest_path: Path,
     *,
@@ -8436,16 +8957,26 @@ def paired_token_overhead_report(
     profile = profile_skill_report(manifest_path)
     with_variant, without_variant = variants
     pairs: list[dict[str, Any]] = []
+    blocked_pairs: list[dict[str, Any]] = []
     if runs is not None:
         for case in iter_cases(manifest, split):
-            with_runs = discover_run_bases(runs, case["id"], with_variant)
-            without_runs = discover_run_bases(runs, case["id"], without_variant)
-            without_by_run = {n: base for n, base in without_runs}
-            for run_number, with_base in with_runs:
-                without_base = without_by_run.get(run_number)
-                if without_base is None and len(with_runs) == 1 and len(without_runs) == 1:
-                    without_base = without_runs[0][1]
-                if without_base is None:
+            for model_name, run_number, with_base, without_base in paired_run_bases(
+                runs, case["id"], with_variant, without_variant):
+                if with_base is None or without_base is None:
+                    missing_reason = "missing_left" if with_base is None else "missing_right"
+                    blocked_pairs.append({
+                        "case_id": case["id"], "model": model_name, "run_number": run_number,
+                        "with_run_base": str(with_base) if with_base else None,
+                        "without_run_base": str(without_base) if without_base else None,
+                        "pair_status": {"availability": "blocked", "reason": missing_reason},
+                        "cost_delta_comparison": {"availability": "blocked", "reason": missing_reason},
+                        "objective_lift_per_dollar_comparison": {"availability": "blocked", "reason": missing_reason},
+                        "objective_lift_per_1k_total_tokens_comparison": {"availability": "blocked", "reason": missing_reason},
+                        "objective_delta_comparison": {"availability": "blocked", "reason": missing_reason},
+                        "cost_delta_usd": None, "objective_lift_per_dollar": None,
+                        "total_token_delta": None, "objective_lift_per_1k_total_tokens": None,
+                        "objective_delta": None,
+                    })
                     continue
                 with_metrics = read_metrics_base(with_base)
                 without_metrics = read_metrics_base(without_base)
@@ -8458,55 +8989,125 @@ def paired_token_overhead_report(
                 # scorable predicate every report view uses (was: graded raw, so a
                 # crashed with_skill arm differenced to a false -1.0 "skill regression").
                 if not (scorable_run(with_grade) and scorable_run(without_grade)):
+                    blocked_pairs.append({
+                        "case_id": case["id"], "model": model_name, "run_number": run_number,
+                        "with_run_base": str(with_base), "without_run_base": str(without_base),
+                        "pair_status": {"availability": "blocked", "reason": "unscorable_arm"},
+                        "cost_delta_comparison": {"availability": "blocked", "reason": "unscorable_arm"},
+                        "objective_lift_per_dollar_comparison": {"availability": "blocked", "reason": "unscorable_arm"},
+                        "objective_lift_per_1k_total_tokens_comparison": {"availability": "blocked", "reason": "unscorable_arm"},
+                        "objective_delta_comparison": {"availability": "blocked", "reason": "unscorable_arm"},
+                        "cost_delta_usd": None, "objective_lift_per_dollar": None,
+                        "total_token_delta": None, "objective_lift_per_1k_total_tokens": None,
+                        "objective_delta": None,
+                    })
                     continue
-                with_facts = run_cost_facts(with_metrics)
-                without_facts = run_cost_facts(without_metrics)
-                wc = with_facts.get("cost_usd")
-                nc = without_facts.get("cost_usd")
-                wt = metric_number(with_metrics, "total_tokens")
-                nt = metric_number(without_metrics, "total_tokens")
-                wi = metric_number(with_metrics, "input_tokens")
-                ni = metric_number(without_metrics, "input_tokens")
-                wo = metric_number(with_metrics, "output_tokens")
-                no = metric_number(without_metrics, "output_tokens")
-                if wt is None and wi is None and wo is None:
-                    continue
+                with_facts = bind_telemetry_pair_identity(
+                    run_cost_facts(with_metrics), case_id=case["id"], run_number=run_number,
+                    variant=with_variant, model=with_metrics.get("model") or model_name, population="answer")
+                without_facts = bind_telemetry_pair_identity(
+                    run_cost_facts(without_metrics), case_id=case["id"], run_number=run_number,
+                    variant=without_variant, model=without_metrics.get("model") or model_name, population="answer")
+                with_total = with_facts["total_tokens_measurement"]
+                without_total = without_facts["total_tokens_measurement"]
+                with_input = with_facts["input_tokens_measurement"]
+                without_input = without_facts["input_tokens_measurement"]
+                with_output = with_facts["output_tokens_measurement"]
+                without_output = without_facts["output_tokens_measurement"]
+                token_delta = telemetry_domain.compare_numeric_pair(with_total, without_total,
+                                                                      left_scorable=scorable_run(with_grade), right_scorable=scorable_run(without_grade))
+                input_delta = telemetry_domain.compare_numeric_pair(with_input, without_input,
+                                                                      left_scorable=scorable_run(with_grade), right_scorable=scorable_run(without_grade))
+                output_delta = telemetry_domain.compare_numeric_pair(with_output, without_output,
+                                                                       left_scorable=scorable_run(with_grade), right_scorable=scorable_run(without_grade))
+                cost_delta = telemetry_domain.compare_cost_pair(
+                    with_facts["cost_measurement"], without_facts["cost_measurement"],
+                    left_scorable=scorable_run(with_grade), right_scorable=scorable_run(without_grade))
+                with_rate = with_grade.get("objective_pass_rate")
+                without_rate = without_grade.get("objective_pass_rate")
+                objective_comparison = telemetry_domain.compare_objective_rates(
+                    with_rate, without_rate,
+                    left_scorable=scorable_run(with_grade), right_scorable=scorable_run(without_grade))
+                objective_delta = objective_comparison.value if objective_comparison.availability == telemetry_domain.COMPARABLE else None
+                lift_per_token = telemetry_domain.lift_per_1k_tokens(objective_comparison, token_delta)
+                lift_per_dollar = telemetry_domain.lift_per_dollar(objective_comparison, cost_delta)
+
+                def scalar(measurement):
+                    return measurement.value if measurement.availability == telemetry_domain.AVAILABLE else None
+
+                with_cost = scalar(with_facts["cost_measurement"])
+                without_cost = scalar(without_facts["cost_measurement"])
                 pairs.append({
                     "case_id": case["id"],
+                    "model": model_name or with_metrics.get("model") or without_metrics.get("model"),
+                    "pair_status": {"availability": "comparable"},
                     "run_number": run_number,
                     "with_run_base": str(with_base),
                     "without_run_base": str(without_base),
                     "with_skill_invoked": with_metrics.get("skill_invoked"),
                     "without_skill_invoked": without_metrics.get("skill_invoked"),
-                    "with_total_tokens": wt,
-                    "without_total_tokens": nt,
-                    "total_token_delta": (wt - nt) if wt is not None and nt is not None else None,
-                    "with_input_tokens": wi,
-                    "without_input_tokens": ni,
-                    "input_token_delta": (wi - ni) if wi is not None and ni is not None else None,
-                    "with_output_tokens": wo,
-                    "without_output_tokens": no,
-                    "output_token_delta": (wo - no) if wo is not None and no is not None else None,
-                    "with_objective_pass_rate": with_grade.get("objective_pass_rate"),
-                    "without_objective_pass_rate": without_grade.get("objective_pass_rate"),
-                    "objective_delta": (with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) if with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None,
-                    "objective_lift_per_1k_total_tokens": ((with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) / ((wt - nt) / 1000)) if wt is not None and nt is not None and wt > nt and with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None,
-                    # Dollar channel (issue #21): what the skill costs, and what
-                    # a point of lift costs, in money rather than tokens.
-                    "with_cost_usd": wc,
-                    "without_cost_usd": nc,
-                    "cost_delta_usd": round(wc - nc, 6) if wc is not None and nc is not None else None,
-                    "objective_lift_per_dollar": (((with_grade.get("objective_pass_rate") - without_grade.get("objective_pass_rate")) / (wc - nc)) if wc is not None and nc is not None and wc > nc and with_grade.get("objective_pass_rate") is not None and without_grade.get("objective_pass_rate") is not None else None),
+                    "with_total_tokens": scalar(with_total),
+                    "without_total_tokens": scalar(without_total),
+                    "total_token_delta": token_delta.value if token_delta.availability == telemetry_domain.COMPARABLE else None,
+                    "total_token_delta_comparison": token_delta.to_dict(),
+                    "with_input_tokens": scalar(with_input),
+                    "without_input_tokens": scalar(without_input),
+                    "input_token_delta": input_delta.value if input_delta.availability == telemetry_domain.COMPARABLE else None,
+                    "input_token_delta_comparison": input_delta.to_dict(),
+                    "with_output_tokens": scalar(with_output),
+                    "without_output_tokens": scalar(without_output),
+                    "output_token_delta": output_delta.value if output_delta.availability == telemetry_domain.COMPARABLE else None,
+                    "output_token_delta_comparison": output_delta.to_dict(),
+                    "with_objective_pass_rate": with_rate,
+                    "without_objective_pass_rate": without_rate,
+                    "objective_delta": objective_delta,
+                    "objective_delta_comparison": objective_comparison.to_dict(),
+                    "objective_lift_per_1k_total_tokens": lift_per_token.value if lift_per_token.availability == telemetry_domain.COMPARABLE else None,
+                    "objective_lift_per_1k_total_tokens_comparison": lift_per_token.to_dict(),
+                    "with_cost": with_facts["cost_measurement"].to_dict(),
+                    "without_cost": without_facts["cost_measurement"].to_dict(),
+                    "with_cost_usd": float(with_cost.amount) if isinstance(with_cost, telemetry_domain.Money) and with_cost.currency == "USD" else None,
+                    "without_cost_usd": float(without_cost.amount) if isinstance(without_cost, telemetry_domain.Money) and without_cost.currency == "USD" else None,
+                    "cost_delta_usd": float(cost_delta.value.amount) if cost_delta.availability == telemetry_domain.COMPARABLE and cost_delta.value.currency == "USD" else None,
+                    "cost_delta_comparison": cost_delta.to_dict(),
+                    # This legacy scalar is USD-only. Other currencies retain
+                    # their typed basis below and must not masquerade as dollars.
+                    "objective_lift_per_dollar": lift_per_dollar.value if lift_per_dollar.availability == telemetry_domain.COMPARABLE and cost_delta.value.currency == "USD" else None,
+                    "objective_lift_per_cost_unit": lift_per_dollar.value if lift_per_dollar.availability == telemetry_domain.COMPARABLE else None,
+                    "objective_lift_per_cost_unit_comparison": lift_per_dollar.to_dict(),
+                    "objective_lift_per_dollar_comparison": (
+                        lift_per_dollar.to_dict() if lift_per_dollar.availability != telemetry_domain.COMPARABLE or cost_delta.value.currency == "USD"
+                        else telemetry_domain.Comparison.blocked("currency_not_usd", basis=lift_per_dollar.basis).to_dict()
+                    ),
                 })
+    all_pair_rows = [*pairs, *blocked_pairs]
     cost_deltas = [p["cost_delta_usd"] for p in pairs if p.get("cost_delta_usd") is not None]
     lift_per_dollar = [p["objective_lift_per_dollar"] for p in pairs if p.get("objective_lift_per_dollar") is not None]
-    # The money wasted on pairs that no longer discriminate: both arms perfect
-    # (saturated) or no lift at all.
-    waste_cost = round(sum((p.get("with_cost_usd") or 0) + (p.get("without_cost_usd") or 0)
-                           for p in pairs
-                           if p.get("objective_delta") is not None and (
-                               (p.get("objective_delta") <= 0)
-                               or (p.get("with_objective_pass_rate") == 1 and p.get("without_objective_pass_rate") == 1))), 6)
+    # The money spent on non-discriminating pairs is availability-aware too:
+    # missing arm cost is not silently counted as $0.
+    waste_measurements: list[telemetry_domain.Measurement[Any]] = []
+    non_discriminating_pairs = 0
+    for pair in pairs:
+        if pair.get("objective_delta") is None or not (
+            pair.get("objective_delta") <= 0
+            or (pair.get("with_objective_pass_rate") == 1 and pair.get("without_objective_pass_rate") == 1)
+        ):
+            continue
+        non_discriminating_pairs += 1
+        for key in ("with_cost", "without_cost"):
+            try:
+                waste_measurements.append(telemetry_domain.Measurement.from_dict(pair[key]))
+            except (KeyError, ValueError):
+                waste_measurements.append(telemetry_domain.Measurement.unavailable("invalid_pair_cost"))
+    waste_buckets = telemetry_domain.aggregate_money_by_currency(waste_measurements)
+    waste_usd = waste_buckets.get("USD") or waste_buckets.get("unknown")
+    if non_discriminating_pairs == 0:
+        # The set of qualifying pairs was observed and empty: this is a real
+        # zero, unlike a qualifying pair whose cost telemetry was absent.
+        waste_usd = telemetry_domain.Aggregate(telemetry_domain.COMPLETE, value=0, observed_count=0)
+    elif waste_usd is None:
+        waste_usd = telemetry_domain.Aggregate(telemetry_domain.UNAVAILABLE, reason_counts={"currency_mismatch": 1})
+    waste_cost = float(waste_usd.value) if waste_usd.availability == telemetry_domain.COMPLETE else None
     total_deltas = [p["total_token_delta"] for p in pairs if p.get("total_token_delta") is not None]
     input_deltas = [p["input_token_delta"] for p in pairs if p.get("input_token_delta") is not None]
     output_deltas = [p["output_token_delta"] for p in pairs if p.get("output_token_delta") is not None]
@@ -8532,12 +9133,28 @@ def paired_token_overhead_report(
             "objective_delta": stats(objective_deltas),
             "objective_lift_per_1k_total_tokens": stats(lift_per_1k),
             "cost_delta_usd": stats(cost_deltas),
+            "cost_delta_coverage": {
+                "eligible_pairs": len(cost_deltas),
+                "blocked_reason_counts": dict(collections.Counter(
+                    p.get("cost_delta_comparison", {}).get("reason") for p in all_pair_rows
+                    if p.get("cost_delta_comparison", {}).get("availability") == telemetry_domain.BLOCKED)),
+            },
             "objective_lift_per_dollar": stats(lift_per_dollar),
+            "objective_lift_per_dollar_coverage": {
+                "eligible_pairs": len(lift_per_dollar),
+                "blocked_reason_counts": dict(collections.Counter(
+                    p.get("objective_lift_per_dollar_comparison", {}).get("reason") for p in all_pair_rows
+                    if p.get("objective_lift_per_dollar_comparison", {}).get("availability") == telemetry_domain.BLOCKED)),
+            },
             "saturated_or_no_lift_cost_usd": waste_cost,
+            "saturated_or_no_lift_cost_usd_aggregate": waste_usd.to_dict(),
+            **({"known_saturated_or_no_lift_cost_usd": float(waste_usd.known_subtotal)}
+               if waste_usd.availability == telemetry_domain.PARTIAL else {}),
             "mean_total_overhead_per_static_skill_token": (statistics.mean(total_deltas) / static_skill_tokens) if total_deltas and static_skill_tokens else None,
         },
         "profile": profile,
         "pairs": pairs,
+        "blocked_pairs": blocked_pairs,
     }
 
 
@@ -8573,11 +9190,17 @@ def token_overhead(args: argparse.Namespace) -> int:
             lines.append(f"| {r['skill_name']} | {s.get('static_skill_tokens')} | {s.get('static_reference_tokens')} | {s.get('paired_runtime_rows')} | {td.get('mean')} | {td.get('median')} | {idelta.get('mean')} | {odelta.get('mean')} | {lift.get('mean')} | {cd.get('mean')} | {lpd.get('mean')} | {s.get('saturated_or_no_lift_cost_usd')} |")
         lines += ["", "## Per-case runtime pairs", ""]
         for r in reports:
-            if not r.get("pairs"):
+            if not r.get("pairs") and not r.get("blocked_pairs"):
                 continue
-            lines += [f"### {r['skill_name']}", "", "| Case | Run | Total delta | Input delta | Objective delta | Lift/1k | with total | without total |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
+            lines += [f"### {r['skill_name']}", "", "| Case | Run | Total delta | Input delta | Objective delta | Lift/1k | With cost | Without cost | Cost delta | Lift/$ | Lift/$ status |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
             for p in r["pairs"]:
-                lines.append(f"| {p['case_id']} | {p['run_number']} | {p.get('total_token_delta')} | {p.get('input_token_delta')} | {p.get('objective_delta')} | {p.get('objective_lift_per_1k_total_tokens')} | {p.get('with_total_tokens')} | {p.get('without_total_tokens')} |")
+                status = p.get("objective_lift_per_dollar_comparison", {})
+                lift_status = status.get("reason") if status.get("availability") == telemetry_domain.BLOCKED else "comparable"
+                lines.append(f"| {p['case_id']} | {p['run_number']} | {p.get('total_token_delta')} | {p.get('input_token_delta')} | {p.get('objective_delta')} | {p.get('objective_lift_per_1k_total_tokens')} | {p.get('with_cost_usd')} | {p.get('without_cost_usd')} | {p.get('cost_delta_usd')} | {p.get('objective_lift_per_dollar')} | {lift_status} |")
+            if r.get("blocked_pairs"):
+                lines += ["", "Blocked pairs (not included in runtime statistics):"]
+                for pair in r["blocked_pairs"]:
+                    lines.append(f"- `{pair.get('case_id')}` / `{pair.get('model')}` / run {pair.get('run_number')}: {pair.get('pair_status', {}).get('reason')}")
             lines.append("")
         text = "\n".join(lines) + "\n"
         if args.out:
@@ -9055,8 +9678,10 @@ def audit_manifest_report(
         cost_by_case = (bench_report.get("cost_summary", {}) or {}).get("by_case", {})
         flags_by_case = {flag.get("case_id"): flag.get("flags", []) for flag in bench_report.get("case_flags", [])}
         for case_id, spend in sorted(cost_by_case.items()):
-            cost = spend.get("total_cost_usd") or 0
-            if cost < expensive_case_usd:
+            cost = spend.get("total_cost_usd")
+            # A partial/unavailable subtotal cannot establish that the case is
+            # cheap or expensive, so it must not drive a dollar finding.
+            if cost is None or cost < expensive_case_usd:
                 continue
             case_flag_list = flags_by_case.get(case_id, [])
             if any("saturated" in f for f in case_flag_list):
@@ -9065,12 +9690,13 @@ def audit_manifest_report(
                 finding("expensive-no-lift-case", "recommended", f"Case {case_id} cost ${cost} with no objective lift — spend without signal.", spend)
         judge_only_ids = {c.get("id") for c in cases if is_judge_only_case(c)}
         for case_id in sorted(judge_only_ids):
-            cost = (cost_by_case.get(case_id) or {}).get("total_cost_usd") or 0
-            if cost >= expensive_case_usd:
+            cost = (cost_by_case.get(case_id) or {}).get("total_cost_usd")
+            if cost is not None and cost >= expensive_case_usd:
                 finding("high-cost-judge-only-case", "recommended", f"Case {case_id} cost ${cost} and is graded only by judge assertions; a deterministic/script oracle would make the spend verifiable.", cost_by_case.get(case_id))
         ablation_rows = [{**result_cost_facts(r), "variant": str(r.get("variant", ""))}
                          for r in bench_report.get("results", []) if is_ablation_variant(r.get("variant", ""))]
-        ablation_spend = {variant: slot["total_cost_usd"] for variant, slot in group_spend(ablation_rows, lambda r: r["variant"]).items()}
+        ablation_spend = {variant: slot["total_cost_usd"] for variant, slot in group_spend(ablation_rows, lambda r: r["variant"]).items()
+                          if slot.get("total_cost_usd") is not None}
         structured = {f"ablation:{a.get('id')}" for a in manifest.get("ablations", []) if any(isinstance(spec, dict) and spec.get("cases") and spec.get("assertions") for spec in a.get("expected_regressions", []))}
         for variant, spend_usd in sorted(ablation_spend.items()):
             if spend_usd >= expensive_case_usd and variant not in structured:
@@ -9559,15 +10185,22 @@ def suite_cost_estimate(scope: dict[str, Any], *, history_dir: Path | None = Non
                 doc = json.loads(f.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
+            # Legacy ledgers do not carry enough availability/basis evidence to
+            # support a budget claim. They stay readable elsewhere but cannot
+            # silently become cost history for a fail-closed dollar gate.
+            if doc.get("telemetry_schema_version") != 3:
+                continue
             coverage = doc.get("coverage") or {}
             doc_totals = doc.get("totals") or {}
             seen = coverage.get("runs_seen") or 0
             if not seen:
                 continue
-            if isinstance(doc_totals.get("total_tokens"), (int, float)):
+            if (doc_totals.get("total_tokens_availability") == telemetry_domain.COMPLETE
+                    and isinstance(doc_totals.get("total_tokens"), (int, float))):
                 token_rates.append(doc_totals["total_tokens"] / seen)
             costed = coverage.get("runs_with_dollar_cost") or 0
-            if costed and isinstance(doc_totals.get("total_cost_usd"), (int, float)):
+            if (doc_totals.get("total_cost_usd_availability") == telemetry_domain.COMPLETE
+                    and costed and isinstance(doc_totals.get("total_cost_usd"), (int, float))):
                 cost_rates.append(doc_totals["total_cost_usd"] / costed)
         if token_rates:
             per_run_tokens = statistics.median(token_rates)
@@ -9724,7 +10357,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-dir", required=True, help="run directory where events.json/metrics.json should be written")
     p.add_argument("--out-events")
     p.add_argument("--out-metrics")
-    p.add_argument("--write-metadata", action="store_true", help="merge normalized metrics into metadata.json")
+    p.add_argument("--write-metadata", action="store_true", help="deprecated compatibility flag; metadata.json is always written with telemetry v3")
 
     p = sub.add_parser("run-codex")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
@@ -9874,6 +10507,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("manifest")
     p.add_argument("--check", action="store_true", help="dry run: print the diff and checklist, write nothing")
     p.add_argument("--out-checklist", help="also write the judgment-call checklist as JSON")
+
+    p = sub.add_parser("migrate-telemetry", help="upgrade run metadata/metrics to availability-aware telemetry schema v3")
+    p.add_argument("--runs", required=True, help="run tree containing metadata.json and/or metrics.json artifacts")
+    p.add_argument("--check", action="store_true", help="report artifacts that would change without writing them")
+    p.add_argument("--out", help="write the migration report as JSON")
 
     p = sub.add_parser("cost-summary", help="suite cost ledger over a runs tree: coverage, totals, by variant/case/runner, top spenders, cost-quality findings (issue #21)")
     p.add_argument("--manifest", required=True)
@@ -10040,6 +10678,8 @@ def main() -> int:
         return compare_results(args)
     if args.cmd == "migrate":
         return migrate_command(args)
+    if args.cmd == "migrate-telemetry":
+        return migrate_telemetry_command(args)
     if args.cmd == "cost-summary":
         return cost_summary_command(args)
     if args.cmd == "trend":

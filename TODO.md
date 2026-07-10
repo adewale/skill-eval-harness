@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:4890`, merged in `grade_case_variant:5980`).
+threshold, evidence}` (`load_judge_results:5029`, merged in `grade_case_variant:6127`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -168,10 +168,17 @@ Mistral support should mean first-class Vibe CLI support, not a raw chat-complet
       smoke-test environment documentation for Vibe.
 - [x] Add a registry/conformance guard that fails when a backend is partially registered (for
       example `run-agent` supports it but parity docs or capability rows do not).
-
 Standing invariant (not a tickable task): `--judge-cmd` stays the escape hatch for arbitrary
 providers while first-class backends move through the native registry — the code documents it
 as "the universal escape hatch" and `judge` points unknown backends at it.
+
+- [ ] Apply the explicit availability/comparability approach to every cross-lab CLI wrapper:
+      model prompt transport, final-answer channels, schema support, tool policy, config isolation,
+      skill discovery, trace completeness, failure semantics, and telemetry as typed capabilities
+      rather than loose provider dictionaries or implied parity. Keep thin native adapters—not a
+      lowest-common-denominator wrapper—and add conformance fixtures for each declared surface.
+      Design: [`docs/telemetry-availability-and-comparability-spec.md`](docs/telemetry-availability-and-comparability-spec.md)
+      § “Follow-on: cross-lab CLI wrappers” and [`docs/agent-cli-control-plane.md`](docs/agent-cli-control-plane.md).
 
 ---
 

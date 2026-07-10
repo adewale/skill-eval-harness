@@ -9,6 +9,7 @@ suite-run preflight budget gate. House rules hold: no live model, no network.
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,6 +57,10 @@ class NormalizeUsageCostTests(unittest.TestCase):
         self.assertEqual(parts["source"], "price_table_estimated")
         self.assertEqual(parts["pricing_table_version"], "2026-06")
         self.assertEqual(sb.normalize_cost(None), {"source": "missing"})
+        eur = sb.normalize_cost({"amount": 1, "currency": "EUR"})
+        self.assertEqual(eur["currency"], "EUR")
+        self.assertEqual(eur["total_cost"], 1.0)
+        self.assertEqual(sb.normalize_cost({"amount": 1, "currency": "eur"}), {"source": "missing"})
 
     def test_run_cost_facts_prefers_normalized_and_falls_back_to_legacy(self):
         normalized = sb.run_cost_facts({
@@ -88,6 +93,9 @@ class RunnerStampTests(unittest.TestCase):
             self.assertEqual(metadata["usage_normalized"]["total_tokens"], 150)   # provider beat the trace
             self.assertEqual(metrics["usage_normalized"]["total_tokens"], 150)
             self.assertEqual(metadata["cost_normalized"]["total_cost"], 0.25)
+            self.assertEqual(metadata["telemetry_schema_version"], 3)
+            self.assertEqual(metadata["telemetry"], metrics["telemetry"])
+            self.assertEqual(metadata["telemetry"]["measurements"]["cost"]["availability"], "available")
 
             bare_dir = Path(td) / "bare"
             sb.write_trace_artifacts(bare_dir, "", source="codex", metadata={"provider": "codex"})
@@ -104,6 +112,19 @@ class RunnerStampTests(unittest.TestCase):
             self.assertEqual(metrics["usage_normalized"]["total_tokens"], 42)
             self.assertEqual(metrics["usage_normalized"]["source"], "trace_normalized")
 
+    def test_missing_provider_block_cannot_erase_trace_telemetry_from_v3(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run"
+            trace = json.dumps({"type": "usage", "usage": {"input_tokens": 3, "output_tokens": 2}})
+            sb.write_trace_artifacts(run_dir, trace, source="codex",
+                                     metadata={"usage_normalized": {"source": "missing"},
+                                               "cost_normalized": {"source": "missing"}})
+            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+            self.assertEqual(metrics["usage_normalized"]["total_tokens"], 5)
+            measured = metrics["telemetry"]["measurements"]["total_tokens"]
+            self.assertEqual(measured["availability"], "available")
+            self.assertEqual(measured["value"], 5)
+
     def test_trace_artifacts_tolerate_non_finite_json_numbers(self):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "run"
@@ -114,10 +135,37 @@ class RunnerStampTests(unittest.TestCase):
             )
             metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
             event = json.loads((run_dir / "events.json").read_text(encoding="utf-8"))["events"][0]
-            self.assertNotIn("usage_normalized", metrics)
+            self.assertEqual(metrics["usage_normalized"], {"source": "missing"})
             self.assertNotIn("elapsed_ms", metrics)
+            self.assertEqual(metrics["telemetry"]["measurements"]["total_tokens"]["availability"], "unavailable")
+            self.assertEqual(metrics["telemetry"]["measurements"]["elapsed_ms"]["availability"], "unavailable")
             self.assertEqual(event.get("tokens"), {})
             self.assertNotIn("duration_ms", event)
+
+    def test_incomplete_trace_cannot_pass_zero_activity_process_assertion(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            sb.write_trace_artifacts(base, "", source="codex")
+            passed, evidence = sb.process_or_efficiency_assertion_result(
+                {"type": "command_not_ran", "pattern": "rm -rf"}, base, {})
+        self.assertFalse(passed)
+        self.assertIn("trace_observation_incomplete", evidence)
+
+    def test_timed_out_runner_trace_is_incomplete_even_when_it_has_events(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            outcome = sb.RunnerOutcome(provider="codex", answer="partial", returncode=124, timed_out=True,
+                                       trace_text="\n".join([json.dumps({"type": "command", "command": "echo partial"}),
+                                                             json.dumps({"type": "usage", "usage": {"input_tokens": 2, "output_tokens": 1}})]))
+            sb.write_runner_outcome(base, outcome)
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+            self.assertFalse(metrics["observation_complete"])
+            self.assertEqual(metrics["telemetry"]["measurements"]["commands"]["availability"], "unavailable")
+            self.assertEqual(metrics["telemetry"]["measurements"]["total_tokens"]["availability"], "unavailable")
+            passed, evidence = sb.process_or_efficiency_assertion_result(
+                {"type": "command_not_ran", "pattern": "rm -rf"}, base, {})
+        self.assertFalse(passed)
+        self.assertIn("trace_observation_incomplete", evidence)
 
     def test_write_trace_artifacts_metadata_is_current_run_only(self):
         with tempfile.TemporaryDirectory() as td:
@@ -141,6 +189,10 @@ class RunnerStampTests(unittest.TestCase):
         self.assertEqual(usage["total_tokens"], 375)
         self.assertEqual(usage["source"], "trace_normalized")
         self.assertEqual(cost["total_cost"], 0.015)
+        _, eur_cost = sb.stream_usage_and_cost('{"cost":{"amount":1,"currency":"EUR"}}')
+        self.assertEqual(eur_cost, {"currency": "EUR", "total_cost": 1.0, "source": "trace_normalized"})
+        _, mixed_cost = sb.stream_usage_and_cost('\n'.join(['{"cost":{"amount":1,"currency":"EUR"}}', '{"cost":1}']))
+        self.assertEqual(mixed_cost, {"source": "missing"})
         empty_usage, empty_cost = sb.stream_usage_and_cost("plain text only")
         self.assertEqual(empty_usage, {"source": "missing"})
         self.assertEqual(empty_cost, {"source": "missing"})
@@ -231,14 +283,14 @@ class RunnerStampTests(unittest.TestCase):
         self.assertEqual(row["cost_normalized"], {"source": "missing"})
 
 
-def result_row(case_id: str, variant: str, *, cost: float | None, tokens: int | None, exec_valid: bool = True, missing: bool = False, rate: float | None = 1.0) -> dict:
-    metadata = {}
+def result_row(case_id: str, variant: str, *, cost: float | None, tokens: int | None, currency: str = "USD", exec_valid: bool = True, missing: bool = False, rate: float | None = 1.0) -> dict:
+    metadata = {"provider": "test-provider", "model": "test-model", "billing_scope": "run"}
     if tokens is not None:
         metadata["usage_normalized"] = {"input_tokens": tokens - 10, "output_tokens": 10, "total_tokens": tokens, "source": "provider_reported"}
     else:
         metadata["usage_normalized"] = {"source": "missing"}
     if cost is not None:
-        metadata["cost_normalized"] = {"currency": "USD", "total_cost": cost, "source": "provider_reported"}
+        metadata["cost_normalized"] = {"currency": currency, "total_cost": cost, "source": "provider_reported"}
     else:
         metadata["cost_normalized"] = {"source": "missing"}
     metadata["elapsed_ms"] = 1000
@@ -257,13 +309,40 @@ class CostSummaryTests(unittest.TestCase):
         ]
         summary = sb.build_cost_summary(results, confirmed_regressions=1)
         self.assertEqual(summary["coverage"], {"runs_seen": 4, "runs_with_token_usage": 3, "runs_with_dollar_cost": 3,
-                                               "runs_missing_usage": 1, "runs_missing_cost": 1})
-        self.assertEqual(summary["totals"]["total_tokens"], 900)
-        self.assertEqual(summary["totals"]["total_cost_usd"], 0.9)      # execution error included: it was paid for
+                                               "runs_with_non_usd_cost": 0, "runs_missing_usage": 1, "runs_missing_cost": 1})
+        self.assertIsNone(summary["totals"]["total_tokens"])
+        self.assertEqual(summary["totals"]["known_total_tokens"], 900)
+        self.assertEqual(summary["totals"]["total_tokens_availability"], "partial")
+        self.assertIsNone(summary["totals"]["total_cost_usd"])
+        self.assertEqual(summary["totals"]["known_total_cost_usd"], 0.9)  # paid error is retained; unknown run prevents a total
         self.assertEqual(summary["totals"]["execution_errors"], 1)
         self.assertEqual(summary["paired_cost_delta"]["c1"]["delta"], 0.2)
         self.assertEqual(summary["ablations"]["total_cost_usd"], 0.5)
         self.assertEqual(summary["ablations"]["cost_per_confirmed_regression"], 0.5)
+
+    def test_mixed_currency_pair_deltas_never_claim_one_dollar_mean(self):
+        summary = sb.build_cost_summary([
+            result_row("c1", "with_skill", cost=2.0, tokens=10, currency="USD"),
+            result_row("c1", "without_skill", cost=1.0, tokens=10, currency="USD"),
+            result_row("c2", "with_skill", cost=2.0, tokens=10, currency="EUR"),
+            result_row("c2", "without_skill", cost=1.0, tokens=10, currency="EUR"),
+        ])
+        self.assertEqual(summary["mean_paired_cost_delta"], 1.0)
+        self.assertEqual(summary["mean_paired_cost_delta_basis"], {"currency": "USD"})
+        self.assertEqual(summary["mean_paired_cost_delta_by_currency"], {"EUR": 1.0, "USD": 1.0})
+        self.assertEqual(summary["paired_cost_delta"]["c2"]["currency"], "EUR")
+
+    def test_all_missing_and_measured_zero_are_not_conflated(self):
+        unavailable = sb.build_cost_summary([
+            result_row("c1", "with_skill", cost=None, tokens=None),
+        ])
+        zero = sb.build_cost_summary([
+            result_row("c1", "with_skill", cost=0.0, tokens=0),
+        ])
+        self.assertIsNone(unavailable["totals"]["total_cost_usd"])
+        self.assertEqual(unavailable["totals"]["total_cost_usd_availability"], "unavailable")
+        self.assertEqual(zero["totals"]["total_cost_usd"], 0.0)
+        self.assertEqual(zero["totals"]["total_cost_usd_availability"], "complete")
 
     def test_judge_spend_is_a_separate_line(self):
         judge_results = {
@@ -271,7 +350,10 @@ class CostSummaryTests(unittest.TestCase):
             "b": {"cost_normalized": {"source": "missing"}},
         }
         summary = sb.build_cost_summary([result_row("c1", "with_skill", cost=1.0, tokens=100)], judge_results=judge_results)
-        self.assertEqual(summary["judge"], {"verdicts": 2, "verdicts_with_cost": 1, "total_cost_usd": 0.02})
+        self.assertEqual(summary["judge"]["verdicts"], 2)
+        self.assertEqual(summary["judge"]["verdicts_with_cost"], 1)
+        self.assertIsNone(summary["judge"]["total_cost_usd"])
+        self.assertEqual(summary["judge"]["known_total_cost_usd"], 0.02)
         self.assertEqual(summary["totals"]["total_cost_usd"], 1.0)   # not folded into model-under-test spend
 
     def test_benchmark_report_carries_cost_summary(self):
@@ -294,6 +376,7 @@ class CostSummaryTests(unittest.TestCase):
                 base.mkdir(parents=True)
                 (base / "output.md").write_text(text, encoding="utf-8")
                 (base / "metadata.json").write_text(json.dumps({
+                    "provider": "test-provider", "model": "test-model", "billing_scope": "run",
                     "usage_normalized": {"total_tokens": 100, "source": "provider_reported"},
                     "cost_normalized": {"currency": "USD", "total_cost": cost, "source": "provider_reported"},
                 }), encoding="utf-8")
@@ -367,8 +450,66 @@ class SuiteLedgerTests(unittest.TestCase):
             self.assertIn("Cost summary", md.read_text(encoding="utf-8"))
 
 
+class TelemetryMigrationTests(unittest.TestCase):
+    def test_migration_is_dry_run_safe_creates_both_artifacts_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            base = runs / "c1" / "with_skill"
+            base.mkdir(parents=True)
+            metadata = {"provider": "test-provider", "model": "test-model", "total_tokens": 0,
+                        "cost_usd": 0.0, "elapsed_ms": 0}
+            (base / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            report_path = Path(td) / "migration.json"
+            check = SimpleNamespace(runs=str(runs), check=True, out=str(report_path))
+            self.assertEqual(sb.migrate_telemetry_command(check), 0)
+            self.assertEqual(json.loads(report_path.read_text(encoding="utf-8"))["changed"], 1)
+            self.assertEqual(json.loads((base / "metadata.json").read_text(encoding="utf-8")), metadata)
+
+            write = SimpleNamespace(runs=str(runs), check=False, out=str(report_path))
+            self.assertEqual(sb.migrate_telemetry_command(write), 0)
+            migrated_meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            migrated_metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+            self.assertEqual(migrated_meta["telemetry_schema_version"], 3)
+            self.assertEqual(migrated_meta["telemetry"], migrated_metrics["telemetry"])
+            self.assertEqual(migrated_meta["telemetry"]["measurements"]["total_tokens"]["availability"], "available")
+            self.assertEqual(migrated_meta["telemetry"]["measurements"]["total_tokens"]["value"], 0)
+            self.assertEqual(migrated_meta["telemetry"]["measurements"]["cost"]["provenance"], "legacy_unverified")
+            self.assertEqual(sb.migrate_telemetry_command(write), 0)
+
+            v2 = runs / "c2" / "with_skill"
+            v2.mkdir(parents=True)
+            (v2 / "metrics.json").write_text(json.dumps({
+                "provider": "test-provider", "model": "test-model",
+                "cost_normalized": {"currency": "USD", "total_cost": 0.25, "source": "provider_reported"},
+            }), encoding="utf-8")
+            self.assertEqual(sb.migrate_telemetry_command(write), 0)
+            v2_metrics = json.loads((v2 / "metrics.json").read_text(encoding="utf-8"))
+            self.assertEqual(v2_metrics["telemetry"]["measurements"]["cost"]["provenance"], "legacy_unverified")
+
+    def test_migration_restores_first_artifact_when_second_backup_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            base = runs / "c1" / "with_skill"
+            base.mkdir(parents=True)
+            original = {"total_tokens": 10}
+            for name in ("metadata.json", "metrics.json"):
+                (base / name).write_text(json.dumps(original), encoding="utf-8")
+            real_replace = sb.os.replace
+
+            def fail_second_backup(src, dst):
+                if Path(src).name == "metrics.json" and Path(dst).name.endswith(".telemetry-v3.bak"):
+                    raise OSError("simulated second backup failure")
+                return real_replace(src, dst)
+
+            with mock.patch.object(sb.os, "replace", side_effect=fail_second_backup):
+                with self.assertRaises(OSError):
+                    sb.migrate_telemetry_command(SimpleNamespace(runs=str(runs), check=False, out=str(Path(td) / "report.json")))
+            for name in ("metadata.json", "metrics.json"):
+                self.assertEqual(json.loads((base / name).read_text(encoding="utf-8")), original)
+
+
 class TokenOverheadDollarTests(unittest.TestCase):
-    def test_pairs_carry_dollar_deltas_and_lift_per_dollar(self):
+    def test_non_usd_pairs_never_populate_dollar_fields(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             repo = root / "repo"
@@ -388,14 +529,18 @@ class TokenOverheadDollarTests(unittest.TestCase):
                 base.mkdir(parents=True)
                 (base / "output.md").write_text(text, encoding="utf-8")
                 (base / "metadata.json").write_text(json.dumps({
-                    "total_tokens": tokens, "input_tokens": tokens - 10, "output_tokens": 10,
-                    "cost_normalized": {"currency": "USD", "total_cost": cost, "source": "provider_reported"},
+                    "provider": "test-provider", "model": "test-model", "billing_scope": "run",
+                    "usage_normalized": {"total_tokens": tokens, "input_tokens": tokens - 10, "output_tokens": 10, "source": "provider_reported"},
+                    "cost_normalized": {"currency": "EUR", "total_cost": cost, "source": "provider_reported"},
                 }), encoding="utf-8")
             report = sb.paired_token_overhead_report(path, runs=runs)
         pair = report["pairs"][0]
-        self.assertEqual(pair["cost_delta_usd"], 0.2)
-        self.assertEqual(pair["objective_lift_per_dollar"], 5.0)   # lift 1.0 / $0.20
-        self.assertEqual(report["summary"]["cost_delta_usd"]["mean"], 0.2)
+        self.assertIsNone(pair["cost_delta_usd"])
+        self.assertIsNone(pair["objective_lift_per_dollar"])
+        self.assertEqual(pair["objective_lift_per_dollar_comparison"]["reason"], "currency_not_usd")
+        self.assertEqual(pair["objective_lift_per_cost_unit"], 5.0)  # lift 1.0 / €0.20
+        self.assertEqual(pair["objective_lift_per_cost_unit_comparison"]["basis"]["currency"], "EUR")
+        self.assertIsNone(report["summary"]["cost_delta_usd"]["mean"])
         self.assertEqual(report["summary"]["saturated_or_no_lift_cost_usd"], 0)
 
     def test_saturated_pair_cost_is_reported_as_waste(self):
@@ -418,7 +563,8 @@ class TokenOverheadDollarTests(unittest.TestCase):
                 base.mkdir(parents=True)
                 (base / "output.md").write_text("alpha", encoding="utf-8")   # both pass: saturated
                 (base / "metadata.json").write_text(json.dumps({
-                    "total_tokens": 100,
+                    "provider": "test-provider", "model": "test-model", "billing_scope": "run",
+                    "usage_normalized": {"total_tokens": 100, "source": "provider_reported"},
                     "cost_normalized": {"currency": "USD", "total_cost": 0.25, "source": "provider_reported"},
                 }), encoding="utf-8")
             report = sb.paired_token_overhead_report(path, runs=runs)
@@ -479,8 +625,10 @@ class SuiteBudgetGateTests(unittest.TestCase):
             history.mkdir()
             for i, (tokens, cost, runs_n) in enumerate([(1_000_000, 10.0, 100), (3_000_000, 30.0, 100)], 1):
                 (history / f"ledger-{i}.json").write_text(json.dumps({
+                    "telemetry_schema_version": 3,
                     "coverage": {"runs_seen": runs_n, "runs_with_dollar_cost": runs_n},
-                    "totals": {"total_tokens": tokens, "total_cost_usd": cost},
+                    "totals": {"total_tokens": tokens, "total_tokens_availability": "complete",
+                               "total_cost_usd": cost, "total_cost_usd_availability": "complete"},
                 }), encoding="utf-8")
             scope = {"totals": {"selected_tier_rows": 10}, "include_ablations": False}
             estimate = sb.suite_cost_estimate(scope, history_dir=history)
@@ -488,6 +636,25 @@ class SuiteBudgetGateTests(unittest.TestCase):
         self.assertEqual(estimate["per_run_tokens"], 20000.0)       # median of 10k and 30k
         self.assertEqual(estimate["estimated_tokens"], 200000)
         self.assertEqual(estimate["estimated_cost_usd"], 2.0)       # median $0.20/run x 10 rows
+
+    def test_foreign_currency_observations_do_not_dilute_usd_budget_history(self):
+        summary = sb.build_cost_summary([
+            result_row("usd", "with_skill", cost=10.0, tokens=10, currency="USD"),
+            result_row("eur", "with_skill", cost=20.0, tokens=10, currency="EUR"),
+        ])
+        self.assertEqual(summary["coverage"]["runs_with_dollar_cost"], 1)
+        self.assertEqual(summary["coverage"]["runs_with_non_usd_cost"], 1)
+        self.assertEqual(summary["coverage"]["runs_missing_cost"], 0)
+        with tempfile.TemporaryDirectory() as td:
+            history = Path(td) / "history"
+            history.mkdir()
+            (history / "ledger.json").write_text(json.dumps({
+                "telemetry_schema_version": 3, "coverage": summary["coverage"],
+                "totals": {"total_tokens": 20, "total_tokens_availability": "complete",
+                           "total_cost_usd": 10.0, "total_cost_usd_availability": "complete"},
+            }), encoding="utf-8")
+            estimate = sb.suite_cost_estimate({"totals": {"selected_tier_rows": 2}, "include_ablations": False}, history_dir=history)
+        self.assertEqual(estimate["estimated_cost_usd"], 20.0)
 
     def test_estimate_static_fallback_has_no_dollar_guess(self):
         estimate = sb.suite_cost_estimate({"totals": {"selected_tier_rows": 4}, "include_ablations": False})

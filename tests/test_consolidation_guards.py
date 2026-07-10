@@ -140,6 +140,22 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         for name, cap in ac.AGENT_CAPABILITIES.items():
             self.assertIn(cap.dollar_cost, sb.COST_SOURCES, name)
 
+    def test_agent_capability_registry_declares_every_telemetry_signal(self):
+        for name, cap in ac.AGENT_CAPABILITIES.items():
+            signals = cap.telemetry_contract()
+            self.assertEqual(set(signals), {"usage", "cost", "elapsed_ms", "trace"}, name)
+            for signal in signals.values():
+                self.assertIn(signal.availability, {"available", "unavailable", "not_applicable"})
+                if signal.availability == "available":
+                    self.assertIsNotNone(signal.provenance)
+                else:
+                    self.assertIsNotNone(signal.reason)
+
+    def test_offline_stub_contract_does_not_promise_elapsed_measurement(self):
+        elapsed = ac.AGENT_CAPABILITIES["stub"].telemetry_contract()["elapsed_ms"]
+        self.assertEqual(elapsed.availability, "not_applicable")
+        self.assertEqual(elapsed.reason, "offline_runner")
+
     def test_invocation_request_is_answer_runner_only(self):
         fields = set(sb.InvocationRequest.__dataclass_fields__)
         self.assertEqual(fields, {"prompt", "workspace", "model", "timeout_s"})

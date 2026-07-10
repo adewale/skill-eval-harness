@@ -93,7 +93,7 @@ Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger
 
 **`metadata.json`** — optional per-run telemetry: elapsed time, token counts, model name, and the normalized cost blocks below.
 
-**`usage_normalized` / `cost_normalized`** — the normalized token and dollar blocks every runner writes into a run's metadata/metrics, alongside the raw provider fields. Each carries a `source` provenance: `provider_reported`, `trace_normalized`, `missing`, or `not_applicable`, plus `estimated` for usage and `price_table_estimated` for cost. Missing telemetry is marked, never written as zero — so the report can total real spend and disclose coverage separately from quality.
+**`usage_normalized` / `cost_normalized`** — legacy-compatible normalized token and dollar blocks every runner writes alongside raw provider fields. Schema-v3 `telemetry` is the canonical contract: it separates provenance (`provider_reported`, `trace_normalized`, `price_table_estimated`, `estimated`, or `legacy_unverified`) from availability (`available`, `unavailable`, or `not_applicable`). A measured zero is available; unavailable telemetry is never numeric zero. See [`telemetry-availability-and-comparability-spec.md`](telemetry-availability-and-comparability-spec.md).
 
 **Trace artifacts** — what a trace-aware runner writes so process and efficiency assertions have evidence:
 

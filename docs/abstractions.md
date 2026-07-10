@@ -133,10 +133,10 @@ editor. This boundary is the main extension seam in the codebase.
 
 A runner consumes task rows and produces the contract. The repo ships seven paths plus a
 generic one: Pi smoke (`examples/adewale-workspace/run_pi_smoke.py`), Pi trigger
-(`run_pi_trigger_eval.py`), Codex (`run_codex:4256`), Claude (`run_claude:4374`, capturing real
+(`run_pi_trigger_eval.py`), Codex (`run_codex:4395`), Claude (`run_claude:4513`, capturing real
 per-run cost), Mistral Vibe (`run-agent --agent vibe`, using isolated `VIBE_HOME` outside the workdir), the in-process
-subagent runner (`run_subagent:5567`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:2217` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:5714`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:2219` and the export/run/import commands), and any runner that writes the
 contract directly. Each runner registers a workspace builder so
 one cross-runner invariant proves its `without_skill` arm is skill-free (CF.2). The harness
 calls no model itself; it reads what the runner left behind.
@@ -178,7 +178,7 @@ a re-grade cheap and deterministic.
 normalized gain, and a flag when the skill hurts). `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:363`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:365`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 ## What changes when you extend the tool

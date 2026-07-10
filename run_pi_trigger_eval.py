@@ -145,7 +145,9 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             ablation_field = ablation
             skill_tree_hash = (abl_prov or {}).get("skill_tree_hash")
         result = {
+            "population": "trigger",
             "query": query,
+            "model": model,
             "should_trigger": should_trigger,
             "triggered": triggered,
             # RAW measurement, NOT a confirmed ablation effect: this is one arm's
@@ -155,6 +157,7 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             "pass": returncode == 0 and triggered == should_trigger,
             "measurement": EvidenceClass.RAW_MEASUREMENT.value,
             "elapsed_ms": elapsed_ms,
+            "observation_complete": bool(run.get("observation_complete", returncode == 0 and not timed_out)),
             "returncode": returncode,
             "timed_out": timed_out,
             "evidence": evidence,
