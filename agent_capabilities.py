@@ -8,10 +8,35 @@ against it instead of relying on stale paragraphs.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Literal
+from types import MappingProxyType
+from typing import Literal, Mapping
 
 CostSupport = Literal["provider_reported", "trace_normalized", "price_table_estimated", "missing", "not_applicable"]
 Availability = Literal["available", "unavailable", "not_applicable"]
+SmokePopulation = Literal["answer", "trigger"]
+
+
+@dataclass(frozen=True)
+class SmokeTarget:
+    """Capability-qualified live-smoke policy for one local CLI."""
+
+    agent: str
+    model_env: str
+    fallback_model: str
+    population: SmokePopulation
+
+    def __post_init__(self) -> None:
+        for label, value in (("agent", self.agent), ("model_env", self.model_env),
+                             ("fallback_model", self.fallback_model)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"smoke target {label} must be non-empty")
+        if self.population not in {"answer", "trigger"}:
+            raise ValueError("smoke target population must be answer or trigger")
+
+    def resolved_model(self, environ: Mapping[str, str]) -> str:
+        """A blank environment override is absent, never an invalid model id."""
+        override = environ.get(self.model_env)
+        return override.strip() if isinstance(override, str) and override.strip() else self.fallback_model
 
 
 @dataclass(frozen=True)
@@ -46,7 +71,12 @@ class AgentCapabilities:
     tool_replay: bool
     live_smoke_env: str | None
     elapsed_ms: Availability = "available"
+    usage_not_applicable: bool = False
     notes: str = ""
+
+    def __post_init__(self) -> None:
+        if self.token_usage and self.usage_not_applicable:
+            raise ValueError("reported token usage cannot also be not applicable")
 
     def telemetry_contract(self) -> dict[str, TelemetryCapability]:
         """Per-signal declaration used by artifacts, docs, and conformance tests."""
@@ -60,7 +90,10 @@ class AgentCapabilities:
         )
         usage = (
             TelemetryCapability("available", provenance="provider_reported")
-            if self.token_usage else TelemetryCapability("unavailable", reason="runner_does_not_report_usage")
+            if self.token_usage
+            else TelemetryCapability("not_applicable", reason="offline_runner")
+            if self.usage_not_applicable
+            else TelemetryCapability("unavailable", reason="runner_does_not_report_usage")
         )
         return {
             "usage": usage,
@@ -163,7 +196,26 @@ AGENT_CAPABILITIES: dict[str, AgentCapabilities] = {
         judge_backend=False,
         tool_replay=False,
         live_smoke_env=None,
-        elapsed_ms="not_applicable",
+        usage_not_applicable=True,
         notes="Offline deterministic demo/CI adapter; never spends model tokens.",
     ),
 }
+
+
+SMOKE_TARGETS: Mapping[str, SmokeTarget] = MappingProxyType({
+    "claude": SmokeTarget("claude", "SMOKE_CLAUDE_MODEL", "haiku", "answer"),
+    "codex": SmokeTarget("codex", "SMOKE_CODEX_MODEL", "gpt-5.4-mini", "answer"),
+    "vibe": SmokeTarget("vibe", "SMOKE_VIBE_MODEL", "devstral-small-latest", "answer"),
+    "pi": SmokeTarget("pi", "SMOKE_PI_MODEL", "openai-codex/gpt-5.4-mini", "trigger"),
+})
+
+for _agent, _target in SMOKE_TARGETS.items():
+    _capability = AGENT_CAPABILITIES.get(_agent)
+    if _capability is None:
+        raise RuntimeError(f"smoke target {_agent!r} has no capability row")
+    if _target.agent != _agent:
+        raise RuntimeError(f"smoke target key {_agent!r} disagrees with target agent {_target.agent!r}")
+    if _target.population == "answer" and not _capability.answer_runner:
+        raise RuntimeError(f"smoke target {_agent!r} requires unsupported answer population")
+    if _target.population == "trigger" and not _capability.autonomous_trigger:
+        raise RuntimeError(f"smoke target {_agent!r} requires unsupported trigger population")

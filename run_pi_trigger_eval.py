@@ -26,23 +26,25 @@ from skill_benchmark import (
     is_trigger_case,
     build_canonical_skill_tree,
     canonical_skill_tree_hash,
-    detect_trigger,
+    detect_trigger,  # compatibility re-export; internal path uses typed detection
+    detect_trigger_records,
     event_texts_for_tool_input,  # noqa: F401  (re-exported for adapters/tests)
     expected_trigger_polarity,
     iter_cases,
     load_manifest_source,
     materialize_trigger_ablation,
     mount_skill_tree,
+    PiStream,
     pi_stream_terminal_error,
     repo_root_for_manifest,
-    run_argv_with_timeout,
+    invoke_argv_with_timeout,
     safe_trace_label,
-    stream_usage_and_cost,
     write_json,
     write_trace_artifacts,
     AblationError,
 )
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
+from trigger_contracts import InvocationOutcome, TriggerExpectation, TriggerObservation
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -92,14 +94,20 @@ def pi_terminal_error(raw_text: str) -> str | None:
     return pi_stream_terminal_error(raw_text)
 
 
-def pi_invoke_result(run: dict[str, Any]) -> dict[str, Any]:
-    """Normalize Pi's process result into a trustworthy observation state."""
-    result = dict(run)
-    provider_error = pi_terminal_error(str(result.get("stdout") or ""))
-    if provider_error:
-        result["provider_error"] = provider_error
-        result["observation_complete"] = False
-    return result
+def pi_invocation_outcome(run: InvocationOutcome) -> InvocationOutcome:
+    """Attach Pi's one parsed provider stream to its classified process state."""
+    if not isinstance(run, InvocationOutcome):
+        raise TypeError("Pi invocation requires InvocationOutcome")
+    stream = PiStream.parse(run.stdout)
+    if stream.terminal_error or (run.observation_complete and stream.protocol_error):
+        return run.with_provider_error(stream.failure_error, payload=stream)
+    return run.with_provider_payload(stream)
+
+
+def pi_invoke_result(run: dict[str, Any] | InvocationOutcome) -> dict[str, Any]:
+    """Compatibility dictionary boundary for callers not yet using typed outcomes."""
+    outcome = run if isinstance(run, InvocationOutcome) else InvocationOutcome.from_legacy_dict("pi", run)
+    return pi_invocation_outcome(outcome).as_legacy_dict()
 
 
 def pi_argv(query: str, model: str | None = None) -> list[str]:
@@ -115,7 +123,8 @@ def pi_argv(query: str, model: str | None = None) -> list[str]:
     return argv
 
 
-def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, Any]) -> None:
+def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, Any],
+                                  pi_stream: PiStream | None = None) -> None:
     write_trace_artifacts(
         run_dir,
         stdout,
@@ -130,6 +139,7 @@ def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, 
         },
         environment={"runner": "pi", "mode": "json", "trigger_eval": True},
         write_metadata=True,
+        pi_stream=pi_stream,
     )
 
 
@@ -141,13 +151,18 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
         copied, abl_prov = copy_skill_to_config(manifest_path, manifest, config_dir, ablation_id=ablation)
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(config_dir)
-        run = pi_invoke_result(run_argv_with_timeout(pi_argv(query, model), cwd=config_dir, env=env, timeout=timeout))
-        stdout, stderr = run["stdout"], run["stderr"]
-        returncode, timed_out, elapsed_ms = run["returncode"], run["timed_out"], run["elapsed_ms"]
-        triggered, evidence = detect_trigger(stdout, copied)
-        # Trigger runs now persist token/cost telemetry like the answer paths
-        # (issue #21): parsed off the same Pi JSON stream the detector reads.
-        usage_normalized, cost_normalized = stream_usage_and_cost(stdout, source="pi")
+        invocation = pi_invocation_outcome(
+            invoke_argv_with_timeout(pi_argv(query, model), cwd=config_dir, env=env, timeout=timeout)
+        )
+        stream = invocation.provider_payload
+        if not isinstance(stream, PiStream):
+            raise TypeError("Pi invocation did not retain its parsed provider stream")
+        detection = detect_trigger_records(stream.records, copied)
+        if invocation.observation_complete:
+            usage_normalized = dict(stream.usage_normalized)
+            cost_normalized = dict(stream.cost_normalized)
+        else:
+            usage_normalized, cost_normalized = {"source": "missing"}, {"source": "missing"}
         is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
         # The materialized ablation's provenance goes through Provenance (one
         # schema); the canonical (parent) tree hash is recorded on BOTH arms under
@@ -160,33 +175,27 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
         else:
             ablation_field = ablation
             skill_tree_hash = (abl_prov or {}).get("skill_tree_hash")
-        result = {
-            "population": "trigger",
-            "query": query,
-            "model": model,
-            "should_trigger": should_trigger,
-            "triggered": triggered,
-            # RAW measurement, NOT a confirmed ablation effect: this is one arm's
-            # autonomous-trigger outcome. The harness does not yet pair baseline vs
-            # ablation here, so do not read a "pass" as a provenance-verified
-            # causal ablation result (unlike the answer-population path).
-            "pass": bool(run.get("observation_complete", returncode == 0 and not timed_out)) and triggered == should_trigger,
-            "measurement": EvidenceClass.RAW_MEASUREMENT.value,
-            "elapsed_ms": elapsed_ms,
-            "observation_complete": bool(run.get("observation_complete", returncode == 0 and not timed_out)),
-            "returncode": returncode,
-            "timed_out": timed_out,
-            "evidence": evidence,
-            "usage_normalized": usage_normalized,
-            "cost_normalized": cost_normalized,
-            "ablation": ablation_field,
-            "skill_tree_hash": skill_tree_hash,
-            "stderr": stderr[-1000:] if stderr else "",
-        }
-        if isinstance(run.get("provider_error"), str):
-            result["provider_error"] = run["provider_error"]
+        # RAW measurement, NOT a confirmed ablation effect: this is one arm's
+        # autonomous-trigger outcome. Pass/completeness/timeout are derived from
+        # the typed invocation and expectation; callers cannot set them independently.
+        observation = TriggerObservation(
+            agent="pi",
+            model=model,
+            query=query,
+            expectation=TriggerExpectation.from_bool(should_trigger),
+            invocation=invocation,
+            detection=detection,
+            usage=usage_normalized,
+            cost=cost_normalized,
+            metadata={
+                "measurement": EvidenceClass.RAW_MEASUREMENT.value,
+                "ablation": ablation_field,
+                "skill_tree_hash": skill_tree_hash,
+            },
+        )
+        result = observation.as_row()
         if trace_dir is not None:
-            write_trigger_trace_artifacts(trace_dir, stdout, result)
+            write_trigger_trace_artifacts(trace_dir, invocation.stdout, result, stream)
         return result
 
 

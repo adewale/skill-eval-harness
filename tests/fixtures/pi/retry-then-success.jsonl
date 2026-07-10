@@ -1,0 +1,6 @@
+{"type":"agent_start"}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"transient provider failure","usage":{"input":2,"output":0,"totalTokens":2,"cost":{"total":0.002}}}}
+{"type":"agent_end","willRetry":true,"messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"transient provider failure","usage":{"input":2,"output":0,"totalTokens":2,"cost":{"total":0.002}}}]}
+{"type":"agent_start"}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop","usage":{"input":10,"output":3,"totalTokens":13,"cost":{"total":0.013}}}}
+{"type":"agent_end","willRetry":false,"messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"transient provider failure","usage":{"input":2,"output":0,"totalTokens":2,"cost":{"total":0.002}}},{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop","usage":{"input":10,"output":3,"totalTokens":13,"cost":{"total":0.013}}}]}

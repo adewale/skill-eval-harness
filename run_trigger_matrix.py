@@ -66,13 +66,15 @@ from skill_benchmark import (
     AblationError,
     build_canonical_skill_tree,
     canonical_skill_tree_hash,
-    detect_trigger,
+    detect_trigger_detection,
+    detect_trigger_records,
     frontmatter_value,
     iter_json_objects,
     materialize_trigger_ablation,
     mount_skill_tree,
+    PiStream,
     repo_root_for_manifest,
-    run_argv_with_timeout,
+    invoke_argv_with_timeout,
     safe_trace_label,
     stream_usage_and_cost,
     build_vibe_cli_argv,
@@ -84,18 +86,20 @@ from skill_benchmark import (
     write_json,
     write_trace_artifacts,
 )
-from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_manifest, pi_argv, pi_invoke_result, skill_name_from_manifest, seed_config_dir, validate_trigger_rows
+from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_manifest, pi_argv, pi_invocation_outcome, skill_name_from_manifest, seed_config_dir, validate_trigger_rows
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
+from trigger_contracts import (
+    InvocationOutcome,
+    InvocationState,
+    TriggerDetection,
+    TriggerEvidence,
+    TriggerEvidenceKind,
+    TriggerExpectation,
+    TriggerObservation,
+)
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
 DEFAULT_CODEX_CMD = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules"
-INVOKE_RESULT_KEYS = ("stdout", "stderr", "returncode", "timed_out", "elapsed_ms", "observation_complete")
-INVOKE_RESULT_METADATA_KEYS = (
-    "provider_error",
-    "config_isolated", "config_isolation_warning",
-    "codex_home_files_copied", "codex_home_outside_workdir",
-    "vibe_env_file_copied", "vibe_home_outside_workdir",
-)
 CLAUDE_PORTABLE_AUTH_FILES = (".credentials.json",)
 SENSITIVE_WORKSPACE_FILES = (
     ".trigger-config/.credentials.json",
@@ -133,13 +137,11 @@ def require_agent_capabilities(name: str) -> Any:
         raise SystemExit(f"agent {name!r} is registered in ADAPTERS but missing agent_capabilities.AGENT_CAPABILITIES[{name!r}]") from exc
 
 
-def validate_invoke_result(agent: str, result: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(result, dict):
-        raise TypeError(f"{agent}.invoke must return a dict, got {type(result).__name__}")
-    missing = [key for key in INVOKE_RESULT_KEYS if key not in result]
-    if missing:
-        raise KeyError(f"{agent}.invoke missing required result key(s): {', '.join(missing)}")
-    return result
+def validate_invoke_result(agent: str, result: InvocationOutcome | dict[str, Any]) -> InvocationOutcome:
+    """Strict compatibility parser; native adapters already return the typed state."""
+    if isinstance(result, InvocationOutcome):
+        return result
+    return InvocationOutcome.from_legacy_dict(agent, result)
 
 
 def seed_claude_config_dir(config_dir: Path, source_config: Path | None = None) -> bool:
@@ -232,6 +234,21 @@ def redact_sensitive_text(text: str, secrets: list[str]) -> str:
     return redacted
 
 
+def redact_sensitive_value(value: Any, secrets: list[str]) -> Any:
+    if isinstance(value, str):
+        return redact_sensitive_text(value, secrets)
+    if isinstance(value, dict):
+        return {
+            redact_sensitive_text(str(key), secrets): redact_sensitive_value(child, secrets)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_sensitive_value(child, secrets) for child in value]
+    if isinstance(value, tuple):
+        return tuple(redact_sensitive_value(child, secrets) for child in value)
+    return value
+
+
 def safe_trace_segment(text: str, fallback: str) -> str:
     label = safe_trace_label(text, fallback).strip(".-")
     return label if label and label not in {".", ".."} else fallback
@@ -260,16 +277,18 @@ class AgentAdapter:
     def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
         raise NotImplementedError
 
-    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
+    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         raise NotImplementedError
 
-    def detect(self, stdout: str, skill_names: list[str], copied: list[Path]) -> tuple[bool, list[str]]:
-        return detect_trigger(stdout, copied)
+    def detect(self, invocation: InvocationOutcome, skill_names: list[str], copied: list[Path]) -> TriggerDetection:
+        if isinstance(invocation.provider_payload, PiStream):
+            return detect_trigger_records(invocation.provider_payload.records, copied)
+        return detect_trigger_detection(invocation.stdout, copied)
 
     # The shared mount and subprocess conventions (skill_benchmark owns them;
     # the Pi runner uses the very same functions, so adapters cannot drift).
     _mount_tree = staticmethod(mount_skill_tree)
-    _run_argv = staticmethod(run_argv_with_timeout)
+    _run_argv = staticmethod(invoke_argv_with_timeout)
 
 
 class ClaudeAdapter(AgentAdapter):
@@ -287,7 +306,7 @@ class ClaudeAdapter(AgentAdapter):
         # Project skills: Claude Code discovers <cwd>/.claude/skills on its own.
         return self._mount_tree(tree_dir, workspace / ".claude" / "skills")
 
-    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
+    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         # Use a fresh config dir when auth is portable, so personal config does
         # not bleed into the run. Claude Code's current OAuth/keychain login is
         # not file-seedable; pointing CLAUDE_CONFIG_DIR at an empty directory
@@ -304,17 +323,21 @@ class ClaudeAdapter(AgentAdapter):
         if os.environ.get("ANTHROPIC_API_KEY") or seed_claude_config_dir(config_dir):
             env["CLAUDE_CONFIG_DIR"] = str(config_dir)
             config_isolated = True
-        result = self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
-        result["config_isolated"] = config_isolated
+        result = validate_invoke_result(
+            self.name, self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
+        )
+        metadata: dict[str, Any] = {"config_isolated": config_isolated}
         if not config_isolated:
-            result["config_isolation_warning"] = (
+            metadata["config_isolation_warning"] = (
                 "Claude OAuth/keychain auth was not portable; preserved the normal Claude config, "
                 "so personal config may influence this measurement"
             )
+        result = result.with_metadata(metadata)
         # Hitting --max-turns exits nonzero, but the model HAD its window to
-        # load the skill — that is a completed observation, not a broken run.
-        if result["returncode"] != 0 and self._result_subtype(result["stdout"]) == "error_max_turns":
-            result["observation_complete"] = True
+        # load the skill. The only legal non-zero completion uses this explicit transition.
+        if (result.state is InvocationState.PROCESS_FAILED
+                and self._result_subtype(result.stdout) == "error_max_turns"):
+            result = result.as_agent_window_complete()
         return result
 
     @staticmethod
@@ -324,11 +347,11 @@ class ClaudeAdapter(AgentAdapter):
                 return event.get("subtype")
         return None
 
-    def detect(self, stdout: str, skill_names: list[str], copied: list[Path]) -> tuple[bool, list[str]]:
+    def detect(self, invocation: InvocationOutcome, skill_names: list[str], copied: list[Path]) -> TriggerDetection:
         # Primary evidence: the Skill tool invoked with a mounted skill's name.
         # Fallback: the shared path detector (the model Read the mounted files).
         evidence: list[str] = []
-        for event in iter_json_objects(stdout):
+        for event in iter_json_objects(invocation.stdout):
             if not isinstance(event, dict) or event.get("type") != "assistant":
                 continue
             for block in (event.get("message") or {}).get("content") or []:
@@ -338,8 +361,8 @@ class ClaudeAdapter(AgentAdapter):
                 if invoked in skill_names:
                     evidence.append(f"Skill tool invoked: {invoked}")
         if evidence:
-            return True, evidence[:5]
-        return super().detect(stdout, skill_names, copied)
+            return TriggerDetection.from_texts(TriggerEvidenceKind.SKILL_TOOL, evidence[:5])
+        return super().detect(invocation, skill_names, copied)
 
 
 class CodexAdapter(AgentAdapter):
@@ -363,7 +386,7 @@ class CodexAdapter(AgentAdapter):
         # invoke() grants the skills directory only via --add-dir.
         return self._mount_tree(tree_dir, self._codex_home(workspace) / "skills")
 
-    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
+    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         argv = shlex.split(self.codex_cmd)
         codex_home = self._codex_home(workspace)
         skills_dir = codex_home / "skills"
@@ -374,12 +397,15 @@ class CodexAdapter(AgentAdapter):
         argv.append(query)
         env, meta = codex_env_for_home(codex_home)
         try:
-            result = self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
+            result = validate_invoke_result(
+                self.name, self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
+            )
         finally:
             shutil.rmtree(codex_home, ignore_errors=True)
-        result.update({k: v for k, v in meta.items() if k != "codex_home"})
-        result["codex_home_outside_workdir"] = True
-        return result
+        return result.with_metadata(
+            {k: v for k, v in meta.items() if k != "codex_home"},
+            codex_home_outside_workdir=True,
+        )
 
 
 class PiAdapter(AgentAdapter):
@@ -395,10 +421,13 @@ class PiAdapter(AgentAdapter):
         seed_config_dir(config_dir)   # auth/settings, never the user's skills
         return self._mount_tree(tree_dir, config_dir / "skills")
 
-    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
+    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(workspace / ".pi-config")
-        return pi_invoke_result(self._run_argv(pi_argv(query, model), cwd=workspace, env=env, timeout=timeout))
+        return pi_invocation_outcome(validate_invoke_result(
+            self.name,
+            self._run_argv(pi_argv(query, model), cwd=workspace, env=env, timeout=timeout),
+        ))
 
 
 class VibeAdapter(AgentAdapter):
@@ -416,7 +445,7 @@ class VibeAdapter(AgentAdapter):
     def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
         return self._mount_tree(tree_dir, workspace / ".agents" / "skills")
 
-    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
+    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         with tempfile.TemporaryDirectory(prefix=f"{workspace.name}-vibe-home-") as vibe_home:
             env, env_meta = vibe_env_for_home(Path(vibe_home), model)
             try:
@@ -424,22 +453,28 @@ class VibeAdapter(AgentAdapter):
                                            tools=VIBE_READ_ONLY_TOOLS, auto_approve=True,
                                            max_turns=self.max_turns)
             except ValueError as exc:
-                return {"stdout": "", "stderr": str(exc), "returncode": 127, "timed_out": False,
-                        "elapsed_ms": None, "observation_complete": False,
-                        "config_isolated": True,
-                        "vibe_env_file_copied": env_meta.get("vibe_env_file_copied", False),
-                        "vibe_home_outside_workdir": True}
-            result = self._run_argv(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
-        result["config_isolated"] = True
-        result["vibe_env_file_copied"] = bool(env_meta.get("vibe_env_file_copied", False))
-        result["vibe_home_outside_workdir"] = True
-        return result
+                return InvocationOutcome.from_process(
+                    stdout="", stderr=str(exc), returncode=127, elapsed_ms=0,
+                ).with_metadata(
+                    config_isolated=True,
+                    vibe_env_file_copied=bool(env_meta.get("vibe_env_file_copied", False)),
+                    vibe_home_outside_workdir=True,
+                )
+            result = validate_invoke_result(
+                self.name,
+                self._run_argv(argv, input_text="", cwd=workspace, env=env, timeout=timeout),
+            )
+        return result.with_metadata(
+            config_isolated=True,
+            vibe_env_file_copied=bool(env_meta.get("vibe_env_file_copied", False)),
+            vibe_home_outside_workdir=True,
+        )
 
-    def detect(self, stdout: str, skill_names: list[str], copied: list[Path]) -> tuple[bool, list[str]]:
-        evidence = vibe_skill_tool_evidence(stdout, skill_names)
+    def detect(self, invocation: InvocationOutcome, skill_names: list[str], copied: list[Path]) -> TriggerDetection:
+        evidence = vibe_skill_tool_evidence(invocation.stdout, skill_names)
         if evidence:
-            return True, evidence
-        return super().detect(stdout, skill_names, copied)
+            return TriggerDetection.from_texts(TriggerEvidenceKind.VIBE_SKILL_TOOL, evidence)
+        return super().detect(invocation, skill_names, copied)
 
 
 class StubAdapter(AgentAdapter):
@@ -458,7 +493,8 @@ class StubAdapter(AgentAdapter):
     def _content_words(text: str) -> set[str]:
         return {w for w in re.findall(r"[a-z]{4,}", text.lower()) if w not in STOPWORDS}
 
-    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> dict[str, Any]:
+    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
+        started = time.monotonic()
         lines: list[str] = []
         for skill_md in sorted((workspace / "skills").glob("*/SKILL.md")):
             description = str(frontmatter_value(skill_md.read_text(encoding="utf-8"), "description") or "")
@@ -468,8 +504,10 @@ class StubAdapter(AgentAdapter):
                 lines.append(json.dumps({"type": "assistant", "message": {"content": [
                     {"type": "tool_use", "name": "Read", "input": {"file_path": str(skill_md)}}]}}))
         lines.append(json.dumps({"type": "result", "subtype": "success"}))
-        return {"stdout": "\n".join(lines) + "\n", "stderr": "", "returncode": 0, "timed_out": False,
-                "elapsed_ms": None, "observation_complete": True}
+        return InvocationOutcome.from_process(
+            stdout="\n".join(lines) + "\n", stderr="", returncode=0,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
 
 
 ADAPTERS: dict[str, type[AgentAdapter]] = {"claude": ClaudeAdapter, "codex": CodexAdapter, "pi": PiAdapter, "vibe": VibeAdapter, "stub": StubAdapter}
@@ -510,96 +548,104 @@ def trigger_tree_for_manifest(repo_root: Path, manifest: dict[str, Any], work_di
 
 def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger: bool,
                        exc: BaseException, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
-    message = f"{type(exc).__name__}: {exc}"
-    row: dict[str, Any] = {
-        "population": "trigger",
-        "agent": agent,
-        "model": model,
-        "query": query,
-        "should_trigger": should_trigger,
-        "triggered": False,
-        "pass": False,
-        "observation_complete": False,
-        "returncode": None,
-        "timed_out": False,
-        "elapsed_ms": None,
-        "evidence": [],
-        "usage_normalized": {"source": "missing"},
-        "cost_normalized": {"source": "missing"},
-        "stderr": message[-1000:],
-        "error": message,
-    }
-    if metadata:
-        row.update({k: v for k, v in metadata.items() if k not in row})
-    return row
+    return TriggerObservation.harness_failure(
+        agent=agent,
+        model=model,
+        query=query,
+        expectation=TriggerExpectation.from_bool(should_trigger),
+        error=exc,
+        metadata=metadata,
+    ).as_row()
 
 
 def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_trigger: bool,
                    model: str | None, timeout: int, trace_dir: Path | None = None,
                    metadata: dict[str, Any] | None = None) -> dict[str, Any]:
-    """One run of one query in one (agent, model) cell, in a fresh workspace."""
+    """One typed observation of one query in one (agent, model) cell."""
     secrets: list[str] = []
     with tempfile.TemporaryDirectory(prefix=f"trigger-{adapter.name}-") as td:
         workspace = Path(td)
         copied = adapter.mount(tree_dir, workspace)
         names = mounted_skill_names(copied)
-        result = validate_invoke_result(adapter.name, adapter.invoke(query, model, workspace, timeout))
-        stdout = str(result["stdout"])
+        invocation = validate_invoke_result(adapter.name, adapter.invoke(query, model, workspace, timeout))
         secrets = workspace_secret_values(workspace) + ambient_secret_values()
-        triggered, evidence = adapter.detect(stdout, names, copied)
-    redacted_stdout = redact_sensitive_text(stdout, secrets)
-    redacted_evidence = [redact_sensitive_text(str(item), secrets) for item in evidence]
-    redacted_stderr = redact_sensitive_text(str(result["stderr"] or ""), secrets)
+        detection = adapter.detect(invocation, names, copied)
+
+    redacted_stdout = redact_sensitive_text(invocation.stdout, secrets)
+    redacted_stderr = redact_sensitive_text(invocation.stderr, secrets)
+    redacted_provider_error = (
+        redact_sensitive_text(invocation.provider_error, secrets)
+        if invocation.provider_error is not None else None
+    )
+    redacted_invocation = invocation.with_wire_text(
+        stdout=redacted_stdout,
+        stderr=redacted_stderr,
+        provider_error=redacted_provider_error,
+    ).with_metadata(redact_sensitive_value(dict(invocation.metadata), secrets))
+    redacted_detection = TriggerDetection(tuple(
+        TriggerEvidence(item.kind, redact_sensitive_text(item.text, secrets))
+        for item in detection.evidence
+    ))
+
     telemetry_error = None
-    try:
-        usage, cost = stream_usage_and_cost(stdout, source=adapter.name)
-    except Exception as exc:
-        telemetry_error = f"{type(exc).__name__}: {exc}"
+    if invocation.observation_complete:
+        try:
+            parsed_pi = invocation.provider_payload if isinstance(invocation.provider_payload, PiStream) else None
+            usage, cost = stream_usage_and_cost(
+                invocation.stdout, source=adapter.name, pi_stream=parsed_pi,
+            )
+        except Exception as exc:
+            telemetry_error = f"{type(exc).__name__}: {exc}"
+            usage, cost = {"source": "missing"}, {"source": "missing"}
+        capability = AGENT_CAPABILITIES.get(adapter.name)
+        if capability is not None:
+            telemetry_contract = capability.telemetry_contract()
+            if telemetry_contract["usage"].availability == "not_applicable":
+                usage = {"source": "not_applicable"}
+            if telemetry_contract["cost"].availability == "not_applicable":
+                cost = {"source": "not_applicable"}
+    else:
         usage, cost = {"source": "missing"}, {"source": "missing"}
-    observation_complete = bool(result["observation_complete"])
-    row = {
-        "population": "trigger",
-        "agent": adapter.name,
-        "model": model,
-        "query": query,
-        "should_trigger": should_trigger,
-        "triggered": triggered,
-        "pass": observation_complete and triggered == should_trigger,
-        "observation_complete": observation_complete,
-        "returncode": result["returncode"],
-        "timed_out": bool(result["timed_out"]),
-        "elapsed_ms": result["elapsed_ms"],
-        "evidence": redacted_evidence,
-        "usage_normalized": usage,
-        "cost_normalized": cost,
-        "stderr": redacted_stderr[-1000:],
-    }
-    for key in INVOKE_RESULT_METADATA_KEYS:
-        if key in result:
-            row[key] = result[key]
+
+    observation_metadata = redact_sensitive_value(dict(metadata or {}), secrets)
     if telemetry_error:
-        row["telemetry_error"] = telemetry_error
-    if metadata:
-        row.update({k: v for k, v in metadata.items() if k not in row})
+        observation_metadata["telemetry_error"] = telemetry_error
     if trace_dir is not None:
-        row["trace_dir"] = str(trace_dir)
+        observation_metadata["trace_dir"] = str(trace_dir)
+    observation = TriggerObservation(
+        agent=adapter.name,
+        model=model,
+        query=query,
+        expectation=TriggerExpectation.from_bool(should_trigger),
+        invocation=redacted_invocation,
+        detection=redacted_detection,
+        usage=usage,
+        cost=cost,
+        metadata=observation_metadata,
+    )
+    row = observation.as_row()
+
+    if trace_dir is not None:
         trace_metadata = {
             "population": "trigger",
             "provider": adapter.name,
             "model": model,
             "returncode": row["returncode"],
             "timed_out": row["timed_out"],
-            "observation_complete": observation_complete,
-            "triggered": triggered,
-            "evidence": redacted_evidence,
+            "observation_complete": row["observation_complete"],
+            "triggered": row["triggered"],
+            "evidence": row["evidence"],
             "usage_normalized": usage,
             "cost_normalized": cost,
-            **(metadata or {}),
+            **dict(redacted_invocation.metadata),
+            **observation_metadata,
         }
-        for key in INVOKE_RESULT_METADATA_KEYS:
-            if key in result:
-                trace_metadata[key] = result[key]
+        if redacted_provider_error is not None:
+            trace_metadata["provider_error"] = redacted_provider_error
         try:
+            # Reparse only the sanitized artifact boundary; detection and telemetry
+            # above share the single provider payload retained by the invocation.
+            artifact_pi_stream = PiStream.parse(redacted_stdout) if adapter.name == "pi" else None
             write_trace_artifacts(
                 trace_dir,
                 redacted_stdout,
@@ -609,11 +655,12 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
                     "elapsed_ms": row["elapsed_ms"],
                     "returncode": row["returncode"],
                     "timed_out": row["timed_out"],
-                    "skill_invoked": triggered,
-                    "skill_invocation_evidence": redacted_evidence,
+                    "skill_invoked": row["triggered"],
+                    "skill_invocation_evidence": row["evidence"],
                 },
                 environment={"runner": adapter.name, "model": model, "trigger_eval": True},
                 write_metadata=True,
+                pi_stream=artifact_pi_stream,
             )
         except Exception as exc:
             row["trace_error"] = f"{type(exc).__name__}: {exc}"

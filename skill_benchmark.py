@@ -39,6 +39,12 @@ from typing import Any, Iterable
 import yaml
 import telemetry as telemetry_domain
 
+from trigger_contracts import (
+    InvocationOutcome,
+    TraceEventKind,
+    TriggerDetection,
+    TriggerEvidenceKind,
+)
 from ablation_model import (
     AblationRecord,
     Arm,
@@ -2865,22 +2871,27 @@ def event_texts_for_tool_input(obj: Any) -> list[str]:
     return out
 
 
-def detect_trigger(stdout: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
-    """THE shared skill-invocation detector: scan a model's JSON event stream for
-    evidence it actually read one of the mounted skill files. Returns (invoked,
-    evidence). Used by the autonomous-trigger eval (run_pi_trigger_eval), the
-    trigger matrix, and the pi-smoke runner, so skill_invoked is derived the same
-    way everywhere instead of one runner asserting it by fiat. Matches on the
-    copied temp skill paths (never a bare skill name — an earlier skill_name
-    parameter was dead weight that each caller computed differently) so unrelated
-    repo files can't look like skill-load evidence."""
+def detect_trigger_records(records: Iterable[dict[str, Any]], copied_paths: list[Path]) -> TriggerDetection:
+    """Derive mounted-path trigger evidence from already parsed provider records."""
     needles = [str(p) for p in copied_paths] + [str(p.parent) for p in copied_paths]
     evidence: list[str] = []
-    for event in iter_json_objects(stdout):
+    for event in records:
         for text in event_texts_for_tool_input(event):
-            if any(n and n in text for n in needles):
+            if any(needle and needle in text for needle in needles):
                 evidence.append(text[:500])
-    return bool(evidence), evidence[:5]
+    return TriggerDetection.from_texts(TriggerEvidenceKind.MOUNTED_PATH, evidence[:5])
+
+
+def detect_trigger_detection(stdout: str, copied_paths: list[Path]) -> TriggerDetection:
+    """Typed skill-invocation detector for a raw JSON event stream."""
+    records = [event for event in iter_json_objects(stdout) if isinstance(event, dict)]
+    return detect_trigger_records(records, copied_paths)
+
+
+def detect_trigger(stdout: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
+    """Compatibility wire helper; internal trigger runners use TriggerDetection."""
+    detection = detect_trigger_detection(stdout, copied_paths)
+    return detection.triggered, detection.legacy_evidence
 
 
 def safe_trace_label(text: str, fallback: str) -> str:
@@ -2906,17 +2917,13 @@ def mount_skill_tree(tree_dir: Path, skills_dir: Path) -> list[Path]:
     return copied
 
 
-def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
-                          env: dict[str, str] | None = None, timeout: int,
-                          input_text: str | None = None) -> dict[str, Any]:
-    """One subprocess convention for every spawned runner/adapter process.
+def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
+                             env: dict[str, str] | None = None, timeout: int,
+                             input_text: str | None = None) -> InvocationOutcome:
+    """Typed subprocess owner for every spawned runner/adapter process.
 
-    Returns {stdout, stderr, returncode, timed_out, elapsed_ms,
-    observation_complete}. This is the single low-level owner for spawn failure,
-    process-group timeout cleanup, and the timeout encoding: `timed_out: True`
-    plus `returncode: 124`. observation_complete means the agent got a fair
-    window to act; a crash, spawn failure, or timeout is a failed observation,
-    never a no-trigger pass."""
+    Completion state is classified once here. Consumers cannot independently
+    assemble contradictory returncode/timeout/completeness booleans."""
     def _text(value: Any) -> str:
         if value is None:
             return ""
@@ -2937,10 +2944,10 @@ def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
             start_new_session=True,
         )
     except (OSError, ValueError) as exc:
-        return {"stdout": "", "stderr": f"{type(exc).__name__}: {exc}"[:4000],
-                "returncode": 127, "timed_out": False,
-                "elapsed_ms": int((time.time() - start) * 1000),
-                "observation_complete": False}
+        return InvocationOutcome.from_process(
+            stdout="", stderr=f"{type(exc).__name__}: {exc}"[:4000],
+            returncode=127, elapsed_ms=int((time.time() - start) * 1000),
+        )
     try:
         out, err = proc.communicate(input=input_text, timeout=timeout)
         stdout, stderr, returncode, timed_out = _text(out), _text(err)[:4000], proc.returncode, False
@@ -2953,9 +2960,19 @@ def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
         stdout = _text(out or exc.stdout)
         stderr = _text(err or exc.stderr or str(exc))[:4000]
         returncode, timed_out = 124, True
-    return {"stdout": stdout, "stderr": stderr, "returncode": returncode, "timed_out": timed_out,
-            "elapsed_ms": int((time.time() - start) * 1000),
-            "observation_complete": returncode == 0 and not timed_out}
+    return InvocationOutcome.from_process(
+        stdout=stdout, stderr=stderr, returncode=returncode,
+        elapsed_ms=int((time.time() - start) * 1000),
+    )
+
+
+def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
+                          env: dict[str, str] | None = None, timeout: int,
+                          input_text: str | None = None) -> dict[str, Any]:
+    """Legacy dictionary boundary for external callers; internal code uses the typed owner."""
+    return invoke_argv_with_timeout(
+        argv, cwd=cwd, env=env, timeout=timeout, input_text=input_text,
+    ).as_legacy_dict()
 
 
 def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:
@@ -3450,32 +3467,32 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     # Unknown session/lifecycle events are not tool calls. Defaulting them to
     # tool_call inflated Pi's process telemetry even when its trace had no
     # model tool use at all.
-    event_type = "event"
+    event_type = TraceEventKind.EVENT
     name = stringify_trace_value(raw_trace_value(record, "tool", "tool_name", "name"))
     if "skill" in raw_type and ("load" in raw_type or "read" in raw_type):
-        event_type = "skill_load"
+        event_type = TraceEventKind.SKILL_LOAD
     elif path.endswith("SKILL.md") or "/SKILL.md" in path:
-        event_type = "skill_load"
+        event_type = TraceEventKind.SKILL_LOAD
     elif "command" in raw_type or "exec" in raw_type or command:
-        event_type = "command"
+        event_type = TraceEventKind.COMMAND
         name = name or "bash"
     elif "tool" in raw_type or raw_trace_value(record, "tool", "tool_name", "tool_call_id") is not None:
-        event_type = "tool_call"
+        event_type = TraceEventKind.TOOL_CALL
     elif "file_write" in raw_type or "write" in raw_type or "edit" in raw_type:
-        event_type = "file_write"
+        event_type = TraceEventKind.FILE_WRITE
     elif "file_read" in raw_type or "read" in raw_type:
-        event_type = "file_read"
+        event_type = TraceEventKind.FILE_READ
     elif "error" in raw_type or str(status).casefold() in {"failed", "error", "errored"}:
-        event_type = "error"
+        event_type = TraceEventKind.ERROR
     elif raw_trace_value(record, "role") or content or "agent_message" in raw_type:
-        event_type = "message"
+        event_type = TraceEventKind.MESSAGE
     elif "usage" in raw_type or "metric" in raw_type or raw_trace_value(record, "usage", "tokens"):
-        event_type = "metric"
+        event_type = TraceEventKind.METRIC
     input_summary = command or path or content[:500]
     output_summary = stringify_trace_value(raw_trace_value(record, "output", "stdout", "stderr", "result"))[:1000]
     event = {
         "index": index,
-        "type": event_type,
+        "type": event_type.value,
         "status": status,
         "raw_ref": {"file": "trace.jsonl", "line": line},
     }
@@ -3554,14 +3571,16 @@ def otel_attributes_for_event(event: dict[str, Any]) -> dict[str, Any]:
     return attrs
 
 
-def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "generic") -> tuple[dict[str, Any], dict[str, Any]]:
+def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "generic",
+                            pi_stream: PiStream | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     events = [normalize_trace_record(record, source=source, index=i, line=i) for i, record in enumerate(records, 1)]
     commands = [command_text(e) for e in command_events(events)]
     token_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     elapsed_ms = 0.0
     is_pi = source.casefold() == "pi"
-    pi_error = _pi_terminal_error(records) if is_pi else None
-    pi_terminal_usage = _pi_terminal_usage(records) if is_pi and not pi_error else None
+    parsed_pi = (pi_stream or PiStream.from_records(records)) if is_pi else None
+    pi_error = parsed_pi.failure_error if parsed_pi else None
+    pi_terminal_usage = parsed_pi.terminal_usage if parsed_pi and not pi_error else None
     if pi_terminal_usage is not None:
         # Pi repeats final cumulative usage on message_end, turn_end, and
         # agent_end. It is one response, not several token deltas.
@@ -3625,57 +3644,53 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
     return event_doc, metrics
 
 
-def _pi_terminal_error(records: list[dict[str, Any]]) -> str | None:
-    """Read Pi's terminal provider status from its retrying JSON stream."""
-    last_agent_end: dict[str, Any] | None = None
-    fallback: dict[str, Any] | None = None
-    for record in records:
-        event_type = str(record.get("type") or "")
-        if event_type == "agent_end":
-            last_agent_end = record
-        elif event_type == "turn_end":
-            fallback = record
-
-    def error_from(record: dict[str, Any] | None) -> str | None:
-        if not isinstance(record, dict):
-            return None
-        candidates: list[Any] = [record.get("message")]
-        messages = record.get("messages")
-        if isinstance(messages, list) and messages:
-            candidates.append(messages[-1])
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            error = candidate.get("errorMessage") or candidate.get("error")
-            if isinstance(error, str) and error.strip():
-                return error.strip()
-            if str(candidate.get("stopReason") or "").casefold() == "error":
-                return "Pi provider ended the turn with stopReason:error"
+def _pi_final_message(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
         return None
+    if isinstance(record.get("message"), dict):
+        return record["message"]
+    messages = record.get("messages")
+    if isinstance(messages, list):
+        for candidate in reversed(messages):
+            if isinstance(candidate, dict) and candidate.get("role") == "assistant":
+                return candidate
+        for candidate in reversed(messages):
+            if isinstance(candidate, dict):
+                return candidate
+    return None
 
-    return error_from(last_agent_end) or error_from(fallback)
+
+def _pi_final_agent_end(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next((record for record in reversed(records) if str(record.get("type") or "") == "agent_end"), None)
+
+
+def _pi_terminal_error(records: list[dict[str, Any]]) -> str | None:
+    """Read only Pi's final retry attempt, never a historical failed message."""
+    last_agent_end = _pi_final_agent_end(records)
+    fallback = next((record for record in reversed(records) if str(record.get("type") or "") == "turn_end"), None)
+    candidate = _pi_final_message(last_agent_end if last_agent_end is not None else fallback)
+    if candidate is None:
+        return None
+    error = candidate.get("errorMessage") or candidate.get("error")
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    if str(candidate.get("stopReason") or "").casefold() == "error":
+        return "Pi provider ended the turn with stopReason:error"
+    return None
 
 
 def pi_stream_terminal_error(raw_text: str) -> str | None:
-    """Public Pi JSON boundary: provider errors cannot become zero telemetry."""
-    records = [record for record in iter_json_objects(raw_text) if isinstance(record, dict)]
-    return _pi_terminal_error(records)
+    """Compatibility boundary backed by the typed, single-pass Pi parser."""
+    return PiStream.parse(raw_text).failure_error
 
 
 def _pi_terminal_usage(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Return Pi's one final cumulative usage block, if this is a Pi stream."""
-    for record in reversed(records):
-        event_type = str(record.get("type") or "")
-        if event_type not in {"agent_end", "turn_end", "message_end"}:
-            continue
-        candidates: list[Any] = [record.get("message")]
-        messages = record.get("messages")
-        if isinstance(messages, list) and messages:
-            candidates.append(messages[-1])
-        for message in candidates:
-            if isinstance(message, dict) and isinstance(message.get("usage"), dict):
-                return message["usage"]
-    return None
+    """Return cumulative usage from Pi's final retry attempt only."""
+    last_agent_end = _pi_final_agent_end(records)
+    fallback = next((record for record in reversed(records)
+                     if str(record.get("type") or "") in {"turn_end", "message_end"}), None)
+    message = _pi_final_message(last_agent_end if last_agent_end is not None else fallback)
+    return message.get("usage") if isinstance(message, dict) and isinstance(message.get("usage"), dict) else None
 
 
 def _stream_usage_doc(record: dict[str, Any]) -> dict[str, Any] | None:
@@ -3717,22 +3732,7 @@ def _cost_value_from_record(record: dict[str, Any]) -> Any:
     return None
 
 
-def stream_usage_and_cost(raw_text: str, *, source: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    """usage_normalized/cost_normalized straight from a runner's raw JSONL
-    stream (issue #21). Prefer final cumulative result/completion usage when a
-    provider emits it; otherwise sum per-event usage deltas. Missing stays
-    marked. Pi's terminal events receive their special cumulative semantics
-    only when the caller identifies the stream as Pi."""
-    records = [obj for obj in iter_json_objects(raw_text) if isinstance(obj, dict)]
-    is_pi = str(source or "").casefold() == "pi"
-    if is_pi and _pi_terminal_error(records):
-        return {"source": "missing"}, {"source": "missing"}
-    pi_terminal_usage = _pi_terminal_usage(records) if is_pi else None
-    if pi_terminal_usage is not None:
-        return (
-            normalize_usage(pi_terminal_usage, source="trace_normalized"),
-            normalize_cost(pi_terminal_usage.get("cost"), source="trace_normalized"),
-        )
+def _generic_stream_usage_and_cost(records: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
     cumulative_usage: list[dict[str, Any]] = []
     for record in records:
         if not _is_cumulative_usage_record(record):
@@ -3756,8 +3756,7 @@ def stream_usage_and_cost(raw_text: str, *, source: str | None = None) -> tuple[
         if normalized.get("source") != "missing":
             cumulative_cost.append(normalized)
     if cumulative_cost:
-        cost = cumulative_cost[-1]
-        return usage, cost
+        return usage, cumulative_cost[-1]
     cost_values = [_cost_value_from_record(record) for record in records]
     cost_blocks = [normalize_cost(value, source="trace_normalized") for value in cost_values if value is not None]
     cost_blocks = [block for block in cost_blocks if block.get("source") != "missing"]
@@ -3767,9 +3766,78 @@ def stream_usage_and_cost(raw_text: str, *, source: str | None = None) -> tuple[
         cost_total = sum(float(block["total_cost"]) for block in cost_blocks)
         cost = normalize_cost({"amount": round(cost_total, 6), "currency": currency}, source="trace_normalized")
     else:
-        # A trace that mixes units has no total without an explicit FX policy.
         cost = {"source": "missing"}
     return usage, cost
+
+
+@_dataclass(frozen=True)
+class PiStream:
+    """One parsed Pi JSON stream with intrinsic terminal semantics.
+
+    Provider status and cumulative telemetry are derived together once. Callers
+    pass this object to detection, telemetry, and trace normalization rather than
+    reinterpreting the same wire text with independent policies.
+    """
+
+    records: tuple[dict[str, Any], ...]
+    parse_errors: tuple[str, ...]
+    terminal_error: str | None
+    protocol_error: str | None
+    terminal_usage: dict[str, Any] | None
+    usage_normalized: dict[str, Any]
+    cost_normalized: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if self.failure_error:
+            if self.usage_normalized != {"source": "missing"} or self.cost_normalized != {"source": "missing"}:
+                raise ValueError("failed Pi streams cannot carry measured usage or cost")
+
+    @property
+    def failure_error(self) -> str | None:
+        return self.terminal_error or self.protocol_error
+
+    @classmethod
+    def from_records(cls, records: Iterable[dict[str, Any]],
+                     parse_errors: Iterable[str] = ()) -> "PiStream":
+        materialized = [dict(record) for record in records]
+        terminal_error = _pi_terminal_error(materialized)
+        final_agent_end = _pi_final_agent_end(materialized)
+        terminal_seen = final_agent_end is not None and final_agent_end.get("willRetry") is not True
+        errors = tuple(parse_errors)
+        protocol_error = (
+            f"Pi JSON stream parse error: {errors[0]}" if errors
+            else None if terminal_seen
+            else "Pi JSON stream ended without a final agent_end event"
+        )
+        terminal_usage = _pi_terminal_usage(materialized)
+        if terminal_error or protocol_error:
+            usage, cost = {"source": "missing"}, {"source": "missing"}
+        elif terminal_usage is not None:
+            usage = normalize_usage(terminal_usage, source="trace_normalized")
+            cost = normalize_cost(terminal_usage.get("cost"), source="trace_normalized")
+        else:
+            usage, cost = _generic_stream_usage_and_cost(materialized)
+        return cls(tuple(materialized), errors, terminal_error, protocol_error,
+                   dict(terminal_usage) if terminal_usage is not None else None,
+                   usage, cost)
+
+    @classmethod
+    def parse(cls, raw_text: str) -> "PiStream":
+        if not isinstance(raw_text, str):
+            raise TypeError("Pi stream must be text")
+        records, errors = parse_trace_jsonl_text(raw_text)
+        return cls.from_records(records, errors)
+
+
+def stream_usage_and_cost(raw_text: str, *, source: str | None = None,
+                          pi_stream: PiStream | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Normalize one runner stream without confusing Pi cumulative events for deltas."""
+    is_pi = str(source or "").casefold() == "pi"
+    if is_pi:
+        parsed = pi_stream or PiStream.parse(raw_text)
+        return dict(parsed.usage_normalized), dict(parsed.cost_normalized)
+    records = [obj for obj in iter_json_objects(raw_text) if isinstance(obj, dict)]
+    return _generic_stream_usage_and_cost(records)
 
 
 def write_trace_artifacts(
@@ -3784,12 +3852,16 @@ def write_trace_artifacts(
     out_events: Path | None = None,
     out_metrics: Path | None = None,
     write_raw_trace: bool = True,
+    pi_stream: PiStream | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     run_dir.mkdir(parents=True, exist_ok=True)
     if write_raw_trace:
         (run_dir / "trace.jsonl").write_text(trace_text, encoding="utf-8")
-    records, parse_errors = parse_trace_jsonl_text(trace_text)
-    events, metrics = normalize_trace_records(records, source=source)
+    if source.casefold() == "pi" and pi_stream is not None:
+        records, parse_errors = list(pi_stream.records), list(pi_stream.parse_errors)
+    else:
+        records, parse_errors = parse_trace_jsonl_text(trace_text)
+    events, metrics = normalize_trace_records(records, source=source, pi_stream=pi_stream)
     if parse_errors:
         metrics["parse_errors"] = parse_errors[:20]
         metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
@@ -4092,12 +4164,12 @@ def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeo
     `run_argv_with_timeout` owns spawn failure, process-group timeout cleanup,
     stderr capping, elapsed time, and returncode shape; this function only adapts
     that dict contract into `InvocationResult`."""
-    result = run_argv_with_timeout(argv, input_text=input_text, cwd=cwd, env=env, timeout=timeout)
-    return InvocationResult(stdout=coerce_text(result.get("stdout")),
-                            stderr=coerce_text(result.get("stderr"))[:4000],
-                            returncode=int(result.get("returncode") or 0),
-                            elapsed_ms=int(result.get("elapsed_ms") or 0),
-                            timed_out=bool(result.get("timed_out")))
+    outcome = invoke_argv_with_timeout(argv, input_text=input_text, cwd=cwd, env=env, timeout=timeout)
+    return InvocationResult(stdout=outcome.stdout,
+                            stderr=outcome.stderr[:4000],
+                            returncode=int(outcome.returncode if outcome.returncode is not None else 127),
+                            elapsed_ms=outcome.elapsed_ms,
+                            timed_out=outcome.timed_out)
 
 
 def seed_codex_home(codex_home: Path) -> dict[str, Any]:

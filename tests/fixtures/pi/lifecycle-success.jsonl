@@ -1,0 +1,6 @@
+{"type":"session","version":1}
+{"type":"agent_start"}
+{"type":"tool_execution_start","toolName":"read","args":{"path":"/tmp/pi-config/skills/demo/SKILL.md"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop","usage":{"input":10,"output":3,"cacheRead":2,"totalTokens":15,"cost":{"total":0.015}}}}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop","usage":{"input":10,"output":3,"cacheRead":2,"totalTokens":15,"cost":{"total":0.015}}}}
+{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop","usage":{"input":10,"output":3,"cacheRead":2,"totalTokens":15,"cost":{"total":0.015}}}]}

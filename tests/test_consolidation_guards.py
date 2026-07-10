@@ -44,8 +44,8 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertIs(tr.mount_skill_tree, sb.mount_skill_tree)
         self.assertIs(tm.mount_skill_tree, sb.mount_skill_tree)
         self.assertIs(tm.AgentAdapter._mount_tree, sb.mount_skill_tree)
-        self.assertIs(tr.run_argv_with_timeout, sb.run_argv_with_timeout)
-        self.assertIs(tm.AgentAdapter._run_argv, sb.run_argv_with_timeout)
+        self.assertIs(tr.invoke_argv_with_timeout, sb.invoke_argv_with_timeout)
+        self.assertIs(tm.AgentAdapter._run_argv, sb.invoke_argv_with_timeout)
 
     def test_trigger_matrix_reuses_the_pi_runner_row_loaders(self):
         self.assertIs(tm.cases_from_manifest, tr.cases_from_manifest)
@@ -151,10 +151,11 @@ class SharedOwnerIdentityTests(unittest.TestCase):
                 else:
                     self.assertIsNotNone(signal.reason)
 
-    def test_offline_stub_contract_does_not_promise_elapsed_measurement(self):
-        elapsed = ac.AGENT_CAPABILITIES["stub"].telemetry_contract()["elapsed_ms"]
-        self.assertEqual(elapsed.availability, "not_applicable")
-        self.assertEqual(elapsed.reason, "offline_runner")
+    def test_offline_stub_contract_marks_model_telemetry_not_applicable(self):
+        signals = ac.AGENT_CAPABILITIES["stub"].telemetry_contract()
+        self.assertEqual(signals["usage"].availability, "not_applicable")
+        self.assertEqual(signals["cost"].availability, "not_applicable")
+        self.assertEqual(signals["elapsed_ms"].availability, "available")
 
     def test_invocation_request_is_answer_runner_only(self):
         fields = set(sb.InvocationRequest.__dataclass_fields__)
@@ -273,11 +274,11 @@ class TimeoutConventionTests(unittest.TestCase):
         self.assertFalse(am.execution_valid(meta, text))
 
     def test_native_invocation_helper_kills_process_groups_on_timeout(self):
-        src = inspect.getsource(sb.run_argv_with_timeout)
+        src = inspect.getsource(sb.invoke_argv_with_timeout)
         self.assertIn("start_new_session=True", src)
         self.assertIn("os.killpg", src)
-        self.assertIn("returncode\": 127", src)
-        self.assertIn("run_argv_with_timeout", inspect.getsource(sb.run_argv_capture))
+        self.assertIn("returncode=127", src)
+        self.assertIn("invoke_argv_with_timeout", inspect.getsource(sb.run_argv_capture))
 
     def test_run_argv_with_timeout_converts_spawn_failure_to_failed_observation(self):
         result = sb.run_argv_with_timeout(["/definitely/not/a/real/binary"], cwd=Path("."), timeout=1)

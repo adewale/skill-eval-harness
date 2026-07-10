@@ -11,6 +11,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from agent_capabilities import AGENT_CAPABILITIES, SMOKE_TARGETS, SmokeTarget
+from trigger_contracts import InvocationOutcome
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "smoke_supported_clis.py"
 _spec = importlib.util.spec_from_file_location("smoke_supported_clis", SCRIPT)
@@ -31,8 +34,40 @@ class SupportedCliSmokeTests(unittest.TestCase):
             self.assertEqual({case["id"] for case in triggers}, {"trig-pos-review-change", "trig-neg-unrelated-question"})
             self.assertTrue((manifest_path.parent.parent / "skills" / "demo" / "SKILL.md").exists())
 
-    def test_pi_default_uses_the_codex_provider(self):
-        self.assertEqual(smoke.DEFAULT_MODELS["pi"], "openai-codex/gpt-5.4-mini")
+    def test_smoke_targets_are_capability_qualified_and_own_model_defaults(self):
+        expected = {
+            "claude": ("SMOKE_CLAUDE_MODEL", "haiku", "answer"),
+            "codex": ("SMOKE_CODEX_MODEL", "gpt-5.4-mini", "answer"),
+            "vibe": ("SMOKE_VIBE_MODEL", "devstral-small-latest", "answer"),
+            "pi": ("SMOKE_PI_MODEL", "openai-codex/gpt-5.4-mini", "trigger"),
+        }
+        self.assertEqual(
+            {name: (target.model_env, target.fallback_model, target.population)
+             for name, target in SMOKE_TARGETS.items()},
+            expected,
+        )
+        self.assertEqual(set(smoke.DEFAULT_MODELS), set(SMOKE_TARGETS))
+        for name, target in SMOKE_TARGETS.items():
+            capability = AGENT_CAPABILITIES[name]
+            self.assertTrue(capability.answer_runner if target.population == "answer" else capability.autonomous_trigger)
+            self.assertEqual(target.resolved_model({target.model_env: "  "}), target.fallback_model)
+            self.assertEqual(target.resolved_model({target.model_env: "custom/model"}), "custom/model")
+        parser = smoke.argparse.ArgumentParser()
+        with mock.patch.object(smoke.argparse, "ArgumentParser", return_value=parser):
+            # parse_args owns one --<agent>-model option per registry target.
+            with mock.patch.object(parser, "parse_args", return_value=None):
+                smoke.parse_args()
+        defaults = {
+            action.dest: action.default for action in parser._actions
+            if action.dest.endswith("_model")
+        }
+        self.assertEqual(defaults, {f"{name}_model": smoke.DEFAULT_MODELS[name] for name in SMOKE_TARGETS})
+
+    def test_smoke_target_rejects_invalid_registry_states(self):
+        for args in (("", "ENV", "model", "answer"), ("pi", "", "model", "trigger"),
+                     ("pi", "ENV", "", "trigger"), ("pi", "ENV", "model", "other")):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                SmokeTarget(*args)
 
     def test_trigger_assessment_requires_the_exact_positive_and_negative_fixture_rows(self):
         with tempfile.TemporaryDirectory() as td:
@@ -42,6 +77,34 @@ class SupportedCliSmokeTests(unittest.TestCase):
                 "query": smoke.SMOKE_TRIGGER_EXPECTATIONS[0][0], "should_trigger": True,
                 "observation_complete": True, "returncode": 0, "pass": True,
             }]}), encoding="utf-8")
+            self.assertFalse(smoke.assess_trigger_report(path, report))
+            self.assertFalse(report["checks"][0]["passed"])
+
+    def test_trigger_assessment_rejects_a_persisted_pass_that_contradicts_provider_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "pi-trigger.json"
+            rows = []
+            for query, should_trigger in smoke.SMOKE_TRIGGER_EXPECTATIONS:
+                rows.append({
+                    "agent": "pi", "model": "bad", "query": query,
+                    "should_trigger": should_trigger, "triggered": should_trigger,
+                    "pass": True, "observation_complete": True,
+                    "returncode": 0, "timed_out": False, "elapsed_ms": 1,
+                    "evidence": ["/tmp/skills/demo/SKILL.md"] if should_trigger else [],
+                    "usage_normalized": {"source": "missing"},
+                    "cost_normalized": {"source": "missing"},
+                    "stderr": "", "provider_error": "provider rejected model",
+                })
+            path.write_text(json.dumps({"results": rows}), encoding="utf-8")
+            report = {"checks": []}
+            self.assertFalse(smoke.assess_trigger_report(path, report))
+            self.assertFalse(report["checks"][0]["passed"])
+
+    def test_trigger_assessment_turns_malformed_rows_into_a_failed_check(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bad-trigger.json"
+            path.write_text(json.dumps({"results": [None, None]}), encoding="utf-8")
+            report = {"checks": []}
             self.assertFalse(smoke.assess_trigger_report(path, report))
             self.assertFalse(report["checks"][0]["passed"])
 
@@ -56,6 +119,57 @@ class SupportedCliSmokeTests(unittest.TestCase):
                 self.assertEqual(smoke.main(), 1)
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.kwargs["label"], "claude:prepare")
+
+    def test_smoke_subprocess_result_is_derived_from_typed_invocation_state(self):
+        outcomes = [
+            (InvocationOutcome.from_process(stdout="x" * 5000, stderr="y" * 5000, returncode=0, elapsed_ms=1234), True),
+            (InvocationOutcome.from_process(stdout="", stderr="bad", returncode=1, elapsed_ms=2), False),
+            (InvocationOutcome.from_process(stdout="", stderr="timeout", returncode=124, elapsed_ms=3), False),
+            (InvocationOutcome.from_process(stdout="", stderr="missing", returncode=127, elapsed_ms=4), False),
+        ]
+        for outcome, expected in outcomes:
+            with self.subTest(state=outcome.state), mock.patch.object(
+                smoke, "invoke_argv_with_timeout", return_value=outcome,
+            ):
+                report = {"commands": []}
+                self.assertIs(smoke.run(["cmd"], cwd=ROOT, report=report, label="x"), expected)
+                entry = report["commands"][0]
+                self.assertEqual(entry["state"], outcome.state.value)
+                self.assertEqual(entry["returncode"], outcome.returncode)
+                self.assertEqual(entry["elapsed_seconds"], round(outcome.elapsed_ms / 1000, 3))
+                self.assertLessEqual(len(entry["stdout"]), 4000)
+                self.assertLessEqual(len(entry["stderr"]), 4000)
+
+    def test_registry_population_dispatches_pi_to_trigger_runner(self):
+        with tempfile.TemporaryDirectory() as td:
+            args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="pi",
+                                      claude_model="unused", codex_model="unused", vibe_model="unused",
+                                      pi_model="model", timeout=1)
+            with mock.patch.object(smoke, "parse_args", return_value=args), \
+                 mock.patch.object(smoke.shutil, "which", return_value="/mock/pi"), \
+                 mock.patch.object(smoke, "run", return_value=True) as run, \
+                 mock.patch.object(smoke, "assess_trigger_report", return_value=True):
+                self.assertEqual(smoke.main(), 0)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.kwargs["label"], "pi:trigger")
+            self.assertIn("run_trigger_matrix.py", run.call_args.args[0][1])
+
+    def test_registry_dispatch_supports_a_non_pi_trigger_target(self):
+        synthetic = SmokeTarget("other", "SMOKE_OTHER_MODEL", "cheap", "trigger")
+        with tempfile.TemporaryDirectory() as td:
+            args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="other",
+                                      other_model="cheap", timeout=1)
+            with mock.patch.object(smoke, "SMOKE_TARGETS", {"other": synthetic}), \
+                 mock.patch.object(smoke, "parse_args", return_value=args), \
+                 mock.patch.object(smoke.shutil, "which", return_value="/mock/other"), \
+                 mock.patch.object(smoke, "run", return_value=True) as run, \
+                 mock.patch.object(smoke, "assess_trigger_report", return_value=True) as assess:
+                self.assertEqual(smoke.main(), 0)
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--agent") + 1], "other")
+            self.assertEqual(command[command.index("--model") + 1], "cheap")
+            self.assertEqual(run.call_args.kwargs["label"], "other:trigger")
+            self.assertEqual(assess.call_args.args[2], "other")
 
     def test_live_acknowledgement_is_required_before_any_cli_call(self):
         with tempfile.TemporaryDirectory() as td:

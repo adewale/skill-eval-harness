@@ -397,3 +397,16 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 - Split audits by domain integrity, producer/CLI integration, and test/CI quality; give reviewers the PR diff and ask for executable counterexamples.
 - Turn every confirmed finding into a regression test at the boundary: failed second backup, non-finite payload, mixed currency, mismatched run key, partial timeout trace, empty smoke selection, missing polarity row, and failed prerequisite.
 - Re-run the full suite, clean-install test command, packaging build, whitespace/doc-reference guards, and a targeted re-audit after fixes. A passing unit suite alone is not release evidence for a schema, migration, or live-control-plane change.
+
+## 2026-07-10 — Parse process success into a semantic state before measuring it
+
+**Problem:** Pi could exit zero while its terminal JSON event reported a provider error. The process dictionary still permitted `returncode=0`, `observation_complete=true`, numeric telemetry, and a passing negative trigger to coexist. Repeated lifecycle usage and unknown events were also interpreted through generic additive/tool defaults.
+
+**Lesson:** Correct telemetry types cannot repair an invalid invocation state assembled upstream. External process and provider wires must first be parsed into one closed semantic state; every downstream value should be derived from that state.
+
+**Rule:**
+- Use `InvocationOutcome` as the internal subprocess state machine; timeout, spawn, process, provider, protocol, and harness failures are not independent booleans.
+- Parse Pi JSON once into `PiStream`; require a terminal agent event, treat terminal usage as cumulative, and make failed streams structurally unable to carry numeric usage/cost.
+- Derive `triggered` from typed evidence and `pass` from `TriggerObservation`; never accept either as an independent internal input.
+- Re-parse persisted rows at the disk trust boundary before a smoke trusts them. Types protect only the interior; wire artifacts must re-establish the contract.
+- Exhaust the finite state/truth tables and keep sanitized provider fixtures. Happy-path mocks do not prove an external protocol parser.
