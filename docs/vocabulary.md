@@ -85,7 +85,7 @@ Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger
 
 **Assertion dependency (`depends_on`)** — an assertion may name prerequisite assertions; when a prerequisite fails or is itself skipped, the dependent is SKIPPED — out of every denominator and out of the critical veto — rather than counted as a failure. Skip is not zero: a dependent that never ran is "not measured", so an upstream miss cannot double-count as two failures. Cycles and unknown targets are rejected at validation.
 
-**Eval intent** — what a case exists to show, declared per case as `eval_intent`: `capability` (the default — the case measures lift and participates in saturation/no-lift/staleness signals) or `regression_guard` (the case pins behavior the skill must not lose; it reports under `regression_guards_holding`, is exempt from staleness and suggestion pruning, and its saturation is the goal, not a warning).
+**Eval intent** — what a case exists to show, declared per case as `eval_intent`: `capability` (the default — the case measures lift and participates in saturation/no-lift/staleness signals) or `regression` (the case pins behavior the skill must not lose; it reports under `regression_guards_holding`, is exempt from staleness and suggestion pruning, and its saturation is the goal, not a warning).
 
 ## Run artifacts
 
@@ -93,7 +93,7 @@ Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger
 
 **`metadata.json`** — optional per-run telemetry: elapsed time, token counts, model name, and the normalized cost blocks below.
 
-**`usage_normalized` / `cost_normalized`** — the normalized token and dollar blocks every runner writes into a run's metadata/metrics, alongside the raw provider fields. Each carries a `source` provenance (`provider_reported`, `trace_normalized`, `price_table_estimated`, `missing`, or `not_applicable`) — missing telemetry is marked, never written as zero — so the report can total real spend and disclose coverage separately from quality.
+**`usage_normalized` / `cost_normalized`** — the normalized token and dollar blocks every runner writes into a run's metadata/metrics, alongside the raw provider fields. Each carries a `source` provenance: `provider_reported`, `trace_normalized`, `missing`, or `not_applicable`, plus `estimated` for usage and `price_table_estimated` for cost. Missing telemetry is marked, never written as zero — so the report can total real spend and disclose coverage separately from quality.
 
 **Trace artifacts** — what a trace-aware runner writes so process and efficiency assertions have evidence:
 
