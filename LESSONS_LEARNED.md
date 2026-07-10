@@ -426,3 +426,16 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 - Preserve protocol failure as its own state. Jetty completed-without-output and a conflicting discriminator are not ordinary model failures, and timeout is not provider failure.
 - Close domain vocabularies at the parser. Unknown ablation modes, populations, component classes, and mechanisms must fail where they cross the boundary, not survive as valid-looking provenance.
 - Test the model gap directly: enumerate finite state tables, attempt every contradictory constructor, inject duplicate/mismatched identities, and use sanitized provider-shaped fixtures. Coverage of lines is not proof that illegal combinations are unrepresentable.
+
+## 2026-07-10 — An upgrade guide must follow the artifacts, not only the manifest
+
+**Problem:** The planned 0.6.0 release keeps manifest versions 1 and 2 compatible, but that fact alone understates the upgrade. Saved judge rows, paired results, Jetty records, trigger fixtures, Codex wrappers, and telemetry reports now cross stricter boundaries; a user could pass manifest validation and still see rejected inputs or changed denominators.
+
+**Lesson:** Package, manifest, and artifact migrations are separate operations. Release notes name what changed; an upgrade runbook must tell a user which files to preserve, which dry run to inspect, why a report can change, and how to return to the exact prior evidence.
+
+**Rule:**
+- Keep the last released run tree and report untouched until the new report is accepted. Test an upgrade in a fresh environment and a copied run tree.
+- Say which old inputs fail, which remain readable, and which numbers change because the measurement became stricter. “Backward compatible” is too broad when JSON still parses but no longer supports a comparison.
+- Give manifest migration and telemetry migration different names and commands. Do not let a version-1 → version-2 manifest guide stand in for a package upgrade.
+- Make rollback restore whole artifacts rather than delete newly added fields. The old report must be reproducible from the same bytes it originally read.
+- Add the version-specific section to the single upgrade runbook before the release tag, then verify every install command against the published package before marking the release complete.

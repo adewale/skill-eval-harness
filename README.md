@@ -131,6 +131,10 @@ uv tool install git+https://github.com/adewale/skill-eval-harness.git@main
 uvx --from git+https://github.com/adewale/skill-eval-harness.git@main skill-benchmark --help
 ```
 
+Upgrading a saved run tree requires more than changing the package pin. Follow the
+relevant release boundary in [`docs/upgrading.md`](docs/upgrading.md) before regenerating
+reports; manifest migration and telemetry migration are separate commands.
+
 The installed commands are:
 
 | Command | What it does |
@@ -172,6 +176,7 @@ skill-benchmark --help
 | `docs/can-i-trust-my-judge.md` | Calibrating a judge before believing its numbers: `judge-robustness` (order-flip + negative controls), `judge-alignment` (human labels, Cohen's kappa, precision/recall), and `compare-judges` (does the lift survive a judge swap?). |
 | `docs/eval-framework-roadmap-spec.md` | The implemented eval-framework roadmap: goals, abstractions, and tests per feature (CF.1–CF.4, buckets 1–4, migration). |
 | `docs/migrating-evals.md` | Upgrading a manifest between versions (v1 → v2): what `migrate` stamps and the judgment calls it leaves. |
+| `docs/upgrading.md` | Version-by-version harness upgrades: saved-run backup, artifact migration, strict input repairs, expected report changes, and rollback. |
 | `docs/porting-existing-evals.md` | Arriving from another framework: `dataset_files` + a template case carry the rows across, then the paired baseline, splits, leakage lint, and the `audit-manifest` punch list supply what the old suite had no slot for. |
 | `docs/vocabulary.md` | Glossary of harness terms: variants, splits, models, ablations, assertions, severity/oracle tiers, graded scoring, cost telemetry, trace artifacts, agent/judge backends, judge calibration, reliability, contamination, and report flags. |
 | `docs/evals-are-not-tests.md` | Why a skill eval is not a unit test, and what that changes about reading results. |

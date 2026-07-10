@@ -365,3 +365,8 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       `import-trace` path for already-recorded outputs. Runnable offline against the demo
       skill (real 2026-07-10 lint/lift/audit output), including the leakage lint firing on a
       genuinely leaky ported row.
+- [x] **"How do I upgrade the harness from 0.5.1 to 0.6.0?"** —
+      [`docs/upgrading.md`](docs/upgrading.md): preserve the old run tree, inspect
+      and apply telemetry migration, repair strict judge/pair/trigger/Jetty inputs, regenerate
+      reports, distinguish expected semantic changes from regressions, and roll back from the
+      untouched 0.5.1 artifacts.
