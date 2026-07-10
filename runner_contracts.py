@@ -27,6 +27,14 @@ def _finite_nonnegative(value: Any, label: str, *, integer: bool = False) -> int
     return value
 
 
+_RESERVED_EVIDENCE_KEYS = frozenset({
+    "observation_complete", "process_observation_complete",
+    "provider_response_complete", "trace_observation_complete",
+    "operation_observation_complete", "artifact_set_complete",
+    "observation_evidence", "telemetry", "telemetry_schema_version",
+})
+
+
 class FrozenDict(dict):
     """JSON-serializable recursively immutable mapping."""
     def _immutable(self, *args: Any, **kwargs: Any) -> None:
@@ -95,6 +103,11 @@ class OutcomeContext:
                 raise TypeError("usage must be a mapping or None")
             _validate_usage(self.usage, "usage")
             object.__setattr__(self, "usage", _freeze_mapping(self.usage, "usage"))
+        for label, values in (("metadata_extra", self.metadata_extra),
+                              ("metrics_extra", self.metrics_extra)):
+            collisions = _RESERVED_EVIDENCE_KEYS & set(values)
+            if collisions:
+                raise ValueError(f"{label} cannot override derived evidence: {', '.join(sorted(collisions))}")
         object.__setattr__(self, "metadata_extra", _freeze_mapping(self.metadata_extra, "metadata_extra"))
         object.__setattr__(self, "metrics_extra", _freeze_mapping(self.metrics_extra, "metrics_extra"))
         if self.environment is not None:
@@ -171,10 +184,12 @@ class ProviderFailed:
     def __post_init__(self) -> None:
         if not isinstance(self.context, OutcomeContext):
             raise TypeError("ProviderFailed context must be OutcomeContext")
-        if isinstance(self.returncode, bool) or not isinstance(self.returncode, int) or self.returncode in {0, 124, 127}:
-            raise ValueError("ProviderFailed requires a non-zero non-timeout spawned returncode")
+        if isinstance(self.returncode, bool) or not isinstance(self.returncode, int) or self.returncode in {124, 127}:
+            raise ValueError("ProviderFailed requires an actual exited-process returncode")
         if self.reason is not None and (not isinstance(self.reason, str) or not self.reason.strip()):
             raise ValueError("provider failure reason must be non-empty or None")
+        if self.returncode == 0 and self.reason is None:
+            raise ValueError("zero-exit provider failure requires a protocol reason")
         if not isinstance(self.answer, str):
             raise TypeError("provider failure answer must be a string")
 
@@ -184,6 +199,16 @@ AnswerOutcome: TypeAlias = Completed | TimedOut | SpawnFailed | ProviderFailed
 
 def outcome_context(outcome: AnswerOutcome) -> OutcomeContext:
     return outcome.context
+
+
+def process_observation_complete(outcome: AnswerOutcome) -> bool:
+    """Whether the subprocess reached an actual exit (success or failure)."""
+    return isinstance(outcome, (Completed, ProviderFailed))
+
+
+def provider_response_complete(outcome: AnswerOutcome) -> bool:
+    """Whether a validated final provider answer exists."""
+    return isinstance(outcome, Completed)
 
 
 def outcome_with_context(outcome: AnswerOutcome, context: OutcomeContext) -> AnswerOutcome:
@@ -219,9 +244,9 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
     if code == 127:
         return SpawnFailed(context, reason=error or stderr or "process spawn failed")
     if code != 0 or error:
-        return ProviderFailed(context, returncode=code if code != 0 else 1, reason=error, answer=answer or "")
+        return ProviderFailed(context, returncode=code, reason=error, answer=answer or "")
     if not answer:
-        return ProviderFailed(context, returncode=1, reason="provider produced no final answer")
+        return ProviderFailed(context, returncode=0, reason="provider produced no final answer")
     return Completed(context, answer=answer)
 
 

@@ -67,7 +67,17 @@ Aggregate[T] =
 Comparison[T] =
     Comparable(value, basis)
   | Blocked(reason, left_state, right_state)
+
+ObservationEvidence =
+    process(complete | incomplete | unknown)
+  × provider_response(complete | incomplete | unknown)
+  × trace(complete | incomplete | unknown)
+  × artifact_set(complete | incomplete | unknown)
 ```
+
+`operation_evidence_complete` is derived only when process, provider response, and trace are all
+complete. The artifact-set axis is committed separately by a last-written digest inventory. No
+channel can promote another channel.
 
 ### Measurement rules
 
@@ -85,8 +95,13 @@ Comparison[T] =
   called `cost_usd`.
 - Token/count values and milliseconds are non-negative integers. Rates are finite and
   within `[0, 1]` when available.
-- A count or boolean derived from a trace is available only when the observation is
-  complete. A completed trace with zero tool calls is different from no trace.
+- A count or boolean derived from a trace is available only when process, provider
+  response, and trace are independently complete. A completed trace with zero tool
+  calls is different from no trace, and a parseable partial trace from a failed
+  provider response cannot support a complete-run negative assertion.
+- New runner/Jetty artifact sets are available only when `artifact-commit.json`
+  verifies every required file and digest. File existence proves artifact presence,
+  not committed evidence.
 
 ### Basis and population
 
@@ -295,8 +310,11 @@ The implementation is maintained against these invariants:
 6. every ratio carries eligible/blocked counts and stable blocked reasons;
 7. unknown/incompatible values cannot affect rankings, audits, trends, or budget passes
    as if they were zero;
-8. legacy artifacts remain readable without acquiring false provenance; and
-9. property, fixture-contract, CLI E2E, doc-sync, and targeted mutation gates pass.
+8. legacy artifacts remain readable without acquiring false provenance;
+9. process, provider-response, trace, and artifact-set states remain independent, and
+   caller extras cannot override their derived fields;
+10. new run directories are complete only with a valid artifact commit inventory; and
+11. property, fixture-contract, CLI E2E, doc-sync, and targeted mutation gates pass.
 
 ## Follow-on: cross-lab CLI wrappers
 

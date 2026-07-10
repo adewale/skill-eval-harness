@@ -132,11 +132,41 @@ class RunnerStampTests(unittest.TestCase):
                     self.assertEqual(measurements[key]["availability"], "unavailable")
                     self.assertEqual(measurements[key]["reason"], "trace_observation_incomplete")
 
+    def test_completeness_parameters_reject_truthy_non_booleans(self):
+        with tempfile.TemporaryDirectory() as td:
+            for field in ("process_observation_complete", "provider_response_complete",
+                          "artifact_set_complete"):
+                with self.subTest(field=field), self.assertRaises(TypeError):
+                    sb.write_trace_artifacts(
+                        Path(td) / field, "", source="codex", **{field: 1})
+
+    def test_caller_metrics_cannot_override_derived_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            for key in ("trace_observation_complete", "process_observation_complete",
+                        "provider_response_complete", "operation_observation_complete",
+                        "artifact_set_complete", "observation_evidence", "telemetry"):
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, "derived evidence"):
+                    sb.write_trace_artifacts(
+                        Path(td) / key, "", source="codex", extra_metrics={key: True})
+
+    def test_empty_legacy_events_file_proves_artifact_presence_not_command_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "events.json").write_text(
+                json.dumps({"schema_version": 2, "events": []}), encoding="utf-8")
+            flags = sb.telemetry_for_result({"run_base": str(base)})
+        self.assertTrue(flags["events"])
+        self.assertFalse(flags["commands"])
+
     def test_trace_derived_usage_is_stamped_when_no_provider_block(self):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "run"
             trace = json.dumps({"type": "usage", "usage": {"input_tokens": 30, "output_tokens": 12}})
-            sb.write_trace_artifacts(run_dir, trace, source="codex")
+            sb.write_trace_artifacts(
+                run_dir, trace, source="codex",
+                process_observation_complete=True,
+                provider_response_complete=True,
+            )
             metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
             self.assertEqual(metrics["usage_normalized"]["total_tokens"], 42)
             self.assertEqual(metrics["usage_normalized"]["source"], "trace_normalized")
@@ -145,9 +175,13 @@ class RunnerStampTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "run"
             trace = json.dumps({"type": "usage", "usage": {"input_tokens": 3, "output_tokens": 2}})
-            sb.write_trace_artifacts(run_dir, trace, source="codex",
-                                     metadata={"usage_normalized": {"source": "missing"},
-                                               "cost_normalized": {"source": "missing"}})
+            sb.write_trace_artifacts(
+                run_dir, trace, source="codex",
+                metadata={"usage_normalized": {"source": "missing"},
+                          "cost_normalized": {"source": "missing"}},
+                process_observation_complete=True,
+                provider_response_complete=True,
+            )
             metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
             self.assertEqual(metrics["usage_normalized"]["total_tokens"], 5)
             measured = metrics["telemetry"]["measurements"]["total_tokens"]
@@ -178,7 +212,7 @@ class RunnerStampTests(unittest.TestCase):
             passed, evidence = sb.process_or_efficiency_assertion_result(
                 {"type": "command_not_ran", "pattern": "rm -rf"}, base, {})
         self.assertFalse(passed)
-        self.assertIn("trace_observation_incomplete", evidence)
+        self.assertIn("process_observation_incomplete", evidence)
 
     def test_timed_out_runner_trace_is_incomplete_even_when_it_has_events(self):
         with tempfile.TemporaryDirectory() as td:
@@ -194,7 +228,7 @@ class RunnerStampTests(unittest.TestCase):
             passed, evidence = sb.process_or_efficiency_assertion_result(
                 {"type": "command_not_ran", "pattern": "rm -rf"}, base, {})
         self.assertFalse(passed)
-        self.assertIn("trace_observation_incomplete", evidence)
+        self.assertIn("process_observation_incomplete", evidence)
 
     def test_write_trace_artifacts_metadata_is_current_run_only(self):
         with tempfile.TemporaryDirectory() as td:
@@ -698,8 +732,16 @@ class SuiteBudgetGateTests(unittest.TestCase):
                 (history / f"ledger-{i}.json").write_text(json.dumps({
                     "telemetry_schema_version": 3,
                     "coverage": {"runs_seen": runs_n, "runs_with_dollar_cost": runs_n},
-                    "totals": {"total_tokens": tokens, "total_tokens_availability": "complete",
-                               "total_cost_usd": cost, "total_cost_usd_availability": "complete"},
+                    "totals": {
+                        "total_tokens": tokens, "total_tokens_availability": "complete",
+                        "total_tokens_aggregate": {"availability": "complete", "value": tokens,
+                                                   "observed_count": runs_n, "unavailable_count": 0,
+                                                   "not_applicable_count": 0, "reason_counts": {}},
+                        "total_cost_usd": cost, "total_cost_usd_availability": "complete",
+                        "total_cost_usd_aggregate": {"availability": "complete", "value": str(cost),
+                                                     "observed_count": runs_n, "unavailable_count": 0,
+                                                     "not_applicable_count": 0, "reason_counts": {}},
+                    },
                 }), encoding="utf-8")
             scope = {"totals": {"selected_tier_rows": 10}, "include_ablations": False}
             estimate = sb.suite_cost_estimate(scope, history_dir=history)
@@ -721,11 +763,43 @@ class SuiteBudgetGateTests(unittest.TestCase):
             history.mkdir()
             (history / "ledger.json").write_text(json.dumps({
                 "telemetry_schema_version": 3, "coverage": summary["coverage"],
-                "totals": {"total_tokens": 20, "total_tokens_availability": "complete",
-                           "total_cost_usd": 10.0, "total_cost_usd_availability": "complete"},
+                "totals": {
+                    "total_tokens": 20, "total_tokens_availability": "complete",
+                    "total_tokens_aggregate": {"availability": "complete", "value": 20,
+                                               "observed_count": 2, "unavailable_count": 0,
+                                               "not_applicable_count": 0, "reason_counts": {}},
+                    "total_cost_usd": 10.0, "total_cost_usd_availability": "complete",
+                    "total_cost_usd_aggregate": {"availability": "complete", "value": "10.0",
+                                                 "observed_count": 1, "unavailable_count": 0,
+                                                 "not_applicable_count": 0, "reason_counts": {}},
+                },
             }), encoding="utf-8")
             estimate = sb.suite_cost_estimate({"totals": {"selected_tier_rows": 2}, "include_ablations": False}, history_dir=history)
         self.assertEqual(estimate["estimated_cost_usd"], 20.0)
+
+    def test_internally_contradictory_v3_history_cannot_establish_budget_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            history = Path(td)
+            (history / "forged.json").write_text(json.dumps({
+                "telemetry_schema_version": 3,
+                "coverage": {"runs_seen": 10, "runs_with_dollar_cost": 10},
+                "totals": {
+                    "total_tokens": 100, "total_tokens_availability": "complete",
+                    "total_tokens_aggregate": {"availability": "complete", "value": 999,
+                                               "observed_count": 10, "unavailable_count": 0,
+                                               "not_applicable_count": 0},
+                    "total_cost_usd": 1.0, "total_cost_usd_availability": "complete",
+                    "total_cost_usd_aggregate": {"availability": "complete", "value": "2.0",
+                                                 "observed_count": 10, "unavailable_count": 0,
+                                                 "not_applicable_count": 0},
+                },
+            }), encoding="utf-8")
+            estimate = sb.suite_cost_estimate(
+                {"totals": {"selected_tier_rows": 2}, "include_ablations": False},
+                history_dir=history,
+            )
+        self.assertEqual(estimate["basis"], "static_assumption")
+        self.assertIsNone(estimate["per_run_cost_usd"])
 
     def test_estimate_static_fallback_has_no_dollar_guess(self):
         estimate = sb.suite_cost_estimate({"totals": {"selected_tier_rows": 4}, "include_ablations": False})

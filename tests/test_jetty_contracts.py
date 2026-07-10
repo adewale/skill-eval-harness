@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
 import jetty_contracts as jc
@@ -78,6 +81,29 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
         self.assertEqual(record["lifecycle"]["kind"], "failed")
         self.assertIn("trajectory_id", record["error"])
         self.assertFalse(client.polled)
+
+    def test_failed_trajectory_cannot_promote_partial_events_to_complete_operations(self):
+        record = {
+            "status": "failed", "trajectory_id": "t", "error": "boom",
+            "trajectory": {"events": [{"type": "command_end", "command": "echo partial"}]},
+            "jetty": {},
+        }
+        metadata = sb.normalized_jetty_metadata(record, success=False)
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            sb.write_trace_artifacts(
+                base,
+                sb.jsonl_from_records(sb.jetty_trace_records(record, [], success=False)),
+                source="jetty", metadata=metadata,
+                process_observation_complete=True,
+                provider_response_complete=False,
+            )
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+        self.assertTrue(metrics["trace_observation_complete"])
+        self.assertFalse(metrics["operation_observation_complete"])
+        command = metrics["telemetry"]["measurements"]["commands"]
+        self.assertEqual(command["availability"], "unavailable")
+        self.assertEqual(command["reason"], "provider_response_incomplete")
 
     def test_poller_preserves_status_state_conflict_as_protocol_invalid(self):
         class Client(sb.JettyClient):

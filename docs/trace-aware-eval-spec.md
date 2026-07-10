@@ -336,8 +336,8 @@ Dataset/oracle audit work should continue as warnings and report hygiene before 
 ## Structured judge results
 
 The harness keeps the judge-command model: it exports prompts and reads user-supplied model output.
-Canonical boolean/scored/dimension/dynamic verdict schemas are validated locally; strict mode turns
-schema errors into failed verdicts:
+Canonical boolean/scored/dimension/dynamic verdict schemas are validated locally. Schema-invalid
+new judge output fails closed in both report and strict modes; report mode retains the diagnostics:
 
 ```json
 {
@@ -405,7 +405,7 @@ This adopts the SkillsBench lesson that focused 2–3-module skills often outper
 
 - [x] Add viewer panels and richer artifacts, plus human feedback export (`render-viewer --serve` with `feedback.json` capture, image/pdf/xlsx artifact embedding, and a `--previous-workspace` iteration diff).
 - [x] Add blind pairwise comparison (`compare-tasks` / `compare-results`, keyed by stable IDs with model-facing blinding).
-- [x] Add optional JSON Schema validation for judge-result files (`verdict_schema_for` post-hoc validation; `--strict-judge-schema` / manifest `judge.schema_enforcement` makes it a gate).
+- [x] Add JSON Schema validation for newly produced judge results (`verdict_schema_for` post-hoc validation always fails malformed evidence closed; `--strict-judge-schema` / manifest `judge.schema_enforcement` controls strict diagnostics/handling compatibility).
 
 ### Phase 5 — broader runner import
 

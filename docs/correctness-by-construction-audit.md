@@ -76,10 +76,34 @@ Completed | TimedOut | SpawnFailed | ProviderFailed
 
 `OutcomeContext` owns the closed provider enum, recursively freezes JSON-shaped context, and
 validates finite non-negative elapsed time, usage, and cost. `Completed` requires a non-empty final
-answer; raw trace bytes are never promoted to candidate output. Timeout return code 124, spawn return code 127, normal completion return code 0,
-and provider failure are mutually exclusive. `write_runner_outcome` exhaustively adapts the union to
-artifacts; backends cannot repair or mutate status booleans while writing files. `RunnerOutcome`
-remains only as a strict compatibility factory that constructs one of the four variants.
+answer; raw trace bytes are never promoted to candidate output. Timeout return code 124 and spawn
+return code 127 remain reserved. `ProviderFailed` preserves the subprocess's actual exit code,
+including zero when the process succeeded but its provider envelope was malformed or lacked a final
+answer; provider-response failure is not encoded by inventing return code 1. `write_runner_outcome`
+exhaustively adapts the union to artifacts; backends cannot repair or mutate status booleans while
+writing files. `RunnerOutcome` remains only as a strict compatibility factory that constructs one
+of the four variants.
+
+## Orthogonal run evidence and artifact commit
+
+`telemetry.ObservationEvidence` is the product of four independent states:
+
+```text
+process × provider_response × trace × artifact_set
+where each state is complete | incomplete | unknown
+```
+
+Operation evidence is derived and complete only when process, provider response, and trace are all
+complete. Completing one axis never promotes another. `write_trace_artifacts` owns trace derivation
+and rejects caller extras that collide with any derived evidence field. Provider adapters may retain
+usage/cost from a valid provider envelope independently of trace availability.
+
+New answer-runner and Jetty directories declare artifact contract version 1 and write
+`artifact-commit.json` last. The marker lists the required files plus a SHA-256 inventory. Readers
+verify the marker and inventory before deriving `artifact_set_complete`; an interrupted write,
+missing or changed committed file, unsafe inventory path, or stale marker remains incomplete and
+unscorable. Later downstream artifacts such as `grading.json` do not alter the committed producer
+inventory.
 
 ## Imported judge verdicts
 
@@ -100,8 +124,8 @@ BooleanVerdict | ScoredVerdict | DimensionVerdict | DynamicVerdict | ConsensusVe
 - Stored result loading rejects missing, conflicting, and duplicate task IDs. Repetition/panel
   merging requires one task identity; panel models must be non-empty and unique. Consensus is
   serialized as its own verdict kind.
-- Provider output that violates semantic invariants is retained only as diagnostic raw payload; the
-  stored verdict is one valid failed boolean verdict.
+- Provider output that violates schema or semantic invariants is retained only as diagnostic raw
+  payload; both report and strict modes store one valid failed boolean verdict.
 
 ## Draft versus executable tasks
 
