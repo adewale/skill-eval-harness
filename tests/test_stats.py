@@ -88,11 +88,66 @@ class PassAtKTests(unittest.TestCase):
         self.assertAlmostEqual(rel["by_variant"]["with_skill"]["mean_pass_at_1"], 0.75)
         self.assertEqual(rel["by_variant"]["with_skill"]["all_runs_pass_rate"], 0.0)  # not every run passed
 
+    def test_invalid_external_rates_do_not_become_reliability_successes(self):
+        results = [
+            {"case_id": "c", "variant": "with_skill", "run_number": 1,
+             "objective_pass_rate": 2.0},
+            {"case_id": "c", "variant": "with_skill", "run_number": 2,
+             "objective_pass_rate": 1.0},
+        ]
+        entry = sb.build_reliability(results)["by_case_variant"]["c"]["with_skill"]
+        self.assertEqual((entry["n"], entry["c"]), (1, 1))
+
     def test_all_runs_pass_rate_reaches_one(self):
         # the c==n side of all_runs_pass_rate (a constant-0.0 mutation must be caught)
         results = [{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0} for _ in range(3)]
         rel = sb.build_reliability(results)
         self.assertEqual(rel["by_variant"]["with_skill"]["all_runs_pass_rate"], 1.0)
+
+
+class ExperimentalPairingIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def row(variant, *, model="m", run_number=1, rate=1.0):
+        return {
+            "case_id": "c", "model": model, "run_number": run_number,
+            "variant": variant, "objective_pass_rate": rate,
+            "missing_output": False, "execution_valid": True,
+        }
+
+    def test_mismatched_repetition_or_model_cannot_create_lift(self):
+        for right in [
+            self.row("without_skill", run_number=2, rate=0.0),
+            self.row("without_skill", model="other", rate=0.0),
+        ]:
+            with self.subTest(right=right):
+                summary = sb.build_paired_summary([self.row("with_skill"), right])
+                self.assertIsNone(summary["absolute_delta"])
+                self.assertEqual(summary["pairing"]["eligible_pairs"], 0)
+                self.assertEqual(summary["pairing"]["blocked_pairs"], 2)
+
+    def test_out_of_range_rates_are_blocked_not_reported_as_impossible_lift(self):
+        for invalid in (-0.001, 1.001, float("nan"), float("inf"), True):
+            with self.subTest(invalid=invalid):
+                rows = [self.row("with_skill", rate=invalid),
+                        self.row("without_skill", rate=0.0)]
+                summary = sb.build_paired_summary(rows)
+                self.assertIsNone(summary["absolute_delta"])
+                self.assertEqual(summary["pairing"]["eligible_pairs"], 0)
+                self.assertEqual(summary["pairing"]["blocked_pairs"], 1)
+
+    def test_duplicate_repetition_arm_fails_before_aggregation(self):
+        rows = [self.row("with_skill"), self.row("with_skill"), self.row("without_skill", rate=0.0)]
+        with self.assertRaisesRegex(ValueError, "duplicate experimental arm"):
+            sb.build_paired_summary(rows)
+
+    def test_unmatched_arm_is_not_averaged_into_reliability(self):
+        rows = [
+            self.row("with_skill", run_number=1), self.row("without_skill", run_number=1, rate=0.0),
+            self.row("with_skill", run_number=2, rate=0.0),
+        ]
+        summary = sb.build_paired_reliability(rows)
+        self.assertEqual(summary["by_case"]["c@m"]["with_skill"], {"n": 1, "c": 1})
+        self.assertEqual(summary["pairing"]["blocked_pairs"], 1)
 
 
 class PairedReliabilityLiftTests(unittest.TestCase):
@@ -103,7 +158,8 @@ class PairedReliabilityLiftTests(unittest.TestCase):
     def _arm(case_id, variant, n, c, model=None):
         rows = []
         for i in range(n):
-            r = {"case_id": case_id, "variant": variant, "objective_pass_rate": 1.0 if i < c else 0.0}
+            r = {"case_id": case_id, "variant": variant, "run_number": i + 1,
+                 "objective_pass_rate": 1.0 if i < c else 0.0}
             if model is not None:
                 r["model"] = model
             rows.append(r)

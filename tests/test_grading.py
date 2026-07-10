@@ -261,6 +261,10 @@ class GradedScoringSeverityTests(unittest.TestCase):
             {"assertions": [{"type": "contains", "value": "x", "severity": "fatal"}]},
             {"assertions": [{"type": "judge", "graded_dimensions": []}]},
             {"assertions": [{"type": "judge", "graded_dimensions": [{"name": "d"}]}]},
+            {"assertions": [{"type": "judge", "graded_dimensions": [
+                {"name": "d", "rubric": "5 = good; 1 = bad"},
+                {"name": "d", "rubric": "5 = other; 1 = bad"},
+            ]}]},
             {"assertions": [{"type": "judge", "dynamic_rubric": {"minimum_criteria": 3}}]},
             {"assertions": [{"type": "contains", "value": "x"}], "reference_score": 2},
         ]

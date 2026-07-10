@@ -30,13 +30,14 @@ flowchart LR
 
 The dotted line marks the rule that shapes the rest of the design: the `grade`/`benchmark`
 scoring path never calls a model. The one exception is the judge, which runs only when you
-ask for it — through a `--judge-cmd` you supply, or natively via `--judge-model` (the Claude
-adapter) — and whose results merge back at report time, each stamped with the `judge_model`
+ask for it — through a `--judge-cmd` you supply, or natively via
+`--judge-backend claude|codex|vibe` plus `--judge-model` — and whose results merge back at
+report time, each stamped with the `judge_model`
 that produced it.
 
-## Two axes, one grid
+## Four axes, one grid
 
-A case does not run once. It runs across a grid of variants and repeats, filtered by split.
+A case does not run once. It runs across a grid of variants, models, and repeats, filtered by split.
 `prepared_task_rows` builds this grid. The variant axis is where lift lives, because lift is
 the difference between two arms of the same case.
 
@@ -50,7 +51,7 @@ flowchart TB
     CA --> FAN
     VA --> FAN
     SP -->|filter| FAN
-    FAN[["fan-out:\ncase x variant x run"]] --> T1[case A / with_skill / run-1]
+    FAN[["fan-out:\ncase x variant x model x run"]] --> T1[case A / with_skill / run-1]
     FAN --> T2[case A / without_skill / run-1]
     FAN --> T3[case A / with_skill / run-2]
     FAN --> T4[case A / without_skill / run-2]
@@ -64,6 +65,31 @@ text. The model sweep (`prepare --models a,b,c`) adds a third axis the same way:
 dimension in the fan-out (`case × variant × model × run`), not a new kind of variant. The
 report then groups `by_model` and computes lift per (case, model) — see `model_analysis`.
 
+Before any lift, reliability, cost delta, or token-overhead value is computed, result rows become
+`ExperimentalPairKey(case, model, repetition, population)` arms. Only a validated pair with exactly
+one `with_skill` and one `without_skill` arm can contribute. Missing/ineligible arms remain blocked
+diagnostics, and duplicate identities fail instead of overwriting an earlier row. Telemetry then
+adds its stricter provenance/unit/billing-basis comparison.
+
+## Typed trust boundaries
+
+The on-disk formats stay JSON for interoperability, but JSON dictionaries do not flow freely through
+the interior. Each external boundary has one parser and a closed value:
+
+```text
+prepared row -> PreparedTaskDraft -> PreparedTask
+provider result -> Completed | TimedOut | SpawnFailed | ProviderFailed
+judge row -> Boolean | Scored | Dimension | Dynamic | Consensus verdict
+trace status -> Completed | InProgress | Failed | Unknown
+Jetty status -> Queued | Running | Succeeded | Failed | TimedOut | ProtocolInvalid
+result arms -> ExperimentalPair | BlockedExperimentalPair
+```
+
+Booleans such as execution success, verdict pass, Jetty success, and comparability are derived from
+those variants. When a persisted row is read back, its parser re-establishes the invariant rather
+than trusting fields that happened to serialize together. The detailed inventory and residual risks
+are in [`correctness-by-construction-audit.md`](correctness-by-construction-audit.md).
+
 ## The runner boundary
 
 Runners disagree about everything except one thing: they all leave the same files on disk.
@@ -71,12 +97,15 @@ That agreement is the contract, and it is why a new runner needs no change to gr
 
 ```mermaid
 flowchart TB
-    P[prepare\ntask rows] --> PI[Pi smoke / trigger]
+    P[prepare\nanswer task rows] --> PI[Pi answer smoke]
     P --> CX[Codex\nrun-codex]
     P --> CL[Claude\nrun-claude]
     P --> JT[Jetty\nexport / run / import]
     P --> SUB[Subagent\nrun-subagent\n+ tool replay]
-    P --> HUM[Any runner\nor a person]
+    P --> HUM[Any answer runner\nor a person]
+
+    M[manifest\ntrigger cases] --> TR[autonomous trigger runners\nmatrix / Pi trigger]
+    TR --> TRR[(trigger report + optional traces)]
 
     PI --> CONTRACT
     CX --> CONTRACT
@@ -96,14 +125,17 @@ flowchart TB
 
 Each runner emits its own event shape. `normalize_trace_records` collapses those shapes into
 one schema-versioned `events.json` and `metrics.json` so a process assertion like
-`command_order` reads the same fields no matter who produced the run. When the evidence is
-missing, the assertion fails rather than guessing from the answer text.
+`command_order` reads the same fields no matter who produced the run. Lifecycle status is parsed
+into a closed event state first; only completed operations count as commands, tools, reads, writes,
+or skill invocation. When the evidence is missing or unknown, the assertion fails rather than
+guessing from the answer text.
 
 ## How a judge defers
 
 A qualitative check does not run inside `grade` itself: grading records a judge task and
-moves on. You run the judge separately — with a `--judge-cmd` you supply, or `--judge-model`
-for the native Claude judge — then merge its verdicts (each carrying its `judge_model`) into
+moves on. You run the judge separately — with a `--judge-cmd` you supply, or
+`--judge-backend claude|codex|vibe` plus `--judge-model` — then merge its verdicts (each
+carrying its `judge_model`) into
 the report.
 
 ```mermaid
@@ -123,8 +155,10 @@ sequenceDiagram
 
 The key is the `judge_task_id` (`case::variant::run-n::assertion`, gaining a `model` segment on
 a multi-model run so verdicts cannot collide across models). It lets results arrive out of
-band, from any model or human, and still land on the right assertion. Deterministic
-checks run first; the judge handles only what a keyword or regex cannot.
+band, from any model or human, and still land on the right assertion. Stored verdicts are parsed
+into strict boolean/scored/dimension/dynamic/consensus variants; duplicate IDs and contradictory
+score/threshold/pass fields are rejected. Deterministic checks run first; the judge handles only
+what a keyword or regex cannot.
 
 ## Where grading stays honest
 

@@ -22,6 +22,7 @@ title is the question; the body is the loop that answers it, runnable on
 | Why did this run fail? | [`why-did-this-run-fail.md`](why-did-this-run-fail.md) |
 | Can I trust my judge? | [`can-i-trust-my-judge.md`](can-i-trust-my-judge.md) |
 | How do I upgrade a v1 manifest to v2? | [`migrating-evals.md`](migrating-evals.md) |
+| How do I upgrade the harness from 0.5.1 to 0.6.0? | [`upgrading.md`](upgrading.md) |
 | How do I port my existing evals into the harness? | [`porting-existing-evals.md`](porting-existing-evals.md) |
 
 The journey backlog lives in [`TODO.md`](../TODO.md) under "User journeys the code

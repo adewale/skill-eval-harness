@@ -41,7 +41,7 @@ S=/tmp/j-fail    # any unique scratch dir
 rm -rf "$S"; mkdir -p "$S"
 
 python3 $H prepare evals/shared-benchmark.json --split tune \
-  --include-ablations --ablation-dir "$S/abl" --runs-per-variant 4 \
+  --include-ablations --ablation-dir "$S/abl" --runs-per-variant 6 \
   --out "$S/tasks.jsonl"
 python3 $H run-codex --tasks "$S/tasks.jsonl" --runs "$S/runs" \
   --codex-cmd "python3 $(pwd)/stub_runner.py"
@@ -53,7 +53,7 @@ python3 $H benchmark evals/shared-benchmark.json --runs "$S/runs" \
 python3 $H error-analysis --benchmark "$S/bench.json"
 ```
 
-Representative output (offline stub, four runs per arm so materialized ablations can clear the significance gate), trimmed to the summary, taxonomy, and selected review-queue rows:
+Representative output (offline stub, six matched runs per arm so materialized ablations can clear the paired sign-flip gate), trimmed to the summary, taxonomy, and selected review-queue rows:
 
 ```json
 "summary": {

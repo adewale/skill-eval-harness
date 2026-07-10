@@ -33,7 +33,7 @@ Run every arm through the deterministic stub — no model, no key. From
 cd examples/demo-skill
 HARNESS=../../skill_benchmark.py
 python3 $HARNESS prepare evals/shared-benchmark.json --split tune \
-  --include-ablations --ablation-dir /tmp/demo-abl --runs-per-variant 4 \
+  --include-ablations --ablation-dir /tmp/demo-abl --runs-per-variant 6 \
   --out /tmp/demo-tasks.jsonl
 python3 $HARNESS run-codex --tasks /tmp/demo-tasks.jsonl --runs /tmp/demo-runs \
   --codex-cmd "python3 $(pwd)/stub_runner.py"
@@ -45,7 +45,7 @@ python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/demo-runs \
 
 The `no-severity` ablation removes the `## Severity rules` section — the same regression a
 careless edit to `SKILL.md` would cause. Read `ablation_regressions` in the report
-(trimmed to the `no-severity` entry; 2026-07-06, offline stub, 4 runs per arm):
+(trimmed to the `no-severity` entry; deterministic offline stub, 6 matched pairs):
 
 ```json
 {
@@ -60,12 +60,13 @@ careless edit to `SKILL.md` would cause. Read `ablation_regressions` in the repo
       "score_regressed": true,
       "evidence": [
         {"case": "c-review", "assertion": "severity-label",
-         "with_skill_rate": 1.0, "ablation_rate": 0.0}
+         "with_skill_rate": 1.0, "ablation_rate": 0.0,
+         "paired_observations": 6}
       ],
       "confirmed_cases": ["c-review"],
       "significance": {
-        "method": "per-case-two-sample-permutation",
-        "significant_at_0_05": true, "min_p_value": 0.028571
+        "method": "per-case-model-paired-sign-flip",
+        "significant_at_0_05": true, "min_p_value": 0.03125
       },
       "evidence_class": "confirmed_causal",
       "expected_regression_confirmed": true
@@ -158,12 +159,12 @@ empty diff instead (real output, same command against a cosmetic-only iteration)
 - **A single-shot diff is noise.** Rerun the ablation arm with one run per arm and the same
   block reads `evidence_class: "indeterminate"`, `expected_regression_confirmed: null`, with
   the note *"regression observed but not significant per case across replicates (min
-  p=1.0); a case needs >= 4 runs per arm to confirm."* The confirmed verdict above only
-  appears at 4 runs per arm, where perfectly-separated scores clear the exact-permutation
-  floor (`min_p_value: 0.028571 ≤ 0.05`). A regression is a *named assertion flipping with
+  p=1.0); a case needs >= 6 matched pairs to confirm."* The confirmed verdict above only
+  appears at six unanimous repetition pairs, where the two-sided sign-flip floor is
+  `2/2^6 = 0.03125 ≤ 0.05` (five pairs floor at `0.0625`). A regression is a *named assertion flipping with
   provenance and significance*, not a score that wobbled once.
 - **The demo diff is exact only because the stub is deterministic.**
-  Its four replicates are identical, so the permutation test clears on perfect separation. A
+  Its six matched replicates are identical, so the paired sign-flip test clears on perfect separation. A
   real model's runs carry variance; there you need *genuine* repeats before a one-run diff
   earns trust, and the significance gate is what stops an unreplicated dip from counting.
 - **Two evidence classes, do not conflate them.** The `ablation_regressions` confirmation is

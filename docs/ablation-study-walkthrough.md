@@ -71,17 +71,18 @@ Re-running the three "interesting" rows **5× per arm** overturned two of them:
 
 | skill (case) | with | without | ablation | first read | holds at n=5? |
 |---|:--:|:--:|:--:|---|:--:|
-| anti-slop (earned-antithesis) | **0.2** | **1.0** | 0.2 | skill hurts | ✅ confirmed |
+| anti-slop (earned-antithesis) | **0.2** | **1.0** | 0.2 | skill hurts | ⚠ direction replicated; paired gate underpowered |
 | good-readme (agent-skill audit) | 0.4 | 0.2 | **0.8** | half-skill worse | ❌ refuted (noise) |
 | testing (cli-doc-sync) | 1.0 | 0.6 | **1.0** | component load-bearing | ❌ refuted (ablation == with) |
 
 ### What actually holds
 
-- **anti-slop-writing reliably over-applies.** Without it the model preserves an
-  *earned* antithesis 5/5; with it mounted it flags the good writing as "slop" and
-  degrades it ~4/5. Removing the flow/conclusion component doesn't fix it, so the
-  false-positive pressure is elsewhere in the skill. This is the one behavioral result
-  robust enough (large effect) to act on.
+- **anti-slop-writing directionally over-applies in this sample.** Without it the model
+  preserves an *earned* antithesis 5/5; with it mounted it flags the good writing as
+  "slop" and degrades it ~4/5. Removing the flow/conclusion component doesn't fix it,
+  so the false-positive pressure appears to be elsewhere. At five matched pairs this is
+  still below the current two-sided sign-flip floor (`p≥0.0625`); rerun at ≥6 informative
+  pairs before labeling it `CONFIRMED_CAUSAL` or acting on it as a confirmed effect.
 - **The good-readme and testing "findings" were n=1 artifacts** — they evaporated at
   n=5. The lesson is the harness's own thesis: single-shot judged ablations stay
   INDETERMINATE; the confirmation gate (verified provenance + an *observed,
@@ -111,7 +112,7 @@ python3 -c "import json,skill_benchmark as sb; from pathlib import Path; print(s
 # run the arms with your runner
 HARNESS=/path/to/skill_benchmark.py
 python3 $HARNESS prepare evals/shared-benchmark.json --split tune --include-ablations \
-  --ablation-dir /tmp/abl --runs-per-variant 4 --out /tmp/tasks.jsonl
+  --ablation-dir /tmp/abl --runs-per-variant 6 --out /tmp/tasks.jsonl
 python3 $HARNESS run-codex --tasks /tmp/tasks.jsonl --runs /tmp/runs --codex-cmd "claude -p"
 python3 - <<'PY' > /tmp/ablation-variants.args
 import json

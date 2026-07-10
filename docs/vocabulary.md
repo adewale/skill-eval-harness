@@ -12,6 +12,8 @@ Terms are grouped by what they describe: the units you evaluate, the comparison 
 
 **Run** — one execution of one case under one variant. Repeated runs of the same case/variant pair produce `run-1`, `run-2`, and so on. Repetition exists because model output varies between runs; one run is not a measurement.
 
+**Prepared-task draft / prepared task** — a draft is permissive planning data and cannot execute. A prepared task is the validated runner input produced at the JSONL boundary: non-empty identifiers, a closed split/variant, positive repetition, safe relative run directory, typed ablation provenance, and no skill paths on `without_skill`. Runners accept only the validated type.
+
 **Fixture** — a real input file referenced by `case.files`, stored under the manifest's `evals/` directory. `prepare` emits fixtures as absolute `input_files` so the runner reads them before answering. Fixtures make a case harder to solve from generic knowledge or from echoing assertion keywords.
 
 **Dataset / template** — a `datasets` block plus a case `template` fans one case shape over a row set, filling `{key}` placeholders per row into stable case ids. Materialized early (inside `iter_cases`), so validation, leakage lint, prepare, and grading all see ordinary cases. A YAML manifest with `dataset_files` (JSONL row files) compiles to the same shape in memory.
@@ -50,6 +52,8 @@ Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger
 **Ablation** — an opt-in variant that simulates removing one component of a skill, declared under `manifest.ablations` and prepared with `--include-ablations`. Each entry names the `removed_component` and its `expected_regressions`. An ablation is a hypothesis about which instructions are load-bearing; it becomes evidence only once it is run on a discriminating case. It is an ablation study in the original sense (Newell; Meyes et al. 2019) applied to instruction components, and because each entry declares `expected_regressions` it doubles as a directional-expectation (DIR) test (Ribeiro et al. 2020): a perturbation with a predicted direction of change.
 
 **Model (axis)** — a third fan-out axis beside variant and run, set with `prepare --models a,b,c`. Each row carries its target model, and the run layout gains a model segment (`<case>/<model>/<variant>`) only when two or more models run, so single-model layouts are unchanged. The report groups `by_model`, pairs lift per (case, model), and `model_analysis` ranks models by lift and names the ones that lose it. Model is a dimension, not a new kind of variant — the variant grid stays orthogonal within each model.
+
+**Experimental pair** — exactly one eligible `with_skill` arm and one eligible `without_skill` arm sharing `(case_id, model, run_number, population)`. The harness constructs this value before lift, paired reliability, paired cost, or token-overhead arithmetic. A missing/ineligible arm is a blocked pair; a duplicate arm is invalid rather than “last row wins.” Telemetry comparisons further require compatible provenance/unit/billing basis before a numeric delta exists.
 
 **Split** — when a case is allowed to be seen.
 
@@ -95,6 +99,8 @@ Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger
 
 **`usage_normalized` / `cost_normalized`** — legacy-compatible normalized token and dollar blocks every runner writes alongside raw provider fields. Schema-v3 `telemetry` is the canonical contract: it separates provenance (`provider_reported`, `trace_normalized`, `price_table_estimated`, `estimated`, or `legacy_unverified`) from availability (`available`, `unavailable`, or `not_applicable`). A measured zero is available; unavailable telemetry is never numeric zero. See [`telemetry-availability-and-comparability-spec.md`](telemetry-availability-and-comparability-spec.md).
 
+**Trace-event lifecycle** — the closed state of one normalized event: completed, in-progress, failed, or unknown, with a recorded source (provider status, intrinsically terminal/start event kind, explicit legacy adaptation, or unknown). Missing or misspelled status is not completion. Only completed operations contribute tool/command/file metrics.
+
 **Trace artifacts** — what a trace-aware runner writes so process and efficiency assertions have evidence:
 
 - `trace.jsonl` — the raw runner event stream, preserved before normalization.
@@ -108,17 +114,23 @@ The normalized shapes are an adapter boundary: Pi, Codex, and Jetty emit differe
 
 **Agent backend** — a registered native runner for one agent CLI, dispatched by `run-agent --agent <name>`. The registry (`AGENT_BACKENDS`) currently holds `claude`, `codex`, and `vibe`; `run-codex` and `run-claude` are compatibility wrappers over the same path. Every backend writes the same run-output contract, and a conformance guard fails the suite if a backend is registered on one surface (answer, judge, trigger) but missing from the capability rows (`agent_capabilities.py`) or the parity doc ([`agent-parity.md`](agent-parity.md)).
 
+**Answer-runner outcome** — one frozen execution variant: completed, timed out, spawn failed, or provider failed. Return code, timeout, answer, and failure are not independent flags. A validated context carries the closed provider identity plus finite non-negative elapsed/usage/cost fields; the shared artifact writer consumes the union exhaustively.
+
 **Workspace isolation** — every arm of a case runs in a fresh isolated workspace built by one shared builder: `with_skill` gets the (real or ablated) skill tree mounted, `without_skill` gets no skill files at all, so the baseline cannot read the skill from disk. Credential-bearing runner homes (`CODEX_HOME`, `VIBE_HOME`) live outside the model's working directory. This is the CF.2 invariant: baseline isolation is enforced by construction and covered by a cross-runner test, because a baseline that can see the skill silently destroys lift.
 
 **Judge backend** — how a deferred qualitative assertion gets its verdict. `--judge-cmd` is the universal escape hatch (any shell command: prompt on stdin, JSON verdict on stdout); `--judge-backend claude|codex|vibe` selects a native adapter (with `--judge-model` picking the model; the native paths capture the judge's real dollar cost). Every verdict records its `judge_model`, and judge spend is its own ledger line in `cost_summary`, never folded into the model under test.
 
 **Judge task** — one deferred qualitative check on one run, keyed by `judge_task_id` (`case::variant::run-n::assertion`, with a model segment when the model axis is fanned). `grade` emits pending tasks to `judge-tasks.jsonl`; verdicts merge back by the same key, which is also how human labels pair with verdicts in `judge-alignment`.
 
+**Judge verdict kind** — the strict semantic shape of a stored verdict: boolean, scored, dimension-scored, dynamic-rubric, or consensus. Pass is derived from that shape (for example `score >= threshold`); duplicate IDs, string truthiness, non-finite values, and contradictory pass/score/threshold fields are rejected at import.
+
 **Judge repetition / panel** — the two merges that stabilize a judge's verdict. `--judge-runs N` repeats each task and majority-merges `passed` (median for scores), killing within-judge noise; `--judge-panel` (repeated) runs several judge models and folds them into one consensus verdict with an `agreement` block, an optional `--quorum`, and even ties reported as `unresolved` rather than silently resolved.
 
 **Judge alignment** — a judge's accuracy against human labels as ground truth: `judge-alignment` reports raw agreement, Cohen's kappa (chance-corrected, so an imbalanced label set cannot flatter the judge), precision/recall/F1, and the confusion matrix, and warns below `--min-labels` matched labels. Distinct from judge-sensitivity (below): two judges can agree and both be wrong.
 
 **Judge robustness** — a judge's stability under probes it must not fail: `judge-robustness` re-judges with the rubric order flipped (`order_flip_consistency`) and feeds negative controls — an empty output and a master-key prompt injection — that a sound judge must reject (`control_leak_rate`). Model-touching and opt-in; it never runs in the grade path. The calibration walkthrough over alignment, robustness, and sensitivity is [`can-i-trust-my-judge.md`](can-i-trust-my-judge.md).
+
+**Jetty lifecycle** — one closed imported/executing state: queued, running, succeeded, failed, timed out, or protocol-invalid. Unknown aliases and conflicting stored discriminators are protocol-invalid. “Succeeded” is not semantic success until `output.md` exists; timeout remains distinct from provider failure. A Jetty dry run is planning, not an execution lifecycle.
 
 ## Report signals
 

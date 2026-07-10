@@ -217,9 +217,11 @@ Submits exported payloads and polls for completion.
 ```sh
 skill-benchmark run-jetty \
   --payloads jetty-payloads.jsonl \
-  --out jetty-runs.jsonl \
-  --concurrency 4
+  --out jetty-runs.jsonl
 ```
+
+Execution is currently sequential. The parser reserves `--concurrency`, but the executor does not
+yet apply it; streaming/concurrent execution remains in `TODO.md`.
 
 Environment:
 
@@ -264,7 +266,8 @@ If there is only one run per variant, importer may follow the existing non-repea
 
 ## Optional manifest extension
 
-Keep this optional.
+The implemented optional fields are `collection`, `task_prefix`, `agent`, `model`,
+`model_provider`, `snapshot`, and `use_trial_keys`:
 
 ```json
 {
@@ -275,32 +278,16 @@ Keep this optional.
     "model": "claude-sonnet-4-6",
     "model_provider": "anthropic",
     "snapshot": "python312-uv",
-    "use_trial_keys": false,
-    "grader_mode": "local_only",
-    "skill_mount_strategy": "variant-aware",
-    "variants": {
-      "without_skill": {
-        "skill_mount_strategy": "omit"
-      }
-    }
+    "use_trial_keys": false
   }
 }
 ```
 
-Validation:
-
-- `jetty` is optional.
-- `agent` should be one of `claude-code`, `opencode`, `codex`, `gemini-cli` unless an explicit override allows unknown runtimes.
-- `model_provider` should be explicit to avoid Jetty runtime inference surprises.
-- `snapshot` should default to `python312-uv`; use `prism-playwright` only for browser cases.
-- `skill_mount_strategy` values:
-  - `variant-aware`
-  - `force-mount`
-  - `omit`
-- `grader_mode` values:
-  - `local_only`
-  - `jetty_only`
-  - `merge`
+`export-jetty` validates `agent` against `claude-code`, `opencode`, `codex`, and `gemini-cli`;
+`model_provider` should be explicit, and `snapshot` defaults to `python312-uv`. Manifest-wide
+shape validation, `grader_mode`, per-variant overrides, and configurable mount strategies remain
+proposed follow-ons tracked in `TODO.md`; the current exporter always derives the mount from the
+validated prepared task.
 
 ## Canonical harness runbook
 
@@ -402,14 +389,7 @@ class VariantKind(Enum):
     OLD_SKILL = "old_skill"
     ABLATION = "ablation"
 
-class TrajectoryStatus(Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELED = "canceled"
-    TIMEOUT = "timeout"
-    UNKNOWN = "unknown"
+JettyLifecycle = Queued | Running | Succeeded | Failed | TimedOut | ProtocolInvalid
 
 @dataclass(frozen=True)
 class HarnessTaskIdentity:
@@ -439,7 +419,9 @@ Required invariants:
 - `ablation:<id>` must either mount a materialized ablated skill or mark the run as instruction-simulated approximation.
 - executor payload never contains `expected_behavior`, `review_rubric`, judge assertion rubrics, or answer keys.
 - dry-run payloads with missing prompt refs are labeled non-executable.
-- unknown Jetty statuses fail closed and write failure metadata.
+- provider status aliases parse once into `JettyLifecycle`; unknown/missing aliases and a conflicting persisted discriminator become `ProtocolInvalid`;
+- `Succeeded` is semantic success only when both a non-empty `trajectory_id` and an `output.md` artifact exist; either missing field is protocol-invalid;
+- timeout is its own lifecycle, not an ordinary provider failure; dry-run is planning outside the execution lifecycle.
 
 ## Import metadata
 
@@ -458,6 +440,7 @@ Normalize Jetty fields into `metadata.json`:
   "errors_encountered": 0,
   "returncode": 0,
   "timed_out": false,
+  "jetty_lifecycle": "succeeded",
   "jetty_trajectory_id": "traj_...",
   "jetty_collection": "skill-evals",
   "jetty_task": "good-pr-pos-security-meaningless-test-with-skill-1",
@@ -496,124 +479,28 @@ Mapping:
 
 Judge payloads may include rubrics. Executor payloads may not.
 
-## Red-green-refactor TDD plan
+## Implemented test record
 
-### Phase 1 — exporter, no network
+Phases 1–4 shipped with deterministic tests:
 
-Red tests:
+- pure export payload/mount-plan tests cover the runbook block, task template variables, fixtures,
+  recursive skill uploads, per-variant mount policy, and answer-key/rubric omission;
+- importer integration tests cover completed/failed trajectories, repeated layout, normalized
+  artifacts/metadata, safe run destinations, duplicate identity rejection, and local benchmark use;
+- fake-client tests cover upload, submit, poll, placeholder replacement, terminal success/failure,
+  timeout, protocol-invalid status, and bounded transient retries; and
+- CLI tests cover export → mocked execute → import plus token-free dry run and missing-token failure.
 
-1. `export-jetty` emits `model`, `messages`, `stream`, and `jetty` block.
-2. `jetty` block includes `runbook`, `collection`, `task`, `agent`, `model_provider`, `snapshot`, and `template_variables.results_dir`.
-3. `template_variables.task_json` is used instead of stuffing task params into the user message.
-4. Executor payload omits answer keys and rubrics.
-5. `without_skill` payload has no skill upload items.
-6. Fixture files appear in upload plan.
+The tests use inline provider-shaped records and temporary run trees in
+`tests/test_skill_benchmark.py`, `tests/test_runners.py`, `tests/test_cost_telemetry.py`, and
+`tests/test_jetty_contracts.py`; there is no separate `tests/fixtures/jetty/` tree.
 
-Green:
+Security checks prove executor payloads omit answer keys/judge rubrics and provider credentials,
+`without_skill` uploads no skill files, hidden prompt placeholders remain non-executable, unsafe or
+duplicate imported destinations fail before writes, and unknown/conflicting statuses fail closed.
 
-- Implement pure payload/mount-plan builders.
-
-Refactor:
-
-- Add typed internal objects and invariant checks.
-
-### Phase 2 — mocked importer
-
-Red tests:
-
-1. Completed trajectory with `output.md` artifact imports to the harness run layout.
-2. Repeated runs import under `run-<n>`.
-3. Missing artifact writes failure output/metadata.
-4. Imported run can be graded by existing `benchmark`.
-
-Green:
-
-- Implement importer with mocked trajectory/artifact objects.
-
-Refactor:
-
-- Normalize metadata in one place.
-
-### Phase 3 — mocked Jetty client
-
-Red tests:
-
-1. Upload calls `/api/v1/files/upload` with `file` and `collection`.
-2. Submit calls `/v1/chat/completions`.
-3. Poll calls `/api/v1/db/trajectory/{collection}/{task}/{trajectory_id}`.
-4. `pending -> running -> completed` succeeds.
-5. `failed`, timeout, and unknown status fail closed.
-6. bounded retry handles transient 429/5xx.
-
-Green:
-
-- Implement `JettyClient` with injectable HTTP transport and fake clock.
-
-Refactor:
-
-- Keep network code at the edge.
-
-### Phase 4 — CLI round trip
-
-Red tests:
-
-1. `export-jetty` JSONL -> mocked `run-jetty` -> `import-jetty-results` -> `benchmark`.
-2. `run-jetty --dry-run` works without token.
-3. Token-backed mode fails with a clear message when `JETTY_API_TOKEN` is absent.
-
-Green:
-
-- Wire CLI commands.
-
-### Phase 5 — live smoke, opt-in only
-
-Requires `JETTY_API_TOKEN` and should never run in default CI.
-
-1. One fixture-free tune case.
-2. One fixture-backed tune case.
-3. One failure/timeout path if a cheap deterministic failure is available.
-
-## Test fixtures
-
-Add under `tests/fixtures/jetty/`:
-
-```text
-tests/fixtures/jetty/
-├── manifest-with-jetty.json
-├── prepared-task-with-skill.json
-├── prepared-task-without-skill.json
-├── export-payload-with-skill.json
-├── export-payload-without-skill.json
-├── trajectory-completed.json
-├── trajectory-failed.json
-├── trajectory-unknown-status.json
-├── artifact-output.md
-└── artifact-metadata.json
-```
-
-## Security tests
-
-Required:
-
-- executor payload never contains `expected_behavior`;
-- executor payload never contains judge rubrics;
-- `without_skill` never uploads skill files;
-- hidden `prompt_ref` content is not exported in dry-run/public payloads;
-- private uploaded files are marked private in upload plan;
-- local provider API keys are never serialized into payloads;
-- unknown statuses fail closed.
-
-## First release acceptance criteria
-
-Acceptable first Jetty release:
-
-1. `export-jetty` has golden tests.
-2. `import-jetty-results` has mocked trajectory round-trip tests.
-3. Variant mount-policy tests pass.
-4. Hidden prompt and answer-key safety tests pass.
-5. `run-jetty --dry-run` works without a token.
-6. Live `run-jetty` requires `JETTY_API_TOKEN` and has one documented manual smoke test.
-7. README documents Jetty as an execution adapter; local harness grading remains the source of truth.
+Phase 5 remains opt-in live validation. It requires `JETTY_API_TOKEN`, never runs in default CI, and
+should cover one fixture-free case, one fixture-backed case, and a cheap failure/timeout path.
 
 ## Remaining live-token questions
 

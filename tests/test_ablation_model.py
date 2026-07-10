@@ -40,9 +40,20 @@ class ProvenanceSchemaTests(unittest.TestCase):
         a = self.prov()
         self.assertTrue(a.matches(self.prov()))                         # same identity
         self.assertFalse(a.matches(self.prov(id="other")))             # different id
-        self.assertFalse(a.matches(self.prov(population="trigger")))   # different population
+        with self.assertRaises(ValueError):
+            self.prov(population="trigger")                              # population is derived from components
         diff_target = self.prov(components=(am.Component("instructions", "section", "skills/x/SKILL.md", {"heading": "## OTHER"}),))
         self.assertFalse(a.matches(diff_target))                       # different component target
+
+    def test_component_target_is_recursively_immutable(self):
+        source = {"heading": "## H", "nested": {"items": ["a"]}}
+        component = am.Component("instructions", "section", "skills/x/SKILL.md", source)
+        source["nested"]["items"].append("mutated")
+        self.assertEqual(component.target["nested"]["items"], ("a",))
+        with self.assertRaises(TypeError):
+            component.target["nested"]["x"] = 1
+        with self.assertRaises(ValueError):
+            am.Component("instructions", "section", "s", {"bad": {"set"}})
 
     def test_removed_bytes_is_recorded_but_not_part_of_identity(self):
         a = self.prov(components=(am.Component("instructions", "section", "skills/x/SKILL.md", {"heading": "## H"}, removed_bytes=42),))
@@ -94,11 +105,43 @@ class StrictFromDictTests(unittest.TestCase):
             am.Component.from_dict({"class": "instructions", "mechanism": "section",
                                     "skill_root": "s", "target": "not-a-dict"})
 
-    def test_empty_components_is_allowed(self):
-        # Present and correctly typed; non-emptiness is a semantic concern for the
-        # materializer/verifier, not the parse (a recorded record may legitimately
-        # carry an empty component list — see the closed-set test in test_cbc).
-        self.assertEqual(am.Provenance.from_dict(dict(self.GOOD, components=[])).components, ())
+    def test_empty_components_cannot_attest_a_materialized_edit(self):
+        with self.assertRaises(ValueError):
+            am.Provenance.from_dict(dict(self.GOOD, components=[]))
+
+    def test_closed_provenance_vocabularies_and_identifiers(self):
+        for mutation in (
+            {"id": ""}, {"id": "not a slug"}, {"mode": "imaginary"},
+            {"mode": "instruction_simulated"}, {"population": "judge"},
+            {"skill_hash": ""}, {"parent_skill_hash": ""},
+        ):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                am.Provenance.from_dict(dict(self.GOOD, **mutation))
+        for mutation in (
+            {"class": "other"}, {"mechanism": "other"}, {"skill_root": ""},
+            {"removed_bytes": -1}, {"removed_bytes": True},
+        ):
+            component = dict(self.GOOD["components"][0], **mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                am.Component.from_dict(component)
+
+    def test_materialized_provenance_requires_edit_and_component_population(self):
+        with self.assertRaisesRegex(ValueError, "edited tree"):
+            am.Provenance.from_dict(dict(self.GOOD, skill_hash="C", parent_skill_hash="C"))
+        discovery = {"class": "discovery", "mechanism": "frontmatter_field",
+                     "skill_root": "skills/x/SKILL.md", "target": {"field": "description"}}
+        with self.assertRaisesRegex(ValueError, "population"):
+            am.Provenance.from_dict(dict(self.GOOD, components=[discovery]))
+        with self.assertRaisesRegex(ValueError, "mix"):
+            am.Provenance.from_dict(dict(self.GOOD, components=[self.GOOD["components"][0], discovery]))
+        with self.assertRaisesRegex(ValueError, "only valid for the answer"):
+            am.InstructionSimulated.from_dict({"id": "a", "population": "trigger"})
+
+    def test_instruction_simulated_rejects_scalar_regressions_and_untyped_removed_component(self):
+        with self.assertRaises(ValueError):
+            am.InstructionSimulated.from_dict({"id": "a", "population": "answer", "expected_regressions": "abc"})
+        with self.assertRaises(ValueError):
+            am.InstructionSimulated.from_dict({"id": "a", "population": "answer", "removed_component": 3})
 
     def test_instruction_simulated_requires_id_and_population(self):
         self.assertEqual(am.InstructionSimulated.from_dict({"id": "a", "population": "answer"}).id, "a")

@@ -135,7 +135,7 @@ blow its budget — the operational half of the same gate.
 - **`report` shows lift dropped vs. the last run** → a real regression, or a flaky
   sample. The `benchmark.json` `significance` block (a sign-flip permutation test on the
   paired scores) tells you which. Gate on *confirmed* regressions, not on a one-run dip;
-  a case needs ≥4 runs per arm to ever clear significance.
+  an ablation cohort needs ≥6 exact repetition pairs to clear its two-sided sign-flip gate.
 - **`audit-manifest --fail-on-blockers` exits non-zero** → read the `blockers` list. A
   `leak-saturated` blocker means an assertion passes from the prompt alone; a
   no-adversarial blocker means nothing tests the skill under pressure. Fix the

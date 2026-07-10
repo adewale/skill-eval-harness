@@ -362,7 +362,7 @@ Opt in with `"invalid_skill": true` on the ablation: the run is tagged
 
 ## Validation additions
 
-`validate_manifest` (`skill_benchmark.py:525`), per ablation:
+`validate_manifest` (`skill_benchmark.py:548`), per ablation:
 
 - `id` unique and slug-formatted; keep `removed_component`.
 - If a removal is declared: exactly one of `mechanism`+`target` or `components`;

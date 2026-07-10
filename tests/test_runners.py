@@ -23,6 +23,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import skill_benchmark as sb
+import trace_contracts as tc
+import runner_contracts as rc
 import run_pi_trigger_eval as tr
 import ablation_model as am
 from helpers import (
@@ -157,6 +159,97 @@ class ToolReplayTests(unittest.TestCase):
             replayer = sb.ToolReplayStore(store_path, "auto")
             self.assertEqual(replayer.mode, "replay")
             self.assertEqual(replayer.resolve("t", {"x": 1}), "out")
+
+
+class ClosedRunnerOutcomeTests(unittest.TestCase):
+    def test_outcome_variants_make_contradictory_states_unconstructible(self):
+        context = rc.OutcomeContext(provider=rc.Provider.CODEX, elapsed_ms=0)
+        with self.assertRaises(ValueError):
+            rc.Completed(context, answer="x", returncode=1)
+        with self.assertRaises(ValueError):
+            rc.TimedOut(context, returncode=0)
+        with self.assertRaises(ValueError):
+            rc.ProviderFailed(context, returncode=0)
+        with self.assertRaises(ValueError):
+            rc.SpawnFailed(context, reason="x", returncode=1)
+        with self.assertRaises(ValueError):
+            rc.RunnerOutcome(provider="codex", answer="", returncode=0, timed_out=True)
+        with self.assertRaises(TypeError):
+            rc.Completed(None, answer="x")  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            rc.Completed(context, answer="")
+
+    def test_context_rejects_unknown_provider_and_invalid_measurements(self):
+        for kwargs in (
+            {"provider": "unknown"}, {"provider": "codex", "elapsed_ms": -1},
+            {"provider": "codex", "elapsed_ms": float("nan")},
+            {"provider": "codex", "cost_usd": float("inf")},
+            {"provider": "codex", "usage": {"input_tokens": -1}},
+            {"provider": "codex", "usage": {"input_tokens": "unknown"}},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises((TypeError, ValueError)):
+                rc.OutcomeContext(**kwargs)
+
+    def test_context_and_outcome_are_recursively_immutable(self):
+        source = {"x": 1, "nested": {"value": 2}, "items": [{"value": 3}]}
+        context = rc.OutcomeContext(provider="codex", metadata_extra=source)
+        outcome = rc.Completed(context, answer="ok")
+        source["nested"]["value"] = 9
+        self.assertEqual(context.metadata_extra["nested"]["value"], 2)
+        with self.assertRaises(TypeError):
+            context.metadata_extra["x"] = 2  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            context.metadata_extra["nested"]["value"] = 4  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            context.metadata_extra["items"][0]["value"] = 4  # type: ignore[index]
+        with self.assertRaises((AttributeError, TypeError)):
+            outcome.answer = "changed"  # type: ignore[misc]
+
+
+class TraceEventStateTests(unittest.TestCase):
+    def test_status_parser_is_closed_and_positive(self):
+        for raw, expected in (("done", tc.EventState.COMPLETED), ("running", tc.EventState.IN_PROGRESS),
+                              ("failed", tc.EventState.FAILED), ("typo", tc.EventState.UNKNOWN),
+                              (None, tc.EventState.UNKNOWN)):
+            with self.subTest(raw=raw):
+                self.assertIs(tc.parse_event_state(raw).state, expected)
+        self.assertFalse(tc.event_is_completed({"type": "command"}))
+        self.assertFalse(tc.event_is_completed({"type": "command", "status": "failed"}))
+        self.assertFalse(tc.event_is_completed({"type": "command", "status": "typo"}))
+        self.assertTrue(tc.event_is_completed({"type": "command", "status": "completed"}))
+
+    def test_raw_terminal_kind_can_prove_completion_during_normalization(self):
+        event = sb.normalize_trace_record({"type": "item.completed", "item": {"type": "command_execution", "command": "echo ok"}}, source="codex", index=1, line=1)
+        self.assertEqual(event["status"], "completed")
+        self.assertEqual(event["state_source"], "provider_event_kind")
+        self.assertEqual(len(sb.command_events([event])), 1)
+
+    def test_statusless_or_unknown_terminal_looking_kinds_do_not_count(self):
+        records = [
+            {"type": "command", "command": "echo no"},
+            {"type": "tool_call", "toolName": "read"},
+            {"type": "tool_typo_end", "toolName": "read"},
+        ]
+        events, metrics = sb.normalize_trace_records(records, source="generic")
+        self.assertTrue(all(event["status"] == "unknown" for event in events["events"]))
+        self.assertEqual(metrics["commands"], 0)
+        self.assertEqual(metrics["tool_calls"], 0)
+
+    def test_present_malformed_status_cannot_be_upgraded_by_terminal_kind(self):
+        for raw in (None, False, 123, [], {}):
+            with self.subTest(raw=raw):
+                events, metrics = sb.normalize_trace_records(
+                    [{"type": "command_end", "status": raw, "command": "echo no"}],
+                    source="generic")
+                self.assertEqual(events["events"][0]["status"], "unknown")
+                self.assertEqual(metrics["commands"], 0)
+
+    def test_unknown_and_failed_commands_do_not_satisfy_command_filters(self):
+        events = [
+            {"type": "command", "status": "unknown", "input_summary": "unsafe"},
+            {"type": "command", "status": "failed", "input_summary": "unsafe"},
+        ]
+        self.assertEqual(sb.command_events(events), [])
 
 
 class OTelNormalizationTests(unittest.TestCase):
@@ -382,15 +475,20 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(meta["returncode"], 127)
             self.assertFalse(sb.execution_valid(meta, text))
 
-    def test_write_runner_outcome_derives_none_answer_from_trace(self):
-        # answer=None means "the answer is the final trace message" (the Codex seam).
+    def test_trace_is_never_a_fallback_final_answer(self):
+        trace = json.dumps({"role": "assistant", "content": "not a sidecar answer"})
+        outcome = am.RunnerOutcome(provider="codex", answer=None, returncode=0, trace_text=trace)
+        self.assertIsInstance(outcome, rc.ProviderFailed)
+        with self.assertRaises(TypeError):
+            rc.Completed(rc.OutcomeContext(provider="codex", trace_text=trace), answer=None)  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as td:
             base = Path(td) / "run"
-            trace = json.dumps({"role": "assistant", "content": "derived answer"})
-            outcome = am.RunnerOutcome(provider="codex", answer=None, returncode=0, trace_text=trace)
             sb.write_runner_outcome(base, outcome)
-            self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "derived answer")
-            self.assertTrue((base / "trace.jsonl").exists())
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            text = (base / "output.md").read_text(encoding="utf-8")
+            self.assertEqual(meta["returncode"], 1)
+            self.assertNotIn(trace, text)
+            self.assertFalse(sb.execution_valid(meta, text))
 
     def test_write_runner_outcome_encodes_timeout_uniformly(self):
         # One timeout encoding for every provider: timed_out + returncode 124, a
@@ -436,11 +534,14 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             base = Path(td) / "run"
             trace = json.dumps({"role": "assistant", "content": "LEAKED FROM TRACE"})
             outcome = am.RunnerOutcome(provider="subagent", answer="", returncode=0, trace_text=trace)
+            self.assertIsInstance(outcome, rc.ProviderFailed)
             sb.write_runner_outcome(base, outcome)
             text = (base / "output.md").read_text(encoding="utf-8")
             self.assertNotIn("LEAKED FROM TRACE", text)
             self.assertTrue(text.lstrip().startswith(am.CLAUDE_FAILURE))
-            self.assertFalse(am.execution_valid({"returncode": 0}, text))
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["returncode"], 1)
+            self.assertFalse(am.execution_valid(meta, text))
 
     def test_run_agent_dispatches_registered_vibe_backend(self):
         with tempfile.TemporaryDirectory() as td:
@@ -550,7 +651,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs),
                                          codex_cmd=f"{sys.executable} {silent}", timeout=30))
             base = runs / run_dir
-            self.assertIn("no output produced", (base / "output.md").read_text(encoding="utf-8"))
+            self.assertIn("no final answer", (base / "output.md").read_text(encoding="utf-8"))
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["usage_normalized"], {"source": "missing"})
             self.assertEqual(meta["cost_normalized"], {"source": "missing"})

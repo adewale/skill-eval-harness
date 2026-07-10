@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:5180`, merged in `grade_case_variant:6278`).
+threshold, evidence}` (`load_judge_results:5312`, merged in `grade_case_variant:6463`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -365,3 +365,8 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       `import-trace` path for already-recorded outputs. Runnable offline against the demo
       skill (real 2026-07-10 lint/lift/audit output), including the leakage lint firing on a
       genuinely leaky ported row.
+- [x] **"How do I upgrade the harness from 0.5.1 to 0.6.0?"** —
+      [`docs/upgrading.md`](docs/upgrading.md): preserve the old run tree, inspect
+      and apply telemetry migration, repair strict judge/pair/trigger/Jetty inputs, regenerate
+      reports, distinguish expected semantic changes from regressions, and roll back from the
+      untouched 0.5.1 artifacts.
