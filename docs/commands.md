@@ -51,7 +51,7 @@ skill-benchmark import-trace \
 
 ## Run Codex JSONL tasks
 
-`run-codex` is a compatibility wrapper for `run-agent --agent codex`. It executes prepared rows through a command compatible with `codex exec --json`, adds `--output-last-message <file>` for final-answer capture, saves JSONL as `trace.jsonl`, normalizes events/metrics, runs with isolated `CODEX_HOME` outside the model workdir, and records nonzero/timeouts as failed run artifacts:
+`run-codex` is a compatibility wrapper for `run-agent --agent codex`. It executes prepared rows through a command compatible with `codex exec --json`, adds `--output-last-message <file>` for final-answer capture, saves JSONL as `trace.jsonl`, normalizes events/metrics, runs with isolated `CODEX_HOME` outside the model workdir, and records nonzero/timeouts as failed run artifacts. The shared subprocess owner observes CLI-leader exit independently of inherited capture-pipe EOF, then terminates remaining members of the original process group on POSIX before bounded retry/backoff removes the isolated home. An escaped process cannot make pipe draining unbounded: POSIX capture descriptors are closed after a short grace period, while non-POSIX reader threads are abandoned and reported. Cleanup recovery or fallback is recorded in stderr and `environment.json` without replacing an already captured answer. Non-POSIX runs report process-group cleanup as unsupported while retaining bounded, non-throwing home cleanup:
 
 ```bash
 skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl

@@ -15,6 +15,7 @@ import argparse
 import collections
 import copy
 import difflib
+import errno
 import hashlib
 import html
 import json
@@ -156,6 +157,14 @@ def expand_judge_preset(assertion: dict[str, Any]) -> dict[str, Any]:
 # Below this graded mean, an objectively saturated case is flagged
 # structurally-pass-but-forgettable (roadmap 2.2): competent, but low-scoring.
 FORGETTABLE_GRADED_THRESHOLD = 0.75
+
+# Native agents run in their own process group. A successful CLI parent can
+# still leave plugin/git group members alive, so the group is force-killed
+# after capture. Pipe draining and Codex-home removal are both bounded so an
+# escaped process cannot stall a benchmark worker indefinitely.
+PROCESS_LEADER_POLL_INTERVAL_S = 0.05
+PROCESS_PIPE_DRAIN_GRACE_S = 0.25
+CODEX_TEMP_CLEANUP_RETRY_DELAYS_S = (0.05, 0.1, 0.2, 0.4, 0.8)
 
 
 def assertion_severity(assertion: dict[str, Any], *, strict: bool = False) -> str:
@@ -3033,6 +3042,43 @@ def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
             return value.decode("utf-8", errors="replace")
         return str(value)
 
+    def kill_process_group(pgid: int) -> dict[str, Any]:
+        """Force-kill remaining members of the CLI's original POSIX process group.
+
+        A completed group leader has no legitimate background work in the eval
+        harness. Use one immediate signal instead of a TERM/poll/KILL sequence:
+        this minimizes both the post-reap PGID-reuse window and the time a plugin
+        helper can continue changing its isolated home. Cleanup retries absorb
+        the short interval between signal delivery and filesystem quiescence.
+        """
+        if not hasattr(os, "killpg"):
+            return {"status": "unsupported"}
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return {"status": "not_needed"}
+        except OSError as exc:
+            return {"status": "warning", "signal": "SIGKILL",
+                    "error": errno.errorcode.get(exc.errno, type(exc).__name__)}
+        return {"status": "kill_sent", "signal": "SIGKILL"}
+
+    def process_leader_exited(proc: subprocess.Popen[str]) -> bool:
+        """Observe POSIX leader exit without reaping it when the OS supports that."""
+        if proc.returncode is not None:
+            return True
+        waitid_parts = ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+        if hasattr(os, "killpg") and all(hasattr(os, name) for name in waitid_parts):
+            try:
+                status = os.waitid(
+                    os.P_PID, proc.pid,
+                    os.WEXITED | os.WNOHANG | os.WNOWAIT,
+                )
+            except (ChildProcessError, OSError):
+                pass
+            else:
+                return status is not None
+        return proc.poll() is not None
+
     start = time.time()
     try:
         proc = subprocess.Popen(
@@ -3050,21 +3096,93 @@ def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
             stdout="", stderr=f"{type(exc).__name__}: {exc}"[:4000],
             returncode=127, elapsed_ms=int((time.time() - start) * 1000),
         )
-    try:
-        out, err = proc.communicate(input=input_text, timeout=timeout)
-        stdout, stderr, returncode, timed_out = _text(out), _text(err)[:4000], proc.returncode, False
-    except subprocess.TimeoutExpired as exc:
+    deadline = time.monotonic() + timeout
+    communication_started = False
+    communication_complete = False
+    communication_timeout: subprocess.TimeoutExpired | None = None
+    leader_exited = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if communication_timeout is None:
+                communication_timeout = subprocess.TimeoutExpired(argv, timeout)
+            leader_exited = process_leader_exited(proc)
+            break
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
+            out, err = proc.communicate(
+                input=input_text if not communication_started else None,
+                timeout=min(PROCESS_LEADER_POLL_INTERVAL_S, remaining),
+            )
+        except subprocess.TimeoutExpired as exc:
+            communication_started = True
+            communication_timeout = exc
+            # ``communicate`` waits for pipe EOF as well as leader exit. Poll in
+            # short slices so a successful leader is not charged the full task
+            # timeout merely because one of its helpers inherited a capture fd.
+            leader_exited = process_leader_exited(proc)
+            if leader_exited:
+                break
+        else:
+            stdout, stderr, returncode, timed_out = _text(out), _text(err)[:4000], proc.returncode, False
+            communication_complete = True
+            break
+    if not communication_complete:
+        assert communication_timeout is not None
+        exc = communication_timeout
+        try:
+            group_cleanup = kill_process_group(proc.pid)
+        except Exception as cleanup_exc:
+            group_cleanup = {"status": "warning", "signal": None,
+                             "error": errno.errorcode.get(getattr(cleanup_exc, "errno", None), type(cleanup_exc).__name__)}
+        if not leader_exited and group_cleanup.get("status") in {"unsupported", "warning"}:
             proc.kill()
-        out, err = proc.communicate()
+        try:
+            out, err = proc.communicate(timeout=PROCESS_PIPE_DRAIN_GRACE_S)
+        except subprocess.TimeoutExpired as drain_exc:
+            # A detached child can outlive the original group and keep the pipe
+            # write ends open forever. Preserve the partial capture, close our
+            # read ends, and reap the group leader without waiting for that child.
+            out, err = drain_exc.output or exc.output, drain_exc.stderr or exc.stderr
+            posix_pipe_close = hasattr(os, "killpg")
+            if posix_pipe_close:
+                for pipe in (proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
+            try:
+                proc.wait(timeout=PROCESS_PIPE_DRAIN_GRACE_S)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=PROCESS_PIPE_DRAIN_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    group_cleanup = {**group_cleanup, "leader_reap": "timed_out"}
+            pipe_action = "closed" if posix_pipe_close else "abandoned"
+            pipe_warning = (
+                "capture pipes remained open after process-group termination"
+                if posix_pipe_close else
+                "capture pipes remained open; non-POSIX reader threads were abandoned"
+            )
+            group_cleanup = {**group_cleanup, "pipe_drain": pipe_action, "warning": pipe_warning}
         stdout = _text(out or exc.stdout)
         stderr = _text(err or exc.stderr or str(exc))[:4000]
-        returncode, timed_out = 124, True
+        returncode = proc.returncode if leader_exited and proc.returncode is not None else 124
+        timed_out = not leader_exited
+    else:
+        try:
+            group_cleanup = kill_process_group(proc.pid)
+        except Exception as exc:  # descendant cleanup cannot replace captured output
+            group_cleanup = {"status": "warning", "signal": None,
+                             "error": errno.errorcode.get(getattr(exc, "errno", None), type(exc).__name__)}
+    if group_cleanup.get("status") == "warning":
+        detail = str(group_cleanup.get("error") or "unknown error")
+        warning = f"process-group cleanup warning: {detail}"
+        stderr = _stderr_with_warning(stderr, warning)
+    if group_cleanup.get("warning"):
+        stderr = _stderr_with_warning(stderr, str(group_cleanup["warning"]))
     return InvocationOutcome.from_process(
         stdout=stdout, stderr=stderr, returncode=returncode,
         elapsed_ms=int((time.time() - start) * 1000),
+        metadata={"process_group_cleanup": group_cleanup},
     )
 
 
@@ -4476,7 +4594,82 @@ def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeo
                             stderr=outcome.stderr[:4000],
                             returncode=int(outcome.returncode if outcome.returncode is not None else 127),
                             elapsed_ms=outcome.elapsed_ms,
-                            timed_out=outcome.timed_out)
+                            timed_out=outcome.timed_out,
+                            adapter_metadata=dict(outcome.metadata))
+
+
+def cleanup_codex_invoke_temp(path: Path) -> dict[str, Any]:
+    """Remove one isolated Codex invocation directory without losing its result.
+
+    macOS can report ``ENOTEMPTY`` while a just-finished plugin clone is still
+    changing the tree; busy mounts can similarly report ``EBUSY``. Retry only
+    those transient errors. A final ignore-errors removal is deliberately the
+    last fallback, and every non-normal cleanup is returned as observable,
+    path-free metadata for stderr/environment artifacts.
+    """
+    attempts = 0
+    last_error: BaseException | None = None
+    max_attempts = 1 + len(CODEX_TEMP_CLEANUP_RETRY_DELAYS_S)
+    for attempt in range(max_attempts):
+        attempts += 1
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError as exc:
+            # Before Python 3.13, a concurrent deletion of an interior entry can
+            # escape from rmtree as FileNotFoundError even while the root remains.
+            # Only call the invocation directory removed after checking the root.
+            last_error = exc
+            try:
+                root_missing = not path.exists()
+            except OSError:
+                root_missing = False
+            if root_missing:
+                result = {"status": "removed", "attempts": attempts, "retry_count": attempts - 1}
+                if attempts > 1:
+                    result["warning"] = f"isolated Codex temporary-home cleanup recovered after {attempts} attempts (ENOENT)"
+                return result
+            if attempt >= len(CODEX_TEMP_CLEANUP_RETRY_DELAYS_S):
+                break
+            time.sleep(CODEX_TEMP_CLEANUP_RETRY_DELAYS_S[attempt])
+        except OSError as exc:
+            last_error = exc
+            transient = exc.errno in {errno.ENOTEMPTY, errno.EBUSY}
+            if not transient or attempt >= len(CODEX_TEMP_CLEANUP_RETRY_DELAYS_S):
+                break
+            time.sleep(CODEX_TEMP_CLEANUP_RETRY_DELAYS_S[attempt])
+        except Exception as exc:  # cleanup must never replace captured provider output
+            last_error = exc
+            break
+        else:
+            result = {"status": "removed", "attempts": attempts, "retry_count": attempts - 1}
+            if attempts > 1:
+                code = errno.errorcode.get(getattr(last_error, "errno", None), type(last_error).__name__)
+                result["warning"] = f"isolated Codex temporary-home cleanup recovered after {attempts} attempts ({code})"
+            return result
+
+    fallback_error: BaseException | None = None
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception as exc:  # a patched/platform implementation may still raise
+        fallback_error = exc
+    try:
+        retained = path.exists()
+    except OSError:
+        retained = True
+    error = fallback_error or last_error
+    code = errno.errorcode.get(getattr(error, "errno", None), type(error).__name__ if error is not None else "unknown")
+    status = "retained" if retained else "removed_after_fallback"
+    return {
+        "status": status,
+        "attempts": attempts,
+        "retry_count": max(0, attempts - 1),
+        "fallback_attempted": True,
+        "warning": (
+            f"isolated Codex temporary-home cleanup could not fully remove its unique directory after {attempts} attempts ({code}); it will not be reused"
+            if retained else
+            f"isolated Codex temporary-home cleanup required the final fallback after {attempts} attempts ({code})"
+        ),
+    }
 
 
 def seed_codex_home(codex_home: Path) -> dict[str, Any]:
@@ -5127,8 +5320,9 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
         argv.append("--ignore-rules")
     if sandbox and "--sandbox" not in argv:
         argv += ["--sandbox", sandbox]
-    with tempfile.TemporaryDirectory(prefix="codex-invoke-") as td:
-        tmp = Path(td)
+    tmp = Path(tempfile.mkdtemp(prefix="codex-invoke-"))
+    cleanup_meta: dict[str, Any]
+    try:
         env, env_meta = codex_env_for_home(tmp / "codex-home")
         invoke_cwd = Path(cwd) if cwd is not None else tmp / "cwd"
         invoke_cwd.mkdir(parents=True, exist_ok=True)
@@ -5150,6 +5344,18 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
         result = run_argv_capture(argv, input_text=prompt, cwd=invoke_cwd, env=env, timeout=timeout)
         last_message_found = last_message.exists()
         final_text = last_message.read_text(encoding="utf-8", errors="replace") if last_message_found else None
+    finally:
+        try:
+            cleanup_meta = cleanup_codex_invoke_temp(tmp)
+        except Exception as exc:  # an unexpected cleanup failure cannot replace a captured result
+            code = errno.errorcode.get(getattr(exc, "errno", None), type(exc).__name__)
+            cleanup_meta = {
+                "status": "retained",
+                "attempts": 0,
+                "retry_count": 0,
+                "fallback_attempted": False,
+                "warning": f"isolated Codex temporary-home cleanup failed unexpectedly ({code}); its unique directory will not be reused",
+            }
     command = " ".join(shlex.quote(a) for a in argv)
     usage: dict[str, Any] = {}
     cost_usd = None
@@ -5162,17 +5368,28 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
                     usage[k] = int(metrics[k])
             if isinstance(metrics.get("cost_usd"), (int, float)):
                 cost_usd = float(metrics["cost_usd"])
+    cleanup_warning = cleanup_meta.get("warning")
+    stderr = result.stderr
+    if isinstance(cleanup_warning, str) and cleanup_warning:
+        stderr = _stderr_with_warning(stderr, cleanup_warning)
+    adapter_meta = dict(result.adapter_metadata or {})
     return {
         "answer": final_text,
         "trace_text": result.stdout,
-        "stderr": result.stderr,
+        "stderr": stderr[:4000],
         "returncode": result.returncode,
         "timed_out": result.timed_out,
         "elapsed_ms": result.elapsed_ms,
         "usage": usage,
         "cost_usd": cost_usd,
         "model": f"codex/{model}" if model else "codex/default",
-        "environment": {**env_meta, "command": command, "cwd": "<isolated workspace>"},
+        "environment": {
+            **env_meta,
+            **adapter_meta,
+            "temporary_home_cleanup": cleanup_meta,
+            "command": command,
+            "cwd": "<isolated workspace>",
+        },
     }
 
 
@@ -11292,6 +11509,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-pin-check", action="store_true", help="load the suite without verifying --pins tree hashes")
 
     return parser
+
+
+def _stderr_with_warning(stderr: str, warning: str, *, limit: int = 4000) -> str:
+    """Append a diagnostic while preserving it inside the stderr size cap."""
+    warning = warning.strip()
+    if len(warning) >= limit:
+        return warning[:limit]
+    base = stderr.rstrip()
+    if not base:
+        return warning
+    available = max(0, limit - len(warning) - 1)
+    prefix = base[:available].rstrip()
+    return f"{prefix}\n{warning}" if prefix else warning
 
 
 def main() -> int:

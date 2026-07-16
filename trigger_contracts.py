@@ -117,7 +117,8 @@ class InvocationOutcome:
 
     @classmethod
     def from_process(cls, *, stdout: str, stderr: str, returncode: int,
-                     elapsed_ms: int) -> "InvocationOutcome":
+                     elapsed_ms: int,
+                     metadata: Mapping[str, Any] | None = None) -> "InvocationOutcome":
         if returncode == 0:
             state = InvocationState.COMPLETE
             evidence = CompletionEvidence.NORMAL_EXIT
@@ -130,7 +131,8 @@ class InvocationOutcome:
         else:
             state = InvocationState.PROCESS_FAILED
             evidence = None
-        return cls(stdout, stderr, returncode, elapsed_ms, state, evidence)
+        return cls(stdout, stderr, returncode, elapsed_ms, state, evidence,
+                   metadata=metadata or {})
 
     @classmethod
     def harness_failed(cls, message: str, *,
