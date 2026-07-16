@@ -15,6 +15,7 @@ import argparse
 import collections
 import copy
 import difflib
+import errno
 import hashlib
 import html
 import json
@@ -156,6 +157,17 @@ def expand_judge_preset(assertion: dict[str, Any]) -> dict[str, Any]:
 # Below this graded mean, an objectively saturated case is flagged
 # structurally-pass-but-forgettable (roadmap 2.2): competent, but low-scoring.
 FORGETTABLE_GRADED_THRESHOLD = 0.75
+
+# Native agents run in their own process group. A successful CLI parent can
+# still leave plugin/git descendants alive, so normal exit gets a short grace
+# period before those descendants are force-killed. Codex-home removal then
+# retries the two transient directory-race errors observed in the wild. Both
+# policies are intentionally bounded so a broken descendant cannot stall a
+# benchmark worker indefinitely.
+PROCESS_GROUP_TERM_GRACE_S = 0.25
+PROCESS_GROUP_KILL_GRACE_S = 0.25
+PROCESS_GROUP_POLL_INTERVAL_S = 0.01
+CODEX_TEMP_CLEANUP_RETRY_DELAYS_S = (0.05, 0.1, 0.2, 0.4, 0.8)
 
 
 def assertion_severity(assertion: dict[str, Any], *, strict: bool = False) -> str:
@@ -3033,6 +3045,54 @@ def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
             return value.decode("utf-8", errors="replace")
         return str(value)
 
+    def process_group_exists(pgid: int) -> bool:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+        return True
+
+    def quiesce_process_group(pgid: int) -> dict[str, Any]:
+        """Terminate descendants left in the CLI's session after its leader exits.
+
+        The group leader has already been reaped by ``communicate``. Therefore a
+        surviving process group is descendant evidence, not the completed CLI
+        itself. This helper is best-effort and never replaces captured output.
+        """
+        if not hasattr(os, "killpg"):
+            return {"status": "unsupported"}
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return {"status": "not_needed"}
+        except OSError as exc:
+            return {"status": "warning", "signal": "SIGTERM",
+                    "error": errno.errorcode.get(exc.errno, type(exc).__name__)}
+
+        deadline = time.monotonic() + PROCESS_GROUP_TERM_GRACE_S
+        while time.monotonic() < deadline:
+            if not process_group_exists(pgid):
+                return {"status": "terminated", "signal": "SIGTERM"}
+            time.sleep(PROCESS_GROUP_POLL_INTERVAL_S)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return {"status": "terminated", "signal": "SIGTERM"}
+        except OSError as exc:
+            return {"status": "warning", "signal": "SIGKILL",
+                    "error": errno.errorcode.get(exc.errno, type(exc).__name__)}
+
+        deadline = time.monotonic() + PROCESS_GROUP_KILL_GRACE_S
+        while time.monotonic() < deadline:
+            if not process_group_exists(pgid):
+                return {"status": "terminated", "signal": "SIGKILL"}
+            time.sleep(PROCESS_GROUP_POLL_INTERVAL_S)
+        return {"status": "warning", "signal": "SIGKILL", "error": "process_group_still_present"}
+
     start = time.time()
     try:
         proc = subprocess.Popen(
@@ -3062,9 +3122,19 @@ def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
         stdout = _text(out or exc.stdout)
         stderr = _text(err or exc.stderr or str(exc))[:4000]
         returncode, timed_out = 124, True
+    try:
+        group_cleanup = quiesce_process_group(proc.pid)
+    except Exception as exc:  # descendant cleanup cannot replace captured output
+        group_cleanup = {"status": "warning", "signal": None,
+                         "error": errno.errorcode.get(getattr(exc, "errno", None), type(exc).__name__)}
+    if group_cleanup.get("status") == "warning":
+        detail = str(group_cleanup.get("error") or "unknown error")
+        warning = f"process-group cleanup warning: {detail}"
+        stderr = f"{stderr.rstrip()}\n{warning}".lstrip()
     return InvocationOutcome.from_process(
         stdout=stdout, stderr=stderr, returncode=returncode,
         elapsed_ms=int((time.time() - start) * 1000),
+        metadata={"process_group_cleanup": group_cleanup},
     )
 
 
@@ -4476,7 +4546,67 @@ def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeo
                             stderr=outcome.stderr[:4000],
                             returncode=int(outcome.returncode if outcome.returncode is not None else 127),
                             elapsed_ms=outcome.elapsed_ms,
-                            timed_out=outcome.timed_out)
+                            timed_out=outcome.timed_out,
+                            adapter_metadata=dict(outcome.metadata))
+
+
+def cleanup_codex_invoke_temp(path: Path) -> dict[str, Any]:
+    """Remove one isolated Codex invocation directory without losing its result.
+
+    macOS can report ``ENOTEMPTY`` while a just-finished plugin clone is still
+    changing the tree; busy mounts can similarly report ``EBUSY``. Retry only
+    those transient errors. A final ignore-errors removal is deliberately the
+    last fallback, and every non-normal cleanup is returned as observable,
+    path-free metadata for stderr/environment artifacts.
+    """
+    attempts = 0
+    last_error: BaseException | None = None
+    max_attempts = 1 + len(CODEX_TEMP_CLEANUP_RETRY_DELAYS_S)
+    for attempt in range(max_attempts):
+        attempts += 1
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            return {"status": "removed", "attempts": attempts, "retry_count": attempts - 1}
+        except OSError as exc:
+            last_error = exc
+            transient = exc.errno in {errno.ENOTEMPTY, errno.EBUSY}
+            if not transient or attempt >= len(CODEX_TEMP_CLEANUP_RETRY_DELAYS_S):
+                break
+            time.sleep(CODEX_TEMP_CLEANUP_RETRY_DELAYS_S[attempt])
+        except Exception as exc:  # cleanup must never replace captured provider output
+            last_error = exc
+            break
+        else:
+            result = {"status": "removed", "attempts": attempts, "retry_count": attempts - 1}
+            if attempts > 1:
+                code = errno.errorcode.get(getattr(last_error, "errno", None), type(last_error).__name__)
+                result["warning"] = f"isolated Codex temporary-home cleanup recovered after {attempts} attempts ({code})"
+            return result
+
+    fallback_error: BaseException | None = None
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception as exc:  # a patched/platform implementation may still raise
+        fallback_error = exc
+    try:
+        retained = path.exists()
+    except OSError:
+        retained = True
+    error = fallback_error or last_error
+    code = errno.errorcode.get(getattr(error, "errno", None), type(error).__name__ if error is not None else "unknown")
+    status = "retained" if retained else "removed_after_fallback"
+    return {
+        "status": status,
+        "attempts": attempts,
+        "retry_count": max(0, attempts - 1),
+        "fallback_attempted": True,
+        "warning": (
+            f"isolated Codex temporary-home cleanup could not fully remove its unique directory after {attempts} attempts ({code}); it will not be reused"
+            if retained else
+            f"isolated Codex temporary-home cleanup required the final fallback after {attempts} attempts ({code})"
+        ),
+    }
 
 
 def seed_codex_home(codex_home: Path) -> dict[str, Any]:
@@ -5127,8 +5257,9 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
         argv.append("--ignore-rules")
     if sandbox and "--sandbox" not in argv:
         argv += ["--sandbox", sandbox]
-    with tempfile.TemporaryDirectory(prefix="codex-invoke-") as td:
-        tmp = Path(td)
+    tmp = Path(tempfile.mkdtemp(prefix="codex-invoke-"))
+    cleanup_meta: dict[str, Any]
+    try:
         env, env_meta = codex_env_for_home(tmp / "codex-home")
         invoke_cwd = Path(cwd) if cwd is not None else tmp / "cwd"
         invoke_cwd.mkdir(parents=True, exist_ok=True)
@@ -5150,6 +5281,18 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
         result = run_argv_capture(argv, input_text=prompt, cwd=invoke_cwd, env=env, timeout=timeout)
         last_message_found = last_message.exists()
         final_text = last_message.read_text(encoding="utf-8", errors="replace") if last_message_found else None
+    finally:
+        try:
+            cleanup_meta = cleanup_codex_invoke_temp(tmp)
+        except Exception as exc:  # an unexpected cleanup failure cannot replace a captured result
+            code = errno.errorcode.get(getattr(exc, "errno", None), type(exc).__name__)
+            cleanup_meta = {
+                "status": "retained",
+                "attempts": 0,
+                "retry_count": 0,
+                "fallback_attempted": False,
+                "warning": f"isolated Codex temporary-home cleanup failed unexpectedly ({code}); its unique directory will not be reused",
+            }
     command = " ".join(shlex.quote(a) for a in argv)
     usage: dict[str, Any] = {}
     cost_usd = None
@@ -5162,17 +5305,28 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
                     usage[k] = int(metrics[k])
             if isinstance(metrics.get("cost_usd"), (int, float)):
                 cost_usd = float(metrics["cost_usd"])
+    cleanup_warning = cleanup_meta.get("warning")
+    stderr = result.stderr
+    if isinstance(cleanup_warning, str) and cleanup_warning:
+        stderr = f"{stderr.rstrip()}\n{cleanup_warning}".lstrip()
+    adapter_meta = dict(result.adapter_metadata or {})
     return {
         "answer": final_text,
         "trace_text": result.stdout,
-        "stderr": result.stderr,
+        "stderr": stderr[:4000],
         "returncode": result.returncode,
         "timed_out": result.timed_out,
         "elapsed_ms": result.elapsed_ms,
         "usage": usage,
         "cost_usd": cost_usd,
         "model": f"codex/{model}" if model else "codex/default",
-        "environment": {**env_meta, "command": command, "cwd": "<isolated workspace>"},
+        "environment": {
+            **env_meta,
+            **adapter_meta,
+            "temporary_home_cleanup": cleanup_meta,
+            "command": command,
+            "cwd": "<isolated workspace>",
+        },
     }
 
 

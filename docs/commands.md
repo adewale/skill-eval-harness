@@ -51,7 +51,7 @@ skill-benchmark import-trace \
 
 ## Run Codex JSONL tasks
 
-`run-codex` is a compatibility wrapper for `run-agent --agent codex`. It executes prepared rows through a command compatible with `codex exec --json`, adds `--output-last-message <file>` for final-answer capture, saves JSONL as `trace.jsonl`, normalizes events/metrics, runs with isolated `CODEX_HOME` outside the model workdir, and records nonzero/timeouts as failed run artifacts:
+`run-codex` is a compatibility wrapper for `run-agent --agent codex`. It executes prepared rows through a command compatible with `codex exec --json`, adds `--output-last-message <file>` for final-answer capture, saves JSONL as `trace.jsonl`, normalizes events/metrics, runs with isolated `CODEX_HOME` outside the model workdir, and records nonzero/timeouts as failed run artifacts. After the CLI exits, the shared subprocess owner terminates any remaining process-group descendants before bounded retry/backoff removes the isolated home; cleanup recovery or fallback is recorded in stderr and `environment.json` without replacing an already captured answer:
 
 ```bash
 skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl

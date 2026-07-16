@@ -7,6 +7,7 @@ subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
@@ -468,6 +469,146 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             sb.run_agent(argparse.Namespace(agent="claude", tasks=str(tasks), runs=str(claude_runs), model="claude-haiku-4-5-20251001",
                                             codex_cmd="codex exec --json", claude_bin=str(claude_bin), timeout=30))
             self.assertIn("token from claude", (claude_runs / run_dir / "output.md").read_text(encoding="utf-8"))
+
+    def test_codex_cleanup_race_preserves_artifacts_and_next_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            case = {"id": "c", "split": "tune", "prompt": "do it",
+                    "assertions": [{"name": "a", "type": "contains", "value": "token"}]}
+            manifest = make_eval_repo(root, cases=[case])
+            rows = sb.prepared_task_rows(manifest, sb.validate_manifest(manifest))
+            tasks = root / "tasks.jsonl"
+            tasks.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            fake_codex = root / "fake_codex.py"
+            fake_codex.write_text(
+                "import json, pathlib, sys\n_ = sys.stdin.read()\n"
+                "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token')\n"
+                "print(json.dumps({'role': 'assistant', 'content': 'trace'}))\n",
+                encoding="utf-8")
+
+            real_rmtree = shutil.rmtree
+            raced: set[Path] = set()
+
+            def fail_each_codex_cleanup_once(path, *args, **kwargs):
+                candidate = Path(path)
+                if candidate.name.startswith("codex-invoke-") and candidate not in raced and not kwargs.get("ignore_errors"):
+                    raced.add(candidate)
+                    raise OSError(errno.ENOTEMPTY, "Directory not empty")
+                return real_rmtree(path, *args, **kwargs)
+
+            runs = root / "runs"
+            with mock.patch.object(sb.shutil, "rmtree", side_effect=fail_each_codex_cleanup_once), \
+                 mock.patch.object(sb.time, "sleep", return_value=None):
+                self.assertEqual(sb.run_codex(SimpleNamespace(
+                    tasks=str(tasks), runs=str(runs),
+                    codex_cmd=f"{sys.executable} {fake_codex}", timeout=30)), 0)
+
+            self.assertEqual(len(raced), 2)
+            for row in rows:
+                base = runs / row["run_dir"]
+                self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "token")
+                self.assertTrue(sb.artifact_commit_valid(base))
+                meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+                self.assertIn("cleanup recovered after 2 attempts", meta["stderr"])
+                environment = json.loads((base / "environment.json").read_text(encoding="utf-8"))
+                self.assertEqual(environment["temporary_home_cleanup"]["status"], "removed")
+                self.assertEqual(environment["temporary_home_cleanup"]["attempts"], 2)
+
+    def test_codex_cleanup_fallback_is_bounded_and_preserves_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_codex = root / "fake_codex.py"
+            fake_codex.write_text(
+                "import pathlib, sys\n_ = sys.stdin.read()\n"
+                "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token')\n",
+                encoding="utf-8")
+            real_rmtree = shutil.rmtree
+            attempts = 0
+
+            def fail_until_final_fallback(path, *args, **kwargs):
+                nonlocal attempts
+                candidate = Path(path)
+                if candidate.name.startswith("codex-invoke-"):
+                    if kwargs.get("ignore_errors"):
+                        return real_rmtree(path, *args, **kwargs)
+                    attempts += 1
+                    raise OSError(errno.EBUSY, "Device or resource busy")
+                return real_rmtree(path, *args, **kwargs)
+
+            with mock.patch.object(sb.shutil, "rmtree", side_effect=fail_until_final_fallback), \
+                 mock.patch.object(sb.time, "sleep", return_value=None):
+                result = sb.codex_cli_invoke(
+                    "prompt", codex_cmd=f"{sys.executable} {fake_codex}",
+                    cwd=root / "workspace", timeout=30)
+
+            self.assertEqual(result["answer"], "token")
+            cleanup = result["environment"]["temporary_home_cleanup"]
+            self.assertEqual(attempts, 1 + len(sb.CODEX_TEMP_CLEANUP_RETRY_DELAYS_S))
+            self.assertEqual(cleanup["status"], "removed_after_fallback")
+            self.assertTrue(cleanup["fallback_attempted"])
+            self.assertIn("required the final fallback", result["stderr"])
+
+    def test_codex_normal_cleanup_removes_temporary_home(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_codex = root / "fake_codex.py"
+            fake_codex.write_text(
+                "import pathlib, sys\n_ = sys.stdin.read()\n"
+                "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token')\n",
+                encoding="utf-8")
+            real_mkdtemp = tempfile.mkdtemp
+            created: list[Path] = []
+
+            def record_codex_temp(*args, **kwargs):
+                path = Path(real_mkdtemp(*args, **kwargs))
+                if str(kwargs.get("prefix", "")).startswith("codex-invoke-"):
+                    created.append(path)
+                return str(path)
+
+            with mock.patch.object(sb.tempfile, "mkdtemp", side_effect=record_codex_temp):
+                result = sb.codex_cli_invoke(
+                    "prompt", codex_cmd=f"{sys.executable} {fake_codex}",
+                    cwd=root / "workspace", timeout=30)
+
+            self.assertEqual(result["answer"], "token")
+            self.assertEqual(result["environment"]["temporary_home_cleanup"]["status"], "removed")
+            self.assertEqual(len(created), 1)
+            self.assertFalse(created[0].exists())
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process-group cleanup requires POSIX")
+    def test_codex_stops_plugin_descendant_before_home_cleanup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pid_file = root / "plugin-child.pid"
+            child_code = (
+                "import os, pathlib, signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "target = pathlib.Path(os.environ['CODEX_HOME']) / '.tmp' / 'plugins-clone-test' / 'plugins'\n"
+                "while True:\n"
+                " target.mkdir(parents=True, exist_ok=True)\n"
+                " (target / 'active').write_text('x')\n"
+                " time.sleep(0.005)\n"
+            )
+            fake_codex = root / "fake_codex_with_plugin_child.py"
+            fake_codex.write_text(
+                "import pathlib, subprocess, sys, time\n_ = sys.stdin.read()\n"
+                f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)\n"
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+                "time.sleep(0.05)\n"
+                "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token')\n",
+                encoding="utf-8")
+
+            result = sb.codex_cli_invoke(
+                "prompt", codex_cmd=f"{sys.executable} {fake_codex}",
+                cwd=root / "workspace", timeout=30)
+
+            self.assertEqual(result["answer"], "token")
+            self.assertEqual(result["environment"]["process_group_cleanup"]["signal"], "SIGKILL")
+            self.assertEqual(result["environment"]["temporary_home_cleanup"]["status"], "removed")
+            child_pid = int(pid_file.read_text(encoding="utf-8"))
+            time.sleep(0.05)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
 
     def test_run_agent_writes_failure_artifact_when_native_command_is_missing(self):
         with tempfile.TemporaryDirectory() as td:
