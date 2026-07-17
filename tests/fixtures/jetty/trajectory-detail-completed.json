@@ -1,0 +1,179 @@
+{
+ "name": "skill-evals/skill-eval-contract-probe",
+ "trajectory_id": "bb2bb71e",
+ "storage_path": "skill-evals/skill-eval-contract-probe/0000",
+ "status": "completed",
+ "attributes": {
+  "asset_type": "activity",
+  "asset_filename": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.json",
+  "created": "2026-07-17T10:25:59.735627",
+  "params": {
+   "vars": {
+    "prompt": "Execute the runbook.",
+    "results_dir": "/app/results"
+   },
+   "agent": "claude-code",
+   "model": "claude-sonnet-4-6",
+   "model_provider": "anthropic"
+  }
+ },
+ "created": "2026-07-17T10:25:59.735651",
+ "updated": "2026-07-17T10:26:23.045087",
+ "author": "mise@jetty.io",
+ "metadata_uri": "none",
+ "steps": {
+  "run": {
+   "inputs": {
+    "agent": "claude-code",
+    "model": "claude-sonnet-4-6",
+    "model_provider": "anthropic",
+    "template_variables": {
+     "prompt": "Execute the runbook.",
+     "results_dir": "/app/results"
+    },
+    "pip_packages": [],
+    "apt_packages": [],
+    "base_image": "python:3.13-slim-bookworm",
+    "files": [],
+    "timeout_sec": 1200,
+    "cpus": 4,
+    "memory": "8G",
+    "network_enabled": true,
+    "snapshot": "python312-uv",
+    "image": null,
+    "agent_env": {},
+    "mcp_servers": null,
+    "mcp_auth_tokens": null,
+    "mcp_auth_token": null,
+    "subscription_credential": null
+   },
+   "outputs": {
+    "success": true,
+    "files": [
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0000.agent--env-debug.txt",
+      "content_type": "text/plain;charset=utf-8",
+      "extension": "txt"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0001.agent--claude-code.txt",
+      "content_type": "text/plain;charset=utf-8",
+      "extension": "txt"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0002.agent--config.toml",
+      "content_type": "application/octet-stream",
+      "extension": "toml"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0003.agent--sessions---claude.json",
+      "content_type": "application/json",
+      "extension": "json"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0004.agent--sessions--policy-limits.json",
+      "content_type": "application/json",
+      "extension": "json"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0005.agent--sessions--backups---claude-json-backup.1784283970150",
+      "content_type": "application/octet-stream",
+      "extension": "1784283970150"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0006.agent--sessions--projects---app--59db3cff-35ef-4869-af0e-d83d79a7981b.jsonl",
+      "content_type": "application/json",
+      "extension": "jsonl"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0007.app--results--output.md",
+      "content_type": "application/octet-stream",
+      "extension": "md"
+     }
+    ],
+    "results_files": [
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0007.app--results--output.md",
+      "content_type": "application/octet-stream",
+      "extension": "md"
+     }
+    ],
+    "primary_files": [
+     "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0007.app--results--output.md"
+    ],
+    "num_files_saved": 8,
+    "agent": "claude-code",
+    "model": "claude-sonnet-4-6",
+    "usage": {
+     "duration_seconds": 16.0148,
+     "prompt_tokens": 4,
+     "completion_tokens": 158,
+     "total_tokens": 162,
+     "cost_usd": 0.0334074,
+     "model": "anthropic/claude-sonnet-4-6",
+     "api_calls": 1,
+     "cache_read_input_tokens": 29058,
+     "cache_creation_input_tokens": 5952
+    }
+   },
+   "activity": "runbook",
+   "key": "38fe8e5caae64a509138e6e16643d148",
+   "depends_on": [],
+   "created": "2026-07-17T10:26:01.018963",
+   "ended": "2026-07-17T10:26:23.045073",
+   "duration_seconds": 22.026,
+   "author": "mise@jetty.io",
+   "origin": {},
+   "config": {
+    "activity": "runbook",
+    "agent_path": "init_params.agent",
+    "cpus": 4,
+    "files_path": "init_params.file_paths",
+    "instruction_path": "init_params.instruction",
+    "memory": "8G",
+    "model_path": "init_params.model",
+    "network_enabled": true,
+    "snapshot": "python312-uv",
+    "template_variables_path": "init_params.vars",
+    "timeout_sec": 1200,
+    "_current_step_name": "run"
+   }
+  }
+ },
+ "labels": [],
+ "total_steps": [
+  "run"
+ ],
+ "completed_steps": [
+  "run"
+ ],
+ "init_params": {
+  "file_paths": [],
+  "vars": {
+   "prompt": "Execute the runbook.",
+   "results_dir": "/app/results"
+  },
+  "agent": "claude-code",
+  "model": "claude-sonnet-4-6",
+  "model_provider": "anthropic"
+ },
+ "step_configs": {
+  "run": {
+   "activity": "runbook",
+   "agent_path": "init_params.agent",
+   "cpus": 4,
+   "files_path": "init_params.file_paths",
+   "instruction_path": "init_params.instruction",
+   "memory": "8G",
+   "model_path": "init_params.model",
+   "network_enabled": true,
+   "snapshot": "python312-uv",
+   "template_variables_path": "init_params.vars",
+   "timeout_sec": 1200
+  }
+ },
+ "org_id": "org_REDACTED",
+ "error": null,
+ "triggered_by_routine_id": null,
+ "webhook_url": null
+}

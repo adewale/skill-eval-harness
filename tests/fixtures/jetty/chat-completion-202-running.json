@@ -1,0 +1,25 @@
+{
+ "id": "chatcmpl-skill-evals-skill-eval-contract-probe-b--37c37963",
+ "object": "chat.completion",
+ "created": 1784284102,
+ "model": "claude-sonnet-4-6",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": "Runbook execution in progress (exceeded 1s sync timeout). Poll for results or use stream:true for long-running runbooks."
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "jetty_metadata": {
+  "workflow_id": "skill-evals-skill-eval-contract-probe-b--37c37963",
+  "status": "running",
+  "collection": "skill-evals",
+  "task": "skill-eval-contract-probe-b",
+  "mode": "runbook",
+  "poll_url": "/api/v1/trajectory/skill-evals/skill-eval-contract-probe-b/skill-evals-skill-eval-contract-probe-b--37c37963",
+  "logs_url": "/api/v1/workflows-logs-stream/skill-evals-skill-eval-contract-probe-b--37c37963"
+ }
+}

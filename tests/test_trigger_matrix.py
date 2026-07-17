@@ -1159,7 +1159,10 @@ class AgentInvokeSmokeConfigTests(unittest.TestCase):
         self.assertEqual(models["vibe"], [None])
 
     def test_advertised_live_smoke_envs_are_consumed_by_tests(self):
-        test_source = Path(__file__).read_text(encoding="utf-8")
+        # Trigger smokes live here; the Jetty answer-path smoke has its own
+        # module. An advertised env var must gate a real test somewhere.
+        sources = [Path(__file__), Path(__file__).with_name("test_smoke_jetty.py")]
+        test_source = "".join(p.read_text(encoding="utf-8") for p in sources)
         for agent, cap in AGENT_CAPABILITIES.items():
             if cap.live_smoke_env:
                 self.assertIn(cap.live_smoke_env, test_source, agent)

@@ -5,10 +5,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+# Production flows-api statuses (verified 2026-07 against mise source + live
+# API) are exactly: pending, running, completed, failed, cancelled, archived —
+# terminal set {completed, failed, cancelled}; "archived" is an administrative
+# soft-delete that can only be observed mid-poll if someone archives the
+# trajectory, so it terminates the run as a failure with an explicit message.
+# The extra aliases below are kept for imported/stored records from older runs.
 _QUEUED = {"pending", "queued", "starting"}
 _RUNNING = {"running", "in_progress"}
 _SUCCEEDED = {"completed", "complete", "succeeded", "success"}
-_FAILED = {"failed", "failure", "error", "errored", "canceled", "cancelled"}
+_FAILED = {"failed", "failure", "error", "errored", "canceled", "cancelled", "archived"}
 _TIMED_OUT = {"timeout", "timed_out"}
 
 
@@ -163,7 +169,8 @@ def lifecycle_from_status(value: Any, *, error: Any = None) -> JettyLifecycle:
     if raw in _SUCCEEDED:
         return Succeeded(raw)
     if raw in _FAILED:
-        message = str(error) if error not in (None, "") else "Jetty trajectory failed"
+        default = "Jetty trajectory was archived mid-run" if raw == "archived" else "Jetty trajectory failed"
+        message = str(error) if error not in (None, "") else default
         return Failed(raw, message)
     if raw in _TIMED_OUT:
         return TimedOut(raw)

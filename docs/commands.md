@@ -484,7 +484,7 @@ Comparison then forms complete (agent, model, query-ID) cells and collapses ever
 
 ## Jetty adapter
 
-Jetty support is optional, and its live response shapes still need token-backed smoke validation before a Jetty run counts as production evidence (see [`jetty-support-spec.md`](jetty-support-spec.md)). The harness exports runbook-mode chat-completion payloads, Jetty executes them, and `import-jetty-results` copies `output.md`, artifacts, and metadata back into the normal run layout. Provider status aliases parse into queued/running/succeeded/failed/timed-out/protocol-invalid states; unknown status and completed-without-`output.md` fail closed as protocol-invalid rather than ordinary model failures. Imports validate every record, destination, embedded answer design, model-visible task digest, and uploaded-file digest before committing the batch; one invalid record leaves all destination run directories untouched.
+Jetty support is optional and validated against production `flows-api.jetty.io` (live smoke first passed 2026-07-17; captured response fixtures live in `tests/fixtures/jetty/` — see [`jetty-support-spec.md`](jetty-support-spec.md)). The harness exports runbook-mode chat-completion payloads, Jetty executes them, and `import-jetty-results` copies `output.md`, artifacts, and metadata back into the normal run layout. `run-jetty` zips each task's upload plan (Jetty's sandbox upload flattens single files to basenames; a zip auto-extracts under `/app/assets/` with paths preserved), submits with a short `timeout_hint` so polling drives the wait, and downloads every `/app/results` artifact from trajectory storage before writing the run record. Provider status aliases parse into queued/running/succeeded/failed/timed-out/protocol-invalid states; unknown status and completed-without-`output.md` fail closed as protocol-invalid rather than ordinary model failures. Imports validate every record, destination, embedded answer design, model-visible task digest, and uploaded-file digest before committing the batch; one invalid record leaves all destination run directories untouched.
 
 ```bash
 # Export runbook-mode Jetty chat-completion payloads. No network calls.
@@ -515,4 +515,11 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --out jetty-benchmark.json
 ```
 
-Defaults follow Jetty docs and `jettyio/jettyio-skills`: `claude-code`, `claude-sonnet-4-6`, `model_provider=anthropic`, and `snapshot=python312-uv`. The runbook is the system message. Runtime values go in `jetty.template_variables`. Uploaded files go in `jetty.file_paths`. Use `JETTY_BASE_URL` to override `https://flows-api.jetty.io`.
+Defaults follow Jetty docs and `jettyio/jettyio-skills`: `claude-code`, `claude-sonnet-4-6`, `model_provider=anthropic`, and `snapshot=python312-uv`. The runbook is the system message. Runtime values go in `jetty.template_variables`; every model-visible file reference is a deterministic `/app/assets/...` path baked at export time. `jetty.file_paths` carries the one run-time value — the uploaded zip bundle's storage path from `POST /api/v1/sandbox/upload`. Use `JETTY_BASE_URL` to override `https://flows-api.jetty.io`.
+
+Opt-in live smoke (five real sandbox runs — fixture-free, fixture-backed, and a forced server-side failure; never in default CI):
+
+```bash
+RUN_JETTY_SMOKE=1 JETTY_API_TOKEN=... JETTY_SMOKE_COLLECTION=<your-collection> \
+  python3 -m unittest discover tests -k smoke_jetty -v
+```

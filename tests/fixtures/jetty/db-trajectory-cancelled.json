@@ -1,0 +1,127 @@
+{
+ "trajectory_id": "564304ee",
+ "name": "skill-evals/skill-eval-contract-probe-badmodel",
+ "storage_path": "skill-evals/skill-eval-contract-probe-badmodel/0000",
+ "status": "cancelled",
+ "created": "2026-07-17T10:37:17.627766+00:00",
+ "updated": "2026-07-17T10:38:29.445709+00:00",
+ "author": "mise@jetty.io",
+ "metadata_uri": "none",
+ "org_id": "org_REDACTED",
+ "error": null,
+ "attributes": {
+  "params": {
+   "vars": {
+    "prompt": "Execute the runbook.",
+    "results_dir": "/app/results"
+   },
+   "agent": "claude-code",
+   "model": "claude-nonexistent-model-99",
+   "instruction": "# Probe\n\nWrite 'probe ok' to {{results_dir}}/output.md.",
+   "model_provider": "anthropic"
+  },
+  "created": "2026-07-17T10:37:17.627734",
+  "asset_type": "activity",
+  "asset_filename": "skill-evals/skill-eval-contract-probe-badmodel/0000/564304ee.json"
+ },
+ "steps": {
+  "run": {
+   "key": "19495a98b98b448f889f753ca1597e37",
+   "ended": "2026-07-17T10:37:29.555270",
+   "author": "mise@jetty.io",
+   "config": {
+    "cpus": 4,
+    "memory": "8G",
+    "activity": "runbook",
+    "snapshot": "python312-uv",
+    "agent_path": "init_params.agent",
+    "files_path": "init_params.file_paths",
+    "model_path": "init_params.model",
+    "timeout_sec": 1200,
+    "network_enabled": true,
+    "instruction_path": "init_params.instruction",
+    "_current_step_name": "run",
+    "template_variables_path": "init_params.vars"
+   },
+   "inputs": {
+    "cpus": 4,
+    "agent": "claude-code",
+    "files": [],
+    "image": null,
+    "model": "claude-nonexistent-model-99",
+    "memory": "8G",
+    "snapshot": "python312-uv",
+    "agent_env": {},
+    "base_image": "python:3.13-slim-bookworm",
+    "mcp_servers": null,
+    "timeout_sec": 1200,
+    "apt_packages": [],
+    "pip_packages": [],
+    "mcp_auth_token": null,
+    "model_provider": "anthropic",
+    "mcp_auth_tokens": null,
+    "network_enabled": true,
+    "template_variables": {
+     "prompt": "Execute the runbook.",
+     "results_dir": "/app/results"
+    },
+    "subscription_credential": null
+   },
+   "origin": {},
+   "created": "2026-07-17T10:37:18.687923",
+   "outputs": {
+    "agent": "claude-code",
+    "error": "agent 'claude-code' produced no /app/results files \u2014 check agent log for upstream errors (auth, CLI usage, or model provider failure)",
+    "files": [],
+    "model": "claude-nonexistent-model-99",
+    "usage": {
+     "model": "anthropic/claude-nonexistent-model-99",
+     "cost_usd": null,
+     "api_calls": 1,
+     "total_tokens": null,
+     "prompt_tokens": null,
+     "duration_seconds": 6.4072,
+     "completion_tokens": null
+    },
+    "success": false,
+    "num_files_saved": 0
+   },
+   "activity": "runbook",
+   "depends_on": [],
+   "duration_seconds": 10.867
+  }
+ },
+ "labels": [],
+ "init_params": {
+  "vars": {
+   "prompt": "Execute the runbook.",
+   "results_dir": "/app/results"
+  },
+  "agent": "claude-code",
+  "model": "claude-nonexistent-model-99",
+  "file_paths": [],
+  "instruction": "---\nversion: \"1.0.0\"\nevaluation: programmatic\nagent: claude-code\nmodel: claude-sonnet-4-6\nmodel_provider: anthropic\nsnapshot: python312-uv\nprimary_outputs:\n  - output.md\n---\n\n# Probe\n\nWrite the single line 'probe ok' to {{results_dir}}/output.md and exit.",
+  "model_provider": "anthropic"
+ },
+ "step_configs": {
+  "run": {
+   "cpus": 4,
+   "memory": "8G",
+   "activity": "runbook",
+   "snapshot": "python312-uv",
+   "agent_path": "init_params.agent",
+   "files_path": "init_params.file_paths",
+   "model_path": "init_params.model",
+   "timeout_sec": 1200,
+   "network_enabled": true,
+   "instruction_path": "init_params.instruction",
+   "template_variables_path": "init_params.vars"
+  }
+ },
+ "total_steps": [
+  "run"
+ ],
+ "completed_steps": [
+  "run"
+ ]
+}

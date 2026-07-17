@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -349,13 +350,26 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertNotIn("expected_behavior", json.dumps(with_row))
             self.assertNotIn("review_rubric", json.dumps(with_row))
             self.assertIn("{{task_json}}", with_row["jetty_request"]["messages"][0]["content"])
+            # Live contract: the agent sees files under /app/assets/ (the zip
+            # bundle auto-extracts there), so every model-visible reference is a
+            # deterministic sandbox path — never a run-time storage key.
+            self.assertTrue(jetty["template_variables"]["task_json"].startswith("/app/assets/tasks/"))
+            self.assertEqual(jetty["timeout_hint"], sb.JETTY_SUBMIT_TIMEOUT_HINT_S)
+            bundle = with_row["upload_plan"]["bundle"]
+            self.assertEqual(jetty["file_paths"], [bundle["placeholder"]])
+            self.assertTrue(bundle["archive_name"].endswith(".zip"))
             with_roles = {f["role"] for f in with_row["upload_plan"]["files"]}
             without_roles = {f["role"] for f in without_row["upload_plan"]["files"]}
             self.assertTrue({"task", "skill", "fixture"}.issubset(with_roles))
             self.assertNotIn("skill", without_roles)
             self.assertTrue({"task", "fixture"}.issubset(without_roles))
+            for item in with_row["upload_plan"]["files"]:
+                self.assertEqual(item["sandbox_path"], "/app/assets/" + item["remote_path_hint"].lstrip("/"))
             without_task_json = next(f for f in without_row["upload_plan"]["files"] if f["role"] == "task")["content"]
             self.assertEqual(json.loads(without_task_json)["skill_files"], [])
+            with_task_json = json.loads(next(f for f in with_row["upload_plan"]["files"] if f["role"] == "task")["content"])
+            for path in with_task_json["skill_files"] + with_task_json["input_files"]:
+                self.assertTrue(path.startswith("/app/assets/"), path)
 
     def test_pi_message_end_trace_normalizes_usage_and_skill_load(self):
         assistant = {"role": "assistant", "content": [{"type": "text", "text": "alpha beta"}], "usage": {"input": 10, "output": 5, "totalTokens": 15}}
@@ -408,6 +422,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                 "artifacts": [
                     {"path": "/app/results/output.md", "content": "alpha beta"},
                     {"path": "/app/results/metadata.json", "content": {"total_tool_calls": 2}},
+                    {"path": "/app/results/outputs/image.bin", "content_b64": "/wA="},
                 ],
             }
             failed = {
@@ -425,6 +440,10 @@ class SkillBenchmarkTests(unittest.TestCase):
             meta = json.loads((runs / "case-1" / "with_skill" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["provider"], "jetty")
             self.assertEqual(meta["jetty_trajectory_id"], "traj_1")
+            self.assertEqual(
+                (runs / "case-1" / "with_skill" / "outputs" / "image.bin").read_bytes(),
+                b"\xff\x00",
+            )
             self.assertTrue((runs / "case-1" / "with_skill" / "trace.jsonl").exists())
             events = json.loads((runs / "case-1" / "with_skill" / "events.json").read_text(encoding="utf-8"))
             metrics = json.loads((runs / "case-1" / "with_skill" / "metrics.json").read_text(encoding="utf-8"))
@@ -1006,7 +1025,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                 sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(root / "runs"), codex_cmd=f"{sys.executable} -c 'print(1)'", timeout=5))
             self.assertFalse((root / "outside").exists())
 
-    def test_run_jetty_uploads_submits_polls_and_replaces_placeholders(self):
+    def test_run_jetty_uploads_bundle_submits_polls_and_fetches_artifacts(self):
         row = {
             "harness": {"skill_name": "demo", "case_id": "case-1", "variant": "with_skill", "run_number": 1, "split": "tune", "run_dir": "case-1/with_skill"},
             "jetty_request": {
@@ -1020,11 +1039,18 @@ class SkillBenchmarkTests(unittest.TestCase):
                     "agent": "claude-code",
                     "model_provider": "anthropic",
                     "snapshot": "python312-uv",
-                    "template_variables": {"results_dir": "/app/results", "task_json": "upload://task-json"},
-                    "file_paths": ["upload://task-json"],
+                    "timeout_hint": sb.JETTY_SUBMIT_TIMEOUT_HINT_S,
+                    "template_variables": {"results_dir": "/app/results", "task_json": "/app/assets/tasks/demo.json"},
+                    "file_paths": ["upload://demo/bundle/zip"],
                 },
             },
-            "upload_plan": {"files": [{"role": "task", "placeholder": "upload://task-json", "content": "{}", "remote_path_hint": "task.json", "private": True}]},
+            "upload_plan": {
+                "bundle": {"placeholder": "upload://demo/bundle/zip", "archive_name": "demo.zip"},
+                "files": [
+                    {"role": "task", "placeholder": "upload://demo/task/json", "content": "{}", "remote_path_hint": "tasks/demo.json", "sandbox_path": "/app/assets/tasks/demo.json", "private": True},
+                    {"role": "skill", "placeholder": "upload://demo/skill/1", "content": "skill body", "remote_path_hint": "skills/demo/SKILL.md", "sandbox_path": "/app/assets/skills/demo/SKILL.md", "private": False},
+                ],
+            },
         }
         row["harness"]["jetty_task_contract_sha256"] = (
             sb.jetty_task_contract_sha256(row))
@@ -1032,22 +1058,83 @@ class SkillBenchmarkTests(unittest.TestCase):
         class FakeClient:
             def __init__(self):
                 self.submitted = None
-            def upload(self, item, collection):
-                self.uploaded = (item, collection)
-                return "uploads/task.json"
+                self.downloaded: list[str] = []
+            def upload_bundle(self, archive_name, data):
+                self.bundle = (archive_name, data)
+                # Live shape: POST /api/v1/sandbox/upload returns file_paths.
+                return "skill-evals/_sandbox_uploads/abc123/demo.zip"
             def submit(self, request_body):
                 self.submitted = request_body
-                return {"trajectory_id": "traj_1"}
+                # Live shape: sync wait exceeded -> 202 + jetty_metadata.workflow_id.
+                return {"jetty_metadata": {"mode": "runbook", "status": "running", "workflow_id": "traj_1"}}
             def poll(self, collection, task, trajectory_id, *, timeout_s=1800, poll_interval_s=5):
-                return {"status": "completed", "artifacts": [{"path": "/app/results/output.md", "content": "alpha beta"}]}
+                return {
+                    "status": "completed",
+                    "trajectory_id": trajectory_id,
+                    "storage_path": f"{collection}/{task}/0000",
+                }
+            def fetch_trajectory(self, collection, task, trajectory_id):
+                return {
+                    "status": "completed",
+                    "trajectory_id": trajectory_id,
+                    "storage_path": "skill-evals/demo-case-1-with-skill-1/0000",
+                    "steps": {"run": {"activity": "runbook", "outputs": {
+                        "success": True,
+                        "results_files": [{"path": "skill-evals/demo-case-1-with-skill-1/0000/traj_1.run.0000.app--results--output.md", "content_type": "text/markdown"}],
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105, "cost_usd": 0.01, "duration_seconds": 2.0, "api_calls": 1},
+                    }}},
+                }
+            def download_file(self, storage_path):
+                self.downloaded.append(storage_path)
+                return b"alpha beta"
 
         client = FakeClient()
         records = list(sb.execute_jetty_payloads([row], client=client, timeout_s=1, poll_interval_s=0))
-        self.assertEqual(client.uploaded[1], "skill-evals")
-        self.assertEqual(client.submitted["jetty"]["template_variables"]["task_json"], "uploads/task.json")
-        self.assertEqual(client.submitted["jetty"]["file_paths"], ["uploads/task.json"])
-        self.assertEqual(records[0]["status"], "completed")
-        self.assertEqual(records[0]["trajectory_id"], "traj_1")
+        archive_name, bundle_bytes = client.bundle
+        self.assertEqual(archive_name, "demo.zip")
+        with zipfile.ZipFile(io.BytesIO(bundle_bytes)) as zf:
+            self.assertEqual(sorted(zf.namelist()), ["skills/demo/SKILL.md", "tasks/demo.json"])
+        self.assertEqual(client.submitted["jetty"]["file_paths"], ["skill-evals/_sandbox_uploads/abc123/demo.zip"])
+        # Model-visible sandbox paths never change at run time.
+        self.assertEqual(client.submitted["jetty"]["template_variables"]["task_json"], "/app/assets/tasks/demo.json")
+        record = records[0]
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["trajectory_id"], "traj_1")
+        self.assertEqual(record["artifacts"], [{
+            "path": "/app/results/output.md",
+            "storage_path": "skill-evals/demo-case-1-with-skill-1/0000/traj_1.run.0000.app--results--output.md",
+            "content_type": "text/markdown",
+            "content": "alpha beta",
+        }])
+        self.assertEqual(record["trajectory"]["usage"]["prompt_tokens"], 100)
+        self.assertEqual(record["trajectory"]["elapsed_ms"], 2000)
+        self.assertEqual(record["trajectory"]["cost_usd"], 0.01)
+
+    def test_jetty_artifact_sandbox_path_decodes_flattened_storage_names(self):
+        tid = "3c9246ca-1111-2222-3333-444455556666"
+        self.assertEqual(
+            sb.jetty_artifact_sandbox_path(f"coll/task/0000/{tid}.run.0000.app--results--output.md"),
+            "/app/results/output.md")
+        self.assertEqual(
+            sb.jetty_artifact_sandbox_path(f"coll/task/0000/{tid}.run.0003.app--results--outputs--chart.png"),
+            "/app/results/outputs/chart.png")
+        # A name that does not decode to app/results is preserved, not guessed.
+        self.assertEqual(
+            sb.jetty_artifact_sandbox_path(f"coll/task/0000/{tid}.run.0007.logs--agent--session.jsonl"),
+            "/app/results/outputs/logs--agent--session.jsonl")
+
+    def test_extract_trajectory_id_reads_live_response_shapes(self):
+        # HTTP 200 (captured 2026-07-17): bare id in jetty_metadata.trajectory_id.
+        self.assertEqual(sb.extract_trajectory_id({"id": "chatcmpl-bb2bb71e", "jetty_metadata": {"trajectory_id": "bb2bb71e"}}), "bb2bb71e")
+        # HTTP 202: workflow_id is <collection>-<task>--<trajectory_id>; the DB
+        # poll route keys on the suffix, so the full id must be normalized.
+        self.assertEqual(
+            sb.extract_trajectory_id({"id": "chatcmpl-coll-my-task--37c37963",
+                                      "jetty_metadata": {"status": "running", "workflow_id": "coll-my-task--37c37963"}}),
+            "37c37963")
+        self.assertEqual(sb.extract_trajectory_id({"jetty_metadata": {"status": "running", "workflow_id": "traj_8"}}), "traj_8")
+        self.assertEqual(sb.extract_trajectory_id({"id": "chatcmpl-traj_7"}), "traj_7")
+        self.assertIsNone(sb.extract_trajectory_id({"object": "chat.completion"}))
 
 
 if __name__ == "__main__":
