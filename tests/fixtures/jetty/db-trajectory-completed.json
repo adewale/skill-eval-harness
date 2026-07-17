@@ -1,0 +1,179 @@
+{
+ "trajectory_id": "bb2bb71e",
+ "name": "skill-evals/skill-eval-contract-probe",
+ "storage_path": "skill-evals/skill-eval-contract-probe/0000",
+ "status": "completed",
+ "created": "2026-07-17T10:25:59.735651+00:00",
+ "updated": "2026-07-17T10:26:24.376386+00:00",
+ "author": "mise@jetty.io",
+ "metadata_uri": "none",
+ "org_id": "org_REDACTED",
+ "error": null,
+ "attributes": {
+  "params": {
+   "vars": {
+    "prompt": "Execute the runbook.",
+    "results_dir": "/app/results"
+   },
+   "agent": "claude-code",
+   "model": "claude-sonnet-4-6",
+   "instruction": "# Probe\n\nWrite 'probe ok' to {{results_dir}}/output.md.",
+   "model_provider": "anthropic"
+  },
+  "created": "2026-07-17T10:25:59.735627",
+  "asset_type": "activity",
+  "asset_filename": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.json"
+ },
+ "steps": {
+  "run": {
+   "key": "38fe8e5caae64a509138e6e16643d148",
+   "ended": "2026-07-17T10:26:23.045073",
+   "author": "mise@jetty.io",
+   "config": {
+    "cpus": 4,
+    "memory": "8G",
+    "activity": "runbook",
+    "snapshot": "python312-uv",
+    "agent_path": "init_params.agent",
+    "files_path": "init_params.file_paths",
+    "model_path": "init_params.model",
+    "timeout_sec": 1200,
+    "network_enabled": true,
+    "instruction_path": "init_params.instruction",
+    "_current_step_name": "run",
+    "template_variables_path": "init_params.vars"
+   },
+   "inputs": {
+    "cpus": 4,
+    "agent": "claude-code",
+    "files": [],
+    "image": null,
+    "model": "claude-sonnet-4-6",
+    "memory": "8G",
+    "snapshot": "python312-uv",
+    "agent_env": {},
+    "base_image": "python:3.13-slim-bookworm",
+    "mcp_servers": null,
+    "timeout_sec": 1200,
+    "apt_packages": [],
+    "pip_packages": [],
+    "mcp_auth_token": null,
+    "model_provider": "anthropic",
+    "mcp_auth_tokens": null,
+    "network_enabled": true,
+    "template_variables": {
+     "prompt": "Execute the runbook.",
+     "results_dir": "/app/results"
+    },
+    "subscription_credential": null
+   },
+   "origin": {},
+   "created": "2026-07-17T10:26:01.018963",
+   "outputs": {
+    "agent": "claude-code",
+    "files": [
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0000.agent--env-debug.txt",
+      "extension": "txt",
+      "content_type": "text/plain;charset=utf-8"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0001.agent--claude-code.txt",
+      "extension": "txt",
+      "content_type": "text/plain;charset=utf-8"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0002.agent--config.toml",
+      "extension": "toml",
+      "content_type": "application/octet-stream"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0003.agent--sessions---claude.json",
+      "extension": "json",
+      "content_type": "application/json"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0004.agent--sessions--policy-limits.json",
+      "extension": "json",
+      "content_type": "application/json"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0005.agent--sessions--backups---claude-json-backup.1784283970150",
+      "extension": "1784283970150",
+      "content_type": "application/octet-stream"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0006.agent--sessions--projects---app--59db3cff-35ef-4869-af0e-d83d79a7981b.jsonl",
+      "extension": "jsonl",
+      "content_type": "application/json"
+     },
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0007.app--results--output.md",
+      "extension": "md",
+      "content_type": "application/octet-stream"
+     }
+    ],
+    "model": "claude-sonnet-4-6",
+    "usage": {
+     "model": "anthropic/claude-sonnet-4-6",
+     "cost_usd": 0.0334074,
+     "api_calls": 1,
+     "total_tokens": 162,
+     "prompt_tokens": 4,
+     "duration_seconds": 16.0148,
+     "completion_tokens": 158,
+     "cache_read_input_tokens": 29058,
+     "cache_creation_input_tokens": 5952
+    },
+    "success": true,
+    "primary_files": [
+     "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0007.app--results--output.md"
+    ],
+    "results_files": [
+     {
+      "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0007.app--results--output.md",
+      "extension": "md",
+      "content_type": "application/octet-stream"
+     }
+    ],
+    "num_files_saved": 8
+   },
+   "activity": "runbook",
+   "depends_on": [],
+   "duration_seconds": 22.026
+  }
+ },
+ "labels": [],
+ "init_params": {
+  "vars": {
+   "prompt": "Execute the runbook.",
+   "results_dir": "/app/results"
+  },
+  "agent": "claude-code",
+  "model": "claude-sonnet-4-6",
+  "file_paths": [],
+  "instruction": "---\nversion: \"1.0.0\"\nevaluation: programmatic\nagent: claude-code\nmodel: claude-sonnet-4-6\nmodel_provider: anthropic\nsnapshot: python312-uv\nprimary_outputs:\n  - output.md\n---\n\n# Probe\n\nWrite the single line 'probe ok' to {{results_dir}}/output.md and exit.",
+  "model_provider": "anthropic"
+ },
+ "step_configs": {
+  "run": {
+   "cpus": 4,
+   "memory": "8G",
+   "activity": "runbook",
+   "snapshot": "python312-uv",
+   "agent_path": "init_params.agent",
+   "files_path": "init_params.file_paths",
+   "model_path": "init_params.model",
+   "timeout_sec": 1200,
+   "network_enabled": true,
+   "instruction_path": "init_params.instruction",
+   "template_variables_path": "init_params.vars"
+  }
+ },
+ "total_steps": [
+  "run"
+ ],
+ "completed_steps": [
+  "run"
+ ]
+}

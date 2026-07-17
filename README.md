@@ -542,7 +542,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 - **Pi**: use `examples/adewale-workspace/run_pi_smoke.py` for the Adewale multi-repo smoke workflow and `skill-pi-trigger-eval` for autonomous trigger checks.
 - **Mistral Vibe**: use `run-agent --agent vibe`, `judge --judge-backend vibe`, and `skill-trigger-matrix --agent vibe`. The harness isolates `VIBE_HOME`, passes `--model` as `VIBE_ACTIVE_MODEL`, mounts trigger skills under `.agents/skills`, and requires `MISTRAL_API_KEY` (or a copied `.env` from the current `VIBE_HOME`, falling back to `~/.vibe/.env`) for live runs.
 - **Other runners**: use `prepare` JSONL as the import format and write results back to the run output contract.
-- **Jetty**: use `export-jetty`, `run-jetty`, and `import-jetty-results` for REST runbook-mode execution. Live response shapes still need token-backed smoke validation before treating Jetty runs as production evidence.
+- **Jetty**: use `export-jetty`, `run-jetty`, and `import-jetty-results` for REST runbook-mode execution. Response shapes were validated against production `flows-api.jetty.io` on 2026-07-17 (captured fixtures in `tests/fixtures/jetty/`); re-verify anytime with the opt-in live smoke — `RUN_JETTY_SMOKE=1 JETTY_API_TOKEN=... JETTY_SMOKE_COLLECTION=<your-collection> python3 -m unittest discover tests -k smoke_jetty` (five real sandbox runs, never in default CI).
 
 ## Contributing
 

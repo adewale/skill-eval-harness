@@ -160,7 +160,7 @@ AGENT_CAPABILITIES: dict[str, AgentCapabilities] = {
         dollar_cost="provider_reported",
         judge_backend=False,
         tool_replay=False,
-        live_smoke_env=None,
+        live_smoke_env="RUN_JETTY_SMOKE",
         notes="Jetty supports answer-path export/run/import; autonomous trigger and judge export/import remain separate Jetty TODOs.",
     ),
     "vibe": AgentCapabilities(

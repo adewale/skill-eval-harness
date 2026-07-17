@@ -1,6 +1,14 @@
 # Jetty Support Spec
 
-Status: phase-1 adapter implemented for deterministic export, REST submission/polling, dry-run mode, and mocked trajectory import; live Jetty response shapes still need token-backed validation. Grounded in Jetty public docs and `jettyio/jettyio-skills` checked on 2026-06-09.
+Status: adapter validated against production `flows-api.jetty.io` with a real token on
+2026-07-17 — the full `export-jetty -> run-jetty -> import-jetty-results -> benchmark`
+loop ran live (fixture-free case, fixture-backed case, and a server-side failure path).
+Captured, redacted response shapes are committed under `tests/fixtures/jetty/` and
+pinned by `tests/test_jetty_live_contract.py`; the opt-in live smoke is
+`RUN_JETTY_SMOKE=1` (`tests/test_smoke_jetty.py`). Originally grounded in Jetty public
+docs and `jettyio/jettyio-skills` checked on 2026-06-09; the live pass corrected four
+assumptions from that snapshot (upload endpoint, in-sandbox paths, trajectory-id shape,
+and artifact transport) — see "Live-token answers" below.
 
 This spec defines the simplest useful Jetty adapter for Skill Eval Harness. Jetty executes harness tasks in runbook mode and records trajectories/artifacts. Skill Eval Harness remains the source of truth for manifests, variants, splits, deterministic assertions, benchmark summaries, and saturation/no-lift flags.
 
@@ -49,10 +57,13 @@ Jetty skills repo consulted:
 
 ## Confirmed facts to build on
 
-From Jetty docs and `jettyio-skills`:
+Verified live on 2026-07-17 (superseding the 2026-06-09 doc snapshot where they differ):
 
 - Runbook execution uses `POST https://flows-api.jetty.io/v1/chat/completions`.
 - Auth uses `Authorization: Bearer $JETTY_API_TOKEN`.
+- flows-api sits behind Cloudflare, which rejects urllib's default
+  `Python-urllib/x.y` User-Agent outright (`403`, error code 1010) — every
+  client request must send a real `User-Agent`.
 - Chat completions has:
   - passthrough mode when there is no `jetty` block;
   - runbook mode when the `jetty` block is present.
@@ -66,10 +77,29 @@ From Jetty docs and `jettyio-skills`:
   - `agent`
   - `model_provider`
   - `snapshot`
+  - `timeout_hint` — how long the non-streaming call may block synchronously
+    before returning HTTP 202 + `status: "running"`. The server default is
+    1200s, which outlives any sane client HTTP timeout; the adapter sends 60s
+    and lets polling drive the wait.
   - `template_variables`
   - optional `file_paths`
-  - optional `use_trial_keys`
-- Files can be uploaded first with `POST https://flows-api.jetty.io/api/v1/files/upload` using multipart fields including `file=@...` and `collection=...`; the returned path is referenced in `jetty.file_paths`.
+  - optional `use_trial_keys` (plus `timeout_sec`, `cpus`, `memory`,
+    `network_enabled`, `agent_env`, `mcp_servers`, `files`, `webhook_url` —
+    unused by the adapter today)
+- File upload: there is **no** `POST /api/v1/files/upload` (it 405s). The two
+  real surfaces are:
+  - `POST /api/v1/sandbox/upload` — multipart field **`files`** (repeatable);
+    the collection comes from the bearer token. Returns
+    `{"upload_id", "file_paths": [...], "count"}`; those storage paths go in
+    `jetty.file_paths`. Individual filenames are flattened to their basename —
+    a **zip** is the only shape that preserves a directory tree (auto-extracted
+    under `/app/assets/` with member paths intact).
+  - `POST /api/v1/files` — OpenAI-style Files API returning an opaque
+    `file-...` id for `jetty.files`. A `file-...` id placed in
+    `jetty.file_paths` is silently dropped, so the adapter never uses this
+    surface.
+- Uploaded files mount under `/app/assets/` inside the sandbox, so the
+  agent-visible path of every bundled file is knowable at export time.
 - The practical agent runtimes from `jettyio-skills` are:
   - `claude-code`
   - `opencode`
@@ -81,9 +111,28 @@ From Jetty docs and `jettyio-skills`:
   - `model_provider: anthropic`
   - `snapshot: python312-uv`
 - Browser tasks should use `snapshot: prism-playwright`.
-- Files written under `/app/results/` persist as artifacts.
+- Files written under `/app/results/` persist as artifacts. Each is stored
+  under a flattened name `<trajectory_id>.<step>.<NNNN>.<dir--parts--stem.ext>`
+  (slashes become `--`, dots in the stem become `-`), listed with its storage
+  path in the runbook step's `outputs.results_files[]`, and downloadable via
+  `GET /api/v1/file/{storage_path}`.
 - `results_dir` should default to `/app/results` and be passed through `jetty.template_variables`.
-- Trajectory details are available through `GET /api/v1/db/trajectory/{collection}/{task}/{trajectory_id}`.
+- Status polling uses `GET /api/v1/db/trajectory/{collection}/{task}/{trajectory_id}`
+  (DB-indexed status/metadata; the row can lag the submission by a few seconds,
+  so a 404 while waiting means queued). Step outputs — `results_files`,
+  `primary_files`, and the `usage` block (`prompt_tokens`, `completion_tokens`,
+  `total_tokens`, `cost_usd`, `duration_seconds`, `api_calls`, cache token
+  counts) — come from the storage detail route
+  `GET /api/v1/trajectory/{collection}/{task}/{trajectory_id}`.
+- The production status set is `pending`, `running`, `completed`, `failed`,
+  `cancelled`, plus administrative `archived`; terminal statuses are
+  `completed` / `failed` / `cancelled`. There is no server-side `timeout`
+  status — an exceeded agent budget surfaces as `failed`, and the sync HTTP
+  wait returns 202 `running` while the workflow keeps going.
+- The trajectory id arrives as `jetty_metadata.trajectory_id` on HTTP 200, and
+  on HTTP 202 as `jetty_metadata.workflow_id` shaped
+  `<collection>-<task>--<trajectory_id>` — the trajectory routes key on the
+  bare suffix after the final `--`.
 - Provider keys belong in Jetty collection environment variables, not in local harness payloads. The only local secret the adapter should require is `JETTY_API_TOKEN`.
 - `simple_judge` supports binary and scale judging for later qualitative judge integration.
 
@@ -189,24 +238,37 @@ Payload shape:
       "agent": "claude-code",
       "model_provider": "anthropic",
       "snapshot": "python312-uv",
+      "timeout_hint": 60,
       "template_variables": {
         "results_dir": "/app/results",
-        "task_json": "uploads/.../task.json"
+        "task_json": "/app/assets/tasks/good-pr-pos-security-meaningless-test-with-skill-1.json"
       },
       "file_paths": [
-        "uploads/.../task.json",
-        "uploads/.../skills/good-pr/SKILL.md",
-        "uploads/.../fixtures/diff.patch"
+        "upload://good-pr-pos-security-meaningless-test-with-skill-1/bundle/zip"
       ]
     }
   },
   "upload_plan": {
+    "bundle": {
+      "placeholder": "upload://good-pr-pos-security-meaningless-test-with-skill-1/bundle/zip",
+      "archive_name": "good-pr-pos-security-meaningless-test-with-skill-1.zip"
+    },
     "files": [
-      {"local_path": "/abs/repo/evals/fixtures/security-pr/diff.patch", "remote_path_hint": "fixtures/diff.patch", "role": "fixture", "private": false}
+      {"local_path": "/abs/repo/evals/fixtures/security-pr/diff.patch", "remote_path_hint": "fixtures/diff.patch", "sandbox_path": "/app/assets/fixtures/diff.patch", "role": "fixture", "private": false}
     ]
   }
 }
 ```
+
+The whole upload plan ships as **one zip** whose member names are the items'
+`remote_path_hint`s: `/api/v1/sandbox/upload` flattens individual filenames to
+their basename, so a zip (auto-extracted under `/app/assets/` with member
+paths preserved) is the only shape that keeps skills/fixtures/tasks trees
+intact. Model-visible references (`template_variables.task_json`, the task
+JSON's `input_files`/`skill_files`) are therefore deterministic
+`/app/assets/...` paths baked at export time; the single `file_paths`
+placeholder is the only run-time substitution, replaced by the zip's storage
+path after upload.
 
 Use `stream: false` by default for simplicity. Streaming can be added after non-streaming import is stable.
 
@@ -230,13 +292,26 @@ Environment:
 
 Responsibilities:
 
-1. Upload each file in `upload_plan.files` to `/api/v1/files/upload`.
-2. Replace local upload placeholders with returned Jetty file paths.
-3. Submit `jetty_request` to `/v1/chat/completions`.
+1. Zip `upload_plan.files` (member names = `remote_path_hint`) and upload the
+   bundle to `/api/v1/sandbox/upload` (multipart field `files`).
+2. Replace the single bundle placeholder in `jetty.file_paths` with the
+   returned storage path.
+3. Submit `jetty_request` to `/v1/chat/completions` and extract the trajectory
+   id from `jetty_metadata` (`trajectory_id` on 200; on 202 the bare suffix of
+   `workflow_id`). Submission is retried on 429 only — a 5xx can arrive after
+   the workflow started, and a blind resubmit would double the sandbox spend.
 4. Persist the trajectory ID immediately.
-5. Poll `/api/v1/db/trajectory/{collection}/{task}/{trajectory_id}` until terminal status.
-6. Write one JSONL run record per task, including failures/timeouts.
-7. Retry bounded transient 429/5xx failures.
+5. Poll `/api/v1/db/trajectory/{collection}/{task}/{trajectory_id}` until
+   terminal status, treating early 404s as queued (the DB row can lag the
+   submission).
+6. On success, fetch the storage detail
+   (`GET /api/v1/trajectory/{collection}/{task}/{trajectory_id}`), download
+   every `results_files[]` artifact via `GET /api/v1/file/{path}`, and inline
+   them into the run record (text as `content`, binary as base64
+   `content_b64`) so the import step stays local and network-free.
+7. Write one JSONL run record per task, including failures/timeouts.
+8. Retry bounded transient 429/5xx failures on the idempotent calls
+   (upload, poll, fetch, download).
 
 ### `import-jetty-results`
 
@@ -328,8 +403,8 @@ Execute one Skill Eval Harness task exactly once. Write the final assistant answ
 
 1. Read `{{task_json}}`.
 2. Read every fixture listed in `task_json.input_files`.
-3. If `task_json.variant` is `with_skill`, read and follow the mounted skill files.
-4. If `task_json.variant` is `without_skill`, do not use a skill. No skill files should be mounted.
+3. If `task_json.skill_files` is non-empty, read and follow the mounted skill files.
+4. If `task_json.skill_files` is empty, do not use a skill. No skill files are mounted.
 5. Answer the user task directly.
 6. Write `{{results_dir}}/output.md`.
 7. Write `{{results_dir}}/metadata.json`.
@@ -493,25 +568,53 @@ Phases 1–4 shipped with deterministic tests:
 
 The tests use inline provider-shaped records and temporary run trees in
 `tests/test_skill_benchmark.py`, `tests/test_runners.py`, `tests/test_cost_telemetry.py`, and
-`tests/test_jetty_contracts.py`; there is no separate `tests/fixtures/jetty/` tree.
+`tests/test_jetty_contracts.py`. Captured production shapes live in `tests/fixtures/jetty/`
+and are pinned by `tests/test_jetty_live_contract.py` (upload endpoint + multipart field +
+User-Agent, both submit shapes, db-record lifecycles, storage-detail artifact/usage
+normalization).
 
 Security checks prove executor payloads omit answer keys/judge rubrics and provider credentials,
 `without_skill` uploads no skill files, hidden prompt placeholders remain non-executable, unsafe or
 duplicate imported destinations fail before writes, and unknown/conflicting statuses fail closed.
 
-Phase 5 remains opt-in live validation. It requires `JETTY_API_TOKEN`, never runs in default CI, and
-should cover one fixture-free case, one fixture-backed case, and a cheap failure/timeout path.
+Phase 5 — opt-in live validation — shipped as `tests/test_smoke_jetty.py`, gated by
+`RUN_JETTY_SMOKE=1` + `JETTY_API_TOKEN` (never in default CI). It runs one fixture-free
+tune case, one fixture-backed tune case, and a cheap server-side failure path
+(`jetty.timeout_sec: 15`) through export → run → import → benchmark, and first passed
+against production on 2026-07-17.
 
-## Remaining live-token questions
+## Live-token answers (2026-07-17)
 
-These are narrower after reading `jettyio-skills`:
+The six open questions, answered against production with a real token; the
+captured shapes live in `tests/fixtures/jetty/`:
 
-1. Exact JSON response shape from `/api/v1/files/upload`.
-2. Exact artifact listing/download shape from trajectory details.
-3. Exact chat-completion response field containing `trajectory_id` in non-streaming runbook mode.
-4. Full terminal status set in production.
-5. Whether directory trees should be uploaded as individual files or archives.
-6. Whether `use_trial_keys` is available to all relevant accounts or only trial collections.
+1. **Upload response**: `/api/v1/files/upload` does not exist (405). The
+   adapter uses `POST /api/v1/sandbox/upload` (multipart field `files`), which
+   returns `{"upload_id", "file_paths": ["<collection>/_sandbox_uploads/<id>/<name>"], "count"}`.
+2. **Artifact listing/download**: storage detail
+   `GET /api/v1/trajectory/{c}/{t}/{id}` lists
+   `steps.run.outputs.results_files[] = {path, content_type, extension}` (plus
+   `files[]`, `primary_files[]`); each `path` is a flattened storage key
+   downloadable as raw bytes via `GET /api/v1/file/{path}`. There is also a
+   whole-trajectory zip at `GET /api/v1/trajectory/{c}/{t}/{id}/download`
+   (same flattened names inside).
+3. **Trajectory id field**: non-streaming 200 → `jetty_metadata.trajectory_id`
+   (also `id: "chatcmpl-<id>"`); 202 → `jetty_metadata.workflow_id` shaped
+   `<collection>-<task>--<id>`, keyed by its bare suffix.
+4. **Terminal status set**: `completed`, `failed`, `cancelled` (non-terminal:
+   `pending`, `running`; administrative: `archived`). No server-side
+   `timeout` status — an exceeded `jetty.timeout_sec` surfaces as `failed`.
+5. **Directory trees**: archives. Individual sandbox uploads flatten to
+   basenames; a zip in `file_paths` is auto-extracted under `/app/assets/`
+   with member paths preserved.
+6. **`use_trial_keys`**: accepted for every account and effectively advisory —
+   server-side trial-key injection is automatic, gated on the collection
+   having an active trial budget and the run lacking a user-supplied provider
+   key, independent of the flag.
+
+One operational surprise worth restating: Cloudflare fronts the API and bans
+urllib's default `Python-urllib` User-Agent (`403`, error code 1010), so the
+client sends `User-Agent: skill-eval-harness` on every request.
 
 ## Simplicity bias
 

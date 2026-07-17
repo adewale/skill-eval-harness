@@ -12,12 +12,14 @@ them. Everything from `grade`/`benchmark` onward is model-free and reproducible 
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import copy
 import difflib
 import errno
 import hashlib
 import html
+import io
 import itertools
 import json
 import math
@@ -36,6 +38,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
@@ -1975,6 +1978,20 @@ JETTY_DEFAULT_MODEL = "claude-sonnet-4-6"
 JETTY_DEFAULT_MODEL_PROVIDER = "anthropic"
 JETTY_DEFAULT_SNAPSHOT = "python312-uv"
 JETTY_ALLOWED_AGENTS = {"claude-code", "opencode", "codex", "gemini-cli"}
+# Uploaded files land under this directory inside the Jetty sandbox; a zip in
+# jetty.file_paths is auto-extracted here with member paths preserved, which is
+# the only upload shape that keeps a directory tree intact (single-file uploads
+# are flattened to their basename by the API).
+JETTY_SANDBOX_ASSETS_DIR = "/app/assets"
+# How long /v1/chat/completions may block synchronously before returning HTTP
+# 202 + status "running" (jetty.timeout_hint). The server default is 1200s,
+# which would outlive the client's HTTP timeout on any real run — keep it short
+# and let poll() drive the wait instead.
+JETTY_SUBMIT_TIMEOUT_HINT_S = 60
+# flows-api.jetty.io sits behind Cloudflare, which bans urllib's default
+# Python-urllib/x.y agent signature outright (403, error code 1010) — every
+# request must carry a real User-Agent.
+JETTY_USER_AGENT = "skill-eval-harness"
 JETTY_TERMINAL_SUCCESS = {"completed", "complete", "succeeded", "success"}
 JETTY_TERMINAL_FAILURE = {"failed", "failure", "error", "errored", "canceled", "cancelled", "timeout", "timed_out"}
 JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
@@ -3190,6 +3207,24 @@ def placeholder(task_name: str, role: str, index: int | str) -> str:
     return f"upload://{task_name}/{role}/{index}"
 
 
+def jetty_archive_member_path(value: Any) -> str:
+    """Validate one portable, canonical ZIP member path for Jetty uploads."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("Jetty archive member must be a safe portable relative path")
+    if (value != unicodedata.normalize("NFC", value)
+            or "\\" in value
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+            or value.startswith("/")
+            or re.match(r"^[A-Za-z]:", value)):
+        raise ValueError(
+            f"Jetty archive member must be a safe portable relative path: {value!r}")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(
+            f"Jetty archive member must be a safe portable relative path: {value!r}")
+    return value
+
+
 def planned_file_surface_hash(
     files: Iterable[dict[str, Any]], *, role: str, path_prefix: str,
 ) -> str:
@@ -3200,7 +3235,7 @@ def planned_file_surface_hash(
     for item in files:
         if item.get("role") != role:
             continue
-        hint = str(item.get("remote_path_hint") or "")
+        hint = jetty_archive_member_path(item.get("remote_path_hint"))
         if not hint.startswith(path_prefix):
             raise ValueError(f"{role} upload destination {hint!r} is outside {path_prefix!r}")
         relative = hint[len(path_prefix):]
@@ -3249,7 +3284,7 @@ def jetty_task_contract(payload: dict[str, Any]) -> dict[str, Any]:
     seen_destinations: set[str] = set()
     for item in files:
         placeholder_value = item.get("placeholder")
-        destination = item.get("remote_path_hint")
+        destination = jetty_archive_member_path(item.get("remote_path_hint"))
         role = item.get("role")
         if (not isinstance(placeholder_value, str) or not placeholder_value
                 or placeholder_value in seen_placeholders):
@@ -3287,6 +3322,17 @@ def jetty_task_contract_sha256(payload: dict[str, Any]) -> str:
     return canonical_json_sha256(jetty_task_contract(payload))
 
 
+def jetty_sandbox_path(remote_path_hint: str) -> str:
+    """The deterministic in-sandbox path of one bundled upload item.
+
+    The whole upload plan ships as a single zip whose member names are the
+    items' `remote_path_hint`s; Jetty auto-extracts it under /app/assets/ with
+    member paths preserved, so the agent-visible path is knowable at export
+    time — no run-time substitution of storage keys into model-visible text.
+    """
+    return f"{JETTY_SANDBOX_ASSETS_DIR}/{jetty_archive_member_path(remote_path_hint)}"
+
+
 def safe_task_json(pt: PreparedTask, manifest: dict[str, Any], *, task_name: str, upload_files: list[dict[str, Any]]) -> dict[str, Any]:
     variant = pt.variant_truth
     safe = {
@@ -3301,26 +3347,29 @@ def safe_task_json(pt: PreparedTask, manifest: dict[str, Any], *, task_name: str
         "skill_name": pt.skill_name,
         "instruction": pt.instruction,
         "prompt": pt.prompt,
-        "input_files": [item["placeholder"] for item in upload_files if item.get("role") == "fixture"],
+        "input_files": [item["sandbox_path"] for item in upload_files if item.get("role") == "fixture"],
         "skill_files": [],
         "tags": list(pt.tags),
     }
     if variant == "with_skill":
-        safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
+        safe["skill_files"] = [item["sandbox_path"] for item in upload_files if item.get("role") == "skill"]
     elif variant == "old_skill":
-        safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "old_skill"]
+        safe["skill_files"] = [item["sandbox_path"] for item in upload_files if item.get("role") == "old_skill"]
     elif pt.is_ablation:
-        safe["skill_files"] = [item["placeholder"] for item in upload_files if item.get("role") == "skill"]
+        safe["skill_files"] = [item["sandbox_path"] for item in upload_files if item.get("role") == "skill"]
         if not pt.is_materialized_ablation:
             # Instruction-simulated is non-blind by design: the model is told what to
             # simulate, via the ONE typed instruction-sim record. removed_component /
             # expected_regressions come from the manifest (the prepared row carries
             # only id/mode/population).
             aid = ablation_id_of(variant)
+            if aid is None or not isinstance(pt.ablation, InstructionSimulated):
+                raise ValueError(
+                    "instruction-simulated ablation is missing its typed identity")
             ablation = ablation_by_id(manifest, aid) or {}
             safe["ablation"] = InstructionSimulated(
                 id=aid,
-                population=(pt.ablation.population if pt.ablation else "answer"),   # from the row, not hardcoded
+                population=pt.ablation.population,  # from the row, not hardcoded
                 removed_component=ablation.get("removed_component"),
                 expected_regressions=tuple(expected_regression_summaries(ablation)),
             ).as_dict()
@@ -3435,6 +3484,8 @@ def build_jetty_payload(
                     "remote_path_hint": f"skills/{pt.skill_name}/{rel}",
                     "private": False,
                 })
+    for item in files:
+        item["sandbox_path"] = jetty_sandbox_path(item["remote_path_hint"])
     try:
         fixture_tree_hash = planned_file_surface_hash(
             files, role="fixture", path_prefix="fixtures/")
@@ -3463,14 +3514,14 @@ def build_jetty_payload(
             f"{pt.case_id}: Jetty mounted skill tree hash "
             f"{mounted_skill_tree_hash!r} does not match expected {expected_skill_hash!r}"
         )
-
     task_json = safe_task_json(pt, manifest, task_name=task_name, upload_files=files)
-    task_placeholder = placeholder(task_name, "task", "json")
+    task_remote_hint = f"tasks/{task_name}.json"
     task_item = {
         "role": "task",
-        "placeholder": task_placeholder,
+        "placeholder": placeholder(task_name, "task", "json"),
         "content": json.dumps(task_json, ensure_ascii=False, indent=2) + "\n",
-        "remote_path_hint": f"tasks/{task_name}.json",
+        "remote_path_hint": task_remote_hint,
+        "sandbox_path": jetty_sandbox_path(task_remote_hint),
         "private": True,
     }
     all_files = [task_item] + files
@@ -3478,6 +3529,12 @@ def build_jetty_payload(
         die(f"{pt.case_id}: without_skill payload attempted to mount skill files")
     if variant == "with_skill" and not any(item.get("role") == "skill" for item in all_files):
         die(f"{pt.case_id}: with_skill payload has no skill files")
+    # The whole mount plan ships as ONE zip: /api/v1/sandbox/upload flattens
+    # individual filenames to their basename, so a zip (auto-extracted under
+    # /app/assets/ with member paths preserved) is the only shape that keeps
+    # skills/fixtures/tasks trees intact. Only the zip's storage path is
+    # unknown until run time, hence the single placeholder in file_paths.
+    bundle_placeholder = placeholder(task_name, "bundle", "zip")
     jetty_block = {
         "runbook": True,
         "collection": collection,
@@ -3485,11 +3542,12 @@ def build_jetty_payload(
         "agent": agent,
         "model_provider": model_provider,
         "snapshot": snapshot,
+        "timeout_hint": JETTY_SUBMIT_TIMEOUT_HINT_S,
         "template_variables": {
             "results_dir": "/app/results",
-            "task_json": task_placeholder,
+            "task_json": task_item["sandbox_path"],
         },
-        "file_paths": [item["placeholder"] for item in all_files],
+        "file_paths": [bundle_placeholder],
     }
     if use_trial_keys:
         jetty_block["use_trial_keys"] = True
@@ -3523,7 +3581,10 @@ def build_jetty_payload(
             "stream": False,
             "jetty": jetty_block,
         },
-        "upload_plan": {"files": all_files},
+        "upload_plan": {
+            "bundle": {"placeholder": bundle_placeholder, "archive_name": f"{task_name}.zip"},
+            "files": all_files,
+        },
     }
     payload["harness"]["jetty_task_contract_sha256"] = (
         jetty_task_contract_sha256(payload))
@@ -3647,33 +3708,124 @@ def resolved_task_upload_bytes(content: bytes, mapping: dict[str, str]) -> bytes
 
 
 def extract_trajectory_id(response: dict[str, Any]) -> str | None:
-    for container in (response, response.get("jetty")):
+    """Trajectory id of a runbook-mode chat-completion response.
+
+    Live shapes (captured 2026-07-17): HTTP 200 carries the bare id in
+    `jetty_metadata.trajectory_id`; HTTP 202 (sync wait exceeded / webhook
+    mode) carries `jetty_metadata.workflow_id` shaped
+    `<collection>-<task>--<trajectory_id>` — the trajectory endpoints key on
+    the suffix after the final `--`, and polling with the full workflow id
+    404s forever. The top-level `id` is `chatcmpl-<same value>` and is only a
+    last resort.
+    """
+    observed: list[tuple[str, str]] = []
+    for container_name, container in (
+        ("jetty_metadata", response.get("jetty_metadata")),
+        ("response", response),
+        ("jetty", response.get("jetty")),
+    ):
         if not isinstance(container, dict):
             continue
-        for key in ["trajectory_id", "trajectoryId", "id"]:
+        for key in ["trajectory_id", "trajectoryId", "workflow_id", "id"]:
             value = container.get(key)
             if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
+                value = value.strip()
+                if key == "id" and value.startswith("chatcmpl-"):
+                    value = value[len("chatcmpl-"):].strip()
+                if key in {"workflow_id", "id"} and "--" in value:
+                    value = value.rsplit("--", 1)[1].strip()
+                if value:
+                    observed.append((f"{container_name}.{key}", value))
+    unique = {value for _, value in observed}
+    if len(unique) > 1:
+        rendered = ", ".join(f"{name}={value!r}" for name, value in observed)
+        raise ValueError(f"conflicting Jetty trajectory identifiers: {rendered}")
+    return next(iter(unique), None)
+
+
+def jetty_remote_path(value: Any, label: str) -> str:
+    """Validate a canonical provider storage path without normalizing it."""
+    try:
+        return jetty_archive_member_path(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a safe portable relative path") from exc
+
+
+def validate_jetty_submission(
+    response: Any, *, collection: str, task: str,
+) -> tuple[str, str | None]:
+    submission = string_keyed_dict(response, "Jetty submit response")
+    trajectory_id = extract_trajectory_id(submission)
+    if trajectory_id is None:
+        raise RuntimeError(
+            f"Jetty submit response did not include trajectory_id: {submission}")
+    storage_paths: set[str] = set()
+    for label, container in (
+        ("submit", submission),
+        ("submit jetty_metadata", submission.get("jetty_metadata")),
+        ("submit jetty", submission.get("jetty")),
+    ):
+        if not isinstance(container, dict):
+            continue
+        for key, expected in (("collection", collection), ("task", task)):
+            value = container.get(key)
+            if value is not None and value != expected:
+                raise ValueError(
+                    f"{label} {key} conflicts with submitted request: "
+                    f"{value!r} != {expected!r}")
+        if container.get("storage_path") is not None:
+            storage_paths.add(jetty_remote_path(
+                container["storage_path"], f"{label} storage_path"))
+    if len(storage_paths) > 1:
+        raise ValueError(
+            f"conflicting Jetty submit storage_path values: {sorted(storage_paths)!r}")
+    return trajectory_id, next(iter(storage_paths), None)
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return scheme, hostname, port
+
+
+class JettySameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep Jetty bearer credentials on the configured origin only."""
+
+    def redirect_request(
+        self, req: urllib.request.Request, fp: Any, code: int, msg: str,
+        headers: Any, newurl: str,
+    ) -> urllib.request.Request | None:
+        if _url_origin(req.full_url) != _url_origin(newurl):
+            raise urllib.error.HTTPError(
+                req.full_url, code,
+                "refusing cross-origin redirect for authenticated Jetty request",
+                headers, fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class JettyClient:
     def __init__(self, token: str, base_url: str = JETTY_DEFAULT_BASE_URL):
         self.token = token
         self.base_url = base_url.rstrip("/")
+        self._opener = urllib.request.build_opener(JettySameOriginRedirectHandler())
 
-    def _open_with_retries(self, req: urllib.request.Request, *, timeout: int = 120, attempts: int = 3) -> Any:
+    def _open_with_retries(self, req: urllib.request.Request, *, timeout: int = 120, attempts: int = 3, retry_5xx: bool = True) -> Any:
         for attempt in range(attempts):
             try:
-                return urllib.request.urlopen(req, timeout=timeout)
+                return self._opener.open(req, timeout=timeout)
             except urllib.error.HTTPError as exc:
-                transient = exc.code == 429 or 500 <= exc.code < 600
+                transient = exc.code == 429 or (retry_5xx and 500 <= exc.code < 600)
                 if not transient or attempt == attempts - 1:
                     raise
                 time.sleep(min(2 ** attempt, 10))
         raise RuntimeError("unreachable retry state")
 
-    def _json_request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _json_request(self, method: str, path: str, body: dict[str, Any] | None = None, *, retry_5xx: bool = True) -> dict[str, Any]:
         data = None if body is None else json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             self.base_url + path,
@@ -3683,52 +3835,68 @@ class JettyClient:
                 "Authorization": f"Bearer {self.token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                "User-Agent": JETTY_USER_AGENT,
             },
         )
-        with self._open_with_retries(req, timeout=120) as resp:
+        with self._open_with_retries(req, timeout=120, retry_5xx=retry_5xx) as resp:
             text = resp.read().decode("utf-8", errors="replace")
             return strict_json_loads(text) if text.strip() else {}
 
-    def upload(self, item: dict[str, Any], collection: str) -> str:
+    def upload_bundle(self, archive_name: str, data: bytes) -> str:
+        """POST /api/v1/sandbox/upload -> the zip's storage path.
+
+        The multipart field name must be `files` (repeatable); the collection
+        comes from the bearer token, not a form field. The response is
+        {"upload_id", "file_paths": [...], "count"} and the returned storage
+        path goes into jetty.file_paths verbatim. (/api/v1/files is the
+        OpenAI-style Files API whose opaque `file-...` ids belong in
+        jetty.files — a `file-...` id in file_paths is silently dropped.)
+        """
         boundary = f"----skill-eval-harness-{int(time.time() * 1000)}"
-        parts: list[bytes] = []
-        def add_field(name: str, value: str) -> None:
-            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
-        add_field("collection", collection)
-        filename = item.get("remote_path_hint") or (Path(str(item.get("local_path", "file"))).name)
-        if "content" in item:
-            raw = item["content"]
-            if isinstance(raw, (bytes, bytearray)):
-                content = bytes(raw)
-            else:
-                content = (json.dumps(raw, ensure_ascii=False).encode("utf-8")
-                           if isinstance(raw, (dict, list))
-                           else str(raw).encode("utf-8"))
-        else:
-            content = Path(str(item["local_path"])).read_bytes()
-        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode())
-        parts.append(content)
-        parts.append(b"\r\n")
-        parts.append(f"--{boundary}--\r\n".encode())
+        parts = [
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{archive_name}\"\r\nContent-Type: application/zip\r\n\r\n".encode(),
+            data,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode(),
+        ]
         req = urllib.request.Request(
-            self.base_url + "/api/v1/files/upload",
+            self.base_url + "/api/v1/sandbox/upload",
             data=b"".join(parts),
             method="POST",
-            headers={"Authorization": f"Bearer {self.token}", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": f"multipart/form-data; boundary={boundary}", "User-Agent": JETTY_USER_AGENT},
         )
         with self._open_with_retries(req, timeout=120) as resp:
-            data = strict_json_loads(resp.read().decode("utf-8", errors="replace") or "{}")
-        for key in ["path", "file_path", "filePath", "url", "id"]:
-            if data.get(key):
-                return str(data[key])
-        if isinstance(data.get("file"), dict):
-            for key in ["path", "file_path", "filePath", "url", "id"]:
-                if data["file"].get(key):
-                    return str(data["file"][key])
-        raise RuntimeError(f"Jetty upload response did not include a file path: {data}")
+            payload = strict_json_loads(
+                resp.read().decode("utf-8", errors="replace") or "{}")
+        paths = payload.get("file_paths")
+        if isinstance(paths, list) and paths and isinstance(paths[0], str) and paths[0].strip():
+            return paths[0].strip()
+        raise RuntimeError(f"Jetty sandbox upload response did not include file_paths: {payload}")
 
     def submit(self, request_body: dict[str, Any]) -> dict[str, Any]:
-        return self._json_request("POST", "/v1/chat/completions", request_body)
+        # A 5xx can arrive AFTER the Temporal workflow started, so blind
+        # re-submission risks a duplicate sandbox run (and duplicate spend).
+        # Only 429 — rejected before execution — is retried here.
+        return self._json_request("POST", "/v1/chat/completions", request_body, retry_5xx=False)
+
+    def fetch_trajectory(self, collection: str, task: str, trajectory_id: str) -> dict[str, Any]:
+        """Full storage-backed trajectory (steps/outputs/usage/results_files).
+
+        The /db/ poll record is the DB-indexed fast path and carries status
+        metadata only; step outputs live on this folderless storage route.
+        """
+        quoted = "/".join(urllib.parse.quote(part, safe="") for part in [collection, task, trajectory_id])
+        return self._json_request("GET", f"/api/v1/trajectory/{quoted}")
+
+    def download_file(self, storage_path: str) -> bytes:
+        """GET /api/v1/file/{storage_path} — raw bytes of one stored artifact."""
+        req = urllib.request.Request(
+            self.base_url + "/api/v1/file/" + urllib.parse.quote(storage_path.lstrip("/"), safe="/"),
+            method="GET",
+            headers={"Authorization": f"Bearer {self.token}", "User-Agent": JETTY_USER_AGENT},
+        )
+        with self._open_with_retries(req, timeout=120) as resp:
+            return resp.read()
 
     def poll(self, collection: str, task: str, trajectory_id: str, *, timeout_s: int = DEFAULT_RUNNER_TIMEOUT_S, poll_interval_s: float = 5) -> dict[str, Any]:
         deadline = time.time() + timeout_s
@@ -3736,7 +3904,15 @@ class JettyClient:
         path = f"/api/v1/db/trajectory/{quoted}"
         last: dict[str, Any] = {}
         while time.time() <= deadline:
-            last = self._json_request("GET", path)
+            try:
+                last = self._json_request("GET", path)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    # The DB row can lag the submission by a few seconds;
+                    # 404 while waiting means queued, not gone.
+                    time.sleep(poll_interval_s)
+                    continue
+                raise
             lifecycle = lifecycle_from_record(last)
             if lifecycle.terminal:
                 last["provider_status"] = lifecycle.raw_status
@@ -3753,6 +3929,235 @@ class JettyClient:
         last["status"] = lifecycle.status
         last["lifecycle"] = lifecycle.to_dict()
         return last
+
+
+def build_jetty_bundle(files: list[dict[str, Any]]) -> bytes:
+    """One zip holding the whole upload plan, member names = remote_path_hint."""
+    buf = io.BytesIO()
+    seen: set[str] = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in files:
+            member = jetty_archive_member_path(item.get("remote_path_hint"))
+            if member in seen:
+                raise ValueError(f"duplicate Jetty archive member: {member!r}")
+            seen.add(member)
+            zf.writestr(member, _jetty_upload_bytes(item))
+    return buf.getvalue()
+
+
+# Persisted sandbox files are flattened to <trajectory_id>.<step>.<NNNN>.<flat>
+# where <flat> is the sandbox-relative path with `/` -> `--` and dots in the
+# stem -> `-` (so output.md / metadata.json round-trip exactly).
+JETTY_STORAGE_NAME_RE = re.compile(r"^[^.]+\.[^.]+\.\d{4}\.(?P<flat>.+)$")
+
+
+def jetty_artifact_sandbox_path(storage_path: str) -> str:
+    """Best-effort original sandbox path of one flattened storage artifact.
+
+    A name that decodes to an app/results path is restored there; anything
+    else is kept under /app/results/outputs/ by its flattened name rather
+    than guessed at (the flattening is lossy for stems containing dots).
+    """
+    name = str(storage_path).rsplit("/", 1)[-1]
+    match = JETTY_STORAGE_NAME_RE.match(name)
+    flat = match.group("flat") if match else name
+    decoded = flat.replace("--", "/")
+    if decoded.startswith("app/results/"):
+        return "/" + decoded
+    return "/app/results/outputs/" + flat
+
+
+def jetty_runbook_outputs(detail: dict[str, Any]) -> dict[str, Any]:
+    """The runbook step's outputs block from a storage trajectory detail."""
+    steps = detail.get("steps") if isinstance(detail, dict) else None
+    if not isinstance(steps, dict):
+        return {}
+    candidates = [steps.get("run")] + list(steps.values())
+    for step in candidates:
+        outputs = step.get("outputs") if isinstance(step, dict) else None
+        if isinstance(outputs, dict) and any(key in outputs for key in ("results_files", "files", "usage")):
+            return outputs
+    return {}
+
+
+def validate_jetty_completed_evidence(
+    polled: Any,
+    detail: Any,
+    *,
+    trajectory_id: str,
+    collection: str,
+    task: str,
+    submitted_storage_path: str | None,
+) -> tuple[dict[str, Any], dict[str, Any], str, dict[str, Any]]:
+    """Bind every successful provider surface to one run and storage root."""
+    poll_record = string_keyed_dict(polled, "Jetty poll response")
+    detail_record = string_keyed_dict(detail, "Jetty trajectory detail")
+    for label, record in (("poll", poll_record), ("detail", detail_record)):
+        observed_id = extract_trajectory_id(record)
+        if observed_id != trajectory_id:
+            raise ValueError(
+                f"{label} trajectory_id conflicts with submission: "
+                f"{observed_id!r} != {trajectory_id!r}")
+        lifecycle = lifecycle_from_record(record)
+        if not lifecycle.successful:
+            raise ValueError(
+                f"{label} lifecycle is not successful: {lifecycle.to_dict()}")
+
+    poll_storage = jetty_remote_path(
+        poll_record.get("storage_path"), "poll storage_path")
+    detail_storage = jetty_remote_path(
+        detail_record.get("storage_path"), "detail storage_path")
+    if poll_storage != detail_storage:
+        raise ValueError(
+            "poll and detail storage_path conflict: "
+            f"{poll_storage!r} != {detail_storage!r}")
+    if submitted_storage_path is not None and submitted_storage_path != detail_storage:
+        raise ValueError(
+            "submit and completed storage_path conflict: "
+            f"{submitted_storage_path!r} != {detail_storage!r}")
+    expected_prefix = jetty_remote_path(
+        f"{collection}/{task}", "Jetty collection/task storage prefix") + "/"
+    if not detail_storage.startswith(expected_prefix):
+        raise ValueError(
+            f"Jetty storage_path {detail_storage!r} is outside "
+            f"collection/task prefix {expected_prefix!r}")
+
+    steps = detail_record.get("steps")
+    run_step = steps.get("run") if isinstance(steps, dict) else None
+    outputs = run_step.get("outputs") if isinstance(run_step, dict) else None
+    if not isinstance(outputs, dict):
+        raise TypeError("detail steps.run.outputs must be an object")
+    if outputs.get("success") is not True:
+        raise ValueError("detail steps.run.outputs.success must be true")
+    result_files = outputs.get("results_files", [])
+    if not isinstance(result_files, list):
+        raise TypeError("detail steps.run.outputs.results_files must be a list")
+    for index, raw_info in enumerate(result_files, 1):
+        info = string_keyed_dict(
+            raw_info, f"detail steps.run.outputs.results_files[{index}]")
+        storage_path = jetty_remote_path(
+            info.get("path"),
+            f"detail steps.run.outputs.results_files[{index}].path",
+        )
+        if not storage_path.startswith(detail_storage + "/"):
+            raise ValueError(
+                f"result path {storage_path!r} is outside trajectory "
+                f"storage_path {detail_storage!r}")
+        filename = storage_path.rsplit("/", 1)[-1]
+        if re.match(
+            rf"^{re.escape(trajectory_id)}\.[^.]+\.\d{{4}}\.", filename,
+        ) is None:
+            raise ValueError(
+                f"result path {storage_path!r} is not owned by trajectory "
+                f"{trajectory_id!r}")
+    return poll_record, detail_record, detail_storage, outputs
+
+
+def fetch_jetty_artifacts(client: Any, run_outputs: dict[str, Any]) -> list[dict[str, Any]]:
+    """Download every /app/results artifact and inline it into the run record.
+
+    Text is inlined as `content`, binary as base64 `content_b64`, so the
+    downstream import contract stays local and network-free.
+    """
+    artifacts: list[dict[str, Any]] = []
+    for info in run_outputs.get("results_files") or []:
+        storage_path = info.get("path") if isinstance(info, dict) else None
+        if not isinstance(storage_path, str) or not storage_path.strip():
+            continue
+        raw = client.download_file(storage_path)
+        artifact: dict[str, Any] = {
+            "path": jetty_artifact_sandbox_path(storage_path),
+            "storage_path": storage_path,
+        }
+        if isinstance(info, dict) and info.get("content_type"):
+            artifact["content_type"] = info["content_type"]
+        try:
+            artifact["content"] = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            artifact["content_b64"] = base64.b64encode(raw).decode("ascii")
+        artifacts.append(artifact)
+    return artifacts
+
+
+JETTY_SAFE_TRAJECTORY_SCALARS = {
+    "status", "state", "provider_status", "trajectory_id", "storage_path", "error",
+    "elapsed_ms", "duration_ms", "input_tokens", "output_tokens", "total_tokens",
+    "cost", "cost_usd", "total_tool_calls", "api_calls",
+}
+JETTY_SAFE_USAGE_SCALARS = {
+    "duration_seconds", "prompt_tokens", "completion_tokens", "input_tokens",
+    "output_tokens", "total_tokens", "cost", "cost_usd", "currency", "model",
+    "api_calls", "cached_input_tokens", "cache_read_input_tokens",
+    "cache_creation_input_tokens", "cache_write_input_tokens",
+}
+
+
+def _safe_jetty_output_file(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or not isinstance(value.get("path"), str):
+        return None
+    return {
+        key: value[key] for key in ("path", "content_type", "extension")
+        if isinstance(value.get(key), str)
+    }
+
+
+def merged_jetty_trajectory(
+    polled: dict[str, Any], detail: dict[str, Any],
+    *, run_outputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project provider evidence onto the secret-safe persisted trajectory."""
+    trajectory: dict[str, Any] = {
+        key: value for key, value in polled.items()
+        if key in JETTY_SAFE_TRAJECTORY_SCALARS
+        and isinstance(value, (str, int, float, bool))
+    }
+    if run_outputs is None:
+        run_outputs = jetty_runbook_outputs(detail)
+    raw_usage = run_outputs.get("usage")
+    usage_record = (
+        string_keyed_dict(raw_usage, "Jetty steps.run.outputs.usage")
+        if isinstance(raw_usage, dict) else {}
+    )
+    usage: dict[str, Any] = {
+        key: value for key, value in usage_record.items()
+        if key in JETTY_SAFE_USAGE_SCALARS
+        and value is not None
+        and isinstance(value, (str, int, float))
+        and not isinstance(value, bool)
+    }
+    if usage:
+        trajectory["usage"] = usage
+        if isinstance(usage.get("duration_seconds"), (int, float)):
+            trajectory.setdefault("elapsed_ms", int(usage["duration_seconds"] * 1000))
+        if isinstance(usage.get("cost_usd"), (int, float)):
+            trajectory.setdefault("cost_usd", usage["cost_usd"])
+        if isinstance(usage.get("api_calls"), int):
+            trajectory.setdefault("api_calls", usage["api_calls"])
+    for key in ("storage_path", "error"):
+        if isinstance(detail.get(key), str) and not trajectory.get(key):
+            trajectory[key] = detail[key]
+    steps = detail.get("steps")
+    run_step = steps.get("run") if isinstance(steps, dict) else None
+    if isinstance(run_step, dict):
+        safe_outputs: dict[str, Any] = {}
+        for key in ("success", "num_files_saved", "agent", "model"):
+            value = run_outputs.get(key)
+            if isinstance(value, (str, int, float, bool)):
+                safe_outputs[key] = value
+        safe_results = [
+            projected for value in run_outputs.get("results_files", [])
+            if (projected := _safe_jetty_output_file(value)) is not None
+        ] if isinstance(run_outputs.get("results_files", []), list) else []
+        safe_outputs["results_files"] = safe_results
+        if usage:
+            safe_outputs["usage"] = usage
+        safe_run: dict[str, Any] = {"outputs": safe_outputs}
+        for key in ("activity", "created", "ended", "duration_seconds"):
+            value = run_step.get(key)
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                safe_run[key] = value
+        trajectory["steps"] = {"run": safe_run}
+    return trajectory
 
 
 def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeout_s: int = DEFAULT_RUNNER_TIMEOUT_S, poll_interval_s: float = 5) -> Any:
@@ -3776,7 +4181,6 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
         jetty = request.get("jetty", {})
         collection = str(jetty.get("collection", ""))
         task_name = str(jetty.get("task", ""))
-        mapping: dict[str, str] = {}
         trajectory_id = None
         actual_task_contract_sha256: str | None = None
         actual_task_contract: dict[str, Any] | None = None
@@ -3818,28 +4222,42 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
                 )
                 if mounted_hash != harness.get("skill_tree_hash"):
                     raise RuntimeError("Jetty skill bytes changed after payload attestation")
-            non_task_files = [
-                item for item in upload_files if item.get("role") != "task"]
-            task_files = [item for item in upload_files if item.get("role") == "task"]
-            for item in non_task_files:
-                upload_item = replace_placeholders(copy.deepcopy(item), mapping)
-                remote = str(client.upload(upload_item, collection))
-                if item.get("placeholder"):
-                    mapping[str(item["placeholder"])] = remote
-            for item in task_files:
-                upload_item = replace_placeholders(copy.deepcopy(item), mapping)
-                upload_item["content"] = resolved_task_upload_bytes(
-                    item["content"], mapping)
-                remote = str(client.upload(upload_item, collection))
-                if item.get("placeholder"):
-                    mapping[str(item["placeholder"])] = remote
+            plan = row.get("upload_plan", {})
+            bundle = plan.get("bundle") if isinstance(plan.get("bundle"), dict) else {}
+            bundle_placeholder = str(bundle.get("placeholder") or placeholder(task_name, "bundle", "zip"))
+            archive_name = str(bundle.get("archive_name") or f"{task_name or 'skill-eval'}.zip")
+            mapping: dict[str, str] = {}
+            if upload_files:
+                storage_path = client.upload_bundle(
+                    archive_name, build_jetty_bundle(upload_files))
+                mapping[bundle_placeholder] = storage_path
             request = replace_placeholders(request, mapping)
             submission = client.submit(request)
-            trajectory_id = extract_trajectory_id(submission)
-            if not trajectory_id:
-                raise RuntimeError(f"Jetty submit response did not include trajectory_id: {submission}")
-            trajectory = client.poll(collection, task_name, trajectory_id, timeout_s=timeout_s, poll_interval_s=poll_interval_s)
-            lifecycle = lifecycle_from_record(trajectory)
+            trajectory_id, submitted_storage_path = validate_jetty_submission(
+                submission, collection=collection, task=task_name)
+            polled = client.poll(
+                collection, task_name, trajectory_id,
+                timeout_s=timeout_s, poll_interval_s=poll_interval_s,
+            )
+            poll_record = string_keyed_dict(polled, "Jetty poll response")
+            lifecycle = lifecycle_from_record(poll_record)
+            artifacts: list[dict[str, Any]] = []
+            if lifecycle.successful:
+                detail = client.fetch_trajectory(collection, task_name, trajectory_id)
+                poll_record, detail_record, _, run_outputs = (
+                    validate_jetty_completed_evidence(
+                        poll_record, detail,
+                        trajectory_id=trajectory_id,
+                        collection=collection,
+                        task=task_name,
+                        submitted_storage_path=submitted_storage_path,
+                    )
+                )
+                trajectory = merged_jetty_trajectory(
+                    poll_record, detail_record, run_outputs=run_outputs)
+                artifacts = fetch_jetty_artifacts(client, run_outputs)
+            else:
+                trajectory = merged_jetty_trajectory(poll_record, {})
             yield {
                 "harness": harness,
                 "status": lifecycle.status,
@@ -3858,7 +4276,7 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
                 "submitted_request": request,
                 "submission_response": submission,
                 "trajectory": trajectory,
-                "artifacts": trajectory.get("artifacts", trajectory.get("outputs", [])) if isinstance(trajectory, dict) else [],
+                "artifacts": artifacts,
             }
         except Exception as exc:
             lifecycle = lifecycle_from_status("failed", error=exc)
@@ -3911,6 +4329,11 @@ def artifact_content(artifact: dict[str, Any]) -> Any:
     for key in ["content", "text", "body"]:
         if key in artifact:
             return artifact[key]
+    if isinstance(artifact.get("content_b64"), str):
+        try:
+            return base64.b64decode(artifact["content_b64"], validate=True)
+        except (ValueError, TypeError):
+            return None
     return None
 
 
@@ -3958,10 +4381,18 @@ def validate_jetty_artifacts(raw_artifacts: Any) -> list[dict[str, Any]]:
         rel = artifact_rel_path(artifact)
         if rel is None:
             raise ValueError(f"Jetty artifacts[{index}] has an unsafe or ambiguous path")
-        content_fields = [key for key in ("content", "text", "body") if key in artifact]
+        content_fields = [
+            key for key in ("content", "text", "body", "content_b64")
+            if key in artifact
+        ]
         if len(content_fields) != 1 or artifact[content_fields[0]] is None:
             raise ValueError(
                 f"Jetty artifacts[{index}] must contain exactly one non-null content field")
+        if content_fields[0] == "content_b64":
+            content = artifact_content(artifact)
+            if not isinstance(content, bytes):
+                raise ValueError(
+                    f"Jetty artifacts[{index}].content_b64 must be valid base64")
         destination = rel.as_posix()
         if destination == "output.md":
             content = artifact[content_fields[0]]
@@ -3983,7 +4414,9 @@ def write_artifact(base: Path, artifact: dict[str, Any]) -> None:
         return
     dest = base / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(content, (dict, list)):
+    if isinstance(content, bytes):
+        dest.write_bytes(content)
+    elif isinstance(content, (dict, list)):
         dest.write_text(json.dumps(content, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     else:
         dest.write_text(str(content), encoding="utf-8")
@@ -4110,7 +4543,34 @@ def jetty_trace_records(record: dict[str, Any], artifacts: list[dict[str, Any]],
             f"Jetty trajectory has conflicting event streams: {present_streams}")
     for key in present_streams:
         values = trajectory[key]
-        if not isinstance(values, list):
+        if key == "steps" and isinstance(values, dict):
+            summarized: list[dict[str, Any]] = []
+            for name, step in values.items():
+                if not isinstance(step, dict):
+                    summarized.append({
+                        "type": "jetty.steps",
+                        "name": str(name),
+                        "content": str(step),
+                    })
+                    continue
+                outputs = step.get("outputs")
+                if not isinstance(outputs, dict):
+                    outputs = {}
+                entry = {
+                    "type": "jetty.steps",
+                    "name": str(name),
+                    "activity": step.get("activity"),
+                    "duration_seconds": step.get("duration_seconds"),
+                    "success": outputs.get("success"),
+                    "num_files_saved": outputs.get("num_files_saved"),
+                }
+                summarized.append({
+                    item_key: item_value
+                    for item_key, item_value in entry.items()
+                    if item_value is not None
+                })
+            values = summarized
+        elif not isinstance(values, list):
             raise TypeError(f"Jetty trajectory.{key} must be a list")
         for index, item in enumerate(values, 1):
             records.append(string_keyed_dict(

@@ -1,0 +1,35 @@
+{
+ "id": "chatcmpl-bb2bb71e",
+ "object": "chat.completion",
+ "created": 1784283984,
+ "model": "claude-sonnet-4-6",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": "Sandbox execution completed successfully. claude-code saved 8 file(s)."
+   },
+   "finish_reason": "stop"
+  }
+ ],
+ "jetty_metadata": {
+  "trajectory_id": "bb2bb71e",
+  "collection": "skill-evals",
+  "task": "skill-eval-contract-probe",
+  "mode": "runbook",
+  "storage_path": "skill-evals/skill-eval-contract-probe/0000",
+  "files": [
+   {
+    "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0001.agent--claude-code.txt",
+    "content_type": "text/plain;charset=utf-8",
+    "extension": "txt"
+   },
+   {
+    "path": "skill-evals/skill-eval-contract-probe/0000/bb2bb71e.runbook.0007.app--results--output.md",
+    "content_type": "application/octet-stream",
+    "extension": "md"
+   }
+  ]
+ }
+}
