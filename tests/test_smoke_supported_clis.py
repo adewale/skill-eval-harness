@@ -213,7 +213,7 @@ class SupportedCliSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             completed = subprocess.run(
                 [sys.executable, str(SCRIPT), "--out-dir", str(Path(td) / "out")],
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                text=True, capture_output=True, check=False,
             )
         self.assertEqual(completed.returncode, 2)
         self.assertIn("--live", completed.stderr)
@@ -222,7 +222,7 @@ class SupportedCliSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             completed = subprocess.run(
                 [sys.executable, str(SCRIPT), "--live", "--agents", " , ", "--out-dir", str(Path(td) / "out")],
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                text=True, capture_output=True, check=False,
             )
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("at least one", completed.stderr)

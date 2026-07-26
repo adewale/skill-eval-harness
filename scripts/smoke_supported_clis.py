@@ -12,21 +12,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import time
-from typing import Any, Mapping
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent_capabilities import SMOKE_TARGETS  # noqa: E402
-from skill_benchmark import invoke_argv_with_timeout  # noqa: E402
-from trigger_contracts import TriggerObservation  # noqa: E402
-from telemetry import ObservationEvidence  # noqa: E402
+from agent_capabilities import SMOKE_TARGETS
+from skill_benchmark import invoke_argv_with_timeout
+from telemetry import ObservationEvidence
+from trigger_contracts import TriggerObservation
 
 DEFAULT_MODELS = {name: target.resolved_model(os.environ) for name, target in SMOKE_TARGETS.items()}
 ANSWER_AGENTS = tuple(name for name, target in SMOKE_TARGETS.items() if target.population == "answer")

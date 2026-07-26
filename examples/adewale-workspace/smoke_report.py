@@ -19,8 +19,9 @@ from pathlib import Path
 ROOT = Path(os.environ.get("SKILL_EVAL_WORKSPACE_ROOT", Path(__file__).resolve().parents[3])).resolve()
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HARNESS_ROOT))
-import skill_benchmark as hb  # noqa: E402
-from run_pi_smoke import DEFAULT_SELECTION  # noqa: E402
+from run_pi_smoke import DEFAULT_SELECTION
+
+import skill_benchmark as hb
 
 
 def selection_for_run(run_name: str) -> dict[str, list[str]]:

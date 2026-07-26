@@ -36,17 +36,17 @@ class InvocationOutcomeInvariantTests(unittest.TestCase):
 
     def test_direct_constructor_rejects_every_contradictory_state(self):
         invalid = [
-            dict(returncode=1, state=InvocationState.COMPLETE),
-            dict(returncode=124, state=InvocationState.COMPLETE,
-                 completion_evidence=CompletionEvidence.AGENT_WINDOW_EXHAUSTED),
-            dict(returncode=127, state=InvocationState.COMPLETE,
-                 completion_evidence=CompletionEvidence.AGENT_WINDOW_EXHAUSTED),
-            dict(returncode=0, state=InvocationState.TIMED_OUT),
-            dict(returncode=1, state=InvocationState.SPAWN_FAILED),
-            dict(returncode=0, state=InvocationState.PROCESS_FAILED),
-            dict(returncode=0, state=InvocationState.PROVIDER_FAILED),
-            dict(returncode=124, state=InvocationState.PROVIDER_FAILED, provider_error="error"),
-            dict(returncode=0, state=InvocationState.HARNESS_FAILED),
+            {"returncode": 1, "state": InvocationState.COMPLETE},
+            {"returncode": 124, "state": InvocationState.COMPLETE,
+                 "completion_evidence": CompletionEvidence.AGENT_WINDOW_EXHAUSTED},
+            {"returncode": 127, "state": InvocationState.COMPLETE,
+                 "completion_evidence": CompletionEvidence.AGENT_WINDOW_EXHAUSTED},
+            {"returncode": 0, "state": InvocationState.TIMED_OUT},
+            {"returncode": 1, "state": InvocationState.SPAWN_FAILED},
+            {"returncode": 0, "state": InvocationState.PROCESS_FAILED},
+            {"returncode": 0, "state": InvocationState.PROVIDER_FAILED},
+            {"returncode": 124, "state": InvocationState.PROVIDER_FAILED, "provider_error": "error"},
+            {"returncode": 0, "state": InvocationState.HARNESS_FAILED},
         ]
         for fields in invalid:
             with self.subTest(fields=fields), self.assertRaises((TypeError, ValueError)):

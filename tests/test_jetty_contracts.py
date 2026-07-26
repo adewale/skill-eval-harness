@@ -1,7 +1,7 @@
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 import jetty_contracts as jc
 import skill_benchmark as sb
@@ -76,7 +76,7 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
                 "model_provider": "anthropic", "snapshot": "s"}},
             "upload_plan": {"files": []},
         }
-        record = list(sb.execute_jetty_payloads([payload], client=client))[0]
+        record = next(iter(sb.execute_jetty_payloads([payload], client=client)))
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["lifecycle"]["kind"], "failed")
         self.assertIn("trajectory_id", record["error"])

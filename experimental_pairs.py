@@ -7,9 +7,10 @@ metric is computed.
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Iterable, Literal, Mapping
+from typing import Any, Literal
 
 ArmName = Literal["with_skill", "without_skill"]
 
@@ -41,7 +42,7 @@ class ExperimentalPairKey:
             raise ValueError(f"unknown experimental population: {self.population!r}") from exc
 
     @classmethod
-    def from_row(cls, row: Mapping[str, Any], *, population: str) -> "ExperimentalPairKey":
+    def from_row(cls, row: Mapping[str, Any], *, population: str) -> ExperimentalPairKey:
         if "case_id" not in row:
             raise ValueError("experimental row is missing case_id")
         if not isinstance(row["case_id"], str):

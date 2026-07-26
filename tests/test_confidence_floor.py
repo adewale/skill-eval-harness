@@ -17,8 +17,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import skill_benchmark as sb
 from helpers import load_example_module
+
+import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "detectors"

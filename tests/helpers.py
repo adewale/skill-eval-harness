@@ -108,8 +108,7 @@ def report_fixture(case_rates: dict[str, tuple[float, float]], *, failures: list
                 "execution_valid": True, "objective_pass_rate": rate, "metadata": {},
                 "assertions": [], "qualitative_assertions": [],
             })
-    for f in failures or []:
-        results.append(f)
+    results.extend(failures or [])
     flags = []
     for case_id, (w, n) in case_rates.items():
         fl = []

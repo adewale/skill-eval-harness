@@ -30,13 +30,14 @@ from __future__ import annotations
 import hashlib
 import re
 import statistics
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Optional, Union
+from typing import Any
 
 
-def _require(d: dict[str, Any], key: str, types: "type | tuple[type, ...]", ctx: str) -> Any:
+def _require(d: dict[str, Any], key: str, types: type | tuple[type, ...], ctx: str) -> Any:
     """Strict field extraction for the from_dict parsers at the JSON boundary where
     runner metadata returns: the field must be present, non-null, and of the right
     type, else ValueError. This is what makes 'the minimum schema is enforced by
@@ -104,13 +105,22 @@ RUNNER_FAILURE_MARKER_BY_PROVIDER = {
     "vibe": VIBE_FAILURE,
 }
 
-
+# These runner-domain names are intentionally re-exported from this module for
+# backwards compatibility with the harness's established import surface.
 from runner_contracts import (
-    AnswerOutcome, Completed, OutcomeContext, Provider, ProviderFailed, RunnerOutcome,
-    SpawnFailed, TimedOut, outcome_context, outcome_with_context,
-    process_observation_complete, provider_response_complete,
+    AnswerOutcome,
+    Completed,
+    OutcomeContext,
+    Provider,
+    ProviderFailed,
+    RunnerOutcome,
+    SpawnFailed,
+    TimedOut,
+    outcome_context,
+    outcome_with_context,
+    process_observation_complete,
+    provider_response_complete,
 )
-
 
 # --------------------------------------------------------------------------- #
 # Tree identity — two hashes, one comparison.
@@ -130,7 +140,7 @@ class TreeIdentity:
     def is_edited(self) -> bool:
         return self.edited != self.canonical
 
-    def same_revision_as(self, other: "TreeIdentity") -> bool:
+    def same_revision_as(self, other: TreeIdentity) -> bool:
         """Both arms derive from the same canonical skill — the precondition for a
         sound paired comparison."""
         return bool(self.canonical) and self.canonical == other.canonical
@@ -288,7 +298,7 @@ class Component:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Component":
+    def from_dict(cls, d: dict[str, Any]) -> Component:
         rb = d.get("removed_bytes") if isinstance(d, dict) else None
         if rb is not None and (isinstance(rb, bool) or not isinstance(rb, int) or rb < 0):
             raise ValueError("Component: field 'removed_bytes' must be a non-negative int")
@@ -352,7 +362,7 @@ class Provenance:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Provenance":
+    def from_dict(cls, d: dict[str, Any]) -> Provenance:
         # Strict at the JSON boundary: a runner that drops id/mode/population/either
         # hash, empty/mixed components, or a malformed component is rejected here
         # instead of yielding a partial Provenance the verifier has to special-case.
@@ -371,7 +381,7 @@ class Provenance:
     # of it once drifted independently across three test files).
     SCHEMA_KEYS = frozenset({"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
 
-    def matches(self, expected: "Provenance | ExpectedProvenance") -> bool:
+    def matches(self, expected: Provenance | ExpectedProvenance) -> bool:
         """Exact declared identity match; tree revision is checked separately."""
         return (
             self.id == expected.id
@@ -418,7 +428,7 @@ class InstructionSimulated:
 
     id: str
     population: Population
-    removed_component: Optional[str] = None
+    removed_component: str | None = None
     expected_regressions: tuple[str, ...] = ()
 
     MODE = AblationMode.INSTRUCTION_SIMULATED
@@ -450,7 +460,7 @@ class InstructionSimulated:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "InstructionSimulated":
+    def from_dict(cls, d: dict[str, Any]) -> InstructionSimulated:
         removed = d.get("removed_component") if isinstance(d, dict) else None
         if removed is not None and not isinstance(removed, str):
             raise ValueError("InstructionSimulated: removed_component must be string or null")
@@ -464,7 +474,7 @@ class InstructionSimulated:
 
 
 # The CLOSED set of records that can describe an ablation on a prepared row.
-AblationRecord = Union[Provenance, InstructionSimulated]
+AblationRecord = Provenance | InstructionSimulated
 _MATERIALIZED_MODES = (AblationMode.MATERIALIZED.value, AblationMode.INVALID_SKILL.value)
 
 
@@ -566,10 +576,10 @@ class PreparedTaskDraft:
         object.__setattr__(self, "row", dict(self.row))
 
     @classmethod
-    def from_row(cls, row: dict[str, Any]) -> "PreparedTaskDraft":
+    def from_row(cls, row: dict[str, Any]) -> PreparedTaskDraft:
         return cls(row)
 
-    def validate(self) -> "PreparedTask":
+    def validate(self) -> PreparedTask:
         return PreparedTask.from_row(self.row)
 
     @property
@@ -593,7 +603,7 @@ class PreparedTaskDraft:
         return tuple(self.row.get("input_files") or ())
 
     @property
-    def ablation(self) -> Optional[AblationRecord]:
+    def ablation(self) -> AblationRecord | None:
         raw = self.row.get("ablation")
         return ablation_record_from_dict(raw) if isinstance(raw, dict) else None
 
@@ -638,9 +648,9 @@ class PreparedTask:
     instruction: str
     prompt: str
     tags: tuple[str, ...]
-    ablation: Optional[AblationRecord] = None
-    skill_tree_hash: Optional[str] = None
-    answer_key: Optional[dict[str, Any]] = None
+    ablation: AblationRecord | None = None
+    skill_tree_hash: str | None = None
+    answer_key: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for label, value in (("case_id", self.case_id), ("kind", self.kind),
@@ -743,7 +753,7 @@ class PreparedTask:
         return row
 
     @classmethod
-    def from_row(cls, row: dict[str, Any]) -> "PreparedTask":
+    def from_row(cls, row: dict[str, Any]) -> PreparedTask:
         if not isinstance(row, dict):
             raise ValueError("PreparedTask row must be an object")
         if "run_number" not in row:
@@ -796,13 +806,13 @@ class ResultSet:
     def all(self) -> list[dict[str, Any]]:
         return list(self._rows)
 
-    def scorable(self) -> "ResultSet":
+    def scorable(self) -> ResultSet:
         return ResultSet(r for r in self._rows if scorable_run(r))
 
-    def where(self, **eq: Any) -> "ResultSet":
+    def where(self, **eq: Any) -> ResultSet:
         return ResultSet(r for r in self._rows if all(r.get(k) == v for k, v in eq.items()))
 
-    def matching(self, predicate) -> "ResultSet":
+    def matching(self, predicate) -> ResultSet:
         return ResultSet(r for r in self._rows if predicate(r))
 
     def by_case_variant(self) -> dict[Any, dict[Any, list[dict[str, Any]]]]:

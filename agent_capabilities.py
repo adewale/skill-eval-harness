@@ -7,9 +7,10 @@ against it instead of relying on stale paragraphs.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
-from typing import Literal, Mapping
+from typing import Literal
 
 CostSupport = Literal["provider_reported", "trace_normalized", "price_table_estimated", "missing", "not_applicable"]
 Availability = Literal["available", "unavailable", "not_applicable"]

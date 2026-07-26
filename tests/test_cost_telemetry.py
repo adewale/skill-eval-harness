@@ -9,9 +9,9 @@ suite-run preflight budget gate. House rules hold: no live model, no network.
 import json
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import skill_benchmark as sb
 
@@ -254,7 +254,7 @@ class RunnerStampTests(unittest.TestCase):
         self.assertEqual(cost["total_cost"], 0.015)
         _, eur_cost = sb.stream_usage_and_cost('{"cost":{"amount":1,"currency":"EUR"}}')
         self.assertEqual(eur_cost, {"currency": "EUR", "total_cost": 1.0, "source": "trace_normalized"})
-        _, mixed_cost = sb.stream_usage_and_cost('\n'.join(['{"cost":{"amount":1,"currency":"EUR"}}', '{"cost":1}']))
+        _, mixed_cost = sb.stream_usage_and_cost('{"cost":{"amount":1,"currency":"EUR"}}\n{"cost":1}')
         self.assertEqual(mixed_cost, {"source": "missing"})
         empty_usage, empty_cost = sb.stream_usage_and_cost("plain text only")
         self.assertEqual(empty_usage, {"source": "missing"})

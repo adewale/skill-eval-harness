@@ -37,7 +37,7 @@ DOC_FILES = sorted(
 # opening fence: a run of >=3 ` or ~ (with optional info string).
 _FENCE_OPEN = re.compile(r"^[ \t]*(`{3,}|~{3,})")
 # inline code: a run of N backticks closed by a run of N backticks (handles ``, ```).
-_INLINE = re.compile(r"(`+)(?:.+?)\1", re.S)
+_INLINE = re.compile(r"(`+)(?:.+?)\1", re.DOTALL)
 # inline links / images: ](target ...) — a <bracketed> target may contain spaces.
 _LINK = re.compile(r"\]\(\s*(<[^>]*>|[^)\s]+)")
 # reference-style definitions: [label]: target

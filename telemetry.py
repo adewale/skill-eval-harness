@@ -6,12 +6,13 @@ measurement cannot leak into arithmetic as zero.
 """
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
 import math
 import re
-from typing import Any, Generic, Iterable, Mapping, TypeVar
+from collections import Counter
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -99,7 +100,7 @@ class ObservationEvidence:
         }
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, Any]) -> "ObservationEvidence":
+    def from_dict(cls, raw: Mapping[str, Any]) -> ObservationEvidence:
         if not isinstance(raw, Mapping) or raw.get("schema_version") != 1:
             raise ValueError("observation evidence must use schema_version 1")
         values: dict[str, str] = {}
@@ -114,7 +115,7 @@ class ObservationEvidence:
         return evidence
 
     @classmethod
-    def from_run(cls, raw: Mapping[str, Any]) -> "ObservationEvidence":
+    def from_run(cls, raw: Mapping[str, Any]) -> ObservationEvidence:
         explicit = raw.get("observation_evidence")
         if isinstance(explicit, Mapping):
             return cls.from_dict(explicit)
@@ -213,7 +214,7 @@ class Money:
         object.__setattr__(self, "currency", currency)
 
     @classmethod
-    def from_raw(cls, amount: Any, currency: Any = "USD") -> "Money":
+    def from_raw(cls, amount: Any, currency: Any = "USD") -> Money:
         return cls(_decimal(amount), str(currency))
 
     def to_dict(self) -> dict[str, str]:
@@ -276,19 +277,19 @@ class Measurement(Generic[T]):
         object.__setattr__(self, "basis", dict(self.basis))
 
     @classmethod
-    def available(cls, value: T, *, provenance: str, basis: Mapping[str, Any] | None = None) -> "Measurement[T]":
+    def available(cls, value: T, *, provenance: str, basis: Mapping[str, Any] | None = None) -> Measurement[T]:
         return cls(AVAILABLE, value=value, provenance=provenance, basis=basis or {})
 
     @classmethod
-    def unavailable(cls, reason: str, *, basis: Mapping[str, Any] | None = None) -> "Measurement[T]":
+    def unavailable(cls, reason: str, *, basis: Mapping[str, Any] | None = None) -> Measurement[T]:
         return cls(UNAVAILABLE, basis=basis or {}, reason=reason)
 
     @classmethod
-    def not_applicable(cls, reason: str, *, basis: Mapping[str, Any] | None = None) -> "Measurement[T]":
+    def not_applicable(cls, reason: str, *, basis: Mapping[str, Any] | None = None) -> Measurement[T]:
         return cls(NOT_APPLICABLE, basis=basis or {}, reason=reason)
 
     @classmethod
-    def from_dict(cls, raw: Any) -> "Measurement[Any]":
+    def from_dict(cls, raw: Any) -> Measurement[Any]:
         if not isinstance(raw, Mapping):
             raise ValueError("measurement must be an object")
         availability = raw.get("availability")
@@ -400,11 +401,11 @@ class Comparison(Generic[T]):
         object.__setattr__(self, "basis", dict(self.basis))
 
     @classmethod
-    def comparable(cls, value: T, *, basis: Mapping[str, Any] | None = None) -> "Comparison[T]":
+    def comparable(cls, value: T, *, basis: Mapping[str, Any] | None = None) -> Comparison[T]:
         return cls(COMPARABLE, value=value, basis=basis or {})
 
     @classmethod
-    def blocked(cls, reason: str, *, basis: Mapping[str, Any] | None = None) -> "Comparison[T]":
+    def blocked(cls, reason: str, *, basis: Mapping[str, Any] | None = None) -> Comparison[T]:
         return cls(BLOCKED, basis=basis or {}, reason=reason)
 
     def to_dict(self) -> dict[str, Any]:

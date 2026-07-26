@@ -13,7 +13,8 @@ that is actually mounted, so:
 That makes the materialized ablations produce a real, confirmable regression with
 zero model calls — the example runs in CI.
 """
-import sys, glob
+import glob
+import sys
 
 sys.stdin.read()  # the task prompt; we deliberately key off the MOUNTED skill, not the text
 
@@ -21,7 +22,8 @@ skill = ""
 for path in sorted(glob.glob("skills/**/*", recursive=True)):
     if path.endswith(".md"):
         try:
-            skill += open(path, encoding="utf-8").read() + "\n"
+            with open(path, encoding="utf-8") as skill_file:
+                skill += skill_file.read() + "\n"
         except OSError:
             pass
 
@@ -36,6 +38,7 @@ if len(lines) == 1:
 answer = "\n".join(lines)
 if "--output-last-message" in sys.argv:
     output_path = sys.argv[sys.argv.index("--output-last-message") + 1]
-    open(output_path, "w", encoding="utf-8").write(answer)
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        output_file.write(answer)
 else:
     print(answer)

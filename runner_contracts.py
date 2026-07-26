@@ -5,10 +5,11 @@ states. Artifact writers consume the union exhaustively and never repair boolean
 """
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
-import math
-from typing import Any, Mapping, TypeAlias
+from typing import Any, TypeAlias
 
 
 class Provider(str, Enum):
@@ -116,7 +117,7 @@ class OutcomeContext:
             raise TypeError("diagnose_returncode must be boolean")
 
     def enriched(self, *, metadata: Mapping[str, Any] | None = None,
-                 environment: Mapping[str, Any] | None = None) -> "OutcomeContext":
+                 environment: Mapping[str, Any] | None = None) -> OutcomeContext:
         return replace(
             self,
             metadata_extra={**dict(self.metadata_extra), **dict(metadata or {})},

@@ -6,37 +6,33 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
-import contextlib
-import io
 import json
-import os
-import re
-import shutil
-import stat
-import subprocess
-import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
-import skill_benchmark as sb
-import run_pi_trigger_eval as tr
-import ablation_model as am
 from helpers import (
-    CODEX_CRASH_OUTPUT as CRASH,
     CONTAINS_APPROVED_CASE as CASE,
-    demo_manifest as base_manifest,
-    good_pr_manifest as _manifest,
-    load_example_module,
-    make_eval_repo,
-    report_fixture,
-    write_demo_manifest as write_manifest,
-    write_good_pr_skill as _skill,
-    write_run,
 )
+from helpers import (
+    demo_manifest as base_manifest,
+)
+from helpers import (
+    good_pr_manifest as _manifest,
+)
+from helpers import (
+    make_eval_repo,
+)
+from helpers import (
+    write_demo_manifest as write_manifest,
+)
+from helpers import (
+    write_good_pr_skill as _skill,
+)
+
+import run_pi_trigger_eval as tr
+import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -141,10 +137,9 @@ class EvalReadinessTests(unittest.TestCase):
             self.assertEqual(r["leak_saturated_cases"], [])
 
     def _audit_ns(self, manifest_path, **over):
-        import argparse
-        base = dict(manifest=str(manifest_path), skill_path=None, runs=None, split=None,
-                    format="json", out=None, min_positive=5, min_negative=3, min_adversarial=3,
-                    min_trigger_pos=2, min_trigger_neg=2, leakage_min_chars=4, fail_on_blockers=False)
+        base = {"manifest": str(manifest_path), "skill_path": None, "runs": None, "split": None,
+                    "format": "json", "out": None, "min_positive": 5, "min_negative": 3, "min_adversarial": 3,
+                    "min_trigger_pos": 2, "min_trigger_neg": 2, "leakage_min_chars": 4, "fail_on_blockers": False}
         base.update(over)
         return argparse.Namespace(**base)
 

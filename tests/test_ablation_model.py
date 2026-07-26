@@ -13,8 +13,8 @@ class ProvenanceSchemaTests(unittest.TestCase):
         return am.TreeIdentity(canonical="C", edited="E")
 
     def prov(self, **over):
-        base = dict(id="no-rp", mode="materialized", population="answer",
-                    identity=self.ident(), components=(am.Component("instructions", "section", "skills/x/SKILL.md", {"heading": "## H"}),))
+        base = {"id": "no-rp", "mode": "materialized", "population": "answer",
+                    "identity": self.ident(), "components": (am.Component("instructions", "section", "skills/x/SKILL.md", {"heading": "## H"}),)}
         base.update(over)
         return am.Provenance(**base)
 

@@ -1,9 +1,9 @@
 """Closed Jetty lifecycle and imported-result contracts."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
-
+from typing import Any
 
 _QUEUED = {"pending", "queued", "starting"}
 _RUNNING = {"running", "in_progress"}
@@ -210,7 +210,7 @@ class JettyObservation:
             raise ValueError("successful Jetty observation requires trajectory_id")
 
     @classmethod
-    def from_record(cls, record: Mapping[str, Any], *, has_output: bool) -> "JettyObservation":
+    def from_record(cls, record: Mapping[str, Any], *, has_output: bool) -> JettyObservation:
         lifecycle = lifecycle_from_record(record)
         trajectory_id = record.get("trajectory_id")
         if lifecycle.successful and (

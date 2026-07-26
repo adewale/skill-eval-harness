@@ -6,38 +6,22 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
-import contextlib
-import io
 import json
 import os
-import re
-import shutil
-import stat
-import subprocess
-import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
-import skill_benchmark as sb
-import run_pi_trigger_eval as tr
-import run_trigger_matrix as tm
-import ablation_model as am
 from helpers import (
-    CODEX_CRASH_OUTPUT as CRASH,
-    CONTAINS_APPROVED_CASE as CASE,
-    demo_manifest as base_manifest,
-    good_pr_manifest as _manifest,
     load_example_module,
     make_eval_repo,
-    report_fixture,
-    write_demo_manifest as write_manifest,
-    write_good_pr_skill as _skill,
-    write_run,
 )
+
+import ablation_model as am
+import run_pi_trigger_eval as tr
+import run_trigger_matrix as tm
+import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
 smoke = load_example_module("run_pi_smoke", "examples/adewale-workspace/run_pi_smoke.py")
@@ -379,7 +363,6 @@ class SkillAblationTests(unittest.TestCase):
     def test_bad_ablation_dir_does_not_clear_owned_dir_before_rejecting(self):
         # A harness-owned dir (has the marker) passed as --out-dir but sitting inside a
         # skill root must NOT be cleared before the containment gate rejects it.
-        import argparse
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             ab = {"id": "x", "removed_component": "sev", "mechanism": "section", "target": {"heading": "## Severity"}}
@@ -649,7 +632,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
 
             # 2) Pi smoke: instruction + mount names (relative) + workspace tree names
             with tempfile.TemporaryDirectory() as wa, tempfile.TemporaryDirectory() as wb:
-                pi_instr_a, pi_args_a, _, paths_a, _ = smoke.materialize_runtime_workspace(manifest, repo_root, case, "ablation:no-rp", Path(wa))
+                pi_instr_a, _pi_args_a, _, paths_a, _ = smoke.materialize_runtime_workspace(manifest, repo_root, case, "ablation:no-rp", Path(wa))
                 pi_instr_w, _, _, paths_w, _ = smoke.materialize_runtime_workspace(manifest, repo_root, case, "with_skill", Path(wb))
                 self.assertEqual(pi_instr_a, pi_instr_w)
                 self.assertEqual([Path(x).relative_to(wa).as_posix() for x in paths_a],
@@ -783,7 +766,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             p = self.repo(root, [self.SECTION_ABL])
             manifest = sb.validate_manifest(p)
             rows = sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl")
-            rp = [r for r in rows if r["variant"] == "ablation:no-rp"][0]
+            rp = next(r for r in rows if r["variant"] == "ablation:no-rp")
             self.assertTrue(all("abl" in Path(sp).parts for sp in rp["skill_paths"]))
             self.assertNotIn("Regression-proof requirement", Path(rp["skill_paths"][0]).read_text(encoding="utf-8"))
 
@@ -792,7 +775,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])
             manifest = sb.validate_manifest(p)
-            row = [r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "rabl") if r["variant"] == "ablation:no-rp"][0]
+            row = next(r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "rabl") if r["variant"] == "ablation:no-rp")
             trees = {"no-rp": sb.materialize(sb.ValidatedAblation.validate(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL), root / "jabl")}
             payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
             skill_files = [f for f in payload["upload_plan"]["files"] if f["role"] == "skill"]
@@ -811,7 +794,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])
             manifest = sb.validate_manifest(p)
-            row = [r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl") if r["variant"] == "ablation:no-rp"][0]
+            row = next(r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl") if r["variant"] == "ablation:no-rp")
             trees = {"no-rp": sb.materialize(sb.ValidatedAblation.validate(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL), root / "jabl")}
             payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
             # What the model actually sees: the jetty request (runbook + jetty block,
@@ -1727,7 +1710,7 @@ class AblationReviewFixesTests(unittest.TestCase):
             p = repo / "evals" / "shared-benchmark.json"
             p.write_text(json.dumps(m), encoding="utf-8")
             manifest = sb.validate_manifest(p)
-            row = [r for r in sb.prepared_task_rows(p, manifest) if r["variant"] == "with_skill"][0]
+            row = next(r for r in sb.prepared_task_rows(p, manifest) if r["variant"] == "with_skill")
             tree_dir = sb.build_canonical_skill_tree(sb.repo_root_for_manifest(p), manifest, root / "wst")
             payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", with_skill_tree_dir=tree_dir)
             hints = [f["remote_path_hint"] for f in payload["upload_plan"]["files"] if f["role"] == "skill"]
@@ -1822,7 +1805,7 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
         # still a subsequence of the original. Pin the EXACT removed bytes with an
         # independent slice of the known fixture (the oracle), so a parser that
         # deleted a different span would be caught.
-        start_marker, end_marker = "<!-- ablation:no-scope:start -->\n", "<!-- ablation:no-scope:end -->"
+        _start_marker, _end_marker = "<!-- ablation:no-scope:start -->\n", "<!-- ablation:no-scope:end -->"
         cases = {
             "section": (
                 {"mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}},
@@ -1934,7 +1917,7 @@ class AblationParserExactnessTests(unittest.TestCase):
         text = "See [guide](references/g.md) now.\n\nSyntax: `[guide](references/g.md)` shows a link.\n"
         ops = sb.reference_pointer_ops(text, "references/g.md")
         self.assertEqual(len(ops), 1)
-        s, e, rep = ops[0]
+        s, _e, rep = ops[0]
         self.assertEqual(rep, "guide")
         self.assertLess(s, text.index("`"))    # the matched link precedes the inline-code span
 
@@ -1969,7 +1952,7 @@ class AblationParserExactnessTests(unittest.TestCase):
         text = "Run !`deploy --prod` now.\n\nExample shown as code: `!`deploy --prod`` stays.\n"
         ops = sb.preprocess_ops(text, ["deploy"])
         self.assertEqual(len(ops), 1)
-        s, e, _ = ops[0]
+        s, _e, _ = ops[0]
         self.assertLess(s, text.index("Example"))   # only the first (real) command line
 
     def test_every_text_mechanism_ignores_code_and_layer_decoys(self):

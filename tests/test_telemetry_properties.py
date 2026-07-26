@@ -6,10 +6,10 @@ exercise the remaining untyped JSON/numeric boundary and algebraic laws.
 from __future__ import annotations
 
 from decimal import Decimal
-from itertools import permutations
 
 import pytest
-from hypothesis import given, strategies as st
+from hypothesis import given
+from hypothesis import strategies as st
 
 from telemetry import (
     AVAILABLE,
@@ -53,7 +53,7 @@ def test_cost_parser_is_valid_or_explicitly_unavailable(raw):
 @pytest.mark.parametrize("left_state", ["available", "unavailable", "not_applicable"])
 @pytest.mark.parametrize("right_state", ["available", "unavailable", "not_applicable"])
 @pytest.mark.parametrize("same_currency", [True, False])
-@pytest.mark.parametrize("increment", [Decimal("-0.10"), Decimal("0"), Decimal("0.10")])
+@pytest.mark.parametrize("increment", [Decimal("-0.10"), Decimal(0), Decimal("0.10")])
 def test_every_availability_currency_and_denominator_combination_is_safe(left_state, right_state, same_currency, increment):
     basis = {"population": "answer", "provider": "p", "model": "m", "billing_scope": "run",
              "case_id": "case-1", "run_number": 1}
