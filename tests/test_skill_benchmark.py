@@ -1,20 +1,20 @@
 import contextlib
 import io
 import json
-import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from helpers import load_example_module
+
+import run_pi_trigger_eval as tr
+
 # Normal imports (not private importlib loads): the whole suite must share ONE
 # skill_benchmark module instance, or registries/monkeypatches/`is`-identity
 # checks silently diverge between test files.
 import skill_benchmark as sb
-import run_pi_trigger_eval as tr
-import ablation_model as am
-from helpers import load_example_module
 
 ROOT = Path(__file__).resolve().parents[1]
 smoke = load_example_module("run_pi_smoke", "examples/adewale-workspace/run_pi_smoke.py")

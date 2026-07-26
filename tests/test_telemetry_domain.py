@@ -9,14 +9,14 @@ import unittest
 from decimal import Decimal
 
 from telemetry import (
+    EVIDENCE_COMPLETE,
+    EVIDENCE_INCOMPLETE,
+    EVIDENCE_UNKNOWN,
     Aggregate,
     Comparison,
     Measurement,
     Money,
     ObservationEvidence,
-    EVIDENCE_COMPLETE,
-    EVIDENCE_INCOMPLETE,
-    EVIDENCE_UNKNOWN,
     aggregate_money_by_currency,
     aggregate_numeric,
     compare_cost_pair,

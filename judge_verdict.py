@@ -1,11 +1,12 @@
 """Strict discriminated judge verdicts and stored-result boundary parsing."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
 import math
 import statistics
-from typing import Any, Mapping, TypeAlias
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, TypeAlias
 
 
 class VerdictKind(str, Enum):
@@ -190,7 +191,7 @@ def verdict_from_dict(raw: Mapping[str, Any], *, strict_stored: bool = True,
         pairs = tuple((name, _number(value, f"dimension {name}")) for name, value in dims.items())
         if not all(isinstance(name, str) and name for name, _ in pairs):
             raise ValueError("dimension names must be non-empty strings")
-        if expected_dimensions is not None and set(name for name, _ in pairs) != set(expected_dimensions):
+        if expected_dimensions is not None and {name for name, _ in pairs} != set(expected_dimensions):
             raise ValueError("dimension_scores must exactly match the declared dimensions")
         normalized = round(statistics.mean((value - 1) / 4 for _, value in pairs), 4) if pairs else float("nan")
         threshold = raw.get("threshold")

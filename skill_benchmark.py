@@ -18,13 +18,14 @@ import difflib
 import errno
 import hashlib
 import html
+import itertools
 import json
 import math
 import os
 import random
 import re
-import shutil
 import shlex
+import shutil
 import signal
 import statistics
 import subprocess
@@ -34,15 +35,68 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
+from dataclasses import dataclass as _dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import yaml
-import telemetry as telemetry_domain
-import experimental_pairs as pair_domain
 
-from judge_verdict import BooleanVerdict, ConsensusVerdict, validated_result_row, verdict_fields, verdict_from_dict
-from jetty_contracts import JettyObservation, ProtocolInvalid, lifecycle_from_record, lifecycle_from_status
+import experimental_pairs as pair_domain
+import telemetry as telemetry_domain
+from ablation_model import (
+    CLAUDE_FAILURE,
+    CODEX_FAILURE,
+    JETTY_FAILURE,
+    RUNNER_FAILURE_MARKER_BY_PROVIDER,
+    TIMEOUT_FAILURE,
+    VIBE_FAILURE,
+    AblationMode,
+    AblationRecord,
+    AnswerOutcome,
+    Arm,
+    Completed,
+    Component,
+    ComponentClass,
+    EvidenceClass,
+    ExpectedProvenance,
+    InstructionSimulated,
+    MaterializedArm,
+    Mechanism,
+    OutcomeContext,
+    Population,
+    PreparedTask,
+    PreparedTaskDraft,
+    Provenance,
+    ProviderFailed,
+    ResultSet,
+    RunnerOutcome,
+    SpawnFailed,
+    TimedOut,
+    TreeIdentity,
+    ablation_id_of,
+    causal_confirmation,
+    execution_valid,
+    is_ablation_variant,
+    outcome_context,
+    outcome_with_context,
+    process_observation_complete,
+    provider_response_complete,
+    scorable_run,
+)
+from jetty_contracts import (
+    JettyObservation,
+    ProtocolInvalid,
+    lifecycle_from_record,
+    lifecycle_from_status,
+)
+from judge_verdict import (
+    BooleanVerdict,
+    ConsensusVerdict,
+    validated_result_row,
+    verdict_fields,
+    verdict_from_dict,
+)
 from trace_contracts import EventState, event_is_completed, parse_event_state
 from trigger_contracts import (
     InvocationOutcome,
@@ -50,47 +104,6 @@ from trigger_contracts import (
     TriggerDetection,
     TriggerEvidenceKind,
 )
-from ablation_model import (
-    AblationRecord,
-    AnswerOutcome,
-    Arm,
-    CLAUDE_FAILURE,
-    Completed,
-    CODEX_FAILURE,
-    AblationMode,
-    Component,
-    ComponentClass,
-    EvidenceClass,
-    ExpectedProvenance,
-    InstructionSimulated,
-    Mechanism,
-    Population,
-    ablation_id_of,
-    is_ablation_variant,
-    JETTY_FAILURE,
-    VIBE_FAILURE,
-    MaterializedArm,
-    PreparedTask,
-    PreparedTaskDraft,
-    OutcomeContext,
-    ProviderFailed,
-    Provenance,
-    ResultSet,
-    RUNNER_FAILURE_MARKER_BY_PROVIDER,
-    RunnerOutcome,
-    SpawnFailed,
-    TimedOut,
-    outcome_context,
-    outcome_with_context,
-    process_observation_complete,
-    provider_response_complete,
-    TIMEOUT_FAILURE,
-    TreeIdentity,
-    causal_confirmation,
-    execution_valid,
-    scorable_run,
-)
-from dataclasses import dataclass as _dataclass
 
 VALID_SPLITS = {"tune", "holdout", "holdback"}
 DEFAULT_VARIANTS = ["with_skill", "without_skill"]
@@ -178,9 +191,7 @@ def assertion_severity(assertion: dict[str, Any], *, strict: bool = False) -> st
             severity = "critical"
         elif assertion.get("gate") is True:
             severity = "gate"
-        elif assertion.get("soft") is True or "atLeast" in assertion:
-            severity = "soft"
-        elif assertion.get("type") in QUALITATIVE_ASSERTIONS or assertion.get("type") == "similarity":
+        elif assertion.get("soft") is True or "atLeast" in assertion or assertion.get("type") in QUALITATIVE_ASSERTIONS or assertion.get("type") == "similarity":
             severity = "soft"
         else:
             severity = "gate"
@@ -361,9 +372,7 @@ def assertion_applies_to_variant(assertion: dict[str, Any], variant: str) -> boo
     if isinstance(only, list) and variant not in only:
         return False
     excluded = assertion.get("except_variants")
-    if isinstance(excluded, list) and variant in excluded:
-        return False
-    return True
+    return not (isinstance(excluded, list) and variant in excluded)
 
 
 def validate_script_assertion(assertion: dict[str, Any], manifest_path: Path, cid: str, index: int) -> None:
@@ -1636,7 +1645,7 @@ class ValidatedAblation:
     population: str
 
     @classmethod
-    def validate(cls, repo_root: Path, manifest: dict[str, Any], ablation: dict[str, Any]) -> "ValidatedAblation":
+    def validate(cls, repo_root: Path, manifest: dict[str, Any], ablation: dict[str, Any]) -> ValidatedAblation:
         comps = ablation_components(ablation)
         if not comps:
             raise AblationError(f"ablation {ablation.get('id')!r} declares no removal (instruction-simulated)")
@@ -2291,7 +2300,7 @@ class JettyClient:
         boundary = f"----skill-eval-harness-{int(time.time() * 1000)}"
         parts: list[bytes] = []
         def add_field(name: str, value: str) -> None:
-            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode("utf-8"))
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
         add_field("collection", collection)
         filename = item.get("remote_path_hint") or (Path(str(item.get("local_path", "file"))).name)
         if "content" in item:
@@ -2299,10 +2308,10 @@ class JettyClient:
             content = json.dumps(raw, ensure_ascii=False).encode("utf-8") if isinstance(raw, (dict, list)) else str(raw).encode("utf-8")
         else:
             content = Path(str(item["local_path"])).read_bytes()
-        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode("utf-8"))
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode())
         parts.append(content)
         parts.append(b"\r\n")
-        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+        parts.append(f"--{boundary}--\r\n".encode())
         req = urllib.request.Request(
             self.base_url + "/api/v1/files/upload",
             data=b"".join(parts),
@@ -3123,7 +3132,7 @@ def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
             if leader_exited:
                 break
         else:
-            stdout, stderr, returncode, timed_out = _text(out), _text(err)[:4000], proc.returncode, False
+            stdout, stderr, returncode, _timed_out = _text(out), _text(err)[:4000], proc.returncode, False
             communication_complete = True
             break
     if not communication_complete:
@@ -3166,7 +3175,6 @@ def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
         stdout = _text(out or exc.stdout)
         stderr = _text(err or exc.stderr or str(exc))[:4000]
         returncode = proc.returncode if leader_exited and proc.returncode is not None else 124
-        timed_out = not leader_exited
     else:
         try:
             group_cleanup = kill_process_group(proc.pid)
@@ -3196,7 +3204,7 @@ def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
 
 
 def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:
-    flags = re.I if ci else 0
+    flags = re.IGNORECASE if ci else 0
     try:
         return re.search(pattern, text, flags) is not None
     except re.error:
@@ -3709,9 +3717,7 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     # model tool use at all.
     event_type = TraceEventKind.EVENT
     name = stringify_trace_value(raw_trace_value(record, "tool", "tool_name", "name"))
-    if "skill" in raw_type and ("load" in raw_type or "read" in raw_type):
-        event_type = TraceEventKind.SKILL_LOAD
-    elif path.endswith("SKILL.md") or "/SKILL.md" in path:
+    if "skill" in raw_type and ("load" in raw_type or "read" in raw_type) or path.endswith("SKILL.md") or "/SKILL.md" in path:
         event_type = TraceEventKind.SKILL_LOAD
     elif "command" in raw_type or "exec" in raw_type or command:
         event_type = TraceEventKind.COMMAND
@@ -4033,9 +4039,11 @@ class PiStream:
     cost_normalized: dict[str, Any]
 
     def __post_init__(self) -> None:
-        if self.failure_error:
-            if self.usage_normalized != {"source": "missing"} or self.cost_normalized != {"source": "missing"}:
-                raise ValueError("failed Pi streams cannot carry measured usage or cost")
+        if self.failure_error and (
+            self.usage_normalized != {"source": "missing"}
+            or self.cost_normalized != {"source": "missing"}
+        ):
+            raise ValueError("failed Pi streams cannot carry measured usage or cost")
 
     @property
     def failure_error(self) -> str | None:
@@ -4043,7 +4051,7 @@ class PiStream:
 
     @classmethod
     def from_records(cls, records: Iterable[dict[str, Any]],
-                     parse_errors: Iterable[str] = ()) -> "PiStream":
+                     parse_errors: Iterable[str] = ()) -> PiStream:
         materialized = [dict(record) for record in records]
         terminal_error = _pi_terminal_error(materialized)
         final_agent_end = _pi_final_agent_end(materialized)
@@ -4067,7 +4075,7 @@ class PiStream:
                    usage, cost)
 
     @classmethod
-    def parse(cls, raw_text: str) -> "PiStream":
+    def parse(cls, raw_text: str) -> PiStream:
         if not isinstance(raw_text, str):
             raise TypeError("Pi stream must be text")
         records, errors = parse_trace_jsonl_text(raw_text)
@@ -5103,7 +5111,7 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     text = stdout if isinstance(stdout, str) else ""
     try:
         env = extract_json_object(text)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return {"answer": "", "raw_response": text, "cost_usd": None,
                 "usage": {}, "parse_error": str(exc)}
     if not isinstance(env, dict) or "result" not in env:
@@ -5261,9 +5269,8 @@ def codex_structured_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
         if isinstance(t, str):
             if t != "null":
                 node["type"] = [t, "null"]
-        elif isinstance(t, list):
-            if "null" not in t:
-                node["type"] = [*t, "null"]
+        elif isinstance(t, list) and "null" not in t:
+            node["type"] = [*t, "null"]
 
     def walk(node: Any) -> None:
         if not isinstance(node, dict):
@@ -5421,7 +5428,14 @@ def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_d
     timeout = float(assertion.get("timeout_s", 30))
     expected = int(assertion.get("pass_exit_code", 0))
     try:
-        proc = subprocess.run(command, cwd=manifest_dir, text=True, capture_output=True, timeout=timeout)
+        proc = subprocess.run(
+            command,
+            cwd=manifest_dir,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
         evidence = f"exit={proc.returncode}"
         if proc.stdout:
             evidence += f"\nstdout:\n{proc.stdout[:4000]}"
@@ -5453,7 +5467,7 @@ def embedding_similarity(actual: str, expected: str, embed_cmd: str, timeout: fl
     Kept out of core grading exactly like `script`: no --embed-cmd, no call."""
     try:
         proc = subprocess.run(embed_cmd, shell=True, input=json.dumps({"texts": [actual, expected]}),
-                              text=True, capture_output=True, timeout=timeout)
+                              text=True, capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
         return None, f"embed command timed out after {timeout}s"
     if proc.returncode != 0:
@@ -5552,12 +5566,12 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
         evidence = "none present" if passed else f"found banned {hit!r}"
     elif atype == "regex":
         pattern = str(assertion.get("pattern", assertion.get("value", "")))
-        flags = re.I if ci else 0
+        flags = re.IGNORECASE if ci else 0
         passed = re.search(pattern, text, flags) is not None
         evidence = f"matched /{pattern}/" if passed else f"missing /{pattern}/"
     elif atype == "not_regex":
         pattern = str(assertion.get("pattern", assertion.get("value", "")))
-        flags = re.I if ci else 0
+        flags = re.IGNORECASE if ci else 0
         passed = re.search(pattern, text, flags) is None
         evidence = f"absent /{pattern}/" if passed else f"found banned /{pattern}/"
     elif atype == "file_exists":
@@ -6057,7 +6071,9 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     assertion_schema = verdict_schema_for(task.get("assertion", {}))
     try:
         if judge_cmd:
-            proc = subprocess.run(judge_cmd, shell=True, input=prompt, text=True, capture_output=True)
+            proc = subprocess.run(
+                judge_cmd, shell=True, input=prompt, text=True, capture_output=True, check=False
+            )
             stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
         elif judge_backend in JUDGE_BACKENDS:
             res = JUDGE_BACKENDS[judge_backend](
@@ -6322,7 +6338,7 @@ class ToolReplayStore:
     @staticmethod
     def call_key(tool: str, payload: Any) -> str:
         canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-        return hashlib.sha256(f"{tool}\n{canonical}".encode("utf-8")).hexdigest()[:32]
+        return hashlib.sha256(f"{tool}\n{canonical}".encode()).hexdigest()[:32]
 
     def resolve(self, tool: str, payload: Any, live: Any = None) -> Any:
         key = self.call_key(tool, payload)
@@ -6388,13 +6404,13 @@ def run_subagent_tasks(
             shutil.copy2(existing_replay, replay_path)
         store = ToolReplayStore(replay_path, mode) if mode != "off" else None
 
-        def tool_executor(tool: str, payload: Any) -> Any:
+        def tool_executor(tool: str, payload: Any, replay_store=store) -> Any:
             live = (live_tools or {}).get(tool)
-            if store is None:
+            if replay_store is None:
                 if live is None:
                     raise ToolReplayMiss(f"no live executor for tool {tool!r}")
                 return live(payload)
-            return store.resolve(tool, payload, live=live)
+            return replay_store.resolve(tool, payload, live=live)
 
         turns = [str(t) for t in task.get("turns") or [] if str(t)]
         with tempfile.TemporaryDirectory(prefix="subagent-ws-") as wd:
@@ -6469,7 +6485,7 @@ def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S)
             payload["history"] = history
         try:
             proc = subprocess.run(agent_cmd, shell=True, input=json.dumps(payload),
-                                  text=True, capture_output=True, timeout=timeout)
+                                  text=True, capture_output=True, timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             return {"answer": "", "returncode": 124, "timed_out": True}
         if proc.returncode != 0:
@@ -8038,7 +8054,7 @@ def p90(values: list[float]) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
-    index = max(0, min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1)))))
+    index = max(0, min(len(ordered) - 1, round(0.9 * (len(ordered) - 1))))
     return ordered[index]
 
 
@@ -8865,7 +8881,7 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
             "time_seconds": copied_stats(tm, divide=1000),
             "tokens": copied_stats(tk),
         }
-    configs = [k for k in run_summary.keys() if k != "delta"]
+    configs = [k for k in run_summary if k != "delta"]
     if len(configs) >= 2:
         a, b = configs[0], configs[1]
         deltas = {}
@@ -9146,7 +9162,7 @@ def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
     import http.server
 
     class ViewerHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):   # noqa: N802 (stdlib naming)
+        def do_GET(self):
             body = html_text.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -9154,7 +9170,7 @@ def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
             self.end_headers()
             self.wfile.write(body)
 
-        def do_POST(self):   # noqa: N802
+        def do_POST(self):
             if self.path != "/feedback":
                 self.send_response(404)
                 self.end_headers()
@@ -9567,7 +9583,7 @@ def stale_case_candidates(reports: list[dict[str, Any]], *, min_runs: int = 2) -
 def build_trend_report(history_entries: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
     series = [trend_entry(label, report) for label, report in history_entries]
     diffs = []
-    for (prev_label, prev), (curr_label, curr) in zip(history_entries, history_entries[1:]):
+    for (prev_label, prev), (curr_label, curr) in itertools.pairwise(history_entries):
         diffs.append({"from": prev_label, "to": curr_label, "diff": benchmark_report_diff(prev, curr)})
     reports = [report for _, report in history_entries]
     return {
@@ -9630,7 +9646,15 @@ def suggest_cases(args: argparse.Namespace) -> int:
         if generate_cmd:
             gen_timeout = float(getattr(args, "timeout", 120))
             try:
-                proc = subprocess.run(generate_cmd, shell=True, input=json.dumps(seed), text=True, capture_output=True, timeout=gen_timeout)
+                proc = subprocess.run(
+                    generate_cmd,
+                    shell=True,
+                    input=json.dumps(seed),
+                    text=True,
+                    capture_output=True,
+                    timeout=gen_timeout,
+                    check=False,
+                )
             except subprocess.TimeoutExpired:
                 candidate["generation_error"] = f"generator timed out after {gen_timeout:g}s"
                 candidates.append(candidate)
@@ -10096,7 +10120,7 @@ def profile_skill(args: argparse.Namespace) -> int:
     return 0
 
 
-TRIGGER_NEGATION_RE = re.compile(r"NO_TRIGGER|not trigger|should not", re.I)
+TRIGGER_NEGATION_RE = re.compile(r"NO_TRIGGER|not trigger|should not", re.IGNORECASE)
 
 
 def expected_trigger_polarity(case: dict[str, Any]) -> str:
@@ -10691,8 +10715,8 @@ def audit_manifest(args: argparse.Namespace) -> int:
             lines.append(f"| {k} | {v} |")
         rd = report.get("readiness", {})
         lines += ["", "## Readiness", "",
-                  f"- ablations materialized: {rd.get('ablations',{}).get('materialized',0)}/{rd.get('ablations',{}).get('total',0)} "
-                  f"(instruction-simulated: {rd.get('ablations',{}).get('instruction_simulated',0)})",
+                  (f"- ablations materialized: {rd.get('ablations',{}).get('materialized',0)}/{rd.get('ablations',{}).get('total',0)} "
+                  f"(instruction-simulated: {rd.get('ablations',{}).get('instruction_simulated',0)})"),
                   f"- leak-saturated cases: {len(rd.get('leak_saturated_cases',[]))}",
                   f"- objective-only cases (no judge assertion): {len(rd.get('objective_only_cases',[]))}",
                   f"- adversarial cases: {rd.get('adversarial_cases',0)}   judge-only cases: {rd.get('judge_only_cases',0)}"]
@@ -10984,7 +11008,15 @@ def _run_suite_command(cmd: list[str], *, cwd: Path, log_path: Path, timeout: in
         log.write("$ " + " ".join(cmd) + "\n")
         log.flush()
         try:
-            proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
+            proc = subprocess.run(
+                cmd,
+                cwd=cwd,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
             returncode = proc.returncode
         except subprocess.TimeoutExpired:
             # The one timeout encoding (see run_argv_with_timeout).

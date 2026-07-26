@@ -21,29 +21,29 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 from skill_benchmark import (
     VALID_SPLITS,
-    is_trigger_case,
+    AblationError,
+    PiStream,
     build_canonical_skill_tree,
     canonical_skill_tree_hash,
-    detect_trigger,  # compatibility re-export; internal path uses typed detection
+    detect_trigger,
     detect_trigger_records,
-    event_texts_for_tool_input,  # noqa: F401  (re-exported for adapters/tests)
+    event_texts_for_tool_input,
     expected_trigger_polarity,
+    invoke_argv_with_timeout,
+    is_trigger_case,
     iter_cases,
     load_manifest_source,
     materialize_trigger_ablation,
     mount_skill_tree,
-    PiStream,
     pi_stream_terminal_error,
     repo_root_for_manifest,
-    invoke_argv_with_timeout,
     safe_trace_label,
     write_json,
     write_trace_artifacts,
-    AblationError,
 )
-from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 from trigger_contracts import InvocationOutcome, TriggerExpectation, TriggerObservation
 
 
@@ -205,7 +205,7 @@ def trigger_query_from_case(case: dict[str, Any]) -> str:
     # "Trigger decision eval. User prompt: <real prompt>\n\nReturn exactly ...".
     # Autonomous trigger testing must run the real user prompt, not the meta prompt,
     # otherwise skill discovery is being tested on the wrong task.
-    match = re.search(r"User prompt:\s*(.*?)(?:\n\s*\n\s*Return exactly|$)", prompt, re.I | re.S)
+    match = re.search(r"User prompt:\s*(.*?)(?:\n\s*\n\s*Return exactly|$)", prompt, re.IGNORECASE | re.DOTALL)
     if match:
         return match.group(1).strip()
     return prompt

@@ -6,12 +6,13 @@ contradictory booleans cannot be assembled independently.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from enum import Enum
 import math
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 import telemetry as telemetry_domain
 
@@ -87,9 +88,8 @@ class InvocationOutcome:
             raise ValueError("timed-out invocation must use returncode 124")
         if self.state is InvocationState.SPAWN_FAILED and self.returncode != 127:
             raise ValueError("spawn failure must use returncode 127")
-        if self.state is InvocationState.PROCESS_FAILED:
-            if self.returncode in {None, 0, 124, 127}:
-                raise ValueError("process failure requires a non-zero non-timeout returncode")
+        if self.state is InvocationState.PROCESS_FAILED and self.returncode in {None, 0, 124, 127}:
+            raise ValueError("process failure requires a non-zero non-timeout returncode")
         if self.state is InvocationState.PROVIDER_FAILED:
             if self.returncode is None or self.returncode in {124, 127} or self.provider_error is None:
                 raise ValueError("provider failure requires a non-timeout spawned process and provider_error")
@@ -118,7 +118,7 @@ class InvocationOutcome:
     @classmethod
     def from_process(cls, *, stdout: str, stderr: str, returncode: int,
                      elapsed_ms: int,
-                     metadata: Mapping[str, Any] | None = None) -> "InvocationOutcome":
+                     metadata: Mapping[str, Any] | None = None) -> InvocationOutcome:
         if returncode == 0:
             state = InvocationState.COMPLETE
             evidence = CompletionEvidence.NORMAL_EXIT
@@ -136,7 +136,7 @@ class InvocationOutcome:
 
     @classmethod
     def harness_failed(cls, message: str, *,
-                       metadata: Mapping[str, Any] | None = None) -> "InvocationOutcome":
+                       metadata: Mapping[str, Any] | None = None) -> InvocationOutcome:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("harness failure requires a non-empty message")
         return cls("", message, None, None, InvocationState.HARNESS_FAILED,
@@ -144,7 +144,7 @@ class InvocationOutcome:
 
     @classmethod
     def from_legacy_dict(cls, agent: str, raw: Mapping[str, Any], *,
-                         allow_nonzero_complete: bool = False) -> "InvocationOutcome":
+                         allow_nonzero_complete: bool = False) -> InvocationOutcome:
         """Strict compatibility parser for third-party/test adapters.
 
         Presence-only validation is deliberately insufficient: boolean strings,
@@ -218,27 +218,27 @@ class InvocationOutcome:
         return cls.from_process(stdout=stdout, stderr=stderr, returncode=returncode,
                                 elapsed_ms=elapsed_ms).with_metadata(metadata)
 
-    def with_metadata(self, values: Mapping[str, Any] | None = None, **extra: Any) -> "InvocationOutcome":
+    def with_metadata(self, values: Mapping[str, Any] | None = None, **extra: Any) -> InvocationOutcome:
         merged = {**dict(self.metadata), **dict(values or {}), **extra}
         return replace(self, metadata=merged)
 
-    def with_provider_payload(self, payload: Any) -> "InvocationOutcome":
+    def with_provider_payload(self, payload: Any) -> InvocationOutcome:
         return replace(self, provider_payload=payload)
 
     def with_wire_text(self, *, stdout: str, stderr: str,
-                       provider_error: str | None = None) -> "InvocationOutcome":
+                       provider_error: str | None = None) -> InvocationOutcome:
         if self.state is InvocationState.PROVIDER_FAILED and provider_error is None:
             raise ValueError("redacted provider failure must retain a provider error")
         return replace(self, stdout=stdout, stderr=stderr, provider_error=provider_error)
 
-    def with_provider_error(self, error: str | None, *, payload: Any = None) -> "InvocationOutcome":
+    def with_provider_error(self, error: str | None, *, payload: Any = None) -> InvocationOutcome:
         if not error or self.state in {InvocationState.TIMED_OUT, InvocationState.SPAWN_FAILED, InvocationState.HARNESS_FAILED}:
             return replace(self, provider_payload=payload if payload is not None else self.provider_payload)
         return replace(self, state=InvocationState.PROVIDER_FAILED,
                        completion_evidence=None, provider_error=error.strip(),
                        provider_payload=payload if payload is not None else self.provider_payload)
 
-    def as_agent_window_complete(self) -> "InvocationOutcome":
+    def as_agent_window_complete(self) -> InvocationOutcome:
         if self.state is not InvocationState.PROCESS_FAILED:
             raise ValueError("only a non-zero process failure can become an agent-window completion")
         return replace(self, state=InvocationState.COMPLETE,
@@ -265,7 +265,7 @@ class TriggerExpectation(str, Enum):
     DO_NOT_TRIGGER = "DO_NOT_TRIGGER"
 
     @classmethod
-    def from_bool(cls, value: bool) -> "TriggerExpectation":
+    def from_bool(cls, value: bool) -> TriggerExpectation:
         if not isinstance(value, bool):
             raise TypeError("trigger expectation must be a boolean at the wire boundary")
         return cls.TRIGGER if value else cls.DO_NOT_TRIGGER
@@ -322,11 +322,11 @@ class TriggerDetection:
         return [item.text for item in self.evidence]
 
     @classmethod
-    def absent(cls) -> "TriggerDetection":
+    def absent(cls) -> TriggerDetection:
         return cls()
 
     @classmethod
-    def from_texts(cls, kind: TriggerEvidenceKind, texts: list[str] | tuple[str, ...]) -> "TriggerDetection":
+    def from_texts(cls, kind: TriggerEvidenceKind, texts: list[str] | tuple[str, ...]) -> TriggerDetection:
         return cls(tuple(TriggerEvidence(kind, text) for text in texts if isinstance(text, str) and text.strip()))
 
 
@@ -436,9 +436,10 @@ class TriggerObservation:
             raise TypeError("trigger observation detection must be TriggerDetection")
         usage = _usage_block(self.usage)
         cost = _cost_block(self.cost)
-        if not self.invocation.observation_complete:
-            if usage.get("source") != "missing" or cost.get("source") != "missing":
-                raise ValueError("incomplete trigger observations must carry missing usage and cost")
+        if not self.invocation.observation_complete and (
+            usage.get("source") != "missing" or cost.get("source") != "missing"
+        ):
+            raise ValueError("incomplete trigger observations must carry missing usage and cost")
         metadata = dict(self.metadata)
         collisions = sorted(_TRIGGER_RESERVED_METADATA & set(metadata))
         if collisions:
@@ -488,7 +489,7 @@ class TriggerObservation:
         return row
 
     @classmethod
-    def from_row(cls, raw: Mapping[str, Any], *, default_agent: str | None = None) -> "TriggerObservation":
+    def from_row(cls, raw: Mapping[str, Any], *, default_agent: str | None = None) -> TriggerObservation:
         """Re-erect the typed contract when reading a persisted trigger row."""
         if not isinstance(raw, Mapping):
             raise TypeError("trigger observation row must be a mapping")
@@ -560,7 +561,7 @@ class TriggerObservation:
     @classmethod
     def harness_failure(cls, *, agent: str, model: str | None, query: str,
                         expectation: TriggerExpectation, error: BaseException,
-                        metadata: Mapping[str, Any] | None = None) -> "TriggerObservation":
+                        metadata: Mapping[str, Any] | None = None) -> TriggerObservation:
         message = f"{type(error).__name__}: {error}"
         invocation = InvocationOutcome.harness_failed(message)
         return cls(agent, model, query, expectation, invocation, TriggerDetection.absent(),

@@ -5,39 +5,27 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
-import argparse
-import contextlib
-import io
 import json
 import os
-import re
-import shutil
 import stat
-import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
-import skill_benchmark as sb
-import judge_verdict as jv
-import run_pi_trigger_eval as tr
-import ablation_model as am
 from helpers import (
-    CODEX_CRASH_OUTPUT as CRASH,
-    CONTAINS_APPROVED_CASE as CASE,
     demo_manifest as base_manifest,
-    good_pr_manifest as _manifest,
-    load_example_module,
-    make_eval_repo,
-    report_fixture,
+)
+from helpers import (
     write_demo_manifest as write_manifest,
-    write_good_pr_skill as _skill,
+)
+from helpers import (
     write_run,
 )
+
+import judge_verdict as jv
+import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -127,7 +115,7 @@ class JudgePresetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             (base / "output.md").write_text("claims", encoding="utf-8")
-            result, tasks = sb.grade_case_variant(case, "with_skill", "claims", base / "output.md", {}, run_base=base)
+            _result, tasks = sb.grade_case_variant(case, "with_skill", "claims", base / "output.md", {}, run_base=base)
             self.assertEqual(len(tasks), 1)
             self.assertTrue(tasks[0]["assertion"]["rubric"])   # canned rubric rides the judge task
             jid = tasks[0]["judge_task_id"]

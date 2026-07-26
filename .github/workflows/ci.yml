@@ -28,6 +28,9 @@ jobs:
       - name: Compile Python files
         run: python -m py_compile *.py examples/adewale-workspace/*.py
 
+      - name: Run Ruff
+        run: ruff check .
+
       - name: Run unit tests
         run: python -m unittest discover tests -v
 

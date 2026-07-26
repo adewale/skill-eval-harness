@@ -21,8 +21,18 @@ from typing import Any
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
-from skill_benchmark import write_trace_artifacts, materialized_tree_for_variant, variant_instruction, _copy_skill_root, ablation_variant_population, canonical_skill_tree_hash, detect_trigger, normalize_usage, normalize_cost  # noqa: E402
-from ablation_model import Provenance, TreeIdentity, TIMEOUT_FAILURE  # noqa: E402
+from ablation_model import TIMEOUT_FAILURE, Provenance
+from skill_benchmark import (
+    _copy_skill_root,
+    ablation_variant_population,
+    canonical_skill_tree_hash,
+    detect_trigger,
+    materialized_tree_for_variant,
+    normalize_cost,
+    normalize_usage,
+    variant_instruction,
+    write_trace_artifacts,
+)
 
 # Workspace-specific example: by default this assumes the harness directory is a
 # sibling of the skill repos. Override with SKILL_EVAL_WORKSPACE_ROOT.
@@ -258,7 +268,9 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
         stdout = ""
         stderr = ""
         try:
-            proc = subprocess.run(cmd, cwd=workspace, text=True, capture_output=True, timeout=timeout)
+            proc = subprocess.run(
+                cmd, cwd=workspace, text=True, capture_output=True, timeout=timeout, check=False
+            )
             stdout = _text(proc.stdout)
             stderr = _text(proc.stderr)
             returncode = proc.returncode

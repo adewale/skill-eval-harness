@@ -24,7 +24,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "hypothesis>=6"]
+test = ["pytest>=8", "hypothesis>=6", "ruff==0.16.0"]
 
 [project.urls]
 Homepage = "https://github.com/adewale/skill-eval-harness"
@@ -43,3 +43,23 @@ py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "a
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.ruff]
+required-version = "==0.16.0"
+
+[tool.ruff.lint.per-file-ignores]
+# These parsers intentionally normalize every malformed wire/schema value to
+# ValueError as part of their public validation contract.
+"ablation_model.py" = ["F401", "TRY004"]
+"experimental_pairs.py" = ["TRY004"]
+"judge_verdict.py" = ["TRY004"]
+"runner_contracts.py" = ["TRY004"]
+"telemetry.py" = ["TRY004"]
+# Runner boundaries must report arbitrary provider/CLI failures as evaluation
+# results, and the matrix's class attributes are immutable fixture shapes.
+"run_pi_trigger_eval.py" = ["F401"]
+"run_trigger_matrix.py" = ["BLE001", "F401", "RUF012"]
+"skill_benchmark.py" = ["BLE001", "F401", "S112"]
+# Test classes use container-valued fixtures, while nested patch contexts make
+# teardown ownership explicit.
+"tests/**/*.py" = ["BLE001", "RUF012", "SIM117"]

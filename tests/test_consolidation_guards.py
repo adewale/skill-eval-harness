@@ -21,12 +21,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import skill_benchmark as sb
-import run_pi_trigger_eval as tr
-import run_trigger_matrix as tm
+from helpers import make_eval_repo
+
 import ablation_model as am
 import agent_capabilities as ac
-from helpers import make_eval_repo
+import run_pi_trigger_eval as tr
+import run_trigger_matrix as tm
+import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -324,7 +325,7 @@ class DocSyncTests(unittest.TestCase):
     def test_readme_documents_no_phantom_assertion_types(self):
         # The Assertions table may only list types the registry knows.
         section = README.split("## Assertions", 1)[1].split("\n## ", 1)[0]
-        documented = {m.group(1) for m in re.finditer(r"^\| `([a-z_]+)`", section, re.M)}
+        documented = {m.group(1) for m in re.finditer(r"^\| `([a-z_]+)`", section, re.MULTILINE)}
         known = sb.OBJECTIVE_ASSERTIONS | sb.QUALITATIVE_ASSERTIONS
         self.assertFalse(documented - known, f"README documents assertion types the code does not register: {sorted(documented - known)}")
 

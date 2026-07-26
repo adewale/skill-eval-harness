@@ -5,38 +5,28 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
-import argparse
-import contextlib
-import io
 import json
-import os
-import re
-import shutil
-import stat
-import subprocess
-import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest import mock
 
-import skill_benchmark as sb
-import run_pi_trigger_eval as tr
-import ablation_model as am
 from helpers import (
-    CODEX_CRASH_OUTPUT as CRASH,
-    CONTAINS_APPROVED_CASE as CASE,
     demo_manifest as base_manifest,
+)
+from helpers import (
     good_pr_manifest as _manifest,
-    load_example_module,
-    make_eval_repo,
-    report_fixture,
+)
+from helpers import (
     write_demo_manifest as write_manifest,
+)
+from helpers import (
     write_good_pr_skill as _skill,
+)
+from helpers import (
     write_run,
 )
+
+import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -577,7 +567,7 @@ class ReviewFixRegressionTests(unittest.TestCase):
         # run_one_judge_task must persist dimension_scores/criteria and compute
         # the verdict via the same owner the merge uses — previously the row
         # kept only passed/score/evidence, so graded judging merged as failed.
-        case, assertion = self.graded_case()
+        case, _assertion = self.graded_case()
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             (base / "output.md").write_text("poster", encoding="utf-8")

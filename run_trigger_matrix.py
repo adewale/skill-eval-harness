@@ -56,38 +56,48 @@ import shlex
 import shutil
 import tempfile
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
+from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 from agent_capabilities import AGENT_CAPABILITIES
+from run_pi_trigger_eval import (
+    cases_from_manifest,
+    eval_rows_from_args,
+    load_manifest,
+    pi_argv,
+    pi_invocation_outcome,
+    seed_config_dir,
+    skill_name_from_manifest,
+    validate_trigger_rows,
+)
 from skill_benchmark import (
     VALID_SPLITS,
+    VIBE_DEFAULT_CMD,
+    VIBE_READ_ONLY_TOOLS,
     AblationError,
+    PiStream,
     build_canonical_skill_tree,
+    build_vibe_cli_argv,
     canonical_skill_tree_hash,
+    codex_env_for_home,
     detect_trigger_detection,
     detect_trigger_records,
     frontmatter_value,
+    invoke_argv_with_timeout,
     iter_json_objects,
     materialize_trigger_ablation,
     mount_skill_tree,
-    PiStream,
     repo_root_for_manifest,
-    invoke_argv_with_timeout,
     safe_trace_label,
     stream_usage_and_cost,
-    build_vibe_cli_argv,
-    codex_env_for_home,
     vibe_env_for_home,
     vibe_skill_tool_evidence,
-    VIBE_DEFAULT_CMD,
-    VIBE_READ_ONLY_TOOLS,
     write_json,
     write_trace_artifacts,
 )
-from run_pi_trigger_eval import cases_from_manifest, eval_rows_from_args, load_manifest, pi_argv, pi_invocation_outcome, skill_name_from_manifest, seed_config_dir, validate_trigger_rows
-from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 from trigger_contracts import (
     InvocationOutcome,
     InvocationState,
@@ -688,15 +698,15 @@ def summarize_matrix(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "passed_runs": sum(1 for r in runs if r["pass"]),
             })
 
-        def polarity(should: bool) -> dict[str, Any]:
-            pol = [r for r in rows if r["should_trigger"] is should]
+        def polarity(result_rows: list[dict[str, Any]], should: bool) -> dict[str, Any]:
+            pol = [r for r in result_rows if r["should_trigger"] is should]
             return {"total": len(pol), "passed": sum(1 for r in pol if r["pass"]),
                     "pass_rate": (sum(1 for r in pol if r["pass"]) / len(pol)) if pol else None}
         passed = sum(1 for r in rows if r["pass"])
         matrix.append({
             "agent": agent, "model": model,
             "summary": {"total": len(rows), "passed": passed, "pass_rate": passed / len(rows),
-                        "should_trigger": polarity(True), "should_not_trigger": polarity(False),
+                        "should_trigger": polarity(rows, True), "should_not_trigger": polarity(rows, False),
                         "incomplete_observations": sum(1 for r in rows if not r["observation_complete"])},
             "queries": query_rows,
         })
@@ -712,7 +722,7 @@ def print_matrix(matrix: list[dict[str, Any]]) -> None:
 
         def frac(block: dict[str, Any]) -> str:
             return f"{block['passed']}/{block['total']}" if block["total"] else "-"
-        print(f"{cell['agent']:<8} {str(cell['model'] or 'default'):<10} "
+        print(f"{cell['agent']:<8} {cell['model'] or 'default'!s:<10} "
               f"{frac(s['should_trigger']):>12} {frac(s['should_not_trigger']):>16} "
               f"{str(s['passed']) + '/' + str(s['total']):>9}")
 

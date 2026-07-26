@@ -3,14 +3,15 @@ envelope in one place, capture real cost/usage into metrics.json, and total it
 in the benchmark report."""
 import argparse
 import json
-import os
 import stat
 import tempfile
 import unittest
 from pathlib import Path
 
+from helpers import make_eval_repo
+from helpers import stub_claude as _stub_claude
+
 import skill_benchmark as sb
-from helpers import make_eval_repo, stub_claude as _stub_claude
 
 
 def _manifest(rp: Path, cases):

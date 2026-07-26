@@ -25,13 +25,13 @@ import os
 import sys
 import tempfile
 import unittest
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from agent_capabilities import AGENT_CAPABILITIES
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
+from agent_capabilities import AGENT_CAPABILITIES
 from trigger_contracts import InvocationOutcome, InvocationState
 
 ROOT = Path(__file__).resolve().parents[1]
