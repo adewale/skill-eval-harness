@@ -553,5 +553,85 @@ class G2_BenchmarkMetricsScorableTests(unittest.TestCase):
             self.assertEqual(s["execution_errors"], 1)               # the failure is still disclosed
 
 
+class TrajectoryDiffTests(unittest.TestCase):
+    """The report's trajectory_diff block: per-case paired event-stream
+    comparison showing HOW behavior differed between arms — commands only one
+    arm ran, count deltas, skill-load rates — with missing trace evidence
+    surfacing as blocked pairs, never as an empty diff."""
+
+    def _events(self, commands, *, reads=0, skill=False):
+        events = [{"index": i + 1, "type": "command", "status": "completed",
+                   "state_source": "provider_status", "name": "bash",
+                   "input_summary": cmd} for i, cmd in enumerate(commands)]
+        for n in range(reads):
+            events.append({"index": len(events) + 1, "type": "file_read", "status": "completed",
+                           "state_source": "provider_status", "name": "Read",
+                           "input_summary": f"notes-{n}.md"})
+        if skill:
+            events.append({"index": len(events) + 1, "type": "skill_load", "status": "completed",
+                           "state_source": "provider_status", "name": "Skill",
+                           "input_summary": "skills/demo/SKILL.md"})
+        return {"schema_version": 2, "source": "test", "events": events}
+
+    def _rows(self, td, *, with_events, without_events, exec_valid=True):
+        from helpers import result_row
+        rows = []
+        for variant, events in (("with_skill", with_events), ("without_skill", without_events)):
+            base = Path(td) / "c1" / variant / "run-1"
+            write_run(base, "answer", events=events)
+            rows.append(result_row("c1", variant, rate=1.0, exec_valid=exec_valid,
+                                   run_number=1, run_base=str(base)))
+        return rows
+
+    def test_paired_diff_reports_command_and_count_deltas(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._rows(
+                td,
+                with_events=self._events(["npm install", "npm test"], reads=2, skill=True),
+                without_events=self._events(["npm install"], reads=0))
+            diff = sb.build_trajectory_diff(rows)
+        self.assertEqual(diff["pairs_compared"], 1)
+        case = diff["cases"][0]
+        self.assertEqual(case["case_id"], "c1")
+        self.assertEqual(case["commands_only_with_skill"], ["npm test"])
+        self.assertEqual(case["commands_only_without_skill"], [])
+        self.assertEqual(case["mean_deltas"]["commands"], 1.0)
+        self.assertEqual(case["mean_deltas"]["file_reads"], 3.0)   # 2 reads + the skill load
+        self.assertEqual(case["mean_deltas"]["steps"], 4.0)
+        self.assertEqual(case["skill_invoked"], {"with_skill": 1.0, "without_skill": 0.0})
+
+    def test_missing_trace_evidence_blocks_the_pair(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._rows(td, with_events=self._events(["ls"]), without_events=None)
+            diff = sb.build_trajectory_diff(rows)
+        self.assertEqual(diff["pairs_compared"], 0)
+        self.assertEqual(diff["cases"], [])
+        self.assertEqual(diff["pair_diagnostics"]["blocked_reason_counts"],
+                         {"missing_trace_evidence": 1})
+
+    def test_unscorable_run_blocks_the_pair(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._rows(td, with_events=self._events(["ls"]),
+                              without_events=self._events(["ls"]), exec_valid=False)
+            diff = sb.build_trajectory_diff(rows)
+        self.assertEqual(diff["pairs_compared"], 0)
+        self.assertEqual(diff["pair_diagnostics"]["blocked_reason_counts"],
+                         {"unscorable_arm": 1})
+
+    def test_benchmark_report_carries_the_section(self):
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / "repo"
+            p = _manifest(rp, [dict(CASE)])
+            runs = Path(td) / "runs"
+            for variant, cmds in (("with_skill", ["npm test"]), ("without_skill", [])):
+                write_run(runs / "c" / variant, "APPROVED", metadata={},
+                          events=self._events(cmds))
+            report = sb.build_benchmark_report(p, runs, split="tune",
+                                               variants_arg=["with_skill", "without_skill"])
+        diff = report["trajectory_diff"]
+        self.assertEqual(diff["pairs_compared"], 1)
+        self.assertEqual(diff["cases"][0]["commands_only_with_skill"], ["npm test"])
+
+
 if __name__ == "__main__":
     unittest.main()

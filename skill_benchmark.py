@@ -8917,6 +8917,88 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _trajectory_profile(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """One arm's trajectory shape, derived from normalized events under the same
+    completed-only rule the metrics counters follow. Commands are the display
+    string (input_summary first), not command_text's concatenated match text —
+    this is a report view for humans, not a regex haystack."""
+    completed = [e for e in events if event_is_completed(e)]
+    return {
+        "commands": [str(e.get("input_summary") or e.get("command") or e.get("cmd") or e.get("name") or "")
+                     for e in command_events(events)],
+        "counts": {
+            "steps": sum(1 for e in completed if e.get("type") in TRAJECTORY_STEP_TYPES),
+            "commands": len(command_events(events)),
+            "tool_calls": sum(1 for e in completed if e.get("type") in {"tool_call", "skill_load"}) + len(command_events(events)),
+            "file_reads": sum(1 for e in completed if e.get("type") in {"file_read", "skill_load"}),
+            "file_writes": sum(1 for e in completed if e.get("type") == "file_write"),
+        },
+        "skill_invoked": any(e.get("type") == "skill_load" or event_mentions_skill_file(e) for e in completed),
+    }
+
+
+def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-case paired event-stream comparison: HOW the arms behaved, not just
+    whether they passed — the commands only one arm ran, count deltas
+    (with - without), and per-arm skill-load rates. The diagnosis companion to
+    lift: on a no-lift or qualitative-only case it shows whether the skill
+    changed behavior at all. Pairing rides the experimental-pair owner, and an
+    arm without readable trace evidence BLOCKS its pair with a named reason —
+    missing evidence is never presented as an empty diff."""
+    profiles: dict[str, dict[str, Any]] = {}
+
+    def eligibility(row: dict[str, Any]) -> tuple[bool, str | None]:
+        if not scorable_run(row):
+            return False, "unscorable_arm"
+        base = row.get("run_base")
+        events, _ = read_events_base(Path(base)) if base else (None, "missing run_base")
+        if events is None:
+            return False, "missing_trace_evidence"
+        profiles[str(base)] = _trajectory_profile(events)
+        return True, None
+
+    construction = pair_domain.pairs_from_rows(results, population="answer", eligibility=eligibility)
+    delta_keys = ("steps", "commands", "tool_calls", "file_reads", "file_writes")
+    by_case: dict[str, dict[str, Any]] = {}
+    for pair in construction.pairs:
+        with_profile = profiles[str(pair.with_skill.payload.get("run_base"))]
+        without_profile = profiles[str(pair.without_skill.payload.get("run_base"))]
+        bucket = by_case.setdefault(pair.key.case_id, {
+            "pairs": 0, "deltas": {key: [] for key in delta_keys},
+            "skill_invoked": {"with_skill": [], "without_skill": []},
+            "only_with": [], "only_without": [],
+        })
+        bucket["pairs"] += 1
+        for key in delta_keys:
+            bucket["deltas"][key].append(with_profile["counts"][key] - without_profile["counts"][key])
+        bucket["skill_invoked"]["with_skill"].append(1.0 if with_profile["skill_invoked"] else 0.0)
+        bucket["skill_invoked"]["without_skill"].append(1.0 if without_profile["skill_invoked"] else 0.0)
+        with_commands, without_commands = set(with_profile["commands"]), set(without_profile["commands"])
+        bucket["only_with"].extend(c for c in with_profile["commands"] if c and c not in without_commands)
+        bucket["only_without"].extend(c for c in without_profile["commands"] if c and c not in with_commands)
+
+    def ordered_unique(values: list[str], cap: int = 8) -> list[str]:
+        seen: list[str] = []
+        for value in values:
+            if value not in seen:
+                seen.append(value)
+        return seen[:cap]
+
+    cases = [{
+        "case_id": case_id,
+        "pairs": bucket["pairs"],
+        "mean_deltas": {key: round(statistics.mean(values), 4) for key, values in bucket["deltas"].items()},
+        "skill_invoked": {arm: round(statistics.mean(values), 4) for arm, values in bucket["skill_invoked"].items()},
+        "commands_only_with_skill": ordered_unique(bucket["only_with"]),
+        "commands_only_without_skill": ordered_unique(bucket["only_without"]),
+    } for case_id, bucket in sorted(by_case.items())]
+    return {
+        "pairs_compared": len(construction.pairs),
+        "pair_diagnostics": construction.diagnostics(),
+        "cases": cases,
+    }
+
+
 def build_benchmark_report(
     path: Path,
     runs: Path,
@@ -9058,6 +9140,9 @@ def build_benchmark_report(
         "reliability": {**build_reliability(results), "paired_lift": build_paired_reliability(results)},
         "model_analysis": model_analysis_from_paired(paired_summary),
         "slice_summary": build_slice_summary(results, variants),
+        # HOW the arms behaved, beside whether they passed: paired event-stream
+        # deltas per case, fail-closed on missing trace evidence.
+        "trajectory_diff": build_trajectory_diff(results),
         "ablation_regressions": ablation_regressions,
         # Operational spend beside the quality numbers (issue #21): totals over
         # ALL runs (failures included), per-variant/case stats, paired cost
