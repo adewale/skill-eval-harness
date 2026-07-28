@@ -116,6 +116,19 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
         self.assertTrue(grep_events)
         self.assertTrue(all(e.get("status") == "in_progress" for e in grep_events))
 
+    def test_unmatched_tool_result_is_error_evidence_not_a_completed_call(self):
+        records = [{"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "missing", "content": "orphan"}]}}]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        self.assertEqual(metrics["tool_calls"], 0)
+        self.assertEqual(metrics["errors"], 1)
+        self.assertEqual(len(events_doc["events"]), 1)
+        event = events_doc["events"][0]
+        self.assertEqual((event["type"], event["status"]), ("error", "failed"))
+        self.assertIn("unmatched Claude tool_result", event["input_summary"])
+        self.assertEqual(event["raw_ref"], {"file": "trace.jsonl", "line": 1})
+        self.assertEqual(event["raw_result_ref"], {"file": "trace.jsonl", "line": 1})
+
     def test_skill_md_read_is_skill_load_evidence(self):
         _, metrics = sb.normalize_trace_records(claude_stream_records(), source="claude")
         self.assertTrue(metrics["skill_invoked"])

@@ -199,20 +199,63 @@ class ArmBlindingTests(unittest.TestCase):
 class EvidenceClassTests(unittest.TestCase):
     def test_confirmed_causal_only_reachable_through_the_guard(self):
         # CONFIRMED_CAUSAL requires verified provenance AND coverage AND the observed regression.
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True, regression_observed=True),
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
+                                                regression_observed=True, significant=None),
                          am.EvidenceClass.CONFIRMED_CAUSAL)
         # Missing any precondition cannot reach a confirmation.
-        self.assertEqual(am.causal_confirmation(provenance_verified=False, has_coverage=True, regression_observed=True),
+        self.assertEqual(am.causal_confirmation(provenance_verified=False, has_coverage=True,
+                                                regression_observed=True, significant=None),
                          am.EvidenceClass.INDETERMINATE)
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=False, regression_observed=True),
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=False,
+                                                regression_observed=True, significant=None),
                          am.EvidenceClass.INDETERMINATE)
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True, regression_observed=False),
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
+                                                regression_observed=False, significant=None),
                          am.EvidenceClass.REFUTED)
 
     def test_raw_measurement_is_not_a_confirmation(self):
         # The trigger path is a different type; it cannot be read as confirmed.
         self.assertFalse(am.EvidenceClass.RAW_MEASUREMENT.is_confirmation)
         self.assertTrue(am.EvidenceClass.CONFIRMED_CAUSAL.is_confirmation)
+
+    def test_significance_gate_lives_inside_the_door(self):
+        # An observed-but-insignificant regression is INDETERMINATE — seen, but
+        # the noise floor cannot be ruled out. Never REFUTED, which would
+        # wrongly claim "no regression".
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
+                                                regression_observed=True, significant=False),
+                         am.EvidenceClass.INDETERMINATE)
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
+                                                regression_observed=True, significant=True),
+                         am.EvidenceClass.CONFIRMED_CAUSAL)
+        # significant=None keeps the historical contract for callers that gate
+        # separately (or have no replication to test).
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
+                                                regression_observed=True, significant=None),
+                         am.EvidenceClass.CONFIRMED_CAUSAL)
+
+    def test_significance_must_be_explicit_and_strictly_typed(self):
+        with self.assertRaises(TypeError):
+            am.causal_confirmation(provenance_verified=True, has_coverage=True,
+                                   regression_observed=True)
+        for invalid in (0, 1, "false", [], {}):
+            with self.subTest(invalid=invalid), self.assertRaises(TypeError):
+                am.causal_confirmation(provenance_verified=True, has_coverage=True,
+                                       regression_observed=True, significant=invalid)
+
+    def test_significance_never_rescues_or_flips_the_other_gates(self):
+        # A refutation is a refutation regardless of significance machinery,
+        # and failed provenance/coverage stay INDETERMINATE even when the
+        # observed drop is significant.
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
+                                                regression_observed=False, significant=False),
+                         am.EvidenceClass.REFUTED)
+        self.assertEqual(am.causal_confirmation(provenance_verified=False, has_coverage=True,
+                                                regression_observed=True, significant=True),
+                         am.EvidenceClass.INDETERMINATE)
+        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=False,
+                                                regression_observed=True, significant=True),
+                         am.EvidenceClass.INDETERMINATE)
 
 
 class ResultSetTests(unittest.TestCase):

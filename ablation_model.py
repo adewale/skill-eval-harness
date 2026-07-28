@@ -186,16 +186,31 @@ def ablation_id_of(variant: Any) -> str | None:
 TRIGGER_MEASUREMENT_EVIDENCE_CLASS = "raw_autonomous_trigger_measurement"
 
 
-def causal_confirmation(*, provenance_verified: bool, has_coverage: bool, regression_observed: bool) -> EvidenceClass:
+def causal_confirmation(*, provenance_verified: bool, has_coverage: bool, regression_observed: bool,
+                        significant: bool | None) -> EvidenceClass:
     """The ONLY path to CONFIRMED_CAUSAL. `regression_observed` is the domain's
     already-resolved behavioral verdict (for the report: at least one cited case
     showed a named flip AND a same-case score drop). The guard adds the
     epistemic preconditions: without verified provenance and coverage a
     confirmation is impossible, and a raw-measurement runner never calls this, so
-    its results cannot be upgraded to a confirmed causal effect."""
+    its results cannot be upgraded to a confirmed causal effect.
+
+    `significant` is the replication gate, inside the door so no caller can
+    forget it: an OBSERVED regression that fails its significance test is
+    INDETERMINATE — seen, but the noise floor cannot be ruled out — never
+    REFUTED, which would wrongly claim "no regression". Pass None only when a
+    caller has no replication-level test and gates separately; it must still be
+    passed explicitly so a future replicated caller cannot forget the gate. A
+    refutation is a refutation regardless of significance machinery."""
+    if significant is not None and type(significant) is not bool:
+        raise TypeError("significant must be boolean or None")
     if not provenance_verified or not has_coverage:
         return EvidenceClass.INDETERMINATE
-    return EvidenceClass.CONFIRMED_CAUSAL if regression_observed else EvidenceClass.REFUTED
+    if not regression_observed:
+        return EvidenceClass.REFUTED
+    if significant is False:
+        return EvidenceClass.INDETERMINATE
+    return EvidenceClass.CONFIRMED_CAUSAL
 
 
 # --------------------------------------------------------------------------- #

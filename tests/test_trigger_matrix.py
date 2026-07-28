@@ -978,6 +978,8 @@ class TriggerComparisonTests(unittest.TestCase):
         self.assertTrue(out["paired"]["significance"]["significant_at_0_05"])
         self.assertGreater(out["summary"]["mean_pass_delta"], 0)
         self.assertEqual(out["evidence_class"], "refuted")
+        self.assertIn("aggregate mean pass delta is non-negative", out["note"])
+        self.assertNotIn("not significant", out["note"])
 
     def test_models_do_not_multiply_one_query_into_six_units(self):
         baseline = [trigger_row("one query", True, triggered=True, model=f"m{n}")
@@ -1013,6 +1015,21 @@ class TriggerComparisonTests(unittest.TestCase):
         self.assertEqual(reasons["only baseline"], "missing_ablation_arm")
         self.assertEqual(reasons["timed out"], "ablation_observations_incomplete")
         self.assertEqual(out["summary"]["comparable"], 6)
+
+    def test_partial_or_mismatched_repetitions_are_blocked(self):
+        base = [trigger_row("partial", True, triggered=True) for _ in range(2)]
+        abl = [trigger_row("partial", True, triggered=False),
+               trigger_row("partial", True, triggered=False, complete=False)]
+        base += [trigger_row("mismatched", True, triggered=True) for _ in range(2)]
+        abl += [trigger_row("mismatched", True, triggered=False)]
+        out = self._compare(base_rows=base, abl_rows=abl)
+        reasons = {entry["query"]: entry["reason"] for entry in out["paired"]["blocked"]}
+        self.assertEqual(reasons, {
+            "mismatched": "repetition_count_mismatch",
+            "partial": "ablation_observations_incomplete",
+        })
+        self.assertEqual(out["summary"]["comparable"], 0)
+        self.assertEqual(out["evidence_class"], "indeterminate")
 
     def test_malformed_row_is_rejected(self):
         bad = self._baseline_rows()
