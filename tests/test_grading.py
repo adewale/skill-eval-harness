@@ -990,5 +990,65 @@ class TriggerNotGradedIntoAnswerTests(unittest.TestCase):
             self.assertTrue(any(r["case_id"] == "ans" for r in report["results"]))
 
 
+class PerStepGradingTests(unittest.TestCase):
+    """A per_step judge assertion is trace-evidence-backed: with no completed
+    trajectory steps it FAILS CLOSED at grade time (no judge task, no model
+    spend), exactly like a process assertion with missing events.json."""
+
+    CASE = {"id": "c", "split": "tune", "prompt": "do it", "assertions": [
+        {"name": "sound-steps", "type": "judge", "per_step": True, "severity": "gate"},
+    ]}
+    EVENTS = [{"index": 1, "type": "command", "status": "completed",
+               "state_source": "provider_status", "name": "Bash",
+               "input_summary": "npm test", "raw_ref": {"file": "trace.jsonl", "line": 1}}]
+
+    def _grade(self, base, judge_results=None):
+        return sb.grade_case_variant(self.CASE, "with_skill", "the answer",
+                                     base / "output.md", {}, run_base=base,
+                                     judge_results=judge_results or {})
+
+    def test_missing_events_fails_closed_without_a_judge_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = write_run(Path(td) / "run", "the answer")
+            result, tasks = self._grade(base)
+        self.assertEqual(tasks, [])
+        rows = result["qualitative_assertions"]
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["passed"])
+        self.assertIn("trajectory", rows[0]["evidence"])
+
+    def test_no_completed_steps_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = write_run(Path(td) / "run", "the answer",
+                             events={"events": [{"index": 1, "type": "command",
+                                                 "status": "in_progress",
+                                                 "state_source": "provider_status"}]})
+            result, tasks = self._grade(base)
+        self.assertEqual(tasks, [])
+        self.assertFalse(result["qualitative_assertions"][0]["passed"])
+
+    def test_steps_present_defers_one_judge_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = write_run(Path(td) / "run", "the answer", events={"events": self.EVENTS})
+            result, tasks = self._grade(base)
+        self.assertEqual(len(tasks), 1)
+        self.assertTrue(tasks[0]["assertion"]["per_step"])
+        self.assertEqual(result["deferred_judge_tasks"], 1)
+
+    def test_per_step_verdict_merges_back_into_the_row(self):
+        jid = "c::with_skill::run-1::sound-steps"
+        verdict = {"judge_task_id": jid, "passed": True, "score": 1.0,
+                   "criteria": [{"name": "step-1", "met": True}], "minimum_criteria": 1,
+                   "evidence": "sound"}
+        with tempfile.TemporaryDirectory() as td:
+            base = write_run(Path(td) / "run", "the answer", events={"events": self.EVENTS})
+            result, tasks = self._grade(base, judge_results={jid: verdict})
+        self.assertEqual(tasks, [])
+        row = result["qualitative_assertions"][0]
+        self.assertTrue(row["passed"])
+        self.assertEqual(row["score"], 1.0)
+        self.assertIn("trajectory step", row["evidence"])
+
+
 if __name__ == "__main__":
     unittest.main()

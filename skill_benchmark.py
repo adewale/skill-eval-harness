@@ -487,6 +487,21 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
         minimum = dyn.get("minimum_criteria", 3)
         if not isinstance(minimum, int) or minimum < 1:
             die(f"{where} dynamic_rubric.minimum_criteria must be a positive integer")
+    per_step = assertion.get("per_step")
+    if per_step is not None:
+        if atype != "judge":
+            die(f"{where} per_step is only valid on judge assertions")
+        if dims is not None or dyn is not None:
+            die(f"{where} per_step cannot combine with graded_dimensions or dynamic_rubric")
+        if isinstance(per_step, dict):
+            unknown = set(per_step) - {"min_met_fraction"}
+            if unknown:
+                die(f"{where} per_step has unknown field(s): {', '.join(sorted(unknown))}")
+            fraction = per_step.get("min_met_fraction", 1.0)
+            if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0 < fraction <= 1:
+                die(f"{where} per_step.min_met_fraction must be a number in (0, 1]")
+        elif per_step is not True:
+            die(f"{where} per_step must be true or an object with min_met_fraction")
     if atype in {"regex", "not_regex"}:
         pattern = str(assertion.get("pattern", assertion.get("value", "")))
         try:
@@ -2932,6 +2947,32 @@ def read_metrics_base(base: Path) -> dict[str, Any]:
         if isinstance(data, dict) and not data.get("_error"):
             merged.update(data)
     return _with_committed_artifact_state(base, merged)
+
+
+def raw_trace_record_for_event(run_base: Path | None, event: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve one normalized event's raw_ref back to the raw provider record in
+    the run's trace.jsonl. The normalizer truncates input/output summaries, so
+    this is the sanctioned path to full fidelity WITHOUT fattening events.json.
+    Fails closed — returns None, never a guess — when the trace file, the cited
+    line, or valid JSON is absent."""
+    if run_base is None or not isinstance(event.get("raw_ref"), dict):
+        return None
+    ref = event["raw_ref"]
+    line_no = ref.get("line")
+    if (ref.get("file") != "trace.jsonl" or isinstance(line_no, bool)
+            or not isinstance(line_no, int) or line_no < 1):
+        return None
+    path = run_base / "trace.jsonl"
+    if not path.is_file():
+        return None
+    for i, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        if i == line_no:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                return None
+            return record if isinstance(record, dict) else None
+    return None
 
 
 def command_text(event: dict[str, Any]) -> str:
@@ -5895,6 +5936,59 @@ def extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("no JSON object found in judge output")
 
 
+# The step-shaped trajectory events a per-step judge grades: completed actions
+# only, same rule the metrics counters follow. Messages/metrics are context.
+TRAJECTORY_STEP_TYPES = {"command", "tool_call", "file_read", "file_write", "skill_load"}
+# Raw provider records can be arbitrarily large; a step payload embeds at most
+# this many characters of the raw record beside the normalized summaries.
+TRAJECTORY_STEP_RAW_CHARS = 2000
+
+
+def trajectory_steps(events: list[dict[str, Any]] | None, run_base: Path | None) -> list[dict[str, Any]]:
+    """The judgeable steps of one run: each COMPLETED action event, in
+    trajectory order, named step-1..step-N (ordinal names keep DynamicVerdict's
+    unique-name invariant). An in-progress or failed call never became an
+    action, so it is not a step. Each step carries the normalized summaries
+    plus the raw provider record resolved through raw_ref, so a per-step judge
+    sees full tool arguments instead of the normalizer's truncation."""
+    steps: list[dict[str, Any]] = []
+    for event in events or []:
+        if event.get("type") not in TRAJECTORY_STEP_TYPES or not event_is_completed(event):
+            continue
+        step: dict[str, Any] = {"step": f"step-{len(steps) + 1}",
+                                "event_index": event.get("index"),
+                                "type": event.get("type")}
+        for key in ("name", "input_summary", "output_summary", "exit_code"):
+            if event.get(key) not in (None, ""):
+                step[key] = event[key]
+        raw = raw_trace_record_for_event(run_base, event)
+        if raw is not None:
+            step["raw"] = json.dumps(raw, ensure_ascii=False, sort_keys=True)[:TRAJECTORY_STEP_RAW_CHARS]
+        steps.append(step)
+    return steps
+
+
+def per_step_minimum(assertion: dict[str, Any], step_count: int) -> int:
+    """minimum_criteria for a per-step verdict: ceil(min_met_fraction x steps),
+    defaulting to EVERY step (fraction 1.0), never below 1. Derived from the
+    run's actual step count at judge time — an authoring-time constant cannot
+    know how many steps a run will take."""
+    spec = assertion.get("per_step")
+    fraction = 1.0
+    if isinstance(spec, dict) and isinstance(spec.get("min_met_fraction"), (int, float)):
+        fraction = float(spec["min_met_fraction"])
+    return max(1, math.ceil(fraction * step_count))
+
+
+def _criteria_verdict_schema(min_items: int) -> dict[str, Any]:
+    """The criteria-list verdict schema shared by dynamic_rubric and per_step."""
+    return {"type": "object", "required": ["criteria"],
+            "properties": {"criteria": {"type": "array", "minItems": min_items,
+                                        "items": {"type": "object", "required": ["name", "met"],
+                                                  "properties": {"name": {"type": "string"}, "met": {"type": "boolean"}}}},
+                           "rationale": {"type": "string"}}}
+
+
 def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
     """The canonical JSON Schema for a judge verdict of this assertion's shape
     (G4), branching exactly as judge_prompt does. Handed to the model as the
@@ -5910,18 +6004,19 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
             dim_schema["required"] = dim_names
         return {"type": "object", "required": ["dimension_scores"],
                 "properties": {"dimension_scores": dim_schema, "rationale": {"type": "string"}}}
+    if assertion.get("per_step"):
+        # step count is a run property, not an assertion property, so the
+        # schema can only pin the item shape; run_one_judge_task enforces the
+        # exact step-name match once the run's steps are known.
+        return _criteria_verdict_schema(1)
     if assertion.get("dynamic_rubric"):
         minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
-        return {"type": "object", "required": ["criteria"],
-                "properties": {"criteria": {"type": "array", "minItems": minimum,
-                                            "items": {"type": "object", "required": ["name", "met"],
-                                                      "properties": {"name": {"type": "string"}, "met": {"type": "boolean"}}}},
-                               "rationale": {"type": "string"}}}
+        return _criteria_verdict_schema(minimum)
     return {"type": "object", "required": ["passed"],
             "properties": {"passed": {"type": "boolean"}, "score": {"type": "number"}, "rationale": {"type": "string"}}}
 
 
-def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | None = None, metrics: dict | None = None, artifacts: list | None = None, explore_dir: str | None = None) -> str:
+def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | None = None, metrics: dict | None = None, artifacts: list | None = None, explore_dir: str | None = None, steps: list | None = None) -> str:
     assertion = task.get("assertion", {})
     payload = {
         "judge_task_id": task.get("judge_task_id"),
@@ -5942,6 +6037,8 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
         payload["metrics"] = metrics
     if artifacts is not None:
         payload["artifacts"] = artifacts
+    if steps is not None:
+        payload["trajectory_steps"] = steps
     context_hint = ("You are ALSO given the run's `trajectory` (normalized tool-call events), `metrics`, "
                     "and an `artifacts` inventory — weigh HOW the answer was produced (skill invoked? sensible "
                     "tools? no forbidden command?), not only candidate_output.\n"
@@ -5957,6 +6054,18 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
     # G4: hand the model the exact schema the validator enforces (purely additive
     # instruction — the parse path is unchanged).
     schema_hint = "Your output MUST validate against this JSON Schema:\n" + json.dumps(verdict_schema_for(assertion)) + "\n\n"
+    if assertion.get("per_step"):
+        return (
+            "You are grading one Skill Eval Harness judge assertion PER STEP of the run's trajectory.\n"
+            "For EACH entry in trajectory_steps, judge whether that step was a sound action in context:\n"
+            "a sensible tool with sensible arguments that advances the task — not destructive, redundant,\n"
+            "or forbidden. A right answer reached through unsound steps is a finding, not a pass.\n"
+            "Return only JSON with keys: criteria (a list of {name (string), met (boolean)} with EXACTLY one\n"
+            "entry per step, using each step's given name, in the given order), rationale (string).\n"
+            + context_hint
+            + schema_hint
+            + json.dumps(payload, indent=2, ensure_ascii=False)
+        )
     if assertion.get("graded_dimensions"):
         return (
             "You are grading one Skill Eval Harness judge assertion with ANCHORED graded dimensions.\n"
@@ -6146,6 +6255,30 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     rb = task.get("run_base")
     run_base = Path(rb) if rb else None
     has_run_base = run_base is not None and run_base.exists()
+    # Per-step judging is trace-evidence-backed: resolve the run's steps BEFORE
+    # any model spend, and fail closed — like a process assertion — when there
+    # is nothing to judge. grade_case_variant already refuses to emit such a
+    # task; this guard covers re-run task files whose run dirs have changed.
+    per_step_steps: list[dict[str, Any]] | None = None
+    if task.get("assertion", {}).get("per_step"):
+        step_events, _ = read_events_base(run_base) if has_run_base else (None, None)
+        per_step_steps = trajectory_steps(step_events, run_base if has_run_base else None)
+        if not per_step_steps:
+            return validated_result_row({
+                "judge_task_id": task["judge_task_id"],
+                "case_id": task.get("case_id"),
+                "variant": task.get("variant"),
+                "run_number": task.get("run_number"),
+                "judge_model": judge_model,
+                "judge_backend": judge_backend if not judge_cmd else "cmd",
+                "cost_usd": None,
+                "usage_normalized": normalize_usage(None, source="provider_reported"),
+                "cost_normalized": {"source": "not_applicable"},
+                "passed": False,
+                "evidence": "per-step judge requires trajectory evidence: no completed trajectory steps in events.json",
+                "returncode": 0,
+                "stderr": "",
+            })
     # G1 tool-using follow-on: an opt-in judge may EXPLORE a SANITIZED copy of the run
     # dir (oracle files removed by construction) with read-only tools, rather than only
     # reading a prompt-embedded trajectory. Native adapter only, and only when the run
@@ -6164,9 +6297,9 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         # G1: hand the judge the same normalized trajectory the objective detectors
         # see, plus a denylisted artifact inventory (never the grader's answer key).
         events, _ = read_events_base(run_base)
-        prompt = judge_prompt(task, output_text, trajectory=events, metrics=read_metrics_base(run_base), artifacts=judge_artifact_inventory(run_base), explore_dir=explore_hint)
+        prompt = judge_prompt(task, output_text, trajectory=events, metrics=read_metrics_base(run_base), artifacts=judge_artifact_inventory(run_base), explore_dir=explore_hint, steps=per_step_steps)
     else:
-        prompt = judge_prompt(task, output_text, explore_dir=explore_hint)
+        prompt = judge_prompt(task, output_text, explore_dir=explore_hint, steps=per_step_steps)
     # Native judge backends share a registry-owned invocation seam. A shell
     # `judge_cmd` remains the universal escape hatch; native Codex uses
     # --output-last-message/--output-schema so stdout JSONL is telemetry, not
@@ -6223,6 +6356,17 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     graded_payload: dict[str, Any] = {}
     if assertion.get("graded_dimensions") and isinstance(parsed.get("dimension_scores"), dict):
         graded_payload["dimension_scores"] = parsed["dimension_scores"]
+    if assertion.get("per_step") and per_step_steps and isinstance(parsed.get("criteria"), list) and parse_error is None:
+        # The verdict must cover EXACTLY the steps the run took, in order — a
+        # verdict about invented or skipped steps is not evidence about this run.
+        names = [str(c.get("name")) for c in parsed["criteria"] if isinstance(c, dict)]
+        expected_names = [s["step"] for s in per_step_steps]
+        if names != expected_names:
+            parse_error = (f"per-step criteria must name each step exactly: "
+                           f"expected {expected_names[:5]}, got {names[:5]}")
+        else:
+            graded_payload["criteria"] = parsed["criteria"]
+            graded_payload["minimum_criteria"] = per_step_minimum(assertion, len(per_step_steps))
     if assertion.get("dynamic_rubric") and isinstance(parsed.get("criteria"), list):
         graded_payload["criteria"] = parsed["criteria"]
         graded_payload["minimum_criteria"] = max(1, int((assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)))
@@ -6970,6 +7114,7 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
     evidence = judged.get("evidence", judged.get("rationale", judged.get("reasoning", "judge result supplied")))
     dims = assertion.get("graded_dimensions")
     dyn = assertion.get("dynamic_rubric")
+    per_step = assertion.get("per_step")
     if dims and isinstance(judged.get("dimension_scores"), dict):
         expected_names = {str(item.get("name")) for item in dims if isinstance(item, dict)}
         if set(judged["dimension_scores"]) != expected_names:
@@ -6990,17 +7135,25 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
             "evidence": f"dimension scores (1-5): {json.dumps(raw, sort_keys=True)}; {evidence}",
         })
         return entry
-    if dyn and isinstance(judged.get("criteria"), list):
+    if (dyn or per_step) and isinstance(judged.get("criteria"), list):
         criteria = [c for c in judged["criteria"] if isinstance(c, dict)]
         met = sum(1 for c in criteria if c.get("met"))
         total = len(criteria)
-        minimum = max(1, int(dyn.get("minimum_criteria", 3)))
+        if per_step:
+            # One criterion per trajectory step (run_one_judge_task enforced the
+            # exact step-name match), so the minimum re-derives from the
+            # assertion's fraction and the run's actual step count.
+            minimum = per_step_minimum(assertion, total)
+            label = "trajectory steps sound"
+        else:
+            minimum = max(1, int(dyn.get("minimum_criteria", 3)))
+            label = "dynamic criteria met"
         entry.update({
             "passed": total >= minimum and met >= minimum,
             "score": round(met / total, 4) if total else None,
             "criteria_met": met,
             "criteria_total": total,
-            "evidence": f"{met}/{total} dynamic criteria met (minimum {minimum}); {evidence}",
+            "evidence": f"{met}/{total} {label} (minimum {minimum}); {evidence}",
         })
         return entry
     entry.update({
@@ -7103,6 +7256,26 @@ def grade_case_variant(
             expanded = expand_judge_preset(assertion)
             if turn_n is not None:
                 expanded = {**expanded, "name": f"turn-{turn_n}: {assertion_label(expanded)}"}
+            if expanded.get("per_step"):
+                # Trace-evidence-backed judging fails closed like a process
+                # assertion: no completed steps means nothing to grade, so no
+                # judge task is emitted (no model spend) and a stored verdict
+                # cannot outlive its evidence.
+                step_events, step_error = read_events_base(unit_base) if unit_base is not None else (None, "missing run directory")
+                if not trajectory_steps(step_events, unit_base):
+                    reason = ("no completed trajectory steps" if step_events is not None
+                              else step_error or "missing events.json")
+                    entry = {"name": assertion_label(expanded), "type": atype, "passed": False,
+                             "score": 0.0, "severity": severity, "oracle": tier,
+                             "evidence": f"per-step judge requires trajectory evidence: {reason}"}
+                    if turn_n is not None:
+                        entry["turn"] = turn_n
+                    qualitative.append(entry)
+                    if turn_n is None:
+                        satisfied[assertion_label(assertion)] = False
+                        if case_uses_depends_on:
+                            entry["_dep_label"] = assertion_label(assertion)
+                    return
             jid = judge_task_id(case["id"], variant, run_number, expanded, model=model)
             judged = judge_results.get(jid)
             if judged:
