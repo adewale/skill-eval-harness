@@ -488,6 +488,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 |---|---|
 | `skill-trigger-matrix` | Autonomous trigger rate per (agent × model), split by should-fire / should-not-fire. |
 | `skill-pi-trigger-eval` | The deeper Pi-specific trigger tool: discovery-population ablation arms, traces, cost. |
+| `skill-benchmark trigger-compare` | Pair a baseline trigger-matrix report with an `--ablation` report of the same skill revision: per-query pass-rate deltas, sign-flip significance, and a causal-confirmation evidence class — the trigger population's version of the answer path's ablation confirmation gate. |
 
 ## Compatibility notes
 

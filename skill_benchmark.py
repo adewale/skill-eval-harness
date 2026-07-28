@@ -50,6 +50,7 @@ from ablation_model import (
     JETTY_FAILURE,
     RUNNER_FAILURE_MARKER_BY_PROVIDER,
     TIMEOUT_FAILURE,
+    TRIGGER_MEASUREMENT_EVIDENCE_CLASS,
     VIBE_FAILURE,
     AblationMode,
     AblationRecord,
@@ -103,6 +104,7 @@ from trigger_contracts import (
     TraceEventKind,
     TriggerDetection,
     TriggerEvidenceKind,
+    TriggerObservation,
 )
 
 VALID_SPLITS = {"tune", "holdout", "holdback"}
@@ -7687,6 +7689,146 @@ def two_sample_permutation_significance(a: list[float], b: list[float], *, max_e
     return {"method": method, "n_a": na, "n_b": nb, "observed_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
 
 
+def _trigger_report_rows(report: dict[str, Any], label: str) -> list[TriggerObservation]:
+    """Re-erect the typed trigger contract from one persisted matrix report.
+    Strict at the boundary: a file that is not a skill-trigger-matrix report, or
+    any row whose stored flags contradict the typed observation, is rejected
+    rather than silently averaged."""
+    if not isinstance(report, dict) or report.get("evidence_class") != TRIGGER_MEASUREMENT_EVIDENCE_CLASS:
+        die(f"{label} is not a skill-trigger-matrix report (expected evidence_class {TRIGGER_MEASUREMENT_EVIDENCE_CLASS!r})")
+    rows = report.get("results")
+    if not isinstance(rows, list) or not rows:
+        die(f"{label} has no results rows")
+    observations: list[TriggerObservation] = []
+    for position, row in enumerate(rows, 1):
+        try:
+            observations.append(TriggerObservation.from_row(row))
+        except (TypeError, ValueError, KeyError) as exc:
+            die(f"{label} results row {position}: {exc}")
+    return observations
+
+
+def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any]) -> dict[str, Any]:
+    """Pair a baseline skill-trigger-matrix report with an --ablation report of
+    the SAME canonical skill revision — the trigger population's version of the
+    answer path's causal-confirmation gate, closing the gap both trigger
+    runners stamp on their output (single-arm raw measurements, no pairing).
+
+    Matrix rows carry no run numbers (repeats are unordered and share no
+    matched randomness), so pairing is at (agent, model, query) granularity
+    over each side's COMPLETE observations; the per-query pass-rate delta is
+    the paired unit, sign-flip-tested across queries exactly as
+    build_paired_summary tests per-case deltas. Pass rates, not trigger rates,
+    carry the verdict, so polarity is inherent: a NO_TRIGGER query regresses by
+    over-triggering. The verdict goes through the EvidenceClass guard —
+    CONFIRMED_CAUSAL needs verified provenance, coverage, and a significant
+    observed drop; an observed-but-insignificant drop downgrades to
+    INDETERMINATE (never REFUTED, which would wrongly claim "no regression")."""
+    base_rows = _trigger_report_rows(baseline, "--baseline")
+    abl_rows = _trigger_report_rows(ablation, "--ablation")
+    if baseline.get("ablation"):
+        die("--baseline must be an unablated trigger run (it declares an ablation)")
+    if not ablation.get("ablation"):
+        die("--ablation must be a trigger run produced with --ablation")
+
+    reasons: list[str] = []
+    base_hash = str(baseline.get("skill_tree_hash") or "")
+    if not base_hash:
+        reasons.append("baseline report has no skill_tree_hash")
+    prov: Provenance | None = None
+    try:
+        prov = Provenance.from_dict(ablation.get("provenance") or {})
+    except (TypeError, ValueError) as exc:
+        reasons.append(f"ablation provenance invalid: {exc}")
+    if prov is not None:
+        if prov.population is not Population.TRIGGER:
+            reasons.append("ablation provenance is not trigger-population")
+        if base_hash and prov.identity.canonical != base_hash:
+            reasons.append("ablation parent_skill_hash does not match the baseline skill_tree_hash: "
+                           "the two runs measured a different skill revision")
+        if str(ablation.get("skill_tree_hash") or "") != prov.identity.edited:
+            reasons.append("ablation report skill_tree_hash does not match its provenance skill_hash")
+    provenance_verified = not reasons
+
+    def keyed(observations: list[TriggerObservation]) -> dict[tuple[str, str | None, str, bool], list[TriggerObservation]]:
+        cells: dict[tuple[str, str | None, str, bool], list[TriggerObservation]] = {}
+        for obs in observations:
+            cells.setdefault((obs.agent, obs.model, obs.query, obs.expectation.should_trigger), []).append(obs)
+        return cells
+
+    def rates(complete: list[TriggerObservation], total: int) -> dict[str, Any]:
+        return {"runs": total, "complete": len(complete),
+                "pass_rate": round(statistics.mean(1.0 if o.passed else 0.0 for o in complete), 6),
+                "trigger_rate": round(statistics.mean(1.0 if o.detection.triggered else 0.0 for o in complete), 6)}
+
+    base_cells, abl_cells = keyed(base_rows), keyed(abl_rows)
+    comparable: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for key in sorted(set(base_cells) | set(abl_cells), key=lambda k: (k[0], str(k[1]), k[2], k[3])):
+        agent, model, query, should = key
+        base_complete = [o for o in base_cells.get(key, []) if o.invocation.observation_complete]
+        abl_complete = [o for o in abl_cells.get(key, []) if o.invocation.observation_complete]
+        reason = ("missing_baseline_arm" if key not in base_cells
+                  else "missing_ablation_arm" if key not in abl_cells
+                  else "baseline_observations_incomplete" if not base_complete
+                  else "ablation_observations_incomplete" if not abl_complete
+                  else None)
+        if reason:
+            blocked.append({"agent": agent, "model": model, "query": query,
+                            "should_trigger": should, "reason": reason})
+            continue
+        base_block = rates(base_complete, len(base_cells[key]))
+        abl_block = rates(abl_complete, len(abl_cells[key]))
+        comparable.append({
+            "agent": agent, "model": model, "query": query, "should_trigger": should,
+            "baseline": base_block, "ablation": abl_block,
+            "pass_delta": round(abl_block["pass_rate"] - base_block["pass_rate"], 6),
+            "trigger_delta": round(abl_block["trigger_rate"] - base_block["trigger_rate"], 6),
+        })
+
+    significance = sign_flip_significance([entry["pass_delta"] for entry in comparable])
+    regressed = [entry for entry in comparable if entry["pass_delta"] < 0]
+    evidence_class = causal_confirmation(
+        provenance_verified=provenance_verified,
+        has_coverage=bool(comparable),
+        regression_observed=bool(regressed),
+    )
+    note = None
+    if evidence_class is EvidenceClass.CONFIRMED_CAUSAL and not significance.get("significant_at_0_05"):
+        evidence_class = EvidenceClass.INDETERMINATE
+        note = (f"regression observed but not significant across queries "
+                f"(p={significance.get('p_value')}); >= 6 consistently regressed queries are needed to confirm")
+    elif not provenance_verified:
+        note = "provenance unverified: " + "; ".join(reasons)
+    elif not comparable:
+        note = "no comparable (agent, model, query) pair has complete observations on both sides"
+
+    out = {
+        "population": "trigger",
+        "evidence_class": evidence_class.value,
+        "skill_name": baseline.get("skill_name"),
+        "ablation": ablation.get("ablation"),
+        "provenance": {"verified": provenance_verified, "reasons": reasons,
+                       "baseline_skill_tree_hash": base_hash,
+                       "ablation_skill_tree_hash": ablation.get("skill_tree_hash")},
+        "paired": {"comparable_queries": comparable, "blocked": blocked, "significance": significance},
+        "regressed_queries": [{k: entry[k] for k in ("agent", "model", "query", "should_trigger", "pass_delta")}
+                              for entry in regressed],
+        "summary": {"comparable": len(comparable), "blocked": len(blocked),
+                    "regressed": len(regressed),
+                    "mean_pass_delta": significance.get("observed_mean_delta")},
+    }
+    if note:
+        out["note"] = note
+    return out
+
+
+def trigger_compare(args: argparse.Namespace) -> int:
+    report = build_trigger_comparison(load_json(Path(args.baseline)), load_json(Path(args.ablation)))
+    emit_report(report, getattr(args, "out", None))
+    return 0
+
+
 def _combinations(items: list[int], r: int) -> Iterable[tuple[int, ...]]:
     # Local, dependency-free itertools.combinations (kept explicit so the grade
     # path's imports stay the audited leaf set).
@@ -11560,7 +11702,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True)
 
     p = sub.add_parser("import-trace")
-    p.add_argument("--source", default="generic", choices=["generic", "codex", "pi", "jetty"], help="runner trace dialect to normalize")
+    p.add_argument("--source", default="generic", choices=["claude", "codex", "generic", "jetty", "pi"], help="runner trace dialect to normalize")
     p.add_argument("--trace", required=True, help="raw JSONL trace path")
     p.add_argument("--run-dir", required=True, help="run directory where events.json/metrics.json should be written")
     p.add_argument("--out-events")
@@ -11709,6 +11851,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("compare-results")
     p.add_argument("--truth", required=True)
     p.add_argument("--results", required=True)
+    p.add_argument("--out")
+
+    p = sub.add_parser("trigger-compare", help="pair a baseline skill-trigger-matrix report with an --ablation report of the same skill revision: per-query pass-rate deltas, sign-flip significance, and a causal-confirmation evidence class")
+    p.add_argument("--baseline", required=True, help="skill-trigger-matrix report JSON from the unablated skill tree")
+    p.add_argument("--ablation", required=True, help="skill-trigger-matrix report JSON produced with --ablation on the same canonical revision")
     p.add_argument("--out")
 
     p = sub.add_parser("migrate", help="upgrade a version-1 manifest to version 2: stamp default severity/oracle tiers, mark binary judge rubrics, print the diff and the judgment-call checklist")
@@ -11897,6 +12044,8 @@ def main() -> int:
         return compare_tasks(args)
     if args.cmd == "compare-results":
         return compare_results(args)
+    if args.cmd == "trigger-compare":
+        return trigger_compare(args)
     if args.cmd == "migrate":
         return migrate_command(args)
     if args.cmd == "migrate-telemetry":

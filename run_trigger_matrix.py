@@ -799,6 +799,8 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         "generated_at": int(time.time()),
         # Same caveat as run_pi_trigger_eval.py: single-arm raw measurements —
         # rates that steer description edits, not confirmed causal effects.
+        # Pair a baseline report with an --ablation report through
+        # `skill-benchmark trigger-compare` to reach a causal evidence class.
         "evidence_class": TRIGGER_MEASUREMENT_EVIDENCE_CLASS,
         "skill_tree_hash": tree_hash,
         "ablation": ablation,
