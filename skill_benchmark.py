@@ -3006,6 +3006,31 @@ def event_mentions_skill_file(event: dict[str, Any]) -> bool:
     return "SKILL.md" in hay or "/skills/" in hay or "\\skills\\" in hay
 
 
+# The step-shaped trajectory events: the completed actions a per-step judge
+# grades and the trajectory diff counts. Messages/metrics are context.
+TRAJECTORY_STEP_TYPES = {"command", "tool_call", "file_read", "file_write", "skill_load"}
+
+
+def trace_event_counts(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Single owner of the completed-events-only counting rules. metrics.json
+    (normalize_trace_records) and the report's trajectory diff both derive
+    their counters here, so the two surfaces cannot drift: a diff delta is a
+    delta of exactly the numbers metrics.json reports. Errors count over ALL
+    events — a failed operation is an error precisely because it never
+    completed."""
+    completed = [e for e in events if event_is_completed(e)]
+    commands = command_events(events)
+    return {
+        "steps": sum(1 for e in completed if e.get("type") in TRAJECTORY_STEP_TYPES),
+        "tool_calls": sum(1 for e in completed if e.get("type") in {"tool_call", "skill_load"}) + len(commands),
+        "commands": len(commands),
+        "file_reads": sum(1 for e in completed if e.get("type") in {"file_read", "skill_load"}),
+        "file_writes": sum(1 for e in completed if e.get("type") == "file_write"),
+        "errors": sum(1 for e in events if e.get("type") == "error"),
+        "skill_events": [e for e in completed if e.get("type") == "skill_load" or event_mentions_skill_file(e)],
+    }
+
+
 EVENT_TEXT_KEYS = {"file_path", "path", "skill", "input", "partial_json", "command", "cmd", "args", "argv"}
 
 
@@ -3980,17 +4005,16 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
                     value = tokens.get(key)
                     if isinstance(value, (int, float)):
                         token_totals[key] += value
-    completed_events = [event for event in events if event_is_completed(event)]
-    skill_events = [e for e in completed_events if e.get("type") == "skill_load" or event_mentions_skill_file(e)]
+    counts = trace_event_counts(events)
+    skill_events = counts["skill_events"]
     metrics: dict[str, Any] = {
         "schema_version": 2,
         "source": source,
-        "tool_calls": (sum(1 for e in completed_events if e.get("type") in {"tool_call", "skill_load"})
-                       + len(command_events(events))),
-        "commands": len(commands),
-        "file_reads": sum(1 for e in completed_events if e.get("type") in {"file_read", "skill_load"}),
-        "file_writes": sum(1 for e in completed_events if e.get("type") == "file_write"),
-        "errors": sum(1 for e in events if e.get("type") == "error"),
+        "tool_calls": counts["tool_calls"],
+        "commands": counts["commands"],
+        "file_reads": counts["file_reads"],
+        "file_writes": counts["file_writes"],
+        "errors": counts["errors"],
         "retries": 0,
         "repeated_command_max": repeated_command_max(commands),
         "skill_invoked": bool(skill_events),
@@ -5938,9 +5962,6 @@ def extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("no JSON object found in judge output")
 
 
-# The step-shaped trajectory events a per-step judge grades: completed actions
-# only, same rule the metrics counters follow. Messages/metrics are context.
-TRAJECTORY_STEP_TYPES = {"command", "tool_call", "file_read", "file_write", "skill_load"}
 # Raw provider records can be arbitrarily large; a step payload embeds at most
 # this many characters of the raw record beside the normalized summaries.
 TRAJECTORY_STEP_RAW_CHARS = 2000
@@ -6243,6 +6264,28 @@ JUDGE_BACKENDS = {
 }
 
 
+# One spelling of the per-step fail-closed reason, shared by grade_case_variant
+# (which refuses to emit the task) and run_one_judge_task (which refuses to
+# invoke on a re-run task file).
+PER_STEP_MISSING_EVIDENCE = "per-step judge requires trajectory evidence"
+
+
+def _judge_row_identity(task: dict[str, Any], *, judge_model: str | None,
+                        judge_backend: str, judge_cmd: str | None) -> dict[str, Any]:
+    """The identity fields every judge verdict row carries, spelled once so the
+    fail-closed (never-invoked) row and the invoked row cannot drift."""
+    return {
+        "judge_task_id": task["judge_task_id"],
+        "case_id": task.get("case_id"),
+        "variant": task.get("variant"),
+        "run_number": task.get("run_number"),
+        # The judge is a variable, not a constant: which model produced this verdict
+        # is recorded so a panel can measure whether the answer depends on the judge.
+        "judge_model": judge_model,
+        "judge_backend": judge_backend if not judge_cmd else "cmd",
+    }
+
+
 def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, transcripts_dir: Path | None = None,
                        repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude",
                        judge_backend: str = "claude", codex_cmd: str = "codex exec", vibe_cmd: str = VIBE_DEFAULT_CMD,
@@ -6266,18 +6309,17 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         step_events, _ = read_events_base(run_base) if has_run_base else (None, None)
         per_step_steps = trajectory_steps(step_events, run_base if has_run_base else None)
         if not per_step_steps:
+            # No model was invoked BY DESIGN, so judge spend is not_applicable
+            # on both channels — never "missing", which would read as lost
+            # telemetry from a run that happened.
             return validated_result_row({
-                "judge_task_id": task["judge_task_id"],
-                "case_id": task.get("case_id"),
-                "variant": task.get("variant"),
-                "run_number": task.get("run_number"),
-                "judge_model": judge_model,
-                "judge_backend": judge_backend if not judge_cmd else "cmd",
+                **_judge_row_identity(task, judge_model=judge_model,
+                                      judge_backend=judge_backend, judge_cmd=judge_cmd),
                 "cost_usd": None,
-                "usage_normalized": normalize_usage(None, source="provider_reported"),
-                "cost_normalized": {"source": "not_applicable"},
+                "usage_normalized": normalize_usage(None, source="not_applicable"),
+                "cost_normalized": normalize_cost(None, source="not_applicable"),
                 "passed": False,
-                "evidence": "per-step judge requires trajectory evidence: no completed trajectory steps in events.json",
+                "evidence": f"{PER_STEP_MISSING_EVIDENCE}: no completed trajectory steps in events.json",
                 "returncode": 0,
                 "stderr": "",
             })
@@ -6389,14 +6431,8 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     evidence = parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or parse_error or "judge command completed"
     row = {
         **graded_payload,
-        "judge_task_id": task["judge_task_id"],
-        "case_id": task.get("case_id"),
-        "variant": task.get("variant"),
-        "run_number": task.get("run_number"),
-        # The judge is a variable, not a constant: which model produced this verdict
-        # is recorded so a panel can measure whether the answer depends on the judge.
-        "judge_model": judge_model_label,
-        "judge_backend": judge_backend if not judge_cmd else "cmd",
+        **_judge_row_identity(task, judge_model=judge_model_label,
+                              judge_backend=judge_backend, judge_cmd=judge_cmd),
         "cost_usd": cost_usd,
         # Judge-model spend is suite cost too, but a SEPARATE ledger line from
         # the model under test (issue #21); normalized like every runner path.
@@ -7269,7 +7305,7 @@ def grade_case_variant(
                               else step_error or "missing events.json")
                     entry = {"name": assertion_label(expanded), "type": atype, "passed": False,
                              "score": 0.0, "severity": severity, "oracle": tier,
-                             "evidence": f"per-step judge requires trajectory evidence: {reason}"}
+                             "evidence": f"{PER_STEP_MISSING_EVIDENCE}: {reason}"}
                     if turn_n is not None:
                         entry["turn"] = turn_n
                     qualitative.append(entry)
@@ -8918,22 +8954,17 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _trajectory_profile(events: list[dict[str, Any]]) -> dict[str, Any]:
-    """One arm's trajectory shape, derived from normalized events under the same
-    completed-only rule the metrics counters follow. Commands are the display
-    string (input_summary first), not command_text's concatenated match text —
-    this is a report view for humans, not a regex haystack."""
-    completed = [e for e in events if event_is_completed(e)]
+    """One arm's trajectory shape. Counts come from trace_event_counts — the
+    same owner metrics.json uses — so a diff delta is a delta of exactly the
+    numbers metrics.json reports. Commands are the display string
+    (input_summary first), not command_text's concatenated match text — this is
+    a report view for humans, not a regex haystack."""
+    counts = trace_event_counts(events)
     return {
         "commands": [str(e.get("input_summary") or e.get("command") or e.get("cmd") or e.get("name") or "")
                      for e in command_events(events)],
-        "counts": {
-            "steps": sum(1 for e in completed if e.get("type") in TRAJECTORY_STEP_TYPES),
-            "commands": len(command_events(events)),
-            "tool_calls": sum(1 for e in completed if e.get("type") in {"tool_call", "skill_load"}) + len(command_events(events)),
-            "file_reads": sum(1 for e in completed if e.get("type") in {"file_read", "skill_load"}),
-            "file_writes": sum(1 for e in completed if e.get("type") == "file_write"),
-        },
-        "skill_invoked": any(e.get("type") == "skill_load" or event_mentions_skill_file(e) for e in completed),
+        "counts": {key: counts[key] for key in ("steps", "commands", "tool_calls", "file_reads", "file_writes")},
+        "skill_invoked": bool(counts["skill_events"]),
     }
 
 

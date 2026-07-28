@@ -25,6 +25,8 @@ from helpers import (
 )
 from helpers import (
     report_fixture,
+    result_row,
+    trace_event,
     write_run,
 )
 from helpers import (
@@ -560,21 +562,17 @@ class TrajectoryDiffTests(unittest.TestCase):
     surfacing as blocked pairs, never as an empty diff."""
 
     def _events(self, commands, *, reads=0, skill=False):
-        events = [{"index": i + 1, "type": "command", "status": "completed",
-                   "state_source": "provider_status", "name": "bash",
-                   "input_summary": cmd} for i, cmd in enumerate(commands)]
+        events = [trace_event("command", index=i + 1, name="bash", input_summary=cmd)
+                  for i, cmd in enumerate(commands)]
         for n in range(reads):
-            events.append({"index": len(events) + 1, "type": "file_read", "status": "completed",
-                           "state_source": "provider_status", "name": "Read",
-                           "input_summary": f"notes-{n}.md"})
+            events.append(trace_event("file_read", index=len(events) + 1, name="Read",
+                                      input_summary=f"notes-{n}.md"))
         if skill:
-            events.append({"index": len(events) + 1, "type": "skill_load", "status": "completed",
-                           "state_source": "provider_status", "name": "Skill",
-                           "input_summary": "skills/demo/SKILL.md"})
+            events.append(trace_event("skill_load", index=len(events) + 1, name="Skill",
+                                      input_summary="skills/demo/SKILL.md"))
         return {"schema_version": 2, "source": "test", "events": events}
 
     def _rows(self, td, *, with_events, without_events, exec_valid=True):
-        from helpers import result_row
         rows = []
         for variant, events in (("with_skill", with_events), ("without_skill", without_events)):
             base = Path(td) / "c1" / variant / "run-1"

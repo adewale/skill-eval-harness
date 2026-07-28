@@ -17,13 +17,14 @@ from helpers import (
     good_pr_manifest as _manifest,
 )
 from helpers import (
+    trace_event,
+    write_run,
+)
+from helpers import (
     write_demo_manifest as write_manifest,
 )
 from helpers import (
     write_good_pr_skill as _skill,
-)
-from helpers import (
-    write_run,
 )
 
 import skill_benchmark as sb
@@ -998,9 +999,8 @@ class PerStepGradingTests(unittest.TestCase):
     CASE = {"id": "c", "split": "tune", "prompt": "do it", "assertions": [
         {"name": "sound-steps", "type": "judge", "per_step": True, "severity": "gate"},
     ]}
-    EVENTS = [{"index": 1, "type": "command", "status": "completed",
-               "state_source": "provider_status", "name": "Bash",
-               "input_summary": "npm test", "raw_ref": {"file": "trace.jsonl", "line": 1}}]
+    EVENTS = [trace_event("command", name="Bash", input_summary="npm test",
+                          raw_ref={"file": "trace.jsonl", "line": 1})]
 
     def _grade(self, base, judge_results=None):
         return sb.grade_case_variant(self.CASE, "with_skill", "the answer",
@@ -1020,9 +1020,7 @@ class PerStepGradingTests(unittest.TestCase):
     def test_no_completed_steps_fails_closed(self):
         with tempfile.TemporaryDirectory() as td:
             base = write_run(Path(td) / "run", "the answer",
-                             events={"events": [{"index": 1, "type": "command",
-                                                 "status": "in_progress",
-                                                 "state_source": "provider_status"}]})
+                             events={"events": [trace_event("command", status="in_progress")]})
             result, tasks = self._grade(base)
         self.assertEqual(tasks, [])
         self.assertFalse(result["qualitative_assertions"][0]["passed"])

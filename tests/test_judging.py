@@ -18,10 +18,11 @@ from helpers import (
     demo_manifest as base_manifest,
 )
 from helpers import (
-    write_demo_manifest as write_manifest,
+    trace_event,
+    write_run,
 )
 from helpers import (
-    write_run,
+    write_demo_manifest as write_manifest,
 )
 
 import judge_verdict as jv
@@ -418,14 +419,13 @@ class TrajectoryJudgeTests(unittest.TestCase):
 
 
 STEP_EVENTS = [
-    {"index": 1, "type": "command", "status": "completed", "state_source": "provider_status",
-     "name": "Bash", "input_summary": "npm install", "raw_ref": {"file": "trace.jsonl", "line": 3}},
-    {"index": 2, "type": "message", "status": "unknown", "state_source": "unknown",
-     "role": "assistant", "input_summary": "planning"},
-    {"index": 3, "type": "command", "status": "in_progress", "state_source": "provider_status",
-     "name": "Bash", "input_summary": "npm test"},
-    {"index": 4, "type": "file_write", "status": "completed", "state_source": "provider_status",
-     "name": "Write", "input_summary": "src/x.py", "raw_ref": {"file": "trace.jsonl", "line": 9}},
+    trace_event("command", index=1, name="Bash", input_summary="npm install",
+                raw_ref={"file": "trace.jsonl", "line": 3}),
+    trace_event("message", index=2, status="unknown", state_source="unknown",
+                role="assistant", input_summary="planning"),
+    trace_event("command", index=3, status="in_progress", name="Bash", input_summary="npm test"),
+    trace_event("file_write", index=4, name="Write", input_summary="src/x.py",
+                raw_ref={"file": "trace.jsonl", "line": 9}),
 ]
 
 

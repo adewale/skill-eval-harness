@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from helpers import claude_stream_records as _canonical_stream_records
 from helpers import make_eval_repo
 from helpers import stub_claude as _stub_claude
 from helpers import stub_claude_stream as _stub_claude_stream
@@ -15,33 +16,11 @@ from helpers import stub_claude_stream as _stub_claude_stream
 import skill_benchmark as sb
 
 
-def claude_stream_records(*, result_event: bool = True, orphan_tool: bool = False) -> list[dict]:
-    """The canonical `--output-format stream-json` event sequence the parser and
-    normalizer tests share: init, a Bash tool_use/tool_result pair, a SKILL.md
-    Read pair, a text turn, and the terminal result envelope."""
-    records = [
-        {"type": "system", "subtype": "init", "session_id": "s"},
-        {"type": "assistant", "message": {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "npm test"}}],
-            "usage": {"input_tokens": 900, "output_tokens": 900}}},
-        {"type": "user", "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "17 passed"}]}},
-        {"type": "assistant", "message": {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_2", "name": "Read", "input": {"file_path": "skills/demo/SKILL.md"}}]}},
-        {"type": "user", "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "toolu_2", "content": "---\nname: demo\n---"}]}},
-        {"type": "assistant", "message": {"role": "assistant", "content": [
-            {"type": "text", "text": "All tests pass."}],
-            "usage": {"input_tokens": 30, "output_tokens": 12}}},
-    ]
-    if orphan_tool:
-        records.append({"type": "assistant", "message": {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_9", "name": "Grep", "input": {"pattern": "x"}}]}})
-    if result_event:
-        records.append({"type": "result", "subtype": "success", "result": "All tests pass.",
-                        "total_cost_usd": 0.05, "duration_ms": 1200,
-                        "usage": {"input_tokens": 39, "output_tokens": 13}})
-    return records
+def claude_stream_records(**overrides) -> list[dict]:
+    """The shared canonical stream fixture (helpers.claude_stream_records) with
+    this file's assertion-friendly envelope values pinned."""
+    return _canonical_stream_records(answer="All tests pass.", cost=0.05,
+                                     in_tok=39, out_tok=13, **overrides)
 
 
 def stream_text(records: list[dict]) -> str:

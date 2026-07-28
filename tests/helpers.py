@@ -197,6 +197,15 @@ def write_run(
     return base
 
 
+def trace_event(type_: str, *, index: int = 1, status: str = "completed", **fields: Any) -> dict[str, Any]:
+    """One normalized trace event with the status/state_source boilerplate
+    stamped — the builder for events.json fixtures. Override state_source (or
+    any field) via kwargs; tests spell only what the behavior under test cares
+    about."""
+    return {"index": index, "type": type_, "status": status,
+            "state_source": "provider_status", **fields}
+
+
 def result_row(
     case_id: str = "c1",
     variant: str = "with_skill",
@@ -263,6 +272,46 @@ def file_judge_cmd(tmp: Path, verdict: dict[str, Any]) -> str:
     return f"cat {verdict_path}"
 
 
+def claude_stream_records(
+    *,
+    answer: str = "STREAM ANSWER token-XYZ",
+    cost: float = 0.0123,
+    in_tok: int = 11,
+    out_tok: int = 22,
+    result_event: bool = True,
+    orphan_tool: bool = False,
+) -> list[dict[str, Any]]:
+    """The ONE canonical `claude -p --output-format stream-json` event sequence,
+    shared by the parser/normalizer tests and the stream stub: init, a Bash
+    tool_use/tool_result pair, a SKILL.md Read pair, an assistant text turn,
+    and the terminal result envelope. Per-message usage is deliberately huge
+    (900) so a double-count against the terminal cumulative usage is loud."""
+    records: list[dict[str, Any]] = [
+        {"type": "system", "subtype": "init", "session_id": "stub"},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "npm test"}}],
+            "usage": {"input_tokens": 900, "output_tokens": 900}}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "17 passed"}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_2", "name": "Read", "input": {"file_path": "skills/demo/SKILL.md"}}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_2", "content": "---\nname: demo\n---"}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": answer}],
+            "usage": {"input_tokens": 900, "output_tokens": 900}}},
+    ]
+    if orphan_tool:
+        records.append({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_9", "name": "Grep", "input": {"pattern": "x"}}]}})
+    if result_event:
+        records.append({"type": "result", "subtype": "success", "result": answer,
+                        "total_cost_usd": cost, "duration_ms": 1200,
+                        "usage": {"input_tokens": in_tok, "output_tokens": out_tok,
+                                  "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5}})
+    return records
+
+
 def stub_claude_stream(
     path: Path,
     *,
@@ -273,38 +322,21 @@ def stub_claude_stream(
     returncode: int = 0,
 ) -> Path:
     """A fake `claude` executable for the stream-json answer path: it emits the
-    `--output-format stream-json` event sequence (a Bash tool_use/tool_result
-    pair, a SKILL.md Read, an assistant text turn, and the terminal result
-    envelope). It emits the stream ONLY when stream-json was actually requested,
-    so a backend that silently falls back to the single-envelope format fails
-    the protocol instead of passing by accident."""
+    canonical claude_stream_records sequence verbatim, and ONLY when
+    stream-json was actually requested — so a backend that silently falls back
+    to the single-envelope format fails the protocol instead of passing by
+    accident."""
+    stream_text = "\n".join(
+        json.dumps(record)
+        for record in claude_stream_records(answer=answer, cost=cost, in_tok=in_tok, out_tok=out_tok)
+    ) + "\n"
     body = f'''#!/usr/bin/env python3
-import sys, json
+import sys
 _ = sys.stdin.read()
 if "stream-json" not in sys.argv:
     sys.stdout.write("stream stub invoked without --output-format stream-json")
     sys.exit(1)
-lines = [
-    {{"type": "system", "subtype": "init", "session_id": "stub"}},
-    {{"type": "assistant", "message": {{"role": "assistant", "content": [
-        {{"type": "tool_use", "id": "toolu_1", "name": "Bash",
-          "input": {{"command": "npm test"}}}}],
-        "usage": {{"input_tokens": 900, "output_tokens": 900}}}}}},
-    {{"type": "user", "message": {{"role": "user", "content": [
-        {{"type": "tool_result", "tool_use_id": "toolu_1", "content": "17 passed"}}]}}}},
-    {{"type": "assistant", "message": {{"role": "assistant", "content": [
-        {{"type": "tool_use", "id": "toolu_2", "name": "Read",
-          "input": {{"file_path": "skills/demo/SKILL.md"}}}}]}}}},
-    {{"type": "user", "message": {{"role": "user", "content": [
-        {{"type": "tool_result", "tool_use_id": "toolu_2", "content": "---name: demo---"}}]}}}},
-    {{"type": "assistant", "message": {{"role": "assistant", "content": [
-        {{"type": "text", "text": {json.dumps(answer)}}}]}}}},
-    {{"type": "result", "subtype": "success", "result": {json.dumps(answer)},
-     "total_cost_usd": {cost}, "duration_ms": 1200,
-     "usage": {{"input_tokens": {in_tok}, "output_tokens": {out_tok},
-              "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5}}}},
-]
-sys.stdout.write("\\n".join(json.dumps(line) for line in lines) + "\\n")
+sys.stdout.write({json.dumps(stream_text)})
 sys.exit({returncode})
 '''
     path.write_text(body, encoding="utf-8")
