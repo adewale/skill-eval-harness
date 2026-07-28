@@ -263,6 +263,55 @@ def file_judge_cmd(tmp: Path, verdict: dict[str, Any]) -> str:
     return f"cat {verdict_path}"
 
 
+def stub_claude_stream(
+    path: Path,
+    *,
+    answer: str = "STREAM ANSWER token-XYZ",
+    cost: float = 0.0123,
+    in_tok: int = 11,
+    out_tok: int = 22,
+    returncode: int = 0,
+) -> Path:
+    """A fake `claude` executable for the stream-json answer path: it emits the
+    `--output-format stream-json` event sequence (a Bash tool_use/tool_result
+    pair, a SKILL.md Read, an assistant text turn, and the terminal result
+    envelope). It emits the stream ONLY when stream-json was actually requested,
+    so a backend that silently falls back to the single-envelope format fails
+    the protocol instead of passing by accident."""
+    body = f'''#!/usr/bin/env python3
+import sys, json
+_ = sys.stdin.read()
+if "stream-json" not in sys.argv:
+    sys.stdout.write("stream stub invoked without --output-format stream-json")
+    sys.exit(1)
+lines = [
+    {{"type": "system", "subtype": "init", "session_id": "stub"}},
+    {{"type": "assistant", "message": {{"role": "assistant", "content": [
+        {{"type": "tool_use", "id": "toolu_1", "name": "Bash",
+          "input": {{"command": "npm test"}}}}],
+        "usage": {{"input_tokens": 900, "output_tokens": 900}}}}}},
+    {{"type": "user", "message": {{"role": "user", "content": [
+        {{"type": "tool_result", "tool_use_id": "toolu_1", "content": "17 passed"}}]}}}},
+    {{"type": "assistant", "message": {{"role": "assistant", "content": [
+        {{"type": "tool_use", "id": "toolu_2", "name": "Read",
+          "input": {{"file_path": "skills/demo/SKILL.md"}}}}]}}}},
+    {{"type": "user", "message": {{"role": "user", "content": [
+        {{"type": "tool_result", "tool_use_id": "toolu_2", "content": "---name: demo---"}}]}}}},
+    {{"type": "assistant", "message": {{"role": "assistant", "content": [
+        {{"type": "text", "text": {json.dumps(answer)}}}]}}}},
+    {{"type": "result", "subtype": "success", "result": {json.dumps(answer)},
+     "total_cost_usd": {cost}, "duration_ms": 1200,
+     "usage": {{"input_tokens": {in_tok}, "output_tokens": {out_tok},
+              "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5}}}},
+]
+sys.stdout.write("\\n".join(json.dumps(line) for line in lines) + "\\n")
+sys.exit({returncode})
+'''
+    path.write_text(body, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
 def stub_claude(
     path: Path,
     *,

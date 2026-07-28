@@ -3820,9 +3820,88 @@ def otel_attributes_for_event(event: dict[str, Any]) -> dict[str, Any]:
     return attrs
 
 
+def _claude_tool_flat_record(name: str, tool_input: Any) -> dict[str, Any]:
+    """One Claude tool_use block as a normalizer-native record. Bash is a shell
+    command; Read/Write/Edit are file operations (a SKILL.md path classifies as
+    skill_load in normalize_trace_record); the Skill tool is a skill load; any
+    other tool stays a generic tool call with its input preserved."""
+    inp = tool_input if isinstance(tool_input, dict) else {}
+    if name == "Bash":
+        return {"type": "command", "tool": name, "command": str(inp.get("command") or "")}
+    if name == "Read":
+        return {"type": "file_read", "tool": name, "path": str(inp.get("file_path") or "")}
+    if name in {"Write", "Edit", "MultiEdit", "NotebookEdit"}:
+        return {"type": "file_write", "tool": name, "path": str(inp.get("file_path") or inp.get("notebook_path") or "")}
+    if name == "Skill":
+        return {"type": "skill_load", "tool": name, "path": str(inp.get("skill") or "")}
+    return {"type": "tool_use", "tool": name, "input": inp}
+
+
+def claude_stream_flat_records(records: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten `claude -p --output-format stream-json` events into (line, record)
+    pairs the generic normalizer understands. A message wraps several content
+    blocks, so one raw line can yield several records — each keeps the RAW line
+    for its raw_ref. Lifecycle is paired: a tool_use OPENS a call (in progress)
+    and the matching tool_result COMPLETES it, so an orphaned call (crash
+    mid-tool) counts zero under the completed-events-only metrics contract.
+    Usage rides ONLY the terminal result event — per-assistant-message usage is
+    API-request-level and would double count the cumulative total."""
+    flat: list[tuple[int, dict[str, Any]]] = []
+    open_calls: dict[str, dict[str, Any]] = {}
+    for line, record in enumerate(records, 1):
+        rtype = str(record.get("type") or "")
+        if rtype not in {"assistant", "user"}:
+            # system/init, result, and unknown lifecycle events pass through:
+            # `result` is an intrinsically terminal kind carrying usage/duration.
+            flat.append((line, record))
+            continue
+        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        role = str(message.get("role") or rtype)
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                flat.append((line, {"type": "message", "role": role, "text": content}))
+            continue
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    flat.append((line, {"type": "message", "role": role, "text": text}))
+            elif btype == "tool_use":
+                spec = _claude_tool_flat_record(str(block.get("name") or ""), block.get("input"))
+                flat.append((line, {**spec, "status": "in_progress"}))
+                call_id = str(block.get("id") or "")
+                if call_id:
+                    open_calls[call_id] = spec
+            elif btype == "tool_result":
+                spec = open_calls.pop(str(block.get("tool_use_id") or ""), {"type": "tool_result"})
+                completion = {**spec, "status": "completed",
+                              "output": stringify_trace_value(block.get("content"))[:1000]}
+                if block.get("is_error"):
+                    # the call completed WITH an error result (e.g. nonzero
+                    # exit); lifecycle-wise it still ran, so it stays completed.
+                    completion["is_error"] = True
+                flat.append((line, completion))
+    return flat
+
+
+def flatten_provider_trace(records: list[dict[str, Any]], *, source: str) -> list[tuple[int, dict[str, Any]]]:
+    """The per-provider flatten seam: claude's block-structured stream expands
+    to several records per raw line; every other dialect is the identity, so
+    existing sources normalize byte-identically."""
+    if source.casefold() == "claude":
+        return claude_stream_flat_records(records)
+    return [(line, record) for line, record in enumerate(records, 1)]
+
+
 def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "generic",
                             pi_stream: PiStream | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    events = [normalize_trace_record(record, source=source, index=i, line=i) for i, record in enumerate(records, 1)]
+    flat = flatten_provider_trace(records, source=source)
+    events = [normalize_trace_record(record, source=source, index=i, line=line)
+              for i, (line, record) in enumerate(flat, 1)]
     commands = [command_text(e) for e in command_events(events)]
     token_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     elapsed_ms = 0.0
@@ -3838,7 +3917,7 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
             if value is not None:
                 token_totals[key] = value
     elif not pi_error:
-        for record, event in zip(records, events):
+        for (_, record), event in zip(flat, events):
             usage = raw_trace_value(record, "usage", "tokens")
             if isinstance(usage, dict):
                 input_tokens = usage_number(usage, "input_tokens")
@@ -4969,7 +5048,12 @@ class ClaudeBackend(AgentBackend):
     name = "claude"
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
-        result = claude_cli_invoke(request.prompt, model=request.model, claude_bin=str(options.get("claude_bin") or "claude"), timeout=request.timeout_s, cwd=str(request.workspace))
+        # stream-json, not the single envelope: the stream is the run's raw
+        # trace, so Claude answer runs carry the same tool-use trajectory
+        # evidence the trigger matrix already observes — without it every
+        # process assertion on a Claude run fails closed for missing evidence.
+        result = claude_cli_invoke(request.prompt, model=request.model, claude_bin=str(options.get("claude_bin") or "claude"),
+                                   timeout=request.timeout_s, cwd=str(request.workspace), output_format="stream-json")
         claude_metrics = claude_run_metrics(result)
         metrics_extra = {k: v for k, v in claude_metrics.items() if k not in ("schema_version", "source")}
         return RunnerOutcome(
@@ -4979,7 +5063,7 @@ class ClaudeBackend(AgentBackend):
             error=result.get("parse_error"), trace_text=result.get("raw_response") or "",
             usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
             metadata_extra={"cost_usd": claude_metrics.get("cost_usd")}, metrics_extra=metrics_extra,
-            environment={"runner": "claude", "command": "claude -p --output-format json --no-session-persistence", "cwd": "<isolated workspace>"})
+            environment={"runner": "claude", "command": result.get("command") or "claude -p", "cwd": "<isolated workspace>"})
 
 
 class VibeBackend(AgentBackend):
@@ -5103,17 +5187,26 @@ CLAUDE_USAGE_KEYS = {
 
 
 def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
-    """Parse the `claude -p --output-format json` envelope.
+    """Parse `claude -p` output in either output format.
 
-    Malformed protocol bytes remain diagnostics and can never become a final
-    answer merely because the subprocess exited zero.
+    `--output-format json` emits one result envelope; `--output-format
+    stream-json` emits a JSONL event stream whose TERMINAL `type:"result"`
+    event carries the same envelope fields — so the runner and the judge keep
+    one parser for Claude's wire format. A stream that dies before its result
+    event, like malformed protocol bytes, remains diagnostics and can never
+    become a final answer merely because the subprocess exited zero.
     """
     text = stdout if isinstance(stdout, str) else ""
-    try:
-        env = extract_json_object(text)
-    except Exception as exc:
-        return {"answer": "", "raw_response": text, "cost_usd": None,
-                "usage": {}, "parse_error": str(exc)}
+    env: dict[str, Any] | None = None
+    for obj in iter_json_objects(text):
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            env = obj
+    if env is None:
+        try:
+            env = extract_json_object(text)
+        except Exception as exc:
+            return {"answer": "", "raw_response": text, "cost_usd": None,
+                    "usage": {}, "parse_error": str(exc)}
     if not isinstance(env, dict) or "result" not in env:
         return {"answer": "", "raw_response": text, "cost_usd": None,
                 "usage": {}, "parse_error": "not a claude -p json envelope"}
@@ -5141,15 +5234,24 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
 
 
 def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str = "claude",
-                      timeout: int = DEFAULT_RUNNER_TIMEOUT_S, extra_args: list[str] | None = None, cwd: str | Path | None = None) -> dict[str, Any]:
+                      timeout: int = DEFAULT_RUNNER_TIMEOUT_S, extra_args: list[str] | None = None, cwd: str | Path | None = None,
+                      output_format: str = "json") -> dict[str, Any]:
     """Single owner for invoking Claude via `claude -p`.
 
-    Returns the parsed envelope plus returncode/elapsed_ms/stderr. `claude_bin`
-    is an executable path (tests inject a stub that emits a canned envelope), NOT
-    a shell string — so there is no shell-quoting seam between the harness and
-    the model. If no cwd is supplied, run in an empty temporary directory rather
-    than inheriting the harness repo cwd."""
-    argv = [claude_bin, "-p", "--output-format", "json", "--no-session-persistence"]
+    Returns the parsed envelope plus returncode/elapsed_ms/stderr/raw_response.
+    `claude_bin` is an executable path (tests inject a stub that emits a canned
+    envelope), NOT a shell string — so there is no shell-quoting seam between
+    the harness and the model. `output_format` selects `json` (one envelope; the
+    judge default) or `stream-json` (the full event stream the answer runner
+    keeps as the run's raw trace; `-p` requires `--verbose` with it). If no cwd
+    is supplied, run in an empty temporary directory rather than inheriting the
+    harness repo cwd."""
+    if output_format not in {"json", "stream-json"}:
+        raise ValueError(f"unsupported claude output_format {output_format!r}")
+    argv = [claude_bin, "-p", "--output-format", output_format]
+    if output_format == "stream-json":
+        argv.append("--verbose")
+    argv.append("--no-session-persistence")
     if model:
         argv += ["--model", model]
     if extra_args:
@@ -5163,10 +5265,11 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
             result = invoke(Path(td))
     else:
         result = invoke(cwd)
+    command = " ".join(shlex.quote(a) for a in ["claude", *argv[1:]])
     if result.timed_out:
         return {"answer": "", "cost_usd": None, "usage": {}, "parse_error": None,
                 "returncode": 124, "timed_out": True, "elapsed_ms": result.elapsed_ms,
-                "stderr": result.stderr}
+                "stderr": result.stderr, "raw_response": result.stdout, "command": command}
     parsed = parse_claude_cli_json(result.stdout)
     effective_returncode = result.returncode
     if effective_returncode == 0 and parsed.get("is_error"):
@@ -5176,6 +5279,10 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
         "timed_out": False,
         "elapsed_ms": result.elapsed_ms,
         "stderr": result.stderr,
+        # The raw wire bytes always ride along: in stream mode they ARE the
+        # run's trace; in envelope mode they preserve the failure diagnostics.
+        "raw_response": result.stdout,
+        "command": command,
     })
     return parsed
 
