@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:5750`, merged in `grade_case_variant:6919`).
+threshold, evidence}` (`load_judge_results:5900`, merged in `grade_case_variant:7181`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -370,3 +370,14 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       and apply telemetry migration, repair strict judge/pair/trigger/Jetty inputs, regenerate
       reports, distinguish expected semantic changes from regressions, and roll back from the
       untouched 0.5.1 artifacts.
+- [ ] **"Did my skill change HOW the model works, not just whether it passes?"** — the
+      machinery shipped with the trace-depth slice: Claude answer runs now stream real
+      tool-use traces, the report's `trajectory_diff` block shows paired command/count/skill-load
+      deltas per case, and a `per_step` judge grades each completed step (raw records resolved
+      through `raw_ref`). The walkthrough should run the demo offline, read a no-lift case
+      through `trajectory_diff`, then escalate to `per_step` where outcome assertions saturate.
+- [ ] **"Did removing this description actually break discovery?"** — extends
+      [`docs/tuning-skill-activation.md`](docs/tuning-skill-activation.md): baseline
+      `skill-trigger-matrix` run + `--ablation` run → `skill-benchmark trigger-compare` →
+      read the evidence class (confirmed/refuted/indeterminate), the ≥6-query significance
+      bound, and blocked-pair reasons before editing the description again.

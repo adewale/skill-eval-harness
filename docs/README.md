@@ -26,9 +26,10 @@ title is the question; the body is the loop that answers it, runnable on
 | How do I port my existing evals into the harness? | [`porting-existing-evals.md`](porting-existing-evals.md) |
 
 The journey backlog lives in [`TODO.md`](../TODO.md) under "User journeys the code
-supports but the docs don't walk"; every entry there is ticked. When a new journey
-earns a slot, its entry names the machinery that already exists, so writing the
-journey is documentation work, not feature work.
+supports but the docs don't walk"; an unticked entry there is a journey whose
+machinery has shipped but whose walkthrough has not. When a new journey earns a
+slot, its entry names the machinery that already exists, so writing the journey
+is documentation work, not feature work.
 
 ## Concepts
 
