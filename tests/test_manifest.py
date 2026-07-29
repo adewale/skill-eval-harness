@@ -731,5 +731,55 @@ class ContaminationPerimeterTests(unittest.TestCase):
         self.assertEqual(report["cases"][0]["findings"][0]["kind"], "canary-hit")
 
 
+class PerStepValidationTests(unittest.TestCase):
+    """per_step is a judge-only assertion field: true, or an object whose only
+    key is min_met_fraction in (0, 1]."""
+
+    def _validate(self, assertion):
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"] = [assertion]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            return sb.validate_manifest(path)
+
+    def _dies(self, assertion):
+        with self.assertRaises(SystemExit):
+            self._validate(assertion)
+
+    def test_per_step_true_on_judge_validates(self):
+        manifest = self._validate({"name": "steps", "type": "judge", "per_step": True})
+        self.assertTrue(manifest["cases"][0]["assertions"][0]["per_step"])
+
+    def test_per_step_fraction_object_validates(self):
+        self._validate({"name": "steps", "type": "judge",
+                        "per_step": {"min_met_fraction": 0.8}})
+
+    def test_per_step_rejects_non_judge_assertions(self):
+        self._dies({"name": "a", "type": "contains", "value": "x", "per_step": True})
+
+    def test_per_step_rejects_other_judge_shapes(self):
+        self._dies({"name": "steps", "type": "judge", "per_step": True,
+                    "dynamic_rubric": {"instruction": "draft criteria"}})
+        self._dies({"name": "steps", "type": "judge", "per_step": True,
+                    "graded_dimensions": [{"name": "d", "rubric": "anchored"}]})
+
+    def test_per_step_rejects_malformed_shapes(self):
+        self._dies({"name": "steps", "type": "judge", "per_step": "yes"})
+        self._dies({"name": "steps", "type": "judge", "per_step": {}})
+        self._dies({"name": "steps", "type": "judge", "per_step": {"min_met_fraction": 0}})
+        self._dies({"name": "steps", "type": "judge", "per_step": {"min_met_fraction": 1.5}})
+        self._dies({"name": "steps", "type": "judge", "per_step": {"unknown": 1}})
+
+    def test_per_step_rejected_on_turn_assertion(self):
+        manifest = base_manifest()
+        manifest["cases"][0]["turns"] = [{
+            "prompt": "first", "assertions": [
+                {"name": "steps", "type": "judge", "per_step": True}]}]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+
+
 if __name__ == "__main__":
     unittest.main()

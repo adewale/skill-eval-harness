@@ -8,10 +8,23 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from helpers import claude_stream_records as _canonical_stream_records
 from helpers import make_eval_repo
 from helpers import stub_claude as _stub_claude
+from helpers import stub_claude_stream as _stub_claude_stream
 
 import skill_benchmark as sb
+
+
+def claude_stream_records(**overrides) -> list[dict]:
+    """The shared canonical stream fixture (helpers.claude_stream_records) with
+    this file's assertion-friendly envelope values pinned."""
+    return _canonical_stream_records(answer="All tests pass.", cost=0.05,
+                                     in_tok=39, out_tok=13, **overrides)
+
+
+def stream_text(records: list[dict]) -> str:
+    return "\n".join(json.dumps(r) for r in records) + "\n"
 
 
 def _manifest(rp: Path, cases):
@@ -49,6 +62,149 @@ class ParseClaudeEnvelopeTests(unittest.TestCase):
         p = sb.parse_claude_cli_json(out)
         self.assertEqual(p["answer"], "x")
         self.assertEqual(p["cost_usd"], 0.01)
+
+
+class ParseClaudeStreamTests(unittest.TestCase):
+    """`--output-format stream-json` resolves through the SAME parser: the
+    terminal type:"result" event carries the envelope fields, so the runner and
+    the judge keep one owner for Claude's wire format."""
+
+    def test_stream_terminal_result_event_is_the_envelope(self):
+        p = sb.parse_claude_cli_json(stream_text(claude_stream_records()))
+        self.assertEqual(p["answer"], "All tests pass.")
+        self.assertEqual(p["cost_usd"], 0.05)
+        self.assertEqual(p["usage"]["input_tokens"], 39)
+        self.assertEqual(p["usage"]["output_tokens"], 13)
+        self.assertEqual(p["usage"]["total_tokens"], 52)
+        self.assertIsNone(p["parse_error"])
+
+    def test_stream_without_result_event_is_protocol_failure(self):
+        # A stream that dies before its terminal result event is diagnostics,
+        # never answer evidence — same rule as the single-envelope path.
+        p = sb.parse_claude_cli_json(stream_text(claude_stream_records(result_event=False)))
+        self.assertEqual(p["answer"], "")
+        self.assertIsNotNone(p["parse_error"])
+
+    def test_last_result_event_wins(self):
+        # Claude emits exactly one result event; if a retrying wrapper ever
+        # concatenates two streams, the LAST terminal event is authoritative.
+        records = claude_stream_records() + claude_stream_records()
+        records[-1] = {**records[-1], "result": "second attempt", "total_cost_usd": 0.09}
+        p = sb.parse_claude_cli_json(stream_text(records))
+        self.assertEqual(p["answer"], "second attempt")
+        self.assertEqual(p["cost_usd"], 0.09)
+
+
+class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
+    """The claude trace dialect flattens message content blocks into
+    normalizer-native records: a tool_use OPENS a call (in progress), its
+    tool_result COMPLETES it, and only the terminal result event carries usage.
+    An orphaned call therefore counts zero, per the completed-events-only
+    metrics contract."""
+
+    def test_paired_tool_use_counts_once_and_orphan_counts_zero(self):
+        events_doc, metrics = sb.normalize_trace_records(
+            claude_stream_records(orphan_tool=True), source="claude")
+        events = events_doc["events"]
+        commands = [e for e in events if e.get("type") == "command"]
+        completed_commands = [e for e in commands if e.get("status") == "completed"]
+        self.assertEqual(len(completed_commands), 1)
+        self.assertIn("npm test", completed_commands[0]["input_summary"])
+        self.assertEqual(metrics["commands"], 1)
+        # the orphaned Grep call never resolved: present as in_progress, uncounted
+        grep_events = [e for e in events if e.get("name") == "Grep"]
+        self.assertTrue(grep_events)
+        self.assertTrue(all(e.get("status") == "in_progress" for e in grep_events))
+
+    def test_skill_md_read_is_skill_load_evidence(self):
+        _, metrics = sb.normalize_trace_records(claude_stream_records(), source="claude")
+        self.assertTrue(metrics["skill_invoked"])
+        self.assertTrue(any("SKILL.md" in ev for ev in metrics["skill_invocation_evidence"]))
+
+    def test_usage_is_counted_once_from_the_terminal_result_event(self):
+        # Per-assistant-message usage is API-request-level and would double
+        # count; only the cumulative terminal usage may feed token metrics.
+        _, metrics = sb.normalize_trace_records(claude_stream_records(), source="claude")
+        self.assertEqual(metrics["input_tokens"], 39)
+        self.assertEqual(metrics["output_tokens"], 13)
+        self.assertEqual(metrics["total_tokens"], 52)
+
+    def test_raw_ref_points_at_the_original_stream_line(self):
+        records = claude_stream_records()
+        events_doc, _ = sb.normalize_trace_records(records, source="claude")
+        completed = next(e for e in events_doc["events"]
+                         if e.get("type") == "command" and e.get("status") == "completed")
+        # The completed action points to its invocation arguments; the result is
+        # retained separately so per-step judging receives both records.
+        self.assertEqual(completed["raw_ref"], {"file": "trace.jsonl", "line": 2})
+        self.assertEqual(completed["raw_result_ref"], {"file": "trace.jsonl", "line": 3})
+
+    def test_physical_raw_refs_survive_filtered_jsonl_lines(self):
+        records = claude_stream_records()[:3]
+        trace = "\n[]\n" + stream_text(records)
+        with tempfile.TemporaryDirectory() as td:
+            events_doc, _ = sb.write_trace_artifacts(Path(td), trace, source="claude")
+        completed = next(e for e in events_doc["events"]
+                         if e.get("type") == "command" and e.get("status") == "completed")
+        self.assertEqual(completed["raw_ref"]["line"], 4)
+        self.assertEqual(completed["raw_result_ref"]["line"], 5)
+
+    def test_file_tools_keep_file_taxonomy(self):
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "r", "name": "Read", "input": {"file_path": "notes.md"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "r", "content": "notes"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "w", "name": "Write", "input": {"file_path": "out.md"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "w", "content": "ok"}]}},
+        ]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        completed_types = [e["type"] for e in events_doc["events"] if e["status"] == "completed"]
+        self.assertEqual(completed_types, ["file_read", "file_write"])
+        self.assertEqual((metrics["file_reads"], metrics["file_writes"]), (1, 1))
+
+    def test_tool_result_error_is_preserved_and_counted(self):
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "false"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "b", "content": "failed", "is_error": True}]}},
+        ]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        completed = next(e for e in events_doc["events"] if e["status"] == "completed")
+        self.assertTrue(completed["is_error"])
+        self.assertIn("error.type", completed["otel"])
+        self.assertEqual(metrics["errors"], 1)
+
+    def test_trajectory_step_has_untruncated_invocation_and_result(self):
+        pattern = "x" * 2500 + "NEEDLE"
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "g", "name": "Grep", "input": {"pattern": pattern}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "g", "content": "match"}]}},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            events_doc, _ = sb.write_trace_artifacts(base, stream_text(records), source="claude")
+            steps = sb.trajectory_steps(events_doc["events"], base)
+        self.assertIn("NEEDLE", steps[0]["raw"])
+        self.assertIn('"name": "Grep"', steps[0]["raw"])
+        self.assertIn("match", steps[0]["raw_result"])
+
+    def test_final_assistant_text_is_a_message_event(self):
+        events_doc, _ = sb.normalize_trace_records(claude_stream_records(), source="claude")
+        messages = [e for e in events_doc["events"] if e.get("type") == "message"]
+        self.assertTrue(any("All tests pass." in (e.get("input_summary") or "") for e in messages))
+
+    def test_generic_sources_keep_the_identity_flatten(self):
+        records = [{"type": "command", "command": "ls", "status": "completed"}]
+        events_doc, metrics = sb.normalize_trace_records(records, source="generic")
+        self.assertEqual(len(events_doc["events"]), 1)
+        self.assertEqual(events_doc["events"][0]["raw_ref"]["line"], 1)
+        self.assertEqual(metrics["commands"], 1)
 
 
 class RunClaudeAdapterTests(unittest.TestCase):
@@ -140,6 +296,47 @@ class RunClaudeAdapterTests(unittest.TestCase):
             p, runs, _ = self._run(td, cost=0.02)
             report = sb.build_benchmark_report(p, runs, split="tune", variants_arg=["with_skill"])
             self.assertAlmostEqual(report["summary"]["with_skill"]["cost_usd_total"], 0.02, places=6)
+
+    def test_stream_json_run_writes_a_real_trace(self):
+        # The answer runner requests stream-json (the stub refuses otherwise),
+        # so events.json carries the run's actual tool-use trajectory and
+        # process assertions have evidence on Claude answer runs.
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            rp = td / "repo"
+            case = {"id": "c", "split": "tune", "prompt": "do it",
+                    "assertions": [{"name": "a", "type": "contains", "value": "token-XYZ"}]}
+            p = _manifest(rp, [case])
+            rows = [r for r in sb.prepared_task_rows(p, sb.validate_manifest(p)) if r["variant"] == "with_skill"]
+            tasks = td / "tasks.jsonl"
+            tasks.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            stub = _stub_claude_stream(td / "claude_stream_stub.py", cost=0.031)
+            runs = td / "runs"
+            sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(runs),
+                                             model="claude-haiku-4-5-20251001",
+                                             claude_bin=str(stub), timeout=60))
+            base = runs / rows[0]["run_dir"]
+            self.assertIn("token-XYZ", (base / "output.md").read_text())
+            trace = (base / "trace.jsonl").read_text(encoding="utf-8")
+            self.assertIn("tool_use", trace)   # raw provider stream is preserved verbatim
+            events = json.loads((base / "events.json").read_text())["events"]
+            completed_commands = [e for e in events
+                                  if e.get("type") == "command" and e.get("status") == "completed"]
+            self.assertEqual(len(completed_commands), 1)
+            metrics = json.loads((base / "metrics.json").read_text())
+            self.assertEqual(metrics["commands"], 1)
+            self.assertTrue(metrics["skill_invoked"])
+            # provider-reported usage/cost still win over trace-derived counts
+            self.assertEqual(metrics["input_tokens"], 11)
+            self.assertEqual(metrics["cost_usd"], 0.031)
+            meta = sb.read_metadata_base(base)
+            self.assertEqual(meta["usage_normalized"]["source"], "provider_reported")
+            env = json.loads((base / "environment.json").read_text())
+            self.assertIn("stream-json", env["command"])
+            # the point of the change: a process assertion has evidence to grade
+            passed, evidence = sb.process_or_efficiency_assertion_result(
+                {"type": "command_ran", "pattern": "npm test"}, base, meta)
+            self.assertTrue(passed, evidence)
 
 
 class ClaudeJudgeAndPanelTests(unittest.TestCase):

@@ -108,7 +108,8 @@ Artifact roles:
       "duration_ms": 1200,
       "tokens": {"input": 100, "output": 20},
       "otel": {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "bash", "process.exit_code": 0},
-      "raw_ref": {"file": "trace.jsonl", "line": 12}
+      "raw_ref": {"file": "trace.jsonl", "line": 12},
+      "raw_result_ref": {"file": "trace.jsonl", "line": 13}
     }
   ]
 }
@@ -123,6 +124,12 @@ Required normalized fields:
 - `status`
 - `state_source`
 - `raw_ref` when a raw trace exists
+
+`raw_ref.line` is the physical JSONL line of the invocation, including any blank,
+malformed, or non-object lines that preceded it. For providers that split tool
+invocation and result into separate records, `raw_result_ref` points to the physical
+result line. A completed error result remains a completed action, carries
+`is_error: true`, increments the error counter, and emits `error.type` telemetry.
 
 `status` is the serialized form of `trace_contracts.EventState`: `completed`, `in_progress`,
 `failed`, or `unknown`. The adapter records whether the state came from an explicit provider

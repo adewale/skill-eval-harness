@@ -37,6 +37,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass as _dataclass
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,7 @@ from ablation_model import (
     JETTY_FAILURE,
     RUNNER_FAILURE_MARKER_BY_PROVIDER,
     TIMEOUT_FAILURE,
+    TRIGGER_MEASUREMENT_EVIDENCE_CLASS,
     VIBE_FAILURE,
     AblationMode,
     AblationRecord,
@@ -103,6 +105,7 @@ from trigger_contracts import (
     TraceEventKind,
     TriggerDetection,
     TriggerEvidenceKind,
+    TriggerObservation,
 )
 
 VALID_SPLITS = {"tune", "holdout", "holdback"}
@@ -487,6 +490,23 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
         minimum = dyn.get("minimum_criteria", 3)
         if not isinstance(minimum, int) or minimum < 1:
             die(f"{where} dynamic_rubric.minimum_criteria must be a positive integer")
+    per_step = assertion.get("per_step")
+    if per_step is not None:
+        if atype != "judge":
+            die(f"{where} per_step is only valid on judge assertions")
+        if dims is not None or dyn is not None:
+            die(f"{where} per_step cannot combine with graded_dimensions or dynamic_rubric")
+        if isinstance(per_step, dict):
+            unknown = set(per_step) - {"min_met_fraction"}
+            if unknown:
+                die(f"{where} per_step has unknown field(s): {', '.join(sorted(unknown))}")
+            if "min_met_fraction" not in per_step:
+                die(f"{where} per_step object must contain min_met_fraction")
+            fraction = per_step["min_met_fraction"]
+            if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0 < fraction <= 1:
+                die(f"{where} per_step.min_met_fraction must be a number in (0, 1]")
+        elif per_step is not True:
+            die(f"{where} per_step must be true or an object with min_met_fraction")
     if atype in {"regex", "not_regex"}:
         pattern = str(assertion.get("pattern", assertion.get("value", "")))
         try:
@@ -676,6 +696,8 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                 validate_case_assertion(cid, f"turn #{t} assertion #{j}", j, assertion, path)
                 if isinstance(assertion, dict) and assertion.get("depends_on"):
                     die(f"{cid}: turn #{t} assertion #{j} depends_on is not supported in turn assertions")
+                if isinstance(assertion, dict) and "per_step" in assertion:
+                    die(f"{cid}: turn #{t} assertion #{j} per_step is not supported in turn assertions")
 
     seen_ablation_ids: set[str] = set()
     for i, ablation in enumerate(manifest.get("ablations", [])):
@@ -2934,6 +2956,39 @@ def read_metrics_base(base: Path) -> dict[str, Any]:
     return _with_committed_artifact_state(base, merged)
 
 
+def raw_trace_record_for_ref(run_base: Path | None, ref: Any) -> dict[str, Any] | None:
+    """Resolve one normalized raw-trace reference back to its provider record.
+
+    Fails closed — returns None, never a guess — when the trace file, the cited
+    physical line, or valid JSON is absent.
+    """
+    if run_base is None or not isinstance(ref, dict):
+        return None
+    line_no = ref.get("line")
+    if (ref.get("file") != "trace.jsonl" or isinstance(line_no, bool)
+            or not isinstance(line_no, int) or line_no < 1):
+        return None
+    path = run_base / "trace.jsonl"
+    if not path.is_file():
+        return None
+    for i, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        if i == line_no:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                return None
+            return record if isinstance(record, dict) else None
+    return None
+
+
+def raw_trace_record_for_event(run_base: Path | None, event: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve one normalized event's raw_ref back to the raw provider record in
+    the run's trace.jsonl. The normalizer truncates input/output summaries, so
+    this is the sanctioned path to full fidelity WITHOUT fattening events.json.
+    """
+    return raw_trace_record_for_ref(run_base, event.get("raw_ref"))
+
+
 def command_text(event: dict[str, Any]) -> str:
     parts: list[str] = []
     for key in ["input_summary", "command", "cmd", "name"]:
@@ -2961,6 +3016,31 @@ def command_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def event_mentions_skill_file(event: dict[str, Any]) -> bool:
     hay = " ".join(str(event.get(key, "")) for key in ["input_summary", "output_summary", "name"])
     return "SKILL.md" in hay or "/skills/" in hay or "\\skills\\" in hay
+
+
+# The step-shaped trajectory events: the completed actions a per-step judge
+# grades and the trajectory diff counts. Messages/metrics are context.
+TRAJECTORY_STEP_TYPES = {"command", "tool_call", "file_read", "file_write", "skill_load"}
+
+
+def trace_event_counts(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Single owner of the completed-events-only counting rules. metrics.json
+    (normalize_trace_records) and the report's trajectory diff both derive
+    their counters here, so the two surfaces cannot drift: a diff delta is a
+    delta of exactly the numbers metrics.json reports. Errors count over ALL
+    events — a failed operation is an error precisely because it never
+    completed."""
+    completed = [e for e in events if event_is_completed(e)]
+    commands = command_events(events)
+    return {
+        "steps": sum(1 for e in completed if e.get("type") in TRAJECTORY_STEP_TYPES),
+        "tool_calls": sum(1 for e in completed if e.get("type") in {"tool_call", "skill_load"}) + len(commands),
+        "commands": len(commands),
+        "file_reads": sum(1 for e in completed if e.get("type") in {"file_read", "skill_load"}),
+        "file_writes": sum(1 for e in completed if e.get("type") == "file_write"),
+        "errors": sum(1 for e in events if e.get("type") == "error" or e.get("is_error") is True),
+        "skill_events": [e for e in completed if e.get("type") == "skill_load" or event_mentions_skill_file(e)],
+    }
 
 
 EVENT_TEXT_KEYS = {"file_path", "path", "skill", "input", "partial_json", "command", "cmd", "args", "argv"}
@@ -3585,10 +3665,11 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
         if atype == "tool_count_le":
             max_allowed = int(assertion.get("max", 0))
             tool = assertion.get("tool")
+            completed_events = [e for e in events if event_is_completed(e)]
             if tool:
-                count = sum(1 for e in events if str(e.get("name", "")).casefold() == str(tool).casefold() or (str(tool).casefold() == "bash" and e.get("type") == "command"))
+                count = sum(1 for e in completed_events if str(e.get("name", "")).casefold() == str(tool).casefold() or (str(tool).casefold() == "bash" and e.get("type") == "command"))
             else:
-                count = len([e for e in events if e.get("type") in {"tool_call", "command"}])
+                count = len([e for e in completed_events if e.get("type") in {"tool_call", "command"}])
             return count <= max_allowed, f"tool_count={count}; max={max_allowed}; tool={tool or '<any>'}"
         if atype == "no_repeated_command_loop":
             max_allowed = int(assertion.get("max_repeats", assertion.get("max", 1)))
@@ -3659,9 +3740,16 @@ def stringify_trace_value(value: Any) -> str:
     return str(value)
 
 
-def parse_trace_jsonl_text(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+def parse_trace_jsonl_text_with_lines(text: str) -> tuple[list[dict[str, Any]], list[str], list[int]]:
+    """Parse JSONL while retaining each object's physical source line.
+
+    Blank, malformed, and non-object lines do not become records, but they do
+    occupy source lines. Keeping that mapping makes every emitted raw_ref
+    resolvable against the original trace.jsonl rather than a filtered ordinal.
+    """
     records: list[dict[str, Any]] = []
     errors: list[str] = []
+    record_lines: list[int] = []
     for line_number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
@@ -3672,8 +3760,14 @@ def parse_trace_jsonl_text(text: str) -> tuple[list[dict[str, Any]], list[str]]:
             continue
         if isinstance(obj, dict):
             records.append(obj)
+            record_lines.append(line_number)
         else:
             errors.append(f"line {line_number}: JSON value is not an object")
+    return records, errors, record_lines
+
+
+def parse_trace_jsonl_text(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    records, errors, _ = parse_trace_jsonl_text_with_lines(text)
     return records, errors
 
 
@@ -3736,13 +3830,20 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
         event_type = TraceEventKind.METRIC
     input_summary = command or path or content[:500]
     output_summary = stringify_trace_value(raw_trace_value(record, "output", "stdout", "stderr", "result"))[:1000]
+    raw_call_line = record.get("_raw_call_line")
+    raw_line = raw_call_line if isinstance(raw_call_line, int) and not isinstance(raw_call_line, bool) and raw_call_line > 0 else line
     event = {
         "index": index,
         "type": event_type.value,
         "status": status,
         "state_source": parsed_state.source.value,
-        "raw_ref": {"file": "trace.jsonl", "line": line},
+        "raw_ref": {"file": "trace.jsonl", "line": raw_line},
     }
+    raw_result_line = record.get("_raw_result_line")
+    if isinstance(raw_result_line, int) and not isinstance(raw_result_line, bool) and raw_result_line > 0:
+        event["raw_result_ref"] = {"file": "trace.jsonl", "line": raw_result_line}
+    if record.get("is_error") is True:
+        event["is_error"] = True
     if isinstance(raw_status, str) and raw_status.casefold() != status:
         event["raw_status"] = raw_status
     role = raw_trace_value(record, "role")
@@ -3817,12 +3918,104 @@ def otel_attributes_for_event(event: dict[str, Any]) -> dict[str, Any]:
             attrs["gen_ai.usage.output_tokens"] = int(output_tokens)
     if isinstance(event.get("exit_code"), int):
         attrs["process.exit_code"] = event["exit_code"]
+    if event.get("is_error") is True:
+        attrs["error.type"] = str(event.get("name") or "tool_result_error")[:120]
     return attrs
 
 
+def _claude_tool_flat_record(name: str, tool_input: Any) -> dict[str, Any]:
+    """One Claude tool_use block as a normalizer-native record. Bash is a shell
+    command; Read/Write/Edit are file operations (a SKILL.md path classifies as
+    skill_load in normalize_trace_record); the Skill tool is a skill load; any
+    other tool stays a generic tool call with its input preserved."""
+    inp = tool_input if isinstance(tool_input, dict) else {}
+    if name == "Bash":
+        return {"type": "command", "tool": name, "command": str(inp.get("command") or "")}
+    if name == "Read":
+        return {"type": "file_read", "name": name, "path": str(inp.get("file_path") or "")}
+    if name in {"Write", "Edit", "MultiEdit", "NotebookEdit"}:
+        return {"type": "file_write", "name": name, "path": str(inp.get("file_path") or inp.get("notebook_path") or "")}
+    if name == "Skill":
+        return {"type": "skill_load", "name": name, "path": str(inp.get("skill") or "")}
+    return {"type": "tool_use", "tool": name, "input": inp}
+
+
+def claude_stream_flat_records(records: list[dict[str, Any]], *,
+                               record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten `claude -p --output-format stream-json` events into (line, record)
+    pairs the generic normalizer understands. A message wraps several content
+    blocks, so one raw line can yield several records — each keeps the RAW line
+    for its raw_ref. Lifecycle is paired: a tool_use OPENS a call (in progress)
+    and the matching tool_result COMPLETES it, so an orphaned call (crash
+    mid-tool) counts zero under the completed-events-only metrics contract.
+    Usage rides ONLY the terminal result event — per-assistant-message usage is
+    API-request-level and would double count the cumulative total."""
+    flat: list[tuple[int, dict[str, Any]]] = []
+    if record_lines is not None and len(record_lines) != len(records):
+        raise ValueError("record_lines must have one physical line per trace record")
+    open_calls: dict[str, tuple[int, dict[str, Any]]] = {}
+    for ordinal, record in enumerate(records, 1):
+        line = record_lines[ordinal - 1] if record_lines is not None else ordinal
+        rtype = str(record.get("type") or "")
+        if rtype not in {"assistant", "user"}:
+            # system/init, result, and unknown lifecycle events pass through:
+            # `result` is an intrinsically terminal kind carrying usage/duration.
+            flat.append((line, record))
+            continue
+        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        role = str(message.get("role") or rtype)
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                flat.append((line, {"type": "message", "role": role, "text": content}))
+            continue
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    flat.append((line, {"type": "message", "role": role, "text": text}))
+            elif btype == "tool_use":
+                spec = _claude_tool_flat_record(str(block.get("name") or ""), block.get("input"))
+                flat.append((line, {**spec, "status": "in_progress"}))
+                call_id = str(block.get("id") or "")
+                if call_id:
+                    open_calls[call_id] = (line, spec)
+            elif btype == "tool_result":
+                call_line, spec = open_calls.pop(
+                    str(block.get("tool_use_id") or ""), (line, {"type": "tool_result"}))
+                completion = {**spec, "status": "completed",
+                              "output": stringify_trace_value(block.get("content"))[:1000],
+                              "_raw_call_line": call_line, "_raw_result_line": line}
+                if block.get("is_error"):
+                    # the call completed WITH an error result (e.g. nonzero
+                    # exit); lifecycle-wise it still ran, so it stays completed.
+                    completion["is_error"] = True
+                flat.append((line, completion))
+    return flat
+
+
+def flatten_provider_trace(records: list[dict[str, Any]], *, source: str,
+                           record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
+    """The per-provider flatten seam: claude's block-structured stream expands
+    to several records per raw line; every other dialect is the identity, so
+    existing sources normalize byte-identically."""
+    if source.casefold() == "claude":
+        return claude_stream_flat_records(records, record_lines=record_lines)
+    if record_lines is not None and len(record_lines) != len(records):
+        raise ValueError("record_lines must have one physical line per trace record")
+    return [((record_lines[i - 1] if record_lines is not None else i), record)
+            for i, record in enumerate(records, 1)]
+
+
 def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "generic",
-                            pi_stream: PiStream | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    events = [normalize_trace_record(record, source=source, index=i, line=i) for i, record in enumerate(records, 1)]
+                            pi_stream: PiStream | None = None,
+                            record_lines: list[int] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    flat = flatten_provider_trace(records, source=source, record_lines=record_lines)
+    events = [normalize_trace_record(record, source=source, index=i, line=line)
+              for i, (line, record) in enumerate(flat, 1)]
     commands = [command_text(e) for e in command_events(events)]
     token_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     elapsed_ms = 0.0
@@ -3838,7 +4031,7 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
             if value is not None:
                 token_totals[key] = value
     elif not pi_error:
-        for record, event in zip(records, events):
+        for (_, record), event in zip(flat, events):
             usage = raw_trace_value(record, "usage", "tokens")
             if isinstance(usage, dict):
                 input_tokens = usage_number(usage, "input_tokens")
@@ -3858,17 +4051,16 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
                     value = tokens.get(key)
                     if isinstance(value, (int, float)):
                         token_totals[key] += value
-    completed_events = [event for event in events if event_is_completed(event)]
-    skill_events = [e for e in completed_events if e.get("type") == "skill_load" or event_mentions_skill_file(e)]
+    counts = trace_event_counts(events)
+    skill_events = counts["skill_events"]
     metrics: dict[str, Any] = {
         "schema_version": 2,
         "source": source,
-        "tool_calls": (sum(1 for e in completed_events if e.get("type") in {"tool_call", "skill_load"})
-                       + len(command_events(events))),
-        "commands": len(commands),
-        "file_reads": sum(1 for e in completed_events if e.get("type") in {"file_read", "skill_load"}),
-        "file_writes": sum(1 for e in completed_events if e.get("type") == "file_write"),
-        "errors": sum(1 for e in events if e.get("type") == "error"),
+        "tool_calls": counts["tool_calls"],
+        "commands": counts["commands"],
+        "file_reads": counts["file_reads"],
+        "file_writes": counts["file_writes"],
+        "errors": counts["errors"],
         "retries": 0,
         "repeated_command_max": repeated_command_max(commands),
         "skill_invoked": bool(skill_events),
@@ -4118,11 +4310,15 @@ def write_trace_artifacts(
     run_dir.mkdir(parents=True, exist_ok=True)
     if write_raw_trace:
         (run_dir / "trace.jsonl").write_text(trace_text, encoding="utf-8")
+    parsed_records, parsed_errors, record_lines = parse_trace_jsonl_text_with_lines(trace_text)
     if source.casefold() == "pi" and pi_stream is not None:
         records, parse_errors = list(pi_stream.records), list(pi_stream.parse_errors)
+        if len(record_lines) != len(records):
+            record_lines = list(range(1, len(records) + 1))
     else:
-        records, parse_errors = parse_trace_jsonl_text(trace_text)
-    events, metrics = normalize_trace_records(records, source=source, pi_stream=pi_stream)
+        records, parse_errors = parsed_records, parsed_errors
+    events, metrics = normalize_trace_records(
+        records, source=source, pi_stream=pi_stream, record_lines=record_lines)
     if parse_errors:
         metrics["parse_errors"] = parse_errors[:20]
         metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
@@ -4969,7 +5165,12 @@ class ClaudeBackend(AgentBackend):
     name = "claude"
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
-        result = claude_cli_invoke(request.prompt, model=request.model, claude_bin=str(options.get("claude_bin") or "claude"), timeout=request.timeout_s, cwd=str(request.workspace))
+        # stream-json, not the single envelope: the stream is the run's raw
+        # trace, so Claude answer runs carry the same tool-use trajectory
+        # evidence the trigger matrix already observes — without it every
+        # process assertion on a Claude run fails closed for missing evidence.
+        result = claude_cli_invoke(request.prompt, model=request.model, claude_bin=str(options.get("claude_bin") or "claude"),
+                                   timeout=request.timeout_s, cwd=str(request.workspace), output_format="stream-json")
         claude_metrics = claude_run_metrics(result)
         metrics_extra = {k: v for k, v in claude_metrics.items() if k not in ("schema_version", "source")}
         return RunnerOutcome(
@@ -4979,7 +5180,7 @@ class ClaudeBackend(AgentBackend):
             error=result.get("parse_error"), trace_text=result.get("raw_response") or "",
             usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
             metadata_extra={"cost_usd": claude_metrics.get("cost_usd")}, metrics_extra=metrics_extra,
-            environment={"runner": "claude", "command": "claude -p --output-format json --no-session-persistence", "cwd": "<isolated workspace>"})
+            environment={"runner": "claude", "command": result.get("command") or "claude -p", "cwd": "<isolated workspace>"})
 
 
 class VibeBackend(AgentBackend):
@@ -5103,17 +5304,26 @@ CLAUDE_USAGE_KEYS = {
 
 
 def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
-    """Parse the `claude -p --output-format json` envelope.
+    """Parse `claude -p` output in either output format.
 
-    Malformed protocol bytes remain diagnostics and can never become a final
-    answer merely because the subprocess exited zero.
+    `--output-format json` emits one result envelope; `--output-format
+    stream-json` emits a JSONL event stream whose TERMINAL `type:"result"`
+    event carries the same envelope fields — so the runner and the judge keep
+    one parser for Claude's wire format. A stream that dies before its result
+    event, like malformed protocol bytes, remains diagnostics and can never
+    become a final answer merely because the subprocess exited zero.
     """
     text = stdout if isinstance(stdout, str) else ""
-    try:
-        env = extract_json_object(text)
-    except Exception as exc:
-        return {"answer": "", "raw_response": text, "cost_usd": None,
-                "usage": {}, "parse_error": str(exc)}
+    env: dict[str, Any] | None = None
+    for obj in iter_json_objects(text):
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            env = obj
+    if env is None:
+        try:
+            env = extract_json_object(text)
+        except Exception as exc:
+            return {"answer": "", "raw_response": text, "cost_usd": None,
+                    "usage": {}, "parse_error": str(exc)}
     if not isinstance(env, dict) or "result" not in env:
         return {"answer": "", "raw_response": text, "cost_usd": None,
                 "usage": {}, "parse_error": "not a claude -p json envelope"}
@@ -5141,15 +5351,24 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
 
 
 def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str = "claude",
-                      timeout: int = DEFAULT_RUNNER_TIMEOUT_S, extra_args: list[str] | None = None, cwd: str | Path | None = None) -> dict[str, Any]:
+                      timeout: int = DEFAULT_RUNNER_TIMEOUT_S, extra_args: list[str] | None = None, cwd: str | Path | None = None,
+                      output_format: str = "json") -> dict[str, Any]:
     """Single owner for invoking Claude via `claude -p`.
 
-    Returns the parsed envelope plus returncode/elapsed_ms/stderr. `claude_bin`
-    is an executable path (tests inject a stub that emits a canned envelope), NOT
-    a shell string — so there is no shell-quoting seam between the harness and
-    the model. If no cwd is supplied, run in an empty temporary directory rather
-    than inheriting the harness repo cwd."""
-    argv = [claude_bin, "-p", "--output-format", "json", "--no-session-persistence"]
+    Returns the parsed envelope plus returncode/elapsed_ms/stderr/raw_response.
+    `claude_bin` is an executable path (tests inject a stub that emits a canned
+    envelope), NOT a shell string — so there is no shell-quoting seam between
+    the harness and the model. `output_format` selects `json` (one envelope; the
+    judge default) or `stream-json` (the full event stream the answer runner
+    keeps as the run's raw trace; `-p` requires `--verbose` with it). If no cwd
+    is supplied, run in an empty temporary directory rather than inheriting the
+    harness repo cwd."""
+    if output_format not in {"json", "stream-json"}:
+        raise ValueError(f"unsupported claude output_format {output_format!r}")
+    argv = [claude_bin, "-p", "--output-format", output_format]
+    if output_format == "stream-json":
+        argv.append("--verbose")
+    argv.append("--no-session-persistence")
     if model:
         argv += ["--model", model]
     if extra_args:
@@ -5163,10 +5382,11 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
             result = invoke(Path(td))
     else:
         result = invoke(cwd)
+    command = " ".join(shlex.quote(a) for a in ["claude", *argv[1:]])
     if result.timed_out:
         return {"answer": "", "cost_usd": None, "usage": {}, "parse_error": None,
                 "returncode": 124, "timed_out": True, "elapsed_ms": result.elapsed_ms,
-                "stderr": result.stderr}
+                "stderr": result.stderr, "raw_response": result.stdout, "command": command}
     parsed = parse_claude_cli_json(result.stdout)
     effective_returncode = result.returncode
     if effective_returncode == 0 and parsed.get("is_error"):
@@ -5176,6 +5396,10 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
         "timed_out": False,
         "elapsed_ms": result.elapsed_ms,
         "stderr": result.stderr,
+        # The raw wire bytes always ride along: in stream mode they ARE the
+        # run's trace; in envelope mode they preserve the failure diagnostics.
+        "raw_response": result.stdout,
+        "command": command,
     })
     return parsed
 
@@ -5788,6 +6012,67 @@ def extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("no JSON object found in judge output")
 
 
+def is_per_step_assertion(assertion: dict[str, Any]) -> bool:
+    """Presence, rather than truthiness, owns the per-step assertion shape."""
+    return "per_step" in assertion and assertion.get("per_step") is not None
+
+
+def trajectory_steps(events: list[dict[str, Any]] | None, run_base: Path | None) -> list[dict[str, Any]]:
+    """The judgeable steps of one run: each COMPLETED action event, in
+    trajectory order, named step-1..step-N (ordinal names keep DynamicVerdict's
+    unique-name invariant). An in-progress or failed call never became an
+    action, so it is not a step. Each step carries the normalized summaries
+    plus the raw provider record resolved through raw_ref, so a per-step judge
+    sees full tool arguments instead of the normalizer's truncation."""
+    steps: list[dict[str, Any]] = []
+    for event in events or []:
+        if event.get("type") not in TRAJECTORY_STEP_TYPES or not event_is_completed(event):
+            continue
+        step: dict[str, Any] = {"step": f"step-{len(steps) + 1}",
+                                "event_index": event.get("index"),
+                                "type": event.get("type")}
+        for key in ("name", "input_summary", "output_summary", "exit_code"):
+            if event.get(key) not in (None, ""):
+                step[key] = event[key]
+        raw = raw_trace_record_for_event(run_base, event)
+        if raw is not None:
+            step["raw"] = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+        raw_result = raw_trace_record_for_ref(run_base, event.get("raw_result_ref"))
+        if raw_result is not None:
+            step["raw_result"] = json.dumps(raw_result, ensure_ascii=False, sort_keys=True)
+        steps.append(step)
+    return steps
+
+
+def trajectory_steps_sha256(steps: list[dict[str, Any]]) -> str:
+    """Content identity for the exact trajectory evidence a verdict judged."""
+    encoded = json.dumps(steps, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def per_step_minimum(assertion: dict[str, Any], step_count: int) -> int:
+    """minimum_criteria for a per-step verdict: ceil(min_met_fraction x steps),
+    defaulting to EVERY step (fraction 1.0), never below 1. Derived from the
+    run's actual step count at judge time — an authoring-time constant cannot
+    know how many steps a run will take."""
+    spec = assertion.get("per_step")
+    fraction = Decimal(1)
+    if isinstance(spec, dict) and isinstance(spec.get("min_met_fraction"), (int, float)):
+        fraction = Decimal(str(spec["min_met_fraction"]))
+    minimum = int((fraction * Decimal(step_count)).to_integral_value(rounding=ROUND_CEILING))
+    return max(1, minimum)
+
+
+def _criteria_verdict_schema(min_items: int) -> dict[str, Any]:
+    """The criteria-list verdict schema shared by dynamic_rubric and per_step."""
+    return {"type": "object", "required": ["criteria"],
+            "properties": {"criteria": {"type": "array", "minItems": min_items,
+                                        "items": {"type": "object", "required": ["name", "met"],
+                                                  "properties": {"name": {"type": "string"}, "met": {"type": "boolean"}}}},
+                           "rationale": {"type": "string"}}}
+
+
 def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
     """The canonical JSON Schema for a judge verdict of this assertion's shape
     (G4), branching exactly as judge_prompt does. Handed to the model as the
@@ -5803,18 +6088,19 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
             dim_schema["required"] = dim_names
         return {"type": "object", "required": ["dimension_scores"],
                 "properties": {"dimension_scores": dim_schema, "rationale": {"type": "string"}}}
+    if is_per_step_assertion(assertion):
+        # step count is a run property, not an assertion property, so the
+        # schema can only pin the item shape; run_one_judge_task enforces the
+        # exact step-name match once the run's steps are known.
+        return _criteria_verdict_schema(1)
     if assertion.get("dynamic_rubric"):
         minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
-        return {"type": "object", "required": ["criteria"],
-                "properties": {"criteria": {"type": "array", "minItems": minimum,
-                                            "items": {"type": "object", "required": ["name", "met"],
-                                                      "properties": {"name": {"type": "string"}, "met": {"type": "boolean"}}}},
-                               "rationale": {"type": "string"}}}
+        return _criteria_verdict_schema(minimum)
     return {"type": "object", "required": ["passed"],
             "properties": {"passed": {"type": "boolean"}, "score": {"type": "number"}, "rationale": {"type": "string"}}}
 
 
-def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | None = None, metrics: dict | None = None, artifacts: list | None = None, explore_dir: str | None = None) -> str:
+def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | None = None, metrics: dict | None = None, artifacts: list | None = None, explore_dir: str | None = None, steps: list | None = None) -> str:
     assertion = task.get("assertion", {})
     payload = {
         "judge_task_id": task.get("judge_task_id"),
@@ -5835,6 +6121,8 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
         payload["metrics"] = metrics
     if artifacts is not None:
         payload["artifacts"] = artifacts
+    if steps is not None:
+        payload["trajectory_steps"] = steps
     context_hint = ("You are ALSO given the run's `trajectory` (normalized tool-call events), `metrics`, "
                     "and an `artifacts` inventory — weigh HOW the answer was produced (skill invoked? sensible "
                     "tools? no forbidden command?), not only candidate_output.\n"
@@ -5850,6 +6138,18 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
     # G4: hand the model the exact schema the validator enforces (purely additive
     # instruction — the parse path is unchanged).
     schema_hint = "Your output MUST validate against this JSON Schema:\n" + json.dumps(verdict_schema_for(assertion)) + "\n\n"
+    if is_per_step_assertion(assertion):
+        return (
+            "You are grading one Skill Eval Harness judge assertion PER STEP of the run's trajectory.\n"
+            "For EACH entry in trajectory_steps, judge whether that step was a sound action in context:\n"
+            "a sensible tool with sensible arguments that advances the task — not destructive, redundant,\n"
+            "or forbidden. A right answer reached through unsound steps is a finding, not a pass.\n"
+            "Return only JSON with keys: criteria (a list of {name (string), met (boolean)} with EXACTLY one\n"
+            "entry per step, using each step's given name, in the given order), rationale (string).\n"
+            + context_hint
+            + schema_hint
+            + json.dumps(payload, indent=2, ensure_ascii=False)
+        )
     if assertion.get("graded_dimensions"):
         return (
             "You are grading one Skill Eval Harness judge assertion with ANCHORED graded dimensions.\n"
@@ -6025,6 +6325,28 @@ JUDGE_BACKENDS = {
 }
 
 
+# One spelling of the per-step fail-closed reason, shared by grade_case_variant
+# (which refuses to emit the task) and run_one_judge_task (which refuses to
+# invoke on a re-run task file).
+PER_STEP_MISSING_EVIDENCE = "per-step judge requires trajectory evidence"
+
+
+def _judge_row_identity(task: dict[str, Any], *, judge_model: str | None,
+                        judge_backend: str, judge_cmd: str | None) -> dict[str, Any]:
+    """The identity fields every judge verdict row carries, spelled once so the
+    fail-closed (never-invoked) row and the invoked row cannot drift."""
+    return {
+        "judge_task_id": task["judge_task_id"],
+        "case_id": task.get("case_id"),
+        "variant": task.get("variant"),
+        "run_number": task.get("run_number"),
+        # The judge is a variable, not a constant: which model produced this verdict
+        # is recorded so a panel can measure whether the answer depends on the judge.
+        "judge_model": judge_model,
+        "judge_backend": judge_backend if not judge_cmd else "cmd",
+    }
+
+
 def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, transcripts_dir: Path | None = None,
                        repeat_index: int = 1, *, judge_model: str | None = None, claude_bin: str = "claude",
                        judge_backend: str = "claude", codex_cmd: str = "codex exec", vibe_cmd: str = VIBE_DEFAULT_CMD,
@@ -6039,6 +6361,50 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     rb = task.get("run_base")
     run_base = Path(rb) if rb else None
     has_run_base = run_base is not None and run_base.exists()
+    # Per-step judging is trace-evidence-backed: resolve the run's steps BEFORE
+    # any model spend, and fail closed — like a process assertion — when there
+    # is nothing to judge. grade_case_variant already refuses to emit such a
+    # task; this guard covers re-run task files whose run dirs have changed.
+    per_step_steps: list[dict[str, Any]] | None = None
+    per_step_fingerprint: str | None = None
+    if is_per_step_assertion(task.get("assertion", {})):
+        step_events, _ = read_events_base(run_base) if has_run_base else (None, None)
+        per_step_steps = trajectory_steps(step_events, run_base if has_run_base else None)
+        if not per_step_steps:
+            # No model was invoked BY DESIGN, so judge spend is not_applicable
+            # on both channels — never "missing", which would read as lost
+            # telemetry from a run that happened.
+            return validated_result_row({
+                **_judge_row_identity(task, judge_model=judge_model,
+                                      judge_backend=judge_backend, judge_cmd=judge_cmd),
+                "cost_usd": None,
+                "usage_normalized": normalize_usage(None, source="not_applicable"),
+                "cost_normalized": normalize_cost(None, source="not_applicable"),
+                "passed": False,
+                "evidence": f"{PER_STEP_MISSING_EVIDENCE}: no completed trajectory steps in events.json",
+                "returncode": 0,
+                "stderr": "",
+            })
+        per_step_fingerprint = trajectory_steps_sha256(per_step_steps)
+        expected_fingerprint = task.get("trajectory_steps_sha256")
+        if (isinstance(expected_fingerprint, str)
+                and expected_fingerprint != per_step_fingerprint):
+            minimum = per_step_minimum(task.get("assertion", {}), len(per_step_steps))
+            return validated_result_row({
+                **_judge_row_identity(task, judge_model=judge_model,
+                                      judge_backend=judge_backend, judge_cmd=judge_cmd),
+                "cost_usd": None,
+                "usage_normalized": normalize_usage(None, source="not_applicable"),
+                "cost_normalized": normalize_cost(None, source="not_applicable"),
+                "criteria": [{"name": step["step"], "met": False} for step in per_step_steps],
+                "minimum_criteria": minimum,
+                "score": 0.0,
+                "passed": False,
+                "trajectory_steps_sha256": per_step_fingerprint,
+                "evidence": "per-step judge task trajectory changed after task creation; model was not invoked",
+                "returncode": 0,
+                "stderr": "",
+            })
     # G1 tool-using follow-on: an opt-in judge may EXPLORE a SANITIZED copy of the run
     # dir (oracle files removed by construction) with read-only tools, rather than only
     # reading a prompt-embedded trajectory. Native adapter only, and only when the run
@@ -6057,9 +6423,9 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         # G1: hand the judge the same normalized trajectory the objective detectors
         # see, plus a denylisted artifact inventory (never the grader's answer key).
         events, _ = read_events_base(run_base)
-        prompt = judge_prompt(task, output_text, trajectory=events, metrics=read_metrics_base(run_base), artifacts=judge_artifact_inventory(run_base), explore_dir=explore_hint)
+        prompt = judge_prompt(task, output_text, trajectory=events, metrics=read_metrics_base(run_base), artifacts=judge_artifact_inventory(run_base), explore_dir=explore_hint, steps=per_step_steps)
     else:
-        prompt = judge_prompt(task, output_text, explore_dir=explore_hint)
+        prompt = judge_prompt(task, output_text, explore_dir=explore_hint, steps=per_step_steps)
     # Native judge backends share a registry-owned invocation seam. A shell
     # `judge_cmd` remains the universal escape hatch; native Codex uses
     # --output-last-message/--output-schema so stdout JSONL is telemetry, not
@@ -6116,6 +6482,26 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     graded_payload: dict[str, Any] = {}
     if assertion.get("graded_dimensions") and isinstance(parsed.get("dimension_scores"), dict):
         graded_payload["dimension_scores"] = parsed["dimension_scores"]
+    if is_per_step_assertion(assertion) and per_step_steps:
+        # The verdict must cover EXACTLY the steps the run took, in order — a
+        # verdict about invented or skipped steps is not evidence about this run.
+        criteria = parsed.get("criteria")
+        names = ([str(c.get("name")) for c in criteria if isinstance(c, dict)]
+                 if isinstance(criteria, list) else [])
+        expected_names = [s["step"] for s in per_step_steps]
+        if parse_error is not None or names != expected_names:
+            if parse_error is None:
+                parse_error = (f"per-step criteria must name each step exactly: "
+                               f"expected {expected_names[:5]}, got {names[:5]}")
+            # Keep malformed repeats in the assertion's dynamic verdict shape,
+            # so repeat aggregation fails closed instead of crashing on mixed
+            # boolean/dynamic verdict kinds.
+            graded_payload["criteria"] = [
+                {"name": name, "met": False} for name in expected_names]
+            graded_payload["minimum_criteria"] = per_step_minimum(assertion, len(per_step_steps))
+        else:
+            graded_payload["criteria"] = criteria
+            graded_payload["minimum_criteria"] = per_step_minimum(assertion, len(per_step_steps))
     if assertion.get("dynamic_rubric") and isinstance(parsed.get("criteria"), list):
         graded_payload["criteria"] = parsed["criteria"]
         graded_payload["minimum_criteria"] = max(1, int((assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)))
@@ -6124,7 +6510,8 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         # merge uses (merged_qualitative_entry), and the graded payload rides
         # the row so the merge can re-derive it — a graded response carries no
         # top-level passed/score, so the plain path would file it as failed.
-        graded_entry = merged_qualitative_entry(assertion, parsed, task["judge_task_id"])
+        graded_entry = merged_qualitative_entry(
+            assertion, {**parsed, **graded_payload}, task["judge_task_id"])
         passed = bool(graded_entry.get("passed"))
         score = graded_entry.get("score")
         if "dimension_scores" in graded_payload:
@@ -6133,17 +6520,11 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         plain_payload = ({**parsed, "threshold": threshold}
                          if parsed.get("score") is not None else parsed)
         passed = judge_verdict_passed(plain_payload)
-    evidence = parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or parse_error or "judge command completed"
+    evidence = parse_error or parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or "judge command completed"
     row = {
         **graded_payload,
-        "judge_task_id": task["judge_task_id"],
-        "case_id": task.get("case_id"),
-        "variant": task.get("variant"),
-        "run_number": task.get("run_number"),
-        # The judge is a variable, not a constant: which model produced this verdict
-        # is recorded so a panel can measure whether the answer depends on the judge.
-        "judge_model": judge_model_label,
-        "judge_backend": judge_backend if not judge_cmd else "cmd",
+        **_judge_row_identity(task, judge_model=judge_model_label,
+                              judge_backend=judge_backend, judge_cmd=judge_cmd),
         "cost_usd": cost_usd,
         # Judge-model spend is suite cost too, but a SEPARATE ledger line from
         # the model under test (issue #21); normalized like every runner path.
@@ -6155,6 +6536,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         "evidence": evidence,
         "returncode": returncode,
         "stderr": stderr[:4000] if stderr else "",
+        **({"trajectory_steps_sha256": per_step_fingerprint} if per_step_fingerprint else {}),
     }
     if schema_errors:
         row["schema_errors"] = schema_errors
@@ -6863,6 +7245,7 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
     evidence = judged.get("evidence", judged.get("rationale", judged.get("reasoning", "judge result supplied")))
     dims = assertion.get("graded_dimensions")
     dyn = assertion.get("dynamic_rubric")
+    per_step = is_per_step_assertion(assertion)
     if dims and isinstance(judged.get("dimension_scores"), dict):
         expected_names = {str(item.get("name")) for item in dims if isinstance(item, dict)}
         if set(judged["dimension_scores"]) != expected_names:
@@ -6883,17 +7266,25 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
             "evidence": f"dimension scores (1-5): {json.dumps(raw, sort_keys=True)}; {evidence}",
         })
         return entry
-    if dyn and isinstance(judged.get("criteria"), list):
+    if (dyn or per_step) and isinstance(judged.get("criteria"), list):
         criteria = [c for c in judged["criteria"] if isinstance(c, dict)]
         met = sum(1 for c in criteria if c.get("met"))
         total = len(criteria)
-        minimum = max(1, int(dyn.get("minimum_criteria", 3)))
+        if per_step:
+            # One criterion per trajectory step (run_one_judge_task enforced the
+            # exact step-name match), so the minimum re-derives from the
+            # assertion's fraction and the run's actual step count.
+            minimum = per_step_minimum(assertion, total)
+            label = "trajectory steps sound"
+        else:
+            minimum = max(1, int(dyn.get("minimum_criteria", 3)))
+            label = "dynamic criteria met"
         entry.update({
             "passed": total >= minimum and met >= minimum,
             "score": round(met / total, 4) if total else None,
             "criteria_met": met,
             "criteria_total": total,
-            "evidence": f"{met}/{total} dynamic criteria met (minimum {minimum}); {evidence}",
+            "evidence": f"{met}/{total} {label} (minimum {minimum}); {evidence}",
         })
         return entry
     entry.update({
@@ -6996,8 +7387,45 @@ def grade_case_variant(
             expanded = expand_judge_preset(assertion)
             if turn_n is not None:
                 expanded = {**expanded, "name": f"turn-{turn_n}: {assertion_label(expanded)}"}
+            current_steps: list[dict[str, Any]] | None = None
+            current_steps_fingerprint: str | None = None
+            if is_per_step_assertion(expanded):
+                # Trace-evidence-backed judging fails closed like a process
+                # assertion: no completed steps means nothing to grade, so no
+                # judge task is emitted (no model spend) and a stored verdict
+                # cannot outlive its evidence.
+                step_events, step_error = read_events_base(unit_base) if unit_base is not None else (None, "missing run directory")
+                current_steps = trajectory_steps(step_events, unit_base)
+                if not current_steps:
+                    reason = ("no completed trajectory steps" if step_events is not None
+                              else step_error or "missing events.json")
+                    entry = {"name": assertion_label(expanded), "type": atype, "passed": False,
+                             "score": 0.0, "severity": severity, "oracle": tier,
+                             "evidence": f"{PER_STEP_MISSING_EVIDENCE}: {reason}"}
+                    if turn_n is not None:
+                        entry["turn"] = turn_n
+                    qualitative.append(entry)
+                    if turn_n is None:
+                        satisfied[assertion_label(assertion)] = False
+                        if case_uses_depends_on:
+                            entry["_dep_label"] = assertion_label(assertion)
+                    return
+                current_steps_fingerprint = trajectory_steps_sha256(current_steps)
             jid = judge_task_id(case["id"], variant, run_number, expanded, model=model)
             judged = judge_results.get(jid)
+            if judged and current_steps is not None:
+                expected_names = [step["step"] for step in current_steps]
+                criteria = judged.get("criteria")
+                judged_names = ([str(item.get("name")) for item in criteria if isinstance(item, dict)]
+                                if isinstance(criteria, list) else [])
+                expected_minimum = per_step_minimum(expanded, len(current_steps))
+                # A stored verdict is evidence only for the exact trajectory it
+                # saw. Missing legacy fingerprints, stale content, invented
+                # criteria, and mismatched thresholds are all re-queued.
+                if (judged.get("trajectory_steps_sha256") != current_steps_fingerprint
+                        or judged_names != expected_names
+                        or judged.get("minimum_criteria") != expected_minimum):
+                    judged = None
             if judged:
                 entry = merged_qualitative_entry(expanded, judged, jid)
                 entry["severity"] = severity
@@ -7023,6 +7451,8 @@ def grade_case_variant(
                     "prompt_ref": case.get("prompt_ref"),
                     "expected_behavior": case.get("expected_behavior", []),
                     "review_rubric": case.get("review_rubric", []),
+                    **({"trajectory_steps_sha256": current_steps_fingerprint}
+                       if current_steps_fingerprint else {}),
                 })
         else:
             labeled = {**assertion, "name": f"turn-{turn_n}: {assertion_label(assertion)}"} if turn_n is not None else assertion
@@ -7405,6 +7835,169 @@ def two_sample_permutation_significance(a: list[float], b: list[float], *, max_e
         # valid permutation, so a sampled p is never an impossible exact 0.
         p = (hits + 1) / (samples + 1)
     return {"method": method, "n_a": na, "n_b": nb, "observed_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
+
+
+def _trigger_report_rows(report: dict[str, Any], label: str) -> list[TriggerObservation]:
+    """Re-erect the typed trigger contract from one persisted matrix report.
+    Strict at the boundary: a file that is not a skill-trigger-matrix report, or
+    any row whose stored flags contradict the typed observation, is rejected
+    rather than silently averaged."""
+    if not isinstance(report, dict) or report.get("evidence_class") != TRIGGER_MEASUREMENT_EVIDENCE_CLASS:
+        die(f"{label} is not a skill-trigger-matrix report (expected evidence_class {TRIGGER_MEASUREMENT_EVIDENCE_CLASS!r})")
+    rows = report.get("results")
+    if not isinstance(rows, list) or not rows:
+        die(f"{label} has no results rows")
+    observations: list[TriggerObservation] = []
+    for position, row in enumerate(rows, 1):
+        try:
+            observations.append(TriggerObservation.from_row(row))
+        except (TypeError, ValueError, KeyError) as exc:
+            die(f"{label} results row {position}: {exc}")
+    return observations
+
+
+def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any]) -> dict[str, Any]:
+    """Pair a baseline skill-trigger-matrix report with an --ablation report of
+    the SAME canonical skill revision — the trigger population's version of the
+    answer path's causal-confirmation gate, closing the gap both trigger
+    runners stamp on their output (single-arm raw measurements, no pairing).
+
+    Matrix rows carry no run numbers (repeats are unordered and share no
+    matched randomness), so complete observations are paired into
+    (agent, model, query) cells, then cells are averaged to one authored-query
+    pass-rate delta. Authored queries are sign-flip-tested exactly as
+    build_paired_summary tests per-case deltas. Pass rates, not trigger rates,
+    carry the verdict, so polarity is inherent: a NO_TRIGGER query regresses by
+    over-triggering. The verdict goes through the EvidenceClass guard —
+    CONFIRMED_CAUSAL needs verified provenance, coverage, and a significant
+    observed drop; an observed-but-insignificant drop downgrades to
+    INDETERMINATE (never REFUTED, which would wrongly claim "no regression")."""
+    base_rows = _trigger_report_rows(baseline, "--baseline")
+    abl_rows = _trigger_report_rows(ablation, "--ablation")
+    if baseline.get("ablation"):
+        die("--baseline must be an unablated trigger run (it declares an ablation)")
+    if not ablation.get("ablation"):
+        die("--ablation must be a trigger run produced with --ablation")
+
+    reasons: list[str] = []
+    base_hash = str(baseline.get("skill_tree_hash") or "")
+    if not base_hash:
+        reasons.append("baseline report has no skill_tree_hash")
+    prov: Provenance | None = None
+    try:
+        prov = Provenance.from_dict(ablation.get("provenance") or {})
+    except (TypeError, ValueError) as exc:
+        reasons.append(f"ablation provenance invalid: {exc}")
+    if prov is not None:
+        if prov.id != ablation.get("ablation"):
+            reasons.append(
+                f"ablation report id {ablation.get('ablation')!r} does not match provenance id {prov.id!r}")
+        if prov.population is not Population.TRIGGER:
+            reasons.append("ablation provenance is not trigger-population")
+        if base_hash and prov.identity.canonical != base_hash:
+            reasons.append("ablation parent_skill_hash does not match the baseline skill_tree_hash: "
+                           "the two runs measured a different skill revision")
+        if str(ablation.get("skill_tree_hash") or "") != prov.identity.edited:
+            reasons.append("ablation report skill_tree_hash does not match its provenance skill_hash")
+    provenance_verified = not reasons
+
+    def keyed(observations: list[TriggerObservation]) -> dict[tuple[str, str | None, str, bool], list[TriggerObservation]]:
+        cells: dict[tuple[str, str | None, str, bool], list[TriggerObservation]] = {}
+        for obs in observations:
+            cells.setdefault((obs.agent, obs.model, obs.query, obs.expectation.should_trigger), []).append(obs)
+        return cells
+
+    def rates(complete: list[TriggerObservation], total: int) -> dict[str, Any]:
+        return {"runs": total, "complete": len(complete),
+                "pass_rate": round(statistics.mean(1.0 if o.passed else 0.0 for o in complete), 6),
+                "trigger_rate": round(statistics.mean(1.0 if o.detection.triggered else 0.0 for o in complete), 6)}
+
+    base_cells, abl_cells = keyed(base_rows), keyed(abl_rows)
+    comparable: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for key in sorted(set(base_cells) | set(abl_cells), key=lambda k: (k[0], str(k[1]), k[2], k[3])):
+        agent, model, query, should = key
+        base_complete = [o for o in base_cells.get(key, []) if o.invocation.observation_complete]
+        abl_complete = [o for o in abl_cells.get(key, []) if o.invocation.observation_complete]
+        reason = ("missing_baseline_arm" if key not in base_cells
+                  else "missing_ablation_arm" if key not in abl_cells
+                  else "baseline_observations_incomplete" if not base_complete
+                  else "ablation_observations_incomplete" if not abl_complete
+                  else None)
+        if reason:
+            blocked.append({"agent": agent, "model": model, "query": query,
+                            "should_trigger": should, "reason": reason})
+            continue
+        base_block = rates(base_complete, len(base_cells[key]))
+        abl_block = rates(abl_complete, len(abl_cells[key]))
+        comparable.append({
+            "agent": agent, "model": model, "query": query, "should_trigger": should,
+            "baseline": base_block, "ablation": abl_block,
+            "pass_delta": round(abl_block["pass_rate"] - base_block["pass_rate"], 6),
+            "trigger_delta": round(abl_block["trigger_rate"] - base_block["trigger_rate"], 6),
+        })
+
+    # Agent/model cells are repeated measurements of the SAME authored query,
+    # not independent experimental units. Collapse them before inference so a
+    # single query run through many models cannot manufacture significance.
+    grouped_queries: dict[tuple[str, bool], list[dict[str, Any]]] = collections.defaultdict(list)
+    for entry in comparable:
+        grouped_queries[(entry["query"], entry["should_trigger"])].append(entry)
+    query_units = [{
+        "query": query,
+        "should_trigger": should,
+        "cells": len(entries),
+        "pass_delta": round(statistics.mean(e["pass_delta"] for e in entries), 6),
+        "trigger_delta": round(statistics.mean(e["trigger_delta"] for e in entries), 6),
+    } for (query, should), entries in sorted(
+        grouped_queries.items(), key=lambda item: (item[0][0], item[0][1]))]
+    significance = sign_flip_significance([entry["pass_delta"] for entry in query_units])
+    regressed = [entry for entry in query_units if entry["pass_delta"] < 0]
+    mean_delta = significance.get("observed_mean_delta")
+    aggregate_regression = isinstance(mean_delta, (int, float)) and mean_delta < 0
+    evidence_class = causal_confirmation(
+        provenance_verified=provenance_verified,
+        has_coverage=bool(query_units),
+        regression_observed=aggregate_regression,
+    )
+    note = None
+    if evidence_class is EvidenceClass.CONFIRMED_CAUSAL and not significance.get("significant_at_0_05"):
+        evidence_class = EvidenceClass.INDETERMINATE
+        note = (f"regression observed but not significant across queries "
+                f"(p={significance.get('p_value')}); >= 6 consistently regressed queries are needed to confirm")
+    elif not provenance_verified:
+        note = "provenance unverified: " + "; ".join(reasons)
+    elif not query_units:
+        note = "no comparable (agent, model, query) pair has complete observations on both sides"
+    elif regressed and not aggregate_regression:
+        note = "some queries regressed, but the aggregate mean pass delta is non-negative"
+
+    out = {
+        "population": "trigger",
+        "evidence_class": evidence_class.value,
+        "skill_name": baseline.get("skill_name"),
+        "ablation": ablation.get("ablation"),
+        "provenance": {"verified": provenance_verified, "reasons": reasons,
+                       "baseline_skill_tree_hash": base_hash,
+                       "ablation_skill_tree_hash": ablation.get("skill_tree_hash")},
+        "paired": {"comparable_queries": comparable, "query_units": query_units,
+                   "blocked": blocked, "significance": significance},
+        "regressed_queries": [{k: entry[k] for k in ("query", "should_trigger", "pass_delta")}
+                              for entry in regressed],
+        "summary": {"comparable": len(query_units), "comparable_cells": len(comparable),
+                    "blocked": len(blocked),
+                    "regressed": len(regressed),
+                    "mean_pass_delta": significance.get("observed_mean_delta")},
+    }
+    if note:
+        out["note"] = note
+    return out
+
+
+def trigger_compare(args: argparse.Namespace) -> int:
+    report = build_trigger_comparison(load_json(Path(args.baseline)), load_json(Path(args.ablation)))
+    emit_report(report, getattr(args, "out", None))
+    return 0
 
 
 def _combinations(items: list[int], r: int) -> Iterable[tuple[int, ...]]:
@@ -8495,6 +9088,89 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _trajectory_profile(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """One arm's trajectory shape. Counts come from trace_event_counts — the
+    same owner metrics.json uses — so a diff delta is a delta of exactly the
+    numbers metrics.json reports. Commands are the display string
+    (input_summary first), not command_text's concatenated match text — this is
+    a report view for humans, not a regex haystack."""
+    counts = trace_event_counts(events)
+    return {
+        "commands": [str(e.get("input_summary") or e.get("command") or e.get("cmd") or e.get("name") or "")
+                     for e in command_events(events)],
+        "counts": {key: counts[key] for key in ("steps", "commands", "tool_calls", "file_reads", "file_writes")},
+        "skill_invoked": bool(counts["skill_events"]),
+    }
+
+
+def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-case paired event-stream comparison: HOW the arms behaved, not just
+    whether they passed — the commands only one arm ran, count deltas
+    (with - without), and per-arm skill-load rates. The diagnosis companion to
+    lift: on a no-lift or qualitative-only case it shows whether the skill
+    changed behavior at all. Pairing rides the experimental-pair owner, and an
+    arm without readable trace evidence BLOCKS its pair with a named reason —
+    missing evidence is never presented as an empty diff."""
+    profiles: dict[str, dict[str, Any]] = {}
+
+    def eligibility(row: dict[str, Any]) -> tuple[bool, str | None]:
+        if not scorable_run(row):
+            return False, "unscorable_arm"
+        base = row.get("run_base")
+        events, _ = read_events_base(Path(base)) if base else (None, "missing run_base")
+        if not events:
+            return False, "missing_trace_evidence"
+        if read_metrics_base(Path(base)).get("trace_observation_complete") is False:
+            return False, "incomplete_trace_evidence"
+        profiles[str(base)] = _trajectory_profile(events)
+        return True, None
+
+    construction = pair_domain.pairs_from_rows(results, population="answer", eligibility=eligibility)
+    delta_keys = ("steps", "commands", "tool_calls", "file_reads", "file_writes")
+    by_case: dict[str, dict[str, Any]] = {}
+    for pair in construction.pairs:
+        with_profile = profiles[str(pair.with_skill.payload.get("run_base"))]
+        without_profile = profiles[str(pair.without_skill.payload.get("run_base"))]
+        bucket = by_case.setdefault(pair.key.case_id, {
+            "pairs": 0, "deltas": {key: [] for key in delta_keys},
+            "skill_invoked": {"with_skill": [], "without_skill": []},
+            "commands_seen": {"with_skill": [], "without_skill": []},
+        })
+        bucket["pairs"] += 1
+        for key in delta_keys:
+            bucket["deltas"][key].append(with_profile["counts"][key] - without_profile["counts"][key])
+        bucket["skill_invoked"]["with_skill"].append(1.0 if with_profile["skill_invoked"] else 0.0)
+        bucket["skill_invoked"]["without_skill"].append(1.0 if without_profile["skill_invoked"] else 0.0)
+        bucket["commands_seen"]["with_skill"].extend(c for c in with_profile["commands"] if c)
+        bucket["commands_seen"]["without_skill"].extend(c for c in without_profile["commands"] if c)
+
+    def ordered_unique(values: list[str], cap: int = 8) -> list[str]:
+        seen: list[str] = []
+        for value in values:
+            if value not in seen:
+                seen.append(value)
+        return seen[:cap]
+
+    cases = []
+    for case_id, bucket in sorted(by_case.items()):
+        with_commands = bucket["commands_seen"]["with_skill"]
+        without_commands = bucket["commands_seen"]["without_skill"]
+        with_set, without_set = set(with_commands), set(without_commands)
+        cases.append({
+            "case_id": case_id,
+            "pairs": bucket["pairs"],
+            "mean_deltas": {key: round(statistics.mean(values), 4) for key, values in bucket["deltas"].items()},
+            "skill_invoked": {arm: round(statistics.mean(values), 4) for arm, values in bucket["skill_invoked"].items()},
+            "commands_only_with_skill": ordered_unique([c for c in with_commands if c not in without_set]),
+            "commands_only_without_skill": ordered_unique([c for c in without_commands if c not in with_set]),
+        })
+    return {
+        "pairs_compared": len(construction.pairs),
+        "pair_diagnostics": construction.diagnostics(),
+        "cases": cases,
+    }
+
+
 def build_benchmark_report(
     path: Path,
     runs: Path,
@@ -8636,6 +9312,9 @@ def build_benchmark_report(
         "reliability": {**build_reliability(results), "paired_lift": build_paired_reliability(results)},
         "model_analysis": model_analysis_from_paired(paired_summary),
         "slice_summary": build_slice_summary(results, variants),
+        # HOW the arms behaved, beside whether they passed: paired event-stream
+        # deltas per case, fail-closed on missing trace evidence.
+        "trajectory_diff": build_trajectory_diff(results),
         "ablation_regressions": ablation_regressions,
         # Operational spend beside the quality numbers (issue #21): totals over
         # ALL runs (failures included), per-variant/case stats, paired cost
@@ -11280,7 +11959,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True)
 
     p = sub.add_parser("import-trace")
-    p.add_argument("--source", default="generic", choices=["generic", "codex", "pi", "jetty"], help="runner trace dialect to normalize")
+    p.add_argument("--source", default="generic", choices=["claude", "codex", "generic", "jetty", "pi"], help="runner trace dialect to normalize")
     p.add_argument("--trace", required=True, help="raw JSONL trace path")
     p.add_argument("--run-dir", required=True, help="run directory where events.json/metrics.json should be written")
     p.add_argument("--out-events")
@@ -11429,6 +12108,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("compare-results")
     p.add_argument("--truth", required=True)
     p.add_argument("--results", required=True)
+    p.add_argument("--out")
+
+    p = sub.add_parser("trigger-compare", help="pair a baseline skill-trigger-matrix report with an --ablation report of the same skill revision: per-query pass-rate deltas, sign-flip significance, and a causal-confirmation evidence class")
+    p.add_argument("--baseline", required=True, help="skill-trigger-matrix report JSON from the unablated skill tree")
+    p.add_argument("--ablation", required=True, help="skill-trigger-matrix report JSON produced with --ablation on the same canonical revision")
     p.add_argument("--out")
 
     p = sub.add_parser("migrate", help="upgrade a version-1 manifest to version 2: stamp default severity/oracle tiers, mark binary judge rubrics, print the diff and the judgment-call checklist")
@@ -11617,6 +12301,8 @@ def main() -> int:
         return compare_tasks(args)
     if args.cmd == "compare-results":
         return compare_results(args)
+    if args.cmd == "trigger-compare":
+        return trigger_compare(args)
     if args.cmd == "migrate":
         return migrate_command(args)
     if args.cmd == "migrate-telemetry":

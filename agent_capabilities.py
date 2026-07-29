@@ -125,7 +125,7 @@ AGENT_CAPABILITIES: dict[str, AgentCapabilities] = {
         judge_backend=True,
         tool_replay=True,
         live_smoke_env="RUN_TRIGGER_SMOKE",
-        notes="run-claude captures the Claude CLI cost envelope; trigger matrix detects Skill tool-use plus path evidence.",
+        notes="run-claude drives stream-json so answer runs keep the full tool-use stream as trace evidence and capture the Claude CLI cost envelope; trigger matrix detects Skill tool-use plus path evidence.",
     ),
     "codex": AgentCapabilities(
         answer_runner=True,

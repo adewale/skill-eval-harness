@@ -18,10 +18,11 @@ from helpers import (
     demo_manifest as base_manifest,
 )
 from helpers import (
-    write_demo_manifest as write_manifest,
+    trace_event,
+    write_run,
 )
 from helpers import (
-    write_run,
+    write_demo_manifest as write_manifest,
 )
 
 import judge_verdict as jv
@@ -415,6 +416,156 @@ class TrajectoryJudgeTests(unittest.TestCase):
             vf.write_text(json.dumps({"passed": True}), encoding="utf-8")
             row = sb.run_one_judge_task(task, judge_cmd=f"cat {vf}", include_trajectory=True)
         self.assertTrue(row["passed"])   # bad events.json -> trajectory omitted, judge still runs
+
+
+STEP_EVENTS = [
+    trace_event("command", index=1, name="Bash", input_summary="npm install",
+                raw_ref={"file": "trace.jsonl", "line": 3}),
+    trace_event("message", index=2, status="unknown", state_source="unknown",
+                role="assistant", input_summary="planning"),
+    trace_event("command", index=3, status="in_progress", name="Bash", input_summary="npm test"),
+    trace_event("file_write", index=4, name="Write", input_summary="src/x.py",
+                raw_ref={"file": "trace.jsonl", "line": 9}),
+]
+
+
+class PerStepJudgeTests(unittest.TestCase):
+    """Per-step judging: a `judge` assertion with `per_step` grades EACH
+    completed trajectory step. The verdict is the EXISTING dynamic-criteria
+    shape — one criterion per step, minimum_criteria derived from the run's
+    actual step count — so storage, merge, and repeat/panel machinery are
+    untouched."""
+
+    def _run_dir(self, td, *, with_events=True, with_trace=True, events=None):
+        run = Path(td) / "run"
+        run.mkdir()
+        (run / "output.md").write_text("the answer", encoding="utf-8")
+        if with_events:
+            (run / "events.json").write_text(
+                json.dumps({"schema_version": 2, "source": "claude",
+                            "events": events if events is not None else STEP_EVENTS}),
+                encoding="utf-8")
+        if with_trace:
+            lines = [json.dumps({"type": "filler", "line": n}) for n in range(1, 10)]
+            lines[2] = json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": "added 120 packages in 3s — full untruncated npm install output"}]}})
+            (run / "trace.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return run
+
+    def _task(self, run, *, per_step=True):
+        assertion = {"type": "judge", "name": "sound-steps"}
+        if per_step is not None:
+            assertion["per_step"] = per_step
+        return {"judge_task_id": "c::with_skill::run-1::sound-steps", "case_id": "c",
+                "variant": "with_skill", "run_number": 1, "prompt": "p", "run_base": str(run),
+                "output_path": str(run / "output.md"), "assertion": assertion}
+
+    def test_trajectory_steps_are_completed_actions_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            steps = sb.trajectory_steps(STEP_EVENTS, run)
+        self.assertEqual([s["step"] for s in steps], ["step-1", "step-2"])
+        self.assertEqual(steps[0]["input_summary"], "npm install")
+        self.assertEqual(steps[1]["type"], "file_write")
+        # the raw provider record is resolved through raw_ref for full fidelity
+        self.assertIn("full untruncated npm install output", steps[0]["raw"])
+
+    def test_raw_trace_record_for_event_fails_closed(self):
+        event = {"raw_ref": {"file": "trace.jsonl", "line": 3}}
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td, with_trace=False)
+            self.assertIsNone(sb.raw_trace_record_for_event(run, event))          # no trace.jsonl
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            self.assertIsNone(sb.raw_trace_record_for_event(run, {"raw_ref": {"file": "trace.jsonl", "line": 99}}))
+            self.assertIsNone(sb.raw_trace_record_for_event(run, {}))             # no raw_ref
+            self.assertIsNone(sb.raw_trace_record_for_event(None, event))         # no run dir
+            resolved = sb.raw_trace_record_for_event(run, event)
+        self.assertEqual(resolved["type"], "user")
+
+    def test_verdict_schema_is_the_dynamic_criteria_shape(self):
+        schema = sb.verdict_schema_for({"type": "judge", "name": "s", "per_step": True})
+        self.assertIn("criteria", schema["required"])
+        self.assertEqual(schema["properties"]["criteria"]["items"]["required"], ["name", "met"])
+
+    def test_prompt_carries_steps_and_per_step_instructions(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            task = self._task(run)
+            steps = sb.trajectory_steps(STEP_EVENTS, run)
+            prompt = sb.judge_prompt(task, "the answer", steps=steps)
+        self.assertIn("PER STEP", prompt)
+        self.assertIn("trajectory_steps", prompt)
+        self.assertIn("npm install", prompt)
+        self.assertIn("step-2", prompt)
+
+    def test_passing_per_step_verdict_uses_dynamic_shape(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            vf = Path(td) / "verdict.json"
+            vf.write_text(json.dumps({"criteria": [
+                {"name": "step-1", "met": True}, {"name": "step-2", "met": True}],
+                "rationale": "both sound"}), encoding="utf-8")
+            row = sb.run_one_judge_task(self._task(run), judge_cmd=f"cat {vf}")
+        self.assertTrue(row["passed"])
+        self.assertEqual(row["verdict_kind"], "dynamic")
+        self.assertEqual(row["minimum_criteria"], 2)   # every step, from the run's actual count
+        self.assertEqual(row["score"], 1.0)
+
+    def test_min_met_fraction_sets_the_minimum(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            task = self._task(run, per_step={"min_met_fraction": 0.5})
+            vf = Path(td) / "verdict.json"
+            vf.write_text(json.dumps({"criteria": [
+                {"name": "step-1", "met": True}, {"name": "step-2", "met": False}],
+                "rationale": "one slip"}), encoding="utf-8")
+            row = sb.run_one_judge_task(task, judge_cmd=f"cat {vf}")
+        self.assertTrue(row["passed"])                 # ceil(0.5 * 2) = 1 <= 1 met
+        self.assertEqual(row["minimum_criteria"], 1)
+        self.assertEqual(row["score"], 0.5)
+
+    def test_min_met_fraction_uses_decimal_ceiling(self):
+        assertion = {"type": "judge", "name": "sound-steps",
+                     "per_step": {"min_met_fraction": 0.07}}
+        self.assertEqual(sb.per_step_minimum(assertion, 100), 7)
+
+    def test_criteria_must_name_each_step_exactly(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            vf = Path(td) / "verdict.json"
+            vf.write_text(json.dumps({"criteria": [
+                {"name": "vibes", "met": True}, {"name": "step-2", "met": True}]}), encoding="utf-8")
+            row = sb.run_one_judge_task(self._task(run), judge_cmd=f"cat {vf}")
+        self.assertFalse(row["passed"])   # a verdict about invented steps is not evidence
+        self.assertEqual(row["verdict_kind"], "dynamic")
+
+    def test_malformed_repeat_keeps_dynamic_shape_and_merges(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            bad = Path(td) / "bad.json"
+            good = Path(td) / "good.json"
+            bad.write_text(json.dumps({"passed": True}), encoding="utf-8")
+            good.write_text(json.dumps({"criteria": [
+                {"name": "step-1", "met": True}, {"name": "step-2", "met": True}]}),
+                encoding="utf-8")
+            rows = [
+                sb.run_one_judge_task(self._task(run), judge_cmd=f"cat {bad}"),
+                sb.run_one_judge_task(self._task(run), judge_cmd=f"cat {good}"),
+            ]
+            merged = sb.merge_repeated_judge_rows(rows)
+        self.assertEqual({row["verdict_kind"] for row in rows}, {"dynamic"})
+        self.assertFalse(merged["passed"])
+
+    def test_missing_step_evidence_fails_closed_without_model_spend(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td, with_events=False)
+            marker = Path(td) / "judge-ran"
+            row = sb.run_one_judge_task(self._task(run), judge_cmd=f"touch {marker} && echo {{}}")
+            self.assertFalse(marker.exists())   # the judge was never invoked
+        self.assertFalse(row["passed"])
+        self.assertIn("trajectory", row["evidence"])
 
 
 class CrossJudgeConsensusTests(unittest.TestCase):

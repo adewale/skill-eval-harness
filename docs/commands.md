@@ -81,7 +81,7 @@ skill-benchmark run-agent --agent claude --tasks tasks.jsonl --runs ../repo/eval
 
 ## Run Claude tasks (with cost capture)
 
-`run-claude` is a compatibility wrapper for `run-agent --agent claude`: it executes prepared rows through `claude -p --output-format json`, extracts the answer into `output.md`, and records real per-run `total_cost_usd` + token usage into `metrics.json`. The benchmark report then totals `cost_usd_total` per arm (over scorable runs), so a paired eval reports actual dollars:
+`run-claude` is a compatibility wrapper for `run-agent --agent claude`: it executes prepared rows through `claude -p --output-format stream-json --verbose`, extracts the answer from the stream's terminal `result` event into `output.md`, records real per-run `total_cost_usd` + token usage into `metrics.json`, and keeps the full stream as the run's raw trace — `trace.jsonl` verbatim, normalized tool-use events in `events.json` (a `tool_use` block opens a call, its `tool_result` completes it; an orphaned call counts zero), so process and efficiency assertions have evidence on Claude answer runs. The benchmark report then totals `cost_usd_total` per arm (over scorable runs), so a paired eval reports actual dollars:
 
 ```bash
 skill-benchmark prepare ../repo/evals/shared-benchmark.json --split tune --out tasks.jsonl
@@ -467,6 +467,18 @@ skill-pi-trigger-eval ../repo/evals/shared-benchmark.json \
 ```
 
 This creates a temporary `PI_CODING_AGENT_DIR`, copies the skill under `skills/`, runs Pi without forced `--skill`, and detects whether the model loaded the skill from JSON stream events. It is the deeper Pi-specific tool: discovery-population ablation arms, per-query trace artifacts, and cost telemetry.
+
+## Trigger comparison (paired causal evidence for activation)
+
+A single trigger-matrix report is a raw single-arm measurement — it steers description edits, but it cannot confirm that an ablation *caused* a discovery regression. `trigger-compare` pairs a baseline matrix report with an `--ablation` matrix report of the **same canonical skill revision** and emits the trigger population's version of the answer path's causal-confirmation verdict:
+
+```bash
+skill-trigger-matrix evals/shared-benchmark.json --agent claude --out baseline.json
+skill-trigger-matrix evals/shared-benchmark.json --agent claude --ablation drop-description --out ablated.json
+skill-benchmark trigger-compare --baseline baseline.json --ablation ablated.json --out trigger-comparison.json
+```
+
+Rows are re-validated through the typed trigger-observation contract (a row whose stored flags contradict the contract is rejected, never averaged). Matrix repeats are unordered, so comparison first forms complete (agent, model, query) cells, then collapses every agent/model cell for the same authored query and polarity into one **pass-rate** delta. The authored query is the inference unit: adding models or agents cannot multiply one query into significance. Pass rates make polarity inherent, so a should-not-trigger query regresses by over-triggering. The verdict goes through the `EvidenceClass` guard: `confirmed_causal` requires matching top-level and recorded ablation IDs, verified revision provenance, at least one comparable query, a negative aggregate mean pass delta, and a sign-flip-significant drop across authored queries (≥ 6 consistently regressed queries, same discretization bound as the answer path). A negative but insignificant mean reports `indeterminate`; a non-negative mean cannot confirm a regression even if the two-sided test is significant. Queries missing an arm, or with no complete observations on a side, are listed as blocked cells with reasons.
 
 ## Jetty adapter
 

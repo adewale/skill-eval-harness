@@ -31,6 +31,7 @@ from unittest import mock
 
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
+import skill_benchmark as sb
 from agent_capabilities import AGENT_CAPABILITIES
 from trigger_contracts import InvocationOutcome, InvocationState
 
@@ -881,6 +882,157 @@ class VibeMatrixSmokeTests(unittest.TestCase):
         self.assertFalse(incomplete, f"broken runs (crash/timeout), not trigger signal: {incomplete}")
         self.assertTrue(any(r["triggered"] for r in report["results"]),
                         "no Vibe run loaded the skill — detection, auth, or mounting is broken")
+
+
+def trigger_row(query, should, *, triggered, complete=True, agent="stub", model=None):
+    """One persisted trigger-matrix result row, valid under
+    TriggerObservation.from_row's contract."""
+    evidence = ["skills/demo/SKILL.md"] if (complete and triggered) else []
+    return {
+        "population": "trigger", "agent": agent, "model": model, "query": query,
+        "should_trigger": should, "triggered": complete and triggered,
+        "pass": complete and (triggered == should),
+        "observation_complete": complete,
+        "returncode": 0 if complete else 124, "timed_out": not complete,
+        "elapsed_ms": 5, "completion_evidence": "normal_exit" if complete else None,
+        "evidence": evidence,
+        "evidence_typed": [{"kind": "mounted_path", "text": t} for t in evidence],
+        "usage_normalized": {"source": "missing"}, "cost_normalized": {"source": "missing"},
+        "stderr": "",
+    }
+
+
+BASE_HASH = "sha256:base-revision"
+EDIT_HASH = "sha256:edited-revision"
+ABLATION_PROVENANCE = {
+    "id": "drop-description", "mode": "materialized", "population": "trigger",
+    "skill_hash": EDIT_HASH, "parent_skill_hash": BASE_HASH,
+    "components": [{"class": "discovery", "mechanism": "frontmatter_field",
+                    "skill_root": "skills/demo", "target": {"field": "description"}}],
+}
+
+
+def trigger_report(rows, *, ablation=None, provenance=None, tree_hash=BASE_HASH):
+    return {"skill_name": "demo", "generated_at": 1,
+            "evidence_class": tm.TRIGGER_MEASUREMENT_EVIDENCE_CLASS,
+            "skill_tree_hash": tree_hash, "ablation": ablation,
+            "provenance": provenance if provenance is not None else {"mode": "baseline", "skill_tree_hash": tree_hash},
+            "runs_per_query": 2, "results": rows}
+
+
+class TriggerComparisonTests(unittest.TestCase):
+    """build_trigger_comparison pairs a baseline matrix run with an --ablation
+    run of the SAME canonical revision, mirroring the answer path's
+    causal-confirmation gate: provenance verified + coverage + an observed,
+    sign-flip-significant pass-rate drop across queries."""
+
+    QUERIES = [f"query {n}" for n in range(1, 7)]   # 6 paired deltas: exact p ~= 0.031
+
+    def _baseline_rows(self):
+        return [trigger_row(q, True, triggered=True) for q in self.QUERIES for _ in range(2)]
+
+    def _ablation_rows(self, *, triggered=False):
+        return [trigger_row(q, True, triggered=triggered) for q in self.QUERIES for _ in range(2)]
+
+    def _compare(self, base_rows=None, abl_rows=None, *, provenance=None, abl_hash=EDIT_HASH):
+        baseline = trigger_report(base_rows if base_rows is not None else self._baseline_rows())
+        ablation = trigger_report(abl_rows if abl_rows is not None else self._ablation_rows(),
+                                  ablation="drop-description",
+                                  provenance=provenance if provenance is not None else ABLATION_PROVENANCE,
+                                  tree_hash=abl_hash)
+        return sb.build_trigger_comparison(baseline, ablation)
+
+    def test_verified_significant_drop_confirms_causal(self):
+        out = self._compare()
+        self.assertEqual(out["population"], "trigger")
+        self.assertEqual(out["evidence_class"], "confirmed_causal")
+        self.assertTrue(out["provenance"]["verified"])
+        self.assertEqual(out["summary"]["comparable"], 6)
+        self.assertEqual(len(out["regressed_queries"]), 6)
+        self.assertTrue(out["paired"]["significance"]["significant_at_0_05"])
+        self.assertEqual(out["paired"]["comparable_queries"][0]["pass_delta"], -1.0)
+
+    def test_no_drop_is_refuted(self):
+        out = self._compare(abl_rows=self._ablation_rows(triggered=True))
+        self.assertEqual(out["evidence_class"], "refuted")
+        self.assertEqual(out["regressed_queries"], [])
+
+    def test_observed_but_insignificant_drop_is_indeterminate(self):
+        # one regressed query out of six cannot clear the sign-flip bar
+        abl = [trigger_row(q, True, triggered=(q != "query 1")) for q in self.QUERIES for _ in range(2)]
+        out = self._compare(abl_rows=abl)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertEqual(len(out["regressed_queries"]), 1)
+        self.assertIn("not significant", out["note"])
+
+    def test_significant_change_in_wrong_direction_is_refuted(self):
+        queries = [f"direction {n}" for n in range(10)]
+        baseline = []
+        ablation = []
+        for i, query in enumerate(queries):
+            # One regression, nine improvements: the old two-sided gate called
+            # this confirmed merely because at least one cell was negative.
+            baseline.append(trigger_row(query, True, triggered=(i == 0)))
+            ablation.append(trigger_row(query, True, triggered=(i != 0)))
+        out = self._compare(base_rows=baseline, abl_rows=ablation)
+        self.assertTrue(out["paired"]["significance"]["significant_at_0_05"])
+        self.assertGreater(out["summary"]["mean_pass_delta"], 0)
+        self.assertEqual(out["evidence_class"], "refuted")
+
+    def test_models_do_not_multiply_one_query_into_six_units(self):
+        baseline = [trigger_row("one query", True, triggered=True, model=f"m{n}")
+                    for n in range(6)]
+        ablation = [trigger_row("one query", True, triggered=False, model=f"m{n}")
+                    for n in range(6)]
+        out = self._compare(base_rows=baseline, abl_rows=ablation)
+        self.assertEqual(out["summary"]["comparable_cells"], 6)
+        self.assertEqual(out["paired"]["significance"]["n"], 1)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+
+    def test_revision_mismatch_is_indeterminate_with_reason(self):
+        provenance = {**ABLATION_PROVENANCE, "parent_skill_hash": "sha256:other-revision"}
+        out = self._compare(provenance=provenance)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertFalse(out["provenance"]["verified"])
+        self.assertTrue(any("different skill revision" in r for r in out["provenance"]["reasons"]))
+
+    def test_top_level_ablation_id_must_match_provenance(self):
+        provenance = {**ABLATION_PROVENANCE, "id": "some-other-ablation"}
+        out = self._compare(provenance=provenance)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertFalse(out["provenance"]["verified"])
+        self.assertTrue(any("does not match provenance id" in reason
+                            for reason in out["provenance"]["reasons"]))
+
+    def test_missing_and_incomplete_arms_are_blocked_pairs(self):
+        base = self._baseline_rows() + [trigger_row("only baseline", True, triggered=True)]
+        abl = self._ablation_rows() + [trigger_row("timed out", True, triggered=False, complete=False)]
+        base += [trigger_row("timed out", True, triggered=True)]
+        out = self._compare(base_rows=base, abl_rows=abl)
+        reasons = {b["query"]: b["reason"] for b in out["paired"]["blocked"]}
+        self.assertEqual(reasons["only baseline"], "missing_ablation_arm")
+        self.assertEqual(reasons["timed out"], "ablation_observations_incomplete")
+        self.assertEqual(out["summary"]["comparable"], 6)
+
+    def test_malformed_row_is_rejected(self):
+        bad = self._baseline_rows()
+        bad[0] = {**bad[0], "pass": True, "triggered": False}   # contradicts derived pass
+        with self.assertRaises(SystemExit):
+            self._compare(base_rows=bad)
+
+    def test_baseline_carrying_an_ablation_is_rejected(self):
+        baseline = trigger_report(self._baseline_rows(), ablation="drop-description",
+                                  provenance=ABLATION_PROVENANCE)
+        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
+                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
+        with self.assertRaises(SystemExit):
+            sb.build_trigger_comparison(baseline, ablation)
+
+    def test_non_trigger_report_is_rejected(self):
+        baseline = trigger_report(self._baseline_rows())
+        baseline["evidence_class"] = "answer"
+        with self.assertRaises(SystemExit):
+            sb.build_trigger_comparison(baseline, trigger_report(self._ablation_rows(), ablation="x", provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH))
 
 
 if __name__ == "__main__":
