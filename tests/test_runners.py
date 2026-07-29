@@ -385,6 +385,29 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     SHARED_META_KEYS = {"provider", "model", "returncode", "timed_out", "elapsed_ms",
                         "stderr", "usage_normalized", "cost_normalized", "trace_source"}
 
+    def _assert_pid_stopped(self, pid: int, timeout: float = 1.0) -> None:
+        """Accept a reaped process or a Linux zombie as no longer running."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+
+            # An orphan killed with its process group can remain in /proc as a
+            # zombie until the runner's init process reaps it.  kill(pid, 0)
+            # still succeeds for that harmless, non-running state.
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            except (FileNotFoundError, PermissionError, OSError):
+                pass
+            else:
+                fields_after_name = stat.rsplit(")", 1)[-1].split()
+                if fields_after_name and fields_after_name[0] == "Z":
+                    return
+            time.sleep(0.01)
+        self.fail(f"process {pid} is still running after {timeout:.1f}s")
+
     def _one_with_skill_task(self, root: Path) -> tuple[Path, str]:
         case = {"id": "c", "split": "tune", "prompt": "do it",
                 "assertions": [{"name": "a", "type": "contains", "value": "token"}]}
@@ -693,9 +716,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(result["environment"]["process_group_cleanup"]["signal"], "SIGKILL")
             self.assertEqual(result["environment"]["temporary_home_cleanup"]["status"], "removed")
             child_pid = int(pid_file.read_text(encoding="utf-8"))
-            time.sleep(0.05)
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child_pid, 0)
+            self._assert_pid_stopped(child_pid)
 
     @unittest.skipUnless(hasattr(os, "killpg"), "process-group cleanup requires POSIX")
     def test_success_quiesces_pipe_holding_group_without_full_timeout(self):
@@ -722,9 +743,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertLess(elapsed, 1.0)
             self.assertEqual(result["environment"]["process_group_cleanup"]["signal"], "SIGKILL")
             child_pid = int(pid_file.read_text(encoding="utf-8"))
-            time.sleep(0.05)
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child_pid, 0)
+            self._assert_pid_stopped(child_pid)
 
     @unittest.skipUnless(hasattr(os, "killpg"), "process-group cleanup requires POSIX")
     def test_success_does_not_wait_for_escaped_child_capture_pipes(self):
@@ -1033,6 +1052,44 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(meta["usage_normalized"], {"source": "missing"})
             self.assertEqual(meta["cost_normalized"], {"source": "missing"})
             self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
+
+
+class TraceDialectRegistryTests(unittest.TestCase):
+    """ONE registry of per-provider trace semantics — how raw records flatten
+    into normalizer-native (line, record) pairs, and how a stream's terminal
+    usage/failure resolve — instead of two special-casing styles inside
+    normalize_trace_records (a pi_stream parameter AND a claude flatten
+    branch)."""
+
+    def test_unknown_sources_get_the_generic_dialect(self):
+        self.assertIs(sb.trace_dialect_for("codex"), sb.GENERIC_TRACE_DIALECT)
+        self.assertIs(sb.trace_dialect_for("JETTY"), sb.GENERIC_TRACE_DIALECT)
+        self.assertIs(sb.trace_dialect_for("generic"), sb.GENERIC_TRACE_DIALECT)
+
+    def test_generic_flatten_is_the_identity_with_line_numbers(self):
+        records = [{"a": 1}, {"b": 2}]
+        self.assertEqual(sb.GENERIC_TRACE_DIALECT.flatten(records), [(1, {"a": 1}), (2, {"b": 2})])
+        self.assertEqual(sb.GENERIC_TRACE_DIALECT.flatten(records, record_lines=[3, 7]),
+                         [(3, {"a": 1}), (7, {"b": 2})])
+        with self.assertRaises(ValueError):
+            sb.GENERIC_TRACE_DIALECT.flatten(records, record_lines=[3])
+
+    def test_generic_dialect_has_no_terminal_stream_semantics(self):
+        self.assertEqual(sb.GENERIC_TRACE_DIALECT.stream_semantics([], None), (None, None))
+
+    def test_claude_dialect_owns_the_stream_flatten(self):
+        self.assertIs(sb.TRACE_DIALECTS["claude"].flatten, sb.claude_stream_flat_records)
+        self.assertIs(sb.trace_dialect_for("Claude"), sb.TRACE_DIALECTS["claude"])
+
+    def test_pi_dialect_resolves_cumulative_terminal_usage(self):
+        # The retry-then-success stream carries per-attempt usage; the dialect
+        # must resolve the FINAL attempt's cumulative usage, not a sum of
+        # attempts, and report no failure for a recovered stream.
+        raw = (ROOT / "tests" / "fixtures" / "pi" / "retry-then-success.jsonl").read_text(encoding="utf-8")
+        records, _ = sb.parse_trace_jsonl_text(raw)
+        terminal_usage, failure = sb.TRACE_DIALECTS["pi"].stream_semantics(records, None)
+        self.assertIsNone(failure)
+        self.assertEqual(sb.usage_number(terminal_usage, "total_tokens"), 13.0)
 
 
 if __name__ == "__main__":

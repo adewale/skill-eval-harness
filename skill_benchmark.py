@@ -35,11 +35,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import yaml
 
@@ -3984,8 +3984,17 @@ def claude_stream_flat_records(records: list[dict[str, Any]], *,
                 if call_id:
                     open_calls[call_id] = (line, spec)
             elif btype == "tool_result":
-                call_line, spec = open_calls.pop(
-                    str(block.get("tool_use_id") or ""), (line, {"type": "tool_result"}))
+                call_id = str(block.get("tool_use_id") or "")
+                matched_call = open_calls.pop(call_id, None)
+                if matched_call is None:
+                    flat.append((line, {
+                        "type": "error", "status": "failed",
+                        "message": f"unmatched Claude tool_result for call id {call_id!r}",
+                        "result": stringify_trace_value(block.get("content"))[:1000],
+                        "_raw_result_line": line,
+                    }))
+                    continue
+                call_line, spec = matched_call
                 completion = {**spec, "status": "completed",
                               "output": stringify_trace_value(block.get("content"))[:1000],
                               "_raw_call_line": call_line, "_raw_result_line": line}
@@ -3997,40 +4006,91 @@ def claude_stream_flat_records(records: list[dict[str, Any]], *,
     return flat
 
 
-def flatten_provider_trace(records: list[dict[str, Any]], *, source: str,
-                           record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
-    """The per-provider flatten seam: claude's block-structured stream expands
-    to several records per raw line; every other dialect is the identity, so
-    existing sources normalize byte-identically."""
-    if source.casefold() == "claude":
-        return claude_stream_flat_records(records, record_lines=record_lines)
+def identity_flat_records(records: list[dict[str, Any]], *,
+                          record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
+    """One raw record per physical line, unchanged — the default flatten."""
     if record_lines is not None and len(record_lines) != len(records):
         raise ValueError("record_lines must have one physical line per trace record")
     return [((record_lines[i - 1] if record_lines is not None else i), record)
             for i, record in enumerate(records, 1)]
 
 
+def _no_stream_semantics(records: list[dict[str, Any]], pi_stream: PiStream | None) -> tuple[dict[str, Any] | None, str | None]:
+    """No terminal cumulative usage and no stream-level failure: per-record
+    token accumulation applies."""
+    return None, None
+
+
+def _pi_stream_semantics(records: list[dict[str, Any]], pi_stream: PiStream | None) -> tuple[dict[str, Any] | None, str | None]:
+    """Pi repeats final cumulative usage on message_end, turn_end, and
+    agent_end — one response, not several token deltas — and a terminal
+    failure invalidates the stream's usage entirely. An already-parsed
+    PiStream may be passed to avoid re-parsing."""
+    parsed = pi_stream or PiStream.from_records(records)
+    error = parsed.failure_error
+    return (parsed.terminal_usage if not error else None), error
+
+
+def _generic_usage_and_cost_blocks(raw_text: str, pi_stream: PiStream | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    records = [obj for obj in iter_json_objects(raw_text) if isinstance(obj, dict)]
+    return _generic_stream_usage_and_cost(records)
+
+
+def _pi_usage_and_cost_blocks(raw_text: str, pi_stream: PiStream | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    parsed = pi_stream or PiStream.parse(raw_text)
+    return dict(parsed.usage_normalized), dict(parsed.cost_normalized)
+
+
+class TraceFlattener(Protocol):
+    def __call__(self, records: list[dict[str, Any]], *,
+                 record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]: ...
+
+
+@_dataclass(frozen=True)
+class TraceDialect:
+    """Per-provider trace semantics: how raw records flatten into
+    normalizer-native (line, record) pairs — claude's block-structured stream
+    expands to several records per raw line — how a stream's terminal
+    usage/failure resolve — Pi's cumulative repeats must not be summed — and
+    how a raw stream normalizes into usage/cost blocks. ONE registry instead
+    of per-source branches scattered through the normalizer and
+    stream_usage_and_cost; every unregistered dialect gets the identity
+    flatten, per-record accumulation, and generic block extraction, so
+    existing sources normalize byte-identically."""
+
+    flatten: TraceFlattener = identity_flat_records
+    stream_semantics: Callable[[list[dict[str, Any]], PiStream | None], tuple[dict[str, Any] | None, str | None]] = _no_stream_semantics
+    usage_and_cost: Callable[[str, PiStream | None], tuple[dict[str, Any], dict[str, Any]]] = _generic_usage_and_cost_blocks
+
+
+GENERIC_TRACE_DIALECT = TraceDialect()
+TRACE_DIALECTS: dict[str, TraceDialect] = {
+    "claude": TraceDialect(flatten=claude_stream_flat_records),
+    "pi": TraceDialect(stream_semantics=_pi_stream_semantics, usage_and_cost=_pi_usage_and_cost_blocks),
+}
+
+
+def trace_dialect_for(source: str) -> TraceDialect:
+    return TRACE_DIALECTS.get(str(source).casefold(), GENERIC_TRACE_DIALECT)
+
+
 def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "generic",
                             pi_stream: PiStream | None = None,
                             record_lines: list[int] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    flat = flatten_provider_trace(records, source=source, record_lines=record_lines)
+    dialect = trace_dialect_for(source)
+    flat = dialect.flatten(records, record_lines=record_lines)
     events = [normalize_trace_record(record, source=source, index=i, line=line)
               for i, (line, record) in enumerate(flat, 1)]
     commands = [command_text(e) for e in command_events(events)]
     token_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     elapsed_ms = 0.0
-    is_pi = source.casefold() == "pi"
-    parsed_pi = (pi_stream or PiStream.from_records(records)) if is_pi else None
-    pi_error = parsed_pi.failure_error if parsed_pi else None
-    pi_terminal_usage = parsed_pi.terminal_usage if parsed_pi and not pi_error else None
-    if pi_terminal_usage is not None:
-        # Pi repeats final cumulative usage on message_end, turn_end, and
-        # agent_end. It is one response, not several token deltas.
+    terminal_usage, stream_error = dialect.stream_semantics(records, pi_stream)
+    if terminal_usage is not None:
         for key in token_totals:
-            value = usage_number(pi_terminal_usage, key)
+            value = usage_number(terminal_usage, key)
             if value is not None:
                 token_totals[key] = value
-    elif not pi_error:
+    elif not stream_error:
         for (_, record), event in zip(flat, events):
             usage = raw_trace_value(record, "usage", "tokens")
             if isinstance(usage, dict):
@@ -4276,13 +4336,9 @@ class PiStream:
 
 def stream_usage_and_cost(raw_text: str, *, source: str | None = None,
                           pi_stream: PiStream | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Normalize one runner stream without confusing Pi cumulative events for deltas."""
-    is_pi = str(source or "").casefold() == "pi"
-    if is_pi:
-        parsed = pi_stream or PiStream.parse(raw_text)
-        return dict(parsed.usage_normalized), dict(parsed.cost_normalized)
-    records = [obj for obj in iter_json_objects(raw_text) if isinstance(obj, dict)]
-    return _generic_stream_usage_and_cost(records)
+    """Normalize one runner stream without confusing Pi cumulative events for
+    deltas — resolved by the source's registered trace dialect."""
+    return trace_dialect_for(str(source or "generic")).usage_and_cost(raw_text, pi_stream)
 
 
 def write_trace_artifacts(
@@ -7917,12 +7973,15 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
     blocked: list[dict[str, Any]] = []
     for key in sorted(set(base_cells) | set(abl_cells), key=lambda k: (k[0], str(k[1]), k[2], k[3])):
         agent, model, query, should = key
-        base_complete = [o for o in base_cells.get(key, []) if o.invocation.observation_complete]
-        abl_complete = [o for o in abl_cells.get(key, []) if o.invocation.observation_complete]
+        base_observations = base_cells.get(key, [])
+        abl_observations = abl_cells.get(key, [])
+        base_complete = [o for o in base_observations if o.invocation.observation_complete]
+        abl_complete = [o for o in abl_observations if o.invocation.observation_complete]
         reason = ("missing_baseline_arm" if key not in base_cells
                   else "missing_ablation_arm" if key not in abl_cells
-                  else "baseline_observations_incomplete" if not base_complete
-                  else "ablation_observations_incomplete" if not abl_complete
+                  else "baseline_observations_incomplete" if len(base_complete) != len(base_observations)
+                  else "ablation_observations_incomplete" if len(abl_complete) != len(abl_observations)
+                  else "repetition_count_mismatch" if len(base_observations) != len(abl_observations)
                   else None)
         if reason:
             blocked.append({"agent": agent, "model": model, "query": query,
@@ -7955,16 +8014,20 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
     regressed = [entry for entry in query_units if entry["pass_delta"] < 0]
     mean_delta = significance.get("observed_mean_delta")
     aggregate_regression = isinstance(mean_delta, (int, float)) and mean_delta < 0
+    # A two-sided test can be significant in the improvement direction. Only a
+    # significant aggregate drop can pass the causal-confirmation gate.
+    significant_drop = bool(significance.get("significant_at_0_05")) and aggregate_regression
     evidence_class = causal_confirmation(
         provenance_verified=provenance_verified,
         has_coverage=bool(query_units),
         regression_observed=aggregate_regression,
+        significant=significant_drop,
     )
     note = None
-    if evidence_class is EvidenceClass.CONFIRMED_CAUSAL and not significance.get("significant_at_0_05"):
-        evidence_class = EvidenceClass.INDETERMINATE
+    if provenance_verified and query_units and aggregate_regression and not significant_drop:
         note = (f"regression observed but not significant across queries "
-                f"(p={significance.get('p_value')}); >= 6 consistently regressed queries are needed to confirm")
+                f"(p={significance.get('p_value')}, mean delta={significance.get('observed_mean_delta')}); "
+                f">= 6 consistently regressed queries are needed to confirm")
     elif not provenance_verified:
         note = "provenance unverified: " + "; ".join(reasons)
     elif not query_units:
@@ -8615,18 +8678,22 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 evidence_class = EvidenceClass.INDETERMINATE
                 reg["note"] = "invalid-skill experiment: a parser/validation rejection is not evidence of a behavioral regression"
             else:
+                has_coverage = bool(measured_pairs) and not assertion_coverage_gaps
+                regression_observed = bool(confirmed_cases)
+                significant = bool(significance and significance.get("significant_at_0_05"))
+                # The significance gate lives INSIDE causal_confirmation (its
+                # `significant` parameter): an OBSERVED regression that is not
+                # significant across replicates comes back INDETERMINATE — not
+                # REFUTED, which would wrongly claim "no regression". This is
+                # where a single-shot finding is caught: it was seen, but the
+                # noise floor cannot be ruled out until it is re-run enough per arm.
                 evidence_class = causal_confirmation(
                     provenance_verified=prov_ok,
-                    has_coverage=bool(measured_pairs) and not assertion_coverage_gaps,
-                    regression_observed=bool(confirmed_cases),
+                    has_coverage=has_coverage,
+                    regression_observed=regression_observed,
+                    significant=significant,
                 )
-                # Significance gate (feature 1): an OBSERVED regression that is not
-                # significant across replicates is downgraded to INDETERMINATE — not
-                # REFUTED, which would wrongly claim "no regression". This is where a
-                # single-shot finding is caught: it was seen, but the noise floor
-                # cannot be ruled out until it is re-run enough per arm.
-                if evidence_class is EvidenceClass.CONFIRMED_CAUSAL and not (significance and significance.get("significant_at_0_05")):
-                    evidence_class = EvidenceClass.INDETERMINATE
+                if prov_ok and has_coverage and regression_observed and not significant:
                     p = (significance or {}).get("min_p_value")
                     reg["note"] = f"regression observed but not significant per case across replicates (min p={p}); a case needs >= 6 matched pairs to confirm"
                 elif not prov_ok:
