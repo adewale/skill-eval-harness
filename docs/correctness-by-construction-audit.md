@@ -171,6 +171,41 @@ optimistically completed. Command grading, tool/file counts, skill-invocation me
 logic consume completed events only. Start/end fixture pairs prove a real operation counts once;
 unknown lifecycle records cannot become phantom tool calls.
 
+## Human-text comparison
+
+Human-readable answer matching has one internal state pipeline:
+
+```text
+raw output string
+  -> ComparisonText(raw, rendered-v1, changes)
+  -> LiteralTextAssertion | RegexTextAssertion | SimilarityTextAssertion
+  -> MatchObservation
+  -> derived verdict and normalization evidence
+```
+
+- `output.md` remains the faithful artifact. `ComparisonText` creates a separate immutable view;
+  no matcher can normalize the evidence on disk.
+- `ComparisonProfile` is closed over `exact` and the versioned `rendered-v1`. The latter applies
+  NFC and removes a stable, narrow allow-list of non-lexical rendering controls. It deliberately
+  preserves joiners, Unicode line/paragraph separators, invisible mathematical operators,
+  variation selectors, and emoji tag characters rather than treating every `Cf` character alike.
+- Literal, regex, and similarity assertion dictionaries cross one strict parser. Missing/empty or
+  rendered-empty operands, conflicting alias fields, scalar value lists, non-boolean `ci`, invalid
+  regexes, normalization-unstable regex source, unknown comparison modes, and non-finite/out-of-range
+  thresholds cannot become executable assertions. The legacy list-valued `value` alias remains valid
+  for the multi-value literal assertions when `values` is absent.
+- Positive and negative assertions derive their verdicts from the same match/negation observation;
+  similarity verdicts derive from ratio plus threshold. A zero-width character therefore cannot make
+  `regex` spuriously fail while making `not_regex` spuriously pass, and contradictory verdict fields
+  are not constructor inputs.
+- Results identify the comparison profile. When normalization changes an operand, the result also
+  records the affected code points, the raw deterministic similarity score where applicable, and
+  whether normalization changed a deterministic verdict. Embedding mode records that last value as
+  unknown (`null`) rather than paying for a second external embedding call.
+- Prompt leakage, held-out-rubric leakage, canary detection, and answer-key n-gram overlap consume
+  the same human-text view. Protocol and machine-identity checks (`golden_output` by default,
+  structured JSON, scripts, command text, tool names, and paths) remain exact.
+
 ## Ablation provenance vocabulary
 
 Answer-population ablation confirmation uses the same exact case/model/repetition pairs, requires

@@ -104,6 +104,17 @@ from judge_verdict import (
     verdict_fields,
     verdict_from_dict,
 )
+from text_contracts import (
+    ComparisonProfile,
+    ComparisonText,
+    LiteralKind,
+    LiteralTextAssertion,
+    MatchObservation,
+    RegexTextAssertion,
+    SimilarityTextAssertion,
+    comparison_note,
+    parse_human_text_assertion,
+)
 from trace_contracts import EventState, event_is_completed, parse_event_state
 from trigger_contracts import (
     InvocationOutcome,
@@ -135,6 +146,15 @@ TEXT_ASSERTIONS = {
     "similarity",
     "structured_output",
     "script",
+}
+HUMAN_TEXT_ASSERTIONS = {
+    "contains",
+    "contains_any",
+    "contains_all",
+    "excludes_any",
+    "regex",
+    "not_regex",
+    "similarity",
 }
 PROCESS_ASSERTIONS = {
     "skill_invoked",
@@ -629,13 +649,14 @@ def validate_script_assertion(assertion: dict[str, Any], manifest_path: Path, ci
 
 def assertion_values_for_leakage(assertion: dict[str, Any]) -> list[str]:
     atype = assertion.get("type")
-    if atype == "contains":
-        return [str(assertion.get("value", ""))]
     if atype in {"contains_any", "contains_all"}:
-        raw = assertion.get("values", assertion.get("value", []))
-        if isinstance(raw, list):
-            return [str(v) for v in raw]
-        return [str(raw)]
+        parsed = parse_human_text_assertion(assertion)
+        if isinstance(parsed, LiteralTextAssertion):
+            return list(parsed.values)
+    if atype == "contains":
+        parsed = parse_human_text_assertion(assertion)
+        if isinstance(parsed, LiteralTextAssertion):
+            return list(parsed.values)
     return []
 
 
@@ -652,21 +673,30 @@ def prompt_assertion_leakage_findings(manifest: dict[str, Any], manifest_path: P
                 prompt = ref.read_text(encoding="utf-8", errors="replace")
         if not prompt:
             continue
-        folded_prompt = prompt.casefold()
         for assertion in case.get("assertions", []) or []:
             for value in assertion_values_for_leakage(assertion):
                 value = value.strip()
                 if len(value) < min_chars:
                     continue
-                if value.casefold() in folded_prompt:
-                    findings.append({
+                comparison = assertion.get("comparison", ComparisonProfile.RENDERED_V1.value)
+                observation = LiteralTextAssertion(
+                    kind=LiteralKind.CONTAINS,
+                    values=(value,),
+                    case_insensitive=True,
+                    profile=ComparisonProfile(comparison),
+                ).evaluate(prompt)
+                if observation.passed:
+                    finding = {
                         "case_id": case.get("id"),
                         "assertion": assertion_label(assertion),
                         "type": assertion.get("type"),
                         "value": value,
                         "message": f"assertion value {value!r} appears in prompt",
                         "guide": "docs/authoring-evals.md — Step 4: assert the behavior, not one spelling; a value echoed from the prompt cannot tell skill from no-skill",
-                    })
+                    }
+                    if observation.changed:
+                        finding["normalization"] = observation.normalization_dict()
+                    findings.append(finding)
     return findings
 
 
@@ -699,6 +729,11 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
     tier = assertion.get("oracle")
     if tier is not None and tier not in ORACLE_TIERS:
         die(f"{where} oracle must be one of {sorted(ORACLE_TIERS)}")
+    if atype in HUMAN_TEXT_ASSERTIONS:
+        try:
+            parse_human_text_assertion(assertion)
+        except (TypeError, ValueError) as exc:
+            die(f"{where} {exc}")
     scalar_string_types = {"contains", "regex", "not_regex", "file_exists",
                            "golden_output", "command_ran", "command_not_ran"}
     if atype in scalar_string_types:
@@ -887,16 +922,25 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
         # name-matched `required_calls`/`call_set` are literal tool names.
         if "expected_no_call" in assertion and not isinstance(assertion["expected_no_call"], bool):
             die(f"{where} tool_call expected_no_call must be true or false")
+        for key in ("tool", "pattern"):
+            value = assertion.get(key)
+            if value is not None and (not isinstance(value, str) or not value):
+                die(f"{where} tool_call {key} must be a non-empty string")
         active = ["expected_no_call"] if assertion.get("expected_no_call") is True else []
         for key in ("required_calls", "call_set", "order"):
             val = assertion.get(key)
             if val is None:
                 continue
-            if not isinstance(val, list) or not val or not all(isinstance(x, str) for x in val):
-                die(f"{where} tool_call {key} must be a non-empty list of strings")
+            if not isinstance(val, list) or not val or not all(isinstance(x, str) and x for x in val):
+                die(f"{where} tool_call {key} must be a non-empty list of non-empty strings")
             active.append(key)
         if len(active) > 1:
             die(f"{where} tool_call sets multiple selectors {active}; use exactly one of expected_no_call/required_calls/call_set/order")
+        structural = next((key for key in ("required_calls", "call_set", "order") if assertion.get(key) is not None), None)
+        if structural and assertion.get("pattern") is not None:
+            die(f"{where} tool_call pattern is ignored with {structural}; remove one of them")
+        if structural and assertion.get("tool") is not None:
+            die(f"{where} tool_call tool is ignored with {structural}; remove one of them")
         for rx in [assertion.get("pattern"), *(assertion.get("order") or [])]:
             if rx is None:
                 continue
@@ -5117,10 +5161,7 @@ def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
 
 def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:
     flags = re.IGNORECASE if ci else 0
-    try:
-        return re.search(pattern, text, flags) is not None
-    except re.error:
-        return pattern.lower() in text.lower() if ci else pattern in text
+    return re.search(pattern, text, flags) is not None
 
 
 def repeated_command_max(commands: list[str]) -> int:
@@ -8283,46 +8324,23 @@ def golden_output_result(assertion: dict[str, Any], text: str, output_path: Path
 def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *, run_base: Path | None = None, allow_scripts: bool = False, manifest_dir: Path | None = None, embed_cmd: str | None = None) -> dict[str, Any]:
     atype = assertion.get("type")
     name = assertion.get("name") or assertion.get("description") or atype
-    ci = assertion.get("ci", True)
-    hay = text.lower() if ci else text
-    def norm(v: str) -> str:
-        return v.lower() if ci else v
+    parsed_text_assertion = parse_human_text_assertion(assertion) if atype in HUMAN_TEXT_ASSERTIONS else None
 
     passed: bool | None = False
     evidence = ""
     availability = "complete"
     score: float | None = None   # scored detectors set a real value; binary ones mirror passed
+    comparison: str | None = None
+    normalization: dict[str, Any] | None = None
     if atype in PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS:
         passed, evidence = process_or_efficiency_assertion_result(assertion, run_base, {})
-    elif atype == "contains":
-        value = str(assertion.get("value", ""))
-        passed = norm(value) in hay
-        evidence = f"contains {value!r}" if passed else f"missing {value!r}"
-    elif atype == "contains_any":
-        values = [str(v) for v in assertion.get("values", assertion.get("value", []))]
-        hit = next((v for v in values if norm(v) in hay), None)
-        passed = hit is not None
-        evidence = f"matched {hit!r}" if hit else f"none matched: {values}"
-    elif atype == "contains_all":
-        values = [str(v) for v in assertion.get("values", assertion.get("value", []))]
-        missing = [v for v in values if norm(v) not in hay]
-        passed = not missing
-        evidence = "all present" if passed else f"missing: {missing}"
-    elif atype == "excludes_any":
-        values = [str(v) for v in assertion.get("values", assertion.get("value", []))]
-        hit = next((v for v in values if norm(v) in hay), None)
-        passed = hit is None
-        evidence = "none present" if passed else f"found banned {hit!r}"
-    elif atype == "regex":
-        pattern = str(assertion.get("pattern", assertion.get("value", "")))
-        flags = re.IGNORECASE if ci else 0
-        passed = re.search(pattern, text, flags) is not None
-        evidence = f"matched /{pattern}/" if passed else f"missing /{pattern}/"
-    elif atype == "not_regex":
-        pattern = str(assertion.get("pattern", assertion.get("value", "")))
-        flags = re.IGNORECASE if ci else 0
-        passed = re.search(pattern, text, flags) is None
-        evidence = f"absent /{pattern}/" if passed else f"found banned /{pattern}/"
+    elif isinstance(parsed_text_assertion, (LiteralTextAssertion, RegexTextAssertion)):
+        observation: MatchObservation = parsed_text_assertion.evaluate(text)
+        passed = observation.passed
+        evidence = observation.evidence_with_normalization()
+        comparison = observation.candidate.profile.value
+        if observation.changed:
+            normalization = observation.normalization_dict()
     elif atype == "file_exists":
         try:
             rel = canonical_assertion_path(
@@ -8363,26 +8381,43 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
         # ratio against an expected string, thresholded, emitting a score.
         # 4.1: mode="embedding" swaps the ratio for cosine similarity behind an
         # explicit --embed-cmd; absent the opt-in, it fails closed like script.
-        expected = str(assertion.get("expected", assertion.get("value", "")))
-        threshold = float(assertion.get("threshold", 0.8))
-        compare = text
-        if assertion.get("artifact"):
+        if not isinstance(parsed_text_assertion, SimilarityTextAssertion):
+            raise TypeError("similarity assertion did not construct SimilarityTextAssertion")
+        expected = parsed_text_assertion.expected
+        threshold = parsed_text_assertion.threshold
+        compare: str | None = text
+        artifact_error: str | None = None
+        if parsed_text_assertion.artifact:
             try:
                 artifact_rel = canonical_assertion_path(assertion, "artifact")
                 candidate = resolved_assertion_path(
                     run_base or output_path.parent, artifact_rel or ".")
                 compare = (candidate.read_text(encoding="utf-8", errors="replace")
-                           if candidate.is_file() else "")
-            except ValueError:
-                compare = ""
-        mode = str(assertion.get("mode", "ratio"))
-        if mode == "embedding":
+                           if candidate.is_file() else None)
+            except ValueError as exc:
+                compare = None
+                artifact_error = str(exc)
+        mode = parsed_text_assertion.mode
+        comparison = parsed_text_assertion.profile.value
+        if compare is None:
+            passed = False
+            evidence = (
+                f"invalid similarity artifact: {artifact_error}"
+                if artifact_error is not None
+                else f"missing similarity artifact: {parsed_text_assertion.artifact}"
+            )
+        elif mode == "embedding":
             if not embed_cmd:
                 passed = None
                 availability = "partial"
                 evidence = "embedding similarity skipped; rerun grade/benchmark with --embed-cmd to call an external embedding command (kept out of core grading by design)"
             else:
-                ratio, err = embedding_similarity(compare, expected, embed_cmd)
+                actual_view, expected_view = parsed_text_assertion.operands(compare)
+                ratio, err = embedding_similarity(
+                    actual_view.folded(parsed_text_assertion.case_insensitive),
+                    expected_view.folded(parsed_text_assertion.case_insensitive),
+                    embed_cmd,
+                )
                 if ratio is None:
                     passed = None
                     availability = "partial"
@@ -8391,12 +8426,42 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
                     score = round(ratio, 4)
                     passed = ratio >= threshold
                     evidence = f"embedding similarity={ratio:.4f} vs threshold={threshold:g}"
+                if actual_view.changed or expected_view.changed:
+                    evidence += comparison_note(actual_view, expected_view)
+                    normalization = {
+                        "profile": parsed_text_assertion.profile.value,
+                        "changed": True,
+                        "verdict_changed": None,
+                        "candidate": actual_view.change_dict(),
+                        "operands": [expected_view.change_dict()] if expected_view.changed else [],
+                    }
         else:
-            a, b = (norm(compare), norm(expected)) if ci else (compare, expected)
-            ratio = difflib.SequenceMatcher(None, a, b).ratio()
+            similarity = parsed_text_assertion.ratio_observation(compare)
+            ratio = similarity.ratio
             score = round(ratio, 4)
-            passed = ratio >= threshold
+            passed = similarity.passed
+            if "atLeast" in assertion:
+                effective_floor = float(assertion["atLeast"])
+                normalized_verdict_changed = (score >= effective_floor) != (
+                    round(similarity.raw_ratio, 4) >= effective_floor
+                )
+            else:
+                normalized_verdict_changed = similarity.verdict_changed
             evidence = f"similarity={ratio:.4f} vs threshold={threshold:g} against expected[:60]={expected[:60]!r}"
+            if similarity.changed:
+                evidence += comparison_note(
+                    similarity.actual,
+                    similarity.expected,
+                    verdict_changed=normalized_verdict_changed,
+                )
+                normalization = {
+                    "profile": parsed_text_assertion.profile.value,
+                    "changed": True,
+                    "verdict_changed": normalized_verdict_changed,
+                    "raw_score": round(similarity.raw_ratio, 4),
+                    "candidate": similarity.actual.change_dict(),
+                    "operands": [similarity.expected.change_dict()] if similarity.expected.changed else [],
+                }
     elif atype == "structured_output":
         # 1.1: json_field_equals extended with (subset) JSON-Schema validation.
         schema = assertion.get("schema")
@@ -8440,12 +8505,17 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
         # A scored assertion with an explicit floor: the floor decides passed.
         passed = score >= float(assertion["atLeast"])
         evidence += f" (score={score:g}, atLeast={assertion['atLeast']:g})"
-    return {
+    result = {
         "name": name, "type": atype, "passed": passed,
         "availability": availability, "evidence": evidence,
         "score": (score if score is not None else
                   1.0 if passed is True else 0.0 if passed is False else None),
     }
+    if comparison is not None:
+        result["comparison"] = comparison
+    if normalization is not None:
+        result["normalization"] = normalization
+    return result
 
 
 def assertion_label(assertion: dict[str, Any]) -> str:
@@ -16311,7 +16381,8 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
 
 
 def word_ngrams(text: str, n: int) -> set[tuple[str, ...]]:
-    words = re.findall(r"\w+", (text or "").lower())
+    comparable = ComparisonText.from_text(text or "", ComparisonProfile.RENDERED_V1)
+    words = re.findall(r"\w+", comparable.value.casefold())
     return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)} if len(words) >= n else set()
 
 
@@ -16371,10 +16442,23 @@ def contamination_check(case: dict[str, Any], output_text: str, *, manifest_dir:
     tripwire, an output<->answer n-gram overlap, and a released_at/cutoff gate.
     Pure and deterministic — no model, no network. Complements the prompt-side
     leakage lint, which cannot see the output."""
-    findings: list[dict[str, str]] = []
+    findings: list[dict[str, Any]] = []
     canary = case.get("canary")
-    if canary and str(canary) in (output_text or ""):
-        findings.append({"kind": "canary-hit", "detail": f"canary {str(canary)!r} appeared in the output — the model has seen this held-out eval"})
+    if canary:
+        canary_observation = LiteralTextAssertion(
+            LiteralKind.CONTAINS,
+            (str(canary),),
+            False,
+            ComparisonProfile.RENDERED_V1,
+        ).evaluate(output_text or "")
+        if canary_observation.passed:
+            finding: dict[str, Any] = {
+                "kind": "canary-hit",
+                "detail": f"canary {str(canary)!r} appeared in the output — the model has seen this held-out eval",
+            }
+            if canary_observation.changed:
+                finding["normalization"] = canary_observation.normalization_dict()
+            findings.append(finding)
     answer = case_answer_material(case, manifest_dir)
     overlap = ngram_containment(output_text or "", answer, n) if answer else 0.0
     if answer and overlap >= overlap_threshold:
@@ -16384,7 +16468,12 @@ def contamination_check(case: dict[str, Any], output_text: str, *, manifest_dir:
     cut_key = cutoff_key(model_cutoff, end=True) if model_cutoff else None
     if rel_key and cut_key and rel_key <= cut_key:
         findings.append({"kind": "released-before-cutoff", "detail": f"case released_at {released_at} is at/before the model cutoff {model_cutoff} — the model may have trained on it"})
-    return {"case_id": case.get("id"), "overlap": round(overlap, 4), "findings": findings}
+    return {
+        "case_id": case.get("id"),
+        "comparison": ComparisonProfile.RENDERED_V1.value,
+        "overlap": round(overlap, 4),
+        "findings": findings,
+    }
 
 
 def contamination_report(manifest_path: Path, runs: Path, *, split: str | None = None, n: int = 8,
@@ -16407,7 +16496,8 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
         if findings or max_overlap > 0:
             cases_out.append({"case_id": case["id"], "max_overlap": round(max_overlap, 4), "findings": findings})
     return {"cases": cases_out, "total_findings": total,
-            "params": {"ngram": n, "overlap_threshold": overlap_threshold, "model_cutoff": model_cutoff}}
+            "params": {"ngram": n, "overlap_threshold": overlap_threshold, "model_cutoff": model_cutoff,
+                       "comparison": ComparisonProfile.RENDERED_V1.value}}
 
 
 def contamination_command(args: argparse.Namespace) -> int:
@@ -16616,8 +16706,7 @@ def audit_manifest_report(
     # the public eval text — a skill must not teach to the rubric it will be
     # graded on ("criteria deliberately absent from generation rules").
     held_out_leaks = []
-    public_prompts = [str(c.get("prompt")).casefold() for c in cases if c.get("split") == "tune" and c.get("prompt")]
-    skill_text_folded = skill_text.casefold()
+    public_prompts = [str(c.get("prompt")) for c in cases if c.get("split") == "tune" and c.get("prompt")]
     for c in cases:
         if c.get("split") not in {"holdout", "holdback"}:
             continue
@@ -16630,10 +16719,33 @@ def audit_manifest_report(
             t = rubric_text.strip()
             if len(t) < 12:
                 continue
-            if t.casefold() in skill_text_folded:
-                held_out_leaks.append({"case_id": c.get("id"), "where": "skill", "rubric": t[:80]})
-            elif any(t.casefold() in p for p in public_prompts):
-                held_out_leaks.append({"case_id": c.get("id"), "where": "public prompt", "rubric": t[:80]})
+            skill_match = LiteralTextAssertion(
+                LiteralKind.CONTAINS,
+                (t,),
+                True,
+                ComparisonProfile.RENDERED_V1,
+            ).evaluate(skill_text)
+            prompt_matches = [
+                LiteralTextAssertion(
+                    LiteralKind.CONTAINS,
+                    (t,),
+                    True,
+                    ComparisonProfile.RENDERED_V1,
+                ).evaluate(prompt)
+                for prompt in public_prompts
+            ]
+            if skill_match.passed:
+                leak: dict[str, Any] = {"case_id": c.get("id"), "where": "skill", "rubric": t[:80]}
+                if skill_match.changed:
+                    leak["normalization"] = skill_match.normalization_dict()
+                held_out_leaks.append(leak)
+            else:
+                prompt_match = next((match for match in prompt_matches if match.passed), None)
+                if prompt_match is not None:
+                    leak = {"case_id": c.get("id"), "where": "public prompt", "rubric": t[:80]}
+                    if prompt_match.changed:
+                        leak["normalization"] = prompt_match.normalization_dict()
+                    held_out_leaks.append(leak)
     if held_out_leaks:
         finding("held-out-rubric-leak", "required", f"{len(held_out_leaks)} held-out rubric string(s) appear in the skill or public eval text; held-out grading criteria must stay invisible to generation.", held_out_leaks[:10])
 

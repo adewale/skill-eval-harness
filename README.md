@@ -303,6 +303,23 @@ the eval-contract digest and rejects symlinks. Changing an imported helper or da
 invalidates stale prepared runs, while generated files beside the manifest cannot make the
 contract self-referential.
 
+Human-readable answer assertions (`contains`, `contains_any`, `contains_all`,
+`excludes_any`, `regex`, `not_regex`, and `similarity`) compare through the
+versioned `rendered-v1` view by default. The raw `output.md` is never rewritten:
+the comparison view applies NFC canonical normalization and removes only a
+narrow allow-list of non-lexical rendering controls such as `U+200B ZERO WIDTH
+SPACE`; case-insensitive literal and ratio comparisons use Unicode case-folding.
+Results record `comparison: "rendered-v1"`; when normalization changes the input
+they also record the affected code points and, for deterministic matchers,
+whether it changed the verdict. Embedding similarity records that field as
+`null` because determining the raw verdict would require a second external
+embedding call. Use `"comparison": "exact"` when an assertion deliberately
+tests those characters. A rendered operand may not become empty, and regex
+source must already be NFC/control-stable so normalization cannot create an
+empty regex branch. Negative assertions use the same view, so invisible
+characters cannot hide banned content. `golden_output`, structured JSON,
+scripts, commands, tool names, and paths retain their exact/protocol semantics.
+
 Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict` on `grade`/`benchmark` promotes soft to gate. An `atLeast` floor on a plain scored judge requires a normalized 0–1 score and decides its pass; on `graded_dimensions` it tightens the normalized form of the dimension threshold. Missing score evidence remains unavailable rather than becoming a failure. Dynamic and per-step judges use `minimum_criteria` and `min_met_fraction` respectively instead of `atLeast`. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for text/process/efficiency), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`).
 
 Use `script` when a keyword check is too weak for the property you care about. The command sees the candidate run directory, so it can inspect `output.md`, generated files under `outputs/`, or metadata. Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `benchmark`, `aggregate`, or `export-anthropic`:
@@ -575,7 +592,7 @@ python3 scripts/check_ty_regressions.py
 python3 -m unittest discover tests -v
 ```
 
-The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics and pair identity (`test_stats.py`, `test_experimental_pairs.py`), runner/Jetty adapters and lifecycle contracts (`test_runners.py`, `test_jetty_contracts.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus three executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), and relative-link resolution across the docs (`test_doc_links.py`). Shared fixture builders live in `tests/helpers.py`.
+The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), human-text construction and matching (`test_text_contracts.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics and pair identity (`test_stats.py`, `test_experimental_pairs.py`), runner/Jetty adapters and lifecycle contracts (`test_runners.py`, `test_jetty_contracts.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus three executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), and relative-link resolution across the docs (`test_doc_links.py`). Shared fixture builders live in `tests/helpers.py`.
 
 ## Source checked
 
