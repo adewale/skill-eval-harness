@@ -765,9 +765,20 @@ class PerStepValidationTests(unittest.TestCase):
 
     def test_per_step_rejects_malformed_shapes(self):
         self._dies({"name": "steps", "type": "judge", "per_step": "yes"})
+        self._dies({"name": "steps", "type": "judge", "per_step": {}})
         self._dies({"name": "steps", "type": "judge", "per_step": {"min_met_fraction": 0}})
         self._dies({"name": "steps", "type": "judge", "per_step": {"min_met_fraction": 1.5}})
         self._dies({"name": "steps", "type": "judge", "per_step": {"unknown": 1}})
+
+    def test_per_step_rejected_on_turn_assertion(self):
+        manifest = base_manifest()
+        manifest["cases"][0]["turns"] = [{
+            "prompt": "first", "assertions": [
+                {"name": "steps", "type": "judge", "per_step": True}]}]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
 
 
 if __name__ == "__main__":

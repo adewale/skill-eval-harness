@@ -965,12 +965,44 @@ class TriggerComparisonTests(unittest.TestCase):
         self.assertEqual(len(out["regressed_queries"]), 1)
         self.assertIn("not significant", out["note"])
 
+    def test_significant_change_in_wrong_direction_is_refuted(self):
+        queries = [f"direction {n}" for n in range(10)]
+        baseline = []
+        ablation = []
+        for i, query in enumerate(queries):
+            # One regression, nine improvements: the old two-sided gate called
+            # this confirmed merely because at least one cell was negative.
+            baseline.append(trigger_row(query, True, triggered=(i == 0)))
+            ablation.append(trigger_row(query, True, triggered=(i != 0)))
+        out = self._compare(base_rows=baseline, abl_rows=ablation)
+        self.assertTrue(out["paired"]["significance"]["significant_at_0_05"])
+        self.assertGreater(out["summary"]["mean_pass_delta"], 0)
+        self.assertEqual(out["evidence_class"], "refuted")
+
+    def test_models_do_not_multiply_one_query_into_six_units(self):
+        baseline = [trigger_row("one query", True, triggered=True, model=f"m{n}")
+                    for n in range(6)]
+        ablation = [trigger_row("one query", True, triggered=False, model=f"m{n}")
+                    for n in range(6)]
+        out = self._compare(base_rows=baseline, abl_rows=ablation)
+        self.assertEqual(out["summary"]["comparable_cells"], 6)
+        self.assertEqual(out["paired"]["significance"]["n"], 1)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+
     def test_revision_mismatch_is_indeterminate_with_reason(self):
         provenance = {**ABLATION_PROVENANCE, "parent_skill_hash": "sha256:other-revision"}
         out = self._compare(provenance=provenance)
         self.assertEqual(out["evidence_class"], "indeterminate")
         self.assertFalse(out["provenance"]["verified"])
         self.assertTrue(any("different skill revision" in r for r in out["provenance"]["reasons"]))
+
+    def test_top_level_ablation_id_must_match_provenance(self):
+        provenance = {**ABLATION_PROVENANCE, "id": "some-other-ablation"}
+        out = self._compare(provenance=provenance)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertFalse(out["provenance"]["verified"])
+        self.assertTrue(any("does not match provenance id" in reason
+                            for reason in out["provenance"]["reasons"]))
 
     def test_missing_and_incomplete_arms_are_blocked_pairs(self):
         base = self._baseline_rows() + [trigger_row("only baseline", True, triggered=True)]

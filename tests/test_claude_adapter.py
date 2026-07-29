@@ -134,8 +134,65 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
         events_doc, _ = sb.normalize_trace_records(records, source="claude")
         completed = next(e for e in events_doc["events"]
                          if e.get("type") == "command" and e.get("status") == "completed")
-        # the Bash completion evidence is the user/tool_result record: line 3
-        self.assertEqual(completed["raw_ref"], {"file": "trace.jsonl", "line": 3})
+        # The completed action points to its invocation arguments; the result is
+        # retained separately so per-step judging receives both records.
+        self.assertEqual(completed["raw_ref"], {"file": "trace.jsonl", "line": 2})
+        self.assertEqual(completed["raw_result_ref"], {"file": "trace.jsonl", "line": 3})
+
+    def test_physical_raw_refs_survive_filtered_jsonl_lines(self):
+        records = claude_stream_records()[:3]
+        trace = "\n[]\n" + stream_text(records)
+        with tempfile.TemporaryDirectory() as td:
+            events_doc, _ = sb.write_trace_artifacts(Path(td), trace, source="claude")
+        completed = next(e for e in events_doc["events"]
+                         if e.get("type") == "command" and e.get("status") == "completed")
+        self.assertEqual(completed["raw_ref"]["line"], 4)
+        self.assertEqual(completed["raw_result_ref"]["line"], 5)
+
+    def test_file_tools_keep_file_taxonomy(self):
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "r", "name": "Read", "input": {"file_path": "notes.md"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "r", "content": "notes"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "w", "name": "Write", "input": {"file_path": "out.md"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "w", "content": "ok"}]}},
+        ]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        completed_types = [e["type"] for e in events_doc["events"] if e["status"] == "completed"]
+        self.assertEqual(completed_types, ["file_read", "file_write"])
+        self.assertEqual((metrics["file_reads"], metrics["file_writes"]), (1, 1))
+
+    def test_tool_result_error_is_preserved_and_counted(self):
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "false"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "b", "content": "failed", "is_error": True}]}},
+        ]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        completed = next(e for e in events_doc["events"] if e["status"] == "completed")
+        self.assertTrue(completed["is_error"])
+        self.assertIn("error.type", completed["otel"])
+        self.assertEqual(metrics["errors"], 1)
+
+    def test_trajectory_step_has_untruncated_invocation_and_result(self):
+        pattern = "x" * 2500 + "NEEDLE"
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "g", "name": "Grep", "input": {"pattern": pattern}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "g", "content": "match"}]}},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            events_doc, _ = sb.write_trace_artifacts(base, stream_text(records), source="claude")
+            steps = sb.trajectory_steps(events_doc["events"], base)
+        self.assertIn("NEEDLE", steps[0]["raw"])
+        self.assertIn('"name": "Grep"', steps[0]["raw"])
+        self.assertIn("match", steps[0]["raw_result"])
 
     def test_final_assistant_text_is_a_message_event(self):
         events_doc, _ = sb.normalize_trace_records(claude_stream_records(), source="claude")

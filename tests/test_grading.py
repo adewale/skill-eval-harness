@@ -900,6 +900,22 @@ class ToolCallTaxonomyTests(unittest.TestCase):
         self.assertFalse(sb.assertion_result({"type": "tool_call", "expected_no_call": True, "pattern": "curl"}, "t", base / "output.md", run_base=base)["passed"])
         self.assertTrue(sb.assertion_result({"type": "tool_call", "expected_no_call": True, "pattern": "wget"}, "t", base / "output.md", run_base=base)["passed"])
 
+    def test_tool_count_counts_completed_lifecycle_once(self):
+        tmp = tempfile.TemporaryDirectory(prefix="toolcount-")
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        events = [
+            {"type": "tool_call", "name": "Grep", "status": "in_progress"},
+            {"type": "tool_call", "name": "Grep", "status": "completed"},
+        ]
+        (base / "events.json").write_text(json.dumps(events), encoding="utf-8")
+        (base / "output.md").write_text("out", encoding="utf-8")
+        result = sb.assertion_result(
+            {"type": "tool_count_le", "tool": "Grep", "max": 1},
+            "out", base / "output.md", run_base=base)
+        self.assertTrue(result["passed"], result["evidence"])
+        self.assertIn("tool_count=1", result["evidence"])
+
 
 class ToolCallValidationTests(unittest.TestCase):
     """P2: validate_case_assertion rejects malformed tool_call assertions at
@@ -1035,17 +1051,30 @@ class PerStepGradingTests(unittest.TestCase):
 
     def test_per_step_verdict_merges_back_into_the_row(self):
         jid = "c::with_skill::run-1::sound-steps"
-        verdict = {"judge_task_id": jid, "passed": True, "score": 1.0,
-                   "criteria": [{"name": "step-1", "met": True}], "minimum_criteria": 1,
-                   "evidence": "sound"}
         with tempfile.TemporaryDirectory() as td:
             base = write_run(Path(td) / "run", "the answer", events={"events": self.EVENTS})
+            fingerprint = sb.trajectory_steps_sha256(sb.trajectory_steps(self.EVENTS, base))
+            verdict = {"judge_task_id": jid, "passed": True, "score": 1.0,
+                       "criteria": [{"name": "step-1", "met": True}], "minimum_criteria": 1,
+                       "trajectory_steps_sha256": fingerprint, "evidence": "sound"}
             result, tasks = self._grade(base, judge_results={jid: verdict})
         self.assertEqual(tasks, [])
         row = result["qualitative_assertions"][0]
         self.assertTrue(row["passed"])
         self.assertEqual(row["score"], 1.0)
         self.assertIn("trajectory step", row["evidence"])
+
+    def test_stale_per_step_verdict_is_requeued(self):
+        jid = "c::with_skill::run-1::sound-steps"
+        stale = {"judge_task_id": jid, "passed": True, "score": 1.0,
+                 "criteria": [{"name": "invented", "met": True}], "minimum_criteria": 1,
+                 "trajectory_steps_sha256": "0" * 64, "evidence": "stale"}
+        with tempfile.TemporaryDirectory() as td:
+            base = write_run(Path(td) / "run", "the answer", events={"events": self.EVENTS})
+            result, tasks = self._grade(base, judge_results={jid: stale})
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(result["deferred_judge_tasks"], 1)
+        self.assertNotEqual(tasks[0]["trajectory_steps_sha256"], stale["trajectory_steps_sha256"])
 
 
 if __name__ == "__main__":

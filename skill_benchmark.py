@@ -37,6 +37,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass as _dataclass
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -499,7 +500,9 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
             unknown = set(per_step) - {"min_met_fraction"}
             if unknown:
                 die(f"{where} per_step has unknown field(s): {', '.join(sorted(unknown))}")
-            fraction = per_step.get("min_met_fraction", 1.0)
+            if "min_met_fraction" not in per_step:
+                die(f"{where} per_step object must contain min_met_fraction")
+            fraction = per_step["min_met_fraction"]
             if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0 < fraction <= 1:
                 die(f"{where} per_step.min_met_fraction must be a number in (0, 1]")
         elif per_step is not True:
@@ -693,6 +696,8 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                 validate_case_assertion(cid, f"turn #{t} assertion #{j}", j, assertion, path)
                 if isinstance(assertion, dict) and assertion.get("depends_on"):
                     die(f"{cid}: turn #{t} assertion #{j} depends_on is not supported in turn assertions")
+                if isinstance(assertion, dict) and "per_step" in assertion:
+                    die(f"{cid}: turn #{t} assertion #{j} per_step is not supported in turn assertions")
 
     seen_ablation_ids: set[str] = set()
     for i, ablation in enumerate(manifest.get("ablations", [])):
@@ -2951,15 +2956,14 @@ def read_metrics_base(base: Path) -> dict[str, Any]:
     return _with_committed_artifact_state(base, merged)
 
 
-def raw_trace_record_for_event(run_base: Path | None, event: dict[str, Any]) -> dict[str, Any] | None:
-    """Resolve one normalized event's raw_ref back to the raw provider record in
-    the run's trace.jsonl. The normalizer truncates input/output summaries, so
-    this is the sanctioned path to full fidelity WITHOUT fattening events.json.
+def raw_trace_record_for_ref(run_base: Path | None, ref: Any) -> dict[str, Any] | None:
+    """Resolve one normalized raw-trace reference back to its provider record.
+
     Fails closed — returns None, never a guess — when the trace file, the cited
-    line, or valid JSON is absent."""
-    if run_base is None or not isinstance(event.get("raw_ref"), dict):
+    physical line, or valid JSON is absent.
+    """
+    if run_base is None or not isinstance(ref, dict):
         return None
-    ref = event["raw_ref"]
     line_no = ref.get("line")
     if (ref.get("file") != "trace.jsonl" or isinstance(line_no, bool)
             or not isinstance(line_no, int) or line_no < 1):
@@ -2975,6 +2979,14 @@ def raw_trace_record_for_event(run_base: Path | None, event: dict[str, Any]) -> 
                 return None
             return record if isinstance(record, dict) else None
     return None
+
+
+def raw_trace_record_for_event(run_base: Path | None, event: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve one normalized event's raw_ref back to the raw provider record in
+    the run's trace.jsonl. The normalizer truncates input/output summaries, so
+    this is the sanctioned path to full fidelity WITHOUT fattening events.json.
+    """
+    return raw_trace_record_for_ref(run_base, event.get("raw_ref"))
 
 
 def command_text(event: dict[str, Any]) -> str:
@@ -3026,7 +3038,7 @@ def trace_event_counts(events: list[dict[str, Any]]) -> dict[str, Any]:
         "commands": len(commands),
         "file_reads": sum(1 for e in completed if e.get("type") in {"file_read", "skill_load"}),
         "file_writes": sum(1 for e in completed if e.get("type") == "file_write"),
-        "errors": sum(1 for e in events if e.get("type") == "error"),
+        "errors": sum(1 for e in events if e.get("type") == "error" or e.get("is_error") is True),
         "skill_events": [e for e in completed if e.get("type") == "skill_load" or event_mentions_skill_file(e)],
     }
 
@@ -3653,10 +3665,11 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
         if atype == "tool_count_le":
             max_allowed = int(assertion.get("max", 0))
             tool = assertion.get("tool")
+            completed_events = [e for e in events if event_is_completed(e)]
             if tool:
-                count = sum(1 for e in events if str(e.get("name", "")).casefold() == str(tool).casefold() or (str(tool).casefold() == "bash" and e.get("type") == "command"))
+                count = sum(1 for e in completed_events if str(e.get("name", "")).casefold() == str(tool).casefold() or (str(tool).casefold() == "bash" and e.get("type") == "command"))
             else:
-                count = len([e for e in events if e.get("type") in {"tool_call", "command"}])
+                count = len([e for e in completed_events if e.get("type") in {"tool_call", "command"}])
             return count <= max_allowed, f"tool_count={count}; max={max_allowed}; tool={tool or '<any>'}"
         if atype == "no_repeated_command_loop":
             max_allowed = int(assertion.get("max_repeats", assertion.get("max", 1)))
@@ -3727,9 +3740,16 @@ def stringify_trace_value(value: Any) -> str:
     return str(value)
 
 
-def parse_trace_jsonl_text(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+def parse_trace_jsonl_text_with_lines(text: str) -> tuple[list[dict[str, Any]], list[str], list[int]]:
+    """Parse JSONL while retaining each object's physical source line.
+
+    Blank, malformed, and non-object lines do not become records, but they do
+    occupy source lines. Keeping that mapping makes every emitted raw_ref
+    resolvable against the original trace.jsonl rather than a filtered ordinal.
+    """
     records: list[dict[str, Any]] = []
     errors: list[str] = []
+    record_lines: list[int] = []
     for line_number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
@@ -3740,8 +3760,14 @@ def parse_trace_jsonl_text(text: str) -> tuple[list[dict[str, Any]], list[str]]:
             continue
         if isinstance(obj, dict):
             records.append(obj)
+            record_lines.append(line_number)
         else:
             errors.append(f"line {line_number}: JSON value is not an object")
+    return records, errors, record_lines
+
+
+def parse_trace_jsonl_text(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    records, errors, _ = parse_trace_jsonl_text_with_lines(text)
     return records, errors
 
 
@@ -3804,13 +3830,20 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
         event_type = TraceEventKind.METRIC
     input_summary = command or path or content[:500]
     output_summary = stringify_trace_value(raw_trace_value(record, "output", "stdout", "stderr", "result"))[:1000]
+    raw_call_line = record.get("_raw_call_line")
+    raw_line = raw_call_line if isinstance(raw_call_line, int) and not isinstance(raw_call_line, bool) and raw_call_line > 0 else line
     event = {
         "index": index,
         "type": event_type.value,
         "status": status,
         "state_source": parsed_state.source.value,
-        "raw_ref": {"file": "trace.jsonl", "line": line},
+        "raw_ref": {"file": "trace.jsonl", "line": raw_line},
     }
+    raw_result_line = record.get("_raw_result_line")
+    if isinstance(raw_result_line, int) and not isinstance(raw_result_line, bool) and raw_result_line > 0:
+        event["raw_result_ref"] = {"file": "trace.jsonl", "line": raw_result_line}
+    if record.get("is_error") is True:
+        event["is_error"] = True
     if isinstance(raw_status, str) and raw_status.casefold() != status:
         event["raw_status"] = raw_status
     role = raw_trace_value(record, "role")
@@ -3885,6 +3918,8 @@ def otel_attributes_for_event(event: dict[str, Any]) -> dict[str, Any]:
             attrs["gen_ai.usage.output_tokens"] = int(output_tokens)
     if isinstance(event.get("exit_code"), int):
         attrs["process.exit_code"] = event["exit_code"]
+    if event.get("is_error") is True:
+        attrs["error.type"] = str(event.get("name") or "tool_result_error")[:120]
     return attrs
 
 
@@ -3897,15 +3932,16 @@ def _claude_tool_flat_record(name: str, tool_input: Any) -> dict[str, Any]:
     if name == "Bash":
         return {"type": "command", "tool": name, "command": str(inp.get("command") or "")}
     if name == "Read":
-        return {"type": "file_read", "tool": name, "path": str(inp.get("file_path") or "")}
+        return {"type": "file_read", "name": name, "path": str(inp.get("file_path") or "")}
     if name in {"Write", "Edit", "MultiEdit", "NotebookEdit"}:
-        return {"type": "file_write", "tool": name, "path": str(inp.get("file_path") or inp.get("notebook_path") or "")}
+        return {"type": "file_write", "name": name, "path": str(inp.get("file_path") or inp.get("notebook_path") or "")}
     if name == "Skill":
-        return {"type": "skill_load", "tool": name, "path": str(inp.get("skill") or "")}
+        return {"type": "skill_load", "name": name, "path": str(inp.get("skill") or "")}
     return {"type": "tool_use", "tool": name, "input": inp}
 
 
-def claude_stream_flat_records(records: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+def claude_stream_flat_records(records: list[dict[str, Any]], *,
+                               record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
     """Flatten `claude -p --output-format stream-json` events into (line, record)
     pairs the generic normalizer understands. A message wraps several content
     blocks, so one raw line can yield several records — each keeps the RAW line
@@ -3915,8 +3951,11 @@ def claude_stream_flat_records(records: list[dict[str, Any]]) -> list[tuple[int,
     Usage rides ONLY the terminal result event — per-assistant-message usage is
     API-request-level and would double count the cumulative total."""
     flat: list[tuple[int, dict[str, Any]]] = []
-    open_calls: dict[str, dict[str, Any]] = {}
-    for line, record in enumerate(records, 1):
+    if record_lines is not None and len(record_lines) != len(records):
+        raise ValueError("record_lines must have one physical line per trace record")
+    open_calls: dict[str, tuple[int, dict[str, Any]]] = {}
+    for ordinal, record in enumerate(records, 1):
+        line = record_lines[ordinal - 1] if record_lines is not None else ordinal
         rtype = str(record.get("type") or "")
         if rtype not in {"assistant", "user"}:
             # system/init, result, and unknown lifecycle events pass through:
@@ -3943,11 +3982,13 @@ def claude_stream_flat_records(records: list[dict[str, Any]]) -> list[tuple[int,
                 flat.append((line, {**spec, "status": "in_progress"}))
                 call_id = str(block.get("id") or "")
                 if call_id:
-                    open_calls[call_id] = spec
+                    open_calls[call_id] = (line, spec)
             elif btype == "tool_result":
-                spec = open_calls.pop(str(block.get("tool_use_id") or ""), {"type": "tool_result"})
+                call_line, spec = open_calls.pop(
+                    str(block.get("tool_use_id") or ""), (line, {"type": "tool_result"}))
                 completion = {**spec, "status": "completed",
-                              "output": stringify_trace_value(block.get("content"))[:1000]}
+                              "output": stringify_trace_value(block.get("content"))[:1000],
+                              "_raw_call_line": call_line, "_raw_result_line": line}
                 if block.get("is_error"):
                     # the call completed WITH an error result (e.g. nonzero
                     # exit); lifecycle-wise it still ran, so it stays completed.
@@ -3956,18 +3997,23 @@ def claude_stream_flat_records(records: list[dict[str, Any]]) -> list[tuple[int,
     return flat
 
 
-def flatten_provider_trace(records: list[dict[str, Any]], *, source: str) -> list[tuple[int, dict[str, Any]]]:
+def flatten_provider_trace(records: list[dict[str, Any]], *, source: str,
+                           record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
     """The per-provider flatten seam: claude's block-structured stream expands
     to several records per raw line; every other dialect is the identity, so
     existing sources normalize byte-identically."""
     if source.casefold() == "claude":
-        return claude_stream_flat_records(records)
-    return [(line, record) for line, record in enumerate(records, 1)]
+        return claude_stream_flat_records(records, record_lines=record_lines)
+    if record_lines is not None and len(record_lines) != len(records):
+        raise ValueError("record_lines must have one physical line per trace record")
+    return [((record_lines[i - 1] if record_lines is not None else i), record)
+            for i, record in enumerate(records, 1)]
 
 
 def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "generic",
-                            pi_stream: PiStream | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    flat = flatten_provider_trace(records, source=source)
+                            pi_stream: PiStream | None = None,
+                            record_lines: list[int] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    flat = flatten_provider_trace(records, source=source, record_lines=record_lines)
     events = [normalize_trace_record(record, source=source, index=i, line=line)
               for i, (line, record) in enumerate(flat, 1)]
     commands = [command_text(e) for e in command_events(events)]
@@ -4264,11 +4310,15 @@ def write_trace_artifacts(
     run_dir.mkdir(parents=True, exist_ok=True)
     if write_raw_trace:
         (run_dir / "trace.jsonl").write_text(trace_text, encoding="utf-8")
+    parsed_records, parsed_errors, record_lines = parse_trace_jsonl_text_with_lines(trace_text)
     if source.casefold() == "pi" and pi_stream is not None:
         records, parse_errors = list(pi_stream.records), list(pi_stream.parse_errors)
+        if len(record_lines) != len(records):
+            record_lines = list(range(1, len(records) + 1))
     else:
-        records, parse_errors = parse_trace_jsonl_text(trace_text)
-    events, metrics = normalize_trace_records(records, source=source, pi_stream=pi_stream)
+        records, parse_errors = parsed_records, parsed_errors
+    events, metrics = normalize_trace_records(
+        records, source=source, pi_stream=pi_stream, record_lines=record_lines)
     if parse_errors:
         metrics["parse_errors"] = parse_errors[:20]
         metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
@@ -5962,9 +6012,9 @@ def extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("no JSON object found in judge output")
 
 
-# Raw provider records can be arbitrarily large; a step payload embeds at most
-# this many characters of the raw record beside the normalized summaries.
-TRAJECTORY_STEP_RAW_CHARS = 2000
+def is_per_step_assertion(assertion: dict[str, Any]) -> bool:
+    """Presence, rather than truthiness, owns the per-step assertion shape."""
+    return "per_step" in assertion and assertion.get("per_step") is not None
 
 
 def trajectory_steps(events: list[dict[str, Any]] | None, run_base: Path | None) -> list[dict[str, Any]]:
@@ -5986,9 +6036,19 @@ def trajectory_steps(events: list[dict[str, Any]] | None, run_base: Path | None)
                 step[key] = event[key]
         raw = raw_trace_record_for_event(run_base, event)
         if raw is not None:
-            step["raw"] = json.dumps(raw, ensure_ascii=False, sort_keys=True)[:TRAJECTORY_STEP_RAW_CHARS]
+            step["raw"] = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+        raw_result = raw_trace_record_for_ref(run_base, event.get("raw_result_ref"))
+        if raw_result is not None:
+            step["raw_result"] = json.dumps(raw_result, ensure_ascii=False, sort_keys=True)
         steps.append(step)
     return steps
+
+
+def trajectory_steps_sha256(steps: list[dict[str, Any]]) -> str:
+    """Content identity for the exact trajectory evidence a verdict judged."""
+    encoded = json.dumps(steps, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def per_step_minimum(assertion: dict[str, Any], step_count: int) -> int:
@@ -5997,10 +6057,11 @@ def per_step_minimum(assertion: dict[str, Any], step_count: int) -> int:
     run's actual step count at judge time — an authoring-time constant cannot
     know how many steps a run will take."""
     spec = assertion.get("per_step")
-    fraction = 1.0
+    fraction = Decimal(1)
     if isinstance(spec, dict) and isinstance(spec.get("min_met_fraction"), (int, float)):
-        fraction = float(spec["min_met_fraction"])
-    return max(1, math.ceil(fraction * step_count))
+        fraction = Decimal(str(spec["min_met_fraction"]))
+    minimum = int((fraction * Decimal(step_count)).to_integral_value(rounding=ROUND_CEILING))
+    return max(1, minimum)
 
 
 def _criteria_verdict_schema(min_items: int) -> dict[str, Any]:
@@ -6027,7 +6088,7 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
             dim_schema["required"] = dim_names
         return {"type": "object", "required": ["dimension_scores"],
                 "properties": {"dimension_scores": dim_schema, "rationale": {"type": "string"}}}
-    if assertion.get("per_step"):
+    if is_per_step_assertion(assertion):
         # step count is a run property, not an assertion property, so the
         # schema can only pin the item shape; run_one_judge_task enforces the
         # exact step-name match once the run's steps are known.
@@ -6077,7 +6138,7 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
     # G4: hand the model the exact schema the validator enforces (purely additive
     # instruction — the parse path is unchanged).
     schema_hint = "Your output MUST validate against this JSON Schema:\n" + json.dumps(verdict_schema_for(assertion)) + "\n\n"
-    if assertion.get("per_step"):
+    if is_per_step_assertion(assertion):
         return (
             "You are grading one Skill Eval Harness judge assertion PER STEP of the run's trajectory.\n"
             "For EACH entry in trajectory_steps, judge whether that step was a sound action in context:\n"
@@ -6305,7 +6366,8 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     # is nothing to judge. grade_case_variant already refuses to emit such a
     # task; this guard covers re-run task files whose run dirs have changed.
     per_step_steps: list[dict[str, Any]] | None = None
-    if task.get("assertion", {}).get("per_step"):
+    per_step_fingerprint: str | None = None
+    if is_per_step_assertion(task.get("assertion", {})):
         step_events, _ = read_events_base(run_base) if has_run_base else (None, None)
         per_step_steps = trajectory_steps(step_events, run_base if has_run_base else None)
         if not per_step_steps:
@@ -6320,6 +6382,26 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
                 "cost_normalized": normalize_cost(None, source="not_applicable"),
                 "passed": False,
                 "evidence": f"{PER_STEP_MISSING_EVIDENCE}: no completed trajectory steps in events.json",
+                "returncode": 0,
+                "stderr": "",
+            })
+        per_step_fingerprint = trajectory_steps_sha256(per_step_steps)
+        expected_fingerprint = task.get("trajectory_steps_sha256")
+        if (isinstance(expected_fingerprint, str)
+                and expected_fingerprint != per_step_fingerprint):
+            minimum = per_step_minimum(task.get("assertion", {}), len(per_step_steps))
+            return validated_result_row({
+                **_judge_row_identity(task, judge_model=judge_model,
+                                      judge_backend=judge_backend, judge_cmd=judge_cmd),
+                "cost_usd": None,
+                "usage_normalized": normalize_usage(None, source="not_applicable"),
+                "cost_normalized": normalize_cost(None, source="not_applicable"),
+                "criteria": [{"name": step["step"], "met": False} for step in per_step_steps],
+                "minimum_criteria": minimum,
+                "score": 0.0,
+                "passed": False,
+                "trajectory_steps_sha256": per_step_fingerprint,
+                "evidence": "per-step judge task trajectory changed after task creation; model was not invoked",
                 "returncode": 0,
                 "stderr": "",
             })
@@ -6400,16 +6482,25 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     graded_payload: dict[str, Any] = {}
     if assertion.get("graded_dimensions") and isinstance(parsed.get("dimension_scores"), dict):
         graded_payload["dimension_scores"] = parsed["dimension_scores"]
-    if assertion.get("per_step") and per_step_steps and isinstance(parsed.get("criteria"), list) and parse_error is None:
+    if is_per_step_assertion(assertion) and per_step_steps:
         # The verdict must cover EXACTLY the steps the run took, in order — a
         # verdict about invented or skipped steps is not evidence about this run.
-        names = [str(c.get("name")) for c in parsed["criteria"] if isinstance(c, dict)]
+        criteria = parsed.get("criteria")
+        names = ([str(c.get("name")) for c in criteria if isinstance(c, dict)]
+                 if isinstance(criteria, list) else [])
         expected_names = [s["step"] for s in per_step_steps]
-        if names != expected_names:
-            parse_error = (f"per-step criteria must name each step exactly: "
-                           f"expected {expected_names[:5]}, got {names[:5]}")
+        if parse_error is not None or names != expected_names:
+            if parse_error is None:
+                parse_error = (f"per-step criteria must name each step exactly: "
+                               f"expected {expected_names[:5]}, got {names[:5]}")
+            # Keep malformed repeats in the assertion's dynamic verdict shape,
+            # so repeat aggregation fails closed instead of crashing on mixed
+            # boolean/dynamic verdict kinds.
+            graded_payload["criteria"] = [
+                {"name": name, "met": False} for name in expected_names]
+            graded_payload["minimum_criteria"] = per_step_minimum(assertion, len(per_step_steps))
         else:
-            graded_payload["criteria"] = parsed["criteria"]
+            graded_payload["criteria"] = criteria
             graded_payload["minimum_criteria"] = per_step_minimum(assertion, len(per_step_steps))
     if assertion.get("dynamic_rubric") and isinstance(parsed.get("criteria"), list):
         graded_payload["criteria"] = parsed["criteria"]
@@ -6419,7 +6510,8 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         # merge uses (merged_qualitative_entry), and the graded payload rides
         # the row so the merge can re-derive it — a graded response carries no
         # top-level passed/score, so the plain path would file it as failed.
-        graded_entry = merged_qualitative_entry(assertion, parsed, task["judge_task_id"])
+        graded_entry = merged_qualitative_entry(
+            assertion, {**parsed, **graded_payload}, task["judge_task_id"])
         passed = bool(graded_entry.get("passed"))
         score = graded_entry.get("score")
         if "dimension_scores" in graded_payload:
@@ -6428,7 +6520,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         plain_payload = ({**parsed, "threshold": threshold}
                          if parsed.get("score") is not None else parsed)
         passed = judge_verdict_passed(plain_payload)
-    evidence = parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or parse_error or "judge command completed"
+    evidence = parse_error or parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or "judge command completed"
     row = {
         **graded_payload,
         **_judge_row_identity(task, judge_model=judge_model_label,
@@ -6444,6 +6536,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         "evidence": evidence,
         "returncode": returncode,
         "stderr": stderr[:4000] if stderr else "",
+        **({"trajectory_steps_sha256": per_step_fingerprint} if per_step_fingerprint else {}),
     }
     if schema_errors:
         row["schema_errors"] = schema_errors
@@ -7152,7 +7245,7 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
     evidence = judged.get("evidence", judged.get("rationale", judged.get("reasoning", "judge result supplied")))
     dims = assertion.get("graded_dimensions")
     dyn = assertion.get("dynamic_rubric")
-    per_step = assertion.get("per_step")
+    per_step = is_per_step_assertion(assertion)
     if dims and isinstance(judged.get("dimension_scores"), dict):
         expected_names = {str(item.get("name")) for item in dims if isinstance(item, dict)}
         if set(judged["dimension_scores"]) != expected_names:
@@ -7294,13 +7387,16 @@ def grade_case_variant(
             expanded = expand_judge_preset(assertion)
             if turn_n is not None:
                 expanded = {**expanded, "name": f"turn-{turn_n}: {assertion_label(expanded)}"}
-            if expanded.get("per_step"):
+            current_steps: list[dict[str, Any]] | None = None
+            current_steps_fingerprint: str | None = None
+            if is_per_step_assertion(expanded):
                 # Trace-evidence-backed judging fails closed like a process
                 # assertion: no completed steps means nothing to grade, so no
                 # judge task is emitted (no model spend) and a stored verdict
                 # cannot outlive its evidence.
                 step_events, step_error = read_events_base(unit_base) if unit_base is not None else (None, "missing run directory")
-                if not trajectory_steps(step_events, unit_base):
+                current_steps = trajectory_steps(step_events, unit_base)
+                if not current_steps:
                     reason = ("no completed trajectory steps" if step_events is not None
                               else step_error or "missing events.json")
                     entry = {"name": assertion_label(expanded), "type": atype, "passed": False,
@@ -7314,8 +7410,22 @@ def grade_case_variant(
                         if case_uses_depends_on:
                             entry["_dep_label"] = assertion_label(assertion)
                     return
+                current_steps_fingerprint = trajectory_steps_sha256(current_steps)
             jid = judge_task_id(case["id"], variant, run_number, expanded, model=model)
             judged = judge_results.get(jid)
+            if judged and current_steps is not None:
+                expected_names = [step["step"] for step in current_steps]
+                criteria = judged.get("criteria")
+                judged_names = ([str(item.get("name")) for item in criteria if isinstance(item, dict)]
+                                if isinstance(criteria, list) else [])
+                expected_minimum = per_step_minimum(expanded, len(current_steps))
+                # A stored verdict is evidence only for the exact trajectory it
+                # saw. Missing legacy fingerprints, stale content, invented
+                # criteria, and mismatched thresholds are all re-queued.
+                if (judged.get("trajectory_steps_sha256") != current_steps_fingerprint
+                        or judged_names != expected_names
+                        or judged.get("minimum_criteria") != expected_minimum):
+                    judged = None
             if judged:
                 entry = merged_qualitative_entry(expanded, judged, jid)
                 entry["severity"] = severity
@@ -7341,6 +7451,8 @@ def grade_case_variant(
                     "prompt_ref": case.get("prompt_ref"),
                     "expected_behavior": case.get("expected_behavior", []),
                     "review_rubric": case.get("review_rubric", []),
+                    **({"trajectory_steps_sha256": current_steps_fingerprint}
+                       if current_steps_fingerprint else {}),
                 })
         else:
             labeled = {**assertion, "name": f"turn-{turn_n}: {assertion_label(assertion)}"} if turn_n is not None else assertion
@@ -7751,9 +7863,9 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
     runners stamp on their output (single-arm raw measurements, no pairing).
 
     Matrix rows carry no run numbers (repeats are unordered and share no
-    matched randomness), so pairing is at (agent, model, query) granularity
-    over each side's COMPLETE observations; the per-query pass-rate delta is
-    the paired unit, sign-flip-tested across queries exactly as
+    matched randomness), so complete observations are paired into
+    (agent, model, query) cells, then cells are averaged to one authored-query
+    pass-rate delta. Authored queries are sign-flip-tested exactly as
     build_paired_summary tests per-case deltas. Pass rates, not trigger rates,
     carry the verdict, so polarity is inherent: a NO_TRIGGER query regresses by
     over-triggering. The verdict goes through the EvidenceClass guard —
@@ -7777,6 +7889,9 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
     except (TypeError, ValueError) as exc:
         reasons.append(f"ablation provenance invalid: {exc}")
     if prov is not None:
+        if prov.id != ablation.get("ablation"):
+            reasons.append(
+                f"ablation report id {ablation.get('ablation')!r} does not match provenance id {prov.id!r}")
         if prov.population is not Population.TRIGGER:
             reasons.append("ablation provenance is not trigger-population")
         if base_hash and prov.identity.canonical != base_hash:
@@ -7822,12 +7937,28 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
             "trigger_delta": round(abl_block["trigger_rate"] - base_block["trigger_rate"], 6),
         })
 
-    significance = sign_flip_significance([entry["pass_delta"] for entry in comparable])
-    regressed = [entry for entry in comparable if entry["pass_delta"] < 0]
+    # Agent/model cells are repeated measurements of the SAME authored query,
+    # not independent experimental units. Collapse them before inference so a
+    # single query run through many models cannot manufacture significance.
+    grouped_queries: dict[tuple[str, bool], list[dict[str, Any]]] = collections.defaultdict(list)
+    for entry in comparable:
+        grouped_queries[(entry["query"], entry["should_trigger"])].append(entry)
+    query_units = [{
+        "query": query,
+        "should_trigger": should,
+        "cells": len(entries),
+        "pass_delta": round(statistics.mean(e["pass_delta"] for e in entries), 6),
+        "trigger_delta": round(statistics.mean(e["trigger_delta"] for e in entries), 6),
+    } for (query, should), entries in sorted(
+        grouped_queries.items(), key=lambda item: (item[0][0], item[0][1]))]
+    significance = sign_flip_significance([entry["pass_delta"] for entry in query_units])
+    regressed = [entry for entry in query_units if entry["pass_delta"] < 0]
+    mean_delta = significance.get("observed_mean_delta")
+    aggregate_regression = isinstance(mean_delta, (int, float)) and mean_delta < 0
     evidence_class = causal_confirmation(
         provenance_verified=provenance_verified,
-        has_coverage=bool(comparable),
-        regression_observed=bool(regressed),
+        has_coverage=bool(query_units),
+        regression_observed=aggregate_regression,
     )
     note = None
     if evidence_class is EvidenceClass.CONFIRMED_CAUSAL and not significance.get("significant_at_0_05"):
@@ -7836,8 +7967,10 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
                 f"(p={significance.get('p_value')}); >= 6 consistently regressed queries are needed to confirm")
     elif not provenance_verified:
         note = "provenance unverified: " + "; ".join(reasons)
-    elif not comparable:
+    elif not query_units:
         note = "no comparable (agent, model, query) pair has complete observations on both sides"
+    elif regressed and not aggregate_regression:
+        note = "some queries regressed, but the aggregate mean pass delta is non-negative"
 
     out = {
         "population": "trigger",
@@ -7847,10 +7980,12 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
         "provenance": {"verified": provenance_verified, "reasons": reasons,
                        "baseline_skill_tree_hash": base_hash,
                        "ablation_skill_tree_hash": ablation.get("skill_tree_hash")},
-        "paired": {"comparable_queries": comparable, "blocked": blocked, "significance": significance},
-        "regressed_queries": [{k: entry[k] for k in ("agent", "model", "query", "should_trigger", "pass_delta")}
+        "paired": {"comparable_queries": comparable, "query_units": query_units,
+                   "blocked": blocked, "significance": significance},
+        "regressed_queries": [{k: entry[k] for k in ("query", "should_trigger", "pass_delta")}
                               for entry in regressed],
-        "summary": {"comparable": len(comparable), "blocked": len(blocked),
+        "summary": {"comparable": len(query_units), "comparable_cells": len(comparable),
+                    "blocked": len(blocked),
                     "regressed": len(regressed),
                     "mean_pass_delta": significance.get("observed_mean_delta")},
     }
@@ -8983,8 +9118,10 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
             return False, "unscorable_arm"
         base = row.get("run_base")
         events, _ = read_events_base(Path(base)) if base else (None, "missing run_base")
-        if events is None:
+        if not events:
             return False, "missing_trace_evidence"
+        if read_metrics_base(Path(base)).get("trace_observation_complete") is False:
+            return False, "incomplete_trace_evidence"
         profiles[str(base)] = _trajectory_profile(events)
         return True, None
 
@@ -8997,16 +9134,15 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
         bucket = by_case.setdefault(pair.key.case_id, {
             "pairs": 0, "deltas": {key: [] for key in delta_keys},
             "skill_invoked": {"with_skill": [], "without_skill": []},
-            "only_with": [], "only_without": [],
+            "commands_seen": {"with_skill": [], "without_skill": []},
         })
         bucket["pairs"] += 1
         for key in delta_keys:
             bucket["deltas"][key].append(with_profile["counts"][key] - without_profile["counts"][key])
         bucket["skill_invoked"]["with_skill"].append(1.0 if with_profile["skill_invoked"] else 0.0)
         bucket["skill_invoked"]["without_skill"].append(1.0 if without_profile["skill_invoked"] else 0.0)
-        with_commands, without_commands = set(with_profile["commands"]), set(without_profile["commands"])
-        bucket["only_with"].extend(c for c in with_profile["commands"] if c and c not in without_commands)
-        bucket["only_without"].extend(c for c in without_profile["commands"] if c and c not in with_commands)
+        bucket["commands_seen"]["with_skill"].extend(c for c in with_profile["commands"] if c)
+        bucket["commands_seen"]["without_skill"].extend(c for c in without_profile["commands"] if c)
 
     def ordered_unique(values: list[str], cap: int = 8) -> list[str]:
         seen: list[str] = []
@@ -9015,14 +9151,19 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
                 seen.append(value)
         return seen[:cap]
 
-    cases = [{
-        "case_id": case_id,
-        "pairs": bucket["pairs"],
-        "mean_deltas": {key: round(statistics.mean(values), 4) for key, values in bucket["deltas"].items()},
-        "skill_invoked": {arm: round(statistics.mean(values), 4) for arm, values in bucket["skill_invoked"].items()},
-        "commands_only_with_skill": ordered_unique(bucket["only_with"]),
-        "commands_only_without_skill": ordered_unique(bucket["only_without"]),
-    } for case_id, bucket in sorted(by_case.items())]
+    cases = []
+    for case_id, bucket in sorted(by_case.items()):
+        with_commands = bucket["commands_seen"]["with_skill"]
+        without_commands = bucket["commands_seen"]["without_skill"]
+        with_set, without_set = set(with_commands), set(without_commands)
+        cases.append({
+            "case_id": case_id,
+            "pairs": bucket["pairs"],
+            "mean_deltas": {key: round(statistics.mean(values), 4) for key, values in bucket["deltas"].items()},
+            "skill_invoked": {arm: round(statistics.mean(values), 4) for arm, values in bucket["skill_invoked"].items()},
+            "commands_only_with_skill": ordered_unique([c for c in with_commands if c not in without_set]),
+            "commands_only_without_skill": ordered_unique([c for c in without_commands if c not in with_set]),
+        })
     return {
         "pairs_compared": len(construction.pairs),
         "pair_diagnostics": construction.diagnostics(),

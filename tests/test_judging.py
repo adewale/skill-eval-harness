@@ -526,6 +526,11 @@ class PerStepJudgeTests(unittest.TestCase):
         self.assertEqual(row["minimum_criteria"], 1)
         self.assertEqual(row["score"], 0.5)
 
+    def test_min_met_fraction_uses_decimal_ceiling(self):
+        assertion = {"type": "judge", "name": "sound-steps",
+                     "per_step": {"min_met_fraction": 0.07}}
+        self.assertEqual(sb.per_step_minimum(assertion, 100), 7)
+
     def test_criteria_must_name_each_step_exactly(self):
         with tempfile.TemporaryDirectory() as td:
             run = self._run_dir(td)
@@ -534,6 +539,24 @@ class PerStepJudgeTests(unittest.TestCase):
                 {"name": "vibes", "met": True}, {"name": "step-2", "met": True}]}), encoding="utf-8")
             row = sb.run_one_judge_task(self._task(run), judge_cmd=f"cat {vf}")
         self.assertFalse(row["passed"])   # a verdict about invented steps is not evidence
+        self.assertEqual(row["verdict_kind"], "dynamic")
+
+    def test_malformed_repeat_keeps_dynamic_shape_and_merges(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            bad = Path(td) / "bad.json"
+            good = Path(td) / "good.json"
+            bad.write_text(json.dumps({"passed": True}), encoding="utf-8")
+            good.write_text(json.dumps({"criteria": [
+                {"name": "step-1", "met": True}, {"name": "step-2", "met": True}]}),
+                encoding="utf-8")
+            rows = [
+                sb.run_one_judge_task(self._task(run), judge_cmd=f"cat {bad}"),
+                sb.run_one_judge_task(self._task(run), judge_cmd=f"cat {good}"),
+            ]
+            merged = sb.merge_repeated_judge_rows(rows)
+        self.assertEqual({row["verdict_kind"] for row in rows}, {"dynamic"})
+        self.assertFalse(merged["passed"])
 
     def test_missing_step_evidence_fails_closed_without_model_spend(self):
         with tempfile.TemporaryDirectory() as td:
