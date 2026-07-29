@@ -187,7 +187,7 @@ TRIGGER_MEASUREMENT_EVIDENCE_CLASS = "raw_autonomous_trigger_measurement"
 
 
 def causal_confirmation(*, provenance_verified: bool, has_coverage: bool, regression_observed: bool,
-                        significant: bool | None) -> EvidenceClass:
+                        significant: bool) -> EvidenceClass:
     """The ONLY path to CONFIRMED_CAUSAL. `regression_observed` is the domain's
     already-resolved behavioral verdict (for the report: at least one cited case
     showed a named flip AND a same-case score drop). The guard adds the
@@ -198,17 +198,24 @@ def causal_confirmation(*, provenance_verified: bool, has_coverage: bool, regres
     `significant` is the replication gate, inside the door so no caller can
     forget it: an OBSERVED regression that fails its significance test is
     INDETERMINATE — seen, but the noise floor cannot be ruled out — never
-    REFUTED, which would wrongly claim "no regression". Pass None only when a
-    caller has no replication-level test and gates separately; it must still be
-    passed explicitly so a future replicated caller cannot forget the gate. A
-    refutation is a refutation regardless of significance machinery."""
-    if significant is not None and type(significant) is not bool:
-        raise TypeError("significant must be boolean or None")
+    REFUTED, which would wrongly claim "no regression". All four gates are
+    strict booleans: truthy strings, integers, and a missing replication verdict
+    cannot cross this sole confirmation boundary. A refutation is a refutation
+    regardless of significance machinery."""
+    gates = {
+        "provenance_verified": provenance_verified,
+        "has_coverage": has_coverage,
+        "regression_observed": regression_observed,
+        "significant": significant,
+    }
+    for name, value in gates.items():
+        if type(value) is not bool:
+            raise TypeError(f"{name} must be boolean")
     if not provenance_verified or not has_coverage:
         return EvidenceClass.INDETERMINATE
     if not regression_observed:
         return EvidenceClass.REFUTED
-    if significant is False:
+    if not significant:
         return EvidenceClass.INDETERMINATE
     return EvidenceClass.CONFIRMED_CAUSAL
 

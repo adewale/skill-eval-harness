@@ -3954,6 +3954,7 @@ def claude_stream_flat_records(records: list[dict[str, Any]], *,
     if record_lines is not None and len(record_lines) != len(records):
         raise ValueError("record_lines must have one physical line per trace record")
     open_calls: dict[str, tuple[int, dict[str, Any]]] = {}
+    seen_call_ids: set[str] = set()
     for ordinal, record in enumerate(records, 1):
         line = record_lines[ordinal - 1] if record_lines is not None else ordinal
         rtype = str(record.get("type") or "")
@@ -3979,10 +3980,23 @@ def claude_stream_flat_records(records: list[dict[str, Any]], *,
                     flat.append((line, {"type": "message", "role": role, "text": text}))
             elif btype == "tool_use":
                 spec = _claude_tool_flat_record(str(block.get("name") or ""), block.get("input"))
-                flat.append((line, {**spec, "status": "in_progress"}))
                 call_id = str(block.get("id") or "")
-                if call_id:
-                    open_calls[call_id] = (line, spec)
+                if not call_id:
+                    flat.append((line, {
+                        "type": "error", "status": "failed",
+                        "message": "Claude tool_use is missing a call id",
+                    }))
+                    continue
+                if call_id in seen_call_ids:
+                    lifecycle = "open " if call_id in open_calls else "reused "
+                    flat.append((line, {
+                        "type": "error", "status": "failed",
+                        "message": f"duplicate {lifecycle}Claude tool_use call id {call_id!r}",
+                    }))
+                    continue
+                flat.append((line, {**spec, "status": "in_progress"}))
+                seen_call_ids.add(call_id)
+                open_calls[call_id] = (line, spec)
             elif btype == "tool_result":
                 call_id = str(block.get("tool_use_id") or "")
                 matched_call = open_calls.pop(call_id, None)
@@ -4054,9 +4068,9 @@ class TraceDialect:
     usage/failure resolve — Pi's cumulative repeats must not be summed — and
     how a raw stream normalizes into usage/cost blocks. ONE registry instead
     of per-source branches scattered through the normalizer and
-    stream_usage_and_cost; every unregistered dialect gets the identity
-    flatten, per-record accumulation, and generic block extraction, so
-    existing sources normalize byte-identically."""
+    stream_usage_and_cost. Generic-semantics providers are registered
+    explicitly; misspelled or unsupported sources are rejected before a
+    provider-specific stream can be silently normalized with the wrong rules."""
 
     flatten: TraceFlattener = identity_flat_records
     stream_semantics: Callable[[list[dict[str, Any]], PiStream | None], tuple[dict[str, Any] | None, str | None]] = _no_stream_semantics
@@ -4065,13 +4079,26 @@ class TraceDialect:
 
 GENERIC_TRACE_DIALECT = TraceDialect()
 TRACE_DIALECTS: dict[str, TraceDialect] = {
+    "codex": GENERIC_TRACE_DIALECT,
+    "generic": GENERIC_TRACE_DIALECT,
+    "jetty": GENERIC_TRACE_DIALECT,
+    "subagent": GENERIC_TRACE_DIALECT,
+    "stub": GENERIC_TRACE_DIALECT,
+    "vibe": GENERIC_TRACE_DIALECT,
     "claude": TraceDialect(flatten=claude_stream_flat_records),
     "pi": TraceDialect(stream_semantics=_pi_stream_semantics, usage_and_cost=_pi_usage_and_cost_blocks),
 }
 
 
 def trace_dialect_for(source: str) -> TraceDialect:
-    return TRACE_DIALECTS.get(str(source).casefold(), GENERIC_TRACE_DIALECT)
+    if not isinstance(source, str) or not source:
+        raise ValueError("trace source must be a non-empty string")
+    key = source.casefold()
+    try:
+        return TRACE_DIALECTS[key]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported trace source {source!r}; known: {sorted(TRACE_DIALECTS)}") from exc
 
 
 def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "generic",
@@ -4338,7 +4365,8 @@ def stream_usage_and_cost(raw_text: str, *, source: str | None = None,
                           pi_stream: PiStream | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Normalize one runner stream without confusing Pi cumulative events for
     deltas — resolved by the source's registered trace dialect."""
-    return trace_dialect_for(str(source or "generic")).usage_and_cost(raw_text, pi_stream)
+    resolved_source = "generic" if source is None else source
+    return trace_dialect_for(resolved_source).usage_and_cost(raw_text, pi_stream)
 
 
 def write_trace_artifacts(
@@ -7893,23 +7921,95 @@ def two_sample_permutation_significance(a: list[float], b: list[float], *, max_e
     return {"method": method, "n_a": na, "n_b": nb, "observed_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
 
 
-def _trigger_report_rows(report: dict[str, Any], label: str) -> list[TriggerObservation]:
+@_dataclass(frozen=True)
+class _TriggerReportRows:
+    runs_per_query: int
+    observations: tuple[TriggerObservation, ...]
+    cells: dict[tuple[str, str | None, str], dict[int, TriggerObservation]]
+    queries: dict[str, tuple[str, bool]]
+
+
+def _trigger_report_rows(report: dict[str, Any], label: str) -> _TriggerReportRows:
     """Re-erect the typed trigger contract from one persisted matrix report.
     Strict at the boundary: a file that is not a skill-trigger-matrix report, or
     any row whose stored flags contradict the typed observation, is rejected
     rather than silently averaged."""
     if not isinstance(report, dict) or report.get("evidence_class") != TRIGGER_MEASUREMENT_EVIDENCE_CLASS:
         die(f"{label} is not a skill-trigger-matrix report (expected evidence_class {TRIGGER_MEASUREMENT_EVIDENCE_CLASS!r})")
+    if not isinstance(report.get("skill_name"), str) or not report["skill_name"].strip():
+        die(f"{label} skill_name must be a non-empty string")
     rows = report.get("results")
     if not isinstance(rows, list) or not rows:
         die(f"{label} has no results rows")
+    runs_per_query = report.get("runs_per_query")
+    if (isinstance(runs_per_query, bool) or not isinstance(runs_per_query, int)
+            or runs_per_query < 1):
+        die(f"{label} runs_per_query must be a positive integer")
+    report_hash = report.get("skill_tree_hash")
+    if not isinstance(report_hash, str) or not report_hash:
+        die(f"{label} skill_tree_hash must be a non-empty string")
+    design = report.get("design")
+    if not isinstance(design, list) or not design:
+        die(f"{label} design must be a non-empty list of expected trigger cells")
+    expected_cells: set[tuple[str, str | None, str]] = set()
+    queries: dict[str, tuple[str, bool]] = {}
+    for position, cell in enumerate(design, 1):
+        if not isinstance(cell, dict):
+            die(f"{label} design cell {position} must be an object")
+        agent, model = cell.get("agent"), cell.get("model")
+        query_id, query, should = (
+            cell.get("query_id"), cell.get("query"), cell.get("should_trigger"))
+        if not isinstance(agent, str) or not agent.strip():
+            die(f"{label} design cell {position} agent must be non-empty")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            die(f"{label} design cell {position} model must be None or non-empty")
+        if not isinstance(query_id, str) or not query_id.strip():
+            die(f"{label} design cell {position} query_id must be non-empty")
+        if not isinstance(query, str) or not query.strip() or type(should) is not bool:
+            die(f"{label} design cell {position} has an invalid query definition")
+        definition = (query, should)
+        prior_definition = queries.setdefault(query_id, definition)
+        if prior_definition != definition:
+            die(f"{label} design query_id {query_id!r} identifies conflicting queries")
+        cell_key = (agent, model, query_id)
+        if cell_key in expected_cells:
+            die(f"{label} duplicates design cell ({agent}, {model}, {query_id})")
+        expected_cells.add(cell_key)
     observations: list[TriggerObservation] = []
+    cells: dict[tuple[str, str | None, str], dict[int, TriggerObservation]] = {}
     for position, row in enumerate(rows, 1):
         try:
-            observations.append(TriggerObservation.from_row(row))
+            observation = TriggerObservation.from_row(row)
         except (TypeError, ValueError, KeyError) as exc:
             die(f"{label} results row {position}: {exc}")
-    return observations
+        if observation.identity is None:
+            die(f"{label} results row {position}: trigger repetition identity is required")
+        if not isinstance(row, dict) or row.get("skill_tree_hash") != report_hash:
+            die(f"{label} results row {position}: skill_tree_hash disagrees with its report")
+        identity = observation.identity
+        definition = (observation.query, observation.expectation.should_trigger)
+        cell_key = (observation.agent, observation.model, identity.query_id)
+        if cell_key not in expected_cells:
+            die(f"{label} results row {position} is not present in the declared design")
+        if queries[identity.query_id] != definition:
+            die(f"{label} results row {position} disagrees with its design query definition")
+        cell = cells.setdefault(cell_key, {})
+        if identity.run_number in cell:
+            die(
+                f"{label} duplicates repetition {identity.run_number} for "
+                f"({observation.agent}, {observation.model}, {identity.query_id})")
+        cell[identity.run_number] = observation
+        observations.append(observation)
+    expected_runs = set(range(1, runs_per_query + 1))
+    for agent, model, query_id in expected_cells:
+        repetitions = cells.get((agent, model, query_id), {})
+        actual_runs = set(repetitions)
+        if actual_runs != expected_runs:
+            die(
+                f"{label} has incomplete repetition identities for "
+                f"({agent}, {model}, {query_id}): expected {sorted(expected_runs)}, "
+                f"got {sorted(actual_runs)}")
+    return _TriggerReportRows(runs_per_query, tuple(observations), cells, queries)
 
 
 def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any]) -> dict[str, Any]:
@@ -7918,27 +8018,36 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
     answer path's causal-confirmation gate, closing the gap both trigger
     runners stamp on their output (single-arm raw measurements, no pairing).
 
-    Matrix rows carry no run numbers (repeats are unordered and share no
-    matched randomness), so complete observations are paired into
-    (agent, model, query) cells, then cells are averaged to one authored-query
-    pass-rate delta. Authored queries are sign-flip-tested exactly as
+    Persisted repetition identities prove that every declared run is present
+    exactly once. They do not claim matched stochastic randomness across arms:
+    complete observations are still aggregated into (agent, model, query-id)
+    rates, then cells are averaged to one authored-query pass-rate delta.
+    Authored queries are sign-flip-tested exactly as
     build_paired_summary tests per-case deltas. Pass rates, not trigger rates,
     carry the verdict, so polarity is inherent: a NO_TRIGGER query regresses by
     over-triggering. The verdict goes through the EvidenceClass guard —
     CONFIRMED_CAUSAL needs verified provenance, coverage, and a significant
     observed drop; an observed-but-insignificant drop downgrades to
     INDETERMINATE (never REFUTED, which would wrongly claim "no regression")."""
-    base_rows = _trigger_report_rows(baseline, "--baseline")
-    abl_rows = _trigger_report_rows(ablation, "--ablation")
-    if baseline.get("ablation"):
+    base_report = _trigger_report_rows(baseline, "--baseline")
+    abl_report = _trigger_report_rows(ablation, "--ablation")
+    if baseline.get("ablation") is not None:
         die("--baseline must be an unablated trigger run (it declares an ablation)")
-    if not ablation.get("ablation"):
+    if (not isinstance(ablation.get("ablation"), str)
+            or not ablation["ablation"].strip()):
         die("--ablation must be a trigger run produced with --ablation")
 
     reasons: list[str] = []
+    if baseline.get("skill_name") != ablation.get("skill_name"):
+        reasons.append("baseline and ablation reports name different skills")
     base_hash = str(baseline.get("skill_tree_hash") or "")
     if not base_hash:
         reasons.append("baseline report has no skill_tree_hash")
+    baseline_provenance = baseline.get("provenance")
+    if (not isinstance(baseline_provenance, dict)
+            or baseline_provenance.get("mode") != "baseline"
+            or baseline_provenance.get("skill_tree_hash") != base_hash):
+        reasons.append("baseline provenance does not attest its reported skill_tree_hash")
     prov: Provenance | None = None
     try:
         prov = Provenance.from_dict(ablation.get("provenance") or {})
@@ -7957,40 +8066,50 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
             reasons.append("ablation report skill_tree_hash does not match its provenance skill_hash")
     provenance_verified = not reasons
 
-    def keyed(observations: list[TriggerObservation]) -> dict[tuple[str, str | None, str, bool], list[TriggerObservation]]:
-        cells: dict[tuple[str, str | None, str, bool], list[TriggerObservation]] = {}
-        for obs in observations:
-            cells.setdefault((obs.agent, obs.model, obs.query, obs.expectation.should_trigger), []).append(obs)
-        return cells
-
     def rates(complete: list[TriggerObservation], total: int) -> dict[str, Any]:
         return {"runs": total, "complete": len(complete),
                 "pass_rate": round(statistics.mean(1.0 if o.passed else 0.0 for o in complete), 6),
                 "trigger_rate": round(statistics.mean(1.0 if o.detection.triggered else 0.0 for o in complete), 6)}
 
-    base_cells, abl_cells = keyed(base_rows), keyed(abl_rows)
+    base_cells, abl_cells = base_report.cells, abl_report.cells
     comparable: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
-    for key in sorted(set(base_cells) | set(abl_cells), key=lambda k: (k[0], str(k[1]), k[2], k[3])):
-        agent, model, query, should = key
-        base_observations = base_cells.get(key, [])
-        abl_observations = abl_cells.get(key, [])
+    for key in sorted(set(base_cells) | set(abl_cells), key=lambda k: (k[0], str(k[1]), k[2])):
+        agent, model, query_id = key
+        base_by_run = base_cells.get(key, {})
+        abl_by_run = abl_cells.get(key, {})
+        base_definition = base_report.queries.get(query_id)
+        abl_definition = abl_report.queries.get(query_id)
+        definition = base_definition or abl_definition
+        if definition is None:
+            raise AssertionError("trigger cell has no authored-query definition")
+        query, should = definition
+        base_observations = [base_by_run[n] for n in sorted(base_by_run)]
+        abl_observations = [abl_by_run[n] for n in sorted(abl_by_run)]
         base_complete = [o for o in base_observations if o.invocation.observation_complete]
         abl_complete = [o for o in abl_observations if o.invocation.observation_complete]
         reason = ("missing_baseline_arm" if key not in base_cells
                   else "missing_ablation_arm" if key not in abl_cells
+                  else "query_definition_mismatch" if base_definition != abl_definition
                   else "baseline_observations_incomplete" if len(base_complete) != len(base_observations)
                   else "ablation_observations_incomplete" if len(abl_complete) != len(abl_observations)
-                  else "repetition_count_mismatch" if len(base_observations) != len(abl_observations)
+                  else "repetition_count_mismatch" if set(base_by_run) != set(abl_by_run)
                   else None)
         if reason:
-            blocked.append({"agent": agent, "model": model, "query": query,
-                            "should_trigger": should, "reason": reason})
+            entry = {"agent": agent, "model": model, "query_id": query_id, "query": query,
+                     "should_trigger": should, "reason": reason}
+            if reason == "query_definition_mismatch":
+                entry.update({
+                    "ablation_query": abl_definition[0] if abl_definition else None,
+                    "ablation_should_trigger": abl_definition[1] if abl_definition else None,
+                })
+            blocked.append(entry)
             continue
-        base_block = rates(base_complete, len(base_cells[key]))
-        abl_block = rates(abl_complete, len(abl_cells[key]))
+        base_block = rates(base_complete, len(base_by_run))
+        abl_block = rates(abl_complete, len(abl_by_run))
         comparable.append({
-            "agent": agent, "model": model, "query": query, "should_trigger": should,
+            "agent": agent, "model": model, "query_id": query_id,
+            "query": query, "should_trigger": should,
             "baseline": base_block, "ablation": abl_block,
             "pass_delta": round(abl_block["pass_rate"] - base_block["pass_rate"], 6),
             "trigger_delta": round(abl_block["trigger_rate"] - base_block["trigger_rate"], 6),
@@ -7999,17 +8118,18 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
     # Agent/model cells are repeated measurements of the SAME authored query,
     # not independent experimental units. Collapse them before inference so a
     # single query run through many models cannot manufacture significance.
-    grouped_queries: dict[tuple[str, bool], list[dict[str, Any]]] = collections.defaultdict(list)
+    grouped_queries: dict[tuple[str, str, bool], list[dict[str, Any]]] = collections.defaultdict(list)
     for entry in comparable:
-        grouped_queries[(entry["query"], entry["should_trigger"])].append(entry)
+        grouped_queries[(entry["query_id"], entry["query"], entry["should_trigger"])].append(entry)
     query_units = [{
+        "query_id": query_id,
         "query": query,
         "should_trigger": should,
         "cells": len(entries),
         "pass_delta": round(statistics.mean(e["pass_delta"] for e in entries), 6),
         "trigger_delta": round(statistics.mean(e["trigger_delta"] for e in entries), 6),
-    } for (query, should), entries in sorted(
-        grouped_queries.items(), key=lambda item: (item[0][0], item[0][1]))]
+    } for (query_id, query, should), entries in sorted(
+        grouped_queries.items(), key=lambda item: item[0])]
     significance = sign_flip_significance([entry["pass_delta"] for entry in query_units])
     regressed = [entry for entry in query_units if entry["pass_delta"] < 0]
     mean_delta = significance.get("observed_mean_delta")
@@ -8019,17 +8139,19 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
     significant_drop = bool(significance.get("significant_at_0_05")) and aggregate_regression
     evidence_class = causal_confirmation(
         provenance_verified=provenance_verified,
-        has_coverage=bool(query_units),
+        has_coverage=bool(query_units) and not blocked,
         regression_observed=aggregate_regression,
         significant=significant_drop,
     )
     note = None
-    if provenance_verified and query_units and aggregate_regression and not significant_drop:
+    if not provenance_verified:
+        note = "provenance unverified: " + "; ".join(reasons)
+    elif blocked:
+        note = f"coverage incomplete: {len(blocked)} trigger cell(s) are blocked"
+    elif query_units and aggregate_regression and not significant_drop:
         note = (f"regression observed but not significant across queries "
                 f"(p={significance.get('p_value')}, mean delta={significance.get('observed_mean_delta')}); "
                 f">= 6 consistently regressed queries are needed to confirm")
-    elif not provenance_verified:
-        note = "provenance unverified: " + "; ".join(reasons)
     elif not query_units:
         note = "no comparable (agent, model, query) pair has complete observations on both sides"
     elif regressed and not aggregate_regression:
@@ -8045,7 +8167,7 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
                        "ablation_skill_tree_hash": ablation.get("skill_tree_hash")},
         "paired": {"comparable_queries": comparable, "query_units": query_units,
                    "blocked": blocked, "significance": significance},
-        "regressed_queries": [{k: entry[k] for k in ("query", "should_trigger", "pass_delta")}
+        "regressed_queries": [{k: entry[k] for k in ("query_id", "query", "should_trigger", "pass_delta")}
                               for entry in regressed],
         "summary": {"comparable": len(query_units), "comparable_cells": len(comparable),
                     "blocked": len(blocked),
@@ -12026,7 +12148,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True)
 
     p = sub.add_parser("import-trace")
-    p.add_argument("--source", default="generic", choices=["claude", "codex", "generic", "jetty", "pi"], help="runner trace dialect to normalize")
+    p.add_argument("--source", default="generic", choices=sorted(TRACE_DIALECTS),
+                   help="runner trace dialect to normalize")
     p.add_argument("--trace", required=True, help="raw JSONL trace path")
     p.add_argument("--run-dir", required=True, help="run directory where events.json/metrics.json should be written")
     p.add_argument("--out-events")

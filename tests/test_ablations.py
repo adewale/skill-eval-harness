@@ -570,8 +570,8 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             tree_dir, tree_hash, provenance = tm.trigger_tree_for_manifest(repo_root, manifest, root / "work", "no-wtu")
             self.assertTrue(tree_dir.is_dir())
             prov = am.Provenance.from_dict(provenance)
-            self.assertEqual(tree_hash, prov.identity.canonical)
-            self.assertEqual(tree_hash, provenance["parent_skill_hash"])
+            self.assertEqual(tree_hash, prov.identity.edited)
+            self.assertEqual(tree_hash, provenance["skill_hash"])
             self.assertNotIn("dir", provenance)
             self.assertNotIn("skill_files", provenance)
 

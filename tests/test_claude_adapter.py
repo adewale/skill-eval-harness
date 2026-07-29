@@ -129,6 +129,53 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
         self.assertEqual(event["raw_ref"], {"file": "trace.jsonl", "line": 1})
         self.assertEqual(event["raw_result_ref"], {"file": "trace.jsonl", "line": 1})
 
+    def test_duplicate_open_tool_id_is_error_and_cannot_replace_first_call(self):
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "same", "name": "Read",
+                 "input": {"file_path": "first.txt"}}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "same", "name": "Write",
+                 "input": {"file_path": "second.txt"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "same", "content": "first"}]}},
+        ]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        completed = [event for event in events_doc["events"]
+                     if event.get("status") == "completed"]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["type"], "file_read")
+        self.assertIn("first.txt", completed[0]["input_summary"])
+        self.assertNotIn("second.txt", completed[0]["input_summary"])
+        self.assertEqual(metrics["errors"], 1)
+        self.assertTrue(any("duplicate open Claude tool_use" in event.get("input_summary", "")
+                            for event in events_doc["events"]))
+
+    def test_tool_use_without_id_is_error_not_an_open_call(self):
+        records = [{"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "x"}}]}}]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        self.assertEqual(metrics["tool_calls"], 0)
+        self.assertEqual(metrics["errors"], 1)
+        self.assertEqual(events_doc["events"][0]["status"], "failed")
+
+    def test_completed_tool_id_cannot_be_reused_later(self):
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "same", "name": "Read",
+                 "input": {"file_path": "first.txt"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "same", "content": "ok"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "same", "name": "Write",
+                 "input": {"file_path": "second.txt"}}]}},
+        ]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        self.assertEqual(metrics["file_reads"], 1)
+        self.assertEqual(metrics["errors"], 1)
+        self.assertTrue(any("duplicate reused Claude tool_use" in event.get("input_summary", "")
+                            for event in events_doc["events"]))
+
     def test_skill_md_read_is_skill_load_evidence(self):
         _, metrics = sb.normalize_trace_records(claude_stream_records(), source="claude")
         self.assertTrue(metrics["skill_invoked"])

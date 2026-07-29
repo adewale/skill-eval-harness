@@ -278,6 +278,16 @@ class RunnerStampTests(unittest.TestCase):
         self.assertEqual(metrics["total_tokens"], 15)
         self.assertEqual(metrics["tool_calls"], 0)
 
+    def test_pi_dialect_typo_cannot_silently_change_cumulative_usage(self):
+        raw = (Path(__file__).parent / "fixtures" / "pi" /
+               "retry-then-success.jsonl").read_text(encoding="utf-8")
+        usage, _ = sb.stream_usage_and_cost(raw, source="pi")
+        self.assertEqual(usage["total_tokens"], 13)
+        with self.assertRaisesRegex(ValueError, "unsupported trace source"):
+            sb.stream_usage_and_cost(raw, source="pi ")
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            sb.stream_usage_and_cost(raw, source="")
+
     def test_non_pi_lifecycle_records_keep_their_existing_delta_semantics(self):
         usage = {"input": 10, "output": 3, "totalTokens": 15}
         assistant = {"role": "assistant", "usage": usage}

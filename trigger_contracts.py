@@ -337,6 +337,7 @@ _TRIGGER_RESERVED_METADATA = {
     "triggered", "pass", "observation_complete", "returncode", "timed_out",
     "elapsed_ms", "completion_evidence", "evidence", "evidence_typed",
     "usage_normalized", "cost_normalized", "stderr", "provider_error",
+    "query_id", "run_number",
 }
 
 
@@ -409,6 +410,39 @@ def _cost_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(dict(block))
 
 
+@dataclass(frozen=True, order=True)
+class TriggerRepetitionIdentity:
+    """Stable identity for one persisted trigger-matrix repetition.
+
+    Trigger rates do not assume matched randomness across arms, but causal
+    comparison still needs to prove that no repetition was duplicated, lost,
+    or silently replaced before rates are aggregated.
+    """
+
+    query_id: str
+    run_number: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.query_id, str) or not self.query_id.strip():
+            raise ValueError("trigger query_id must be a non-empty string")
+        if (isinstance(self.run_number, bool) or not isinstance(self.run_number, int)
+                or self.run_number < 1):
+            raise ValueError("trigger run_number must be a positive integer")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"query_id": self.query_id, "run_number": self.run_number}
+
+    @classmethod
+    def from_row(cls, raw: Mapping[str, Any]) -> TriggerRepetitionIdentity | None:
+        has_query_id = "query_id" in raw
+        has_run_number = "run_number" in raw
+        if has_query_id != has_run_number:
+            raise ValueError("trigger repetition identity requires both query_id and run_number")
+        if not has_query_id:
+            return None
+        return cls(raw["query_id"], raw["run_number"])
+
+
 @dataclass(frozen=True)
 class TriggerObservation:
     agent: str
@@ -420,6 +454,7 @@ class TriggerObservation:
     usage: Mapping[str, Any]
     cost: Mapping[str, Any]
     metadata: Mapping[str, Any] = field(default_factory=dict, compare=False)
+    identity: TriggerRepetitionIdentity | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.agent, str) or not self.agent.strip():
@@ -434,6 +469,8 @@ class TriggerObservation:
             raise TypeError("trigger observation invocation must be InvocationOutcome")
         if not isinstance(self.detection, TriggerDetection):
             raise TypeError("trigger observation detection must be TriggerDetection")
+        if self.identity is not None and not isinstance(self.identity, TriggerRepetitionIdentity):
+            raise TypeError("trigger observation identity must be TriggerRepetitionIdentity or None")
         usage = _usage_block(self.usage)
         cost = _cost_block(self.cost)
         if not self.invocation.observation_complete and (
@@ -483,6 +520,8 @@ class TriggerObservation:
                 row[key] = value
         if self.invocation.provider_error is not None:
             row["provider_error"] = self.invocation.provider_error
+        if self.identity is not None:
+            row.update(self.identity.as_dict())
         for key, value in self.metadata.items():
             if key not in row:
                 row[key] = value
@@ -553,6 +592,7 @@ class TriggerObservation:
             agent=agent, model=model, query=query, expectation=expectation,
             invocation=invocation, detection=detection,
             usage=raw.get("usage_normalized"), cost=raw.get("cost_normalized"),
+            identity=TriggerRepetitionIdentity.from_row(raw),
         )
         if not isinstance(raw.get("pass"), bool) or raw["pass"] != observation.passed:
             raise ValueError("persisted pass flag disagrees with the typed observation")
@@ -561,9 +601,10 @@ class TriggerObservation:
     @classmethod
     def harness_failure(cls, *, agent: str, model: str | None, query: str,
                         expectation: TriggerExpectation, error: BaseException,
-                        metadata: Mapping[str, Any] | None = None) -> TriggerObservation:
+                        metadata: Mapping[str, Any] | None = None,
+                        identity: TriggerRepetitionIdentity | None = None) -> TriggerObservation:
         message = f"{type(error).__name__}: {error}"
         invocation = InvocationOutcome.harness_failed(message)
         return cls(agent, model, query, expectation, invocation, TriggerDetection.absent(),
                    {"source": "missing"}, {"source": "missing"},
-                   {"error": message, **dict(metadata or {})})
+                   {"error": message, **dict(metadata or {})}, identity)

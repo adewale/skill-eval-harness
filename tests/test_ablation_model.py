@@ -200,17 +200,17 @@ class EvidenceClassTests(unittest.TestCase):
     def test_confirmed_causal_only_reachable_through_the_guard(self):
         # CONFIRMED_CAUSAL requires verified provenance AND coverage AND the observed regression.
         self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=True, significant=None),
+                                                regression_observed=True, significant=True),
                          am.EvidenceClass.CONFIRMED_CAUSAL)
         # Missing any precondition cannot reach a confirmation.
         self.assertEqual(am.causal_confirmation(provenance_verified=False, has_coverage=True,
-                                                regression_observed=True, significant=None),
+                                                regression_observed=True, significant=True),
                          am.EvidenceClass.INDETERMINATE)
         self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=False,
-                                                regression_observed=True, significant=None),
+                                                regression_observed=True, significant=True),
                          am.EvidenceClass.INDETERMINATE)
         self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=False, significant=None),
+                                                regression_observed=False, significant=True),
                          am.EvidenceClass.REFUTED)
 
     def test_raw_measurement_is_not_a_confirmation(self):
@@ -228,20 +228,16 @@ class EvidenceClassTests(unittest.TestCase):
         self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
                                                 regression_observed=True, significant=True),
                          am.EvidenceClass.CONFIRMED_CAUSAL)
-        # significant=None keeps the historical contract for callers that gate
-        # separately (or have no replication to test).
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=True, significant=None),
-                         am.EvidenceClass.CONFIRMED_CAUSAL)
-
     def test_significance_must_be_explicit_and_strictly_typed(self):
         with self.assertRaises(TypeError):
             am.causal_confirmation(provenance_verified=True, has_coverage=True,
                                    regression_observed=True)
-        for invalid in (0, 1, "false", [], {}):
-            with self.subTest(invalid=invalid), self.assertRaises(TypeError):
-                am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                       regression_observed=True, significant=invalid)
+        valid = {"provenance_verified": True, "has_coverage": True,
+                 "regression_observed": True, "significant": True}
+        for name in valid:
+            for invalid in (None, 0, 1, "false", [], {}):
+                with self.subTest(name=name, invalid=invalid), self.assertRaises(TypeError):
+                    am.causal_confirmation(**{**valid, name: invalid})
 
     def test_significance_never_rescues_or_flips_the_other_gates(self):
         # A refutation is a refutation regardless of significance machinery,

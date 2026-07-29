@@ -39,8 +39,9 @@ Five adapters ship:
 To add another agent: subclass AgentAdapter, implement mount() (copy the
 canonical tree where that agent discovers skills) and invoke() (run the agent
 headless on the raw query, return its JSON event stream), then register it in
-ADAPTERS and agent_capabilities.AGENT_CAPABILITIES. detect() only needs
-overriding when load evidence is not a file path in the stream.
+ADAPTERS, agent_capabilities.AGENT_CAPABILITIES, and the explicit trace-dialect
+registry (choose the generic dialect deliberately when appropriate). detect()
+only needs overriding when load evidence is not a file path in the stream.
 
 Every number this emits is a RAW autonomous-trigger measurement (the same
 evidence class as run_pi_trigger_eval.py) — a rate to steer description edits,
@@ -93,6 +94,7 @@ from skill_benchmark import (
     repo_root_for_manifest,
     safe_trace_label,
     stream_usage_and_cost,
+    trace_dialect_for,
     vibe_env_for_home,
     vibe_skill_tool_evidence,
     write_json,
@@ -106,6 +108,7 @@ from trigger_contracts import (
     TriggerEvidenceKind,
     TriggerExpectation,
     TriggerObservation,
+    TriggerRepetitionIdentity,
 )
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
@@ -553,11 +556,12 @@ def trigger_tree_for_manifest(repo_root: Path, manifest: dict[str, Any], work_di
     except AblationError as exc:
         raise SystemExit(str(exc)) from exc
     prov = Provenance.from_dict(provenance)
-    return Path(provenance["dir"]), prov.identity.canonical, prov.as_dict()
+    return Path(provenance["dir"]), prov.identity.edited, prov.as_dict()
 
 
 def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger: bool,
-                       exc: BaseException, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+                       exc: BaseException, metadata: dict[str, Any] | None = None,
+                       identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
     return TriggerObservation.harness_failure(
         agent=agent,
         model=model,
@@ -565,12 +569,14 @@ def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger
         expectation=TriggerExpectation.from_bool(should_trigger),
         error=exc,
         metadata=metadata,
+        identity=identity,
     ).as_row()
 
 
 def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_trigger: bool,
                    model: str | None, timeout: int, trace_dir: Path | None = None,
-                   metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+                   metadata: dict[str, Any] | None = None,
+                   identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
     """One typed observation of one query in one (agent, model) cell."""
     secrets: list[str] = []
     with tempfile.TemporaryDirectory(prefix=f"trigger-{adapter.name}-") as td:
@@ -632,6 +638,7 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
         usage=usage,
         cost=cost,
         metadata=observation_metadata,
+        identity=identity,
     )
     row = observation.as_row()
 
@@ -647,6 +654,7 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
             "evidence": row["evidence"],
             "usage_normalized": usage,
             "cost_normalized": cost,
+            **(identity.as_dict() if identity is not None else {}),
             **dict(redacted_invocation.metadata),
             **observation_metadata,
         }
@@ -686,15 +694,20 @@ def summarize_matrix(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cells.setdefault((r["agent"], r["model"]), []).append(r)
     matrix = []
     for (agent, model), rows in sorted(cells.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
-        queries: dict[tuple[str, bool], list[dict[str, Any]]] = {}
+        queries: dict[tuple[str, str, bool], list[dict[str, Any]]] = {}
         for r in rows:
-            queries.setdefault((r["query"], r["should_trigger"]), []).append(r)
+            queries.setdefault(
+                (r["query_id"], r["query"], r["should_trigger"]), []).append(r)
         query_rows = []
-        for (query, should), runs in queries.items():
-            triggered = sum(1 for r in runs if r["triggered"])
+        for (query_id, query, should), runs in queries.items():
+            complete = [r for r in runs if r["observation_complete"]]
+            triggered = sum(1 for r in complete if r["triggered"])
             query_rows.append({
-                "query": query, "should_trigger": should, "runs": len(runs),
-                "triggered_runs": triggered, "trigger_rate": triggered / len(runs),
+                "query_id": query_id, "query": query, "should_trigger": should,
+                "runs": len(runs), "complete": len(complete),
+                "incomplete": len(runs) - len(complete),
+                "triggered_runs": triggered,
+                "trigger_rate": triggered / len(complete) if complete else None,
                 "passed_runs": sum(1 for r in runs if r["pass"]),
             })
 
@@ -733,6 +746,15 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
                vibe_cmd: str | None = None, max_turns: int = 6,
                trace_runs: Path | None = None, ablation: str | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
+    rows = validate_trigger_rows(rows, "trigger matrix rows")
+    if not rows:
+        raise SystemExit("no trigger queries")
+    if not agents:
+        raise SystemExit("select at least one --agent")
+    if models is not None and not models:
+        raise SystemExit("select at least one --model or omit --model for adapter defaults")
+    if isinstance(runs_per_query, bool) or not isinstance(runs_per_query, int) or runs_per_query < 1:
+        raise SystemExit("--runs-per-query must be a positive integer")
     repo_root = repo_root_for_manifest(manifest_path)
     reject_duplicates(agents, "--agent")
     if models is not None:
@@ -743,6 +765,10 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         if name not in ADAPTERS:
             raise SystemExit(f"unknown agent {name!r}; known: {sorted(ADAPTERS)} (subclass AgentAdapter to add one)")
         cap = require_agent_capabilities(name)
+        try:
+            trace_dialect_for(name)
+        except ValueError as exc:
+            raise SystemExit(f"agent {name!r} has no registered trace dialect") from exc
         if not cap.autonomous_trigger:
             raise SystemExit(f"agent {name!r} is not registered for autonomous trigger measurement")
         if ablation and not cap.trigger_ablation:
@@ -760,13 +786,18 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         if trace_runs is not None:
             trace_runs.mkdir(parents=True, exist_ok=True)
             trace_root = Path(tempfile.mkdtemp(prefix="matrix-", dir=trace_runs))
-        futures, results = [], []
-        future_context: dict[Any, tuple[str, str | None, str, bool, dict[str, Any]]] = {}
+        futures, results, design = [], [], []
+        future_context: dict[Any, tuple[str, str | None, str, bool, dict[str, Any], TriggerRepetitionIdentity]] = {}
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for adapter in adapters:
                 for model in (models if models is not None else adapter.default_models):
                     for row_index, row in enumerate(rows, 1):
                         query = str(row["query"])
+                        design.append({
+                            "agent": adapter.name, "model": model,
+                            "query_id": row["query_id"], "query": query,
+                            "should_trigger": row["should_trigger"],
+                        })
                         for run_number in range(1, runs_per_query + 1):
                             trace_dir = None
                             if trace_root is not None:
@@ -781,17 +812,24 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
                                 "skill_tree_hash": tree_hash,
                             }
                             should_trigger = row["should_trigger"]
+                            identity = TriggerRepetitionIdentity(row["query_id"], run_number)
                             future = ex.submit(run_cell_query, adapter, tree_dir,
                                                query, should_trigger,
-                                               model, timeout, trace_dir, metadata)
+                                               model, timeout, trace_dir, metadata, identity)
                             futures.append(future)
-                            future_context[future] = (adapter.name, model, query, should_trigger, metadata)
+                            future_context[future] = (
+                                adapter.name, model, query, should_trigger, metadata, identity)
             for fut in as_completed(futures):
                 try:
                     results.append(fut.result())
                 except Exception as exc:
-                    agent, model, query, should_trigger, metadata = future_context[fut]
-                    results.append(matrix_failure_row(agent, model, query, should_trigger, exc, metadata))
+                    agent, model, query, should_trigger, metadata, identity = future_context[fut]
+                    results.append(matrix_failure_row(
+                        agent, model, query, should_trigger, exc, metadata, identity))
+    results.sort(key=lambda row: (
+        str(row["agent"]), str(row.get("model") or ""),
+        str(row["query_id"]), int(row["run_number"]),
+    ))
     matrix = summarize_matrix(results)
     passed = sum(1 for r in results if r["pass"])
     return {
@@ -807,6 +845,7 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         "provenance": provenance,
         "agents": {name: capability_rows[name].as_dict() for name in sorted(capability_rows)},
         "runs_per_query": runs_per_query,
+        "design": design,
         "summary": {"total": len(results), "passed": passed,
                     "pass_rate": (passed / len(results)) if results else None},
         "matrix": matrix,

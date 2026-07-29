@@ -12,6 +12,7 @@ from trigger_contracts import (
     TriggerEvidenceKind,
     TriggerExpectation,
     TriggerObservation,
+    TriggerRepetitionIdentity,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "pi"
@@ -309,6 +310,36 @@ class TriggerObservationTruthTableTests(unittest.TestCase):
                 self.assertIs(restored.invocation.completion_evidence, CompletionEvidence.AGENT_WINDOW_EXHAUSTED)
                 self.assertIs(restored.detection.evidence[0].kind, kind)
                 self.assertTrue(restored.passed)
+
+    def test_repetition_identity_round_trips_and_is_part_of_observation_identity(self):
+        base = self._observation(usage={"source": "missing"}, cost={"source": "missing"})
+        first = TriggerObservation(
+            agent=base.agent, model=base.model, query=base.query,
+            expectation=base.expectation, invocation=base.invocation,
+            detection=base.detection, usage=base.usage, cost=base.cost,
+            identity=TriggerRepetitionIdentity("query-a", 1),
+        )
+        second = TriggerObservation(
+            agent=base.agent, model=base.model, query=base.query,
+            expectation=base.expectation, invocation=base.invocation,
+            detection=base.detection, usage=base.usage, cost=base.cost,
+            identity=TriggerRepetitionIdentity("query-a", 2),
+        )
+        self.assertNotEqual(first, second)
+        self.assertEqual(TriggerObservation.from_row(first.as_row()).identity,
+                         TriggerRepetitionIdentity("query-a", 1))
+
+    def test_partial_or_invalid_repetition_identity_is_rejected(self):
+        row = self._observation(
+            usage={"source": "missing"}, cost={"source": "missing"}).as_row()
+        for mutation in (
+            {"query_id": "q"}, {"run_number": 1},
+            {"query_id": "q", "run_number": 0},
+            {"query_id": "", "run_number": 1},
+            {"query_id": "q", "run_number": True},
+        ):
+            with self.subTest(mutation=mutation), self.assertRaises((TypeError, ValueError)):
+                TriggerObservation.from_row({**row, **mutation})
 
     def test_persisted_boundary_rejects_population_and_evidence_disagreement(self):
         row = self._observation(

@@ -139,9 +139,9 @@ editor. This boundary is the main extension seam in the codebase.
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:5335`), Claude (`run_claude:5480`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:5363`), Claude (`run_claude:5508`, capturing real
 per-run cost), Mistral Vibe (`run-agent --agent vibe`, using isolated `VIBE_HOME` outside the workdir), the in-process
-subagent runner (`run_subagent:6938`, which hosts record/replay tool I/O via `ToolReplayStore`),
+subagent runner (`run_subagent:6966`, which hosts record/replay tool I/O via `ToolReplayStore`),
 Jetty (`JettyClient:2289` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they

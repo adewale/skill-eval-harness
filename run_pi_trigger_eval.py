@@ -11,6 +11,7 @@ Pi can also load a skill when the user explicitly names `/skill:name`.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -44,7 +45,12 @@ from skill_benchmark import (
     write_json,
     write_trace_artifacts,
 )
-from trigger_contracts import InvocationOutcome, TriggerExpectation, TriggerObservation
+from trigger_contracts import (
+    InvocationOutcome,
+    TriggerExpectation,
+    TriggerObservation,
+    TriggerRepetitionIdentity,
+)
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -143,7 +149,10 @@ def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, 
     )
 
 
-def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int, model: str | None, trace_dir: Path | None = None, ablation: str | None = None) -> dict[str, Any]:
+def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int,
+              model: str | None, trace_dir: Path | None = None,
+              ablation: str | None = None,
+              identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     with tempfile.TemporaryDirectory(prefix="pi-trigger-") as td:
         config_dir = Path(td)
@@ -165,13 +174,13 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
             usage_normalized, cost_normalized = {"source": "missing"}, {"source": "missing"}
         is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
         # The materialized ablation's provenance goes through Provenance (one
-        # schema); the canonical (parent) tree hash is recorded on BOTH arms under
-        # the same field the answer path uses, so a baseline and an ablation run can
-        # be checked for the same skill revision.
+        # schema). skill_tree_hash names the bytes this arm actually mounted;
+        # parent_skill_hash in the ablation provenance links those edited bytes
+        # back to the baseline's canonical revision.
         if is_ablation:
             prov = Provenance.from_dict(abl_prov)
             ablation_field = prov.as_dict()
-            skill_tree_hash = prov.identity.canonical
+            skill_tree_hash = prov.identity.edited
         else:
             ablation_field = ablation
             skill_tree_hash = (abl_prov or {}).get("skill_tree_hash")
@@ -192,6 +201,7 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
                 "ablation": ablation_field,
                 "skill_tree_hash": skill_tree_hash,
             },
+            identity=identity,
         )
         result = observation.as_row()
         if trace_dir is not None:
@@ -221,7 +231,8 @@ def cases_from_manifest(manifest: dict[str, Any], split: str | None) -> list[dic
             # Single shared resolver with the manifest audit (skill_benchmark), so the
             # eval and the audit cannot disagree on a case's expected polarity.
             should = expected_trigger_polarity(c) == "TRIGGER"
-            out.append({"query": prompt, "should_trigger": should})
+            out.append({"query_id": str(c.get("id") or ""),
+                        "query": prompt, "should_trigger": should})
     return out
 
 
@@ -233,6 +244,7 @@ def validate_trigger_rows(rows: Any, source: str) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         raise SystemExit(f"{source}: expected a list of trigger rows or an object with evals/queries")
     out: list[dict[str, Any]] = []
+    seen: dict[str, tuple[str, bool]] = {}
     for i, row in enumerate(rows, 1):
         if not isinstance(row, dict):
             raise SystemExit(f"{source}: row {i} must be an object")
@@ -241,7 +253,23 @@ def validate_trigger_rows(rows: Any, source: str) -> list[dict[str, Any]]:
             raise SystemExit(f"{source}: row {i} query must be a non-empty string")
         if not isinstance(row.get("should_trigger"), bool):
             raise SystemExit(f"{source}: row {i} should_trigger must be true or false")
+        query_id = row.get("query_id", row.get("id"))
+        if query_id is None or query_id == "":
+            encoded = json.dumps([query, row["should_trigger"]], ensure_ascii=False,
+                                 separators=(",", ":")).encode("utf-8")
+            query_id = "query-" + hashlib.sha256(encoded).hexdigest()
+        if not isinstance(query_id, str) or not query_id.strip():
+            raise SystemExit(f"{source}: row {i} query_id must be a non-empty string")
+        authored = (query, row["should_trigger"])
+        if query_id in seen:
+            if seen[query_id] != authored:
+                raise SystemExit(
+                    f"{source}: duplicate query_id {query_id!r} identifies conflicting queries")
+            raise SystemExit(f"{source}: duplicate query_id {query_id!r}")
+        seen[query_id] = authored
         normalized = dict(row)
+        normalized.pop("id", None)
+        normalized["query_id"] = query_id
         normalized["query"] = query
         normalized["should_trigger"] = row["should_trigger"]
         out.append(normalized)
@@ -284,6 +312,10 @@ def main() -> int:
     manifest_path = Path(args.manifest)
     manifest = load_manifest(manifest_path)
     rows = eval_rows_from_args(args, manifest_path)
+    if not rows:
+        raise SystemExit("no trigger queries: add kind:'trigger' cases to the manifest or pass --eval-set")
+    if isinstance(args.runs_per_query, bool) or args.runs_per_query < 1:
+        raise SystemExit("--runs-per-query must be a positive integer")
     futures = []
     results = []
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -293,10 +325,26 @@ def main() -> int:
                 if args.trace_runs:
                     label = safe_trace_label(str(row.get("query", f"query-{i}")), f"query-{i}")
                     trace_dir = Path(args.trace_runs) / f"query-{i:03d}-{label}" / f"run-{run_number}"
-                futures.append(ex.submit(run_query, manifest_path, row["query"], row["should_trigger"], args.timeout, args.model, trace_dir, args.ablation))
+                identity = TriggerRepetitionIdentity(row["query_id"], run_number)
+                futures.append(ex.submit(
+                    run_query, manifest_path, row["query"], row["should_trigger"],
+                    args.timeout, args.model, trace_dir, args.ablation, identity))
         for fut in as_completed(futures):
             results.append(fut.result())
+    results.sort(key=lambda row: (str(row["query_id"]), int(row["run_number"])))
     passed = sum(1 for r in results if r["pass"])
+    tree_hashes = {r.get("skill_tree_hash") for r in results}
+    if len(tree_hashes) != 1 or not next(iter(tree_hashes), None):
+        raise SystemExit("trigger rows did not retain one consistent skill_tree_hash")
+    tree_hash = next(iter(tree_hashes))
+    if args.ablation:
+        provenance_rows = [r.get("ablation") for r in results]
+        if (not all(isinstance(value, dict) for value in provenance_rows)
+                or len({json.dumps(value, sort_keys=True) for value in provenance_rows}) != 1):
+            raise SystemExit("trigger rows did not retain one consistent ablation provenance")
+        provenance = provenance_rows[0]
+    else:
+        provenance = {"mode": "baseline", "skill_tree_hash": tree_hash}
     output = {
         "skill_name": skill_name_from_manifest(manifest),
         "generated_at": int(time.time()),
@@ -305,11 +353,19 @@ def main() -> int:
         # provenance-verified baseline-vs-ablation comparison: the harness does not
         # yet pair the two arms or gate a confirmed trigger regression on recorded
         # provenance the way the answer-population (benchmark) path does. Treat the
-        # pass_rate as a measurement, not a confirmed ablation effect. The recorded
-        # skill_tree_hash on each result lets a future pairing verify both arms ran
-        # the same skill revision.
+        # pass_rate as a measurement, not a confirmed ablation effect. The report
+        # carries the exact mounted-tree hash, provenance, declared design, and
+        # repetition identities needed by `skill-benchmark trigger-compare`.
         "evidence_class": TRIGGER_MEASUREMENT_EVIDENCE_CLASS,
+        "skill_tree_hash": tree_hash,
         "ablation": args.ablation,
+        "provenance": provenance,
+        "runs_per_query": args.runs_per_query,
+        "design": [
+            {"agent": "pi", "model": args.model, "query_id": row["query_id"],
+             "query": row["query"], "should_trigger": row["should_trigger"]}
+            for row in rows
+        ],
         "summary": {"total": len(results), "passed": passed, "failed": len(results) - passed, "pass_rate": (passed / len(results)) if results else None},
         "results": results,
     }

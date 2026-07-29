@@ -628,7 +628,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                 (base / "output.md").write_text("alpha beta", encoding="utf-8")
                 sb.write_trace_artifacts(
                     base, json.dumps({"type": "message", "role": "assistant", "content": "done"}),
-                    source="test",
+                    source="generic",
                     extra_metrics={"skill_invoked": invoked,
                                    "skill_invocation_evidence": [variant] if invoked else []},
                     write_metadata=True,

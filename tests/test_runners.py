@@ -1061,10 +1061,15 @@ class TraceDialectRegistryTests(unittest.TestCase):
     normalize_trace_records (a pi_stream parameter AND a claude flatten
     branch)."""
 
-    def test_unknown_sources_get_the_generic_dialect(self):
-        self.assertIs(sb.trace_dialect_for("codex"), sb.GENERIC_TRACE_DIALECT)
-        self.assertIs(sb.trace_dialect_for("JETTY"), sb.GENERIC_TRACE_DIALECT)
-        self.assertIs(sb.trace_dialect_for("generic"), sb.GENERIC_TRACE_DIALECT)
+    def test_registered_generic_sources_get_the_generic_dialect(self):
+        for source in ("codex", "JETTY", "generic", "stub", "subagent", "vibe"):
+            with self.subTest(source=source):
+                self.assertIs(sb.trace_dialect_for(source), sb.GENERIC_TRACE_DIALECT)
+
+    def test_unknown_misspelled_and_non_string_sources_are_rejected(self):
+        for source in ("unknown", "pi ", " vibes", "", None, 3):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                sb.trace_dialect_for(source)
 
     def test_generic_flatten_is_the_identity_with_line_numbers(self):
         records = [{"a": 1}, {"b": 2}]
