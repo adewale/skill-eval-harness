@@ -111,6 +111,7 @@ from text_contracts import (
     LiteralTextAssertion,
     MatchObservation,
     RegexTextAssertion,
+    SimilarityDecision,
     SimilarityTextAssertion,
     comparison_note,
     parse_human_text_assertion,
@@ -676,15 +677,18 @@ def prompt_assertion_leakage_findings(manifest: dict[str, Any], manifest_path: P
         for assertion in case.get("assertions", []) or []:
             for value in assertion_values_for_leakage(assertion):
                 value = value.strip()
-                if len(value) < min_chars:
-                    continue
                 comparison = assertion.get("comparison", ComparisonProfile.RENDERED_V1.value)
-                observation = LiteralTextAssertion(
+                profile = ComparisonProfile(comparison)
+                value_view = ComparisonText.from_text(value, profile)
+                if len(value_view.value.strip()) < min_chars:
+                    continue
+                leakage_matcher = LiteralTextAssertion(
                     kind=LiteralKind.CONTAINS,
                     values=(value,),
                     case_insensitive=True,
-                    profile=ComparisonProfile(comparison),
-                ).evaluate(prompt)
+                    profile=profile,
+                )
+                observation = leakage_matcher.evaluate(prompt)
                 if observation.passed:
                     finding = {
                         "case_id": case.get("id"),
@@ -1167,9 +1171,14 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                                          or not math.isfinite(float(graded_floor))
                                          or not 1 <= float(graded_floor) <= 5):
             die(f"{cid}: reference_graded_score must be a number on the 1-5 scale")
-        for cfield in ("canary", "released_at"):   # contamination perimeter (output side)
-            if case.get(cfield) is not None and not isinstance(case.get(cfield), str):
-                die(f"{cid}: {cfield} must be a string")
+        canary = case.get("canary")
+        if canary is not None:
+            if not isinstance(canary, str) or not canary:
+                die(f"{cid}: canary must be a non-empty string")
+            if not ComparisonText.from_text(canary, ComparisonProfile.RENDERED_V1).value.strip():
+                die(f"{cid}: canary must not become empty under rendered-v1")
+        if case.get("released_at") is not None and not isinstance(case.get("released_at"), str):
+            die(f"{cid}: released_at must be a string")
         for j, assertion in enumerate(assertions):
             validate_case_assertion(cid, f"assertion #{j}", j, assertion, path)
         labels = [assertion_label(assertion) for assertion in assertions]
@@ -8172,6 +8181,15 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
     }
 
 
+def finite_real(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
 def parse_script_score_line(stdout: str) -> float | None:
     """1.8: a graded script oracle may print a JSON line such as
     {"score": 6, "max_score": 7}; the parsed value (normalized 0-1) feeds the
@@ -8184,12 +8202,15 @@ def parse_script_score_line(stdout: str) -> float | None:
             obj = strict_json_loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(obj, dict) or not isinstance(obj.get("score"), (int, float)):
+        if not isinstance(obj, dict) or not finite_real(obj.get("score")):
             continue
         score = float(obj["score"])
         max_score = obj.get("max_score", 1)
-        if isinstance(max_score, (int, float)) and float(max_score) > 0:
-            score = score / float(max_score)
+        if not finite_real(max_score) or float(max_score) <= 0:
+            continue
+        score = score / float(max_score)
+        if not math.isfinite(score):
+            continue
         return max(0.0, min(1.0, score))
     return None
 
@@ -8251,10 +8272,15 @@ def embedding_similarity(actual: str, expected: str, embed_cmd: str, timeout: fl
         return None, "embed command emitted no JSON object"
     vectors = obj.get("embeddings")
     if (not isinstance(vectors, list) or len(vectors) != 2
-            or not all(isinstance(v, list) and v and all(isinstance(x, (int, float)) for x in v) for v in vectors)
+            or not all(isinstance(v, list) and v and all(finite_real(x) for x in v) for v in vectors)
             or len(vectors[0]) != len(vectors[1])):
-        return None, "embed command must return two equal-length numeric vectors under 'embeddings'"
-    return cosine_similarity([float(x) for x in vectors[0]], [float(x) for x in vectors[1]]), ""
+        return None, "embed command must return two equal-length finite numeric vectors under 'embeddings'"
+    cosine = cosine_similarity([float(x) for x in vectors[0]], [float(x) for x in vectors[1]])
+    if not math.isfinite(cosine):
+        return None, "embed command produced a non-finite cosine similarity"
+    # Assertion scores are a closed 0-1 domain.  Preserve ordinary cosine
+    # thresholds while mapping antiparallel evidence to the domain floor.
+    return max(0.0, min(1.0, cosine)), ""
 
 
 def normalize_golden(text: str, mode: str) -> str:
@@ -8423,9 +8449,10 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
                     availability = "partial"
                     evidence = err
                 else:
-                    score = round(ratio, 4)
-                    passed = ratio >= threshold
-                    evidence = f"embedding similarity={ratio:.4f} vs threshold={threshold:g}"
+                    decision = SimilarityDecision(ratio, threshold)
+                    score = decision.score
+                    passed = decision.passed
+                    evidence = f"embedding similarity={score:.4f} vs threshold={threshold:g}"
                 if actual_view.changed or expected_view.changed:
                     evidence += comparison_note(actual_view, expected_view)
                     normalization = {
@@ -8438,16 +8465,15 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
         else:
             similarity = parsed_text_assertion.ratio_observation(compare)
             ratio = similarity.ratio
-            score = round(ratio, 4)
+            score = SimilarityDecision(ratio, threshold).score
             passed = similarity.passed
             if "atLeast" in assertion:
                 effective_floor = float(assertion["atLeast"])
-                normalized_verdict_changed = (score >= effective_floor) != (
-                    round(similarity.raw_ratio, 4) >= effective_floor
-                )
+                raw_decision = SimilarityDecision(similarity.raw_ratio, effective_floor)
+                normalized_verdict_changed = (score >= effective_floor) != raw_decision.passed
             else:
                 normalized_verdict_changed = similarity.verdict_changed
-            evidence = f"similarity={ratio:.4f} vs threshold={threshold:g} against expected[:60]={expected[:60]!r}"
+            evidence = f"similarity={score:.4f} vs threshold={threshold:g} against expected[:60]={expected[:60]!r}"
             if similarity.changed:
                 evidence += comparison_note(
                     similarity.actual,
@@ -8458,7 +8484,7 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
                     "profile": parsed_text_assertion.profile.value,
                     "changed": True,
                     "verdict_changed": normalized_verdict_changed,
-                    "raw_score": round(similarity.raw_ratio, 4),
+                    "raw_score": SimilarityDecision(similarity.raw_ratio, threshold).score,
                     "candidate": similarity.actual.change_dict(),
                     "operands": [similarity.expected.change_dict()] if similarity.expected.changed else [],
                 }
@@ -16444,7 +16470,8 @@ def contamination_check(case: dict[str, Any], output_text: str, *, manifest_dir:
     leakage lint, which cannot see the output."""
     findings: list[dict[str, Any]] = []
     canary = case.get("canary")
-    if canary:
+    canary_view = ComparisonText.from_text(str(canary), ComparisonProfile.RENDERED_V1) if canary else None
+    if canary_view is not None and canary_view.value.strip():
         canary_observation = LiteralTextAssertion(
             LiteralKind.CONTAINS,
             (str(canary),),
@@ -16717,21 +16744,18 @@ def audit_manifest_report(
                 rubric_texts.extend(str(d.get("rubric", "")) for d in (a.get("graded_dimensions") or []))
         for rubric_text in rubric_texts:
             t = rubric_text.strip()
-            if len(t) < 12:
+            rubric_view = ComparisonText.from_text(t, ComparisonProfile.RENDERED_V1)
+            if len(rubric_view.value.strip()) < 12:
                 continue
-            skill_match = LiteralTextAssertion(
+            rubric_matcher = LiteralTextAssertion(
                 LiteralKind.CONTAINS,
                 (t,),
                 True,
                 ComparisonProfile.RENDERED_V1,
-            ).evaluate(skill_text)
+            )
+            skill_match = rubric_matcher.evaluate(skill_text)
             prompt_matches = [
-                LiteralTextAssertion(
-                    LiteralKind.CONTAINS,
-                    (t,),
-                    True,
-                    ComparisonProfile.RENDERED_V1,
-                ).evaluate(prompt)
+                rubric_matcher.evaluate(prompt)
                 for prompt in public_prompts
             ]
             if skill_match.passed:

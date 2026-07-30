@@ -4,12 +4,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from helpers import demo_manifest, write_demo_manifest
 from hypothesis import given
 from hypothesis import strategies as st
 
 import skill_benchmark as sb
+import text_contracts as tc
 from text_contracts import (
     RENDERED_V1_REMOVED_CODEPOINTS,
     ComparisonProfile,
@@ -18,6 +21,7 @@ from text_contracts import (
     MatchObservation,
     RegexTextAssertion,
     RemovedCodePoint,
+    SimilarityDecision,
     SimilarityObservation,
     SimilarityTextAssertion,
     parse_human_text_assertion,
@@ -45,9 +49,16 @@ class ComparisonTextConstructionTests(unittest.TestCase):
         self.assertTrue(value.canonical_normalized)
 
     def test_rendered_v1_preserves_semantically_meaningful_controls_and_separators(self):
-        preserved = "a\u200cb\u200dc\u2028d\u2029e\u2061f\u2062g\u2063h\u2064i\ufe0f"
+        preserved = "a\u00adb\u061cc\u200ed\u200fe\u202ef\u202cg\u2066h\u2069i\u200cj\u200dk\u2028l\u2029m\u2061n\u2062o\u2063p\u2064q\ufe0f"
         value = ComparisonText.from_text(preserved, ComparisonProfile.RENDERED_V1)
         self.assertEqual(value.value, preserved)
+        self.assertFalse(value.changed)
+
+    def test_rendered_v1_policy_is_narrow_and_does_not_erase_directionality(self):
+        self.assertEqual(RENDERED_V1_REMOVED_CODEPOINTS, {0x200B, 0x2060, 0xFEFF})
+        directional = "abc\u202e123\u202c"
+        value = ComparisonText.from_text(directional, ComparisonProfile.RENDERED_V1)
+        self.assertEqual(value.value, directional)
         self.assertFalse(value.changed)
 
     def test_normalization_is_idempotent(self):
@@ -58,12 +69,18 @@ class ComparisonTextConstructionTests(unittest.TestCase):
         self.assertFalse(twice.changed)
 
     def test_direct_constructor_rejects_a_forged_comparison_view(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaises(TypeError):
             ComparisonText(
                 raw=OBSCURED_COORDINATE,
                 value=OBSCURED_COORDINATE,
                 profile=ComparisonProfile.RENDERED_V1,
             )
+
+    def test_comparison_constructor_derives_the_view_once(self):
+        with mock.patch.object(tc, "_rendered_v1", wraps=tc._rendered_v1) as render:
+            value = ComparisonText.from_text(OBSCURED_COORDINATE, ComparisonProfile.RENDERED_V1)
+        self.assertEqual(value.value, COORDINATE)
+        self.assertEqual(render.call_count, 1)
 
     def test_observation_constructors_preserve_immutable_single_profile_state(self):
         rendered = ComparisonText.from_text("x", ComparisonProfile.RENDERED_V1)
@@ -76,6 +93,9 @@ class ComparisonTextConstructionTests(unittest.TestCase):
             MatchObservation(True, False, False, "evidence", rendered, (exact,))
         with self.assertRaises(ValueError):
             SimilarityObservation(0.8, 0.7, 0.75, rendered, exact)
+        for invalid in (True, float("nan"), float("inf"), -0.1, 1.1):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                SimilarityDecision(invalid, 0.8)
 
         observation = SimilarityObservation(0.8, 0.7, 0.75, rendered, rendered)
         self.assertTrue(observation.passed)
@@ -115,6 +135,19 @@ class TypedTextAssertionTests(unittest.TestCase):
                 result = self.result({"type": "contains", "value": COORDINATE}, obscured)
                 self.assertTrue(result["passed"])
                 self.assertTrue(result["normalization"]["verdict_changed"])
+
+    def test_direction_changing_controls_cannot_create_a_rendered_pass(self):
+        directional = "abc\u202e123\u202c"
+        assertions = [
+            {"type": "contains", "value": "abc123", "ci": False},
+            {"type": "regex", "pattern": "^abc123$", "ci": False},
+            {"type": "similarity", "expected": "abc123", "threshold": 1.0, "ci": False},
+        ]
+        for assertion in assertions:
+            with self.subTest(assertion=assertion["type"]):
+                result = self.result(assertion, directional)
+                self.assertFalse(result["passed"])
+                self.assertNotIn("normalization", result)
 
     @given(
         st.sampled_from(sorted(RENDERED_V1_REMOVED_CODEPOINTS)),
@@ -197,6 +230,41 @@ class TypedTextAssertionTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual(result["score"], 1.0)
 
+    def test_embedding_verdict_uses_the_public_rounded_score(self):
+        with mock.patch.object(sb, "embedding_similarity", return_value=(0.79996, "")):
+            result = self.result_with_embedder(
+                {"type": "similarity", "mode": "embedding", "expected": "target", "threshold": 0.8},
+                "candidate",
+                "stub",
+            )
+        self.assertEqual(result["score"], 0.8)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["evidence"], "embedding similarity=0.8000 vs threshold=0.8")
+
+    def test_embedding_vectors_reject_non_finite_and_boolean_values(self):
+        invalid_values = [True, float("nan"), float("inf"), float("-inf")]
+        for invalid in invalid_values:
+            proc = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"embeddings": [[invalid, 0], [1, 0]]}),
+                stderr="",
+            )
+            with self.subTest(invalid=invalid), mock.patch.object(sb.subprocess, "run", return_value=proc):
+                ratio, error = sb.embedding_similarity("candidate", "expected", "stub")
+            self.assertIsNone(ratio)
+            self.assertIn("finite numeric vectors", error)
+
+    def test_embedding_cosine_is_closed_over_the_unit_score_domain(self):
+        proc = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"embeddings": [[1, 0], [-1, 0]]}),
+            stderr="",
+        )
+        with mock.patch.object(sb.subprocess, "run", return_value=proc):
+            ratio, error = sb.embedding_similarity("candidate", "expected", "stub")
+        self.assertEqual(ratio, 0.0)
+        self.assertEqual(error, "")
+
     def result_with_embedder(self, assertion: dict, output: str, command: str) -> dict:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "output.md"
@@ -239,6 +307,13 @@ class TypedTextAssertionTests(unittest.TestCase):
         self.assertEqual(result["score"], 0.8)
         self.assertTrue(result["passed"])
         self.assertIn("similarity=0.8000 vs threshold=0.8", result["evidence"])
+
+    def test_unchanged_ratio_computes_one_sequence_match(self):
+        assertion = SimilarityTextAssertion("same", 0.8, "ratio", True, ComparisonProfile.RENDERED_V1)
+        with mock.patch.object(tc.difflib, "SequenceMatcher", wraps=tc.difflib.SequenceMatcher) as matcher:
+            observation = assertion.ratio_observation("same")
+        self.assertEqual(observation.ratio, observation.raw_ratio)
+        self.assertEqual(matcher.call_count, 1)
 
     def test_contains_uses_unicode_casefold(self):
         result = self.result({"type": "contains", "value": "STRASSE"}, "Stra\u00dfe")
@@ -373,6 +448,20 @@ class HumanTextAuditTests(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertTrue(findings[0]["normalization"]["verdict_changed"])
 
+    def test_prompt_leakage_minimum_length_uses_the_rendered_operand(self):
+        manifest = {
+            "cases": [{
+                "id": "c",
+                "split": "tune",
+                "prompt": "a",
+                "assertions": [{"type": "contains", "value": "a\u200b\u200b\u200b"}],
+            }]
+        }
+        self.assertEqual(
+            sb.prompt_assertion_leakage_findings(manifest, Path("manifest.json"), min_chars=4),
+            [],
+        )
+
     def test_contamination_canary_and_ngrams_use_rendered_view(self):
         case = {
             "id": "c",
@@ -384,6 +473,17 @@ class HumanTextAuditTests(unittest.TestCase):
         self.assertEqual(report["comparison"], "rendered-v1")
         self.assertEqual(report["overlap"], 1.0)
         self.assertEqual({item["kind"] for item in report["findings"]}, {"canary-hit", "output-answer-overlap"})
+
+    def test_rendered_empty_canary_is_rejected_before_contamination(self):
+        for canary in ("\u200b", " \u200b "):
+            manifest = demo_manifest()
+            manifest["cases"][0]["canary"] = canary
+            with self.subTest(canary=repr(canary)), tempfile.TemporaryDirectory() as td:
+                path = write_demo_manifest(Path(td), manifest)
+                with self.assertRaises(SystemExit):
+                    sb.validate_manifest(path)
+        report = sb.contamination_check({"id": "c", "canary": "\u200b"}, "output")
+        self.assertFalse(any(item["kind"] == "canary-hit" for item in report["findings"]))
 
     def test_held_out_rubric_leak_records_zero_width_normalization(self):
         manifest = demo_manifest(cases=[{
@@ -405,6 +505,21 @@ class HumanTextAuditTests(unittest.TestCase):
         leak = finding["evidence"][0]
         self.assertEqual(leak["where"], "skill")
         self.assertTrue(leak["normalization"]["verdict_changed"])
+
+    def test_held_out_rubric_minimum_length_uses_the_rendered_operand(self):
+        for rubric in ("\u200b" * 12, "a" + "\u200b" * 11):
+            manifest = demo_manifest(cases=[{
+                "id": "held",
+                "split": "holdout",
+                "kind": "behavior",
+                "prompt": "Do an unrelated task.",
+                "assertions": [{"type": "contains", "value": "alpha"}],
+                "review_rubric": [rubric],
+            }])
+            with self.subTest(rubric=repr(rubric)), tempfile.TemporaryDirectory() as td:
+                path = write_demo_manifest(Path(td), manifest)
+                report = sb.audit_manifest_report(path)
+            self.assertFalse(any(item["kind"] == "held-out-rubric-leak" for item in report["findings"]))
 
 
 if __name__ == "__main__":

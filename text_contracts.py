@@ -13,7 +13,7 @@ import re
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, TypeAlias
 
@@ -35,27 +35,29 @@ class RegexKind(str, Enum):
     NOT_REGEX = "not_regex"
 
 
-# A deliberately narrow and versioned set.  These characters affect wrapping or
-# bidirectional rendering but do not carry lexical content.  Do not replace this
+# A deliberately narrow and versioned set.  These characters affect wrapping
+# but not visible glyph order.  Directional controls and SOFT HYPHEN remain
+# exact because removing them can change what a human sees.  Do not replace this
 # with category(c) == "Cf": joiners, invisible mathematical operators, emoji tag
 # characters, and other format characters can be semantically meaningful.
 RENDERED_V1_REMOVED_CODEPOINTS = frozenset({
-    0x00AD,  # SOFT HYPHEN
-    0x061C,  # ARABIC LETTER MARK
     0x200B,  # ZERO WIDTH SPACE (issue #55)
-    0x200E,  # LEFT-TO-RIGHT MARK
-    0x200F,  # RIGHT-TO-LEFT MARK
-    *range(0x202A, 0x202F),  # bidi embedding/override controls
     0x2060,  # WORD JOINER
-    *range(0x2066, 0x206A),  # bidi isolate controls
-    *range(0x206A, 0x2070),  # deprecated bidi formatting controls
     0xFEFF,  # ZERO WIDTH NO-BREAK SPACE / interior BOM
 })
 
+_RENDERED_V1_TRANSLATION = str.maketrans({codepoint: None for codepoint in RENDERED_V1_REMOVED_CODEPOINTS})
+
 
 def _rendered_v1(text: str) -> tuple[str, tuple[RemovedCodePoint, ...], bool]:
-    counts = Counter(ord(char) for char in text if ord(char) in RENDERED_V1_REMOVED_CODEPOINTS)
-    without_ignorables = "".join(char for char in text if ord(char) not in RENDERED_V1_REMOVED_CODEPOINTS)
+    # str.translate keeps the unchanged fast path in C.  Count removed values
+    # only when the translation actually changed the text.
+    without_ignorables = text.translate(_RENDERED_V1_TRANSLATION)
+    counts = (
+        Counter(ord(char) for char in text if ord(char) in RENDERED_V1_REMOVED_CODEPOINTS)
+        if without_ignorables != text
+        else Counter()
+    )
     normalized = unicodedata.normalize("NFC", without_ignorables)
     removed = tuple(RemovedCodePoint(codepoint, count) for codepoint, count in sorted(counts.items()))
     return normalized, removed, normalized != without_ignorables
@@ -81,35 +83,28 @@ class RemovedCodePoint:
         return {"codepoint": f"U+{self.codepoint:04X}", "name": unicodedata.name(chr(self.codepoint), "UNNAMED"), "count": self.count}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ComparisonText:
     raw: str
     value: str
     profile: ComparisonProfile
-    removed: tuple[RemovedCodePoint, ...] = ()
-    canonical_normalized: bool = False
+    removed: tuple[RemovedCodePoint, ...]
+    canonical_normalized: bool
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.raw, str) or not isinstance(self.value, str):
-            raise TypeError("comparison text must be constructed from strings")
-        if not isinstance(self.profile, ComparisonProfile):
+    def __init__(self, raw: str, profile: ComparisonProfile) -> None:
+        if not isinstance(raw, str):
+            raise TypeError("comparison text must be constructed from a string")
+        if not isinstance(profile, ComparisonProfile):
             raise TypeError("comparison profile must be ComparisonProfile")
-        if not isinstance(self.removed, tuple) or not all(isinstance(item, RemovedCodePoint) for item in self.removed):
-            raise TypeError("removed code points must be a tuple of RemovedCodePoint values")
-        if not isinstance(self.canonical_normalized, bool):
-            raise TypeError("canonical_normalized must be boolean")
-        if self.profile is ComparisonProfile.EXACT and (
-            self.raw != self.value or self.removed or self.canonical_normalized
-        ):
-            raise ValueError("exact comparison text cannot contain transformations")
-        if self.profile is ComparisonProfile.RENDERED_V1:
-            expected_value, expected_removed, expected_canonical = _rendered_v1(self.raw)
-            if (self.value, self.removed, self.canonical_normalized) != (
-                expected_value,
-                expected_removed,
-                expected_canonical,
-            ):
-                raise ValueError("rendered-v1 comparison fields do not match the raw text")
+        if profile is ComparisonProfile.EXACT:
+            value, removed, canonical_normalized = raw, (), False
+        else:
+            value, removed, canonical_normalized = _rendered_v1(raw)
+        object.__setattr__(self, "raw", raw)
+        object.__setattr__(self, "value", value)
+        object.__setattr__(self, "profile", profile)
+        object.__setattr__(self, "removed", removed)
+        object.__setattr__(self, "canonical_normalized", canonical_normalized)
 
     @classmethod
     def from_text(cls, text: str, profile: ComparisonProfile | str) -> ComparisonText:
@@ -119,16 +114,7 @@ class ComparisonText:
             selected = ComparisonProfile(profile)
         except ValueError as exc:
             raise ValueError(f"unknown comparison profile {profile!r}; expected exact or rendered-v1") from exc
-        if selected is ComparisonProfile.EXACT:
-            return cls(text, text, selected)
-        normalized, removed, canonical_normalized = _rendered_v1(text)
-        return cls(
-            raw=text,
-            value=normalized,
-            profile=selected,
-            removed=removed,
-            canonical_normalized=canonical_normalized,
-        )
+        return cls(text, selected)
 
     @property
     def changed(self) -> bool:
@@ -239,6 +225,7 @@ class LiteralTextAssertion:
     values: tuple[str, ...]
     case_insensitive: bool
     profile: ComparisonProfile
+    comparison_values: tuple[ComparisonText, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, LiteralKind):
@@ -251,11 +238,13 @@ class LiteralTextAssertion:
             raise TypeError("literal assertion case_insensitive must be boolean")
         if not isinstance(self.profile, ComparisonProfile):
             raise TypeError("literal assertion profile must be ComparisonProfile")
-        if any(not ComparisonText.from_text(item, self.profile).value for item in self.values):
+        comparison_values = tuple(ComparisonText.from_text(item, self.profile) for item in self.values)
+        if any(not item.value for item in comparison_values):
             raise ValueError(
                 f"literal assertion values must not become empty under {self.profile.value}; "
                 "use comparison='exact' to test formatting controls"
             )
+        object.__setattr__(self, "comparison_values", comparison_values)
 
     @classmethod
     def from_wire(cls, wire: Mapping[str, Any]) -> LiteralTextAssertion:
@@ -280,7 +269,7 @@ class LiteralTextAssertion:
 
     def evaluate(self, text: str) -> MatchObservation:
         candidate = ComparisonText.from_text(text, self.profile)
-        operands = tuple(ComparisonText.from_text(value, self.profile) for value in self.values)
+        operands = self.comparison_values
 
         def relation(haystack: str, needles: tuple[str, ...]) -> tuple[bool, str | None, list[str]]:
             hits = [original for original, needle in zip(self.values, needles) if needle in haystack]
@@ -296,9 +285,12 @@ class LiteralTextAssertion:
 
         normalized_needles = tuple(item.folded(self.case_insensitive) for item in operands)
         matched, hit, missing = relation(candidate.folded(self.case_insensitive), normalized_needles)
-        raw_needles = tuple(value.casefold() if self.case_insensitive else value for value in self.values)
-        raw_haystack = text.casefold() if self.case_insensitive else text
-        raw_matched, _, _ = relation(raw_haystack, raw_needles)
+        if candidate.changed or any(item.changed for item in operands):
+            raw_needles = tuple(value.casefold() if self.case_insensitive else value for value in self.values)
+            raw_haystack = text.casefold() if self.case_insensitive else text
+            raw_matched, _, _ = relation(raw_haystack, raw_needles)
+        else:
+            raw_matched = matched
         negated = self.kind is LiteralKind.EXCLUDES_ANY
         passed = not matched if negated else matched
         if self.kind is LiteralKind.CONTAINS:
@@ -318,9 +310,9 @@ class RegexTextAssertion:
     pattern: str
     case_insensitive: bool
     profile: ComparisonProfile
-    raw_regex: re.Pattern[str]
-    comparison_regex: re.Pattern[str]
-    pattern_text: ComparisonText
+    raw_regex: re.Pattern[str] = field(init=False, repr=False, compare=False)
+    comparison_regex: re.Pattern[str] = field(init=False, repr=False, compare=False)
+    pattern_text: ComparisonText = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, RegexKind):
@@ -331,29 +323,21 @@ class RegexTextAssertion:
             raise TypeError("regex assertion case_insensitive must be boolean")
         if not isinstance(self.profile, ComparisonProfile):
             raise TypeError("regex assertion profile must be ComparisonProfile")
-        if not isinstance(self.raw_regex, re.Pattern) or not isinstance(self.comparison_regex, re.Pattern):
-            raise TypeError("regex assertion must carry compiled regular expressions")
-        expected_pattern = ComparisonText.from_text(self.pattern, self.profile)
-        if expected_pattern.changed:
+        pattern_text = ComparisonText.from_text(self.pattern, self.profile)
+        if pattern_text.changed:
             raise ValueError(
                 "regex pattern must already be stable under rendered-v1; "
                 "remove formatting controls/use NFC, or set comparison='exact'"
             )
         flags = re.IGNORECASE if self.case_insensitive else 0
         try:
-            expected_raw = re.compile(self.pattern, flags)
-            expected_comparison = re.compile(expected_pattern.value, flags)
+            raw_regex = re.compile(self.pattern, flags)
+            comparison_regex = re.compile(pattern_text.value, flags)
         except re.error as exc:
             raise ValueError(f"invalid regex {self.pattern!r}: {exc}") from exc
-        if self.pattern_text != expected_pattern:
-            raise ValueError("regex pattern comparison text does not match its policy")
-        if (self.raw_regex.pattern, self.raw_regex.flags) != (expected_raw.pattern, expected_raw.flags):
-            raise ValueError("raw compiled regex does not match the assertion")
-        if (self.comparison_regex.pattern, self.comparison_regex.flags) != (
-            expected_comparison.pattern,
-            expected_comparison.flags,
-        ):
-            raise ValueError("comparison regex does not match the assertion")
+        object.__setattr__(self, "pattern_text", pattern_text)
+        object.__setattr__(self, "raw_regex", raw_regex)
+        object.__setattr__(self, "comparison_regex", comparison_regex)
 
     @classmethod
     def from_wire(cls, wire: Mapping[str, Any]) -> RegexTextAssertion:
@@ -366,24 +350,12 @@ class RegexTextAssertion:
         pattern = _non_empty_string(wire.get("pattern", wire.get("value")), f"{kind.value} pattern")
         ci = _case_insensitive(wire)
         profile = _profile(wire)
-        flags = re.IGNORECASE if ci else 0
-        pattern_text = ComparisonText.from_text(pattern, profile)
-        if pattern_text.changed:
-            raise ValueError(
-                "regex pattern must already be stable under rendered-v1; "
-                "remove formatting controls/use NFC, or set comparison='exact'"
-            )
-        try:
-            raw_regex = re.compile(pattern, flags)
-            comparison_regex = re.compile(pattern_text.value, flags)
-        except re.error as exc:
-            raise ValueError(f"invalid regex {pattern!r}: {exc}") from exc
-        return cls(kind, pattern, ci, profile, raw_regex, comparison_regex, pattern_text)
+        return cls(kind, pattern, ci, profile)
 
     def evaluate(self, text: str) -> MatchObservation:
         candidate = ComparisonText.from_text(text, self.profile)
-        raw_hit = self.raw_regex.search(text) is not None
         hit = self.comparison_regex.search(candidate.value) is not None
+        raw_hit = self.raw_regex.search(text) is not None if candidate.changed else hit
         negated = self.kind is RegexKind.NOT_REGEX
         passed = not hit if negated else hit
         if not negated:
@@ -391,6 +363,28 @@ class RegexTextAssertion:
         else:
             evidence = f"absent /{self.pattern}/" if passed else f"found banned /{self.pattern}/"
         return MatchObservation(hit, raw_hit, negated, evidence, candidate, (self.pattern_text,))
+
+
+@dataclass(frozen=True)
+class SimilarityDecision:
+    ratio: float
+    threshold: float
+
+    def __post_init__(self) -> None:
+        if isinstance(self.ratio, bool) or not isinstance(self.ratio, (int, float)) or not math.isfinite(float(self.ratio)) or not 0 <= float(self.ratio) <= 1:
+            raise ValueError("similarity ratio must be a finite number in [0, 1]")
+        if isinstance(self.threshold, bool) or not isinstance(self.threshold, (int, float)) or not math.isfinite(float(self.threshold)) or not 0 <= float(self.threshold) <= 1:
+            raise ValueError("similarity threshold must be a finite number in [0, 1]")
+
+    @property
+    def score(self) -> float:
+        return round(float(self.ratio), 4)
+
+    @property
+    def passed(self) -> bool:
+        # The public score is serialized to four decimals; verdicts use that
+        # same value so a result cannot say score=threshold while failing.
+        return self.score >= self.threshold
 
 
 @dataclass(frozen=True)
@@ -402,11 +396,8 @@ class SimilarityObservation:
     expected: ComparisonText
 
     def __post_init__(self) -> None:
-        for label, value in (("ratio", self.ratio), ("raw_ratio", self.raw_ratio)):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0 <= float(value) <= 1:
-                raise ValueError(f"similarity {label} must be a finite number in [0, 1]")
-        if isinstance(self.threshold, bool) or not isinstance(self.threshold, (int, float)) or not math.isfinite(float(self.threshold)) or not 0 <= float(self.threshold) <= 1:
-            raise ValueError("similarity threshold must be a finite number in [0, 1]")
+        SimilarityDecision(self.ratio, self.threshold)
+        SimilarityDecision(self.raw_ratio, self.threshold)
         if not isinstance(self.actual, ComparisonText) or not isinstance(self.expected, ComparisonText):
             raise TypeError("similarity operands must be ComparisonText values")
         if self.actual.profile is not self.expected.profile:
@@ -414,13 +405,11 @@ class SimilarityObservation:
 
     @property
     def passed(self) -> bool:
-        # The public score is serialized to four decimals; verdicts use that
-        # same value so a result cannot say score=threshold while failing.
-        return round(self.ratio, 4) >= self.threshold
+        return SimilarityDecision(self.ratio, self.threshold).passed
 
     @property
     def raw_passed(self) -> bool:
-        return round(self.raw_ratio, 4) >= self.threshold
+        return SimilarityDecision(self.raw_ratio, self.threshold).passed
 
     @property
     def changed(self) -> bool:
@@ -439,6 +428,7 @@ class SimilarityTextAssertion:
     case_insensitive: bool
     profile: ComparisonProfile
     artifact: str | None = None
+    expected_view: ComparisonText = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.expected, str) or not self.expected:
@@ -451,13 +441,15 @@ class SimilarityTextAssertion:
             raise TypeError("similarity case_insensitive must be boolean")
         if not isinstance(self.profile, ComparisonProfile):
             raise TypeError("similarity profile must be ComparisonProfile")
-        if not ComparisonText.from_text(self.expected, self.profile).value:
+        expected_view = ComparisonText.from_text(self.expected, self.profile)
+        if not expected_view.value:
             raise ValueError(
                 f"similarity expected must not become empty under {self.profile.value}; "
                 "use comparison='exact' to test formatting controls"
             )
         if self.artifact is not None and (not isinstance(self.artifact, str) or not self.artifact):
             raise ValueError("similarity artifact must be a non-empty string")
+        object.__setattr__(self, "expected_view", expected_view)
 
     @classmethod
     def from_wire(cls, wire: Mapping[str, Any]) -> SimilarityTextAssertion:
@@ -476,16 +468,19 @@ class SimilarityTextAssertion:
         return cls(expected, float(threshold), str(mode), _case_insensitive(wire), _profile(wire), artifact)
 
     def operands(self, actual: str) -> tuple[ComparisonText, ComparisonText]:
-        return ComparisonText.from_text(actual, self.profile), ComparisonText.from_text(self.expected, self.profile)
+        return ComparisonText.from_text(actual, self.profile), self.expected_view
 
     def ratio_observation(self, actual: str) -> SimilarityObservation:
         got, want = self.operands(actual)
         a = got.folded(self.case_insensitive)
         b = want.folded(self.case_insensitive)
-        raw_a = actual.casefold() if self.case_insensitive else actual
-        raw_b = self.expected.casefold() if self.case_insensitive else self.expected
         ratio = difflib.SequenceMatcher(None, a, b).ratio()
-        raw_ratio = difflib.SequenceMatcher(None, raw_a, raw_b).ratio()
+        if got.changed or want.changed:
+            raw_a = actual.casefold() if self.case_insensitive else actual
+            raw_b = self.expected.casefold() if self.case_insensitive else self.expected
+            raw_ratio = difflib.SequenceMatcher(None, raw_a, raw_b).ratio()
+        else:
+            raw_ratio = ratio
         return SimilarityObservation(ratio, raw_ratio, self.threshold, got, want)
 
 

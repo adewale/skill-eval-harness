@@ -564,6 +564,16 @@ class GradedScriptOracleTests(unittest.TestCase):
         self.assertIsNone(sb.parse_script_score_line("not json"))
         self.assertEqual(sb.parse_script_score_line('{"score": 0.5}'), 0.5)
         self.assertEqual(sb.parse_script_score_line('{"score": 9, "max_score": 3}'), 1.0)  # clamped
+        for malformed in (
+            '{"score": true}',
+            '{"score": NaN}',
+            '{"score": Infinity}',
+            '{"score": 1, "max_score": true}',
+            '{"score": 1, "max_score": NaN}',
+            '{"score": 1, "max_score": 0}',
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(sb.parse_script_score_line(malformed))
 
 
 class OracleTierTests(unittest.TestCase):

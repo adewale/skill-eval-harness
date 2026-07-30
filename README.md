@@ -307,14 +307,21 @@ Human-readable answer assertions (`contains`, `contains_any`, `contains_all`,
 `excludes_any`, `regex`, `not_regex`, and `similarity`) compare through the
 versioned `rendered-v1` view by default. The raw `output.md` is never rewritten:
 the comparison view applies NFC canonical normalization and removes only a
-narrow allow-list of non-lexical rendering controls such as `U+200B ZERO WIDTH
-SPACE`; case-insensitive literal and ratio comparisons use Unicode case-folding.
+narrow allow-list of zero-width, non-ordering controls: `U+200B ZERO WIDTH
+SPACE`, `U+2060 WORD JOINER`, and `U+FEFF ZERO WIDTH NO-BREAK SPACE`. Controls
+that can change visible glyph order (including bidi overrides/isolates) and
+`U+00AD SOFT HYPHEN` remain exact. Case-insensitive literal and ratio comparisons
+use Unicode case-folding.
 Results record `comparison: "rendered-v1"`; when normalization changes the input
 they also record the affected code points and, for deterministic matchers,
 whether it changed the verdict. Embedding similarity records that field as
 `null` because determining the raw verdict would require a second external
-embedding call. Use `"comparison": "exact"` when an assertion deliberately
-tests those characters. A rendered operand may not become empty, and regex
+embedding call. Similarity scores are rounded to four decimals before either
+`threshold` or `atLeast` derives the verdict, so a published score cannot
+contradict `passed`. Embedding vectors must contain finite, non-boolean numbers;
+negative cosine values map to the 0.0 floor of the public 0-1 score domain. Use
+`"comparison": "exact"` when an assertion deliberately tests formatting
+characters (and `"ci": false` when case must also remain exact). A rendered operand may not become empty, and regex
 source must already be NFC/control-stable so normalization cannot create an
 empty regex branch. Negative assertions use the same view, so invisible
 characters cannot hide banned content. `golden_output`, structured JSON,
