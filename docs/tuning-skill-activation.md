@@ -141,11 +141,12 @@ evidence in its event stream. Claude Code, Codex, Vibe, Pi, and the offline stub
 adapters. `docs/agent-parity.md` is the capability table for which surfaces each
 agent currently supports.
 
-Adding another agent is one subclass plus one capability registry row:
+Adding another agent is one implementation plus one unified registry row. The
+trigger class remains beside the trigger runner; its registration, capability
+gates, command option, smoke policy, and other supported surfaces belong in
+`agent_capabilities.BACKENDS`:
 
 ```python
-from agent_capabilities import AGENT_CAPABILITIES, AgentCapabilities
-
 class MyAgentAdapter(AgentAdapter):
     name = "my-agent"
 
@@ -156,17 +157,18 @@ class MyAgentAdapter(AgentAdapter):
         argv = ["my-agent", "run", "--json", query] + (["--model", model] if model else [])
         return self._run_argv(argv, cwd=workspace, env=os.environ.copy(), timeout=timeout)
 
-ADAPTERS["my-agent"] = MyAgentAdapter
-AGENT_CAPABILITIES["my-agent"] = AgentCapabilities(
-    answer_runner=False,
-    autonomous_trigger=True,
-    trigger_ablation=True,
-    trace_artifacts=True,
-    token_usage=True,
-    dollar_cost="trace_normalized",
-    judge_backend=False,
-    tool_replay=False,
-    live_smoke_env=None,
+# Add as another argument to backend_registry(...), which builds BACKENDS:
+BackendRegistration(
+    name="my-agent",
+    capabilities=AgentCapabilities(
+        answer_runner=False, autonomous_trigger=True,
+        trigger_ablation=True, trace_artifacts=True,
+        token_usage=True, dollar_cost="trace_normalized",
+        judge_backend=False, tool_replay=False, live_smoke_env=None,
+    ),
+    trace_dialect="my-agent",
+    answer_route="none",
+    trigger=SurfaceBinding(ObjectRef("run_trigger_matrix", "MyAgentAdapter")),
 )
 ```
 
@@ -175,7 +177,7 @@ skill paths; override it only when an agent reports skill loads some other way, 
 Claude Code does. Once registered, `--agent my-agent` joins the same matrix, and the
 report's cells stay comparable because every adapter mounts the identical canonical
 or materialized skill tree and the same detector rules decide "triggered." The
-matrix validates the capability row before starting runs so a new adapter cannot
+matrix validates the unified row before starting runs so a new adapter cannot
 finish live calls and then fail during report assembly.
 
 For Pi specifically, `skill-pi-trigger-eval` remains a compatibility entry point for

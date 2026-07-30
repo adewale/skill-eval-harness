@@ -141,7 +141,7 @@ The installed commands are:
 |---|---|
 | `skill-benchmark` | Validate manifests, prepare tasks, grade outputs, compare variants, run judges, and import/export runner formats. |
 | `skill-pi-trigger-eval` | Runs Pi without forced `--skill` and checks whether the model loads the skill from stream events. |
-| `skill-trigger-matrix` | Measures autonomous skill activation per (agent, model) cell — Claude, Codex, Pi, Vibe, and an offline stub are built in; additional agents register via an adapter subclass plus capability row. |
+| `skill-trigger-matrix` | Measures autonomous skill activation per (agent, model) cell — Claude, Codex, Pi, Vibe, and an offline stub are built in; additional agents add an adapter implementation and one unified backend-registry row. |
 
 ### Local development
 
@@ -471,6 +471,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 
 | Command | What it does |
 |---|---|
+| `skill-benchmark agent-capabilities` | List the unified backend registry, capability gates, trace dialect, smoke policy, and answer/trigger/judge surfaces as JSON. |
 | `skill-benchmark validate` | Check manifest shape, fixture paths, regex, oracle paths, and prompt-leakage. |
 | `skill-benchmark prepare` | Emit answer-key-safe task rows per case/variant/run (`--include-ablations` materializes ablated trees). |
 | `skill-benchmark materialize-ablations` | Write the declared ablated skill trees to disk without preparing tasks — inspect or diff an ablation before spending a run on it. |
@@ -578,7 +579,7 @@ skill-eval-harness/
 ├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
 ├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance/task value objects
-├── agent_capabilities.py       # backend capability and smoke-target registry
+├── agent_capabilities.py       # unified backend surfaces, capabilities, CLI options, smoke, and failure policy
 ├── experimental_pairs.py       # exact pair identities and blocked-pair construction
 ├── runner_contracts.py         # closed answer-runner outcome union
 ├── judge_verdict.py            # strict imported/stored judge verdict variants

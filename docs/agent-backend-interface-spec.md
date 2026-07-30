@@ -13,7 +13,11 @@ The harness already treats saved run directories as the stable grading contract,
 - `judge` has native Claude and Codex backends plus an untyped shell `--judge-cmd` escape hatch for every other provider.
 - Tool replay exists through `run-subagent`, not through every native CLI runner.
 
-That is enough to ship features, but it makes parity hard to reason about. A new agent should not require inventing seven separate integration stories.
+Those implementation families remain intentionally separate, but their registration is now unified. `agent_capabilities.BACKENDS` is the declarative owner of answer route and executable answer entrypoints, native answer/trigger/judge bindings, workspace-builder, trace-dialect name, capability, smoke, failure-marker, and provider CLI-option bindings. `AGENT_BACKENDS`, `JUDGE_BACKENDS`, `run_trigger_matrix.ADAPTERS`, `WORKSPACE_BUILDERS`, `AGENT_CAPABILITIES`, and `SMOKE_TARGETS` are derived compatibility views. Existing entries in the mutable implementation dispatch maps can still be replaced temporarily by tests and integrations; policy projections are immutable. Adding a backend requires one complete registry row rather than adding unrelated keys piecemeal.
+
+`skill-benchmark agent-capabilities` lists every row, explicit answer route (`native`, `export_import`, `subagent`, or `none`), executable command entrypoints, broader capability, and native command binding without invoking a provider. The distinction is intentional: Jetty answers through export/import and `subagent` through its dedicated runner, so neither has a native `run-agent` binding. Lazy object references keep the registry acyclic even while the answer/judge implementations remain in `skill_benchmark.py` and trigger implementations remain in `run_trigger_matrix.py`; registry serialization does not dereference handlers, while normal CLI import still materializes compatibility implementation views. Direct-script entrypoints alias their `__main__` module to the canonical import name before resolving those references, preventing a second module instance with divergent classes and mutable views.
+
+Each row's lower-case stable backend name is also its trace source/dialect identity. Runtime artifacts dispatch trace normalization from that source, so aliases are rejected instead of advertising a dialect the runtime would never select. Registry construction rejects incomplete capability/binding combinations and conflicting CLI flags before a command can make a provider call. Command names must agree with their handler names; native routes bind `run-agent`, subagent routes bind only `run-subagent`, and export/import routes declare exactly one typed export, run, and import phase. Materializing answer or trigger implementations also verifies their declared `name` matches the row.
 
 ## Goals
 
@@ -310,8 +314,8 @@ Extend `AgentCapabilities` beyond the current booleans:
 
 - `run-agent --agent claude|codex|gemini|vibe|...` should replace provider-specific answer runners long-term, while keeping `run-claude`/`run-codex` as compatibility aliases.
 - `judge --judge-backend claude|codex|gemini|vibe|cmd` should replace the overloaded `--judge-model` / `--judge-cmd` split long-term.
-- `skill-trigger-matrix` should consume the same registry and `TriggerBackend` implementations.
-- `agent-capabilities` should become an introspection command and doc generator.
+- `skill-trigger-matrix` consumes the same registry and its `TriggerBackend` implementations through the derived `ADAPTERS` compatibility view.
+- `agent-capabilities` is the JSON introspection command; the parity document remains the reviewed reader-facing rendering.
 
 ## Conformance tests for any adapter
 
@@ -326,7 +330,10 @@ Every new backend must pass offline or stubbed tests for:
 7. Workspace isolation: no source repo, eval oracle, or unrelated global skills visible.
 8. Trigger mounting and activation detection, if `autonomous_trigger` is claimed.
 9. Materialized ablation provenance: same canonical tree hash as matching full-skill arm.
-10. Capability registry/docs drift: `agent_capabilities.py`, `docs/agent-parity.md`, and tests must agree.
+10. Unified registry/docs drift: `agent_capabilities.py`, `docs/agent-parity.md`, and tests must agree.
+11. Direct `python skill_benchmark.py` and `python run_trigger_matrix.py` entrypoints resolve the same implementation objects as installed console scripts.
+12. Registered answer/trigger implementations identify with the row's stable name, and provider CLI flags do not collide.
+13. Every non-`none` answer route declares executable, route-specific command phases whose handler names agree with the CLI parser and registry dispatch.
 
 Live smoke tests remain opt-in by env var, one per adapter:
 
@@ -338,10 +345,10 @@ Live smoke tests remain opt-in by env var, one per adapter:
 
 ## Phased implementation plan
 
-1. **Refactor without behavior change**
+1. **Refactor without behavior change** — implemented.
    - Extract Claude and Codex answer invocation into `AgentBackend` implementations.
    - Keep old commands as wrappers.
-   - Move trigger adapters into the same registry.
+   - Register answer, trigger, and judge implementations in `agent_capabilities.BACKENDS`; keep implementation code separate and project the old dictionaries for compatibility.
 2. **Codex native judge** — done for the current CLI surface.
    - Uses `--output-last-message` and `--output-schema`.
    - Parses optional JSONL telemetry when present.

@@ -14,13 +14,18 @@ source of truth and make the sync executable —
     packaging metadata, and registries and require their owning docs to mention
     every member exactly where promised.
 """
+import argparse
+import contextlib
 import inspect
+import io
 import json
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from helpers import make_eval_repo
 
@@ -67,7 +72,9 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         codex_action = next(a for a in parser._actions if "--codex-cmd" in getattr(a, "option_strings", ()))
         self.assertEqual(codex_action.default, tm.DEFAULT_CODEX_CMD)
         self.assertEqual(tm.CodexAdapter().codex_cmd, tm.DEFAULT_CODEX_CMD)
-        self.assertEqual((ROOT / "run_trigger_matrix.py").read_text(encoding="utf-8").count(tm.DEFAULT_CODEX_CMD), 1)
+        self.assertIs(tm.DEFAULT_CODEX_CMD, ac.CODEX_TRIGGER_DEFAULT_CMD)
+        self.assertNotIn(tm.DEFAULT_CODEX_CMD,
+                         (ROOT / "run_trigger_matrix.py").read_text(encoding="utf-8"))
 
     def test_manifest_loading_goes_through_the_harness_source_loader(self):
         # tr.load_manifest is a thin named wrapper; what matters is that a YAML
@@ -167,31 +174,502 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertEqual(fields, {"prompt", "workspace", "model", "timeout_s"})
 
     def test_agent_capability_registry_matches_registered_surfaces(self):
-        for name in tm.ADAPTERS:
-            self.assertIn(name, ac.AGENT_CAPABILITIES)
-            self.assertTrue(ac.AGENT_CAPABILITIES[name].autonomous_trigger, name)
-        autonomous = {name for name, cap in ac.AGENT_CAPABILITIES.items() if cap.autonomous_trigger}
-        self.assertEqual(autonomous, set(tm.ADAPTERS))
+        self.assertEqual(
+            ac.AGENT_CAPABILITIES,
+            {name: registration.capabilities for name, registration in ac.BACKENDS.items()},
+        )
+        self.assertEqual(set(tm.ADAPTERS), set(ac.surface_names("trigger")))
+        self.assertEqual(set(sb.AGENT_BACKENDS), set(ac.surface_names("answer")))
+        self.assertEqual(set(sb.JUDGE_BACKENDS), set(ac.surface_names("judge")))
+        self.assertEqual(
+            set(sb.WORKSPACE_BUILDERS),
+            {name for name, registration in ac.BACKENDS.items()
+             if registration.workspace_builder is not None},
+        )
+        autonomous = {name for name, cap in ac.AGENT_CAPABILITIES.items()
+                      if cap.autonomous_trigger}
+        self.assertEqual(autonomous, set(ac.surface_names("trigger")))
         for name, cap in ac.AGENT_CAPABILITIES.items():
             if cap.trigger_ablation:
                 self.assertTrue(cap.autonomous_trigger, name)
-        for name in sb.AGENT_BACKENDS:
-            self.assertTrue(ac.AGENT_CAPABILITIES[name].answer_runner, name)
         parser = sb.build_arg_parser()
         subs = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
         judge_parser = subs.choices["judge"]
         judge_backend_action = next(a for a in judge_parser._actions if "--judge-backend" in getattr(a, "option_strings", ()))
         native_judges = set(judge_backend_action.choices) - {"cmd"}
         self.assertEqual(native_judges, set(sb.JUDGE_BACKENDS))
-        self.assertEqual(native_judges, {name for name, cap in ac.AGENT_CAPABILITIES.items() if cap.judge_backend})
+        self.assertEqual(native_judges, set(ac.surface_names("judge")))
+        self.assertLessEqual(
+            {registration.trace_dialect for registration in ac.BACKENDS.values()},
+            set(sb.TRACE_DIALECTS),
+        )
+        for name in ac.surface_names("answer"):
+            self.assertIsInstance(
+                sb.AGENT_BACKENDS[name],
+                ac.binding_for(name, "answer").implementation.resolve(),
+            )
+        for name in ac.surface_names("trigger"):
+            self.assertIs(
+                tm.ADAPTERS[name],
+                ac.binding_for(name, "trigger").implementation.resolve(),
+            )
+        for name in ac.surface_names("judge"):
+            self.assertIs(
+                sb.JUDGE_BACKENDS[name],
+                ac.binding_for(name, "judge").implementation.resolve(),
+            )
+        answer_entrypoints = {
+            entrypoint.command: entrypoint.handler.resolve()
+            for registration in ac.BACKENDS.values()
+            for entrypoint in registration.answer_entrypoints
+        }
+        self.assertEqual(
+            ac.answer_entrypoint_implementations(), answer_entrypoints)
+        self.assertLessEqual(set(answer_entrypoints), set(subs.choices))
 
-    def test_every_capability_row_appears_in_the_parity_doc(self):
-        # The parity doc renders the capability registry for humans; a backend
-        # registered in code but absent from the doc is the drift the registry
-        # guard above cannot see.
-        parity = (ROOT / "docs" / "agent-parity.md").read_text(encoding="utf-8").lower()
-        for name in ac.AGENT_CAPABILITIES:
-            self.assertIn(name.lower(), parity, f"docs/agent-parity.md must cover the registered backend {name!r}")
+    def test_backend_cli_options_are_projected_into_each_command_parser(self):
+        parser = sb.build_arg_parser()
+        subs = next(a for a in parser._actions
+                    if a.__class__.__name__ == "_SubParsersAction")
+        parsers = {
+            "answer": subs.choices["run-agent"],
+            "judge": subs.choices["judge"],
+            "trigger": tm.build_arg_parser(),
+        }
+        for surface, surface_parser in parsers.items():
+            actions = {flag: action for action in surface_parser._actions
+                       for flag in getattr(action, "option_strings", ())}
+            for option in ac.surface_cli_options(surface):
+                for flag in option.flags:
+                    self.assertIn(flag, actions)
+                    self.assertEqual(actions[flag].dest, option.dest)
+                    self.assertEqual(actions[flag].default, option.default)
+
+    def test_main_dispatches_registered_answer_entrypoints(self):
+        handler = mock.Mock(return_value=23)
+        argv = [
+            "skill_benchmark.py", "run-agent", "--agent", "codex",
+            "--tasks", "tasks.jsonl", "--runs", "runs",
+        ]
+        with (
+            mock.patch.object(
+                sb, "answer_entrypoint_implementations",
+                return_value={"run-agent": handler},
+            ),
+            mock.patch.object(sys, "argv", argv),
+        ):
+            self.assertEqual(sb.main(), 23)
+        self.assertEqual(handler.call_args.args[0].cmd, "run-agent")
+
+    def test_registry_introspection_distinguishes_capability_from_native_binding(self):
+        payload = ac.registry_payload()
+        self.assertTrue(payload["jetty"]["capabilities"]["answer_runner"])
+        self.assertFalse(payload["jetty"]["native_bindings"]["answer"])
+        self.assertEqual(payload["jetty"]["answer_route"], "export_import")
+        self.assertEqual(
+            payload["jetty"]["answer_entrypoints"],
+            ["export-jetty", "run-jetty", "import-jetty-results"],
+        )
+        self.assertEqual(
+            ac.DEDICATED_SMOKE_TARGETS["jetty"].command,
+            ("python3", "-m", "unittest", "discover", "tests", "-k", "smoke_jetty", "-v"),
+        )
+        self.assertNotIn("jetty", ac.SMOKE_TARGETS)
+        self.assertEqual(
+            payload["jetty"]["smoke"]["command"],
+            ac.DEDICATED_SMOKE_TARGETS["jetty"].command,
+        )
+        self.assertTrue(payload["subagent"]["capabilities"]["answer_runner"])
+        self.assertFalse(payload["subagent"]["native_bindings"]["answer"])
+        self.assertEqual(payload["subagent"]["answer_route"], "subagent")
+        self.assertEqual(
+            payload["subagent"]["answer_entrypoints"], ["run-subagent"])
+        self.assertTrue(payload["codex"]["native_bindings"]["answer"])
+        self.assertEqual(payload["codex"]["answer_route"], "native")
+        self.assertIn("run-agent", payload["codex"]["answer_entrypoints"])
+        for row in payload.values():
+            self.assertNotIn("surfaces", row)
+
+    def test_unified_registry_rejects_partial_surface_rows(self):
+        triggerless = ac.AgentCapabilities(
+            answer_runner=False, autonomous_trigger=False,
+            trigger_ablation=False, trace_artifacts=True, token_usage=False,
+            dollar_cost="missing", judge_backend=False, tool_replay=False,
+            live_smoke_env=None,
+        )
+        with self.assertRaisesRegex(ValueError, "trigger binding disagrees"):
+            ac.BackendRegistration(
+                name="partial", capabilities=triggerless,
+                trace_dialect="partial",
+                answer_route="none",
+                trigger=ac.SurfaceBinding(
+                    ac.ObjectRef("run_trigger_matrix", "StubAdapter")),
+            )
+        answer_without_safety = ac.AgentCapabilities(
+            answer_runner=True, autonomous_trigger=False,
+            trigger_ablation=False, trace_artifacts=True, token_usage=False,
+            dollar_cost="missing", judge_backend=False, tool_replay=False,
+            live_smoke_env=None,
+        )
+        native_entrypoint = ac.AnswerEntrypoint(
+            "run-agent", ac.ObjectRef("skill_benchmark", "run_agent"))
+        with self.assertRaisesRegex(ValueError, "workspace builder"):
+            ac.BackendRegistration(
+                name="partial", capabilities=answer_without_safety,
+                trace_dialect="partial", answer_route="native",
+                answer_entrypoints=(native_entrypoint,),
+                answer=ac.SurfaceBinding(
+                    ac.ObjectRef("skill_benchmark", "ClaudeBackend")),
+            )
+
+        with self.assertRaisesRegex(ValueError, "native answer binding"):
+            ac.BackendRegistration(
+                name="agy", capabilities=answer_without_safety,
+                trace_dialect="agy", answer_route="native",
+                answer_entrypoints=(native_entrypoint,),
+                workspace_builder=ac.ObjectRef(
+                    "skill_benchmark", "build_skill_workspace"),
+                failure_marker="[AGY FAILURE",
+            )
+
+        for route in ("export_import", "subagent"):
+            with self.subTest(route=route), self.assertRaisesRegex(
+                ValueError, "executable answer entrypoints"
+            ):
+                ac.BackendRegistration(
+                    name="agy", capabilities=answer_without_safety,
+                    trace_dialect="agy", answer_route=route,
+                    workspace_builder=ac.ObjectRef(
+                        "skill_benchmark", "build_skill_workspace"),
+                    failure_marker="[AGY FAILURE",
+                )
+
+        with self.assertRaisesRegex(ValueError, "run-subagent"):
+            ac.BackendRegistration(
+                name="agy", capabilities=answer_without_safety,
+                trace_dialect="agy", answer_route="subagent",
+                answer_entrypoints=(native_entrypoint,),
+                workspace_builder=ac.ObjectRef(
+                    "skill_benchmark", "build_skill_workspace"),
+                failure_marker="[AGY FAILURE",
+            )
+
+        with self.assertRaisesRegex(ValueError, "one export, run, and import"):
+            ac.BackendRegistration(
+                name="agy", capabilities=answer_without_safety,
+                trace_dialect="agy", answer_route="export_import",
+                answer_entrypoints=(native_entrypoint,),
+                workspace_builder=ac.ObjectRef(
+                    "skill_benchmark", "build_skill_workspace"),
+                failure_marker="[AGY FAILURE",
+            )
+
+        with self.assertRaisesRegex(ValueError, "must resolve handler 'run_agent'"):
+            ac.AnswerEntrypoint(
+                "run-agent",
+                ac.ObjectRef("skill_benchmark", "run_subagent"),
+            )
+
+        for marker in ("   ", "[", 7):
+            with self.subTest(marker=marker), self.assertRaisesRegex(
+                ValueError, "marker like"
+            ):
+                ac.BackendRegistration(
+                    name="agy", capabilities=answer_without_safety,
+                    trace_dialect="agy", answer_route="native",
+                    answer_entrypoints=(native_entrypoint,),
+                    answer=ac.SurfaceBinding(
+                        ac.ObjectRef("skill_benchmark", "ClaudeBackend")),
+                    workspace_builder=ac.ObjectRef(
+                        "skill_benchmark", "build_skill_workspace"),
+                    failure_marker=marker,  # type: ignore[arg-type]
+                )
+
+        with self.assertRaisesRegex(ValueError, "same stable identity"):
+            ac.BackendRegistration(
+                name="alias", capabilities=triggerless,
+                trace_dialect="generic", answer_route="none",
+            )
+
+        with self.assertRaisesRegex(ValueError, "backend names"):
+            ac.BackendRegistration(
+                name=" agy ", capabilities=triggerless,
+                trace_dialect=" agy ", answer_route="none",
+            )
+
+        with self.assertRaisesRegex(ValueError, "unknown answer route"):
+            ac.BackendRegistration(
+                name="agy", capabilities=triggerless,
+                trace_dialect="agy", answer_route="other",  # type: ignore[arg-type]
+            )
+
+    def test_registry_keys_come_from_unique_stable_backend_names(self):
+        self.assertEqual(list(ac.BACKENDS), [row.name for row in ac.BACKENDS.values()])
+        offline = ac.AgentCapabilities(
+            answer_runner=False, autonomous_trigger=False,
+            trigger_ablation=False, trace_artifacts=False, token_usage=False,
+            dollar_cost="not_applicable", judge_backend=False,
+            tool_replay=False, live_smoke_env=None,
+            usage_not_applicable=True,
+        )
+        row = ac.BackendRegistration(
+            name="offline", capabilities=offline,
+            trace_dialect="offline", answer_route="none",
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate backend registration 'offline'"):
+            ac.backend_registry(row, row)
+
+    def test_registry_rejects_wrong_implementation_identity_and_cli_collisions(self):
+        answer_capability = ac.AgentCapabilities(
+            answer_runner=True, autonomous_trigger=False,
+            trigger_ablation=False, trace_artifacts=True, token_usage=False,
+            dollar_cost="missing", judge_backend=False, tool_replay=False,
+            live_smoke_env=None,
+        )
+        wrong_answer = ac.BackendRegistration(
+            name="agy", capabilities=answer_capability,
+            trace_dialect="agy", answer_route="native",
+            answer_entrypoints=(ac.AnswerEntrypoint(
+                "run-agent", ac.ObjectRef("skill_benchmark", "run_agent")),),
+            answer=ac.SurfaceBinding(
+                ac.ObjectRef("skill_benchmark", "ClaudeBackend")),
+            workspace_builder=ac.ObjectRef(
+                "skill_benchmark", "build_skill_workspace"),
+            failure_marker="[AGY FAILURE",
+        )
+        with self.assertRaisesRegex(RuntimeError, "identifies as 'claude'"):
+            ac.surface_implementations(
+                "answer", instantiate=True,
+                registrations=ac.backend_registry(wrong_answer),
+            )
+
+        conflicting_route = ac.BackendRegistration(
+            name="other", capabilities=answer_capability,
+            trace_dialect="other", answer_route="native",
+            answer_entrypoints=(ac.AnswerEntrypoint(
+                "run-agent", ac.ObjectRef("other_module", "run_agent")),),
+            answer=ac.SurfaceBinding(
+                ac.ObjectRef("skill_benchmark", "ClaudeBackend")),
+            workspace_builder=ac.ObjectRef(
+                "skill_benchmark", "build_skill_workspace"),
+            failure_marker="[OTHER FAILURE",
+        )
+        with self.assertRaisesRegex(ValueError, "conflicting handlers"):
+            ac.backend_registry(wrong_answer, conflicting_route)
+
+        def trigger_row(name, dest, flag="--shared-command"):
+            capability = ac.AgentCapabilities(
+                answer_runner=False, autonomous_trigger=True,
+                trigger_ablation=True, trace_artifacts=True,
+                token_usage=False, dollar_cost="not_applicable",
+                judge_backend=False, tool_replay=False,
+                live_smoke_env=None, usage_not_applicable=True,
+            )
+            return ac.BackendRegistration(
+                name=name, capabilities=capability,
+                trace_dialect=name, answer_route="none",
+                trigger=ac.SurfaceBinding(
+                    ac.ObjectRef("run_trigger_matrix", "StubAdapter"),
+                    (ac.BackendCliOption(
+                        (flag,), dest, "stub", "test"),),
+                ),
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "identifies as 'stub'"):
+            ac.surface_implementations(
+                "trigger", instantiate=True,
+                registrations=ac.backend_registry(
+                    trigger_row("agy", "agy_cmd")),
+            )
+
+        with self.assertRaisesRegex(ValueError, "CLI flag '--shared-command'"):
+            ac.backend_registry(
+                trigger_row("first", "first_cmd"),
+                trigger_row("second", "second_cmd"),
+            )
+
+        for flag, dest, message in (
+            ("--model", "agy_model", "CLI flag '--model'"),
+            ("--agy-model", "model", "CLI destination 'model'"),
+            ("--out", "agy_out", "CLI flag '--out'"),
+            ("--agy-timeout", "timeout", "CLI destination 'timeout'"),
+        ):
+            with self.subTest(flag=flag, dest=dest):
+                parser = argparse.ArgumentParser()
+                parser.add_argument("--model")
+                parser.add_argument("--timeout")
+                parser.add_argument("--out")
+                registrations = ac.backend_registry(
+                    trigger_row("agy", dest, flag))
+                with self.assertRaisesRegex(ValueError, message):
+                    ac.add_surface_cli_options(
+                        parser, "trigger", registrations=registrations)
+
+    def test_direct_script_entrypoints_share_their_canonical_module_identity(self):
+        probe = r'''
+import importlib.util
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1]).resolve()
+canonical = sys.argv[2]
+spec = importlib.util.spec_from_file_location("__main__", path)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules["__main__"] = module
+sys.argv = [str(path), "--help"]
+try:
+    spec.loader.exec_module(module)
+except SystemExit as exc:
+    assert exc.code == 0, exc.code
+assert sys.modules[canonical] is module
+if canonical == "skill_benchmark":
+    assert module.AGENT_BACKENDS["codex"].__class__ is module.CodexBackend
+    assert module.JUDGE_BACKENDS["codex"] is module.codex_judge_invoke
+    assert module.WORKSPACE_BUILDERS["codex"] is module.build_skill_workspace
+else:
+    assert module.ADAPTERS["codex"] is module.CodexAdapter
+'''
+        for filename, canonical in (
+            ("skill_benchmark.py", "skill_benchmark"),
+            ("run_trigger_matrix.py", "run_trigger_matrix"),
+        ):
+            completed = subprocess.run(
+                [sys.executable, "-c", probe, str(ROOT / filename), canonical],
+                cwd=ROOT, capture_output=True, text=True,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode, 0,
+                f"{filename} loaded a second module instance:\n{completed.stderr}",
+            )
+
+    def test_answer_runtimes_use_the_registered_workspace_builders(self):
+        class RecordingBackend:
+            name = "codex"
+
+            def invoke_answer(self, request, **options):
+                return sb.Completed(
+                    sb.OutcomeContext(provider=sb.Provider.CODEX),
+                    answer="ok",
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_eval_repo(root)
+            rows = sb.prepared_task_rows(manifest, sb.validate_manifest(manifest))
+            original = sb.WORKSPACE_BUILDERS["codex"]
+            calls = []
+
+            def recording_builder(task, workspace):
+                calls.append(task.case_id)
+                return original(task, workspace)
+
+            try:
+                sb.WORKSPACE_BUILDERS["codex"] = recording_builder
+                sb.run_agent_tasks(
+                    rows[:1], root / "runs", RecordingBackend())
+            finally:
+                sb.WORKSPACE_BUILDERS["codex"] = original
+
+            subagent_original = sb.WORKSPACE_BUILDERS["subagent"]
+            subagent_calls = []
+
+            def recording_subagent_builder(task, workspace):
+                subagent_calls.append(task.case_id)
+                return subagent_original(task, workspace)
+
+            def subagent(**_kwargs):
+                return {"answer": "ok", "returncode": 0}
+
+            try:
+                sb.WORKSPACE_BUILDERS["subagent"] = recording_subagent_builder
+                sb.run_subagent_tasks(
+                    rows[:1], root / "subagent-runs", subagent,
+                    replay_mode="off",
+                )
+            finally:
+                sb.WORKSPACE_BUILDERS["subagent"] = subagent_original
+        self.assertEqual(calls, [rows[0]["case_id"]])
+        self.assertEqual(subagent_calls, [rows[0]["case_id"]])
+
+        class UnregisteredBackend(RecordingBackend):
+            name = "unregistered"
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            sb.run_agent_tasks(
+                rows[:1], root / "unregistered-runs", UnregisteredBackend())
+        self.assertIn("no registered workspace builder", stderr.getvalue())
+
+    def test_mutable_answer_replacement_must_keep_registry_identity(self):
+        class WrongBackend:
+            name = "claude"
+
+        original = sb.AGENT_BACKENDS["codex"]
+        try:
+            sb.AGENT_BACKENDS["codex"] = WrongBackend()
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                sb.run_agent(argparse.Namespace(agent="codex"))
+            self.assertIn("replacement identifies as 'claude'", stderr.getvalue())
+        finally:
+            sb.AGENT_BACKENDS["codex"] = original
+
+    def test_trigger_adapter_replacements_keep_the_zero_argument_compatibility_seam(self):
+        class Replacement:
+            name = "codex"
+
+            def __init__(self):
+                self.created = True
+
+        original = tm.ADAPTERS["codex"]
+        try:
+            tm.ADAPTERS["codex"] = Replacement
+            adapter = tm.adapter_instance(
+                "codex", backend_options={"codex_cmd": "custom codex"})
+        finally:
+            tm.ADAPTERS["codex"] = original
+        self.assertIsInstance(adapter, Replacement)
+        self.assertTrue(adapter.created)
+
+    def test_policy_projections_are_immutable(self):
+        with self.assertRaises(TypeError):
+            ac.AGENT_CAPABILITIES["stub"] = ac.AGENT_CAPABILITIES["stub"]  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            am.RUNNER_FAILURE_MARKER_BY_PROVIDER["stub"] = "[STUB FAILURE"  # type: ignore[index]
+
+    def test_parity_doc_matches_registry_policy(self):
+        parity = (ROOT / "docs" / "agent-parity.md").read_text(encoding="utf-8")
+        lines = [line for line in parity.splitlines() if line.startswith("|")]
+        cells = lambda line: [cell.strip() for cell in line.strip().strip("|").split("|")]
+        header = cells(lines[0])
+        self.assertEqual(header, [
+            "Agent", "Answer runs", "Answer route", "Autonomous trigger",
+            "Trigger ablation", "Trace artifacts", "Token usage",
+            "Dollar cost", "Judge backend", "Tool replay", "Live smoke",
+        ])
+        rows = {cells(line)[0].strip("`"): cells(line)[1:] for line in lines[2:]}
+        self.assertEqual(set(rows), set(ac.BACKENDS))
+        bool_columns = {
+            0: "answer_runner", 2: "autonomous_trigger", 3: "trigger_ablation",
+            4: "trace_artifacts", 5: "token_usage", 7: "judge_backend",
+            8: "tool_replay",
+        }
+        for name, registration in ac.BACKENDS.items():
+            row = rows[name]
+            self.assertEqual(len(row), len(header) - 1, name)
+            self.assertEqual(row[1], f"`{registration.answer_route}`", name)
+            for column, attribute in bool_columns.items():
+                expected = getattr(registration.capabilities, attribute)
+                self.assertTrue(
+                    row[column].lower().startswith("yes" if expected else "no"),
+                    f"{name} {header[column + 1]} must match BACKENDS",
+                )
+            self.assertIn(
+                f"`{registration.capabilities.dollar_cost}`", row[6], name)
+            expected_smoke = registration.capabilities.live_smoke_env
+            self.assertEqual(row[9], f"`{expected_smoke}`" if expected_smoke else "n/a")
 
 
 class TimeoutConventionTests(unittest.TestCase):
@@ -228,8 +706,12 @@ class TimeoutConventionTests(unittest.TestCase):
                           f"{fn.__name__} bypasses the shared native answer runner")
 
     def test_runner_failure_markers_have_one_provider_map(self):
-        # A provider is bound to its failure marker in exactly one place, and the
-        # subagent reuses the Claude marker (its backend IS Claude).
+        # Backend rows own the binding; the ablation module only projects it.
+        self.assertEqual(
+            am.RUNNER_FAILURE_MARKER_BY_PROVIDER,
+            {name: registration.failure_marker for name, registration in ac.BACKENDS.items()
+             if registration.failure_marker is not None},
+        )
         self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["codex"], am.CODEX_FAILURE)
         self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["claude"], am.CLAUDE_FAILURE)
         self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["subagent"], am.CLAUDE_FAILURE)

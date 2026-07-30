@@ -82,7 +82,7 @@ a more specific unit.
 <!-- otel-command-inventory:start -->
 | Pipeline surface | Current commands / entry points | Required telemetry owner | Slice |
 |---|---|---|---:|
-| Authoring and preflight | `validate`, `migrate`, `profile-skill`, `audit-manifest`, `materialize-ablations`, `suite-run` | command root; bounded validation/materialization and policy-gate operations | 2 |
+| Authoring and preflight | `agent-capabilities`, `validate`, `migrate`, `profile-skill`, `audit-manifest`, `materialize-ablations`, `suite-run` | command root; bounded registry introspection, validation/materialization, and policy-gate operations | 2 |
 | Task preparation and outbound handoff | `prepare`, `export-jetty`, `compare-tasks` | prepare/export root; durable run group plus task/export digest | 2 |
 | Native and in-process answers | `run-agent`, `run-codex`, `run-claude`, `run-subagent`; Pi answer smoke | one root per prepared attempt; runner invocation and artifact commit | 1, 3 |
 | Remote answer execution | `run-jetty` | one root per remote attempt; submit, poll, and download operations with remote links | 3 |

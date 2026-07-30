@@ -63,6 +63,16 @@ judged by a human or model outside the harness before `compare-results` imports 
 Jetty adds a networked control plane around a remote answer runner; import and default grading
 remain local.
 
+Provider support is declared once in `agent_capabilities.BACKENDS`. The answer,
+trigger, and judge implementations remain separate protocol implementations,
+while executable answer entrypoints, command choices, provider-specific command
+flags, capability gates, smoke targets, workspace builders, and failure policy
+project from the same row. Run `skill-benchmark agent-capabilities` to inspect
+that control plane as JSON. An explicit answer route distinguishes native dispatch
+from Jetty export/import and the dedicated subagent path. Implementation dispatch
+maps are mutable replacement views for compatibility; policy projections are
+immutable, and neither is an alternative registration point for new providers.
+
 ## Four axes, one grid
 
 A case does not run once. It runs across a grid of variants, models, and repeats, filtered by split.
