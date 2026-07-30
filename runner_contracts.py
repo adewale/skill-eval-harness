@@ -9,7 +9,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, TypeAlias
+from typing import Any, NoReturn, TypeAlias
 
 
 class Provider(str, Enum):
@@ -45,7 +45,7 @@ _RESERVED_EVIDENCE_KEYS = frozenset({
 
 class FrozenDict(dict):
     """JSON-serializable recursively immutable mapping."""
-    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+    def _immutable(self, *args: Any, **kwargs: Any) -> NoReturn:
         raise TypeError("frozen mapping cannot be mutated")
 
     __setitem__ = __delitem__ = __ior__ = clear = pop = popitem = setdefault = update = _immutable

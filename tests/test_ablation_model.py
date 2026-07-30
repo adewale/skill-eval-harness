@@ -269,6 +269,21 @@ class ResultSetTests(unittest.TestCase):
     def test_mean_rate_ignores_non_scorable(self):
         self.assertEqual(am.ResultSet(self.rows()).mean_rate(), 1.0)   # the 0.0 crash/missing do not drag it down
 
+    def test_mean_rate_rejects_invalid_rate_evidence(self):
+        for value in (
+            True, "1.0", float("nan"), float("inf"), -1e-12, 1.0 + 1e-12,
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, r"finite rate in \[0, 1\] or null"
+            ):
+                am.ResultSet([{
+                    "case_id": "c1",
+                    "variant": "with_skill",
+                    "objective_pass_rate": value,
+                    "missing_output": False,
+                    "execution_valid": True,
+                }]).mean_rate()
+
     def test_all_is_the_explicit_escape_hatch(self):
         self.assertEqual(len(am.ResultSet(self.rows()).all), 3)   # raw access is opt-in, not the default
 

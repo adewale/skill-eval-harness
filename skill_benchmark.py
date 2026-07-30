@@ -40,7 +40,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 import yaml
 
@@ -272,7 +272,7 @@ def oracle_tier(assertion: dict[str, Any]) -> str:
     return "strong"
 
 
-def die(msg: str) -> None:
+def die(msg: str) -> NoReturn:
     print(f"FAIL: {msg}", file=sys.stderr)
     raise SystemExit(1)
 

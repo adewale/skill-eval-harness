@@ -49,13 +49,18 @@ pythonpath = ["."]
 # modules in this gate instead of inheriting the legacy CLI's diagnostic debt.
 include = [
   "agent_capabilities.py",
+  "ablation_model.py",
   "experimental_pairs.py",
   "jetty_contracts.py",
+  "judge_verdict.py",
+  "run_pi_trigger_eval.py",
   "run_trigger_matrix.py",
+  "runner_contracts.py",
   "telemetry.py",
   "trace_contracts.py",
   "text_contracts.py",
   "observability.py",
+  "trigger_contracts.py",
 ]
 
 [tool.ruff]

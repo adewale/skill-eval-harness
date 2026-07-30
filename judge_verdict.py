@@ -180,9 +180,9 @@ def verdict_from_dict(raw: Mapping[str, Any], *, strict_stored: bool = True,
                 raise ValueError("stored scored verdict requires threshold")
             threshold = 1.0
         else:
-            threshold = raw.get("threshold")
+            threshold = _number(raw.get("threshold"), "threshold")
         score = _number(raw.get("score"), "score")
-        passed = raw.get("passed", score >= _number(threshold, "threshold"))
+        passed = raw.get("passed", score >= threshold)
         return ScoredVerdict(score, threshold, _passed(passed))
     if kind is VerdictKind.DIMENSIONS:
         dims = raw.get("dimension_scores")

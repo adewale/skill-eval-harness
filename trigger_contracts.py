@@ -546,7 +546,20 @@ class TriggerObservation:
         agent = raw.get("agent", default_agent)
         model = raw.get("model")
         query = raw.get("query")
-        expectation = TriggerExpectation.from_bool(raw.get("should_trigger"))
+        should_trigger = raw.get("should_trigger")
+        usage = raw.get("usage_normalized")
+        cost = raw.get("cost_normalized")
+        if not isinstance(agent, str) or not agent.strip():
+            raise ValueError("trigger observation agent must be non-empty")
+        if model is not None and not isinstance(model, str):
+            raise TypeError("trigger observation model must be a string or null")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("trigger observation query must be non-empty")
+        if not isinstance(should_trigger, bool):
+            raise TypeError("trigger observation should_trigger must be boolean")
+        if not isinstance(usage, Mapping) or not isinstance(cost, Mapping):
+            raise TypeError("trigger observation usage and cost must be mappings")
+        expectation = TriggerExpectation.from_bool(should_trigger)
         legacy_invocation = {
             "stdout": "",
             "stderr": raw.get("stderr", ""),
@@ -600,7 +613,7 @@ class TriggerObservation:
         observation = cls(
             agent=agent, model=model, query=query, expectation=expectation,
             invocation=invocation, detection=detection,
-            usage=raw.get("usage_normalized"), cost=raw.get("cost_normalized"),
+            usage=usage, cost=cost,
             identity=TriggerRepetitionIdentity.from_row(raw),
         )
         if not isinstance(raw.get("pass"), bool) or raw["pass"] != observation.passed:

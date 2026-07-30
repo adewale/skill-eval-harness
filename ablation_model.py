@@ -28,13 +28,14 @@ adopt it without a cycle.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import statistics
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 
 def _require(d: dict[str, Any], key: str, types: type | tuple[type, ...], ctx: str) -> Any:
@@ -287,7 +288,7 @@ class Mechanism(str, Enum):
 
 
 class _FrozenDict(dict):
-    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+    def _immutable(self, *args: Any, **kwargs: Any) -> NoReturn:
         raise TypeError("frozen component target cannot be mutated")
 
     __setitem__ = __delitem__ = __ior__ = clear = pop = popitem = setdefault = update = _immutable
@@ -610,7 +611,10 @@ class MaterializedArm:
     def as_legacy_dict(self) -> dict[str, Any]:
         """The historical materialize_ablation() dict shape, derived from the typed
         core so the on-disk/on-wire contract is unchanged for existing consumers."""
-        d = dict(self.arm.provenance.as_dict())
+        provenance = self.arm.provenance
+        if provenance is None:  # guarded structurally by __post_init__
+            raise AssertionError("MaterializedArm lost its required provenance")
+        d = dict(provenance.as_dict())
         d["dir"] = self.dir
         d["skill_files"] = dict(self.skill_files)
         d["isolation_warnings"] = list(self.isolation_warnings)
@@ -842,17 +846,18 @@ class PreparedTask:
             if not isinstance(raw, (list, tuple)) or not all(isinstance(item, str) for item in raw):
                 raise ValueError(f"PreparedTask row field {key!r} must be a list of strings")
             collections[key] = tuple(raw)
+        ctx = "PreparedTask row"
         return cls(
-            case_id=row.get("case_id"),
-            split=row.get("split"),
+            case_id=_require(row, "case_id", str, ctx),
+            split=_require(row, "split", str, ctx),
             kind=row.get("kind", "behavior"),
             variant_truth=str(row.get("variant")),
-            run_number=row.get("run_number"),
-            skill_name=row.get("skill_name"),
-            repo_root=row.get("repo_root"),
+            run_number=_require(row, "run_number", int, ctx),
+            skill_name=_require(row, "skill_name", str, ctx),
+            repo_root=_require(row, "repo_root", str, ctx),
             skill_paths=collections["skill_paths"],
             input_files=collections["input_files"],
-            run_dir=row.get("run_dir"),
+            run_dir=_require(row, "run_dir", str, ctx),
             instruction=row.get("instruction", ""),
             prompt=row.get("prompt", ""),
             tags=collections["tags"],
@@ -905,5 +910,14 @@ class ResultSet:
         return out
 
     def mean_rate(self, key: str = "objective_pass_rate") -> float | None:
-        vals = [r.get(key) for r in self.scorable()._rows if r.get(key) is not None]
+        vals: list[int | float] = []
+        for row in self.scorable()._rows:
+            value = row.get(key)
+            if value is None:
+                continue
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or not 0 <= value <= 1):
+                raise ValueError(
+                    f"result field {key!r} must be a finite rate in [0, 1] or null")
+            vals.append(value)
         return statistics.mean(vals) if vals else None

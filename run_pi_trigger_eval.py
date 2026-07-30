@@ -295,7 +295,8 @@ def validate_trigger_rows(rows: Any, source: str) -> list[dict[str, Any]]:
         query = row.get("query")
         if not isinstance(query, str) or not query.strip():
             raise SystemExit(f"{source}: row {i} query must be a non-empty string")
-        if not isinstance(row.get("should_trigger"), bool):
+        should_trigger = row.get("should_trigger")
+        if not isinstance(should_trigger, bool):
             raise SystemExit(f"{source}: row {i} should_trigger must be true or false")
         if ("query_id" in row and "id" in row
                 and row.get("query_id") != row.get("id")):
@@ -303,12 +304,12 @@ def validate_trigger_rows(rows: Any, source: str) -> list[dict[str, Any]]:
                 f"{source}: row {i} has conflicting query_id and id aliases")
         query_id = row.get("query_id", row.get("id"))
         if query_id is None or query_id == "":
-            encoded = json.dumps([query, row["should_trigger"]], ensure_ascii=False,
+            encoded = json.dumps([query, should_trigger], ensure_ascii=False,
                                  separators=(",", ":")).encode("utf-8")
             query_id = "query-" + hashlib.sha256(encoded).hexdigest()
         if not isinstance(query_id, str) or not query_id.strip():
             raise SystemExit(f"{source}: row {i} query_id must be a non-empty string")
-        authored = (query, row["should_trigger"])
+        authored = (query, should_trigger)
         if query_id in seen:
             if seen[query_id] != authored:
                 raise SystemExit(
@@ -316,17 +317,17 @@ def validate_trigger_rows(rows: Any, source: str) -> list[dict[str, Any]]:
             raise SystemExit(f"{source}: duplicate query_id {query_id!r}")
         inference_query = canonical_trigger_query(query)
         prior = seen_definitions.setdefault(
-            inference_query, (query_id, row["should_trigger"]))
-        if prior != (query_id, row["should_trigger"]):
+            inference_query, (query_id, should_trigger))
+        if prior != (query_id, should_trigger):
             raise SystemExit(
                 f"{source}: canonical query aliases alias the same query and must share one query ID and polarity; "
-                f"got {prior!r} and {(query_id, row['should_trigger'])!r}")
+                f"got {prior!r} and {(query_id, should_trigger)!r}")
         seen[query_id] = authored
         normalized = dict(row)
         normalized.pop("id", None)
         normalized["query_id"] = query_id
         normalized["query"] = query
-        normalized["should_trigger"] = row["should_trigger"]
+        normalized["should_trigger"] = should_trigger
         out.append(normalized)
     return out
 
