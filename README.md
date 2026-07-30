@@ -324,11 +324,13 @@ negative cosine values map to the 0.0 floor of the public 0-1 score domain. Use
 characters (and `"ci": false` when case must also remain exact). A rendered operand may not become empty, and regex
 source must already be NFC/control-stable so normalization cannot create an
 empty regex branch. When rendered-v1 changes the candidate, its normalized
-regex verdict and optional raw diagnostic share one 0.25-second process-local
-deadline. A timeout, worker-thread call, active caller timer, or platform
-without interval timers produces partial/unavailable evidence rather than a
-positive or negative verdict. Exact and unchanged regex inputs retain their
-existing local matching behavior.
+regex verdict and optional raw diagnostic share one 0.25-second native operation
+deadline from exact-pinned `regex==2026.7.19` in `VERSION0` compatibility mode.
+Timeout or resource exhaustion produces partial/unavailable evidence rather
+than a positive or negative verdict. This path is in-process, works in worker
+threads, and owns no process signal or timer. Because that engine targets
+CPython for non-ASCII text, a normalization-changed regex on PyPy is unavailable;
+exact and unchanged regex inputs retain their existing stdlib matching behavior.
 Negative assertions use the same view, so invisible
 characters cannot hide banned content. `golden_output`, structured JSON,
 scripts, commands, tool names, and paths retain their exact/protocol semantics.

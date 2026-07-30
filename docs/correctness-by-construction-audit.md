@@ -202,10 +202,11 @@ raw output string
   inputs. External embedding vectors reject boolean/non-finite elements before cosine construction;
   negative cosine occupies the public score domain's 0.0 floor.
 - When rendered-v1 changes a regex candidate, the normalized search and optional raw diagnostic
-  share one 0.25-second process-local deadline. Expiry, an already-owned process timer, a
-  worker-thread call, or a platform without interval timers constructs unavailable evidence rather
-  than letting the synthesized candidate produce a negative pass. Exact and unchanged inputs retain
-  their existing local behavior. The bound adds no subprocess, model, network, or runtime dependency.
+  share one monotonic 0.25-second budget enforced by exact-pinned `regex==2026.7.19` in `VERSION0`
+  compatibility mode. Expiry, resource exhaustion, or a non-CPython implementation constructs
+  unavailable evidence rather than letting the synthesized candidate produce a negative pass.
+  Exact and unchanged inputs retain their existing stdlib behavior. The bounded path works in worker
+  threads and owns no process-global timer or handler; it adds no subprocess, model, or network call.
 - Results identify the comparison profile. When normalization changes an operand, the result also
   records the affected code points, the raw deterministic similarity score where applicable, and
   whether normalization changed a deterministic verdict. Embedding mode records that last value as

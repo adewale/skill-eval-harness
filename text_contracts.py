@@ -9,15 +9,17 @@ from __future__ import annotations
 
 import difflib
 import math
+import platform
 import re
-import signal
-import threading
+import time
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, TypeAlias
+from typing import Any, Protocol, TypeAlias
+
+import regex as timeout_regex
 
 
 class ComparisonProfile(str, Enum):
@@ -50,77 +52,56 @@ RENDERED_V1_REMOVED_CODEPOINTS = frozenset({
 
 _RENDERED_V1_TRANSLATION = str.maketrans({codepoint: None for codepoint in RENDERED_V1_REMOVED_CODEPOINTS})
 
-# Python's backtracking regex engine has no native timeout.  When rendered-v1
-# synthesizes a new candidate by joining text across removable controls, a
-# short process-local timer bounds the complete normalized + raw-diagnostic
-# observation.  This closes the new risk without moving ordinary/exact regexes
-# out of the deterministic core or changing their pre-existing platform
-# support.  Call sites that cannot establish the required bound fail closed
-# through the typed unavailable state below.
+# When rendered-v1 joins text across removable controls it can synthesize a
+# backtracking input that did not exist in the raw artifact.  The exact-pinned
+# regex engine supplies an in-process operation timeout for that new input.
+# Ordinary exact/unchanged searches stay on stdlib re, preserving their
+# pre-existing behavior.  The normalized verdict and raw diagnostic share one
+# monotonic budget.
 REGEX_SEARCH_TIMEOUT_SECONDS = 0.25
+BOUNDED_REGEX_ENGINE = f"regex {timeout_regex.__version__} VERSION0"
 
 
 class RegexEvaluationUnavailable(RuntimeError):
     """A regex verdict does not exist because it could not be derived safely."""
 
 
-class _RegexDeadlineExceeded(Exception):
-    """Private signal-handler escape used only inside the bounded search."""
+class _BoundedRegexPattern(Protocol):
+    def search(self, string: str, *, timeout: float) -> Any: ...
 
 
 def _bounded_regex_searches(
-    compiled: re.Pattern[str], texts: tuple[str, ...],
+    compiled: _BoundedRegexPattern, texts: tuple[str, ...],
 ) -> tuple[bool, ...]:
-    if not isinstance(compiled, re.Pattern):
-        raise TypeError("bounded regex search requires a compiled pattern")
     if not isinstance(texts, tuple) or not texts or not all(isinstance(text, str) for text in texts):
         raise TypeError("bounded regex search requires a non-empty tuple of strings")
     timeout = REGEX_SEARCH_TIMEOUT_SECONDS
     if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
             or not math.isfinite(float(timeout)) or timeout <= 0):
         raise ValueError("regex search timeout must be a positive finite number")
-    if not all(hasattr(signal, name) for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")):
+    if platform.python_implementation() != "CPython":
         raise RegexEvaluationUnavailable(
-            "bounded regex evaluation is unavailable on this platform")
-    if threading.current_thread() is not threading.main_thread():
-        raise RegexEvaluationUnavailable(
-            "bounded regex evaluation is unavailable outside the main thread")
-    try:
-        active_delay, active_interval = signal.getitimer(signal.ITIMER_REAL)
-    except (OSError, ValueError) as exc:
-        raise RegexEvaluationUnavailable(
-            "bounded regex evaluation could not inspect the process timer") from exc
-    if active_delay > 0 or active_interval > 0:
-        raise RegexEvaluationUnavailable(
-            "bounded regex evaluation cannot replace an active process timer")
-
-    previous_handler = signal.getsignal(signal.SIGALRM)
-
-    def deadline_exceeded(_signum: int, _frame: Any) -> None:
-        raise _RegexDeadlineExceeded
-
-    handler_installed = False
-    try:
-        try:
-            signal.signal(signal.SIGALRM, deadline_exceeded)
-            handler_installed = True
-            signal.setitimer(signal.ITIMER_REAL, float(timeout))
-        except (OSError, ValueError) as exc:
+            f"bounded regex evaluation with {BOUNDED_REGEX_ENGINE} is unavailable on "
+            f"{platform.python_implementation()}")
+    deadline = time.monotonic() + float(timeout)
+    results: list[bool] = []
+    for text in texts:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise RegexEvaluationUnavailable(
-                "bounded regex evaluation could not establish a process timer") from exc
-        return tuple(compiled.search(text) is not None for text in texts)
-    except _RegexDeadlineExceeded as exc:
-        raise RegexEvaluationUnavailable(
-            f"regex evaluation exceeded {float(timeout):g}s safety limit") from exc
-    except (MemoryError, RecursionError) as exc:
-        raise RegexEvaluationUnavailable(
-            "regex evaluation exhausted its safe resource budget") from exc
-    finally:
-        if handler_installed:
-            try:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-            finally:
-                signal.signal(signal.SIGALRM, previous_handler)
+                f"regex evaluation exceeded {float(timeout):g}s shared safety limit "
+                f"({BOUNDED_REGEX_ENGINE})")
+        try:
+            results.append(compiled.search(text, timeout=remaining) is not None)
+        except TimeoutError as exc:
+            raise RegexEvaluationUnavailable(
+                f"regex evaluation exceeded {float(timeout):g}s shared safety limit "
+                f"({BOUNDED_REGEX_ENGINE})") from exc
+        except (MemoryError, RecursionError) as exc:
+            raise RegexEvaluationUnavailable(
+                f"regex evaluation exhausted its safe resource budget "
+                f"({BOUNDED_REGEX_ENGINE})") from exc
+    return tuple(results)
 
 
 def _rendered_v1(text: str) -> tuple[str, tuple[RemovedCodePoint, ...], bool]:
@@ -384,8 +365,8 @@ class RegexTextAssertion:
     pattern: str
     case_insensitive: bool
     profile: ComparisonProfile
-    raw_regex: re.Pattern[str] = field(init=False, repr=False, compare=False)
     comparison_regex: re.Pattern[str] = field(init=False, repr=False, compare=False)
+    bounded_regex: _BoundedRegexPattern | None = field(init=False, repr=False, compare=False)
     pattern_text: ComparisonText = field(init=False)
 
     def __post_init__(self) -> None:
@@ -405,13 +386,24 @@ class RegexTextAssertion:
             )
         flags = re.IGNORECASE if self.case_insensitive else 0
         try:
-            raw_regex = re.compile(self.pattern, flags)
             comparison_regex = re.compile(pattern_text.value, flags)
         except re.error as exc:
             raise ValueError(f"invalid regex {self.pattern!r}: {exc}") from exc
+        bounded_regex: _BoundedRegexPattern | None = None
+        if self.profile is ComparisonProfile.RENDERED_V1:
+            bounded_flags = timeout_regex.VERSION0
+            if self.case_insensitive:
+                bounded_flags |= timeout_regex.IGNORECASE
+            try:
+                bounded_regex = timeout_regex.compile(pattern_text.value, bounded_flags)
+            except timeout_regex.error as exc:
+                raise ValueError(
+                    f"regex {self.pattern!r} is incompatible with the bounded "
+                    f"{BOUNDED_REGEX_ENGINE} engine; set comparison='exact' to retain "
+                    "stdlib re behavior") from exc
         object.__setattr__(self, "pattern_text", pattern_text)
-        object.__setattr__(self, "raw_regex", raw_regex)
         object.__setattr__(self, "comparison_regex", comparison_regex)
+        object.__setattr__(self, "bounded_regex", bounded_regex)
 
     @classmethod
     def from_wire(cls, wire: Mapping[str, Any]) -> RegexTextAssertion:
@@ -429,8 +421,11 @@ class RegexTextAssertion:
     def evaluate(self, text: str) -> MatchObservation:
         candidate = ComparisonText.from_text(text, self.profile)
         if candidate.changed:
+            if self.bounded_regex is None:
+                raise RegexEvaluationUnavailable(
+                    "rendered-v1 regex evaluation has no bounded engine")
             hit, raw_hit = _bounded_regex_searches(
-                self.comparison_regex, (candidate.value, text))
+                self.bounded_regex, (candidate.value, text))
         else:
             hit = self.comparison_regex.search(candidate.value) is not None
             raw_hit = hit
@@ -440,6 +435,10 @@ class RegexTextAssertion:
             evidence = f"matched /{self.pattern}/" if passed else f"missing /{self.pattern}/"
         else:
             evidence = f"absent /{self.pattern}/" if passed else f"found banned /{self.pattern}/"
+        if candidate.changed:
+            evidence += (
+                f"; bounded by {BOUNDED_REGEX_ENGINE} under one "
+                f"{REGEX_SEARCH_TIMEOUT_SECONDS:g}s deadline")
         return MatchObservation(hit, raw_hit, negated, evidence, candidate, (self.pattern_text,))
 
 

@@ -11,7 +11,11 @@ uv tool install --editable .
 skill-benchmark --help
 ```
 
-The only runtime dependency is PyYAML (declared in `pyproject.toml`, used to parse skill frontmatter). Install test dependencies with `pip install -e ".[test]"` before running tests; CI uses that same extra.
+Runtime dependencies are PyYAML (used to parse skill frontmatter) and the exact-pinned
+`regex` engine (used only to place a native timeout around normalization-changed regex
+inputs). The regex version is part of deterministic grading semantics, so update its pin
+deliberately and with compatibility/timeout evidence. Install test dependencies with
+`pip install -e ".[test]"` before running tests; CI uses that same extra.
 
 ## Validation
 
