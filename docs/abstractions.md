@@ -3,7 +3,7 @@
 The harness is a pipeline. Each stage hands one well-defined object to the next: a manifest
 becomes task rows, task rows become files on disk, files on disk become graded result rows,
 and result rows become a report. Because the boundaries are explicit, you can swap the
-runner without touching grading, and grading never has to call a model.
+runner without touching grading, and the default grading path never has to call a model.
 
 This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md): what each object *is* in the code and what it hands downstream. The glossary defines the words; this page shows their shape. Symbols below point at `skill_benchmark.py` at the line where each abstraction is defined.
 
@@ -164,7 +164,8 @@ Native answer backends return the frozen `Completed | TimedOut | SpawnFailed | P
 union from `runner_contracts.py`. `OutcomeContext` validates provider, telemetry, and elapsed-time
 fields; `write_runner_outcome` exhaustively writes the disk contract. A backend therefore cannot
 independently set timeout, return code, answer, and failure into a contradictory bag. The harness
-calls no model during grading; it reads what the runner left behind.
+calls no model during default grading; it reads what the runner left behind. The explicit
+`--allow-scripts` and `--embed-cmd` modes may invoke caller-supplied external oracle subprocesses.
 
 ## Trace normalization
 
@@ -193,7 +194,9 @@ payload; duplicate IDs and contradictory score/threshold/pass rows are rejected.
 row still carries `{judge_task_id, verdict_kind, passed, score, evidence}` — plus
 `dimension_scores`/`criteria` for a graded verdict and normalized `usage_normalized`/
 `cost_normalized` for judge spend — merged back whenever `grade` or `benchmark` receives
-`--judge-results`.
+`--judge-results`. Both task and result carry `judge_input_sha256`, binding the verdict to the
+exact rendered prompt, candidate output, and evidence. A stale or mismatched result is rejected
+or re-queued even when its `judge_task_id` still matches.
 
 ## Grade result row
 
@@ -201,11 +204,12 @@ row still carries `{judge_task_id, verdict_kind, passed, score, evidence}` — p
 efficiency, and qualitative counts, computes each pass rate, marks `missing_output` when a run
 never produced text, and carries the run `metadata`. Deferred judge assertions leave a task
 behind rather than a verdict. Grading reads from disk and calls no model, which is what makes
-a re-grade cheap and deterministic.
+a default re-grade cheap and deterministic; opt-in script and embedding oracles are the explicit
+external-process exceptions.
 
 ## Benchmark report
 
-`build_benchmark_report` invokes the shared model-free grader for each discovered run, then
+`build_benchmark_report` invokes the shared grader for each discovered run, then
 turns those in-memory result rows into the artifact you read. It does not consume the output
 of the `grade` command. Before arithmetic,
 `experimental_pairs.py` constructs exact `(case, model, repetition, population)` identities and

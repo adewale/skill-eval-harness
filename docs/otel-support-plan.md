@@ -1,7 +1,7 @@
 # Minimal end-to-end OpenTelemetry support roadmap
 
-Status: proposed; source-audited 2026-07-30 against `main` at `b4d47ac` and
-the active PR heads listed below.
+Status: proposed; source-audited 2026-07-31 against `main` at `99da1f8` and
+the active PR/issue snapshot listed below.
 
 ## Decision
 
@@ -40,17 +40,18 @@ The source audit corrected three assumptions in the first version of this plan:
 - the pipeline is an artifact graph, not a single `prepare → run → grade → report`
   process;
 - `grade`, `benchmark`, `token-overhead`, `export-anthropic`, `aggregate`, and
-  run-aware audits can call the shared model-free grading owner directly, so a
+  run-aware audits can call the shared grading owner directly, so a
   `grade` command trace cannot be the parent of later aggregation; and
 - there is no `run-vibe` compatibility command. Vibe runs through
   `run-agent --agent vibe`; only `run-codex` and `run-claude` are compatibility
   frontends.
 
 The accompanying corrections to [`architecture.md`](architecture.md) and
-[`abstractions.md`](abstractions.md) record those facts and the actual
-`artifact-commit.json` boundary. The command inventory was checked against
-`build_arg_parser`, the two standalone entry points, shared-function call sites,
-tests, complete reachable history, and the active PR/issue set.
+[`abstractions.md`](abstractions.md) record those facts plus the authoritative
+`answer-design.json`, `judge_input_sha256`, and `artifact-commit.json`
+boundaries. The command inventory was checked against `build_arg_parser`, the
+installed console entry points, shared-function call sites, tests, complete
+reachable history, and the active PR/issue set.
 
 End-to-end coverage means all five of these statements are true:
 
@@ -58,21 +59,27 @@ End-to-end coverage means all five of these statements are true:
    an enumerated command name, outcome, and run-group ID when available. It is a
    navigation and operational span, never the parent of an unbounded matrix.
 2. Every expensive unit has its own bounded root: one answer attempt, trigger
-   query repetition, remote Jetty attempt, grading unit, or judge invocation.
+   query repetition, remote Jetty attempt, grading unit, opt-in external
+   script/embedding oracle, or judge invocation.
 3. Every durable handoff carries a content-free correlation envelope or an
-   explicit `unavailable` state: prepared tasks, remote submissions/results,
-   run artifacts, judge tasks/results, benchmark reports, and published output.
+   explicit `unavailable` state: `answer-design.json` plus prepared tasks,
+   remote submissions/results, run artifacts, judge tasks/results, comparison
+   tasks/results, benchmark reports, and published output.
 4. Every command that imports, migrates, enriches, or publishes artifacts traces
    validation plus atomic commit. It never overwrites the original producer's
    correlation or manufactures a causal parent.
-5. Work separated by a process, queue, human, or elapsed time starts a new trace
-   and uses span links plus `skill.eval.run_group.id`. No trace grows with the
-   total experiment size.
+5. A synchronous subprocess or RPC continues the active W3C context. A durable
+   queue/file handoff, human step, delayed resume, batch fan-in, or deliberate
+   trust-boundary restart begins a new trace and uses bounded span links when
+   there is direct causality. Work sharing only experiment membership uses
+   `skill.eval.run_group.id`, not a fabricated causal link. No trace or link set
+   grows with total experiment size.
 
 The inventory below assigns all current commands to that contract. A generic
 command root is sufficient for model-free utilities unless a later column names
 a more specific unit.
 
+<!-- otel-command-inventory:start -->
 | Pipeline surface | Current commands / entry points | Required telemetry owner | Slice |
 |---|---|---|---:|
 | Authoring and preflight | `validate`, `migrate`, `profile-skill`, `audit-manifest`, `materialize-ablations`, `suite-run` | command root; bounded validation/materialization and policy-gate operations | 2 |
@@ -81,9 +88,10 @@ a more specific unit.
 | Remote answer execution | `run-jetty` | one root per remote attempt; submit, poll, and download operations with remote links | 3 |
 | Ingestion and artifact mutation | `import-jetty-results`, `import-trace`, `migrate-telemetry`, `compare-results` | new ingest/migration root; validate then atomic commit, linked to producer/export context | 3, 5 |
 | Autonomous activation | `skill-trigger-matrix`, `skill-pi-trigger-eval`, `trigger-compare` | one root per query repetition; bounded comparison root over completed observations | 3, 5 |
-| Deterministic evaluation and judges | `grade`, `judge`, `judge-robustness`, `compare-judges`, `judge-alignment` | one grade root per discovered run; judge task, invocation, result-ingest, and analysis operations | 4, 5 |
+| Deterministic evaluation and judges | `grade`, `judge`, `judge-robustness`, `compare-judges`, `judge-alignment` | one grade root per discovered run; bounded opt-in script/embed operations; judge task, invocation, result-ingest, and analysis operations | 4, 5 |
 | Aggregation and analysis | `benchmark`, `aggregate`, `cost-summary`, `token-overhead`, `contamination`, `error-analysis`, `trend` | bounded aggregate/analysis roots linked to inputs; shared grade roots where those commands re-grade | 5 |
 | Publication and generated follow-up | `report`, `render-viewer`, `export-anthropic`, `suggest-cases` | publish/render commit; separate model invocation only when `--generate-cmd` is used | 5 |
+<!-- otel-command-inventory:end -->
 
 Manual answer runners, human judges, and arbitrary external commands cannot be
 made traceable retroactively. Their import boundary records either validated
@@ -92,46 +100,59 @@ without pretending the harness observed work that happened elsewhere.
 
 ## Repository prerequisites and landing order
 
-This order follows an audit of all 104 commits reachable from `main`, the 117
-additional commits on remote branch tips, and every open PR and issue as of
-2026-07-30. The history repeatedly succeeds by stabilizing a typed owner before
-instrumenting its callers; large cross-cutting changes are then rebased once,
-after their prerequisites, rather than repeatedly merged around one another.
+This is a commit-pinned snapshot, not a claim that mutable branch counts will
+remain current. The 2026-07-31 audit covered complete reachable history through
+`99da1f8`, every then-open PR (#47, #61, #62, #63, and #65), and every open issue
+(#37, #48, #49, #52, and #64). The history repeatedly succeeds by stabilizing a
+typed owner before instrumenting its callers; cross-cutting changes are then
+rebased once after their prerequisites.
 
 Current status and remaining order:
 
-1. [#60](https://github.com/adewale/skill-eval-harness/pull/60), the focused
-   `ty` gate, and [#59](https://github.com/adewale/skill-eval-harness/pull/59),
-   the first version of this roadmap, are on `main` as `69ebeb1` and `b4d47ac`.
-2. Land [#57](https://github.com/adewale/skill-eval-harness/pull/57), the fail-closed
-   evidence construction change. It rewrites the shared invocation, artifact,
-   trigger, judge, and telemetry seams that later spans must wrap.
-3. Rebase and land [#58](https://github.com/adewale/skill-eval-harness/pull/58)
-   on #57, closing [#55](https://github.com/adewale/skill-eval-harness/issues/55).
-   The branches currently conflict in the grading owner and six documentation
-   files; resolving once in this direction makes the narrower Unicode contract
-   adapt to the new fail-closed construction boundary.
-4. Reconcile draft [#61](https://github.com/adewale/skill-eval-harness/pull/61)
-   after #57. Issue [#54](https://github.com/adewale/skill-eval-harness/issues/54)
-   was administratively closed when #59 linked the intended resolution, but the
-   runtime fix is not on `main`. If #57 already proves the complete/incomplete
-   denominator and exit-status contract, close #61 as superseded; otherwise
-   rebase it and retain only the missing reporting boundary. Do not land both
-   competing implementations unchanged.
+1. [#60](https://github.com/adewale/skill-eval-harness/pull/60), the focused `ty`
+   gate; [#59](https://github.com/adewale/skill-eval-harness/pull/59), the first
+   roadmap; [#57](https://github.com/adewale/skill-eval-harness/pull/57), the
+   fail-closed evidence/design boundary; and
+   [#58](https://github.com/adewale/skill-eval-harness/pull/58), the Unicode-safe
+   comparison boundary, are on `main` through `99da1f8`. #58 closed
+   [#55](https://github.com/adewale/skill-eval-harness/issues/55).
+2. Land this audited roadmap in
+   [#63](https://github.com/adewale/skill-eval-harness/pull/63) so later runtime
+   rebases share the corrected artifact graph and OTel contracts.
+3. Rebase and land [#61](https://github.com/adewale/skill-eval-harness/pull/61).
+   #57 fixed incomplete denominators and nullable public rates, but #61 remains
+   the typed complete/incomplete/empty cohort owner plus the explicit terminal
+   output and nonzero-exit contract. It completes the user-visible/runtime work
+   behind the already-closed
+   [#54](https://github.com/adewale/skill-eval-harness/issues/54); it is not
+   superseded by #57.
+4. Rebase and land [#65](https://github.com/adewale/skill-eval-harness/pull/65),
+   the unified backend registry prompted by
+   [#52 item 4](https://github.com/adewale/skill-eval-harness/issues/52). OTel
+   conformance must enumerate that registry/capability model rather than only
+   parser subcommands, so a new backend cannot miss answer, trigger, judge,
+   workspace, trace, smoke, or privacy policy on one surface.
 5. Rebase and land [#47](https://github.com/adewale/skill-eval-harness/pull/47)
-   last among the current runtime branches. It is based before #50–#53 and
-   conflicts with #57/#58 in `skill_benchmark.py` and shared docs; one final
-   rebase preserves its live Jetty evidence without repeatedly resolving the
-   same ownership changes.
+   after repairing its current Python 3.12 failure. Preserve its token-backed
+   live Jetty evidence while adapting the old branch to the typed evidence and
+   unified-registry owners.
+6. Complete the relevant [#64](https://github.com/adewale/skill-eval-harness/issues/64)
+   type-clean slices and [#52 item 5](https://github.com/adewale/skill-eval-harness/issues/52)
+   typed judge-invocation result before instrumenting those central-CLI regions.
+7. Rebase and preferably split [#62](https://github.com/adewale/skill-eval-harness/pull/62)
+   over #65 and the typed judge boundary. Agy then joins answer, trigger, judge,
+   telemetry, privacy, and conformance coverage by registry capability. If #62
+   lands after an OTel slice, add Agy in a focused parity PR rather than weakening
+   an already-passing gate.
 
-Slices 0–1 may begin after steps 2–3. Slice 2 also depends on #57's prepared-task
-and artifact identities. Slice 3 requires the trigger completeness contract from
-#57 or the reconciled #61, the rebased #47 live Jetty contract, and an atomic
-owner for `import-trace` / `migrate-telemetry` augmentation. Slice 4 additionally
-requires the typed judge-invocation result from
-[#52 item 5](https://github.com/adewale/skill-eval-harness/issues/52); adding
-span lifecycle to the current untyped backend/parse/merge dictionary would make
-that boundary harder to close later.
+Slice 0 may begin after #63 because its facade is isolated and type-clean. Slice
+1 waits for the runner/artifact portion of #64 or an explicit proof that the
+identity-aware `ty` regression gate introduces no new diagnostic. Slice 2 applies
+the same rule to command/control-plane code. Slice 3 requires #61, #65, the
+rebased #47 live Jetty contract, and an atomic owner for `import-trace` /
+`migrate-telemetry` augmentation. Slice 4 additionally requires #52 item 5;
+adding span lifecycle to the current untyped backend/parse/merge dictionary
+would make that boundary harder to close later.
 
 The remaining issues are sequenced by when they change telemetry identity:
 
@@ -141,14 +162,19 @@ The remaining issues are sequenced by when they change telemetry identity:
   lands later, that parity extension is a separate PR with the same conformance
   gate.
 - [#49](https://github.com/adewale/skill-eval-harness/issues/49), composition
-  attribution, follows #48. If it lands before Slice 2, run-group and preparation
+  attribution, can operate under today's forced-skill mode and therefore does
+  not strictly depend on #48. Landing #48 first is preferred because the two
+  identities intersect. If #49 lands before Slice 2, run-group and preparation
   identity include a bounded composition-arm/component-set digest from the
-  start; otherwise it gets a focused identity extension before Slice 5. Component
-  names never become span names or an unbounded attribute list.
-- [#52 item 4](https://github.com/adewale/skill-eval-harness/issues/52) becomes
-  mandatory before OTel would otherwise add parallel hooks to the answer,
-  trigger, and judge registries; avoid creating a fourth registry-spanning rule.
-  Items 1–3 already shipped in #53 and should be checked off independently.
+  start; otherwise it gets a focused identity extension before Slice 5.
+  Component names never become span names or an unbounded attribute list.
+- [#52 item 4](https://github.com/adewale/skill-eval-harness/issues/52) is now
+  represented by #65 and must land before backend-specific OTel hooks. Items 1–3
+  shipped in #53; item 5 remains the Slice 4 typed-result prerequisite.
+- [#64](https://github.com/adewale/skill-eval-harness/issues/64) records the 38
+  diagnostics that remain in the central CLI after #58. It does not block the
+  new type-clean facade, but its runner, command, grading, judge, and reporting
+  regions should become clean before the corresponding OTel slice edits them.
 - [#37](https://github.com/adewale/skill-eval-harness/issues/37) is upstream-
   capability-driven and is not on the OTel critical path. Missing Vibe usage,
   schema enforcement, or native telemetry stays explicitly unavailable; OTel
@@ -183,15 +209,16 @@ are still evolving. The implementation should pin its instrumentation schema and
 use standard `gen_ai.*` attributes only where the harness knows their exact
 meaning; harness identity stays under `skill.eval.*`.
 
-### Flue active-branch audit
+### Flue branch-history audit
 
-The 2026-07-30 audit inspected all remote branches. Only
-[`main` at `b814b82b`](https://github.com/withastro/flue/commit/b814b82b2ce45dc941c77bb010140070e1bd48d5)
-and [`snapshot` at `4b29e770`](https://github.com/withastro/flue/commit/4b29e770929e6ed919f430d2ef0e34e4b8780121)
-contain `packages/opentelemetry`; their OTel, runtime, and docs trees are identical
-apart from package version. Recent `redesign-02` and June WIP branches predate the
-implementation, and there were no open PRs. `main` is therefore the cited design,
-not one choice among competing active implementations.
+The 2026-07-31 audit inspected every public branch tree. There were no open Flue
+PRs, and [`main` at `b814b82b`](https://github.com/withastro/flue/commit/b814b82b2ce45dc941c77bb010140070e1bd48d5)
+is the latest design, so it remains the implementation cited below. It is not the
+only surviving OTel tree: [`redesign-02` at `2d387a91`](https://github.com/withastro/flue/tree/2d387a91bfd46b303158e46698fa7e8ac94771d3/packages/opentelemetry),
+[`wip/event-stream` at `d112d0b4`](https://github.com/withastro/flue/tree/d112d0b4609885be1a44f17975f47a1cbe594617/packages/opentelemetry),
+`v0.10`, `feat/invoke-console`, and several durable-agent branches preserve older,
+materially different iterations. Those branches are useful design history, not
+evidence of competing work currently proposed for merge.
 
 The transferable parts are:
 
@@ -233,11 +260,15 @@ The transferable parts are:
 Three cautions matter. Flue currently enables richer content than an eval harness
 should, so its capture defaults are not copied. Its OTel and Cloudflare adapters
 also classify cancellation differently, so the harness needs one explicit
-timeout/cancellation/error taxonomy before backend parity. Finally, the active
-nightly branches do not contain the OTel test tree; the last visible
-[historical in-memory-exporter suite](https://github.com/withastro/flue/blob/09b78e844d03376167c8f88ee0ee83556ca8b09a/packages/opentelemetry/test/index.test.ts#L103-L832)
-is a strong catalogue of hierarchy, privacy, concurrency, propagation, cleanup,
-and signal-failure cases, but not evidence that current public-branch CI runs them.
+timeout/cancellation/error taxonomy before backend parity. Finally, public side
+branches such as
+[`redesign-02`](https://github.com/withastro/flue/tree/2d387a91bfd46b303158e46698fa7e8ac94771d3/packages/opentelemetry/test)
+and [`wip/event-stream`](https://github.com/withastro/flue/tree/d112d0b4609885be1a44f17975f47a1cbe594617/packages/opentelemetry/test)
+preserve OTel tests, while the older
+[in-memory-exporter suite](https://github.com/withastro/flue/blob/09b78e844d03376167c8f88ee0ee83556ca8b09a/packages/opentelemetry/test/index.test.ts#L103-L832)
+remains the broadest visible catalogue of hierarchy, privacy, concurrency,
+propagation, cleanup, and signal-failure cases. They are historical test designs,
+not proof that current `main` CI runs the same suite.
 
 ## Slices 0–1: implementation-ready MVP
 
@@ -261,6 +292,10 @@ and signal-failure cases, but not evidence that current public-branch CI runs th
 - Enable CLI export only with `SKILL_EVAL_OTEL_ENABLED=1`. Reuse standard
   `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, and
   `OTEL_EXPORTER_OTLP_*` configuration rather than adding exporter-specific flags.
+- Honor standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` configuration
+  from the first exported span. Harness-owned carriers use W3C Trace Context
+  without baggage even if an application has configured a broader global
+  propagator; propagation policy is part of the privacy facade, not adapter code.
 - Set the default resource `service.name` to `skill-eval-harness` when the user has
   not supplied one.
 
@@ -298,8 +333,11 @@ In `invoke_argv_with_timeout`, copy the task environment, inject the active W3C
 context into that copy, and pass it to the subprocess. Never mutate the parent
 process environment, and do not propagate baggage in this slice.
 
+Capture the attempt root's `SpanContext` before entering the artifact-write child.
 Before the atomic artifact commit, add this content-free correlation block to
-`metadata.json` when the span is recording:
+`metadata.json` whenever that context is valid. `IsRecording` and the sampled bit
+do not control propagation: an unsampled valid context is still persisted with
+flags `00`, while a disabled/no-provider invalid context produces no block.
 
 ```json
 {
@@ -311,11 +349,13 @@ Before the atomic artifact commit, add this content-free correlation block to
 ```
 
 Absence means unavailable, exactly like other optional telemetry. Grading must
-not require this block. Add `otel_tracestate` only when the propagator produced a
-validated non-empty value. The W3C carrier leaves a valid correlation token for
-later, separately executed grading without putting prompt or result content into
-metadata. Validate every field before persistence and again before reactivation;
-malformed context is unavailable, not partially used.
+not require this block. Persist `traceparent` only in the MVP: vendor-opaque
+`tracestate` is not inherently content-free and must not cross a durable or
+external trust boundary by default. A future same-trust-domain policy may retain
+filtered, size-bounded, provenance-labelled entries, but external/manual imports
+never reactivate arbitrary `tracestate`. Parse a persisted `traceparent` into a
+validated context for a link; do not reactivate an ended attempt as the parent of
+later grading. Malformed context is unavailable, not partially used.
 
 #### Error and privacy rules
 
@@ -342,9 +382,10 @@ change.
 
 ### Slice 2: control plane and durable handoffs
 
-**Entry:** slice 0 has shipped, and #57's prepared-task, experiment, and artifact
-identities are stable. Observability metadata is explicitly excluded from task,
-treatment, and eval-contract digests so tracing cannot change experimental
+**Entry:** slice 0 has shipped, and #57's prepared-task, `answer-design.json`,
+judge-input, experiment, and artifact identities are stable. Observability
+metadata is explicitly excluded from task, treatment, answer-design,
+judge-input, and eval-contract digests so tracing cannot change experimental
 identity.
 
 Cover work that can stop or branch before an answer attempt exists:
@@ -355,9 +396,11 @@ Cover work that can stop or branch before an answer attempt exists:
   trace.
 - Create `skill.eval.run_group.id` at `suite-run` or `prepare`, accept a
   caller-supplied validated ID when orchestration already owns one, and persist
-  it in `RUN_SCOPE.json` plus a versioned, content-free preparation sidecar.
-  Do not put W3C context into the experimental/task digest or reactivate an old
-  prepare span as the parent of work performed days later.
+  it in `RUN_SCOPE.json` plus a versioned, content-free preparation sidecar keyed
+  by the authoritative `answer-design.json` `design_sha256`. Do not add tracing
+  fields to `answer-design.json` or include them in `design_sha256`,
+  `eval_contract_sha256`, task, treatment, or instruction digests. Do not
+  reactivate an old prepare span as the parent of work performed days later.
 - Add bounded operations for manifest validation, readiness audit, pin and
   budget gates, ablation materialization, task preparation, Jetty export, and
   blind-comparison task export. Persist the run group and input/output digests at
@@ -379,12 +422,13 @@ digests, or output when OTel is disabled.
 
 ### Slice 3: execution, remote orchestration, and ingestion parity
 
-**Entry:** slices 0–2 have shipped, the answer trace is stable across concurrent
-Claude, Codex, and Vibe fixture runs, at least one real child runner has proved
-W3C parentage, trigger completeness is correct on the post-#57/#61 contract,
-and the rebased #47 is the Jetty source of truth. `import-trace` and
-`migrate-telemetry` must first have one atomic artifact-augmentation owner that
-refreshes or deliberately retires the existing commit marker.
+**Entry:** slices 0–2 have shipped, #65's unified backend registry is the source
+of tracing capability, the answer trace is stable across every registered
+answer backend fixture, at least one real child runner has proved W3C parentage,
+trigger completeness uses #61's typed cohort contract, and the rebased #47 is
+the Jetty source of truth. `import-trace` and `migrate-telemetry` must first have
+one atomic artifact-augmentation owner that refreshes or deliberately retires
+the existing commit marker.
 
 Add the remaining live execution producers while retaining one root per attempt:
 
@@ -407,30 +451,32 @@ Add the remaining live execution producers while retaining one root per attempt:
   correlation without replacing the originating attempt context. Invalid or
   absent producer context is an explicit availability state.
 - Accept manual/person-written and arbitrary external answer contracts at the
-  same boundary. Valid supplied correlation may be linked; otherwise the ingest
-  trace records `unavailable`. The harness never invents a remote attempt span.
+  same boundary. A valid supplied `traceparent` may be linked; untrusted
+  `tracestate` is discarded, and absent/invalid correlation records
+  `unavailable`. The harness never invents a remote attempt span.
 - Reuse `invoke_argv_with_timeout` and `write_runner_outcome` so subprocess,
   error, privacy, and artifact semantics do not fork by adapter.
 - Key active spans by the complete prepared-task identity, suppress duplicate
   starts, and end any still-open owned children on timeout/cancellation/attempt
   completion. Never keep one process-global “current run.”
 
-**Exit:** a shared conformance suite proves the same attempt identity, error
-taxonomy, secret allowlist, concurrency isolation, and artifact correlation for
-every runner that claims tracing support. Unsupported remote propagation is
-reported as unavailable, never silently fabricated. Owner completion also proves
-that no descendant span remains open after interruption. The #54 runtime gap is
-proved resolved by #57 or the reconciled #61, and the rebased #47 live contract
-is the source of truth for Jetty submission, polling, artifact commit, and
-failure states. Import and migration failure leaves the previous committed
-artifact set and its producer correlation intact.
+**Exit:** a registry-driven conformance suite proves the same attempt identity,
+error taxonomy, secret allowlist, concurrency isolation, and artifact
+correlation for every backend capability that claims tracing support; every
+other capability declares an explicit unavailable reason. Unsupported remote
+propagation is never fabricated. Owner completion also proves that no descendant
+span remains open after interruption. #61 proves the remaining #54 runtime
+contract, and the rebased #47 live contract is the source of truth for Jetty
+submission, polling, artifact commit, and failure states. Import and migration
+failure leaves the previous committed artifact set and its producer correlation
+intact.
 
 ### Slice 4: grading and judge lifecycle
 
 **Entry:** slices 1–2 correlation metadata is stable; grading can consume old or
-external runs whose metadata has no observability block; #58 has fixed the
-comparison view; and #52 item 5 has replaced the judge invocation dictionary
-with a closed typed result.
+external runs whose metadata has no observability block; #58's comparison view
+is on `main`; and #52 item 5 has replaced the judge invocation dictionary with a
+closed typed result.
 
 Instrument work that may happen minutes or days after generation without making
 one misleading long-lived trace:
@@ -438,12 +484,20 @@ one misleading long-lived trace:
 - Instrument the shared `grade_case_variant` ownership boundary, not only the
   `grade` command. Every logical grading of one discovered run therefore creates
   one bounded `skill.eval.grade` root whether invoked by `grade`, `benchmark`,
-  `token-overhead`, `export-anthropic`, `aggregate`, or a run-aware audit. Link
-  it to the evaluated run context from `metadata.json` when present.
+  `judge` task reconstruction, `token-overhead`, `export-anthropic`, `aggregate`,
+  or a run-aware audit. Link it to the evaluated run context from `metadata.json`
+  when present.
 - Identify a re-grade by a content-free digest over the committed run identity,
-  manifest/assertion contract, strict/script/embed policy, and judge-result set.
-  The same run graded under a changed manifest is a new evaluation, not the old
-  grade trace reused under a misleading ID.
+  authoritative answer design, manifest/assertion contract, strict/script/embed
+  policy, and validated `judge_input_sha256`/judge-result set. Reuse those #57
+  identities rather than defining an observability-only digest. The same run
+  graded under a changed manifest is a new evaluation, not the old grade trace
+  reused under a misleading ID.
+- When `--allow-scripts` or `--embed-cmd` actually invokes an external oracle,
+  create a bounded `skill.eval.grade.external.invoke` child with an enumerated
+  `script_assertion` or `embedding` kind. Record no command, path, assertion
+  label, input, output, or embedding vector. Operational subprocess failure is
+  an OTel error; an oracle's pass/fail/score remains evaluation data.
 - Trace judge-task emission and optional `judge-tasks.jsonl` commit separately
   from invocation. `judge` reconstructing tasks from manifest+runs must produce
   the same task identity as `grade --judge-tasks`.
@@ -478,10 +532,12 @@ Cover every consumer of committed run, judge, trigger, and benchmark artifacts
 without creating a giant all-or-nothing trace:
 
 - Add bounded aggregate roots for `benchmark`, `aggregate`, `trigger-compare`,
-  `cost-summary`, and `token-overhead`. They link to contributing grade,
-  trigger, or run contexts and record counts plus complete/partial/blocked state;
-  they never attach arrays of case IDs or make thousands of grade traces their
-  children.
+  `cost-summary`, and `token-overhead`. Before root creation, select at most 32
+  contributing grade, trigger, or run contexts by one documented deterministic
+  rule and provide those links at span creation. Record `input.count`,
+  `linked.count`, and `links.omitted.count`; keep the complete input-digest
+  inventory in the output artifact/sidecar. They never attach arrays of case IDs,
+  grow an O(N) link list, or make thousands of grade traces their children.
 - Give `compare-results`, `compare-judges`, `judge-alignment`, `contamination`,
   `error-analysis`, and `trend` bounded analysis/import roots. A finding,
   regression, contamination hit, or poor agreement is domain data, not an OTel
@@ -517,8 +573,10 @@ experiment size.
 observed operational questions rather than speculation.
 
 - Add low-cardinality attempt counts and duration/error histograms for harness
-  operations. Do not re-export provider token/cost values already represented by
-  native spans or canonical artifacts.
+  operations. The metric allowlist is separate from trace attributes and
+  explicitly excludes case, run-group, repetition, task, model, panel, and
+  digest identities. Do not re-export provider token/cost values already
+  represented by native spans or canonical artifacts.
 - Correlate existing structured warnings/errors with active trace and span IDs
   before considering an OTel log exporter. Routine evaluation failures remain
   data, not error logs.
@@ -526,9 +584,9 @@ observed operational questions rather than speculation.
   projection and pass the same conformance fixtures, even when its span-opening
   mechanics differ. Disable overlapping provider auto-instrumentation rather
   than emitting two model spans for one call.
-- Document Collector-based OTLP deployment, batching, resource attributes,
-  sampling, and exporter-health checks. The harness supplies safe defaults and
-  examples; operators retain sampling and retention policy.
+- Document Collector-based OTLP deployment, batching, resource attributes, and
+  exporter-health checks. Slice 0 already owns sampler configuration and
+  propagation tests; operators retain sampling and retention policy.
 - Publish vendor-neutral query recipes for runner latency, operational error
   rate, missing propagation, and export failures. Vendor-specific dashboards can
   live outside core.
@@ -558,7 +616,9 @@ Use the SDK's in-memory exporter; no live collector or model call belongs in CI.
 2. A successful fake native run produces the exact three-span tree and leaves
    span status unset.
 3. The runner child receives an isolated `TRACEPARENT` whose trace ID matches the
-   committed `otel_traceparent`; a sibling task receives a different parent span.
+   attempt-root context committed as `otel_traceparent`; a sibling task receives
+   a different parent span, and the artifact-write child ID is never persisted as
+   the attempt identity.
 4. Timeout and nonzero exit set `Error` plus the expected bounded `error.type`;
    an assertion failure does not.
 5. Span attributes pass an explicit allowlist test, including a sentinel secret
@@ -569,6 +629,11 @@ Use the SDK's in-memory exporter; no live collector or model call belongs in CI.
 8. `ty check` passes with `observability.py` in the project-owned include and no
    OTel-specific broad ignore; an optional-SDK-disabled run follows the same
    typed facade as an exporting run.
+9. `always_off` sampling exports no spans but propagates and persists a valid
+   flags-`00` attempt context; sampled roots export normally; an unsampled remote
+   parent and an independently sampled linked root follow documented policy.
+10. Baggage and `tracestate` sentinels reach neither durable artifacts nor an
+    external/manual reactivation boundary; malformed context becomes unavailable.
 
 ## End-to-end acceptance gates
 
@@ -579,19 +644,25 @@ default CI.
    completed command trace with `outcome=blocked`, no attempt traces, no content
    attributes, and the same exit/artifact behavior with OTel disabled.
 2. `prepare` and a later `run-agent` in separate processes share a run group but
-   not a parent span. Observability metadata does not change task, treatment, or
-   eval-contract digests.
-3. Fake native, subagent, trigger, Pi, and Jetty runners pass one conformance
+   not a parent span. The preparation sidecar binds the exact
+   `answer-design.json` digest, while observability metadata changes none of the
+   answer-design, task, treatment, instruction, or eval-contract digests.
+   Missing, stale, duplicated, or extra design rows remain `partial` and cannot
+   publish aggregate headlines merely because tracing succeeded.
+3. Every capability in #65's backend registry either passes one conformance
    matrix for identity, error taxonomy, W3C availability, secret filtering,
-   cancellation cleanup, and artifact correlation.
+   cancellation cleanup, and artifact correlation or declares tracing
+   unavailable with a bounded reason. A new backend value fails this gate until
+   one of those states is explicit.
 4. Jetty submit/poll, remote trace linking, result import, `import-trace`, and
    `migrate-telemetry` each preserve the previous committed artifact set under
    injected validation/write failure; successful augmentation commits a new
    correlation entry without overwriting the producer entry.
-5. Grading one run through `grade`, `benchmark`, `token-overhead`,
-   `export-anthropic`, and `aggregate` produces the same grade identity and
-   evaluation semantics. Changing an assertion or judge-result digest produces
-   a distinct re-grade identity.
+5. Grading one run through `grade`, `judge` reconstruction, `benchmark`,
+   `token-overhead`, `export-anthropic`, and `aggregate` produces the same grade
+   identity and evaluation semantics. Changing answer design, assertion,
+   `judge_input_sha256`, or judge-result digest produces a distinct re-grade
+   identity. Opt-in script/embed subprocesses use content-free child spans.
 6. `grade --judge-tasks` and `judge` reconstruction yield the same task IDs;
    repeats/panels remain distinct invocations; external and human verdicts merge
    with valid correlation or explicit absence; prompts and rubrics never appear
@@ -600,20 +671,22 @@ default CI.
    gate, and poor judge-alignment result remain domain outcomes rather than OTel
    errors. Malformed inputs and failed artifact commits are errors.
 8. A large synthetic multi-model, multi-repeat suite proves constant trace size:
-   command/aggregate roots link to bounded attempt/grade roots, published
-   artifacts retain the run group, and no span carries an unbounded identity or
-   content list.
-9. The executable documentation guard continues to require every parser
-   subcommand and standalone entry point in the coverage inventory before CI can
-   pass.
+   each aggregate has at most 32 deterministic links, records total/linked/omitted
+   counts, retains the full input digest inventory and run group in artifacts,
+   and carries no unbounded identity or content list.
+9. Metrics expose only their signal-specific low-cardinality allowlist, and log
+   correlation sentinel tests prove no eval content reaches structured messages.
+10. The executable documentation guard derives parser subcommands and installed
+    console scripts, requires each exactly once inside the delimited coverage
+    inventory, and rejects phantom or duplicate command assignments.
 
 ## Delivery units
 
 Each numbered slice is a separate review and release decision. Slices 0–1 may
 share one focused implementation PR if it stays reviewable:
 
-1. after #57 and #58 land, add the optional dependency, typed facade, packaging,
-   and no-op tests;
+1. on the merged #57/#58 foundation, add the optional dependency, typed facade,
+   packaging, sampler policy, and no-op tests;
 2. instrument the shared native answer path and subprocess propagation;
 3. persist trace correlation and add the acceptance tests; and
 4. document one local OTLP example plus the privacy/default behavior.

@@ -10,8 +10,9 @@ source of truth and make the sync executable —
   * identity tests pin that a runner's helper IS the harness's function, so a
     re-fork shows up as a failing `assertIs`, not as silent drift;
   * source scans pin that single-owner literals are not re-spelled;
-  * doc-coverage tests enumerate the CLI/assertion surface from the parser and
-    registries and require the README to mention every member.
+  * doc-coverage tests enumerate CLI/assertion surfaces from the parser,
+    packaging metadata, and registries and require their owning docs to mention
+    every member exactly where promised.
 """
 import inspect
 import json
@@ -33,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 COMMAND_REFERENCE = (ROOT / "docs" / "commands.md").read_text(encoding="utf-8")
 OTEL_PLAN = (ROOT / "docs" / "otel-support-plan.md").read_text(encoding="utf-8")
+PYPROJECT = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
 
 class SharedOwnerIdentityTests(unittest.TestCase):
@@ -329,11 +331,38 @@ class DocSyncTests(unittest.TestCase):
     def test_otel_roadmap_accounts_for_every_cli_surface(self):
         parser = sb.build_arg_parser()
         subs = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
-        missing = [cmd for cmd in subs.choices if f"`{cmd}`" not in OTEL_PLAN]
-        for entry_point in ("skill-trigger-matrix", "skill-pi-trigger-eval"):
-            if f"`{entry_point}`" not in OTEL_PLAN:
-                missing.append(entry_point)
-        self.assertFalse(missing, f"CLI surfaces absent from the OTel coverage inventory: {missing}")
+        parser_commands = set(subs.choices)
+
+        scripts_match = re.search(
+            r"(?ms)^\[project\.scripts\]\s*$\n(?P<body>.*?)(?=^\[|\Z)",
+            PYPROJECT,
+        )
+        self.assertIsNotNone(scripts_match, "pyproject.toml has no [project.scripts] table")
+        console_scripts = set(
+            re.findall(r"(?m)^([A-Za-z0-9_.-]+)\s*=", scripts_match.group("body"))
+        )
+        standalone_scripts = console_scripts - {"skill-benchmark"}
+
+        start = "<!-- otel-command-inventory:start -->"
+        end = "<!-- otel-command-inventory:end -->"
+        self.assertEqual(OTEL_PLAN.count(start), 1, "OTel inventory needs one start marker")
+        self.assertEqual(OTEL_PLAN.count(end), 1, "OTel inventory needs one end marker")
+        inventory = OTEL_PLAN.split(start, 1)[1].split(end, 1)[0]
+        table_rows = [line for line in inventory.splitlines() if line.startswith("|")][2:]
+        assigned = []
+        for row in table_rows:
+            cells = row.split("|")
+            self.assertGreaterEqual(len(cells), 5, f"malformed OTel inventory row: {row}")
+            assigned.extend(re.findall(r"`([^`]+)`", cells[2]))
+
+        expected = parser_commands | standalone_scripts
+        duplicates = sorted({command for command in assigned if assigned.count(command) > 1})
+        self.assertEqual(
+            set(assigned),
+            expected,
+            "OTel command inventory must exactly match parser commands and console scripts",
+        )
+        self.assertFalse(duplicates, f"OTel command inventory assigns commands twice: {duplicates}")
 
     def test_every_assertion_type_is_documented_in_readme(self):
         types = sorted(sb.OBJECTIVE_ASSERTIONS | sb.QUALITATIVE_ASSERTIONS)

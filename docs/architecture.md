@@ -2,7 +2,7 @@
 
 The harness scores whether a skill changes a model's output. At minimum it runs the same
 case in a paired `with_skill` / `without_skill` experiment, then grades both runs with checks
-that call no model. Repetitions, model sweeps, and ablation arms extend that experiment
+that call no model by default. Repetitions, model sweeps, and ablation arms extend that experiment
 without changing the paired comparison at its centre. Everything in the system follows
 from that decision.
 
@@ -13,7 +13,7 @@ This doc shows how the pieces fit. For what each piece *is*, read
 
 The pipeline is an artifact graph, not one long process. A manifest branches into answer
 tasks, autonomous-trigger work, and static checks. Commands can run on different machines or
-days apart, and several commands call the same model-free grading owner directly rather than
+days apart, and several commands call the same grading owner directly rather than
 consume another command's report.
 
 ```mermaid
@@ -29,14 +29,19 @@ flowchart LR
     C --> IT[import-trace / normalize\noptional enrichment]
     IT --> C
 
-    C --> G[grade_case_variant\nshared model-free owner]
+    C --> G[grade_case_variant\nshared grading owner]
     G --> GO[grade output\noptional grading files / judge tasks]
     G --> B[benchmark\naggregated report]
-    G --> Q[judge task]
-    Q --> J[judge / human / external model]
+    G --> RC[regrading consumers\naggregate / token-overhead\nexport-anthropic]
+    C --> RA[direct run consumers\ncost-summary / contamination\nerror-analysis]
+    G --> Q[deferred judge task identity]
+    Q --> J[judge command\ninternal backend / external command]
+    Q --> EQ[optional exported queue]
+    EQ --> X[human / external workflow]
     J --> JR[judge-results]
+    X --> JR
     JR --> G
-    B --> PP[report / viewer / exports\naggregate and analysis]
+    B --> PP[report / viewer]
 
     M --> TR[autonomous trigger runners]
     TR --> TM[trigger reports]
@@ -49,11 +54,14 @@ and run-aware audit paths also reuse grading or benchmark construction directly.
 `grading.json` or `grade --out` report is therefore a review/export artifact, not a required
 handoff to `benchmark`.
 
-The model-free rule applies to `grade_case_variant` and report construction. Model calls live
-in explicit answer and trigger runners, the opt-in `judge` / `judge-robustness` paths, and
-`suggest-cases --generate-cmd`. A blind comparison can also be judged by a human or model
-outside the harness before `compare-results` imports the decisions. Jetty adds a networked
-control plane around a remote answer runner; import, grading, and reporting remain local.
+The default grading path and report construction are local and model-free. A `script`
+assertion with `--allow-scripts` or embedding assertion with `--embed-cmd` is an explicit,
+opt-in external oracle subprocess; the harness does not choose what that command runs.
+Model calls otherwise live in explicit answer and trigger runners, the opt-in `judge` /
+`judge-robustness` paths, and `suggest-cases --generate-cmd`. A blind comparison can also be
+judged by a human or model outside the harness before `compare-results` imports the decisions.
+Jetty adds a networked control plane around a remote answer runner; import and default grading
+remain local.
 
 ## Four axes, one grid
 
@@ -198,18 +206,22 @@ The key is the `judge_task_id` (`case::variant::run-n::assertion`, gaining a `mo
 a multi-model run so verdicts cannot collide across models). It lets results arrive out of
 band, from any model or human, and still land on the right assertion. Stored verdicts are parsed
 into strict boolean/scored/dimension/dynamic/consensus variants; duplicate IDs and contradictory
-score/threshold/pass fields are rejected. Deterministic checks run first; the judge handles only
-what a keyword or regex cannot.
+score/threshold/pass fields are rejected. Every task and result also carries
+`judge_input_sha256`, a digest of the exact rendered judge input; a matching task ID with stale
+prompt, evidence, or candidate output is rejected rather than silently reused. Deterministic
+checks run first; the judge handles only what a keyword or regex cannot.
 
 ## Where grading stays honest
 
 Three properties hold across the whole pipeline, and every feature — the roadmap included — is
 built to preserve them:
 
-- **Grading is local and deterministic.** `grade_case_variant` reads files and applies checks.
-  No network, no model. A re-grade after editing an assertion costs nothing. A test guard
+- **Default grading is local and deterministic.** `grade_case_variant` reads files and applies
+  in-process checks. No network, no model. A re-grade after editing an assertion costs nothing.
+  The explicit `--allow-scripts` and `--embed-cmd` oracle modes may invoke a caller-supplied
+  subprocess. A test guard
   (`test_confidence_floor.py`) patches `subprocess`/`urllib` to raise and proves the grade path
-  completes without either.
+  completes without either when those modes are disabled.
 - **The harness picks no model.** Judge and runner models are yours to supply. The tool scores
   outputs; it does not decide who produces them.
 - **Generation is answer-key-safe.** `prepare` omits expected behavior and rubrics unless you
