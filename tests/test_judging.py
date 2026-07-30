@@ -893,6 +893,19 @@ class CrossJudgeConsensusTests(unittest.TestCase):
         self.assertEqual(sb.effective_judge_models({}, None, "cli"), ["cli"])
         self.assertEqual(sb.effective_judge_models({}, None, None), [])
 
+    def test_effective_judge_models_rejects_duplicates_before_calls(self):
+        with self.assertRaises(SystemExit):
+            sb.effective_judge_models({}, ["same", "same"])
+
+    def test_judge_task_identity_rejects_ambiguous_delimiter_segments(self):
+        assertion = {"name": "j", "type": "judge"}
+        with self.assertRaisesRegex(ValueError, "delimiter"):
+            sb.judge_task_id(
+                "a::b", "with_skill", 1, assertion, model="c")
+        with self.assertRaisesRegex(ValueError, "delimiter"):
+            sb.judge_task_id(
+                "a", "with_skill", 1, assertion, model="b::c")
+
     def test_consensus_row_joins_like_a_single_verdict(self):
         jassert = {"name": "j", "type": "judge", "severity": "gate"}
         jid = sb.judge_task_id("c", "with_skill", 1, sb.expand_judge_preset(jassert))
@@ -1369,6 +1382,7 @@ class StrictJudgeVerdictTests(unittest.TestCase):
             [valid, valid],
             [{"passed": True}],
             [{**valid, "id": "other"}],
+            [{**valid, "judge_task_id": "1", "id": 1}],
             [{**valid, "passed": "false"}],
             [valid, "not-an-object"],
         ]

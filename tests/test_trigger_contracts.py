@@ -381,6 +381,13 @@ class TriggerObservationTruthTableTests(unittest.TestCase):
         row["adapter_tag"] = "forged"
         with self.assertRaisesRegex(ValueError, "disagrees"):
             TriggerObservation.from_row(row)
+        row = self._observation(
+            usage={"source": "missing"}, cost={"source": "missing"},
+        ).as_row()
+        row["invocation_metadata"] = {"score": 1}
+        row["score"] = True
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            TriggerObservation.from_row(row)
 
     def test_metadata_rejects_non_string_keys_and_nonfinite_values(self):
         for metadata in ({1: "bad key"}, {"score": float("nan")}):
@@ -400,6 +407,27 @@ class TriggerObservationTruthTableTests(unittest.TestCase):
                     detection=base.detection, usage=base.usage, cost=base.cost,
                     metadata=metadata,
                 )
+        for constructor in (
+            lambda: InvocationOutcome.from_process(
+                stdout="", stderr="", returncode=0, elapsed_ms=1,
+                metadata=[]),
+            lambda: InvocationOutcome.harness_failed("failed", metadata=[]),
+        ):
+            with self.assertRaises(TypeError):
+                constructor()
+
+    def test_cost_pricing_notes_are_recursively_immutable(self):
+        notes = ["pinned provider table"]
+        observation = self._observation(
+            usage={"source": "missing"},
+            cost={
+                "source": "provider_reported", "total_cost": 0.0,
+                "currency": "USD", "pricing_notes": notes,
+            },
+        )
+        notes.append("mutated after construction")
+        self.assertEqual(
+            observation.cost["pricing_notes"], ("pinned provider table",))
 
     def test_partial_or_invalid_repetition_identity_is_rejected(self):
         row = self._observation(

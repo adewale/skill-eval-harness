@@ -416,10 +416,10 @@ class TrendTrackingTests(unittest.TestCase):
         # A critical failure in 1 of 2 runs (0.5 x 3 = 1.5) outranks a soft
         # failure in 2 of 2 runs (1.0 x 1 = 1.0).
         fail_critical = {"case_id": "c-crit", "variant": "with_skill", "missing_output": False, "execution_valid": True,
-                         "objective_pass_rate": 0.0, "metadata": {},
+                         "objective_pass_rate": 0.0, "metadata": {}, "grading_availability": "complete",
                          "assertions": [{"name": "guard", "passed": False, "severity": "critical"}], "qualitative_assertions": []}
         fail_soft = {"case_id": "c-soft", "variant": "with_skill", "missing_output": False, "execution_valid": True,
-                     "objective_pass_rate": 1.0, "metadata": {},
+                     "objective_pass_rate": 1.0, "metadata": {}, "grading_availability": "complete",
                      "assertions": [{"name": "styling", "passed": False, "severity": "soft"}], "qualitative_assertions": []}
         run1 = {"availability": "complete", "results": [fail_critical, fail_soft]}
         run2 = {"availability": "complete", "results": [fail_soft]}
@@ -506,10 +506,10 @@ class ErrorAnalysisTests(unittest.TestCase):
         report = {
             "availability": "complete",
             "results": [
-                {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "x", "passed": True}], "qualitative_assertions": []},
-                {"case_id": "c1", "variant": "without_skill", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "type": "contains", "passed": False, "evidence": "missing"}], "qualitative_assertions": []},
-                {"case_id": "c2", "variant": "without_skill", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "type": "contains", "passed": False, "evidence": "missing"}], "qualitative_assertions": []},
-                {"case_id": "c3", "variant": "with_skill", "missing_output": True, "assertions": [], "qualitative_assertions": []},
+                {"case_id": "c1", "variant": "with_skill", "grading_availability": "complete", "objective_pass_rate": 1.0, "assertions": [{"name": "x", "passed": True}], "qualitative_assertions": []},
+                {"case_id": "c1", "variant": "without_skill", "grading_availability": "complete", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "type": "contains", "passed": False, "evidence": "missing"}], "qualitative_assertions": []},
+                {"case_id": "c2", "variant": "without_skill", "grading_availability": "complete", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "type": "contains", "passed": False, "evidence": "missing"}], "qualitative_assertions": []},
+                {"case_id": "c3", "variant": "with_skill", "grading_availability": "complete", "missing_output": True, "assertions": [], "qualitative_assertions": []},
             ],
             "case_flags": [{"case_id": "c1", "flags": ["saturated/non-discriminating", "flaky repeated pass rates: with_skill"]}],
         }
@@ -524,9 +524,9 @@ class ErrorAnalysisTests(unittest.TestCase):
 
     def test_execution_error_critical_and_judge_categories(self):
         report = {"availability": "complete", "results": [
-            {"case_id": "c1", "variant": "with_skill", "execution_valid": False, "assertions": [], "qualitative_assertions": []},
-            {"case_id": "c2", "variant": "with_skill", "vetoed": True, "critical_failures": ["wrote-outside-results"], "assertions": [], "qualitative_assertions": []},
-            {"case_id": "c3", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "ok", "passed": True}],
+            {"case_id": "c1", "variant": "with_skill", "grading_availability": "complete", "execution_valid": False, "assertions": [], "qualitative_assertions": []},
+            {"case_id": "c2", "variant": "with_skill", "grading_availability": "complete", "vetoed": True, "critical_failures": ["wrote-outside-results"], "assertions": [], "qualitative_assertions": []},
+            {"case_id": "c3", "variant": "with_skill", "grading_availability": "complete", "objective_pass_rate": 1.0, "assertions": [{"name": "ok", "passed": True}],
              "qualitative_assertions": [{"name": "rubric", "type": "judge", "passed": False, "evidence": "weak"}]},
         ], "case_flags": []}
         out = sb.error_analysis_report(report)
@@ -538,6 +538,7 @@ class ErrorAnalysisTests(unittest.TestCase):
     def test_review_queue_limit_truncates(self):
         report = {"availability": "complete", "results": [
             {"case_id": f"c{i}", "variant": "without_skill", "objective_pass_rate": 0.0,
+             "grading_availability": "complete",
              "assertions": [{"name": "x", "type": "contains", "passed": False}], "qualitative_assertions": []}
             for i in range(5)
         ], "case_flags": []}

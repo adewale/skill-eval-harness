@@ -117,7 +117,7 @@ from trigger_contracts import (
 VALID_SPLITS = {"tune", "holdout", "holdback"}
 HARNESS_SEMANTIC_MODULES = (
     "ablation_model.py", "agent_capabilities.py", "experimental_pairs.py",
-    "jetty_contracts.py", "judge_verdict.py", "run_pi_trigger_eval.py",
+    "jetty_contracts.py", "judge_verdict.py", "json_contracts.py", "run_pi_trigger_eval.py",
     "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
     "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
 )
@@ -1020,10 +1020,14 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         # A manifest panel (judge.panel / judge.models) activates cross-judge consensus
         # (G3) with no CLI flag, so validate its shape like every other activation field.
         for pfield in ("panel", "models"):
-            if pfield in judge_cfg and (not isinstance(judge_cfg.get(pfield), list)
-                                        or not judge_cfg.get(pfield)
-                                        or not all(isinstance(m, str) and m for m in judge_cfg[pfield])):
-                die(f"manifest.judge.{pfield} must be a non-empty list of non-empty model-name strings")
+            if pfield in judge_cfg:
+                panel = judge_cfg.get(pfield)
+                if (not isinstance(panel, list) or not panel
+                        or not all(isinstance(model, str) and model for model in panel)
+                        or len(panel) != len(set(panel))):
+                    die(
+                        f"manifest.judge.{pfield} must be a non-empty list "
+                        "of unique non-empty model-name strings")
         if "panel" in judge_cfg and "models" in judge_cfg:
             die("manifest.judge may set panel or models, not both")
     datasets = manifest.get("datasets")
@@ -1474,6 +1478,8 @@ def prepared_task_rows(
                 if population == "trigger":
                     continue
                 aid = ablation_id_of(variant)
+                if aid is None:
+                    raise ValueError(f"invalid ablation variant {variant!r}")
                 if aid in trees:
                     # Materialized: carry the arm's TYPED provenance straight through —
                     # no dict round-trip, no re-parse (the drop-then-reparse is gone).
@@ -1483,7 +1489,8 @@ def prepared_task_rows(
                 else:
                     # Instruction-simulated: no tree, original skill mounted; its typed
                     # record is the sibling InstructionSimulated, not a Provenance.
-                    record = InstructionSimulated(id=aid, population=population)
+                    record = InstructionSimulated(
+                        id=aid, population=Population(population))
             for run_number in range(1, runs_per_variant + 1):
                 for model in model_list:
                     prefix = f"{case['id']}/{model}" if (model and multi_model) else case["id"]
@@ -8531,8 +8538,20 @@ def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[s
     case-1/m1/with_skill and case-1/m2/with_skill would share an ID and the
     last-loaded verdict would silently apply to both models. Single-model IDs
     keep the historical shape."""
-    model_segment = f"{model}::" if model else ""
-    return f"{case_id}::{model_segment}{variant}::run-{run_number}::{assertion_label(assertion)}"
+    label = assertion_label(assertion)
+    segments = {"case_id": case_id, "variant": variant, "assertion": label}
+    if model is not None:
+        segments["model"] = model
+    for segment_name, segment in segments.items():
+        if not isinstance(segment, str) or not segment:
+            raise ValueError(f"judge task {segment_name} must be a non-empty string")
+        if "::" in segment:
+            raise ValueError(
+                f"judge task {segment_name} cannot contain reserved delimiter '::'")
+    if type(run_number) is not int or run_number < 1:
+        raise ValueError("judge task run_number must be a positive integer")
+    model_segment = f"{model}::" if model is not None else ""
+    return f"{case_id}::{model_segment}{variant}::run-{run_number}::{label}"
 
 
 JUDGE_EVIDENCE_MODES = {
@@ -8654,7 +8673,8 @@ def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
     positions: dict[str, int] = {}
     for position, row in enumerate(rows, 1):
         primary, legacy = row.get("judge_task_id"), row.get("id")
-        if primary is not None and legacy is not None and str(primary) != str(legacy):
+        if (primary is not None and legacy is not None
+                and (type(primary) is not type(legacy) or primary != legacy)):
             die(f"judge results row {position}: conflicting judge_task_id and id")
         jid = primary if primary is not None else legacy
         if not isinstance(jid, str) or not jid.strip():
@@ -9473,7 +9493,11 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if member_errors:
         return _incomplete_judge_consensus(
             rows, member_errors, members_key="judge_runs")
-    scores = [r.get("score") for r in rows if isinstance(r.get("score"), (int, float))]
+    scores = [
+        score for row in rows
+        if isinstance((score := row.get("score")), (int, float))
+        and not isinstance(score, bool) and math.isfinite(float(score))
+    ]
     passed_count = sum(1 for r in rows if r.get("passed"))
     first = dict(rows[0])
     first["passed"] = passed_count > len(rows) / 2
@@ -9525,7 +9549,11 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
         return validated_result_row(out)
     n = len(rows)
     concur = sum(1 for r in rows if r.get("passed"))
-    scores = [r.get("score") for r in rows if isinstance(r.get("score"), (int, float))]
+    scores = [
+        score for row in rows
+        if isinstance((score := row.get("score")), (int, float))
+        and not isinstance(score, bool) and math.isfinite(float(score))
+    ]
     median_score = statistics.median(scores) if scores else None
     unresolved = False
     if isinstance(quorum, int) and quorum > 0:
@@ -9578,12 +9606,23 @@ def effective_judge_models(manifest: dict[str, Any], cli_panel: list[str] | None
     judge.panel (or judge.models) list, else the single judge (effective_judge_model)
     as a 1-element panel — so a lone judge resolves to a 1-member panel and its
     path is unchanged."""
-    if cli_panel:
-        return [str(m) for m in cli_panel]
+    def validated_panel(values: Any, label: str) -> list[str]:
+        if (not isinstance(values, list) or not values
+                or not all(isinstance(model, str) and model for model in values)):
+            die(f"{label} must be a non-empty list of non-empty model names")
+        if len(values) != len(set(values)):
+            die(f"{label} model names must be unique")
+        return [
+            model for model in values
+            if isinstance(model, str) and model
+        ]
+
+    if cli_panel is not None:
+        return validated_panel(cli_panel, "--judge-panel")
     cfg = manifest.get("judge") or {}
     manifest_panel = cfg.get("panel") or cfg.get("models")
-    if isinstance(manifest_panel, list) and manifest_panel:
-        return [str(m) for m in manifest_panel]
+    if manifest_panel is not None:
+        return validated_panel(manifest_panel, "manifest judge panel")
     single = effective_judge_model(manifest, cli_single)
     return [single] if single else []
 
@@ -10611,7 +10650,7 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
          "variant": row.get("variant"), "run_base": row.get("run_base"),
          "blocked_assertions": row.get("blocked_assertions", [])}
         for row in results
-        if row.get("grading_availability", "complete") != "complete"
+        if row.get("grading_availability") != "complete"
     ]
     taxonomy: dict[str, dict[str, Any]] = {}
     for r in results:
@@ -10688,6 +10727,8 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
     evidence = judged.get("evidence", judged.get("rationale", judged.get("reasoning", "judge result supplied")))
     dims = assertion.get("graded_dimensions")
     dyn = assertion.get("dynamic_rubric")
+    if dyn is not None and not isinstance(dyn, dict):
+        raise TypeError("dynamic_rubric must be an object")
     per_step = is_per_step_assertion(assertion)
     at_least = assertion.get("atLeast")
     if dims and isinstance(judged.get("dimension_scores"), dict):
@@ -10729,6 +10770,8 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
             minimum = per_step_minimum(assertion, total)
             label = "trajectory steps sound"
         else:
+            if dyn is None:
+                raise ValueError("dynamic criteria require a dynamic_rubric")
             minimum = max(1, int(dyn.get("minimum_criteria", 3)))
             label = "dynamic criteria met"
         entry.update({
@@ -11441,7 +11484,7 @@ def two_sample_permutation_significance(a: list[float], b: list[float], *, max_e
     if math.comb(total_n, na) <= max(1, max_exact_total ** 2) and total_n <= max_exact_total:
         hits = 0
         combos = 0
-        for combo in _combinations(range(total_n), na):
+        for combo in _combinations(list(range(total_n)), na):
             combos += 1
             if abs(delta_for(combo)) >= target:
                 hits += 1
@@ -12593,7 +12636,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         def ablation_eligibility(row: Mapping[str, Any]) -> tuple[bool, str | None]:
             if not scorable_run(row):
                 return False, "unscorable_arm"
-            if row.get("grading_availability", "complete") != "complete":
+            if row.get("grading_availability") != "complete":
                 return False, "grading_evidence_incomplete"
             rate = row.get("combined_pass_rate", row.get("objective_pass_rate"))
             if (isinstance(rate, bool) or not isinstance(rate, (int, float))
@@ -13026,7 +13069,11 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
             comparisons.append(telemetry_domain.compare_cost_pair(
                 _cost_measurement(with_row), _cost_measurement(without_row),
                 left_scorable=scorable_run(with_row), right_scorable=scorable_run(without_row)))
-        comparable = [c for c in comparisons if c.availability == telemetry_domain.COMPARABLE]
+        comparable = [
+            comparison for comparison in comparisons
+            if comparison.availability == telemetry_domain.COMPARABLE
+            and isinstance(comparison.value, telemetry_domain.SignedMoney)
+        ]
         blocked = blocked_by_case.get(case_id, []) + [
             str(c.reason) for c in comparisons if c.availability == telemetry_domain.BLOCKED]
         if blocked:
@@ -13034,7 +13081,11 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
         if comparable:
             by_currency: dict[str, list[Any]] = collections.defaultdict(list)
             for comparison in comparable:
-                by_currency[comparison.value.currency].append(comparison)
+                comparison_value = comparison.value
+                if not isinstance(comparison_value, telemetry_domain.SignedMoney):
+                    raise TypeError(
+                        "comparable cost delta must carry signed money")
+                by_currency[comparison_value.currency].append(comparison)
             for currency, currency_comparisons in by_currency.items():
                 deltas_by_currency[currency].append(statistics.mean(float(c.value.amount) for c in currency_comparisons))
             if len(by_currency) == 1:
@@ -13182,7 +13233,7 @@ def qualitative_by_visibility(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     scorable_rows = [row for row in ResultSet(rows).scorable().all
-                     if row.get("grading_availability", "complete") == "complete"]
+                     if row.get("grading_availability") == "complete"]
     blocked_runs = len(rows) - len(scorable_rows)
     objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
     combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
@@ -13718,7 +13769,7 @@ def build_benchmark_report(
     unscorable_results = [row for row in results if not scorable_run(row)]
     grading_blocked_results = [
         row for row in results
-        if row.get("grading_availability", "complete") != "complete"]
+        if row.get("grading_availability") != "complete"]
     if not design_coverage["complete"]:
         paired_summary = invalidate_report_pairing(
             paired_summary, "answer_design_incomplete")
@@ -13918,8 +13969,11 @@ def junit_xml_from_report(report: dict[str, Any]) -> str:
             "name": f"{r.get('model') or 'default-model'}/{r.get('variant')}/run-{r.get('run_number', 1)}",
         }
         if elapsed.availability == telemetry_domain.AVAILABLE:
-            total_time += float(elapsed.value) / 1000.0
-            attrs["time"] = f"{float(elapsed.value) / 1000.0:.3f}"
+            elapsed_value = elapsed.value
+            if isinstance(elapsed_value, bool) or not isinstance(elapsed_value, int):
+                raise TypeError("available elapsed telemetry must be an integer")
+            total_time += elapsed_value / 1000.0
+            attrs["time"] = f"{elapsed_value / 1000.0:.3f}"
         else:
             missing_time += 1
             ET.SubElement(props, "property", {
@@ -13960,7 +14014,7 @@ def github_summary_from_report(report: dict[str, Any]) -> str:
             reasons.append("answer-design coverage")
         if report.get("deferred_judge_tasks"):
             reasons.append("deferred judge verdicts")
-        if any(row.get("grading_availability", "complete") != "complete"
+        if any(row.get("grading_availability") != "complete"
                for row in report.get("results", [])):
             reasons.append("blocked grading evidence")
         if any(not scorable_run(row) for row in report.get("results", [])):
@@ -14120,15 +14174,24 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
         }
         availability: dict[str, Any] = {}
         if elapsed.availability == telemetry_domain.AVAILABLE:
-            result["time_seconds"] = round(float(elapsed.value) / 1000, 3)
+            elapsed_value = elapsed.value
+            if isinstance(elapsed_value, bool) or not isinstance(elapsed_value, int):
+                raise TypeError("available elapsed telemetry must be an integer")
+            result["time_seconds"] = round(elapsed_value / 1000, 3)
         else:
             availability["time_seconds"] = elapsed.to_dict()
         if tokens.availability == telemetry_domain.AVAILABLE:
-            result["tokens"] = int(tokens.value)
+            token_value = tokens.value
+            if isinstance(token_value, bool) or not isinstance(token_value, int):
+                raise TypeError("available token telemetry must be an integer")
+            result["tokens"] = token_value
         else:
             availability["tokens"] = tokens.to_dict()
         if tool_calls.availability == telemetry_domain.AVAILABLE:
-            result["tool_calls"] = int(tool_calls.value)
+            tool_call_value = tool_calls.value
+            if isinstance(tool_call_value, bool) or not isinstance(tool_call_value, int):
+                raise TypeError("available tool-call telemetry must be an integer")
+            result["tool_calls"] = tool_call_value
         else:
             availability["tool_calls"] = tool_calls.to_dict()
         runs.append({
@@ -15385,7 +15448,7 @@ def severity_weighted_failures(reports: list[dict[str, Any]]) -> Any:
         seen: set[tuple] = set()
         for r in report.get("results", []):
             if (not scorable_run(r)
-                    or r.get("grading_availability", "complete") != "complete"):
+                    or r.get("grading_availability") != "complete"):
                 continue
             for a in r.get("assertions", []) + r.get("qualitative_assertions", []):
                 if (a.get("availability", "complete") != "complete"
@@ -15858,7 +15921,14 @@ def paired_token_overhead_report(
         waste_usd = telemetry_domain.Aggregate(telemetry_domain.COMPLETE, value=0, observed_count=0)
     elif waste_usd is None:
         waste_usd = telemetry_domain.Aggregate(telemetry_domain.UNAVAILABLE, reason_counts={"currency_mismatch": 1})
-    waste_cost = float(waste_usd.value) if waste_usd.availability == telemetry_domain.COMPLETE else None
+    waste_value = waste_usd.value
+    waste_cost = (
+        float(waste_value)
+        if waste_usd.availability == telemetry_domain.COMPLETE
+        and isinstance(waste_value, (int, Decimal))
+        and not isinstance(waste_value, bool)
+        else None
+    )
     total_deltas = [p["total_token_delta"] for p in pairs if p.get("total_token_delta") is not None]
     input_deltas = [p["input_token_delta"] for p in pairs if p.get("input_token_delta") is not None]
     output_deltas = [p["output_token_delta"] for p in pairs if p.get("output_token_delta") is not None]
@@ -15894,8 +15964,11 @@ def paired_token_overhead_report(
         },
         "saturated_or_no_lift_cost_usd": waste_cost,
         "saturated_or_no_lift_cost_usd_aggregate": waste_usd.to_dict(),
-        **({"known_saturated_or_no_lift_cost_usd": float(waste_usd.known_subtotal)}
-           if waste_usd.availability == telemetry_domain.PARTIAL else {}),
+        **({
+            "known_saturated_or_no_lift_cost_usd": float(waste_usd.known_subtotal)
+        } if (waste_usd.availability == telemetry_domain.PARTIAL
+              and isinstance(waste_usd.known_subtotal, (int, Decimal))
+              and not isinstance(waste_usd.known_subtotal, bool)) else {}),
         "mean_total_overhead_per_static_skill_token": (
             statistics.mean(total_deltas) / static_skill_tokens
             if total_deltas and static_skill_tokens else None),
@@ -16518,7 +16591,10 @@ def audit_manifest_report(
                 finding("expensive-saturated-case", "recommended", f"Case {case_id} cost ${cost} but is saturated/non-discriminating — spend without signal.", spend)
             elif any("no objective lift" in f for f in case_flag_list):
                 finding("expensive-no-lift-case", "recommended", f"Case {case_id} cost ${cost} with no objective lift — spend without signal.", spend)
-        judge_only_ids = {c.get("id") for c in cases if is_judge_only_case(c)}
+        judge_only_ids = {
+            case_id for case in cases if is_judge_only_case(case)
+            if isinstance((case_id := case.get("id")), str)
+        }
         for case_id in sorted(judge_only_ids):
             cost = (cost_by_case.get(case_id) or {}).get("total_cost_usd")
             if cost is not None and cost >= expensive_case_usd:

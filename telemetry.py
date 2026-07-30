@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Generic, TypeVar
 
+from json_contracts import freeze_json_mapping
+
 T = TypeVar("T")
 
 AVAILABLE = "available"
@@ -274,26 +276,32 @@ class Measurement(Generic[T]):
                 raise ValueError("unavailable/not-applicable measurement requires a reason")
         if not isinstance(self.basis, Mapping):
             raise ValueError("measurement basis must be a mapping")
-        object.__setattr__(self, "basis", dict(self.basis))
+        object.__setattr__(self, "basis", freeze_json_mapping(
+            self.basis, "measurement basis"))
 
     @classmethod
     def available(cls, value: T, *, provenance: str, basis: Mapping[str, Any] | None = None) -> Measurement[T]:
-        return cls(AVAILABLE, value=value, provenance=provenance, basis=basis or {})
+        return cls(
+            AVAILABLE, value=value, provenance=provenance,
+            basis={} if basis is None else basis)
 
     @classmethod
     def unavailable(cls, reason: str, *, basis: Mapping[str, Any] | None = None) -> Measurement[T]:
-        return cls(UNAVAILABLE, basis=basis or {}, reason=reason)
+        return cls(UNAVAILABLE, basis={} if basis is None else basis, reason=reason)
 
     @classmethod
     def not_applicable(cls, reason: str, *, basis: Mapping[str, Any] | None = None) -> Measurement[T]:
-        return cls(NOT_APPLICABLE, basis=basis or {}, reason=reason)
+        return cls(
+            NOT_APPLICABLE, basis={} if basis is None else basis, reason=reason)
 
     @classmethod
     def from_dict(cls, raw: Any) -> Measurement[Any]:
         if not isinstance(raw, Mapping):
             raise ValueError("measurement must be an object")
         availability = raw.get("availability")
-        basis = raw.get("basis") if isinstance(raw.get("basis"), Mapping) else {}
+        basis = raw.get("basis", {})
+        if not isinstance(basis, Mapping):
+            raise ValueError("measurement basis must be an object")
         if availability == AVAILABLE:
             value = raw.get("value")
             if isinstance(value, Mapping) and set(value) >= {"amount", "currency"}:
@@ -333,8 +341,23 @@ class Aggregate(Generic[T]):
     def __post_init__(self) -> None:
         if self.availability not in {COMPLETE, PARTIAL, UNAVAILABLE, NOT_APPLICABLE}:
             raise ValueError(f"unknown aggregate availability {self.availability!r}")
+        for label, count in (
+            ("observed_count", self.observed_count),
+            ("unavailable_count", self.unavailable_count),
+            ("not_applicable_count", self.not_applicable_count),
+        ):
+            if type(count) is not int:
+                raise TypeError(f"aggregate {label} must be an integer")
         if min(self.observed_count, self.unavailable_count, self.not_applicable_count) < 0:
             raise ValueError("aggregate counts cannot be negative")
+        if not isinstance(self.reason_counts, Mapping):
+            raise TypeError("aggregate reason_counts must be a mapping")
+        for reason, count in self.reason_counts.items():
+            if not isinstance(reason, str) or not reason:
+                raise TypeError("aggregate reason_counts keys must be non-empty strings")
+            if type(count) is not int or count < 0:
+                raise TypeError(
+                    "aggregate reason_counts values must be non-negative integers")
         if self.availability == COMPLETE:
             if self.value is None or self.known_subtotal is not None:
                 raise ValueError("complete aggregate requires value only")
@@ -357,7 +380,8 @@ class Aggregate(Generic[T]):
                 raise ValueError("N/A aggregate cannot carry numeric data")
             if not self.reason:
                 raise ValueError("N/A aggregate requires a reason")
-        object.__setattr__(self, "reason_counts", dict(self.reason_counts))
+        object.__setattr__(self, "reason_counts", freeze_json_mapping(
+            self.reason_counts, "aggregate reason_counts"))
 
     def scalar_if_complete(self) -> T | None:
         return self.value if self.availability == COMPLETE else None
@@ -398,15 +422,18 @@ class Comparison(Generic[T]):
                 raise ValueError("comparable result requires a finite numeric or money value")
         elif self.value is not None or not self.reason:
             raise ValueError("blocked result requires reason and no value")
-        object.__setattr__(self, "basis", dict(self.basis))
+        if not isinstance(self.basis, Mapping):
+            raise TypeError("comparison basis must be a mapping")
+        object.__setattr__(self, "basis", freeze_json_mapping(
+            self.basis, "comparison basis"))
 
     @classmethod
     def comparable(cls, value: T, *, basis: Mapping[str, Any] | None = None) -> Comparison[T]:
-        return cls(COMPARABLE, value=value, basis=basis or {})
+        return cls(COMPARABLE, value=value, basis={} if basis is None else basis)
 
     @classmethod
     def blocked(cls, reason: str, *, basis: Mapping[str, Any] | None = None) -> Comparison[T]:
-        return cls(BLOCKED, basis=basis or {}, reason=reason)
+        return cls(BLOCKED, basis={} if basis is None else basis, reason=reason)
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"availability": self.availability}
@@ -509,7 +536,7 @@ def aggregate_money_by_currency(measurements: Iterable[Measurement[Money]], *,
 def measurement_from_cost_block(block: Any, *, legacy_value: Any = None,
                                  basis: Mapping[str, Any] | None = None) -> Measurement[Money]:
     """Read normalized v2 cost or a legacy scalar into the strict domain model."""
-    basis = basis or {}
+    basis = {} if basis is None else basis
     if isinstance(block, Mapping):
         source = block.get("source")
         if source == "missing":
@@ -539,7 +566,7 @@ def measurement_from_cost_block(block: Any, *, legacy_value: Any = None,
 def measurement_from_usage_block(block: Any, key: str, *, legacy_value: Any = None,
                                   basis: Mapping[str, Any] | None = None) -> Measurement[int]:
     """Read one normalized usage key or legacy scalar into a strict measurement."""
-    basis = basis or {}
+    basis = {} if basis is None else basis
     if isinstance(block, Mapping):
         source = block.get("source")
         if source == "missing":
@@ -578,7 +605,9 @@ def measurement_from_nonnegative(value: Any, *, provenance: str = "runner_measur
 
 def basis_from_run(raw: Mapping[str, Any] | None, *, source: str | None = None,
                    population: str = "answer") -> dict[str, Any]:
-    raw = raw or {}
+    if raw is not None and not isinstance(raw, Mapping):
+        raise TypeError("telemetry run basis source must be a mapping or None")
+    raw = {} if raw is None else raw
     return {
         "population": raw.get("population", population),
         "provider": raw.get("provider") or raw.get("runner") or source,
@@ -597,7 +626,9 @@ def basis_from_run(raw: Mapping[str, Any] | None, *, source: str | None = None,
 def telemetry_envelope(raw: Mapping[str, Any] | None, *, source: str | None = None,
                        population: str = "answer", legacy_unverified: bool = False) -> dict[str, Any]:
     """Build the additive v3 envelope while preserving legacy blocks beside it."""
-    raw = raw or {}
+    if raw is not None and not isinstance(raw, Mapping):
+        raise TypeError("telemetry envelope source must be a mapping or None")
+    raw = {} if raw is None else raw
     existing = raw.get("telemetry")
     if isinstance(existing, Mapping) and existing.get("schema_version") == 3:
         return dict(existing)
@@ -651,7 +682,9 @@ def telemetry_envelope(raw: Mapping[str, Any] | None, *, source: str | None = No
 
 def measurement_from_envelope_or_cost(raw: Mapping[str, Any] | None, *, source: str | None = None,
                                       population: str = "answer") -> Measurement[Money]:
-    raw = raw or {}
+    if raw is not None and not isinstance(raw, Mapping):
+        raise TypeError("telemetry cost source must be a mapping or None")
+    raw = {} if raw is None else raw
     envelope = raw.get("telemetry")
     if isinstance(envelope, Mapping) and envelope.get("schema_version") == 3:
         measurements = envelope.get("measurements")
@@ -839,6 +872,8 @@ def display_aggregate(aggregate: Mapping[str, Any] | Aggregate[Any], *, prefix: 
         return f"partial: {prefix}{data.get('known_subtotal')} known subtotal ({data.get('unavailable_count', 0)} unavailable)"
     if availability == NOT_APPLICABLE:
         return "N/A"
-    reasons = data.get("reason_counts") or {}
+    reasons = data.get("reason_counts", {})
+    if not isinstance(reasons, Mapping):
+        raise TypeError("aggregate reason_counts must be a mapping")
     reason = next(iter(reasons), "unavailable")
     return f"— unavailable ({reason})"

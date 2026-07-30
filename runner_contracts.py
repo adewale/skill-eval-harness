@@ -101,10 +101,20 @@ class OutcomeContext:
 
     def enriched(self, *, metadata: Mapping[str, Any] | None = None,
                  environment: Mapping[str, Any] | None = None) -> OutcomeContext:
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise TypeError("metadata must be a mapping or None")
+        if environment is not None and not isinstance(environment, Mapping):
+            raise TypeError("environment must be a mapping or None")
         return replace(
             self,
-            metadata_extra={**dict(self.metadata_extra), **dict(metadata or {})},
-            environment={**dict(self.environment or {}), **dict(environment or {})},
+            metadata_extra={
+                **dict(self.metadata_extra),
+                **dict({} if metadata is None else metadata),
+            },
+            environment={
+                **dict({} if self.environment is None else self.environment),
+                **dict({} if environment is None else environment),
+            },
         )
 
 
@@ -174,7 +184,9 @@ class ProviderFailed:
     def __post_init__(self) -> None:
         if not isinstance(self.context, OutcomeContext):
             raise TypeError("ProviderFailed context must be OutcomeContext")
-        if isinstance(self.returncode, bool) or not isinstance(self.returncode, int) or self.returncode in {124, 127}:
+        if type(self.returncode) is not int:
+            raise TypeError("ProviderFailed returncode must be an integer")
+        if self.returncode in {124, 127}:
             raise ValueError("ProviderFailed requires an actual exited-process returncode")
         if self.reason is not None and (not isinstance(self.reason, str) or not self.reason.strip()):
             raise ValueError("provider failure reason must be non-empty or None")
@@ -218,10 +230,18 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
     """Strict compatibility factory for the historical constructor spelling."""
     if not isinstance(timed_out, bool):
         raise TypeError("timed_out must be boolean")
+    if returncode is not None and type(returncode) is not int:
+        raise TypeError("returncode must be an integer or None")
+    if answer is not None and not isinstance(answer, str):
+        raise TypeError("answer must be a string or None")
+    if error is not None and (not isinstance(error, str) or not error.strip()):
+        raise ValueError("error must be a non-empty string or None")
     context = OutcomeContext(
         provider=Provider(provider), model=model, elapsed_ms=elapsed_ms, stderr=stderr,
-        trace_text=trace_text or "", usage=usage, cost_usd=cost_usd,
-        metadata_extra=metadata_extra or {}, metrics_extra=metrics_extra or {},
+        trace_text="" if trace_text is None else trace_text,
+        usage=usage, cost_usd=cost_usd,
+        metadata_extra={} if metadata_extra is None else metadata_extra,
+        metrics_extra={} if metrics_extra is None else metrics_extra,
         environment=environment, diagnose_returncode=diagnose_returncode,
     )
     if timed_out:
@@ -234,7 +254,9 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
     if code == 127:
         return SpawnFailed(context, reason=error or stderr or "process spawn failed")
     if code != 0 or error:
-        return ProviderFailed(context, returncode=code, reason=error, answer=answer or "")
+        return ProviderFailed(
+            context, returncode=code, reason=error,
+            answer="" if answer is None else answer)
     if not answer:
         return ProviderFailed(context, returncode=0, reason="provider produced no final answer")
     return Completed(context, answer=answer)

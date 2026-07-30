@@ -55,6 +55,7 @@ from trigger_contracts import (
     TriggerExpectation,
     TriggerObservation,
     TriggerRepetitionIdentity,
+    validated_trigger_model,
     validated_trigger_protocol_limits,
 )
 
@@ -113,6 +114,7 @@ def pi_trigger_protocol(
 ) -> dict[str, Any]:
     timeout, runs_per_query, workers = validated_trigger_protocol_limits(
         timeout_seconds=timeout, runs_per_query=runs_per_query, workers=workers)
+    model = validated_trigger_model(model)
     resolved = shutil.which("pi")
     executable = {"requested": "pi", "resolved": str(Path(resolved).resolve()) if resolved else None}
     if resolved:

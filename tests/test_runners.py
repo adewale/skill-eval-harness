@@ -367,6 +367,12 @@ class ClosedRunnerOutcomeTests(unittest.TestCase):
             with self.subTest(constructor=constructor.__name__, returncode=returncode), \
                  self.assertRaises(TypeError):
                 constructor(context, returncode=returncode, **kwargs)
+        for returncode in (False, 0.0, 124.0, 127.0):
+            with self.subTest(factory_returncode=returncode), self.assertRaises(TypeError):
+                rc.RunnerOutcome(
+                    provider="codex", answer="ok", returncode=returncode)
+        with self.assertRaises(TypeError):
+            rc.ProviderFailed(context, returncode=1.0)
 
     def test_context_rejects_unknown_provider_and_invalid_measurements(self):
         for kwargs in (
@@ -398,6 +404,13 @@ class ClosedRunnerOutcomeTests(unittest.TestCase):
                 with self.subTest(field=field, value=value), \
                      self.assertRaises((TypeError, ValueError)):
                     rc.OutcomeContext(provider="codex", **{field: value})
+        for field in ("metadata_extra", "metrics_extra"):
+            with self.subTest(factory_field=field), self.assertRaises(TypeError):
+                rc.RunnerOutcome(
+                    provider="codex", answer="ok", **{field: []})
+        context = rc.OutcomeContext(provider="codex")
+        with self.assertRaises(TypeError):
+            context.enriched(metadata=[])
 
     def test_context_and_outcome_are_recursively_immutable(self):
         source = {"x": 1, "nested": {"value": 2}, "items": [{"value": 3}]}

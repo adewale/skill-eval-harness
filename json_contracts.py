@@ -1,6 +1,7 @@
 """Lossless, immutable JSON values for persisted evidence contracts."""
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from typing import Any, NoReturn
@@ -55,3 +56,14 @@ def freeze_json_mapping(
     if not isinstance(frozen, Mapping):  # pragma: no cover - established above
         raise TypeError(f"{label} must be a mapping")
     return frozen
+
+
+def strict_json_equal(left: Any, right: Any) -> bool:
+    """Compare JSON values without Python's bool/int or int/float coercions."""
+    left_frozen = freeze_json_value(left, "left JSON value")
+    right_frozen = freeze_json_value(right, "right JSON value")
+    left_wire = json.dumps(
+        left_frozen, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    right_wire = json.dumps(
+        right_frozen, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return left_wire == right_wire

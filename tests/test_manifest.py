@@ -791,6 +791,14 @@ class ClosedManifestBoundaryTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._validate(case, judge={"panel": ["a"], "models": ["b"]})
 
+    def test_judge_panel_models_must_be_unique(self):
+        case = {
+            "id": "case-1", "split": "tune", "prompt": "do it",
+            "assertions": [{"name": "a", "type": "contains", "value": "x"}],
+        }
+        with self.assertRaises(SystemExit):
+            self._validate(case, judge={"panel": ["same", "same"]})
+
 
 class PerStepValidationTests(unittest.TestCase):
     """per_step is a judge-only assertion field: true, or an object whose only

@@ -887,7 +887,11 @@ class AblationRegressionReportTests(unittest.TestCase):
         for row in results:
             key = (row.get("case_id"), row.get("model"), row.get("variant"))
             counters[key] = counters.get(key, 0) + 1
-            identified.append({**row, "run_number": row.get("run_number", counters[key])})
+            identified.append({
+                "grading_availability": "complete",
+                **row,
+                "run_number": row.get("run_number", counters[key]),
+            })
         return sb.build_ablation_regression_report(manifest, identified)
 
     def test_expected_regression_confirmed_when_named_assertion_flips(self):
@@ -932,6 +936,31 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertEqual(regression["evidence_class"], "indeterminate")
         self.assertIsNone(regression["expected_regression_confirmed"])
 
+    def test_missing_grading_status_cannot_default_to_complete_causal_evidence(self):
+        results = []
+        for run_number in range(1, 7):
+            results.append({
+                "case_id": "c1", "variant": "with_skill", "run_number": run_number,
+                "objective_pass_rate": 1.0,
+                "assertions": [{"name": "detect-weak", "passed": True}],
+                "qualitative_assertions": [], **self.ws(),
+            })
+            results.append({
+                "case_id": "c1", "variant": "ablation:no-rp", "run_number": run_number,
+                "objective_pass_rate": 0.0,
+                "assertions": [{"name": "detect-weak", "passed": False}],
+                "qualitative_assertions": [], **self.prov(),
+            })
+        entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
+        regression = entry["regressions"][0]
+        self.assertEqual(entry["pairing"]["eligible_pairs"], 0)
+        self.assertEqual(
+            entry["pairing"]["blocked_reason_counts"],
+            {"grading_evidence_incomplete": 6},
+        )
+        self.assertEqual(regression["evidence_class"], "indeterminate")
+        self.assertIsNone(regression["expected_regression_confirmed"])
+
     def test_blocked_cited_repetition_prevents_answer_causal_confirmation(self):
         results = []
         for run_number in range(1, 8):
@@ -964,12 +993,14 @@ class AblationRegressionReportTests(unittest.TestCase):
             for run_number in range(1, 5):
                 results.append({"case_id": "c1", "variant": "with_skill", "model": "model-a",
                                 "run_number": run_number, "objective_pass_rate": 1.0,
+                                "grading_availability": "complete",
                                 "assertions": [{"name": "detect-weak", "passed": True}],
                                 "qualitative_assertions": [], **self.ws()})
                 results.append({"case_id": "c1", "variant": "ablation:no-rp",
                                 "model": "model-b" if mismatch == "model" else "model-a",
                                 "run_number": run_number if mismatch == "model" else run_number + 10,
                                 "objective_pass_rate": 0.0,
+                                "grading_availability": "complete",
                                 "assertions": [{"name": "detect-weak", "passed": False}],
                                 "qualitative_assertions": [], **self.prov()})
             entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
@@ -984,10 +1015,12 @@ class AblationRegressionReportTests(unittest.TestCase):
         for run_number in range(1, 7):
             results.append({"case_id": "c1", "variant": "with_skill", "run_number": run_number,
                             "objective_pass_rate": 1.0,
+                            "grading_availability": "complete",
                             "assertions": [{"name": "detect-weak", "passed": True}],
                             "qualitative_assertions": [], **self.ws()})
             results.append({"case_id": "c1", "variant": "ablation:no-rp", "run_number": run_number,
                             "objective_pass_rate": 0.0,
+                            "grading_availability": "complete",
                             "assertions": ([{"name": "detect-weak", "passed": False}] if run_number == 1 else []),
                             "qualitative_assertions": [], **self.prov()})
         reg = sb.build_ablation_regression_report(self.MANIFEST, results)[0]["regressions"][0]

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import ast
 import collections
+import hashlib
 import json
 import os
 import re
@@ -18,18 +19,26 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "skill_benchmark.py"
 
 
-class DiagnosticIdentity(NamedTuple):
+@dataclass(frozen=True, order=True)
+class DiagnosticIdentity:
+    path: str
     rule: str
     description: str
     scope: str
+    occurrence: str
     source: str
+    # ty's GitLab fingerprint is validated and reported, but it is not a
+    # cross-revision identity: ty 0.0.65 reuses the same fingerprint for
+    # unrelated diagnostics and changes fingerprints after structural edits.
+    fingerprint: str = field(compare=False)
 
 
 def _run(*argv: str, cwd: Path = ROOT, text: bool = True) -> subprocess.CompletedProcess:
@@ -86,37 +95,109 @@ def diagnostic_identities(
     lines = source_text.splitlines()
     tree = ast.parse(source_text)
 
-    def scope_for_line(line_number: int) -> str:
-        def descend(node: ast.AST, path: tuple[str, ...]) -> tuple[str, ...]:
-            best = path
+    def scope_and_occurrence(
+        line_number: int, column_number: int,
+    ) -> tuple[str, str]:
+        def named_scope(
+            node: ast.AST, path: tuple[str, ...],
+        ) -> tuple[ast.AST, tuple[str, ...]]:
+            best_node, best_path = node, path
             for child in ast.iter_child_nodes(node):
                 if not isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 end_line = getattr(child, "end_lineno", child.lineno)
                 if child.lineno <= line_number <= end_line:
-                    candidate = descend(child, (*path, child.name))
-                    if len(candidate) > len(best):
-                        best = candidate
+                    candidate_node, candidate_path = named_scope(
+                        child, (*path, child.name))
+                    if len(candidate_path) > len(best_path):
+                        best_node, best_path = candidate_node, candidate_path
+            return best_node, best_path
+
+        def contains_point(node: ast.AST) -> bool:
+            start_line = getattr(node, "lineno", None)
+            end_line = getattr(node, "end_lineno", start_line)
+            if start_line is None or end_line is None:
+                return False
+            if not start_line <= line_number <= end_line:
+                return False
+            start_column = getattr(node, "col_offset", 0)
+            end_column = getattr(node, "end_col_offset", start_column)
+            column = max(0, column_number - 1)
+            if line_number == start_line and column < start_column:
+                return False
+            return not (line_number == end_line and column > end_column)
+
+        scope_node, scope_path = named_scope(tree, ())
+
+        def occurrence_path(node: ast.AST, path: tuple[str, ...]) -> tuple[str, ...]:
+            best = path
+            for field_name, value in ast.iter_fields(node):
+                children: list[tuple[str, ast.AST]] = []
+                if isinstance(value, ast.AST):
+                    children.append((field_name, value))
+                elif isinstance(value, list):
+                    for index, child in enumerate(value):
+                        if not isinstance(child, ast.AST):
+                            continue
+                        segment = f"{field_name}[{index}]"
+                        if isinstance(child, ast.stmt):
+                            child_dump = ast.dump(
+                                child, include_attributes=False)
+                            digest = hashlib.sha256(
+                                child_dump.encode()).hexdigest()[:16]
+                            ordinal = sum(
+                                1 for prior in value[:index]
+                                if isinstance(prior, ast.stmt)
+                                and ast.dump(prior, include_attributes=False)
+                                == child_dump
+                            )
+                            segment = (
+                                f"{field_name}[{type(child).__name__}:"
+                                f"{digest}:{ordinal}]")
+                        children.append((segment, child))
+                for segment, child in children:
+                    if contains_point(child):
+                        candidate = occurrence_path(child, (*path, segment))
+                        if len(candidate) > len(best):
+                            best = candidate
             return best
 
-        return ".".join(descend(tree, ())) or "<module>"
+        scope = ".".join(scope_path) or "<module>"
+        occurrence = "/".join(occurrence_path(scope_node, ())) or "<scope>"
+        return scope, occurrence
 
     identities: collections.Counter[DiagnosticIdentity] = collections.Counter()
+    seen_fingerprints: set[str] = set()
     for diagnostic in diagnostics:
         try:
             line_number = diagnostic["location"]["positions"]["begin"]["line"]
+            column_number = diagnostic["location"]["positions"]["begin"]["column"]
+            path = diagnostic["location"]["path"]
+            fingerprint = diagnostic["fingerprint"]
             rule = diagnostic["check_name"]
             description = diagnostic["description"]
         except (KeyError, TypeError) as exc:
             raise ValueError("malformed ty diagnostic") from exc
-        if type(line_number) is not int or not 1 <= line_number <= len(lines):
-            raise ValueError("ty diagnostic line is outside the checked source")
-        if not isinstance(rule, str) or not isinstance(description, str):
-            raise TypeError("ty diagnostic rule and description must be strings")
+        if (type(line_number) is not int or not 1 <= line_number <= len(lines)
+                or type(column_number) is not int or column_number < 1):
+            raise ValueError("ty diagnostic position is outside the checked source")
+        if (not isinstance(path, str) or not path
+                or not isinstance(fingerprint, str) or not fingerprint
+                or not isinstance(rule, str) or not isinstance(description, str)):
+            raise TypeError(
+                "ty diagnostic path, fingerprint, rule, and description must be strings")
+        if path != TARGET:
+            raise ValueError(
+                f"ty diagnostic path must be exactly {TARGET!r}, got {path!r}")
+        if fingerprint in seen_fingerprints:
+            raise ValueError(
+                f"ty emitted duplicate fingerprint {fingerprint!r} in one run")
+        seen_fingerprints.add(fingerprint)
         source = re.sub(r"\s+", " ", lines[line_number - 1].strip())
+        scope, occurrence = scope_and_occurrence(line_number, column_number)
         identities[
             DiagnosticIdentity(
-                rule, description, scope_for_line(line_number), source)
+                path, rule, description, scope, occurrence, source, fingerprint)
         ] += 1
     return identities
 
@@ -160,7 +241,10 @@ def main(argv: list[str] | None = None) -> int:
             multiplicity = f" ({count} occurrences)" if count > 1 else ""
             print(
                 f"- [{identity.rule}] {identity.description}{multiplicity}\n"
+                f"  fingerprint: {identity.fingerprint}\n"
+                f"  path: {identity.path}\n"
                 f"  scope: {identity.scope}\n"
+                f"  occurrence: {identity.occurrence}\n"
                 f"  source: {identity.source}",
                 file=sys.stderr,
             )

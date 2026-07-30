@@ -118,6 +118,7 @@ from trigger_contracts import (
     TriggerExpectation,
     TriggerObservation,
     TriggerRepetitionIdentity,
+    validated_trigger_model,
     validated_trigger_protocol_limits,
 )
 
@@ -696,11 +697,22 @@ def executable_identity(command: str) -> dict[str, Any]:
 
 
 def trigger_protocol(
-    adapters: list[AgentAdapter], models: list[str] | None, *,
+    adapters: list[AgentAdapter], models: list[str | None] | None, *,
     runs_per_query: int, timeout: int, workers: int,
 ) -> dict[str, Any]:
     timeout, runs_per_query, workers = validated_trigger_protocol_limits(
         timeout_seconds=timeout, runs_per_query=runs_per_query, workers=workers)
+    effective_models: dict[AgentAdapter, list[str | None]] = {}
+    for adapter in adapters:
+        candidates = models if models is not None else adapter.default_models
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError(
+                f"models for adapter {adapter.name!r} must be a non-empty list")
+        effective_models[adapter] = [
+            validated_trigger_model(
+                model, f"models[{index}] for adapter {adapter.name!r}")
+            for index, model in enumerate(candidates)
+        ]
     return {
         "schema_version": 1,
         "producer": "skill-trigger-matrix",
@@ -710,7 +722,7 @@ def trigger_protocol(
         "workers": workers,
         "adapters": [
             {**adapter.protocol_parameters(),
-             "models": list(models if models is not None else adapter.default_models)}
+             "models": effective_models[adapter]}
             for adapter in adapters
         ],
     }
@@ -963,7 +975,7 @@ def print_matrix(matrix: list[dict[str, Any]]) -> None:
 
 
 def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str],
-               models: list[str] | None, runs_per_query: int, timeout: int, workers: int,
+               models: list[str | None] | None, runs_per_query: int, timeout: int, workers: int,
                claude_bin: str = "claude", codex_cmd: str | None = None,
                vibe_cmd: str | None = None, max_turns: int = 6,
                trace_runs: Path | None = None, ablation: str | None = None) -> dict[str, Any]:

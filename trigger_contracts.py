@@ -15,7 +15,7 @@ from types import MappingProxyType
 from typing import Any
 
 import telemetry as telemetry_domain
-from json_contracts import freeze_json_mapping
+from json_contracts import freeze_json_mapping, strict_json_equal
 
 
 class InvocationState(str, Enum):
@@ -133,7 +133,7 @@ class InvocationOutcome:
             state = InvocationState.PROCESS_FAILED
             evidence = None
         return cls(stdout, stderr, returncode, elapsed_ms, state, evidence,
-                   metadata=metadata or {})
+                   metadata={} if metadata is None else metadata)
 
     @classmethod
     def harness_failed(cls, message: str, *,
@@ -141,7 +141,7 @@ class InvocationOutcome:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("harness failure requires a non-empty message")
         return cls("", message, None, None, InvocationState.HARNESS_FAILED,
-                   metadata=metadata or {})
+                   metadata={} if metadata is None else metadata)
 
     @classmethod
     def from_legacy_dict(cls, agent: str, raw: Mapping[str, Any], *,
@@ -220,7 +220,13 @@ class InvocationOutcome:
                                 elapsed_ms=elapsed_ms).with_metadata(metadata)
 
     def with_metadata(self, values: Mapping[str, Any] | None = None, **extra: Any) -> InvocationOutcome:
-        merged = {**dict(self.metadata), **dict(values or {}), **extra}
+        if values is not None and not isinstance(values, Mapping):
+            raise TypeError("invocation metadata must be a mapping or None")
+        merged = {
+            **dict(self.metadata),
+            **dict({} if values is None else values),
+            **extra,
+        }
         return replace(self, metadata=merged)
 
     def with_provider_payload(self, payload: Any) -> InvocationOutcome:
@@ -362,6 +368,15 @@ def validated_trigger_protocol_limits(
     return timeout_seconds, runs_per_query, workers
 
 
+def validated_trigger_model(value: Any, label: str = "model") -> str | None:
+    """Return a protocol model only when its persisted identity is unambiguous."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be None or a non-empty string")
+    return value
+
+
 def _usage_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
     if not isinstance(block, Mapping):
         raise TypeError("usage telemetry must be a mapping")
@@ -401,7 +416,7 @@ def _cost_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
     if source in {"missing", "not_applicable"}:
         if set(block) != {"source"}:
             raise ValueError(f"{source} cost telemetry cannot carry numeric evidence")
-        return MappingProxyType(dict(block))
+        return freeze_json_mapping(block, "cost telemetry")
     numeric_keys = {
         "total_cost", "input_cost", "output_cost", "cache_read_cost",
         "cache_write_cost", "reasoning_cost",
@@ -428,7 +443,7 @@ def _cost_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
     notes = block.get("pricing_notes")
     if notes is not None and (not isinstance(notes, list) or not all(isinstance(item, str) for item in notes)):
         raise ValueError("cost telemetry pricing_notes must be a list of strings")
-    return MappingProxyType(dict(block))
+    return freeze_json_mapping(block, "cost telemetry")
 
 
 @dataclass(frozen=True, order=True)
@@ -589,8 +604,10 @@ class TriggerObservation:
             if (not isinstance(raw_invocation_metadata, Mapping)
                     or not isinstance(raw_observation_metadata, Mapping)):
                 raise TypeError("trigger observation metadata namespaces must be mappings")
-            invocation_metadata = dict(raw_invocation_metadata)
-            observation_metadata = dict(raw_observation_metadata)
+            invocation_metadata = freeze_json_mapping(
+                raw_invocation_metadata, "persisted invocation metadata")
+            observation_metadata = freeze_json_mapping(
+                raw_observation_metadata, "persisted observation metadata")
             declared_flat_keys = set(invocation_metadata) | set(observation_metadata)
             undeclared_flat_keys = (
                 set(raw) - _TRIGGER_RESERVED_METADATA - declared_flat_keys)
@@ -603,7 +620,7 @@ class TriggerObservation:
                 ("observation", observation_metadata),
             ):
                 for key, value in values.items():
-                    if key not in raw or raw[key] != value:
+                    if key not in raw or not strict_json_equal(raw[key], value):
                         raise ValueError(
                             f"persisted {namespace} metadata disagrees with flattened field {key!r}")
         else:
@@ -688,7 +705,10 @@ class TriggerObservation:
                         metadata: Mapping[str, Any] | None = None,
                         identity: TriggerRepetitionIdentity | None = None) -> TriggerObservation:
         message = f"{type(error).__name__}: {error}"
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise TypeError("trigger failure metadata must be a mapping or None")
         invocation = InvocationOutcome.harness_failed(message)
         return cls(agent, model, query, expectation, invocation, TriggerDetection.absent(),
                    {"source": "missing"}, {"source": "missing"},
-                   {"error": message, **dict(metadata or {})}, identity)
+                   {"error": message, **dict({} if metadata is None else metadata)},
+                   identity)

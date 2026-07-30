@@ -83,6 +83,16 @@ class TriggerRowBoundaryTests(unittest.TestCase):
                 models=[None], runs_per_query=1, timeout=30, workers=0,
             )
 
+    def test_protocol_producers_reject_ambiguous_model_identities(self):
+        for model in ("", "   ", False):
+            with self.subTest(producer="pi", model=model), self.assertRaises(ValueError):
+                tr.pi_trigger_protocol(
+                    timeout=1, runs_per_query=1, workers=1, model=model)
+            with self.subTest(producer="matrix", model=model), self.assertRaises(ValueError):
+                tm.trigger_protocol(
+                    [tm.AgentAdapter()], [model],
+                    timeout=1, runs_per_query=1, workers=1)
+
     def test_eval_set_preserves_false_boolean(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "rows.json"
