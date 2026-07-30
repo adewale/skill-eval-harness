@@ -59,7 +59,8 @@ Design records for shipped or in-flight subsystems:
 [`telemetry-availability-and-comparability-spec.md`](telemetry-availability-and-comparability-spec.md),
 [`eval-framework-roadmap-spec.md`](eval-framework-roadmap-spec.md),
 [`jetty-support-spec.md`](jetty-support-spec.md), and
-[`agent-backend-interface-spec.md`](agent-backend-interface-spec.md).
+[`agent-backend-interface-spec.md`](agent-backend-interface-spec.md). The proposed
+live observability slice is in [`otel-support-plan.md`](otel-support-plan.md).
 
 ## Audits
 
