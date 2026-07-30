@@ -274,7 +274,7 @@ skill-benchmark import-trace \
   --run-dir eval-runs/latest/case/with_skill/run-1
 ```
 
-`import-trace` currently accepts `generic`, `codex`, `pi`, and `jetty` source dialects. Runner-specific adapters can still add richer normalization as their event streams stabilize.
+`import-trace` currently accepts `claude`, `codex`, `generic`, `jetty`, and `pi` source dialects. Runner-specific adapters can still add richer normalization as their event streams stabilize.
 
 ### `run-codex`
 

@@ -1,39 +1,59 @@
 # Architecture
 
-The harness scores whether a skill changes a model's output. It does this by running the
-same case twice, once with the skill and once without, then grading both runs with checks
-that call no model. Everything in the system follows from that one decision.
+The harness scores whether a skill changes a model's output. At minimum it runs the same
+case in a paired `with_skill` / `without_skill` experiment, then grades both runs with checks
+that call no model. Repetitions, model sweeps, and ablation arms extend that experiment
+without changing the paired comparison at its centre. Everything in the system follows
+from that decision.
 
 This doc shows how the pieces fit. For what each piece *is*, read
 [`abstractions.md`](abstractions.md).
 
 ## The pipeline
 
-A manifest flows left to right. Each stage consumes the previous stage's output and produces
-the next stage's input. The runner is the only stage that talks to a model; grading and
-reporting read files.
+The pipeline is an artifact graph, not one long process. A manifest branches into answer
+tasks, autonomous-trigger work, and static checks. Commands can run on different machines or
+days apart, and several commands call the same model-free grading owner directly rather than
+consume another command's report.
 
 ```mermaid
 flowchart LR
     M[Manifest\nshared-benchmark.json] --> V[validate]
-    V --> P[prepare\ntask rows]
-    P --> R{Runner}
-    R --> C[(Run-output\ncontract\non disk)]
-    C --> G[grade]
-    G --> B[benchmark\nreport]
-    B --> VW[render-viewer\nexports]
+    V --> P[prepare\nanswer task rows]
+    P --> R{Answer runner}
+    P --> EJ[export-jetty]
+    EJ --> RJ[run-jetty]
+    RJ --> IJ[import-jetty-results]
+    R --> C[(Run-output contract\non disk)]
+    IJ --> C
+    C --> IT[import-trace / normalize\noptional enrichment]
+    IT --> C
 
-    R -.no model in\nthese stages.-> G
-    G -.->|deferred| J[judge\nvia --judge-cmd]
-    J --> B
+    C --> G[grade_case_variant\nshared model-free owner]
+    G --> GO[grade output\noptional grading files / judge tasks]
+    G --> B[benchmark\naggregated report]
+    G --> Q[judge task]
+    Q --> J[judge / human / external model]
+    J --> JR[judge-results]
+    JR --> G
+    B --> PP[report / viewer / exports\naggregate and analysis]
+
+    M --> TR[autonomous trigger runners]
+    TR --> TM[trigger reports]
+    TM --> TC[trigger-compare]
 ```
 
-The dotted line marks the rule that shapes the rest of the design: the `grade`/`benchmark`
-scoring path never calls a model. The one exception is the judge, which runs only when you
-ask for it — through a `--judge-cmd` you supply, or natively via
-`--judge-backend claude|codex|vibe` plus `--judge-model` — and whose results merge back at
-report time, each stamped with the `judge_model`
-that produced it.
+`grade` and `benchmark` are peer frontends over `grade_case_variant`: `benchmark` does not
+read the output of the `grade` command. `token-overhead`, `export-anthropic`, `aggregate`,
+and run-aware audit paths also reuse grading or benchmark construction directly. An optional
+`grading.json` or `grade --out` report is therefore a review/export artifact, not a required
+handoff to `benchmark`.
+
+The model-free rule applies to `grade_case_variant` and report construction. Model calls live
+in explicit answer and trigger runners, the opt-in `judge` / `judge-robustness` paths, and
+`suggest-cases --generate-cmd`. A blind comparison can also be judged by a human or model
+outside the harness before `compare-results` imports the decisions. Jetty adds a networked
+control plane around a remote answer runner; import, grading, and reporting remain local.
 
 ## Four axes, one grid
 
@@ -105,6 +125,7 @@ flowchart TB
     P[prepare\nanswer task rows] --> PI[Pi answer smoke]
     P --> CX[Codex\nrun-codex]
     P --> CL[Claude\nrun-claude]
+    P --> VB[Vibe\nrun-agent]
     P --> JT[Jetty\nexport / run / import]
     P --> SUB[Subagent\nrun-subagent\n+ tool replay]
     P --> HUM[Any answer runner\nor a person]
@@ -115,6 +136,7 @@ flowchart TB
     PI --> CONTRACT
     CX --> CONTRACT
     CL --> CONTRACT
+    VB --> CONTRACT
     JT --> CONTRACT
     SUB --> CONTRACT
     HUM --> CONTRACT
@@ -122,7 +144,10 @@ flowchart TB
     RAW[raw trace.jsonl] --> NORM[normalize_trace_records]
     PI -.-> RAW
     CX -.-> RAW
+    CL -.-> RAW
+    VB -.-> RAW
     JT -.-> RAW
+    SUB -.-> RAW
     NORM --> CONTRACT[(Run-output contract\noutput.md + metadata\n+ events/metrics\n+ artifact-commit.json)]
 
     CONTRACT --> GR[grade reads from disk]
@@ -139,25 +164,34 @@ missing or unknown, the assertion fails rather than guessing from the answer tex
 
 ## How a judge defers
 
-A qualitative check does not run inside `grade` itself: grading records a judge task and
-moves on. You run the judge separately — with a `--judge-cmd` you supply, or
-`--judge-backend claude|codex|vibe` plus `--judge-model` — then merge its verdicts (each
-carrying its `judge_model`) into
-the report.
+A qualitative check does not call a model inside `grade_case_variant`: without a matching
+verdict, grading constructs a judge task and moves on. `grade --judge-tasks` can export those
+tasks for an external or human workflow. The `judge` command does not consume that optional
+queue; it reconstructs the same tasks from the manifest and run artifacts, invokes the
+selected backend, and writes keyed judge results. Supplying those results to `grade` or
+`benchmark` merges each verdict, stamped with its `judge_model`, into the corresponding row.
 
 ```mermaid
 sequenceDiagram
-    participant G as grade
+    participant C as run contract
+    participant G as grade_case_variant
     participant Q as judge-tasks.jsonl
-    participant J as your --judge-cmd
-    participant B as benchmark report
+    participant J as judge command
+    participant X as external / human workflow
+    participant R as judge-results.jsonl
+    participant B as grade or benchmark output
 
-    G->>Q: write {judge_task_id, prompt, output}
-    Note over G,Q: no model called
-    J->>Q: read pending tasks
-    J->>J: run your model, score each
-    J->>B: judge-results.jsonl {passed, score, evidence}
-    B->>B: merge by judge_task_id
+    G->>C: read output and normalized evidence
+    G-->>Q: optionally export {judge_task_id, prompt, output}
+    Note over G,Q: grading itself calls no model
+    J->>C: reconstruct pending tasks from manifest + runs
+    X->>Q: read the optional exported queue
+    J->>J: run the selected model or external command
+    X->>X: produce a human or external verdict
+    J->>R: write {judge_task_id, passed, score, evidence}
+    X->>R: write the same keyed result shape
+    R->>G: supply with --judge-results
+    G->>B: merge by judge_task_id
 ```
 
 The key is the `judge_task_id` (`case::variant::run-n::assertion`, gaining a `model` segment on

@@ -31,6 +31,8 @@ import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
+COMMAND_REFERENCE = (ROOT / "docs" / "commands.md").read_text(encoding="utf-8")
+OTEL_PLAN = (ROOT / "docs" / "otel-support-plan.md").read_text(encoding="utf-8")
 
 
 class SharedOwnerIdentityTests(unittest.TestCase):
@@ -316,6 +318,22 @@ class DocSyncTests(unittest.TestCase):
         subs = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
         missing = [cmd for cmd in subs.choices if f"skill-benchmark {cmd}" not in README]
         self.assertFalse(missing, f"CLI subcommands undocumented in README.md: {missing}")
+
+    def test_every_cli_subcommand_is_documented_in_command_reference(self):
+        parser = sb.build_arg_parser()
+        subs = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
+        missing = [cmd for cmd in subs.choices
+                   if f"skill-benchmark {cmd}" not in COMMAND_REFERENCE]
+        self.assertFalse(missing, f"CLI subcommands undocumented in docs/commands.md: {missing}")
+
+    def test_otel_roadmap_accounts_for_every_cli_surface(self):
+        parser = sb.build_arg_parser()
+        subs = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
+        missing = [cmd for cmd in subs.choices if f"`{cmd}`" not in OTEL_PLAN]
+        for entry_point in ("skill-trigger-matrix", "skill-pi-trigger-eval"):
+            if f"`{entry_point}`" not in OTEL_PLAN:
+                missing.append(entry_point)
+        self.assertFalse(missing, f"CLI surfaces absent from the OTel coverage inventory: {missing}")
 
     def test_every_assertion_type_is_documented_in_readme(self):
         types = sorted(sb.OBJECTIVE_ASSERTIONS | sb.QUALITATIVE_ASSERTIONS)
