@@ -102,6 +102,180 @@ class SubagentRunnerTests(unittest.TestCase):
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["returncode"], 1)
 
+    def test_multiturn_commits_each_turn_and_sums_explicit_deltas(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = make_tasks(root)[:1]
+            tasks[0]["turns"] = ["first", "second"]
+
+            def agent(*, prompt, workspace, model, tool_executor, history=None):
+                n = len(history or []) + 1
+                return {
+                    "answer": f"answer-{n}",
+                    "trace": [{
+                        "type": "command", "command": f"step-{n}",
+                        "status": "completed", "usage": {"total_tokens": 999},
+                        "elapsed_ms": 999,
+                    }],
+                    "usage": {
+                        "input_tokens": n + 1, "output_tokens": n,
+                        "cost_usd": n / 10,
+                    },
+                    "elapsed_ms": n * 10,
+                    "telemetry_scope": "turn_delta",
+                }
+
+            sb.run_subagent_tasks(tasks, root / "runs", agent)
+            base = root / "runs" / "case-1" / "with_skill"
+            metadata = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+            root_trace = [json.loads(line) for line in
+                          (base / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+
+            self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "answer-2")
+            self.assertEqual(metadata["elapsed_ms"], 30)
+            self.assertEqual(metrics["input_tokens"], 5)
+            self.assertEqual(metrics["output_tokens"], 3)
+            self.assertEqual(metrics["total_tokens"], 8)
+            self.assertAlmostEqual(metrics["cost_usd"], 0.3)
+            self.assertEqual([row["_subagent_turn"] for row in root_trace], [1, 2])
+            self.assertTrue(all("usage" not in row and "elapsed_ms" not in row
+                                for row in root_trace))
+            summary = metadata["multi_turn_telemetry"]
+            self.assertTrue(summary["run_complete"])
+            for channel in ("elapsed", "usage", "cost", "trace"):
+                self.assertEqual(summary[channel]["availability"], "complete")
+            for n, answer in ((1, "answer-1"), (2, "answer-2")):
+                turn = base / f"turn-{n}"
+                self.assertEqual((turn / "output.md").read_text(encoding="utf-8"), answer)
+                self.assertTrue((turn / "trace.jsonl").is_file())
+                self.assertTrue((turn / sb.ARTIFACT_COMMIT_NAME).is_file())
+                turn_meta = json.loads((turn / "metadata.json").read_text(encoding="utf-8"))
+                self.assertEqual(turn_meta["returncode"], 0)
+                self.assertEqual(turn_meta["billing_scope"], "turn")
+                self.assertEqual(turn_meta["turn_number"], n)
+
+    def test_multiturn_mixed_or_cumulative_telemetry_stays_partial(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = make_tasks(root)[:1]
+            tasks[0]["turns"] = ["first", "second"]
+
+            def agent(*, prompt, workspace, model, tool_executor, history=None):
+                n = len(history or []) + 1
+                return {
+                    "answer": f"answer-{n}",
+                    "trace": [{"type": "command", "command": f"step-{n}",
+                               "status": "completed"}],
+                    "usage": {"total_tokens": 5 if n == 1 else 9,
+                              "cost_usd": 0.1 if n == 1 else 0.3},
+                    "elapsed_ms": n * 10,
+                    "telemetry_scope": ("turn_delta" if n == 1
+                                        else "conversation_cumulative"),
+                }
+
+            sb.run_subagent_tasks(tasks, root / "runs", agent)
+            base = root / "runs" / "case-1" / "with_skill"
+            metadata = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+            summary = metadata["multi_turn_telemetry"]
+
+            self.assertTrue(summary["run_complete"])
+            self.assertFalse(summary["delta_semantics_complete"])
+            for channel in ("elapsed", "usage", "cost", "trace"):
+                self.assertEqual(summary[channel]["availability"], "partial")
+            self.assertEqual(summary["usage"]["observed_delta_totals"]["total_tokens"], 5)
+            self.assertEqual(metadata["usage_normalized"]["source"], "missing")
+            self.assertEqual(metadata["cost_normalized"]["source"], "missing")
+            self.assertNotIn("total_tokens", metrics)
+            self.assertNotIn("cost_usd", metrics)
+            self.assertNotIn("elapsed_ms", metrics)
+            self.assertFalse(metrics["trace_observation_complete"])
+            # The unaggregated cumulative provider values remain inspectable.
+            self.assertEqual(json.loads(
+                (base / "turn-2" / "metrics.json").read_text(encoding="utf-8")
+            )["total_tokens"], 9)
+
+    def test_multiturn_unspecified_telemetry_is_unavailable_not_final_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = make_tasks(root)[:1]
+            tasks[0]["turns"] = ["first", "second"]
+
+            def agent(*, prompt, workspace, model, tool_executor, history=None):
+                n = len(history or []) + 1
+                # These could be either turn deltas or conversation-cumulative
+                # counters. Absence of an explicit scope makes either sum or
+                # final-turn overwrite unsafe.
+                return {
+                    "answer": f"answer-{n}",
+                    "trace": [{"type": "command", "command": f"step-{n}",
+                               "status": "completed"}],
+                    "usage": {"total_tokens": 10 * n, "cost_usd": n / 10},
+                    "elapsed_ms": n * 10,
+                }
+
+            sb.run_subagent_tasks(tasks, root / "runs", agent)
+            base = root / "runs" / "case-1" / "with_skill"
+            metadata = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+            summary = metadata["multi_turn_telemetry"]
+
+            for channel in ("elapsed", "usage", "cost", "trace"):
+                self.assertEqual(summary[channel]["availability"], "unavailable")
+            self.assertEqual(metadata["usage_normalized"]["source"], "missing")
+            self.assertEqual(metadata["cost_normalized"]["source"], "missing")
+            self.assertNotIn("total_tokens", metrics)
+            self.assertNotIn("elapsed_ms", metrics)
+            self.assertEqual(json.loads(
+                (base / "turn-1" / "metrics.json").read_text(encoding="utf-8")
+            )["total_tokens"], 10)
+            self.assertEqual(json.loads(
+                (base / "turn-2" / "metrics.json").read_text(encoding="utf-8")
+            )["total_tokens"], 20)
+
+    def test_multiturn_failure_is_fatal_without_erasing_prior_turns(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = make_tasks(root)[:1]
+            tasks[0]["turns"] = ["first", "second", "must-not-run"]
+            calls: list[int] = []
+
+            def agent(*, prompt, workspace, model, tool_executor, history=None):
+                n = len(calls) + 1
+                calls.append(n)
+                common = {
+                    "trace": [{"type": "command", "command": f"step-{n}",
+                               "status": "completed" if n == 1 else "failed"}],
+                    "usage": {"total_tokens": n, "cost_usd": n / 10},
+                    "elapsed_ms": n * 10,
+                    "telemetry_scope": "turn_delta",
+                }
+                return ({"answer": "first-answer", **common} if n == 1 else
+                        {"answer": "ignored partial answer", "returncode": 7, **common})
+
+            sb.run_subagent_tasks(tasks, root / "runs", agent)
+            base = root / "runs" / "case-1" / "with_skill"
+            metadata = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(calls, [1, 2])
+            self.assertEqual((base / "turn-1" / "output.md").read_text(encoding="utf-8"),
+                             "first-answer")
+            self.assertIn("subagent turn 2 did not complete",
+                          (base / "turn-2" / "output.md").read_text(encoding="utf-8"))
+            self.assertFalse((base / "turn-3").exists())
+            self.assertIn("subagent turn 2 did not complete",
+                          (base / "output.md").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["returncode"], 7)
+            summary = metadata["multi_turn_telemetry"]
+            self.assertFalse(summary["run_complete"])
+            self.assertEqual(summary["attempted_turns"], 2)
+            self.assertEqual(summary["completed_turns"], 1)
+            self.assertEqual(summary["usage"]["availability"], "partial")
+            self.assertEqual(metadata["usage_normalized"]["source"], "missing")
+            self.assertFalse(metrics["operation_observation_complete"])
+
     def test_agent_backends_are_registered_workspace_builders(self):
         for name in ("subagent", "codex", "claude", "vibe"):
             self.assertIn(name, sb.WORKSPACE_BUILDERS)
@@ -339,11 +513,15 @@ class SharedSkillInvokedTests(unittest.TestCase):
 
     def test_detect_trigger_is_evidence_based(self):
         sp = Path("/ws/skills/root-0/SKILL.md")
-        read_it = json.dumps({"type": "tool_use", "name": "Read", "input": {"file_path": "/ws/skills/root-0/SKILL.md"}})
+        read_it = json.dumps({"type": "tool_use", "name": "Read",
+                              "status": "completed",
+                              "input": {"file_path": "/ws/skills/root-0/SKILL.md"}})
         invoked, evidence = sb.detect_trigger(read_it, [sp])
         self.assertTrue(invoked)
         self.assertTrue(evidence)
-        never = json.dumps({"type": "tool_use", "name": "Read", "input": {"file_path": "/ws/inputs/data.csv"}})
+        never = json.dumps({"type": "tool_use", "name": "Read",
+                            "status": "completed",
+                            "input": {"file_path": "/ws/inputs/data.csv"}})
         self.assertEqual(sb.detect_trigger(never, [sp]), (False, []))   # mounted but unread => False
 
     def test_trigger_eval_uses_the_one_owner(self):
@@ -1061,10 +1239,14 @@ class TraceDialectRegistryTests(unittest.TestCase):
     normalize_trace_records (a pi_stream parameter AND a claude flatten
     branch)."""
 
-    def test_registered_generic_sources_get_the_generic_dialect(self):
-        for source in ("codex", "JETTY", "generic", "stub", "subagent", "vibe"):
+    def test_registered_sources_use_explicit_dialects(self):
+        for source in ("generic", "stub", "subagent"):
             with self.subTest(source=source):
                 self.assertIs(sb.trace_dialect_for(source), sb.GENERIC_TRACE_DIALECT)
+        for source in ("codex", "JETTY", "vibe"):
+            with self.subTest(source=source):
+                self.assertIsNot(
+                    sb.trace_dialect_for(source), sb.GENERIC_TRACE_DIALECT)
 
     def test_unknown_misspelled_and_non_string_sources_are_rejected(self):
         for source in ("unknown", "pi ", " vibes", "", None, 3):
@@ -1085,6 +1267,76 @@ class TraceDialectRegistryTests(unittest.TestCase):
     def test_claude_dialect_owns_the_stream_flatten(self):
         self.assertIs(sb.TRACE_DIALECTS["claude"].flatten, sb.claude_stream_flat_records)
         self.assertIs(sb.trace_dialect_for("Claude"), sb.TRACE_DIALECTS["claude"])
+
+    def test_claude_completed_tool_lifecycle_counts_exactly_once(self):
+        records = [
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call-1", "name": "Read",
+                 "input": {"file_path": "/tmp/a"}},
+            ]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call-1", "content": "ok"},
+            ]}},
+        ]
+        events, metrics = sb.normalize_trace_records(records, source="claude")
+        lifecycle = [event for event in events["events"]
+                     if event["type"] in {"tool_call", "file_read"}]
+        self.assertEqual([event["status"] for event in lifecycle],
+                         ["in_progress", "completed"])
+        self.assertEqual(metrics["tool_calls"], 1)
+        self.assertNotIn("trace_protocol_errors", metrics)
+
+    def test_claude_dangling_and_unmatched_calls_are_protocol_invalid(self):
+        for records, phrase in (
+            ([{"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "call-1", "name": "Read", "input": {}},
+            ]}}], "no matching tool_result"),
+            ([{"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "missing", "content": "x"},
+            ]}}], "unmatched Claude tool_result"),
+        ):
+            with self.subTest(phrase=phrase):
+                _, metrics = sb.normalize_trace_records(records, source="claude")
+                self.assertTrue(any(phrase in error
+                                    for error in metrics["trace_protocol_errors"]))
+
+    def test_claude_malformed_message_and_lifecycle_fields_are_protocol_invalid(self):
+        malformed = [
+            {"type": "assistant", "message": {"content": {"type": "tool_use"}}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": 1, "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "x", "name": "", "input": {}},
+                {"type": "tool_use", "id": "y", "name": "Read", "input": []},
+            ]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "x", "is_error": "false"},
+            ]}},
+        ]
+        _, metrics = sb.normalize_trace_records(malformed, source="claude")
+        self.assertGreaterEqual(len(metrics["trace_protocol_errors"]), 5)
+
+    def test_claude_protocol_error_makes_trace_signal_unavailable(self):
+        raw = json.dumps({
+            "type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "dangling", "name": "Read", "input": {}},
+            ]},
+        })
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run"
+            sb.write_trace_artifacts(
+                run_dir, raw, source="claude",
+                process_observation_complete=True,
+                provider_response_complete=True,
+            )
+            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+            passed, evidence = sb.process_or_efficiency_assertion_result(
+                {"type": "tool_call", "tool": "WebSearch", "expected_no_call": True},
+                run_dir, {},
+            )
+        self.assertFalse(metrics["trace_observation_complete"])
+        self.assertFalse(metrics["operation_observation_complete"])
+        self.assertFalse(passed)
+        self.assertIn("trace_observation_incomplete", evidence)
 
     def test_pi_dialect_resolves_cumulative_terminal_usage(self):
         # The retry-then-success stream carries per-attempt usage; the dialect

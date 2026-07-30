@@ -43,6 +43,11 @@ DOC_REF_IGNORE = "<!-- doc-ref-ignore -->"
 INLINE_REF_RE = re.compile(r"`([A-Za-z_]\w*):(\d+)`")
 PAREN_REF_RE = re.compile(
     r"`([A-Za-z_]\w*)`\s+\(`(?:([\w.]+\.py))?:(\d+)`\)")
+MARKDOWN_LINE_REF_RE = re.compile(r"`([\w.-]+\.md):(\d+)`")
+LINK_LINE_FRAGMENT_RE = re.compile(
+    r"(?:\]\([^\n)]*#L\d+(?:-L\d+)?\)|<[^\n>]*#L\d+(?:-L\d+)?>)",
+    re.IGNORECASE,
+)
 
 
 def line_map(path: Path) -> dict[str, int]:
@@ -88,24 +93,38 @@ def resolve(name: str, module: str | None, maps: dict[str, dict[str, int]]) -> t
     raise ValueError(f"unknown unqualified code reference {name!r}")
 
 
-def _line_is_ignored(text: str, offset: int) -> bool:
-    start = text.rfind("\n", 0, offset) + 1
-    end = text.find("\n", offset)
+def _reference_is_ignored(text: str, reference_end: int) -> bool:
+    """The marker opts out only the immediately preceding reference."""
+    end = text.find("\n", reference_end)
     if end < 0:
         end = len(text)
-    return DOC_REF_IGNORE in text[start:end]
+    suffix = text[reference_end:end]
+    # Normal sentence punctuation may sit between the reference and marker,
+    # but intervening prose or another reference may not.
+    return re.fullmatch(
+        rf"[ \t]*[.,;:!?)]?[ \t]*{re.escape(DOC_REF_IGNORE)}[ \t]*",
+        suffix,
+    ) is not None
 
 
 def doc_references(text: str) -> list[dict]:
     """Extract (name, module?, cited_line, offset) references from doc text."""
+    markdown_line_refs = [
+        *MARKDOWN_LINE_REF_RE.finditer(text),
+        *LINK_LINE_FRAGMENT_RE.finditer(text),
+    ]
+    if markdown_line_refs:
+        rendered = ", ".join(match.group(0) for match in markdown_line_refs[:3])
+        raise ValueError(
+            f"Markdown line references are unstable ({rendered}); use a heading anchor")
     refs = []
     for m in INLINE_REF_RE.finditer(text):
-        if _line_is_ignored(text, m.start()):
+        if _reference_is_ignored(text, m.end()):
             continue
         refs.append({"name": m.group(1), "module": None, "cited": int(m.group(2)),
                      "offset": m.start(), "form": "inline", "span": m.span(2)})
     for m in PAREN_REF_RE.finditer(text):
-        if _line_is_ignored(text, m.start()):
+        if _reference_is_ignored(text, m.end()):
             continue
         refs.append({"name": m.group(1), "module": m.group(2), "cited": int(m.group(3)),
                      "offset": m.start(), "form": "paren", "span": m.span(3)})
@@ -116,7 +135,8 @@ def rewrite_doc_text(text: str, maps: dict[str, dict[str, int]]) -> tuple[str, i
     """Return text with every stale reference re-pointed at the definition.
 
     Unknown references fail closed. A prose example that intentionally looks
-    like a code reference must opt out on its line with DOC_REF_IGNORE.
+    like a code reference must put DOC_REF_IGNORE immediately after that one
+    reference. Markdown citations use stable heading anchors, never line numbers.
     """
     edits: list[tuple[int, int, str]] = []
     for ref in doc_references(text):

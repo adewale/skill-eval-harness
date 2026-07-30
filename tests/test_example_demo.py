@@ -28,7 +28,23 @@ class DemoExampleTests(unittest.TestCase):
         stub = f"{sys.executable} {DEMO / 'stub_runner.py'}"
         sb.run_codex(argparse.Namespace(tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"), codex_cmd=stub, timeout=120))
         variants = sorted({r["variant"] for r in rows})   # include the ablation arms, not just the manifest variants
-        return sb.build_benchmark_report(mp, td / "runs", variants_arg=variants)
+        # The example declares one judge assertion, so an executable end-to-end
+        # report must also materialize its verdicts. Leaving them deferred would
+        # correctly make the report partial and would make objective ablation
+        # evidence look complete only by projecting away a declared grader.
+        judge_tasks = sb.collect_judge_tasks(mp, td / "runs", variants=variants)
+        judge_cmd = f"{sys.executable} {DEMO / 'stub_judge.py'}"
+        verdicts = [sb.run_one_judge_task(task, judge_cmd, None, 1)
+                    for task in judge_tasks]
+        judge_results = td / "judge-results.jsonl"
+        judge_results.write_text(
+            "\n".join(json.dumps(verdict) for verdict in verdicts) + "\n",
+            encoding="utf-8",
+        )
+        return sb.build_benchmark_report(
+            mp, td / "runs", variants_arg=variants,
+            judge_results_path=str(judge_results),
+        )
 
     def test_materialized_ablations_confirm_offline(self):
         rep = self._run()

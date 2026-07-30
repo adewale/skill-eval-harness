@@ -32,10 +32,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
@@ -80,6 +81,7 @@ from ablation_model import (
     causal_confirmation,
     execution_valid,
     is_ablation_variant,
+    metadata_lifecycle_error,
     outcome_context,
     outcome_with_context,
     process_observation_complete,
@@ -109,6 +111,12 @@ from trigger_contracts import (
 )
 
 VALID_SPLITS = {"tune", "holdout", "holdback"}
+HARNESS_SEMANTIC_MODULES = (
+    "ablation_model.py", "agent_capabilities.py", "experimental_pairs.py",
+    "jetty_contracts.py", "judge_verdict.py", "run_pi_trigger_eval.py",
+    "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
+    "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
+)
 DEFAULT_VARIANTS = ["with_skill", "without_skill"]
 TEXT_ASSERTIONS = {
     "contains",
@@ -142,6 +150,50 @@ OBJECTIVE_ASSERTIONS = TEXT_ASSERTIONS | PROCESS_ASSERTIONS | EFFICIENCY_ASSERTI
 QUALITATIVE_ASSERTIONS = {"judge", "rubric", "factuality"}
 SEVERITIES = {"critical", "gate", "soft"}
 ORACLE_TIERS = {"strong", "demo", "live"}
+ASSERTION_COMMON_FIELDS = {
+    "type", "name", "description", "ci", "severity", "critical", "gate",
+    "soft", "oracle", "variants", "only_variants", "except_variants",
+    "depends_on", "atLeast", "_migrate_todo",
+}
+ASSERTION_TYPE_FIELDS: dict[str, set[str]] = {
+    "contains": {"value"},
+    "contains_any": {"values", "value"},
+    "contains_all": {"values", "value"},
+    "excludes_any": {"values", "value"},
+    "regex": {"pattern", "value"},
+    "not_regex": {"pattern", "value"},
+    "file_exists": {"path", "value"},
+    "json_field_equals": {"path", "field", "equals"},
+    "golden_output": {"reference", "value", "artifact", "normalize"},
+    "similarity": {"expected", "value", "artifact", "threshold", "mode"},
+    "structured_output": {"path", "schema"},
+    "script": {"command", "timeout_s", "pass_exit_code"},
+    "skill_invoked": {"expected"},
+    "command_ran": {"pattern", "value"},
+    "command_not_ran": {"pattern", "value"},
+    "command_order": {"patterns"},
+    "tool_call": {
+        "tool", "pattern", "expected_no_call", "required_calls", "call_set",
+        "order", "min_count", "max_count",
+    },
+    "tool_count_le": {"tool", "max", "value"},
+    "no_repeated_command_loop": {"max_repeats", "max", "value"},
+    "total_tokens_le": {"max", "value"},
+    "elapsed_seconds_le": {"max", "value"},
+    "command_count_le": {"max", "value"},
+    "judge": {
+        "preset", "prompt", "rubric", "review_rubric", "threshold",
+        "graded_dimensions", "dynamic_rubric", "per_step",
+    },
+    "rubric": {
+        "preset", "prompt", "rubric", "review_rubric", "threshold",
+        "graded_dimensions", "dynamic_rubric", "per_step",
+    },
+    "factuality": {
+        "preset", "prompt", "rubric", "review_rubric", "threshold",
+        "graded_dimensions", "dynamic_rubric", "per_step",
+    },
+}
 # 1.1: the factuality preset is a named, anchored rubric — no new execution
 # path; it renders through judge_prompt and runs through --judge-cmd/--judge-model.
 JUDGE_PRESETS: dict[str, dict[str, Any]] = {
@@ -225,9 +277,67 @@ def die(msg: str) -> None:
     raise SystemExit(1)
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise json.JSONDecodeError(f"duplicate object key: {key!r}", "", 0)
+        result[key] = value
+    return result
+
+
+def strict_json_loads(value: str | bytes | bytearray) -> Any:
+    """Parse JSON without allowing last-key-wins shadowing."""
+    def reject_constant(constant: str) -> Any:
+        raise json.JSONDecodeError(
+            f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
+
+    parsed = json.loads(
+        value, object_pairs_hook=_unique_json_object,
+        parse_constant=reject_constant)
+    reject_nonfinite_numbers(parsed)
+    return parsed
+
+
+def reject_nonfinite_numbers(value: Any, *, location: str = "$") -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{location} contains a non-finite number")
+    if isinstance(value, dict):
+        for key, child in value.items():
+            reject_nonfinite_numbers(child, location=f"{location}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            reject_nonfinite_numbers(child, location=f"{location}[{index}]")
+
+
+class UniqueKeySafeLoader(yaml.SafeLoader):
+    """PyYAML safe loader that rejects duplicate mapping keys."""
+
+
+def _construct_unique_yaml_mapping(
+    loader: UniqueKeySafeLoader, node: yaml.nodes.MappingNode, deep: bool = False,
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    result: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in result:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                f"found duplicate key {key!r}", key_node.start_mark)
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_yaml_mapping,
+)
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = strict_json_loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         die(f"no such file: {path}")
     except json.JSONDecodeError as exc:
@@ -239,7 +349,8 @@ def load_json(path: Path) -> dict[str, Any]:
 
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(
+        data, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
 
 
 def emit_report(report: Any, out: str | Path | None) -> None:
@@ -250,7 +361,7 @@ def emit_report(report: Any, out: str | Path | None) -> None:
     if out:
         write_json(Path(out), report)
     else:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+        print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
 
 
 def iter_json_objects(text: str):
@@ -260,8 +371,11 @@ def iter_json_objects(text: str):
     hand-rolled copies of the same try/except."""
     for line in text.splitlines():
         try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
+            yield strict_json_loads(line)
+        except json.JSONDecodeError as exc:
+            if ("duplicate object key" in exc.msg
+                    or "non-finite numeric constant" in exc.msg):
+                raise ValueError(exc.msg) from exc
             continue
 
 
@@ -332,7 +446,9 @@ def is_judge_only_case(case: dict[str, Any]) -> bool:
     return bool(assertions) and all(a.get("type") in QUALITATIVE_ASSERTIONS for a in assertions)
 
 
-def case_prompt(case: dict[str, Any], manifest_path: Path, allow_missing: bool = False) -> str:
+def case_prompt_from_dir(case: dict[str, Any], manifest_dir: Path,
+                         allow_missing: bool = False) -> str:
+    """Resolve the exact case-prompt text from its manifest-relative source."""
     if case.get("prompt"):
         return str(case["prompt"])
     if case.get("turns"):
@@ -340,13 +456,17 @@ def case_prompt(case: dict[str, Any], manifest_path: Path, allow_missing: bool =
         # runners that understand turns drive the full sequence from the row.
         return str((case["turns"][0] or {}).get("prompt", ""))
     if case.get("prompt_ref"):
-        p = (manifest_path.parent / str(case["prompt_ref"])).resolve()
+        p = (manifest_dir / str(case["prompt_ref"])).resolve()
         if p.exists():
             return p.read_text(encoding="utf-8")
         if allow_missing:
             return f"<hidden prompt: {case['prompt_ref']}>"
         die(f"{case.get('id')}: prompt_ref is missing: {p} (use --allow-missing-prompts only for dry-run planning)")
     return f"<no prompt supplied; scenario: {case.get('scenario', case.get('id'))}>"
+
+
+def case_prompt(case: dict[str, Any], manifest_path: Path, allow_missing: bool = False) -> str:
+    return case_prompt_from_dir(case, manifest_path.parent, allow_missing=allow_missing)
 
 
 def repo_root_for_manifest(manifest_path: Path) -> Path:
@@ -365,9 +485,58 @@ def script_command_list(assertion: dict[str, Any]) -> list[str]:
 
 
 def validate_variant_filter(assertion: dict[str, Any], cid: str, index: int) -> None:
+    if "variants" in assertion and "only_variants" in assertion:
+        die(f"{cid}: assertion #{index} cannot set both variants and only_variants")
     for key in ["variants", "only_variants", "except_variants"]:
-        if key in assertion and (not isinstance(assertion.get(key), list) or not all(isinstance(v, str) for v in assertion.get(key, []))):
-            die(f"{cid}: assertion #{index} {key} must be a list of strings")
+        if key not in assertion:
+            continue
+        values = assertion.get(key)
+        if (not isinstance(values, list) or not values
+                or not all(isinstance(v, str) and v for v in values)
+                or len(values) != len(set(values))):
+            die(f"{cid}: assertion #{index} {key} must be a non-empty unique list of non-empty strings")
+    only = assertion.get("variants", assertion.get("only_variants", []))
+    excluded = assertion.get("except_variants", [])
+    if set(only) & set(excluded):
+        die(f"{cid}: assertion #{index} includes and excludes the same variant")
+
+
+def canonical_assertion_path(
+    assertion: dict[str, Any], canonical_key: str, *aliases: str,
+    required: bool = False, mutate: bool = False,
+) -> str | None:
+    """Resolve one path operand and reject ambiguous/root/escaping spellings."""
+    keys = (canonical_key, *aliases)
+    present = [key for key in keys if key in assertion]
+    if len(present) > 1:
+        raise ValueError(f"sets conflicting path aliases {present}")
+    if not present:
+        if required:
+            raise ValueError(f"needs a {canonical_key} path")
+        return None
+    raw = assertion[present[0]]
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{canonical_key} must be a safe non-empty relative path")
+    candidate = Path(raw)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError(f"{canonical_key} must be a safe non-empty relative path")
+    normalized = candidate.as_posix()
+    if candidate == Path(".") or normalized in {"", "."}:
+        raise ValueError(f"{canonical_key} must name a file, not the root directory")
+    if mutate:
+        assertion[canonical_key] = normalized
+        for alias in aliases:
+            assertion.pop(alias, None)
+    return normalized
+
+
+def resolved_assertion_path(root: Path, relative: str) -> Path:
+    """Resolve a validated assertion path without following a symlink outside root."""
+    root_resolved = root.resolve()
+    candidate = (root_resolved / relative).resolve()
+    if candidate == root_resolved or root_resolved not in candidate.parents:
+        raise ValueError(f"path escapes assertion root: {relative}")
+    return candidate
 
 
 def assertion_applies_to_variant(assertion: dict[str, Any], variant: str) -> bool:
@@ -382,20 +551,52 @@ def validate_script_assertion(assertion: dict[str, Any], manifest_path: Path, ci
     command = script_command_list(assertion)
     if not command:
         die(f"{cid}: assertion #{index} script command must be a non-empty string or list of strings")
+    for part_index, part in enumerate(command):
+        try:
+            tokens = shlex.split(part)
+        except ValueError as exc:
+            die(f"{cid}: assertion #{index} script command is not parseable: {exc}")
+        for token_index, token in enumerate(tokens):
+            candidate = Path(token)
+            absolute_executor = (
+                part_index == 0 and token_index == 0
+                and candidate.is_absolute() and candidate.is_file()
+                and candidate.suffix not in {".py", ".js", ".mjs", ".sh"})
+            if (candidate.is_absolute() and not absolute_executor) or ".." in candidate.parts:
+                die(
+                    f"{cid}: assertion #{index} script command paths must be "
+                    "relative to the manifest directory")
     for part in command:
         if "{" in part:
             continue
         candidate = Path(part)
+        manifest_relative = not candidate.is_absolute()
         should_exist = candidate.is_absolute() or "/" in part or part.endswith((".py", ".js", ".mjs", ".sh"))
         if not should_exist:
             continue
-        if not candidate.is_absolute():
+        if manifest_relative:
             candidate = manifest_path.parent / candidate
         if not candidate.exists():
             die(f"{cid}: assertion #{index} script path does not exist: {candidate}")
+        if manifest_relative:
+            resolved = candidate.resolve()
+            try:
+                relative = resolved.relative_to(manifest_path.parent.resolve())
+            except ValueError:
+                die(
+                    f"{cid}: assertion #{index} script path must stay inside the "
+                    "manifest directory")
+            if len(relative.parts) == 1 and resolved.is_file():
+                die(
+                    f"{cid}: assertion #{index} script oracles must live in a "
+                    "dedicated subdirectory so their dependency tree is stable")
     timeout = assertion.get("timeout_s", 30)
-    if not isinstance(timeout, (int, float)) or timeout <= 0:
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout)) or timeout <= 0):
         die(f"{cid}: assertion #{index} timeout_s must be a positive number")
+    pass_exit_code = assertion.get("pass_exit_code", 0)
+    if isinstance(pass_exit_code, bool) or not isinstance(pass_exit_code, int):
+        die(f"{cid}: assertion #{index} pass_exit_code must be an integer")
 
 
 def assertion_values_for_leakage(assertion: dict[str, Any]) -> list[str]:
@@ -412,7 +613,8 @@ def assertion_values_for_leakage(assertion: dict[str, Any]) -> list[str]:
 
 def prompt_assertion_leakage_findings(manifest: dict[str, Any], manifest_path: Path, *, min_chars: int = 4, split: str | None = None) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
-    for case in iter_cases(manifest, split):
+    selected_cases = list(iter_cases(manifest, split))
+    for case in selected_cases:
         prompt = ""
         if case.get("prompt"):
             prompt = str(case["prompt"])
@@ -451,22 +653,106 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
     atype = assertion.get("type")
     if atype not in OBJECTIVE_ASSERTIONS | QUALITATIVE_ASSERTIONS:
         die(f"{where} has unsupported type {atype!r}")
+    unknown_fields = set(assertion) - ASSERTION_COMMON_FIELDS - ASSERTION_TYPE_FIELDS[atype]
+    if unknown_fields:
+        die(f"{where} has unknown field(s): {', '.join(sorted(unknown_fields))}")
+    if "ci" in assertion and not isinstance(assertion["ci"], bool):
+        die(f"{where} ci must be boolean")
+    shorthand = [key for key in ("critical", "gate", "soft")
+                 if assertion.get(key) is True]
+    if any(key in assertion and not isinstance(assertion[key], bool)
+           for key in ("critical", "gate", "soft")):
+        die(f"{where} severity shorthands must be boolean")
+    if len(shorthand) > 1 or (assertion.get("severity") is not None and shorthand):
+        die(f"{where} sets conflicting severity selectors")
     severity = assertion.get("severity")
     if severity is not None and severity not in SEVERITIES:
         die(f"{where} severity must be one of {sorted(SEVERITIES)}")
     tier = assertion.get("oracle")
     if tier is not None and tier not in ORACLE_TIERS:
         die(f"{where} oracle must be one of {sorted(ORACLE_TIERS)}")
+    scalar_string_types = {"contains", "regex", "not_regex", "file_exists",
+                           "golden_output", "command_ran", "command_not_ran"}
+    if atype in scalar_string_types:
+        aliases = {
+            "regex": ("pattern", "value"), "not_regex": ("pattern", "value"),
+            "file_exists": ("path", "value"),
+            "golden_output": ("reference", "value"),
+            "command_ran": ("pattern", "value"),
+            "command_not_ran": ("pattern", "value"),
+        }.get(atype, ("value",))
+        present_aliases = [key for key in aliases if key in assertion]
+        if len(present_aliases) > 1:
+            die(f"{where} {atype} sets conflicting operand aliases {present_aliases}")
+        raw = next((assertion[key] for key in aliases if key in assertion), None)
+        if not isinstance(raw, str) or not raw:
+            die(f"{where} {atype} needs a non-empty string operand")
+    if atype in {"contains_any", "contains_all", "excludes_any"}:
+        if "values" in assertion and "value" in assertion:
+            die(f"{where} {atype} cannot set both values and value")
+        values = assertion.get("values", assertion.get("value"))
+        if (not isinstance(values, list) or not values
+                or not all(isinstance(value, str) and value for value in values)):
+            die(f"{where} {atype} needs a non-empty list of non-empty strings")
     if atype == "similarity" and not str(assertion.get("expected", assertion.get("value", ""))):
         die(f"{where} similarity needs an expected string")
+    if atype == "similarity" and "expected" in assertion and "value" in assertion:
+        die(f"{where} similarity cannot set both expected and value")
     if atype == "similarity" and assertion.get("mode") not in (None, "ratio", "embedding"):
         die(f"{where} similarity mode must be ratio or embedding")
-    if atype == "structured_output" and not isinstance(assertion.get("schema"), dict):
-        die(f"{where} structured_output needs a schema object")
+    if atype == "structured_output" and (not isinstance(assertion.get("schema"), dict)
+                                           or not assertion["schema"]):
+        die(f"{where} structured_output needs a non-empty schema object")
+    if atype == "structured_output":
+        schema_errors = supported_json_schema_errors(assertion["schema"])
+        if schema_errors:
+            die(f"{where} structured_output schema is unsupported: {schema_errors[0]}")
+    if atype == "json_field_equals":
+        if not isinstance(assertion.get("field"), str) or not assertion["field"]:
+            die(f"{where} json_field_equals needs a non-empty field")
+        if "equals" not in assertion:
+            die(f"{where} json_field_equals needs an explicit equals value")
+    path_specs = []
+    if atype == "file_exists":
+        path_specs.append(("path", ("value",), True))
+    elif atype == "golden_output":
+        path_specs.append(("reference", ("value",), True))
+    elif (atype == "structured_output"
+          or atype == "json_field_equals" and "path" in assertion):
+        path_specs.append(("path", (), False))
+    if atype in {"golden_output", "similarity"} and "artifact" in assertion:
+        path_specs.append(("artifact", (), False))
+    for canonical_key, aliases, required in path_specs:
+        try:
+            canonical_assertion_path(
+                assertion, canonical_key, *aliases,
+                required=required, mutate=True)
+        except ValueError as exc:
+            die(f"{where} {exc}")
+    if atype == "golden_output":
+        try:
+            reference_path = resolved_assertion_path(path.parent, assertion["reference"])
+        except ValueError as exc:
+            die(f"{where} {exc}")
+        if not reference_path.is_file():
+            die(f"{where} golden_output reference is not a regular file: {reference_path}")
+    if atype == "golden_output" and assertion.get("normalize", "exact") not in {"exact", "trim", "text"}:
+        die(f"{where} golden_output normalize must be exact, trim, or text")
+    if atype == "similarity":
+        threshold = assertion.get("threshold", 0.8)
+        if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+                or not math.isfinite(float(threshold)) or not 0 <= threshold <= 1):
+            die(f"{where} similarity threshold must be a number in [0, 1]")
     if assertion.get("preset") is not None and str(assertion.get("preset")) not in JUDGE_PRESETS:
         die(f"{where} unknown judge preset {assertion.get('preset')!r}; known: {sorted(JUDGE_PRESETS)}")
-    if "atLeast" in assertion and not isinstance(assertion.get("atLeast"), (int, float)):
-        die(f"{where} atLeast must be a number")
+    if "atLeast" in assertion and atype not in QUALITATIVE_ASSERTIONS | {"similarity", "script"}:
+        die(f"{where} atLeast is only valid on scored assertions")
+    if ("atLeast" in assertion
+            and (isinstance(assertion.get("atLeast"), bool)
+                 or not isinstance(assertion.get("atLeast"), (int, float))
+                 or not math.isfinite(float(assertion["atLeast"]))
+                 or not 0 <= float(assertion["atLeast"]) <= 1)):
+        die(f"{where} atLeast must be a number in [0, 1]")
     dep = assertion.get("depends_on")
     if dep is not None and not ((isinstance(dep, str) and dep) or (isinstance(dep, list) and dep and all(isinstance(x, str) and x for x in dep))):
         die(f"{where} depends_on must be a non-empty string or non-empty list of non-empty strings")
@@ -478,6 +764,13 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
         for k, dim in enumerate(dims):
             if not isinstance(dim, dict) or not isinstance(dim.get("name"), str) or not dim.get("name"):
                 die(f"{where} graded_dimensions[{k}] needs a string name")
+            unknown = set(dim) - {"name", "scale", "rubric"}
+            if unknown:
+                die(
+                    f"{where} graded_dimensions[{k}] has unknown field(s): "
+                    f"{', '.join(sorted(unknown))}")
+            if dim.get("scale", "1-5") != "1-5":
+                die(f"{where} graded_dimensions[{k}].scale must be '1-5'")
             if not isinstance(dim.get("rubric"), str) or not dim.get("rubric"):
                 die(f"{where} graded_dimensions[{k}] needs an anchored string rubric")
             names.append(dim["name"])
@@ -487,8 +780,13 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
     if dyn is not None:
         if not isinstance(dyn, dict) or not isinstance(dyn.get("instruction"), str) or not dyn.get("instruction"):
             die(f"{where} dynamic_rubric needs a string instruction")
+        unknown = set(dyn) - {"instruction", "minimum_criteria"}
+        if unknown:
+            die(
+                f"{where} dynamic_rubric has unknown field(s): "
+                f"{', '.join(sorted(unknown))}")
         minimum = dyn.get("minimum_criteria", 3)
-        if not isinstance(minimum, int) or minimum < 1:
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
             die(f"{where} dynamic_rubric.minimum_criteria must be a positive integer")
     per_step = assertion.get("per_step")
     if per_step is not None:
@@ -507,12 +805,48 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
                 die(f"{where} per_step.min_met_fraction must be a number in (0, 1]")
         elif per_step is not True:
             die(f"{where} per_step must be true or an object with min_met_fraction")
+    if "atLeast" in assertion and (dyn is not None or per_step is not None):
+        die(
+            f"{where} atLeast cannot combine with dynamic_rubric or per_step; "
+            "use minimum_criteria or min_met_fraction respectively")
     if atype in {"regex", "not_regex"}:
         pattern = str(assertion.get("pattern", assertion.get("value", "")))
         try:
             re.compile(pattern)
         except re.error as exc:
             die(f"{where} invalid regex {pattern!r}: {exc}")
+    if atype in {"command_ran", "command_not_ran"}:
+        pattern = str(assertion.get("pattern", assertion.get("value")))
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            die(f"{where} invalid command regex {pattern!r}: {exc}")
+    if atype == "command_order":
+        patterns = assertion.get("patterns")
+        if (not isinstance(patterns, list) or not patterns
+                or not all(isinstance(pattern, str) and pattern for pattern in patterns)):
+            die(f"{where} command_order patterns must be a non-empty string list")
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                die(f"{where} invalid command_order regex {pattern!r}: {exc}")
+    if atype == "skill_invoked" and "expected" in assertion and not isinstance(assertion["expected"], bool):
+        die(f"{where} skill_invoked expected must be boolean")
+    if atype in {"tool_count_le", "no_repeated_command_loop",
+                 "total_tokens_le", "elapsed_seconds_le", "command_count_le"}:
+        key = "max_repeats" if atype == "no_repeated_command_loop" and "max_repeats" in assertion else "max"
+        raw_limit = assertion.get(key, assertion.get("value"))
+        limit_aliases = [alias for alias in ("max_repeats", "max", "value")
+                         if alias in assertion]
+        if len(limit_aliases) > 1:
+            die(f"{where} {atype} sets conflicting limit aliases {limit_aliases}")
+        integer_limit = atype in {"tool_count_le", "no_repeated_command_loop",
+                                  "total_tokens_le", "command_count_le"}
+        if (isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, float))
+                or not math.isfinite(float(raw_limit)) or raw_limit < 0
+                or integer_limit and (not isinstance(raw_limit, int))):
+            die(f"{where} {atype} needs a finite nonnegative {'integer' if integer_limit else 'number'} limit")
     if atype == "tool_call":
         # The taxonomy selectors are mutually exclusive; each early-returns in
         # grading, so a manifest setting two would silently drop the lower-precedence
@@ -539,6 +873,39 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
                 re.compile(str(rx))
             except re.error as exc:
                 die(f"{where} tool_call invalid regex {rx!r}: {exc}")
+        for key in ("min_count", "max_count"):
+            if key in assertion and (isinstance(assertion[key], bool)
+                                     or not isinstance(assertion[key], int)
+                                     or assertion[key] < 0):
+                die(f"{where} tool_call {key} must be a nonnegative integer")
+        if assertion.get("min_count", 1) < 1:
+            die(f"{where} tool_call min_count must be at least 1")
+        if ("max_count" in assertion
+                and assertion["max_count"] < assertion.get("min_count", 1)):
+            die(f"{where} tool_call max_count must be >= min_count")
+    if atype in QUALITATIVE_ASSERTIONS:
+        if "threshold" in assertion:
+            threshold = assertion["threshold"]
+            if (isinstance(threshold, bool)
+                    or not isinstance(threshold, (int, float))
+                    or not math.isfinite(float(threshold))):
+                die(f"{where} qualitative threshold must be a finite number")
+            if dims is not None and not 1 <= float(threshold) <= 5:
+                die(f"{where} graded-dimension threshold must be in [1, 5]")
+        for key in ("rubric", "review_rubric"):
+            if key in assertion and (not isinstance(assertion[key], list)
+                                     or not assertion[key]
+                                     or not all(isinstance(item, str) and item
+                                                for item in assertion[key])):
+                die(f"{where} {key} must be a non-empty list of non-empty strings")
+        anchored = (
+            atype == "factuality" or assertion.get("preset") is not None
+            or isinstance(assertion.get("prompt"), str) and bool(assertion["prompt"])
+            or any(assertion.get(key) for key in ("rubric", "review_rubric"))
+            or dims is not None or dyn is not None or per_step is not None
+        )
+        if not anchored:
+            die(f"{where} qualitative assertion needs an anchored rubric or prompt")
     if atype == "script":
         validate_script_assertion(assertion, path, cid, index)
 
@@ -550,7 +917,8 @@ def load_manifest_source(path: Path) -> dict[str, Any]:
     of this loader — validation, leakage lint, prepare, grading — is unchanged."""
     if path.suffix.lower() in {".yaml", ".yml"}:
         try:
-            manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
+            manifest = yaml.load(
+                path.read_text(encoding="utf-8"), Loader=UniqueKeySafeLoader)
         except FileNotFoundError:
             die(f"no such file: {path}")
         except yaml.YAMLError as exc:
@@ -559,6 +927,10 @@ def load_manifest_source(path: Path) -> dict[str, Any]:
             die(f"{path} must contain a YAML mapping")
     else:
         manifest = load_json(path)
+    try:
+        reject_nonfinite_numbers(manifest)
+    except ValueError as exc:
+        die(f"invalid manifest numeric value: {exc}")
     dataset_files = manifest.pop("dataset_files", None)
     if dataset_files is not None:
         if not isinstance(dataset_files, dict):
@@ -573,7 +945,7 @@ def load_manifest_source(path: Path) -> dict[str, Any]:
                 if not line.strip():
                     continue
                 try:
-                    row = json.loads(line)
+                    row = strict_json_loads(line)
                 except json.JSONDecodeError as exc:
                     die(f"{rows_path}: line {n} is not valid JSON: {exc}")
                 rows.append(row)
@@ -597,11 +969,15 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
     if not isinstance(manifest.get("skill_paths", []), list) or not manifest.get("skill_paths") or not all(isinstance(p, str) for p in manifest.get("skill_paths", [])):
         die("manifest.skill_paths must be a non-empty list of strings")
     variants = manifest.get("variants", DEFAULT_VARIANTS)
-    if not isinstance(variants, list) or not variants or not all(isinstance(v, str) for v in variants):
-        die("manifest.variants must be a non-empty list of strings")
+    if (not isinstance(variants, list) or len(variants) != len(set(variants))
+            or set(variants) != {"with_skill", "without_skill"}):
+        die("manifest.variants must contain exactly unique with_skill and without_skill arms")
     optional_variants = manifest.get("optional_variants", [])
-    if optional_variants and (not isinstance(optional_variants, list) or not all(isinstance(v, str) for v in optional_variants)):
-        die("manifest.optional_variants must be a list of strings")
+    if optional_variants and (
+            not isinstance(optional_variants, list)
+            or len(optional_variants) != len(set(optional_variants))
+            or any(v != "old_skill" for v in optional_variants)):
+        die("manifest.optional_variants may contain unique old_skill only")
     judge_cfg = manifest.get("judge")
     if judge_cfg is not None:
         if not isinstance(judge_cfg, dict):
@@ -617,6 +993,8 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                                         or not judge_cfg.get(pfield)
                                         or not all(isinstance(m, str) and m for m in judge_cfg[pfield])):
                 die(f"manifest.judge.{pfield} must be a non-empty list of non-empty model-name strings")
+        if "panel" in judge_cfg and "models" in judge_cfg:
+            die("manifest.judge may set panel or models, not both")
     datasets = manifest.get("datasets")
     if datasets is not None:
         if not isinstance(datasets, dict):
@@ -644,22 +1022,48 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         split = case.get("split")
         if split not in VALID_SPLITS:
             die(f"{cid}: split must be one of {sorted(VALID_SPLITS)}")
+        trigger_case = is_trigger_case(case)
+        if trigger_case:
+            if not isinstance(case.get("should_trigger"), bool):
+                die(f"{cid}: trigger cases require an explicit boolean should_trigger")
+        elif "should_trigger" in case:
+            die(f"{cid}: should_trigger is only valid when kind is 'trigger'")
         eval_intent = case.get("eval_intent")
         if eval_intent is not None and eval_intent not in {"capability", "regression"}:
             die(f"{cid}: eval_intent must be 'capability' or 'regression'")
         turns = case.get("turns")
+        prompt_sources = [
+            key for key in ("prompt", "prompt_ref", "turns")
+            if key in case and case[key] is not None
+        ]
+        if len(prompt_sources) > 1:
+            die(
+                f"{cid}: prompt, prompt_ref, and turns are mutually exclusive; "
+                f"found {prompt_sources}")
+        if "prompt" in case and (
+                not isinstance(case.get("prompt"), str) or not case.get("prompt")):
+            die(f"{cid}: prompt must be a non-empty string")
+        if "prompt_ref" in case and (
+                not isinstance(case.get("prompt_ref"), str) or not case.get("prompt_ref")):
+            die(f"{cid}: prompt_ref must be a non-empty string")
         if turns is not None:
             if not isinstance(turns, list) or not turns:
                 die(f"{cid}: turns must be a non-empty list of turn objects")
             for t, turn in enumerate(turns, 1):
                 if not isinstance(turn, dict) or not isinstance(turn.get("prompt"), str) or not turn.get("prompt"):
                     die(f"{cid}: turn #{t} needs a string prompt")
-        if not case.get("prompt") and not case.get("prompt_ref") and not turns and split == "tune":
-            die(f"{cid}: tune cases must include prompt, prompt_ref, or turns")
+        if not prompt_sources and split == "tune":
+            die(f"{cid}: tune cases must include exactly one of prompt, prompt_ref, or turns")
         if case.get("prompt_ref"):
             ref = path.parent / str(case["prompt_ref"])
             if not ref.exists() and not (allow_missing_holdback and split in {"holdout", "holdback"}):
                 die(f"{cid}: prompt_ref does not exist: {ref}")
+        for field in ("expected_behavior", "review_rubric"):
+            if field in case and (
+                    not isinstance(case[field], list)
+                    or not all(isinstance(item, str) and item
+                               for item in case[field])):
+                die(f"{cid}: {field} must be a list of non-empty strings")
         files = case.get("files", [])
         if files and (not isinstance(files, list) or not all(isinstance(f, str) for f in files)):
             die(f"{cid}: files must be a list of strings")
@@ -673,16 +1077,25 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         if not isinstance(assertions, list):
             die(f"{cid}: assertions must be a list")
         floor = case.get("reference_score")
-        if floor is not None and (not isinstance(floor, (int, float)) or not 0 <= float(floor) <= 1):
+        if floor is not None and (isinstance(floor, bool)
+                                  or not isinstance(floor, (int, float))
+                                  or not math.isfinite(float(floor))
+                                  or not 0 <= float(floor) <= 1):
             die(f"{cid}: reference_score must be a number in [0, 1]")
         graded_floor = case.get("reference_graded_score")
-        if graded_floor is not None and (not isinstance(graded_floor, (int, float)) or not 1 <= float(graded_floor) <= 5):
+        if graded_floor is not None and (isinstance(graded_floor, bool)
+                                         or not isinstance(graded_floor, (int, float))
+                                         or not math.isfinite(float(graded_floor))
+                                         or not 1 <= float(graded_floor) <= 5):
             die(f"{cid}: reference_graded_score must be a number on the 1-5 scale")
         for cfield in ("canary", "released_at"):   # contamination perimeter (output side)
             if case.get(cfield) is not None and not isinstance(case.get(cfield), str):
                 die(f"{cid}: {cfield} must be a string")
         for j, assertion in enumerate(assertions):
             validate_case_assertion(cid, f"assertion #{j}", j, assertion, path)
+        labels = [assertion_label(assertion) for assertion in assertions]
+        if len(labels) != len(set(labels)):
+            die(f"{cid}: assertion labels must be unique within the case")
         validate_depends_on_scope(cid, assertions, path)   # G2: case-level depends_on graph
         # Per-turn assertions go through the SAME validator as case-level ones
         # (an unsupported type under a turn must fail validate, not grading).
@@ -698,6 +1111,37 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                     die(f"{cid}: turn #{t} assertion #{j} depends_on is not supported in turn assertions")
                 if isinstance(assertion, dict) and "per_step" in assertion:
                     die(f"{cid}: turn #{t} assertion #{j} per_step is not supported in turn assertions")
+            turn_labels = [assertion_label(assertion) for assertion in turn_assertions]
+            if len(turn_labels) != len(set(turn_labels)):
+                die(f"{cid}: turn #{t} assertion labels must be unique")
+        all_assertions = [*assertions, *[
+            assertion for turn in (turns or [])
+            for assertion in (turn.get("assertions") or [])
+        ]]
+        allowed_variants = {
+            *variants, *optional_variants,
+            *(f"ablation:{ablation.get('id')}" for ablation in manifest.get("ablations", [])
+              if isinstance(ablation, dict) and ablation.get("id")),
+        }
+        if manifest.get("old_skill_paths"):
+            allowed_variants.add("old_skill")
+        for assertion in all_assertions:
+            for field in ("variants", "only_variants", "except_variants"):
+                unknown = set(assertion.get(field, [])) - allowed_variants
+                if unknown:
+                    die(f"{cid}: assertion {field} names unknown variants: {sorted(unknown)}")
+        if not trigger_case:
+            for variant in variants:
+                applicable = [
+                    assertion for assertion in all_assertions
+                    if assertion_applies_to_variant(assertion, variant)
+                    and assertion_severity(assertion) in {"gate", "critical"}
+                ]
+                if not applicable:
+                    die(
+                        f"{cid}: answer variant {variant!r} needs at least one "
+                        "applicable gate or critical grading oracle")
+        validate_judge_assertion_ids(cid, assertions, turns or [])
 
     seen_ablation_ids: set[str] = set()
     for i, ablation in enumerate(manifest.get("ablations", [])):
@@ -775,6 +1219,87 @@ def task_variants(manifest: dict[str, Any], *, include_old_skill: bool = False, 
     return variants
 
 
+def eval_contract_sha256(
+    manifest: dict[str, Any], manifest_path: Path,
+    *, cases: Iterable[dict[str, Any]] | None = None,
+) -> str:
+    """Commit the semantic manifest plus every referenced grading/input byte."""
+    referenced: set[str] = set()
+    script_roots: set[Path] = set()
+    manifest_dir = manifest_path.parent.resolve()
+    for case in (list(cases) if cases is not None else iter_cases(manifest)):
+        for key in ("prompt_ref",):
+            if isinstance(case.get(key), str) and case[key]:
+                referenced.add(case[key])
+        referenced.update(str(value) for value in (case.get("files") or []))
+        assertions = [*(case.get("assertions") or []), *[
+            assertion for turn in (case.get("turns") or [])
+            for assertion in (turn.get("assertions") or [])
+        ]]
+        for assertion in assertions:
+            if not isinstance(assertion, dict):
+                continue
+            if assertion.get("type") == "golden_output":
+                reference = assertion.get("reference", assertion.get("value"))
+                if isinstance(reference, str) and reference:
+                    referenced.add(reference)
+            if assertion.get("type") == "script":
+                for part in script_command_list(assertion):
+                    candidate = Path(part)
+                    if candidate.is_absolute() or ".." in candidate.parts:
+                        continue
+                    resolved = (manifest_dir / candidate).resolve()
+                    if not resolved.is_file():
+                        continue
+                    try:
+                        relative = resolved.relative_to(manifest_dir)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"script oracle path escapes manifest directory: {part}") from exc
+                    if len(relative.parts) == 1:
+                        raise ValueError(
+                            "script oracles must live in a dedicated subdirectory "
+                            "so their dependency tree is stable")
+                    referenced.add(relative.as_posix())
+                    script_roots.add(manifest_dir / relative.parts[0])
+    files = []
+    for relative in sorted(referenced):
+        candidate = (manifest_path.parent / relative).resolve()
+        try:
+            display = candidate.relative_to(manifest_path.parent.resolve()).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"eval contract path escapes manifest directory: {relative}") from exc
+        if not candidate.is_file():
+            files.append({"path": display, "availability": "missing"})
+            continue
+        files.append({
+            "path": display,
+            "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+        })
+    oracle_trees = []
+    for root in sorted(script_roots):
+        digest = hashlib.sha256()
+        for candidate in sorted(root.rglob("*")):
+            if candidate.is_symlink():
+                raise ValueError(f"script oracle tree contains a symlink: {candidate}")
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(root).as_posix()
+            digest.update(relative.encode("utf-8") + b"\0")
+            digest.update(candidate.read_bytes())
+        oracle_trees.append({
+            "path": root.relative_to(manifest_dir).as_posix()
+            if root != manifest_dir else ".",
+            "sha256": digest.hexdigest(),
+        })
+    return canonical_json_sha256({
+        "schema_version": 1,
+        "manifest": manifest,
+        "referenced_files": files,
+        "script_oracle_trees": oracle_trees,
+    })
+
+
 def materialize_declared_ablations(repo_root: Path, manifest: dict[str, Any], ablation_dir: Path | str) -> dict[str, MaterializedArm]:
     """Materialize every declared-removal ablation once into ``ablation_dir``,
     carrying the TYPED ``MaterializedArm`` (not its serialized dict) so callers read
@@ -823,20 +1348,49 @@ def prepared_task_rows(
     models: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     variants = task_variants(manifest, include_old_skill=include_old_skill, include_ablations=include_ablations)
-    runs_per_variant = max(1, int(runs_per_variant))
+    if (isinstance(runs_per_variant, bool) or not isinstance(runs_per_variant, int)
+            or runs_per_variant < 1):
+        raise ValueError("runs_per_variant must be a positive integer")
     # Model is a third fan-out axis beside variant and run_number (roadmap 2.1):
     # each row carries its target model, and with two or more models the run_dir
     # gains a model segment. A single (or absent) model keeps today's layout, so
     # existing manifests and run dirs are untouched.
-    model_list: list[str | None] = [m.strip() for m in (models or []) if isinstance(m, str) and m.strip()] or [None]
+    supplied_models = models or []
+    if not isinstance(supplied_models, list) or any(
+            not isinstance(m, str) or not m.strip() or "/" in m or "\\" in m
+            or m.strip() in {".", ".."} for m in supplied_models):
+        raise ValueError("models must be a list of non-empty path-safe strings")
+    model_list: list[str | None] = [m.strip() for m in supplied_models] or [None]
+    if len(model_list) != len(set(model_list)):
+        raise ValueError("models must not contain duplicates")
     multi_model = len(model_list) > 1
     cases = iter_cases(manifest, split)
+    for case in cases:
+        if is_trigger_case(case):
+            continue
+        assertions = [*(case.get("assertions") or []), *[
+            assertion for turn in (case.get("turns") or [])
+            for assertion in (turn.get("assertions") or [])
+        ]]
+        for variant in variants:
+            if (is_ablation_variant(variant)
+                    and ablation_variant_population(manifest, variant) == "trigger"):
+                continue
+            if not any(
+                    assertion_applies_to_variant(assertion, variant)
+                    and assertion_severity(assertion) in {"gate", "critical"}
+                    for assertion in assertions):
+                die(
+                    f"{case['id']}: executable answer variant {variant!r} has "
+                    "no applicable gate or critical grading oracle")
     repo_root = repo_root_for_manifest(manifest_path)
     real_skill_paths = [str((repo_root / p).resolve()) for p in manifest.get("skill_paths", [])]
+    real_skill_root_keys = [_skill_root_key(p) for p in manifest.get("skill_paths", [])]
     # The old/baseline arm's files, resolved ONCE here so every runner reads the
     # same row field instead of each re-deriving them (the divergence that let
     # Codex mount the current skill for an old_skill arm while Jetty mounted the old).
     old_skill_paths = [str((repo_root / p).resolve()) for p in manifest.get("old_skill_paths", [])]
+    old_skill_root_keys = [_skill_root_key(p) for p in manifest.get("old_skill_paths", [])]
     # When an ablation directory is provided, materialize each declared-removal
     # ablation once and point its rows at the altered tree. A caller that has
     # already materialized (e.g. export-jetty, which also needs the trees for
@@ -849,7 +1403,12 @@ def prepared_task_rows(
         trees = materialize_declared_ablations(repo_root, manifest, ablation_dir)
     # Every materialized ablation derives from the same canonical (unedited) tree,
     # so its parent_skill_hash is the canonical hash recorded on the with_skill arm.
-    canonical_hash = next(iter(trees.values())).arm.identity.canonical if trees else None
+    canonical_hash = (
+        next(iter(trees.values())).arm.identity.canonical
+        if trees else canonical_skill_tree_hash(repo_root, manifest)
+    )
+    contract_sha256 = eval_contract_sha256(
+        manifest, manifest_path, cases=cases)
     rows: list[dict[str, Any]] = []
     for case in cases:
         # Trigger cases are the DISCOVERY population: "does the skill load on its
@@ -864,10 +1423,13 @@ def prepared_task_rows(
         for variant in variants:
             record: AblationRecord | None = None
             skill_paths = real_skill_paths
+            skill_root_keys = real_skill_root_keys
             if variant == "without_skill":
                 skill_paths = []   # the no-skill arm carries NO skill files at the source (defense in depth)
+                skill_root_keys = []
             elif variant == "old_skill":
                 skill_paths = old_skill_paths   # the OLD tree, carried on the row for both runners
+                skill_root_keys = old_skill_root_keys
             elif is_ablation_variant(variant):
                 population = ablation_variant_population(manifest, variant)
                 # Discovery (trigger-population) ablations measure AUTONOMOUS skill
@@ -880,6 +1442,7 @@ def prepared_task_rows(
                     # Materialized: carry the arm's TYPED provenance straight through —
                     # no dict round-trip, no re-parse (the drop-then-reparse is gone).
                     skill_paths = list(trees[aid].skill_files.values())   # mounted files == ablated tree
+                    skill_root_keys = [_skill_root_key(root) for root in trees[aid].skill_files]
                     record = trees[aid].arm.provenance
                 else:
                     # Instruction-simulated: no tree, original skill mounted; its typed
@@ -900,6 +1463,7 @@ def prepared_task_rows(
                         skill_name=manifest["skill_name"],
                         repo_root=str(repo_root),
                         skill_paths=tuple(skill_paths),
+                        skill_root_keys=tuple(skill_root_keys),
                         input_files=tuple(str((manifest_path.parent / f).resolve()) for f in case.get("files", [])),
                         run_dir=run_dir,
                         instruction=variant_instruction(variant, manifest, repo_root),
@@ -915,6 +1479,7 @@ def prepared_task_rows(
                         answer_key=({"expected_behavior": case.get("expected_behavior", []), "review_rubric": case.get("review_rubric", [])} if include_answer_key else None),
                     )
                     row = task.harness_record()
+                    row["eval_contract_sha256"] = contract_sha256
                     if model:
                         # The target model rides the row (PreparedTask.from_row ignores
                         # it); runners pass it through and stamp it into metadata.
@@ -946,11 +1511,356 @@ def prepare(args: argparse.Namespace) -> int:
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
     try:
         for task in rows:
-            fh.write(json.dumps(task, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(task, ensure_ascii=False, allow_nan=False) + "\n")
     finally:
         if out:
             fh.close()
     return 0
+
+
+ANSWER_DESIGN_NAME = "answer-design.json"
+
+
+def prepared_task_model(task: dict[str, Any], default_model: str | None = None) -> str | None:
+    """Resolve a task model without treating invalid falsy values as absence."""
+    row_model = task.get("model", default_model)
+    if row_model is not None and (not isinstance(row_model, str) or not row_model):
+        raise ValueError("prepared task model must be null or a non-empty string")
+    return row_model
+
+
+def answer_case_input_fingerprint(task: dict[str, Any], pt: PreparedTask) -> str:
+    """Commit the case input shared by every model, arm, and repetition."""
+    raw_turns = task.get("turns", [])
+    if not isinstance(raw_turns, list) or not all(isinstance(turn, str) for turn in raw_turns):
+        raise ValueError("prepared task turns must be a list of strings")
+    payload = {
+        "schema_version": 1,
+        "case_id": pt.case_id,
+        "split": pt.split,
+        "kind": pt.kind,
+        "skill_name": pt.skill_name,
+        "repo_root": pt.repo_root,
+        "input_files": list(pt.input_files),
+        "prompt": pt.prompt,
+        "tags": list(pt.tags),
+        "turns": raw_turns,
+    }
+    return canonical_json_sha256(payload)
+
+
+def answer_task_fingerprint(task: dict[str, Any], pt: PreparedTask,
+                            model: str | None) -> str:
+    """Commit the complete planned treatment, stable across repetitions."""
+    raw_turns = task.get("turns", [])
+    if not isinstance(raw_turns, list) or not all(isinstance(turn, str) for turn in raw_turns):
+        raise ValueError("prepared task turns must be a list of strings")
+    payload = {
+        "schema_version": 2,
+        "case_id": pt.case_id,
+        "model": model,
+        "variant": pt.variant_truth,
+        "split": pt.split,
+        "kind": pt.kind,
+        "skill_name": pt.skill_name,
+        "repo_root": pt.repo_root,
+        "skill_paths": list(pt.skill_paths),
+        "skill_root_keys": list(pt.skill_root_keys),
+        "skill_tree_hash": pt.skill_tree_hash,
+        "ablation": pt.ablation.as_dict() if pt.ablation is not None else None,
+        "input_files": list(pt.input_files),
+        "instruction": pt.instruction,
+        "prompt": pt.prompt,
+        "tags": list(pt.tags),
+        "turns": raw_turns,
+        "answer_key": pt.answer_key,
+    }
+    return canonical_json_sha256(payload)
+
+
+def prepared_skill_surface_hash(pt: PreparedTask) -> str | None:
+    """Hash the exact logical skill tree named by a prepared treatment."""
+    if not pt.skill_paths:
+        return None
+    if not pt.skill_root_keys or len(pt.skill_root_keys) != len(pt.skill_paths):
+        raise ValueError("skill-bearing prepared task needs aligned skill_root_keys")
+    temp_root = Path(tempfile.mkdtemp(prefix=".planned-skill-hash-"))
+    try:
+        tree = temp_root / "skills"
+        for key, raw in zip(pt.skill_root_keys, pt.skill_paths, strict=True):
+            source = Path(raw)
+            source_dir = source if source.is_dir() else source.parent
+            if not source_dir.is_dir():
+                raise ValueError(f"prepared skill root is not a directory: {source_dir}")
+            _copy_skill_root(source_dir, tree / key)
+        return skill_tree_hash(tree)
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def prepared_fixture_tree_hash(pt: PreparedTask) -> str:
+    destinations: dict[str, Path] = {}
+    for raw in pt.input_files:
+        source = Path(raw)
+        destination = source.name
+        if destination in destinations:
+            raise ValueError(
+                f"input fixture destination collision: {destination}")
+        if not source.is_file():
+            raise ValueError(f"input fixture is not a file: {source}")
+        destinations[destination] = source
+    digest = hashlib.sha256()
+    for destination, source in sorted(destinations.items()):
+        digest.update(destination.encode("utf-8") + b"\0")
+        digest.update(source.read_bytes())
+    return digest.hexdigest()
+
+
+def manifest_case_input_fingerprint(
+    manifest: dict[str, Any], manifest_path: Path, case: dict[str, Any],
+) -> str:
+    """Recompute the treatment-invariant prepared input from the manifest."""
+    repo_root = repo_root_for_manifest(manifest_path)
+    payload = {
+        "schema_version": 1,
+        "case_id": case["id"],
+        "split": case["split"],
+        "kind": case.get("kind", "behavior"),
+        "skill_name": manifest["skill_name"],
+        "repo_root": str(repo_root),
+        "input_files": [
+            str((manifest_path.parent / value).resolve())
+            for value in case.get("files", [])
+        ],
+        "prompt": case_prompt(case, manifest_path, allow_missing=True),
+        "tags": list(case.get("tags", [])),
+        "turns": [str((turn or {}).get("prompt", ""))
+                  for turn in case.get("turns", [])],
+    }
+    return canonical_json_sha256(payload)
+
+
+def manifest_variant_skill_hash(
+    manifest: dict[str, Any], manifest_path: Path, variant: str,
+) -> str | None:
+    """Rebuild the skill bytes the current manifest says an arm must mount."""
+    repo_root = repo_root_for_manifest(manifest_path)
+    if variant == "without_skill":
+        return None
+    if variant == "old_skill":
+        old_paths = manifest.get("old_skill_paths") or []
+        if not old_paths:
+            raise ValueError("old_skill arm has no old_skill_paths")
+        return canonical_skill_tree_hash(
+            repo_root, {**manifest, "skill_paths": old_paths})
+    if is_ablation_variant(variant):
+        ablation = ablation_by_id(manifest, ablation_id_of(variant))
+        if ablation is None:
+            raise ValueError(f"unknown ablation arm: {variant}")
+        if ablation_components(ablation):
+            temp_root = Path(tempfile.mkdtemp(prefix=".coverage-ablation-"))
+            try:
+                materialized = materialize_ablation(
+                    repo_root, manifest, ablation, temp_root)
+                return str(materialized["skill_hash"])
+            finally:
+                shutil.rmtree(temp_root, ignore_errors=True)
+    return canonical_skill_tree_hash(repo_root, manifest)
+
+
+def answer_design_from_tasks(tasks: list[dict[str, Any]], *,
+                             default_model: str | None = None) -> dict[str, Any]:
+    """Exact expected answer-run identities, persisted before execution."""
+    identities: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None, str, int]] = set()
+    invariant_by_case: dict[str, tuple[str, str]] = {}
+    treatment_by_coordinate: dict[tuple[str, str | None, str], tuple[str, str, str | None]] = {}
+    contract_hashes: set[str] = set()
+    for task in tasks:
+        pt = PreparedTask.from_row(task)
+        row_model = prepared_task_model(task, default_model)
+        contract_sha256 = task.get("eval_contract_sha256")
+        if (not isinstance(contract_sha256, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", contract_sha256) is None):
+            raise ValueError("prepared task is missing a valid eval_contract_sha256")
+        contract_hashes.add(contract_sha256)
+        key = (pt.case_id, row_model, pt.variant_truth, pt.run_number)
+        if key in seen:
+            raise ValueError(f"duplicate answer design identity: {key}")
+        seen.add(key)
+        task_sha256 = answer_task_fingerprint(task, pt, row_model)
+        case_input_sha256 = answer_case_input_fingerprint(task, pt)
+        fixture_tree_hash = prepared_fixture_tree_hash(pt)
+        instruction_sha256 = canonical_json_sha256({"instruction": pt.instruction})
+        planned_skill_tree_hash = prepared_skill_surface_hash(pt)
+        previous_case = invariant_by_case.setdefault(
+            pt.case_id, (case_input_sha256, fixture_tree_hash))
+        if previous_case != (case_input_sha256, fixture_tree_hash):
+            raise ValueError(
+                f"case input or fixtures differ across experimental coordinates: {pt.case_id}")
+        treatment_key = (pt.case_id, row_model, pt.variant_truth)
+        treatment = (task_sha256, instruction_sha256, planned_skill_tree_hash)
+        previous_treatment = treatment_by_coordinate.setdefault(treatment_key, treatment)
+        if previous_treatment != treatment:
+            raise ValueError(
+                f"planned treatment differs across repetitions: {treatment_key}")
+        run_parts = Path(pt.run_dir).parts
+        variant_index = -2 if run_parts[-1] == f"run-{pt.run_number}" else -1
+        model_parts = run_parts[1:variant_index]
+        if model_parts and (len(model_parts) != 1 or model_parts[0] != row_model):
+            raise ValueError(
+                "answer design run_dir model segment disagrees with task model")
+        if row_model is None and model_parts:
+            raise ValueError("model-less answer design cannot carry a model path segment")
+        identities.append({
+            "case_id": pt.case_id, "model": row_model,
+            "variant": pt.variant_truth, "run_number": pt.run_number,
+            "run_dir": pt.run_dir, "task_sha256": task_sha256,
+            "case_input_sha256": case_input_sha256,
+            "instruction_sha256": instruction_sha256,
+            "planned_skill_tree_hash": planned_skill_tree_hash,
+            "fixture_tree_hash": fixture_tree_hash,
+        })
+    identities.sort(key=lambda row: (
+        row["case_id"], str(row["model"] or ""), row["variant"], row["run_number"]))
+    if len(contract_hashes) != 1:
+        raise ValueError("prepared tasks carry conflicting eval contracts")
+    payload = {"schema_version": 2, "population": "answer",
+               "eval_contract_sha256": next(iter(contract_hashes)),
+               "identities": identities}
+    return {**payload, "design_sha256": canonical_json_sha256(payload)}
+
+
+def validate_answer_design(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError("answer design must be an object")
+    payload = {key: value.get(key) for key in
+               ("schema_version", "population", "eval_contract_sha256", "identities")}
+    if payload["schema_version"] != 2 or payload["population"] != "answer":
+        raise ValueError("answer design has unsupported schema or population")
+    if (not isinstance(payload["eval_contract_sha256"], str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", payload["eval_contract_sha256"]) is None):
+        raise ValueError("answer design has an invalid eval contract digest")
+    identities = payload["identities"]
+    if not isinstance(identities, list):
+        raise TypeError("answer design identities must be a list")
+    normalized_identities: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None, str, int]] = set()
+    seen_run_dirs: set[str] = set()
+    for row in identities:
+        if not isinstance(row, dict) or set(row) != {
+                "case_id", "model", "variant", "run_number", "run_dir",
+                "task_sha256", "case_input_sha256", "instruction_sha256",
+                "planned_skill_tree_hash", "fixture_tree_hash"}:
+            raise ValueError("answer design identity has an invalid shape")
+        case_id, model, variant = row["case_id"], row["model"], row["variant"]
+        run_number, run_dir = row["run_number"], row["run_dir"]
+        task_sha256 = row["task_sha256"]
+        case_input_sha256 = row["case_input_sha256"]
+        instruction_sha256 = row["instruction_sha256"]
+        planned_skill_tree_hash = row["planned_skill_tree_hash"]
+        fixture_tree_hash = row["fixture_tree_hash"]
+        if (not isinstance(case_id, str) or not case_id
+                or model is not None and (not isinstance(model, str) or not model)
+                or not isinstance(variant, str) or not variant
+                or isinstance(run_number, bool) or not isinstance(run_number, int)
+                or run_number < 1 or not isinstance(run_dir, str) or not run_dir
+                or not isinstance(task_sha256, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", task_sha256) is None
+                or not isinstance(case_input_sha256, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", case_input_sha256) is None
+                or not isinstance(instruction_sha256, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", instruction_sha256) is None
+                or planned_skill_tree_hash is not None
+                and (not isinstance(planned_skill_tree_hash, str)
+                     or re.fullmatch(r"[0-9a-f]{64}", planned_skill_tree_hash) is None)
+                or not isinstance(fixture_tree_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", fixture_tree_hash) is None):
+            raise ValueError("answer design identity fields are invalid")
+        run_path = Path(run_dir)
+        if run_path.is_absolute() or run_path == Path(".") or ".." in run_path.parts:
+            raise ValueError("answer design run_dir must be a safe relative path")
+        run_parts = run_path.parts
+        if run_parts[0] != case_id:
+            raise ValueError("answer design run_dir case segment disagrees with case_id")
+        has_run = run_parts[-1] == f"run-{run_number}"
+        if run_number > 1 and not has_run:
+            raise ValueError("answer design repeated run_dir must end in run-N")
+        variant_index = -2 if has_run else -1
+        if run_parts[variant_index] != variant:
+            raise ValueError("answer design run_dir arm disagrees with variant")
+        model_parts = run_parts[1:variant_index]
+        if model_parts and (len(model_parts) != 1 or model_parts[0] != model):
+            raise ValueError("answer design run_dir model segment disagrees with model")
+        key = (case_id, model, variant, run_number)
+        if key in seen:
+            raise ValueError(f"duplicate answer design identity: {key}")
+        if run_dir in seen_run_dirs:
+            raise ValueError(f"duplicate answer design run_dir: {run_dir}")
+        seen.add(key)
+        seen_run_dirs.add(run_dir)
+        normalized_identities.append(dict(row))
+    normalized_identities.sort(key=lambda row: (
+        row["case_id"], str(row["model"] or ""), row["variant"], row["run_number"]))
+    invariant_by_case: dict[str, tuple[str, str]] = {}
+    treatment_by_coordinate: dict[tuple[str, str | None, str], tuple[str, str, str | None]] = {}
+    for row in normalized_identities:
+        case_key = row["case_id"]
+        case_value = (row["case_input_sha256"], row["fixture_tree_hash"])
+        previous_case = invariant_by_case.setdefault(case_key, case_value)
+        if previous_case != case_value:
+            raise ValueError(
+                f"answer design case input or fixtures differ across coordinates: {case_key}")
+        treatment_key = (row["case_id"], row["model"], row["variant"])
+        treatment = (row["task_sha256"], row["instruction_sha256"],
+                     row["planned_skill_tree_hash"])
+        previous_treatment = treatment_by_coordinate.setdefault(treatment_key, treatment)
+        if previous_treatment != treatment:
+            raise ValueError(
+                f"answer design treatment differs across repetitions: {treatment_key}")
+    normalized_payload = {"schema_version": 2, "population": "answer",
+                          "eval_contract_sha256": payload["eval_contract_sha256"],
+                          "identities": normalized_identities}
+    expected_sha = canonical_json_sha256(normalized_payload)
+    if value.get("design_sha256") != expected_sha:
+        raise ValueError("answer design digest does not match its identities")
+    return {**normalized_payload, "design_sha256": expected_sha}
+
+
+def persist_answer_design(runs: Path, tasks: list[dict[str, Any]], *,
+                          default_model: str | None = None) -> dict[str, Any]:
+    design = answer_design_from_tasks(tasks, default_model=default_model)
+    path = runs / ANSWER_DESIGN_NAME
+    if path.exists():
+        existing = validate_answer_design(strict_json_loads(path.read_text(encoding="utf-8")))
+        if existing != design:
+            die("runs directory already carries a different answer design")
+    else:
+        write_json(path, design)
+    return design
+
+
+def persist_answer_design_value(runs: Path, value: Any) -> dict[str, Any]:
+    design = validate_answer_design(value)
+    runs.mkdir(parents=True, exist_ok=True)
+    path = runs / ANSWER_DESIGN_NAME
+    if path.exists():
+        existing = validate_answer_design(strict_json_loads(path.read_text(encoding="utf-8")))
+        if existing != design:
+            die("runs directory already carries a different answer design")
+    else:
+        write_json(path, design)
+    return design
+
+
+def answer_design_identity(design: dict[str, Any], pt: PreparedTask,
+                           model: str | None) -> dict[str, Any]:
+    matches = [row for row in design["identities"]
+               if (row["case_id"], row["model"], row["variant"], row["run_number"])
+               == (pt.case_id, model, pt.variant_truth, pt.run_number)]
+    if len(matches) != 1:
+        raise ValueError("prepared task has no unique answer-design identity")
+    return matches[0]
 
 
 # THE default wall-clock budget for any spawned runner/judge/poll (seconds).
@@ -1453,6 +2363,19 @@ def _hash_tree(root: Path) -> str:
     return digest.hexdigest()
 
 
+def skill_tree_hash(root: Path) -> str:
+    """Hash an already-built skill tree at the attestation boundary.
+
+    Producers must identify the exact immutable snapshot they mount. Rebuilding
+    mutable sources to derive the hash would let the report name bytes no model
+    actually observed.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        raise ValueError(f"skill tree is not a directory: {root}")
+    return _hash_tree(root)
+
+
 def _safe_under(base: Path, path: Path) -> Path:
     base_r = base.resolve()
     p = path.resolve()
@@ -1698,6 +2621,150 @@ def materialize_trigger_ablation(repo_root: Path, manifest: dict[str, Any], abla
     return materialize_ablation(repo_root, manifest, ablation, out_root)
 
 
+def canonical_json_sha256(value: Any) -> str:
+    """Stable JSON identity used by persisted experiment contracts."""
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def canonical_trigger_query(query: str) -> str:
+    """Conservative inference identity for authored trigger prompts.
+
+    Raw text is still executed and persisted, but Unicode compatibility forms,
+    case-only variants, and whitespace-only edits are one experimental unit.
+    Treating those cosmetic aliases as independent samples would manufacture
+    replication without adding evidence.
+    """
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("trigger query must be non-empty text")
+    normalized = unicodedata.normalize("NFKC", query).casefold()
+    normalized = "".join(
+        char for char in normalized
+        if (unicodedata.category(char) != "Cf"
+            and not 0x180B <= ord(char) <= 0x180F
+            and not 0xFE00 <= ord(char) <= 0xFE0F
+            and not 0xE0100 <= ord(char) <= 0xE01EF)
+    )
+    return " ".join(normalized.split())
+
+
+def trigger_harness_identity() -> dict[str, Any]:
+    """Identity of every local module that can change trigger evidence semantics."""
+    module_dir = Path(__file__).resolve().parent
+    modules: dict[str, str] = {}
+    for name in HARNESS_SEMANTIC_MODULES:
+        path = module_dir / name
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"cannot identify trigger dependency {name}: {exc}") from exc
+        modules[name] = "sha256:" + hashlib.sha256(content).hexdigest()
+    payload = {"schema_version": 1, "modules": modules}
+    return {**payload, "identity_sha256": canonical_json_sha256(payload)}
+
+
+def validate_trigger_harness_identity(identity: Any, label: str) -> dict[str, Any]:
+    """Reject partial or internally inconsistent dependency manifests."""
+    if not isinstance(identity, dict):
+        raise TypeError(f"{label} harness_identity must be an object")
+    payload = {key: value for key, value in identity.items() if key != "identity_sha256"}
+    if (identity.get("schema_version") != 1
+            or canonical_json_sha256(payload) != identity.get("identity_sha256")):
+        raise ValueError(f"{label} harness_identity does not match its identity_sha256")
+    modules = identity.get("modules")
+    if not isinstance(modules, dict) or set(modules) != set(HARNESS_SEMANTIC_MODULES):
+        raise ValueError(
+            f"{label} harness_identity must identify exactly {list(HARNESS_SEMANTIC_MODULES)}")
+    if any(not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+           for digest in modules.values()):
+        raise ValueError(f"{label} harness_identity contains an invalid module digest")
+    return identity
+
+
+def expected_provenance_for_ablation(
+    manifest: dict[str, Any], ablation_id: str,
+) -> ExpectedProvenance:
+    """Authoritative treatment identity derived from one manifest declaration."""
+    ablation = ablation_by_id(manifest, ablation_id)
+    if ablation is None:
+        raise ValueError(f"manifest does not declare ablation {ablation_id!r}")
+    components = ablation_components(ablation)
+    if not components:
+        raise ValueError(f"ablation {ablation_id!r} has no materialized components")
+    return ExpectedProvenance(
+        id=ablation_id,
+        mode=(AblationMode.INVALID_SKILL if ablation.get("invalid_skill")
+              else AblationMode.MATERIALIZED),
+        population=Population(derived_population(components)),
+        components=tuple(
+            Component(
+                cls=(component.get("class") or component_class(component)),
+                mechanism=component.get("mechanism"),
+                skill_root=resolve_skill_root(component, manifest.get("skill_paths", [])),
+                target=component.get("target", {}),
+            )
+            for component in components
+        ),
+    )
+
+
+def trigger_manifest_identity(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Self-verifying manifest treatment snapshot for trigger reports.
+
+    The full loaded-manifest digest binds cases and dataset expansion; embedded
+    expected-provenance records let an offline comparer verify that a runner's
+    recorded edit is the edit the manifest declared.
+    """
+    trigger_ablations = []
+    for ablation in manifest.get("ablations", []):
+        if not isinstance(ablation, dict) or not isinstance(ablation.get("id"), str):
+            continue
+        components = ablation_components(ablation)
+        if not components or derived_population(components) != "trigger":
+            continue
+        expected = expected_provenance_for_ablation(manifest, ablation["id"])
+        trigger_ablations.append({
+            "id": expected.id,
+            "mode": expected.mode.value,
+            "population": expected.population.value,
+            "components": [component.fingerprint() for component in expected.components],
+        })
+    payload = {
+        "schema_version": 1,
+        "manifest_sha256": canonical_json_sha256(manifest),
+        "skill_name": str(manifest.get("skill_name") or "skill-under-test"),
+        "skill_paths": list(manifest.get("skill_paths", [])),
+        "trigger_ablations": sorted(trigger_ablations, key=lambda item: item["id"]),
+    }
+    return {**payload, "identity_sha256": canonical_json_sha256(payload)}
+
+
+def expected_provenance_from_trigger_identity(
+    identity: dict[str, Any], ablation_id: str,
+) -> ExpectedProvenance:
+    """Parse one expected treatment from a validated trigger identity block."""
+    entries = identity.get("trigger_ablations") if isinstance(identity, dict) else None
+    if not isinstance(entries, list):
+        raise TypeError("trigger manifest identity has no trigger_ablations list")
+    matches = [entry for entry in entries
+               if isinstance(entry, dict) and entry.get("id") == ablation_id]
+    if len(matches) != 1:
+        raise ValueError(
+            f"trigger manifest identity must declare ablation {ablation_id!r} exactly once")
+    entry = matches[0]
+    components = entry.get("components")
+    if not isinstance(components, list):
+        raise TypeError("trigger manifest identity components must be a list")
+    return ExpectedProvenance(
+        id=entry.get("id"), mode=entry.get("mode"),
+        population=entry.get("population"),
+        components=tuple(Component.from_dict(component) for component in components),
+    )
+
+
 def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm:
     """Produce out_root/<id>/ holding the altered skill tree for a VALIDATED
     ablation, and return a MaterializedArm (which itself cannot exist without an
@@ -1872,6 +2939,30 @@ def enumerate_tree(root_dir: Path) -> list[tuple[Path, str]]:
     return [(p, p.relative_to(root_dir).as_posix()) for p in sorted(root_dir.rglob("*")) if p.is_file()]
 
 
+def enumerate_prepared_skill_roots(pt: PreparedTask) -> list[tuple[Path, str]]:
+    """Source files with the same logical root layout/copy exclusions as execution."""
+    if not pt.skill_root_keys or len(pt.skill_root_keys) != len(pt.skill_paths):
+        die(f"{pt.case_id}: skill upload requires one logical key per skill root")
+    out: list[tuple[Path, str]] = []
+    for key, raw in zip(pt.skill_root_keys, pt.skill_paths, strict=True):
+        src = Path(raw)
+        src_dir = src if src.is_dir() else src.parent
+        src_real = src_dir.resolve()
+        for root, dirs, names in os.walk(src_dir):
+            dirs[:] = sorted(d for d in dirs if d not in _COPY_EXCLUDE and not d.startswith("."))
+            for name in sorted(names):
+                if name in _COPY_EXCLUDE or name.startswith("."):
+                    continue
+                path = Path(root) / name
+                if path.is_symlink():
+                    target = path.resolve()
+                    if target != src_real and src_real not in target.parents:
+                        die(f"{pt.case_id}: skill root contains a symlink escaping the root: {path}")
+                relative = path.relative_to(src_dir).as_posix()
+                out.append((path, f"{key}/{relative}"))
+    return sorted(out, key=lambda item: item[1])
+
+
 def ablation_variant_population(manifest: dict[str, Any], variant: str) -> str:
     """Case population for an ablation:<id> variant: trigger (discovery ablation)
     or answer (everything else, including instruction-simulated)."""
@@ -1998,6 +3089,103 @@ def placeholder(task_name: str, role: str, index: int | str) -> str:
     return f"upload://{task_name}/{role}/{index}"
 
 
+def planned_file_surface_hash(
+    files: Iterable[dict[str, Any]], *, role: str, path_prefix: str,
+) -> str:
+    """Hash upload bytes using their model-visible relative destinations."""
+    digest = hashlib.sha256()
+    entries: list[tuple[str, bytes]] = []
+    seen: set[str] = set()
+    for item in files:
+        if item.get("role") != role:
+            continue
+        hint = str(item.get("remote_path_hint") or "")
+        if not hint.startswith(path_prefix):
+            raise ValueError(f"{role} upload destination {hint!r} is outside {path_prefix!r}")
+        relative = hint[len(path_prefix):]
+        if not relative or relative in seen:
+            raise ValueError(f"duplicate or empty {role} upload destination: {relative!r}")
+        seen.add(relative)
+        entries.append((relative, _jetty_upload_bytes(item)))
+    for relative, content in sorted(entries):
+        digest.update(relative.encode("utf-8") + b"\0")
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def _jetty_upload_bytes(item: dict[str, Any]) -> bytes:
+    present = [key for key in ("local_path", "content") if item.get(key) is not None]
+    if len(present) != 1:
+        raise ValueError("Jetty upload item must own exactly one local_path or content")
+    if present[0] == "local_path":
+        path = Path(str(item["local_path"]))
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"Jetty upload source is not a regular file: {path}")
+        return path.read_bytes()
+    content = item["content"]
+    if isinstance(content, (bytes, bytearray)):
+        return bytes(content)
+    if isinstance(content, str):
+        return content.encode("utf-8")
+    return json.dumps(
+        content, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def jetty_task_contract(payload: dict[str, Any]) -> dict[str, Any]:
+    """Commit the exact model-visible request and every planned upload byte."""
+    request = payload.get("jetty_request")
+    upload_plan = payload.get("upload_plan")
+    harness = payload.get("harness")
+    if (not isinstance(request, dict) or not isinstance(upload_plan, dict)
+            or not isinstance(harness, dict)):
+        raise TypeError("Jetty payload needs harness, request, and upload_plan objects")
+    files = upload_plan.get("files")
+    if not isinstance(files, list) or not all(isinstance(item, dict) for item in files):
+        raise ValueError("Jetty upload_plan.files must contain objects")
+    identities = []
+    seen_placeholders: set[str] = set()
+    seen_destinations: set[str] = set()
+    for item in files:
+        placeholder_value = item.get("placeholder")
+        destination = item.get("remote_path_hint")
+        role = item.get("role")
+        if (not isinstance(placeholder_value, str) or not placeholder_value
+                or placeholder_value in seen_placeholders):
+            raise ValueError("Jetty upload placeholders must be unique non-empty strings")
+        if (not isinstance(destination, str) or not destination
+                or destination in seen_destinations):
+            raise ValueError("Jetty upload destinations must be unique non-empty strings")
+        if not isinstance(role, str) or not role:
+            raise ValueError("Jetty upload role must be a non-empty string")
+        seen_placeholders.add(placeholder_value)
+        seen_destinations.add(destination)
+        descriptor = {
+            key: value for key, value in item.items()
+            if key not in {"local_path", "content"}
+        }
+        descriptor["content_sha256"] = (
+            "sha256:" + hashlib.sha256(_jetty_upload_bytes(item)).hexdigest())
+        identities.append(descriptor)
+    normalized_plan = {key: value for key, value in upload_plan.items() if key != "files"}
+    normalized_plan["files"] = identities
+    return {
+        "schema_version": 1,
+        # Bind every harness-owned causal field, including future additions, but
+        # exclude the digest itself to avoid a circular identity.
+        "harness": {
+            key: value for key, value in harness.items()
+            if key != "jetty_task_contract_sha256"
+        },
+        "jetty_request": request,
+        "upload_plan": normalized_plan,
+    }
+
+
+def jetty_task_contract_sha256(payload: dict[str, Any]) -> str:
+    return canonical_json_sha256(jetty_task_contract(payload))
+
+
 def safe_task_json(pt: PreparedTask, manifest: dict[str, Any], *, task_name: str, upload_files: list[dict[str, Any]]) -> dict[str, Any]:
     variant = pt.variant_truth
     safe = {
@@ -2053,6 +3241,7 @@ def build_jetty_payload(
     use_trial_keys: bool = False,
     ablation_trees: dict[str, MaterializedArm] | None = None,
     with_skill_tree_dir: Path | None = None,
+    answer_design: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # The PreparedTask is the sole authority after the JSONL boundary: the true
     # variant, skill paths, model-facing surface, upload token, and harness truth all
@@ -2060,12 +3249,17 @@ def build_jetty_payload(
     variant = pt.variant_truth
     task_name = jetty_task_name(pt, task_prefix)
     files: list[dict[str, Any]] = []
+    fixture_destinations: set[str] = set()
     for i, local in enumerate(pt.input_files, 1):
+        destination = f"fixtures/{Path(local).name}"
+        if destination in fixture_destinations:
+            die(f"{pt.case_id}: duplicate Jetty fixture destination: {destination}")
+        fixture_destinations.add(destination)
         files.append({
             "role": "fixture",
             "placeholder": placeholder(task_name, "fixture", i),
             "local_path": str(Path(local).resolve()),
-            "remote_path_hint": f"fixtures/{Path(local).name}",
+            "remote_path_hint": destination,
             "private": False,
         })
     if variant == "with_skill":
@@ -2081,12 +3275,12 @@ def build_jetty_payload(
                     "private": False,
                 })
         else:
-            for i, local in enumerate(pt.skill_paths, 1):
+            for i, (local, rel) in enumerate(enumerate_prepared_skill_roots(pt), 1):
                 files.append({
                     "role": "skill",
                     "placeholder": placeholder(task_name, "skill", i),
                     "local_path": str(Path(local).resolve()),
-                    "remote_path_hint": f"skills/{pt.skill_name}/{Path(local).name}",
+                    "remote_path_hint": f"skills/{pt.skill_name}/{rel}",
                     "private": False,
                 })
     elif variant == "old_skill":
@@ -2096,12 +3290,12 @@ def build_jetty_payload(
         old_paths = list(pt.skill_paths)
         if not old_paths:
             die("old_skill export requires manifest.old_skill_paths to be populated")
-        for i, local in enumerate(old_paths, 1):
+        for i, (local, rel) in enumerate(enumerate_prepared_skill_roots(pt), 1):
             files.append({
                 "role": "old_skill",
                 "placeholder": placeholder(task_name, "old-skill", i),
                 "local_path": str(Path(local).resolve()),
-                "remote_path_hint": f"old-skills/{pt.skill_name}/{Path(local).name}",
+                "remote_path_hint": f"skills/{pt.skill_name}/{rel}",
                 "private": False,
             })
     elif is_ablation_variant(variant):
@@ -2132,14 +3326,43 @@ def build_jetty_payload(
                     "private": False,
                 })
         else:
-            for i, local in enumerate(pt.skill_paths, 1):
+            for i, (local, rel) in enumerate(enumerate_prepared_skill_roots(pt), 1):
                 files.append({
                     "role": "skill",
                     "placeholder": placeholder(task_name, "skill", i),
                     "local_path": str(Path(local).resolve()),
-                    "remote_path_hint": f"skills/{pt.skill_name}/{Path(local).name}",
+                    "remote_path_hint": f"skills/{pt.skill_name}/{rel}",
                     "private": False,
                 })
+    try:
+        fixture_tree_hash = planned_file_surface_hash(
+            files, role="fixture", path_prefix="fixtures/")
+    except ValueError as exc:
+        die(f"{pt.case_id}: {exc}")
+    mounted_skill_tree_hash: str | None = None
+    mounted_skill_role = "old_skill" if variant == "old_skill" else "skill"
+    if any(item.get("role") == mounted_skill_role for item in files):
+        try:
+            mounted_skill_tree_hash = planned_file_surface_hash(
+                files, role=mounted_skill_role,
+                path_prefix=f"skills/{pt.skill_name}/")
+        except ValueError as exc:
+            die(f"{pt.case_id}: {exc}")
+    expected_skill_hash: str | None = None
+    if variant == "with_skill":
+        expected_skill_hash = pt.skill_tree_hash
+        if not expected_skill_hash:
+            die(f"{pt.case_id}: with_skill Jetty task has no canonical skill_tree_hash")
+    elif pt.is_materialized_ablation:
+        assert isinstance(pt.ablation, Provenance)
+        expected_skill_hash = pt.ablation.identity.edited
+    if (expected_skill_hash is not None
+            and mounted_skill_tree_hash != expected_skill_hash):
+        die(
+            f"{pt.case_id}: Jetty mounted skill tree hash "
+            f"{mounted_skill_tree_hash!r} does not match expected {expected_skill_hash!r}"
+        )
+
     task_json = safe_task_json(pt, manifest, task_name=task_name, upload_files=files)
     task_placeholder = placeholder(task_name, "task", "json")
     task_item = {
@@ -2169,7 +3392,7 @@ def build_jetty_payload(
     }
     if use_trial_keys:
         jetty_block["use_trial_keys"] = True
-    return {
+    payload = {
         "harness": {
             "skill_name": pt.skill_name,
             "case_id": pt.case_id,
@@ -2178,8 +3401,17 @@ def build_jetty_payload(
             "split": pt.split,
             "run_dir": pt.run_dir,
             "executable": not str(pt.prompt or "").startswith("<hidden prompt:"),
+            **({"answer_design": answer_design} if answer_design else {}),
+            **({
+                "answer_task_sha256": answer_design_identity(
+                    answer_design, pt, model)["task_sha256"],
+                "answer_instruction_sha256": answer_design_identity(
+                    answer_design, pt, model)["instruction_sha256"],
+            } if answer_design else {}),
             **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
-            **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {}),
+            **({"skill_tree_hash": mounted_skill_tree_hash}
+               if mounted_skill_tree_hash is not None else {}),
+            "fixture_tree_hash": fixture_tree_hash,
         },
         "jetty_request": {
             "model": model,
@@ -2192,11 +3424,23 @@ def build_jetty_payload(
         },
         "upload_plan": {"files": all_files},
     }
+    payload["harness"]["jetty_task_contract_sha256"] = (
+        jetty_task_contract_sha256(payload))
+    return payload
 
 
 def export_jetty(args: argparse.Namespace) -> int:
     path = Path(args.manifest)
     manifest = validate_manifest(path)
+    multi_turn_cases = [
+        str(case.get("id")) for case in iter_cases(manifest, getattr(args, "split", None))
+        if not is_trigger_case(case) and case.get("turns")
+    ]
+    if multi_turn_cases:
+        die(
+            "Jetty export does not support multi-turn prepared tasks: "
+            + ", ".join(sorted(set(multi_turn_cases)))
+        )
     agent = getattr(args, "jetty_agent", None) or manifest.get("jetty", {}).get("agent") or JETTY_DEFAULT_AGENT
     if agent not in JETTY_ALLOWED_AGENTS:
         die(f"unsupported Jetty agent {agent!r}; expected one of {sorted(JETTY_ALLOWED_AGENTS)}")
@@ -2238,6 +3482,9 @@ def export_jetty(args: argparse.Namespace) -> int:
         ablation_dir=str(abl_root) if abl_root is not None else None,
         trees=ablation_trees or None,
     )
+    if any(row.get("turns") for row in rows):
+        raise AssertionError("Jetty multi-turn case passed the pre-export gate")
+    answer_design = answer_design_from_tasks(rows, default_model=model)
     payloads = [build_jetty_payload(
         PreparedTask.from_row(row),
         manifest,
@@ -2250,6 +3497,7 @@ def export_jetty(args: argparse.Namespace) -> int:
         use_trial_keys=bool(getattr(args, "use_trial_keys", False) or manifest.get("jetty", {}).get("use_trial_keys", False)),
         ablation_trees=ablation_trees,
         with_skill_tree_dir=with_skill_tree_dir,
+        answer_design=answer_design,
     ) for row in rows]
     out = Path(args.out) if getattr(args, "out", None) else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
@@ -2264,15 +3512,37 @@ def export_jetty(args: argparse.Namespace) -> int:
 
 def replace_placeholders(value: Any, mapping: dict[str, str]) -> Any:
     if isinstance(value, str):
-        out = value
-        for old, new in mapping.items():
-            out = out.replace(old, new)
-        return out
+        if not mapping:
+            return value
+        pattern = re.compile("|".join(
+            re.escape(token) for token in sorted(mapping, key=len, reverse=True)))
+        return pattern.sub(lambda match: mapping[match.group(0)], value)
     if isinstance(value, list):
         return [replace_placeholders(v, mapping) for v in value]
     if isinstance(value, dict):
         return {k: replace_placeholders(v, mapping) for k, v in value.items()}
     return value
+
+
+def resolved_task_upload_bytes(content: bytes, mapping: dict[str, str]) -> bytes:
+    """Resolve upload tokens in an immutable JSON task snapshot.
+
+    Remote paths are JSON-escaped before textual substitution, preserving the
+    exported task's exact formatting while keeping arbitrary provider paths
+    valid inside JSON strings.
+    """
+    try:
+        source = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Jetty task upload must be UTF-8 JSON") from exc
+    strict_json_loads(source)
+    escaped_mapping = {
+        token: json.dumps(remote, ensure_ascii=False)[1:-1]
+        for token, remote in mapping.items()
+    }
+    resolved = replace_placeholders(source, escaped_mapping)
+    strict_json_loads(resolved)
+    return resolved.encode("utf-8")
 
 
 def extract_trajectory_id(response: dict[str, Any]) -> str | None:
@@ -2316,7 +3586,7 @@ class JettyClient:
         )
         with self._open_with_retries(req, timeout=120) as resp:
             text = resp.read().decode("utf-8", errors="replace")
-            return json.loads(text) if text.strip() else {}
+            return strict_json_loads(text) if text.strip() else {}
 
     def upload(self, item: dict[str, Any], collection: str) -> str:
         boundary = f"----skill-eval-harness-{int(time.time() * 1000)}"
@@ -2327,7 +3597,12 @@ class JettyClient:
         filename = item.get("remote_path_hint") or (Path(str(item.get("local_path", "file"))).name)
         if "content" in item:
             raw = item["content"]
-            content = json.dumps(raw, ensure_ascii=False).encode("utf-8") if isinstance(raw, (dict, list)) else str(raw).encode("utf-8")
+            if isinstance(raw, (bytes, bytearray)):
+                content = bytes(raw)
+            else:
+                content = (json.dumps(raw, ensure_ascii=False).encode("utf-8")
+                           if isinstance(raw, (dict, list))
+                           else str(raw).encode("utf-8"))
         else:
             content = Path(str(item["local_path"])).read_bytes()
         parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode())
@@ -2341,7 +3616,7 @@ class JettyClient:
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": f"multipart/form-data; boundary={boundary}"},
         )
         with self._open_with_retries(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+            data = strict_json_loads(resp.read().decode("utf-8", errors="replace") or "{}")
         for key in ["path", "file_path", "filePath", "url", "id"]:
             if data.get(key):
                 return str(data[key])
@@ -2390,6 +3665,8 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
                 "lifecycle": lifecycle.to_dict(),
                 "trajectory_id": None,
                 "jetty": row.get("jetty_request", {}).get("jetty", {}),
+                "jetty_task_contract_sha256": harness.get(
+                    "jetty_task_contract_sha256"),
                 "error": lifecycle.reason,
                 "artifacts": [],
             }
@@ -2400,12 +3677,59 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
         task_name = str(jetty.get("task", ""))
         mapping: dict[str, str] = {}
         trajectory_id = None
+        actual_task_contract_sha256: str | None = None
+        actual_task_contract: dict[str, Any] | None = None
         try:
+            expected_task_contract_sha256 = harness.get(
+                "jetty_task_contract_sha256")
+            if (not isinstance(expected_task_contract_sha256, str)
+                    or re.fullmatch(
+                        r"sha256:[0-9a-f]{64}", expected_task_contract_sha256) is None):
+                raise RuntimeError("Jetty payload has no valid task contract digest")
             files = list(row.get("upload_plan", {}).get("files", []))
-            files.sort(key=lambda item: 1 if item.get("role") == "task" else 0)
+            # Materialize every upload as immutable bytes before validating any
+            # causal digest or performing network I/O. The exact snapshot that
+            # passes attestation is therefore the exact snapshot sent.
+            upload_files = []
             for item in files:
+                snapshotted = copy.deepcopy(item)
+                snapshotted["content"] = _jetty_upload_bytes(item)
+                snapshotted.pop("local_path", None)
+                upload_files.append(snapshotted)
+            execution_row = copy.deepcopy(row)
+            execution_row["upload_plan"]["files"] = upload_files
+            actual_task_contract = jetty_task_contract(execution_row)
+            actual_task_contract_sha256 = canonical_json_sha256(actual_task_contract)
+            if actual_task_contract_sha256 != expected_task_contract_sha256:
+                raise RuntimeError(
+                    "Jetty model-visible task/runbook/upload plan changed after attestation")
+            if "fixture_tree_hash" in harness:
+                fixture_hash = planned_file_surface_hash(
+                    upload_files, role="fixture", path_prefix="fixtures/")
+                if fixture_hash != harness.get("fixture_tree_hash"):
+                    raise RuntimeError("Jetty fixture bytes changed after payload attestation")
+            if harness.get("skill_tree_hash") is not None:
+                mounted_skill_role = (
+                    "old_skill" if harness.get("variant") == "old_skill" else "skill")
+                mounted_hash = planned_file_surface_hash(
+                    upload_files, role=mounted_skill_role,
+                    path_prefix=f"skills/{harness.get('skill_name')}/",
+                )
+                if mounted_hash != harness.get("skill_tree_hash"):
+                    raise RuntimeError("Jetty skill bytes changed after payload attestation")
+            non_task_files = [
+                item for item in upload_files if item.get("role") != "task"]
+            task_files = [item for item in upload_files if item.get("role") == "task"]
+            for item in non_task_files:
                 upload_item = replace_placeholders(copy.deepcopy(item), mapping)
-                remote = client.upload(upload_item, collection)
+                remote = str(client.upload(upload_item, collection))
+                if item.get("placeholder"):
+                    mapping[str(item["placeholder"])] = remote
+            for item in task_files:
+                upload_item = replace_placeholders(copy.deepcopy(item), mapping)
+                upload_item["content"] = resolved_task_upload_bytes(
+                    item["content"], mapping)
+                remote = str(client.upload(upload_item, collection))
                 if item.get("placeholder"):
                     mapping[str(item["placeholder"])] = remote
             request = replace_placeholders(request, mapping)
@@ -2420,6 +3744,8 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
                 "status": lifecycle.status,
                 "lifecycle": lifecycle.to_dict(),
                 "trajectory_id": trajectory_id,
+                "jetty_task_contract_sha256": actual_task_contract_sha256,
+                "jetty_task_contract": actual_task_contract,
                 "jetty": {
                     "collection": collection,
                     "task": task_name,
@@ -2440,6 +3766,8 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
                 "status": lifecycle.status,
                 "lifecycle": lifecycle.to_dict(),
                 "trajectory_id": trajectory_id,
+                "jetty_task_contract_sha256": actual_task_contract_sha256,
+                "jetty_task_contract": actual_task_contract,
                 "jetty": {
                     "collection": collection,
                     "task": task_name,
@@ -2454,7 +3782,7 @@ def execute_jetty_payloads(payloads: list[dict[str, Any]], *, client: Any, timeo
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [strict_json_loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def run_jetty(args: argparse.Namespace) -> int:
@@ -2486,10 +3814,16 @@ def artifact_content(artifact: dict[str, Any]) -> Any:
 
 
 def artifact_rel_path(artifact: dict[str, Any]) -> Path | None:
-    raw = str(artifact.get("path") or artifact.get("name") or artifact.get("filename") or "")
-    if not raw:
+    path_fields = [artifact.get(key) for key in ("path", "name", "filename")
+                   if artifact.get(key) is not None]
+    if len(path_fields) != 1 or not isinstance(path_fields[0], str):
+        return None
+    raw = path_fields[0]
+    if not raw.strip():
         return None
     raw = raw.replace("\\", "/")
+    if raw.startswith("/") and not raw.startswith("/app/results/"):
+        return None
     for prefix in ["/app/results/", "app/results/", "results/"]:
         if raw.startswith(prefix):
             raw = raw[len(prefix):]
@@ -2503,6 +3837,41 @@ def artifact_rel_path(artifact: dict[str, Any]) -> Path | None:
     if rel.name in {"output.md", "metadata.json"}:
         return Path(rel.name)
     return Path("outputs") / rel.name
+
+
+def validate_jetty_artifacts(raw_artifacts: Any) -> list[dict[str, Any]]:
+    """Validate the whole artifact collection before importing any member.
+
+    A valid output beside an unsafe, malformed, content-less, or colliding
+    sibling is not a valid result set: silently dropping that sibling would
+    change the provider's evidence before the harness scores it.
+    """
+    if raw_artifacts is None:
+        return []
+    if not isinstance(raw_artifacts, list):
+        raise TypeError("Jetty artifacts must be a list")
+    artifacts: list[dict[str, Any]] = []
+    destinations: set[str] = set()
+    for index, artifact in enumerate(raw_artifacts, 1):
+        if not isinstance(artifact, dict):
+            raise TypeError(f"Jetty artifacts[{index}] must be an object")
+        rel = artifact_rel_path(artifact)
+        if rel is None:
+            raise ValueError(f"Jetty artifacts[{index}] has an unsafe or ambiguous path")
+        content_fields = [key for key in ("content", "text", "body") if key in artifact]
+        if len(content_fields) != 1 or artifact[content_fields[0]] is None:
+            raise ValueError(
+                f"Jetty artifacts[{index}] must contain exactly one non-null content field")
+        destination = rel.as_posix()
+        if destination == "output.md":
+            content = artifact[content_fields[0]]
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("Jetty output.md must contain a non-blank string answer")
+        if destination in destinations:
+            raise ValueError(f"duplicate Jetty artifact destination: {destination}")
+        destinations.add(destination)
+        artifacts.append(artifact)
+    return artifacts
 
 
 def write_artifact(base: Path, artifact: dict[str, Any]) -> None:
@@ -2538,44 +3907,172 @@ def artifact_metadata(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
             return content
         if isinstance(content, str):
             try:
-                data = json.loads(content)
-                return data if isinstance(data, dict) else {}
-            except json.JSONDecodeError:
-                return {"metadata_error": "invalid Jetty metadata artifact"}
+                data = strict_json_loads(content)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid Jetty metadata artifact: {exc}") from exc
+            if not isinstance(data, dict):
+                raise TypeError("Jetty metadata artifact must contain a JSON object")
+            return data
+        raise ValueError("Jetty metadata artifact must be an object or JSON object string")
     return {}
 
 
+def jetty_telemetry_values(record: dict[str, Any]) -> dict[str, Any]:
+    """Resolve Jetty telemetry aliases once, rejecting disagreement.
+
+    Jetty response shapes have used both trajectory-level and nested usage
+    spellings. They are redundant observations of one measurement, not a
+    precedence list: accepting the first would let insertion/adapter shape
+    silently choose the evidence that reaches normalization.
+    """
+    raw_trajectory = record.get("trajectory", {})
+    if not isinstance(raw_trajectory, dict):
+        raise TypeError("Jetty trajectory must be an object")
+    usage = raw_trajectory.get("usage", {})
+    if usage is None:
+        usage = {}
+    if not isinstance(usage, dict):
+        raise TypeError("Jetty trajectory.usage must be an object")
+
+    def numeric_alias(
+        label: str, observations: list[tuple[str, Any]], *, integer: bool,
+    ) -> int | float | None:
+        present = [(name, value) for name, value in observations
+                   if value is not None]
+        for name, value in present:
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or value < 0
+                    or integer and not isinstance(value, int)):
+                kind = "nonnegative integer" if integer else "finite nonnegative number"
+                raise ValueError(f"Jetty {name} must be a {kind}")
+        if len({value for _, value in present}) > 1:
+            raise ValueError(
+                f"conflicting Jetty {label} aliases: {dict(present)}")
+        return present[0][1] if present else None
+
+    values: dict[str, Any] = {
+        "elapsed_ms": numeric_alias(
+            "elapsed time",
+            [("trajectory.elapsed_ms", raw_trajectory.get("elapsed_ms")),
+             ("trajectory.duration_ms", raw_trajectory.get("duration_ms"))],
+            integer=False),
+        "input_tokens": numeric_alias(
+            "input token",
+            [("trajectory.input_tokens", raw_trajectory.get("input_tokens")),
+             ("trajectory.usage.input_tokens", usage.get("input_tokens")),
+             ("trajectory.usage.prompt_tokens", usage.get("prompt_tokens"))],
+            integer=True),
+        "output_tokens": numeric_alias(
+            "output token",
+            [("trajectory.output_tokens", raw_trajectory.get("output_tokens")),
+             ("trajectory.usage.output_tokens", usage.get("output_tokens")),
+             ("trajectory.usage.completion_tokens", usage.get("completion_tokens"))],
+            integer=True),
+        "total_tokens": numeric_alias(
+            "total token",
+            [("trajectory.total_tokens", raw_trajectory.get("total_tokens")),
+             ("trajectory.usage.total_tokens", usage.get("total_tokens"))],
+            integer=True),
+    }
+    cost_observations = [
+        ("trajectory.cost", raw_trajectory.get("cost")),
+        ("trajectory.cost_usd", raw_trajectory.get("cost_usd")),
+        ("trajectory.usage.cost", usage.get("cost")),
+        ("trajectory.usage.cost_usd", usage.get("cost_usd")),
+    ]
+    normalized_costs = [
+        (name, normalize_cost(value, source="provider_reported"))
+        for name, value in cost_observations if value is not None
+    ]
+    if normalized_costs:
+        first = normalized_costs[0][1]
+        if any(not _json_values_equal(first, value)
+               for _, value in normalized_costs[1:]):
+            raise ValueError(
+                "conflicting Jetty cost aliases: "
+                + ", ".join(name for name, _ in normalized_costs))
+        values["cost_normalized"] = first
+    else:
+        values["cost_normalized"] = {"source": "missing"}
+    return values
+
+
 def jetty_trace_records(record: dict[str, Any], artifacts: list[dict[str, Any]], *, success: bool) -> list[dict[str, Any]]:
-    trajectory = record.get("trajectory", {}) if isinstance(record.get("trajectory"), dict) else {}
+    raw_trajectory = record.get("trajectory", {})
+    if not isinstance(raw_trajectory, dict):
+        raise TypeError("Jetty trajectory must be an object")
+    trajectory = raw_trajectory
     records: list[dict[str, Any]] = []
-    for key in ["events", "steps", "messages", "trace", "logs"]:
-        values = trajectory.get(key)
-        if isinstance(values, list):
-            for item in values:
-                if isinstance(item, dict):
-                    records.append(item)
-                else:
-                    records.append({"type": f"jetty.{key}", "content": str(item)})
-    usage = trajectory.get("usage") if isinstance(trajectory, dict) else None
+    present_streams = [key for key in ("events", "steps", "messages", "trace", "logs")
+                       if trajectory.get(key) is not None]
+    if len(present_streams) > 1:
+        raise ValueError(
+            f"Jetty trajectory has conflicting event streams: {present_streams}")
+    for key in present_streams:
+        values = trajectory[key]
+        if not isinstance(values, list):
+            raise TypeError(f"Jetty trajectory.{key} must be a list")
+        for index, item in enumerate(values, 1):
+            if not isinstance(item, dict):
+                raise TypeError(
+                    f"Jetty trajectory.{key}[{index}] must be an object")
+            records.append(item)
+    telemetry_values = jetty_telemetry_values(record)
     metric_record: dict[str, Any] = {"type": "usage"}
-    if isinstance(usage, dict):
-        metric_record["usage"] = usage
-    for key in ["elapsed_ms", "duration_ms", "input_tokens", "output_tokens", "total_tokens", "total_tool_calls"]:
-        value = trajectory.get(key) if isinstance(trajectory, dict) else None
-        if isinstance(value, (int, float)):
+    canonical_usage = {
+        key: telemetry_values[key]
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+        if telemetry_values.get(key) is not None
+    }
+    if canonical_usage:
+        metric_record["usage"] = canonical_usage
+    if telemetry_values.get("elapsed_ms") is not None:
+        metric_record["elapsed_ms"] = telemetry_values["elapsed_ms"]
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        value = telemetry_values.get(key)
+        if value is not None:
             metric_record[key] = value
+    aggregate_observations: list[tuple[str, int]] = []
+    for key in ("total_tool_calls", "tool_calls"):
+        if key not in trajectory or trajectory[key] is None:
+            continue
+        value = trajectory[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"Jetty trajectory.{key} must be a nonnegative integer")
+        aggregate_observations.append((key, value))
+    if aggregate_observations:
+        if len({value for _, value in aggregate_observations}) != 1:
+            raise ValueError(
+                f"conflicting Jetty tool-call aggregates: {dict(aggregate_observations)}")
+        metric_record["total_tool_calls"] = aggregate_observations[0][1]
     if len(metric_record) > 1:
         records.append(metric_record)
-    for artifact in artifacts:
-        rel = artifact_rel_path(artifact)
-        if rel:
-            records.append({"type": "file_write", "path": str(rel), "status": "completed"})
+    # Returned artifacts are transport outputs, not model file-write actions.
     if not success:
         error = record.get("error") or trajectory.get("error") if isinstance(trajectory, dict) else record.get("error")
         records.append({"type": "error", "status": str(record.get("status") or "failed"), "message": str(error or "Jetty trajectory failed")})
     if not records:
         records.append({"type": "jetty_trajectory", "status": record.get("status"), "trajectory_id": record.get("trajectory_id")})
     return records
+
+
+def _jetty_trace_protocol_error(
+    records: list[dict[str, Any]], pi_stream: PiStream | None,
+) -> str | None:
+    aggregate = next((record.get("total_tool_calls") for record in records
+                      if record.get("type") == "usage"), None)
+    if aggregate is None:
+        if not any(str(record.get("type") or "").casefold() in {
+                "command", "tool_call", "tool_use", "file_read", "file_write",
+                "skill_load"} for record in records):
+            return "Jetty trajectory has no event stream or explicit zero aggregate"
+        return None
+    detailed = sum(1 for record in records if str(record.get("type") or "").casefold()
+                   in {"command", "tool_call", "tool_use", "file_read", "file_write", "skill_load"})
+    if detailed != aggregate:
+        return ("Jetty aggregate total_tool_calls has no complete matching "
+                "event-level trajectory")
+    return None
 
 
 def jsonl_from_records(records: list[dict[str, Any]]) -> str:
@@ -2587,22 +4084,22 @@ def normalized_jetty_metadata(record: dict[str, Any], *, success: bool) -> dict[
     success = observation.success
     jetty = record.get("jetty", {}) if isinstance(record.get("jetty"), dict) else {}
     trajectory = record.get("trajectory", {}) if isinstance(record.get("trajectory"), dict) else {}
-    usage = trajectory.get("usage", {}) if isinstance(trajectory.get("usage"), dict) else {}
+    telemetry_values = jetty_telemetry_values(record)
     collection = jetty.get("collection")
     task = jetty.get("task")
     trajectory_id = record.get("trajectory_id")
-    elapsed = trajectory.get("elapsed_ms", trajectory.get("duration_ms"))
-    total_tokens = trajectory.get("total_tokens", usage.get("total_tokens"))
-    tool_calls = trajectory.get("total_tool_calls")
-    if tool_calls is None and isinstance(trajectory.get("tool_calls"), int):
-        tool_calls = trajectory.get("tool_calls")
+    elapsed = telemetry_values["elapsed_ms"]
+    total_tokens = telemetry_values["total_tokens"]
+    aggregate_values = [trajectory[key] for key in ("total_tool_calls", "tool_calls")
+                        if key in trajectory and trajectory[key] is not None]
+    tool_calls = aggregate_values[0] if aggregate_values else None
     meta = {
         "provider": "jetty",
         "model": jetty.get("model"),
         "model_provider": jetty.get("model_provider"),
         "elapsed_ms": elapsed,
-        "input_tokens": trajectory.get("input_tokens", usage.get("input_tokens", usage.get("prompt_tokens"))),
-        "output_tokens": trajectory.get("output_tokens", usage.get("output_tokens", usage.get("completion_tokens"))),
+        "input_tokens": telemetry_values["input_tokens"],
+        "output_tokens": telemetry_values["output_tokens"],
         "total_tokens": total_tokens,
         "total_tool_calls": tool_calls,
         "errors_encountered": 0 if success else 1,
@@ -2623,32 +4120,264 @@ def normalized_jetty_metadata(record: dict[str, Any], *, success: bool) -> dict[
         "jetty_raw_path": "jetty_raw.json",
         # Normalized telemetry (issue #21): provider-reported when the
         # trajectory carried numbers, explicit missing markers otherwise.
-        "usage_normalized": normalize_usage({**usage, **{k: meta_val for k, meta_val in [("input_tokens", trajectory.get("input_tokens")), ("output_tokens", trajectory.get("output_tokens")), ("total_tokens", total_tokens)] if meta_val is not None}}, source="provider_reported"),
-        "cost_normalized": normalize_cost(trajectory.get("cost", trajectory.get("cost_usd", usage.get("cost"))), source="provider_reported", pricing_model=jetty.get("model")),
+        "usage_normalized": normalize_usage({
+            key: telemetry_values[key]
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+            if telemetry_values.get(key) is not None
+        }, source="provider_reported"),
+        "cost_normalized": {
+            **telemetry_values["cost_normalized"],
+            **({"pricing_model": jetty.get("model")}
+               if (telemetry_values["cost_normalized"].get("source") != "missing"
+                   and jetty.get("model")) else {}),
+        },
     }
     return {k: v for k, v in meta.items() if v is not None}
 
 
+def resolved_jetty_artifacts(record: dict[str, Any]) -> list[dict[str, Any]]:
+    sources: list[tuple[str, Any]] = []
+    if record.get("artifacts") is not None:
+        sources.append(("record.artifacts", record["artifacts"]))
+    trajectory = record.get("trajectory")
+    if trajectory is not None and not isinstance(trajectory, dict):
+        raise TypeError("Jetty trajectory must be an object")
+    if isinstance(trajectory, dict):
+        present = [key for key in ("artifacts", "outputs")
+                   if trajectory.get(key) is not None]
+        if len(present) > 1:
+            raise ValueError("trajectory has conflicting artifacts and outputs")
+        if present:
+            sources.append((f"trajectory.{present[0]}", trajectory[present[0]]))
+    if len(sources) > 1 and not _json_values_equal(sources[0][1], sources[1][1]):
+        raise ValueError(
+            f"conflicting Jetty artifact collections: {sources[0][0]} and {sources[1][0]}")
+    return validate_jetty_artifacts(sources[0][1] if sources else [])
+
+
+def _jetty_record_preflight(
+    record: dict[str, Any], harness: dict[str, Any], destination: Path,
+    design: dict[str, Any] | None,
+) -> dict[str, Any]:
+    expected_task_contract_sha256 = harness.get("jetty_task_contract_sha256")
+    observed_task_contract_sha256 = record.get("jetty_task_contract_sha256")
+    task_contract = record.get("jetty_task_contract")
+    if (not isinstance(observed_task_contract_sha256, str)
+            or observed_task_contract_sha256 != expected_task_contract_sha256):
+        raise ValueError(
+            "Jetty result task contract digest does not match its harness attestation")
+    if (not isinstance(task_contract, dict)
+            or task_contract.get("schema_version") != 1
+            or canonical_json_sha256(task_contract) != expected_task_contract_sha256):
+        raise ValueError("Jetty result does not preserve its complete task contract")
+    contract_harness = task_contract.get("harness")
+    current_harness = {
+        key: value for key, value in harness.items()
+        if key != "jetty_task_contract_sha256"
+    }
+    if (not isinstance(contract_harness, dict)
+            or not _json_values_equal(contract_harness, current_harness)):
+        raise ValueError("Jetty result harness identity changed after task attestation")
+    artifacts = resolved_jetty_artifacts(record)
+    observation = JettyObservation.from_record(
+        record, has_output=find_output_artifact(artifacts) is not None)
+    success = observation.success
+    harness_metadata: dict[str, Any] = {
+        "population": "answer",
+        "case_id": harness["case_id"],
+        "run_number": harness["run_number"],
+        "variant": harness["variant"],
+        "billing_scope": "run",
+        "artifact_contract_version": ARTIFACT_CONTRACT_VERSION,
+        "jetty_task_contract_sha256": expected_task_contract_sha256,
+        **({"answer_design_sha256": design["design_sha256"]} if design else {}),
+    }
+    if isinstance(harness.get("ablation"), dict):
+        harness_metadata["ablation"] = harness["ablation"]
+    for hash_field in ("skill_tree_hash", "fixture_tree_hash"):
+        if harness.get(hash_field):
+            harness_metadata[hash_field] = harness[hash_field]
+    normalized = normalized_jetty_metadata(record, success=success)
+    if design:
+        identity_matches = [
+            row for row in design["identities"]
+            if (row["case_id"], row["model"], row["variant"], row["run_number"])
+            == (harness["case_id"], normalized.get("model"),
+                harness["variant"], harness["run_number"])
+        ]
+        if len(identity_matches) != 1:
+            raise ValueError("no unique answer-design identity")
+        harness_metadata["answer_task_sha256"] = identity_matches[0]["task_sha256"]
+        harness_metadata["answer_instruction_sha256"] = identity_matches[0]["instruction_sha256"]
+    metadata = merge_owned_json_objects([
+        ("Jetty metadata artifact", artifact_metadata(artifacts)),
+        ("normalized Jetty lifecycle", normalized),
+        ("harness identity", harness_metadata),
+    ])
+    trace_records = jetty_trace_records(record, artifacts, success=success)
+    return {
+        "record": record,
+        "destination": destination,
+        "artifacts": artifacts,
+        "observation": observation,
+        "success": success,
+        "metadata": metadata,
+        "trace_records": trace_records,
+    }
+
+
+def _stage_jetty_record(preflight: dict[str, Any], staged: Path) -> None:
+    staged.mkdir(parents=True)
+    write_json(staged / "jetty_raw.json", preflight["record"])
+    if preflight["success"]:
+        for artifact in preflight["artifacts"]:
+            write_artifact(staged, artifact)
+    else:
+        (staged / "output.md").write_text(
+            f"{JETTY_FAILURE}: trajectory failed before producing output]\n",
+            encoding="utf-8")
+    observation = preflight["observation"]
+    record = preflight["record"]
+    write_trace_artifacts(
+        staged,
+        jsonl_from_records(preflight["trace_records"]),
+        source="jetty",
+        metadata=preflight["metadata"],
+        environment={
+            "runner": "jetty", "jetty": record.get("jetty", {}),
+            "trajectory_id": record.get("trajectory_id"),
+        },
+        write_metadata=True,
+        process_observation_complete=not observation.timed_out,
+        provider_response_complete=preflight["success"],
+        artifact_set_complete=None,
+    )
+    write_artifact_commit(staged)
+    if not artifact_commit_valid(staged):
+        raise ValueError("staged Jetty artifact commit is invalid")
+
+
+def _install_staged_transaction(
+    targets: list[tuple[Path, Path]], transaction_root: Path,
+) -> None:
+    """Replace a batch only after all members stage; restore the whole batch."""
+    backup_root = transaction_root / "backups"
+    displaced_root = transaction_root / "displaced-new"
+    backup_root.mkdir()
+    displaced_root.mkdir()
+    backups: list[tuple[Path, Path]] = []
+    installed: list[Path] = []
+    created_dirs: list[Path] = []
+
+    def ensure_parent(path: Path) -> None:
+        missing = []
+        parent = path.parent
+        while not parent.exists():
+            missing.append(parent)
+            parent = parent.parent
+        path.parent.mkdir(parents=True, exist_ok=True)
+        created_dirs.extend(missing)
+
+    try:
+        for destination, _ in targets:
+            ensure_parent(destination)
+        for index, (destination, _) in enumerate(targets):
+            if destination.exists():
+                backup = backup_root / str(index)
+                os.replace(destination, backup)
+                backups.append((destination, backup))
+        for destination, staged in targets:
+            os.replace(staged, destination)
+            installed.append(destination)
+    except OSError as exc:
+        rollback_errors = []
+        for index, destination in enumerate(reversed(installed)):
+            try:
+                if destination.exists():
+                    os.replace(destination, displaced_root / str(index))
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        for destination, backup in reversed(backups):
+            try:
+                if backup.exists() and not destination.exists():
+                    os.replace(backup, destination)
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        for directory in created_dirs:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        if rollback_errors:
+            raise RuntimeError(
+                f"Jetty import failed ({exc}); rollback also failed: {rollback_errors}; "
+                f"recovery artifacts remain in {transaction_root}") from exc
+        raise
+
+
 def import_jetty_results(args: argparse.Namespace) -> int:
     validate_manifest(Path(args.manifest))
-    runs = Path(args.runs)
+    runs = Path(args.runs).resolve()
     records = load_jsonl(Path(args.jetty_runs))
-    validated_records: list[tuple[dict[str, Any], dict[str, Any], Path]] = []
+    if not records:
+        die("invalid Jetty results: no records")
+    if not all(isinstance(record, dict) for record in records):
+        die("invalid Jetty results: every record must be an object")
+
+    embedded_designs = [
+        record.get("harness", {}).get("answer_design")
+        for record in records if isinstance(record.get("harness"), dict)
+    ]
+    design: dict[str, Any] | None = None
+    if any(value is not None for value in embedded_designs):
+        if (len(embedded_designs) != len(records)
+                or any(value is None for value in embedded_designs)):
+            die("invalid Jetty results: answer design must be present on every record")
+        try:
+            designs = [validate_answer_design(value) for value in embedded_designs]
+        except (TypeError, ValueError) as exc:
+            die(f"invalid Jetty results: {exc}")
+        if len({value["design_sha256"] for value in designs}) != 1:
+            die("invalid Jetty results: conflicting answer designs")
+        design = designs[0]
+        design_path = runs / ANSWER_DESIGN_NAME
+        if design_path.exists():
+            try:
+                existing_design = validate_answer_design(strict_json_loads(
+                    design_path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                die(f"runs directory carries an invalid answer design: {exc}")
+            if existing_design != design:
+                die("runs directory already carries a different answer design")
+
+    preflight_records: list[dict[str, Any]] = []
     seen_identities: set[tuple[str, str | None, str, int, str]] = set()
     seen_destinations: set[Path] = set()
     for record in records:
         harness = record.get("harness")
         if not isinstance(harness, dict):
             die("invalid Jetty result: harness must be an object")
-        case_id, variant, run_number = harness.get("case_id"), harness.get("variant"), harness.get("run_number")
+        for hash_field in ("skill_tree_hash", "fixture_tree_hash"):
+            value = harness.get(hash_field)
+            if value is not None and (not isinstance(value, str) or not value):
+                die(f"invalid Jetty result: harness.{hash_field} must be non-empty text")
+        task_contract_sha256 = harness.get("jetty_task_contract_sha256")
+        if (not isinstance(task_contract_sha256, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", task_contract_sha256) is None):
+            die("invalid Jetty result: harness.jetty_task_contract_sha256 is required")
+        case_id = harness.get("case_id")
+        variant = harness.get("variant")
+        run_number = harness.get("run_number")
         if not isinstance(case_id, str) or not case_id:
             die("invalid Jetty result: harness.case_id must be a non-empty string")
-        if (not isinstance(variant, str) or
-                (variant not in {"with_skill", "without_skill", "old_skill"} and not is_ablation_variant(variant))):
+        if (not isinstance(variant, str)
+                or variant not in {"with_skill", "without_skill", "old_skill"}
+                and not is_ablation_variant(variant)):
             die("invalid Jetty result: harness.variant is not an execution arm")
         if isinstance(run_number, bool) or not isinstance(run_number, int) or run_number < 1:
             die("invalid Jetty result: harness.run_number must be a positive integer")
-        model = (record.get("jetty") or {}).get("model") if isinstance(record.get("jetty"), dict) else None
+        jetty = record.get("jetty")
+        model = jetty.get("model") if isinstance(jetty, dict) else None
         if model is not None and (not isinstance(model, str) or not model):
             die("invalid Jetty result: jetty.model must be null or a non-empty string")
         identity = (case_id, model, variant, run_number, "answer")
@@ -2658,68 +4387,48 @@ def import_jetty_results(args: argparse.Namespace) -> int:
         run_dir = harness.get("run_dir")
         if run_dir is not None and (not isinstance(run_dir, str) or not run_dir):
             die("invalid Jetty result: harness.run_dir must be a non-empty string")
-        relative = run_dir or (f"{case_id}/{variant}" if run_number == 1 else f"{case_id}/{variant}/run-{run_number}")
-        base = safe_child_path(runs, relative)
-        if base in seen_destinations:
+        relative = run_dir or (
+            f"{case_id}/{variant}" if run_number == 1
+            else f"{case_id}/{variant}/run-{run_number}")
+        destination = safe_child_path(runs, relative)
+        if destination in seen_destinations:
             die(f"duplicate Jetty result destination: {relative}")
-        seen_destinations.add(base)
+        if any(destination in prior.parents or prior in destination.parents
+               for prior in seen_destinations):
+            die(f"overlapping Jetty result destination: {relative}")
+        seen_destinations.add(destination)
         lifecycle = lifecycle_from_record(record)
-        if lifecycle.successful and (
-                not isinstance(record.get("trajectory_id"), str)
-                or not record.get("trajectory_id", "").strip()):
+        if (lifecycle.successful
+                and (not isinstance(record.get("trajectory_id"), str)
+                     or not record.get("trajectory_id", "").strip())):
             die("invalid Jetty result: successful trajectory requires non-blank trajectory_id")
-        validated_records.append((record, harness, base))
-    for record, harness, base in validated_records:
-        destination = base
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        base = Path(tempfile.mkdtemp(prefix=f".{destination.name}.artifact-stage-",
-                                     dir=destination.parent))
-        (base / ARTIFACT_COMMIT_NAME).unlink(missing_ok=True)
-        write_json(base / "jetty_raw.json", record)
-        artifacts = record.get("artifacts") or []
-        if not artifacts and isinstance(record.get("trajectory"), dict):
-            artifacts = record["trajectory"].get("artifacts", record["trajectory"].get("outputs", [])) or []
-        artifacts = [a for a in artifacts if isinstance(a, dict)]
-        observation = JettyObservation.from_record(
-            record, has_output=find_output_artifact(artifacts) is not None)
-        success = observation.success
-        if success:
-            for artifact in artifacts:
-                write_artifact(base, artifact)
-        else:
-            (base / "output.md").write_text(f"{JETTY_FAILURE}: trajectory failed before producing output]\n", encoding="utf-8")
-        meta = artifact_metadata(artifacts)
-        meta.update(normalized_jetty_metadata(record, success=success))
-        meta.update({
-            "population": "answer",
-            "case_id": harness.get("case_id"),
-            "run_number": harness.get("run_number", 1),
-            "variant": harness.get("variant"),
-            "billing_scope": "run",
-            "artifact_contract_version": ARTIFACT_CONTRACT_VERSION,
-        })
-        # Persist the harness-only ablation provenance into the run metadata so the
-        # benchmark report can VERIFY (mode/population/skill_hash/components) that a
-        # materialized ablation was actually mounted — never trusting the manifest
-        # and the run-dir name alone.
-        if isinstance(harness.get("ablation"), dict):
-            meta["ablation"] = harness["ablation"]
-        if harness.get("skill_tree_hash"):
-            meta["skill_tree_hash"] = harness["skill_tree_hash"]
-        trace_records = jetty_trace_records(record, artifacts, success=success)
-        write_trace_artifacts(
-            base,
-            jsonl_from_records(trace_records),
-            source="jetty",
-            metadata=meta,
-            environment={"runner": "jetty", "jetty": record.get("jetty", {}), "trajectory_id": record.get("trajectory_id")},
-            write_metadata=True,
-            process_observation_complete=not observation.timed_out,
-            provider_response_complete=success,
-            artifact_set_complete=None,
-        )
-        write_artifact_commit(base)
-        _install_staged_run(destination, base)
+        try:
+            preflight_records.append(_jetty_record_preflight(
+                record, harness, destination, design))
+        except (TypeError, ValueError, KeyError) as exc:
+            die(f"invalid Jetty result: {exc}")
+
+    runs.parent.mkdir(parents=True, exist_ok=True)
+    transaction_root = Path(tempfile.mkdtemp(
+        prefix=f".{runs.name}.jetty-import-", dir=runs.parent))
+    keep_for_recovery = False
+    try:
+        targets: list[tuple[Path, Path]] = []
+        if design is not None and not (runs / ANSWER_DESIGN_NAME).exists():
+            staged_design = transaction_root / "staged-answer-design.json"
+            write_json(staged_design, design)
+            targets.append((runs / ANSWER_DESIGN_NAME, staged_design))
+        for index, preflight in enumerate(preflight_records):
+            staged = transaction_root / "staged-runs" / str(index)
+            _stage_jetty_record(preflight, staged)
+            targets.append((preflight["destination"], staged))
+        _install_staged_transaction(targets, transaction_root)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        keep_for_recovery = isinstance(exc, RuntimeError) and "rollback also failed" in str(exc)
+        die(f"Jetty import transaction failed: {exc}")
+    finally:
+        if not keep_for_recovery and transaction_root.exists():
+            shutil.rmtree(transaction_root)
     return 0
 
 
@@ -2747,14 +4456,23 @@ def discover_run_bases_under(base: Path) -> list[tuple[int, Path]]:
     if not base.exists():
         return [(1, base)]
     run_dirs = []
+    seen_numbers: set[int] = set()
     for child in base.iterdir():
         if child.is_dir() and child.name.startswith("run-"):
-            try:
-                n = int(child.name.split("-", 1)[1])
-            except ValueError:
-                n = len(run_dirs) + 1
+            match = re.fullmatch(r"run-([1-9]\d*)", child.name)
+            if match is None:
+                raise ValueError(f"invalid run directory name: {child.name}")
+            n = int(match.group(1))
+            if n in seen_numbers:
+                raise ValueError(f"duplicate run identity under {base}: {n}")
+            seen_numbers.add(n)
             run_dirs.append((n, child))
     if run_dirs:
+        if any((base / name).exists() for name in OUTPUT_FILE_ALIASES):
+            raise ValueError(f"mixed root and run-N output layouts under {base}")
+        expected = set(range(1, max(seen_numbers) + 1))
+        if seen_numbers != expected:
+            raise ValueError(f"non-contiguous run identities under {base}")
         return sorted(run_dirs, key=lambda x: x[0])
     return [(1, base)]
 
@@ -2839,10 +4557,19 @@ def discover_turn_bases(base: Path) -> list[tuple[int, Path]]:
     if not base.exists():
         return []
     found = []
+    seen: set[int] = set()
     for child in base.iterdir():
-        m = re.fullmatch(r"turn-(\d+)", child.name)
-        if child.is_dir() and m:
-            found.append((int(m.group(1)), child))
+        if child.is_dir() and child.name.startswith("turn-"):
+            m = re.fullmatch(r"turn-([1-9]\d*)", child.name)
+            if m is None:
+                raise ValueError(f"invalid turn directory name: {child.name}")
+            number = int(m.group(1))
+            if number in seen:
+                raise ValueError(f"duplicate turn identity under {base}: {number}")
+            seen.add(number)
+            found.append((number, child))
+    if seen and seen != set(range(1, max(seen) + 1)):
+        raise ValueError(f"non-contiguous turn identities under {base}")
     return sorted(found)
 
 
@@ -2854,20 +4581,70 @@ def text_files_under(directory: Path) -> list[Path]:
     return files[:100]
 
 
+OUTPUT_FILE_ALIASES = (
+    "output.md", "output.txt", "response.md", "response.txt", "final.md", "final.txt",
+)
+RUN_SIDECAR_PATHS = (
+    "metadata.json", "timing.json", "outputs/metrics.json", "metrics.json",
+)
+
+
+def _json_values_equal(left: Any, right: Any) -> bool:
+    return json.dumps(
+        left, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ) == json.dumps(
+        right, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+
+
+def merge_owned_json_objects(
+    sources: Iterable[tuple[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    """Merge named JSON objects without implicit first/last-writer wins."""
+    merged: dict[str, Any] = {}
+    owners: dict[str, str] = {}
+    for owner, data in sources:
+        for key, value in data.items():
+            if key in merged and not _json_values_equal(merged[key], value):
+                raise ValueError(
+                    f"conflicting field {key!r} owned by {owners[key]} and {owner}")
+            if key not in merged:
+                merged[key] = value
+                owners[key] = owner
+    return merged
+
+
+def read_run_sidecar_contract(base: Path) -> tuple[dict[str, Any], str | None]:
+    sources: list[tuple[str, dict[str, Any]]] = []
+    for relative in RUN_SIDECAR_PATHS:
+        path = base / relative
+        if not path.exists():
+            continue
+        if not path.is_file() or path.is_symlink():
+            return {}, f"{relative} must be a regular file"
+        try:
+            data = strict_json_loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return {}, f"invalid JSON in {relative}: {exc}"
+        if not isinstance(data, dict):
+            return {}, f"{relative} must contain a JSON object"
+        sources.append((relative, data))
+    try:
+        return merge_owned_json_objects(sources), None
+    except ValueError as exc:
+        return {}, f"conflicting run sidecars: {exc}"
+
+
 def read_output_base(base: Path) -> tuple[str | None, Path]:
-    for name in ["output.md", "output.txt", "response.md", "response.txt", "final.md", "final.txt"]:
-        p = base / name
-        if p.exists():
-            return p.read_text(encoding="utf-8", errors="replace"), p
-    outputs = base / "outputs"
-    files = text_files_under(outputs)
-    if files:
-        chunks = []
-        for f in files:
-            rel = f.relative_to(base)
-            text = f.read_text(encoding="utf-8", errors="replace")
-            chunks.append(f"\n--- {rel} ---\n{text}")
-        return "\n".join(chunks).strip(), outputs
+    present = [base / name for name in OUTPUT_FILE_ALIASES if (base / name).exists()]
+    if len(present) > 1:
+        raise ValueError(
+            f"multiple output aliases under {base}: {', '.join(path.name for path in present)}")
+    if present:
+        path = present[0]
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"output alias must be a regular file: {path}")
+        return path.read_text(encoding="utf-8", errors="replace"), path
     return None, base / "output.md"
 
 
@@ -2877,9 +4654,13 @@ def read_output(runs: Path, case_id: str, variant: str) -> tuple[str | None, Pat
 
 
 def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str, Any]:
-    if data.get("artifact_contract_version") != ARTIFACT_CONTRACT_VERSION:
-        return data
-    committed = artifact_commit_valid(base)
+    marker_present = (base / ARTIFACT_COMMIT_NAME).exists()
+    contract_declared = data.get("artifact_contract_version") == ARTIFACT_CONTRACT_VERSION
+    if not marker_present and not contract_declared:
+        error = metadata_lifecycle_error(data)
+        return ({**data, "metadata_error": error, "metadata_artifact_valid": False}
+                if error else data)
+    committed = marker_present and contract_declared and artifact_commit_valid(base)
     current = telemetry_domain.ObservationEvidence.from_run(data)
     evidence = telemetry_domain.ObservationEvidence(
         current.process, current.provider_response, current.trace,
@@ -2893,26 +4674,18 @@ def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str
         envelope = dict(envelope)
         envelope["observation_evidence"] = evidence.to_dict()
         enriched["telemetry"] = envelope
+    error = metadata_lifecycle_error(enriched)
+    if error:
+        enriched["metadata_error"] = error
+        enriched["metadata_artifact_valid"] = False
     return enriched
 
 
 def read_metadata_base(base: Path) -> dict[str, Any]:
-    for name in ["metadata.json", "timing.json", "metrics.json"]:
-        p = base / name
-        if p.exists():
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                return _with_committed_artifact_state(base, data) if isinstance(data, dict) else {}
-            except json.JSONDecodeError:
-                return {"metadata_error": f"invalid JSON in {name}"}
-    p = base / "outputs" / "metrics.json"
-    if p.exists():
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            return _with_committed_artifact_state(base, data) if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
-            return {"metadata_error": "invalid JSON in outputs/metrics.json"}
-    return {}
+    merged, error = read_run_sidecar_contract(base)
+    if error is not None:
+        return {"metadata_error": error, "metadata_artifact_valid": False}
+    return _with_committed_artifact_state(base, merged)
 
 
 def read_metadata(runs: Path, case_id: str, variant: str) -> dict[str, Any]:
@@ -2921,7 +4694,7 @@ def read_metadata(runs: Path, case_id: str, variant: str) -> dict[str, Any]:
 
 def read_json_dict_or_list(path: Path) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return strict_json_loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except json.JSONDecodeError as exc:
@@ -2934,10 +4707,13 @@ def read_events_base(base: Path) -> tuple[list[dict[str, Any]] | None, str | Non
         return None, "missing events.json"
     if isinstance(data, dict) and data.get("_error"):
         return None, str(data["_error"])
+    version = data.get("schema_version") if isinstance(data, dict) else None
+    if version not in {None, 1, 2}:
+        return None, f"unsupported events.json schema_version {version!r}"
     events = data.get("events") if isinstance(data, dict) else data
     if not isinstance(events, list) or not all(isinstance(e, dict) for e in events):
         return None, "events.json must contain an events list"
-    if isinstance(data, dict) and data.get("schema_version") == 1:
+    if version in {None, 1}:
         events = [
             ({**event, "status": EventState.COMPLETED.value,
               "state_source": "legacy_assumed_completed"}
@@ -2948,11 +4724,9 @@ def read_events_base(base: Path) -> tuple[list[dict[str, Any]] | None, str | Non
 
 
 def read_metrics_base(base: Path) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for rel in ["metadata.json", "timing.json", "outputs/metrics.json", "metrics.json"]:
-        data = read_json_dict_or_list(base / rel)
-        if isinstance(data, dict) and not data.get("_error"):
-            merged.update(data)
+    merged, error = read_run_sidecar_contract(base)
+    if error is not None:
+        return {"metadata_error": error, "metadata_artifact_valid": False}
     return _with_committed_artifact_state(base, merged)
 
 
@@ -2974,7 +4748,7 @@ def raw_trace_record_for_ref(run_base: Path | None, ref: Any) -> dict[str, Any] 
     for i, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
         if i == line_no:
             try:
-                record = json.loads(line)
+                record = strict_json_loads(line)
             except json.JSONDecodeError:
                 return None
             return record if isinstance(record, dict) else None
@@ -3014,6 +4788,8 @@ def command_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def event_mentions_skill_file(event: dict[str, Any]) -> bool:
+    if event.get("type") not in {"skill_load", "file_read", "tool_call", "command"}:
+        return False
     hay = " ".join(str(event.get(key, "")) for key in ["input_summary", "output_summary", "name"])
     return "SKILL.md" in hay or "/skills/" in hay or "\\skills\\" in hay
 
@@ -3034,7 +4810,11 @@ def trace_event_counts(events: list[dict[str, Any]]) -> dict[str, Any]:
     commands = command_events(events)
     return {
         "steps": sum(1 for e in completed if e.get("type") in TRAJECTORY_STEP_TYPES),
-        "tool_calls": sum(1 for e in completed if e.get("type") in {"tool_call", "skill_load"}) + len(commands),
+        # File and skill operations are provider tool calls too.  Keeping their
+        # finer taxonomy must not make them disappear from the aggregate call
+        # count or from tool-call assertions.
+        "tool_calls": sum(1 for e in completed
+                          if e.get("type") in TRAJECTORY_STEP_TYPES),
         "commands": len(commands),
         "file_reads": sum(1 for e in completed if e.get("type") in {"file_read", "skill_load"}),
         "file_writes": sum(1 for e in completed if e.get("type") == "file_write"),
@@ -3043,7 +4823,7 @@ def trace_event_counts(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-EVENT_TEXT_KEYS = {"file_path", "path", "skill", "input", "partial_json", "command", "cmd", "args", "argv"}
+EVENT_TEXT_KEYS = {"file_path", "path", "skill", "input", "input_summary", "partial_json", "command", "cmd", "args", "argv"}
 
 
 def _flatten_event_text(value: Any) -> str:
@@ -3071,21 +4851,31 @@ def event_texts_for_tool_input(obj: Any) -> list[str]:
     return out
 
 
-def detect_trigger_records(records: Iterable[dict[str, Any]], copied_paths: list[Path]) -> TriggerDetection:
-    """Derive mounted-path trigger evidence from already parsed provider records."""
+def detect_trigger_records(records: Iterable[dict[str, Any]], copied_paths: list[Path],
+                           *, source: str = "generic",
+                           pi_stream: PiStream | None = None) -> TriggerDetection:
+    """Derive mounted-path evidence from provider-aware completed operations."""
     needles = [str(p) for p in copied_paths] + [str(p.parent) for p in copied_paths]
     evidence: list[str] = []
-    for event in records:
+    materialized = list(records)
+    event_doc, _ = normalize_trace_records(
+        materialized, source=source, pi_stream=pi_stream)
+    for event in event_doc["events"]:
+        if not event_is_completed(event):
+            continue
+        if event.get("type") not in {"skill_load", "file_read", "command"}:
+            continue
         for text in event_texts_for_tool_input(event):
             if any(needle and needle in text for needle in needles):
                 evidence.append(text[:500])
     return TriggerDetection.from_texts(TriggerEvidenceKind.MOUNTED_PATH, evidence[:5])
 
 
-def detect_trigger_detection(stdout: str, copied_paths: list[Path]) -> TriggerDetection:
+def detect_trigger_detection(stdout: str, copied_paths: list[Path],
+                             *, source: str = "generic") -> TriggerDetection:
     """Typed skill-invocation detector for a raw JSON event stream."""
     records = [event for event in iter_json_objects(stdout) if isinstance(event, dict)]
-    return detect_trigger_records(records, copied_paths)
+    return detect_trigger_records(records, copied_paths, source=source)
 
 
 def detect_trigger(stdout: str, copied_paths: list[Path]) -> tuple[bool, list[str]]:
@@ -3307,16 +5097,30 @@ def repeated_command_max(commands: list[str]) -> int:
 
 
 def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:
+    def validated(value: Any, key: str) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            return None
+        integer_metric = (key.endswith("tokens") or key in {
+            "commands", "command_count", "tool_calls", "file_reads",
+            "file_writes", "errors", "retries", "repeated_command_max",
+        })
+        if integer_metric and not number.is_integer():
+            return None
+        return number
+
     for key in keys:
-        value = metrics.get(key)
-        if isinstance(value, (int, float)):
-            return float(value)
+        value = validated(metrics.get(key), key)
+        if value is not None:
+            return value
     usage = metrics.get("usage")
     if isinstance(usage, dict):
         for key in keys:
-            value = usage.get(key)
-            if isinstance(value, (int, float)):
-                return float(value)
+            value = validated(usage.get(key), key)
+            if value is not None:
+                return value
     return None
 
 
@@ -3362,15 +5166,25 @@ def normalize_usage(raw: Any, *, source: str = "provider_reported") -> dict[str,
     out: dict[str, Any] = {}
     if isinstance(raw, dict):
         for key, aliases in USAGE_ALIASES.items():
+            observed: list[tuple[str, int]] = []
             for alias in aliases:
-                value = _num(raw.get(alias))
-                if value is not None:
-                    out[key] = int(value)
-                    break
+                if alias not in raw or raw.get(alias) is None:
+                    continue
+                value = raw[alias]
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(
+                        f"usage.{alias} must be a finite nonnegative integer token count")
+                observed.append((alias, value))
+            if observed:
+                values = {value for _, value in observed}
+                if len(values) != 1:
+                    raise ValueError(f"conflicting aliases for {key}: {dict(observed)}")
+                out[key] = observed[0][1]
     if source == "not_applicable":
         return {"source": "not_applicable"}
-    if "total_tokens" not in out and ("input_tokens" in out or "output_tokens" in out):
-        out["total_tokens"] = out.get("input_tokens", 0) + out.get("output_tokens", 0)
+    if ("total_tokens" not in out and "input_tokens" in out
+            and "output_tokens" in out):
+        out["total_tokens"] = out["input_tokens"] + out["output_tokens"]
     if not out:
         return {"source": "missing"}
     out["source"] = source
@@ -3387,6 +5201,8 @@ def normalize_cost(raw: Any, *, source: str = "provider_reported", currency: str
         raise ValueError(f"unknown cost source {source!r}; expected one of {sorted(COST_SOURCES)}")
     if source == "not_applicable":
         return {"source": "not_applicable"}
+    if isinstance(raw, (int, float)) and (isinstance(raw, bool) or _num(raw) is None):
+        raise ValueError("cost measurement must be a finite number")
     total = _num(raw)
     parts: dict[str, float] = {}
     resolved_currency = currency
@@ -3394,23 +5210,56 @@ def normalize_cost(raw: Any, *, source: str = "provider_reported", currency: str
         if raw.get("currency") is not None:
             raw_currency = raw.get("currency")
             if not isinstance(raw_currency, str) or not re.fullmatch(r"[A-Z]{3}", raw_currency):
-                return {"source": "missing"}
+                raise ValueError("cost currency must be a three-letter uppercase code")
             resolved_currency = raw_currency
+        total_observations: list[tuple[str, float]] = []
         for key in ("total_cost", "total_cost_usd", "cost_usd", "total", "cost", "amount"):
-            total = _num(raw.get(key))
-            if total is not None:
-                break
+            if key not in raw or raw[key] is None:
+                continue
+            value = _num(raw[key])
+            if value is None:
+                raise ValueError(f"cost.{key} must be a finite number")
+            if key.endswith("_usd") and resolved_currency != "USD":
+                raise ValueError(f"cost.{key} cannot be labelled {resolved_currency}")
+            total_observations.append((key, value))
+        if total_observations:
+            values = {value for _, value in total_observations}
+            if len(values) != 1:
+                raise ValueError(
+                    f"conflicting total cost aliases: {dict(total_observations)}")
+            total = total_observations[0][1]
         for norm_key, aliases in COST_PART_ALIASES.items():
+            observations: list[tuple[str, float]] = []
             for alias in aliases:
-                value = _num(raw.get(alias))
-                if value is not None:
-                    parts[norm_key] = value
-                    break
-        if total is None and parts:
+                if alias not in raw or raw[alias] is None:
+                    continue
+                value = _num(raw[alias])
+                if value is None:
+                    raise ValueError(f"cost.{alias} must be a finite number")
+                observations.append((alias, value))
+            if observations:
+                values = {value for _, value in observations}
+                if len(values) != 1:
+                    raise ValueError(
+                        f"conflicting aliases for {norm_key}: {dict(observations)}")
+                parts[norm_key] = observations[0][1]
+        if "components_complete" in raw and not isinstance(raw["components_complete"], bool):
+            raise ValueError("cost.components_complete must be boolean")
+        if total is None and parts and raw.get("components_complete") is True:
             total = sum(parts.values())
+        elif total is not None and parts and raw.get("components_complete") is True:
+            component_total = sum(parts.values())
+            if not math.isclose(total, component_total, rel_tol=1e-12, abs_tol=1e-12):
+                raise ValueError(
+                    "complete cost components do not sum to the reported total")
     if total is None:
-        return {"source": "missing"}
-    out: dict[str, Any] = {"currency": resolved_currency, **{k: round(v, 6) for k, v in parts.items()}, "total_cost": round(total, 6), "source": source}
+        return ({"source": "missing", "currency": resolved_currency,
+                 "observed_parts": parts, "reason": "partial_cost_components"}
+                if parts else {"source": "missing"})
+    if total < 0 or any(value < 0 for value in parts.values()):
+        raise ValueError("cost measurements must be nonnegative")
+    out: dict[str, Any] = {"currency": resolved_currency, **parts,
+                           "total_cost": total, "source": source}
     if pricing_model:
         out["pricing_model"] = pricing_model
     if pricing_table_version:
@@ -3492,9 +5341,9 @@ def missing_evidence(name: str) -> dict[str, Any]:
     return {"passed": False, "evidence": f"missing {name} evidence"}
 
 
-def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: Path | None, metadata: dict[str, Any]) -> tuple[bool, str]:
+def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: Path | None, metadata: dict[str, Any]) -> tuple[bool | None, str]:
     if run_base is None:
-        return False, "missing run directory for trace assertion"
+        return None, "missing run directory for trace assertion"
     atype = assertion.get("type")
     events, event_error = read_events_base(run_base)
     metrics = dict(metadata or {})
@@ -3538,7 +5387,7 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
     if required_signal:
         observed, evidence_error = require_v3_measurement(required_signal)
         if not observed:
-            return False, str(evidence_error)
+            return None, str(evidence_error)
 
     if atype == "skill_invoked":
         expected = bool(assertion.get("expected", True))
@@ -3546,29 +5395,34 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
         invoked = bool(metrics.get("skill_invoked")) if has_metric else False
         evidence: list[str] = []
         if events is not None:
-            skill_events = [e for e in events if e.get("type") == "skill_load" or event_mentions_skill_file(e)]
+            skill_events = [e for e in events
+                            if event_is_completed(e)
+                            and (e.get("type") == "skill_load" or event_mentions_skill_file(e))]
             if skill_events:
                 invoked = True
                 evidence.extend(command_text(e) or str(e.get("path", "skill_load")) for e in skill_events[:5])
         if has_metric:
             evidence.extend(str(x) for x in metrics.get("skill_invocation_evidence", [])[:5] if isinstance(metrics.get("skill_invocation_evidence", []), list))
         if events is None and not has_metric:
-            return False, f"missing skill invocation evidence ({event_error})"
+            return None, f"missing skill invocation evidence ({event_error})"
         return invoked == expected, f"skill_invoked={invoked}; expected={expected}; evidence={evidence[:5]}"
 
     if atype in {"command_ran", "command_not_ran", "command_order", "tool_call", "tool_count_le", "no_repeated_command_loop"}:
         if events is None:
-            return False, event_error or "missing events.json"
+            return None, event_error or "missing events.json"
         commands = [command_text(e) for e in command_events(events)]
+        observed_commands = [command_text(e) for e in events
+                             if e.get("type") == "command"]
         if atype == "tool_call":
             # 1.1 preset: assert a tool was actually called — optionally matching
             # a pattern, in order, with count bounds. Completed calls only, over
-            # BOTH normalized shapes: command events and tool_call events (the
-            # normalizer emits type "tool_call" for non-shell tools, which
-            # command_events deliberately excludes).
+            # every normalized action shape: shell commands, generic tools,
+            # file operations, and skill loads.
             completed_calls = [e for e in events
-                               if e.get("type") in {"command", "tool_call"}
+                               if e.get("type") in TRAJECTORY_STEP_TYPES
                                and event_is_completed(e)]
+            observed_calls = [e for e in events
+                              if e.get("type") in TRAJECTORY_STEP_TYPES]
             tool = assertion.get("tool")
             if tool:
                 tool_folded = str(tool).casefold()
@@ -3586,14 +5440,23 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
             call_names = [str(e.get("name", "")).casefold() for e in completed_calls if e.get("name")]
             if assertion.get("expected_no_call"):
                 # Irrelevance detection: the named tool (or, if `pattern` is given, any
-                # tool NAME matching that regex) must NOT have been called.
+                # observed invocation, including started/failed/in-progress calls,
+                # falsifies the negative claim. Completion remains required only for
+                # positive "the tool ran" assertions.
+                observed_names = [
+                    (str(e.get("name")).casefold() if e.get("name")
+                     else "bash" if e.get("type") == "command"
+                     else str(e.get("type") or "unknown_tool").casefold())
+                    for e in observed_calls
+                ]
+                observed_names = [name for name in observed_names if name]
                 pat = assertion.get("pattern")
                 if pat:
-                    offending = sorted({n for n in call_names if regex_hit(str(pat), n, ci)})
+                    offending = sorted({n for n in observed_names if regex_hit(str(pat), n, ci)})
                 elif tool:
-                    offending = sorted({n for n in call_names if n == str(tool).casefold()})
+                    offending = sorted({n for n in observed_names if n == str(tool).casefold()})
                 else:
-                    offending = sorted(set(call_names))   # no tool call at all
+                    offending = sorted(set(observed_names))   # no tool call at all
                 return (not offending), ("no matching tool call (as required)" if not offending else f"unexpected tool call(s): {offending[:5]}")
             required = assertion.get("required_calls")
             if isinstance(required, list) and required:
@@ -3645,7 +5508,7 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
             return hit is not None, f"matched command {hit!r}" if hit else f"no command matched /{pattern}/"
         if atype == "command_not_ran":
             pattern = str(assertion.get("pattern", assertion.get("value", "")))
-            hit = next((cmd for cmd in commands if regex_hit(pattern, cmd, ci)), None)
+            hit = next((cmd for cmd in observed_commands if regex_hit(pattern, cmd, ci)), None)
             return hit is None, "no banned command matched" if hit is None else f"banned command matched {hit!r}"
         if atype == "command_order":
             patterns = [str(p) for p in assertion.get("patterns", [])]
@@ -3669,7 +5532,8 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
             if tool:
                 count = sum(1 for e in completed_events if str(e.get("name", "")).casefold() == str(tool).casefold() or (str(tool).casefold() == "bash" and e.get("type") == "command"))
             else:
-                count = len([e for e in completed_events if e.get("type") in {"tool_call", "command"}])
+                count = len([e for e in completed_events
+                             if e.get("type") in TRAJECTORY_STEP_TYPES])
             return count <= max_allowed, f"tool_count={count}; max={max_allowed}; tool={tool or '<any>'}"
         if atype == "no_repeated_command_loop":
             max_allowed = int(assertion.get("max_repeats", assertion.get("max", 1)))
@@ -3679,7 +5543,7 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
     if atype == "total_tokens_le":
         value = metric_number(metrics, "total_tokens")
         if value is None:
-            return False, "missing total_tokens evidence"
+            return None, "missing total_tokens evidence"
         max_allowed = float(assertion.get("max", assertion.get("value", 0)))
         return value <= max_allowed, f"total_tokens={value:g}; max={max_allowed:g}"
     if atype == "elapsed_seconds_le":
@@ -3688,7 +5552,7 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
             ms = metric_number(metrics, "elapsed_ms", "duration_ms")
             value = (ms / 1000.0) if ms is not None else None
         if value is None:
-            return False, "missing elapsed time evidence"
+            return None, "missing elapsed time evidence"
         max_allowed = float(assertion.get("max", assertion.get("value", 0)))
         return value <= max_allowed, f"elapsed_seconds={value:g}; max={max_allowed:g}"
     if atype == "command_count_le":
@@ -3696,17 +5560,31 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
         if value is None and events is not None:
             value = float(len(command_events(events)))
         if value is None:
-            return False, "missing command count evidence"
+            return None, "missing command count evidence"
         max_allowed = float(assertion.get("max", assertion.get("value", 0)))
         return value <= max_allowed, f"command_count={value:g}; max={max_allowed:g}"
-    return False, f"unsupported trace assertion {atype!r}"
+    return None, f"unsupported trace assertion {atype!r}"
 
 
 def raw_trace_value(record: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in record:
             return record[key]
-    for container_key in ["message", "delta", "data", "item", "tool_input", "input", "details"]:
+    for container_key in ["message", "delta", "data", "item"]:
+        nested = record.get(container_key)
+        if isinstance(nested, dict):
+            for key in keys:
+                if key in nested:
+                    return nested[key]
+    return None
+
+
+def raw_trace_input_value(record: dict[str, Any], *keys: str) -> Any:
+    """Invocation arguments may supply paths/commands, never lifecycle facts."""
+    value = raw_trace_value(record, *keys)
+    if value is not None:
+        return value
+    for container_key in ("tool_input", "input", "details", "args"):
         nested = record.get(container_key)
         if isinstance(nested, dict):
             for key in keys:
@@ -3718,7 +5596,7 @@ def raw_trace_value(record: dict[str, Any], *keys: str) -> Any:
 def raw_trace_has_key(record: dict[str, Any], *keys: str) -> bool:
     if any(key in record for key in keys):
         return True
-    for container_key in ["message", "delta", "data", "item", "tool_input", "input", "details"]:
+    for container_key in ["message", "delta", "data", "item"]:
         nested = record.get(container_key)
         if isinstance(nested, dict) and any(key in nested for key in keys):
             return True
@@ -3754,8 +5632,11 @@ def parse_trace_jsonl_text_with_lines(text: str) -> tuple[list[dict[str, Any]], 
         if not line.strip():
             continue
         try:
-            obj = json.loads(line)
+            obj = strict_json_loads(line)
         except json.JSONDecodeError as exc:
+            if ("duplicate object key" in exc.msg
+                    or "non-finite numeric constant" in exc.msg):
+                raise ValueError(exc.msg) from exc
             errors.append(f"line {line_number}: {exc}")
             continue
         if isinstance(obj, dict):
@@ -3783,13 +5664,11 @@ def nested_item_type(record: dict[str, Any]) -> str:
     return ""
 
 
-def usage_number(usage: dict[str, Any], *keys: str) -> float | None:
-    search: list[str] = []
+def usage_number(usage: dict[str, Any], *keys: str) -> int | None:
+    normalized = normalize_usage(usage, source="trace_normalized")
     for key in keys:
-        search.extend(USAGE_ALIASES.get(key, [key]))
-    for key in search:
-        value = _num(usage.get(key))
-        if value is not None:
+        value = normalized.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
             return value
     return None
 
@@ -3798,8 +5677,8 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     top_type = str(raw_trace_value(record, "type", "event", "name", "kind") or "")
     item_type = nested_item_type(record)
     raw_type = f"{top_type} {item_type}".casefold()
-    path = stringify_trace_value(raw_trace_value(record, "path", "file"))
-    command = stringify_trace_value(raw_trace_value(record, "command", "cmd", "args"))
+    path = stringify_trace_value(raw_trace_input_value(record, "path", "file", "file_path"))
+    command = stringify_trace_value(raw_trace_input_value(record, "command", "cmd", "args"))
     content = stringify_trace_value(raw_trace_value(record, "content", "text", "message"))
     raw_status = raw_trace_value(record, "status", "state")
     parsed_state = parse_event_state(
@@ -3810,18 +5689,27 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     # tool_call inflated Pi's process telemetry even when its trace had no
     # model tool use at all.
     event_type = TraceEventKind.EVENT
-    name = stringify_trace_value(raw_trace_value(record, "tool", "tool_name", "name"))
-    if "skill" in raw_type and ("load" in raw_type or "read" in raw_type) or path.endswith("SKILL.md") or "/SKILL.md" in path:
+    name = stringify_trace_value(raw_trace_value(
+        record, "tool", "tool_name", "toolName", "name"))
+    tool_name = name.casefold()
+    is_write = ("file_write" in raw_type or "write" in raw_type or "edit" in raw_type
+                or tool_name in {"write", "edit", "multiedit", "notebookedit", "write_file"})
+    is_read = ("file_read" in raw_type or "read" in raw_type
+               or tool_name in {"read", "read_file"})
+    skill_path = path.endswith("SKILL.md") or "/SKILL.md" in path or "\\SKILL.md" in path
+    explicit_skill_load = "skill" in raw_type and ("load" in raw_type or "read" in raw_type)
+    if is_write:
+        event_type = TraceEventKind.FILE_WRITE
+    elif explicit_skill_load or (is_read and skill_path):
         event_type = TraceEventKind.SKILL_LOAD
     elif "command" in raw_type or "exec" in raw_type or command:
         event_type = TraceEventKind.COMMAND
         name = name or "bash"
-    elif "tool" in raw_type or raw_trace_value(record, "tool", "tool_name", "tool_call_id") is not None:
-        event_type = TraceEventKind.TOOL_CALL
-    elif "file_write" in raw_type or "write" in raw_type or "edit" in raw_type:
-        event_type = TraceEventKind.FILE_WRITE
-    elif "file_read" in raw_type or "read" in raw_type:
+    elif is_read:
         event_type = TraceEventKind.FILE_READ
+    elif "tool" in raw_type or raw_trace_value(
+            record, "tool", "tool_name", "toolName", "tool_call_id") is not None:
+        event_type = TraceEventKind.TOOL_CALL
     elif "error" in raw_type or str(status).casefold() in {"failed", "error", "errored"}:
         event_type = TraceEventKind.ERROR
     elif raw_trace_value(record, "role") or content or "agent_message" in raw_type:
@@ -3866,7 +5754,7 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     duration = _num(raw_trace_value(record, "duration_ms", "elapsed_ms"))
     if duration is not None:
         event["duration_ms"] = duration
-    usage = raw_trace_value(record, "usage", "tokens")
+    usage = record.get("usage") if isinstance(record.get("usage"), dict) else record.get("tokens")
     if isinstance(usage, dict):
         token_doc = {k: v for k, raw in usage.items() if (v := _num(raw)) is not None}
         normalized_total = usage_number(usage, "total_tokens")
@@ -3940,6 +5828,13 @@ def _claude_tool_flat_record(name: str, tool_input: Any) -> dict[str, Any]:
     return {"type": "tool_use", "tool": name, "input": inp}
 
 
+def _claude_protocol_error(message: str) -> dict[str, Any]:
+    return {
+        "type": "error", "status": "failed", "message": message,
+        "_trace_protocol_invalid": True,
+    }
+
+
 def claude_stream_flat_records(records: list[dict[str, Any]], *,
                                record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
     """Flatten `claude -p --output-format stream-json` events into (line, record)
@@ -3963,47 +5858,84 @@ def claude_stream_flat_records(records: list[dict[str, Any]], *,
             # `result` is an intrinsically terminal kind carrying usage/duration.
             flat.append((line, record))
             continue
-        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        if not isinstance(record.get("message"), dict):
+            flat.append((line, _claude_protocol_error(
+                f"Claude {rtype} record has no message object")))
+            continue
+        message = record["message"]
         role = str(message.get("role") or rtype)
         content = message.get("content")
         if isinstance(content, str):
             if content.strip():
                 flat.append((line, {"type": "message", "role": role, "text": content}))
             continue
-        for block in content if isinstance(content, list) else []:
+        if not isinstance(content, list):
+            flat.append((line, _claude_protocol_error(
+                "Claude message content must be a string or list")))
+            continue
+        for block in content:
             if not isinstance(block, dict):
+                flat.append((line, _claude_protocol_error(
+                    "Claude message content blocks must be objects")))
                 continue
             btype = block.get("type")
             if btype == "text":
                 text = block.get("text")
-                if isinstance(text, str) and text.strip():
+                if not isinstance(text, str):
+                    flat.append((line, _claude_protocol_error(
+                        "Claude text block text must be a string")))
+                elif text.strip():
                     flat.append((line, {"type": "message", "role": role, "text": text}))
+            elif btype == "thinking":
+                if not isinstance(block.get("thinking"), str):
+                    flat.append((line, _claude_protocol_error(
+                        "Claude thinking block must contain thinking text")))
+            elif btype == "redacted_thinking":
+                if not isinstance(block.get("data"), str):
+                    flat.append((line, _claude_protocol_error(
+                        "Claude redacted_thinking block must contain data")))
             elif btype == "tool_use":
-                spec = _claude_tool_flat_record(str(block.get("name") or ""), block.get("input"))
-                call_id = str(block.get("id") or "")
-                if not call_id:
-                    flat.append((line, {
-                        "type": "error", "status": "failed",
-                        "message": "Claude tool_use is missing a call id",
-                    }))
+                name, raw_input, call_id = block.get("name"), block.get("input"), block.get("id")
+                if not isinstance(name, str) or not name.strip():
+                    flat.append((line, _claude_protocol_error(
+                        "Claude tool_use name must be a non-empty string")))
                     continue
+                if not isinstance(raw_input, dict):
+                    flat.append((line, _claude_protocol_error(
+                        "Claude tool_use input must be an object")))
+                    continue
+                if not isinstance(call_id, str) or not call_id.strip():
+                    flat.append((line, _claude_protocol_error(
+                        "Claude tool_use id must be a non-empty string")))
+                    continue
+                spec = _claude_tool_flat_record(name, raw_input)
                 if call_id in seen_call_ids:
                     lifecycle = "open " if call_id in open_calls else "reused "
-                    flat.append((line, {
-                        "type": "error", "status": "failed",
-                        "message": f"duplicate {lifecycle}Claude tool_use call id {call_id!r}",
-                    }))
+                    flat.append((line, _claude_protocol_error(
+                        f"duplicate {lifecycle}Claude tool_use call id {call_id!r}")))
                     continue
                 flat.append((line, {**spec, "status": "in_progress"}))
                 seen_call_ids.add(call_id)
                 open_calls[call_id] = (line, spec)
             elif btype == "tool_result":
-                call_id = str(block.get("tool_use_id") or "")
+                call_id = block.get("tool_use_id")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    flat.append((line, _claude_protocol_error(
+                        "Claude tool_result tool_use_id must be a non-empty string")))
+                    continue
+                if "is_error" in block and not isinstance(block["is_error"], bool):
+                    flat.append((line, _claude_protocol_error(
+                        "Claude tool_result is_error must be boolean")))
+                    continue
+                if not isinstance(block.get("content"), (str, list)):
+                    flat.append((line, _claude_protocol_error(
+                        "Claude tool_result content must be a string or list")))
+                    continue
                 matched_call = open_calls.pop(call_id, None)
                 if matched_call is None:
                     flat.append((line, {
-                        "type": "error", "status": "failed",
-                        "message": f"unmatched Claude tool_result for call id {call_id!r}",
+                        **_claude_protocol_error(
+                            f"unmatched Claude tool_result for call id {call_id!r}"),
                         "result": stringify_trace_value(block.get("content"))[:1000],
                         "_raw_result_line": line,
                     }))
@@ -4017,6 +5949,12 @@ def claude_stream_flat_records(records: list[dict[str, Any]], *,
                     # exit); lifecycle-wise it still ran, so it stays completed.
                     completion["is_error"] = True
                 flat.append((line, completion))
+            else:
+                flat.append((line, _claude_protocol_error(
+                    f"unsupported Claude content block type {btype!r}")))
+    for call_id, (call_line, _) in sorted(open_calls.items()):
+        flat.append((call_line, _claude_protocol_error(
+            f"Claude tool_use call id {call_id!r} has no matching tool_result")))
     return flat
 
 
@@ -4027,6 +5965,100 @@ def identity_flat_records(records: list[dict[str, Any]], *,
         raise ValueError("record_lines must have one physical line per trace record")
     return [((record_lines[i - 1] if record_lines is not None else i), record)
             for i, record in enumerate(records, 1)]
+
+
+def vibe_stream_flat_records(records: list[dict[str, Any]], *,
+                             record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten Vibe's OpenAI-style message/tool lifecycle without dropping it."""
+    if record_lines is not None and len(record_lines) != len(records):
+        raise ValueError("record_lines must have one physical line per trace record")
+    flat: list[tuple[int, dict[str, Any]]] = []
+    open_calls: dict[str, tuple[int, dict[str, Any]]] = {}
+    seen: set[str] = set()
+
+    def invalid(line: int, message: str) -> None:
+        flat.append((line, _claude_protocol_error(f"Vibe {message}")))
+
+    for ordinal, record in enumerate(records, 1):
+        line = record_lines[ordinal - 1] if record_lines is not None else ordinal
+        role = record.get("role")
+        tool_calls = record.get("tool_calls")
+        if tool_calls is not None:
+            if role != "assistant" or not isinstance(tool_calls, list):
+                invalid(line, "tool_calls must be a list on an assistant message")
+                continue
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    invalid(line, "tool_calls entries must be objects")
+                    continue
+                call_id = call.get("id")
+                function = call.get("function")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    invalid(line, "tool call id must be a non-empty string")
+                    continue
+                if call_id in seen:
+                    invalid(line, f"tool call id {call_id!r} is duplicated or reused")
+                    continue
+                if not isinstance(function, dict):
+                    invalid(line, "tool call function must be an object")
+                    continue
+                name, arguments = function.get("name"), function.get("arguments")
+                if not isinstance(name, str) or not name.strip():
+                    invalid(line, "tool call function name must be a non-empty string")
+                    continue
+                if isinstance(arguments, str):
+                    try:
+                        arguments = strict_json_loads(arguments)
+                    except json.JSONDecodeError:
+                        invalid(line, "tool call arguments must be a JSON object")
+                        continue
+                if not isinstance(arguments, dict):
+                    invalid(line, "tool call arguments must be an object")
+                    continue
+                if name == "skill":
+                    spec = {"type": "skill_load", "name": name,
+                            "path": str(arguments.get("name") or arguments.get("skill") or "")}
+                elif name == "read_file":
+                    spec = {"type": "file_read", "name": name,
+                            "path": str(arguments.get("path") or arguments.get("file_path") or "")}
+                elif name == "grep":
+                    spec = {"type": "tool_use", "tool": name, "input": arguments}
+                else:
+                    invalid(line, f"tool call function {name!r} is unsupported")
+                    continue
+                flat.append((line, {**spec, "status": "in_progress"}))
+                open_calls[call_id] = (line, spec)
+                seen.add(call_id)
+        content = record.get("content")
+        if role == "tool":
+            call_id = record.get("tool_call_id")
+            if not isinstance(call_id, str) or not call_id.strip():
+                invalid(line, "tool result tool_call_id must be a non-empty string")
+                continue
+            matched = open_calls.pop(call_id, None)
+            if matched is None:
+                invalid(line, f"tool result for unknown call id {call_id!r}")
+                continue
+            call_line, spec = matched
+            flat.append((line, {**spec, "status": "completed",
+                                "output": stringify_trace_value(content)[:1000],
+                                "_raw_call_line": call_line,
+                                "_raw_result_line": line}))
+        elif role in {"assistant", "user", "system"}:
+            if content is not None and not isinstance(content, str):
+                invalid(line, "message content must be a string")
+            elif isinstance(content, str) and content.strip():
+                flat.append((line, {"type": "message", "role": role,
+                                    "text": content,
+                                    **({"usage": record["usage"]}
+                                       if isinstance(record.get("usage"), dict) else {})}))
+        elif role is not None:
+            invalid(line, f"message role {role!r} is unsupported")
+        elif tool_calls is None:
+            invalid(line, "record must have a supported role")
+    for call_id, (line, _) in sorted(open_calls.items()):
+        invalid(line, f"tool call id {call_id!r} has no matching tool result")
+    return flat
 
 
 def _no_stream_semantics(records: list[dict[str, Any]], pi_stream: PiStream | None) -> tuple[dict[str, Any] | None, str | None]:
@@ -4055,6 +6087,49 @@ def _pi_usage_and_cost_blocks(raw_text: str, pi_stream: PiStream | None) -> tupl
     return dict(parsed.usage_normalized), dict(parsed.cost_normalized)
 
 
+def _generic_trace_protocol_error(
+    records: list[dict[str, Any]], pi_stream: PiStream | None,
+) -> str | None:
+    return None
+
+
+def _codex_trace_protocol_error(
+    records: list[dict[str, Any]], pi_stream: PiStream | None,
+) -> str | None:
+    terminals = [i for i, record in enumerate(records)
+                 if str(record.get("type") or "").casefold() == "turn.completed"]
+    if terminals != [len(records) - 1]:
+        return "Codex trace must contain exactly one final turn.completed event"
+    return None
+
+
+def _claude_trace_protocol_error(
+    records: list[dict[str, Any]], pi_stream: PiStream | None,
+) -> str | None:
+    terminals = [i for i, record in enumerate(records) if record.get("type") == "result"]
+    if terminals != [len(records) - 1]:
+        return "Claude trace must contain exactly one final result event"
+    return None
+
+
+def _vibe_trace_protocol_error(
+    records: list[dict[str, Any]], pi_stream: PiStream | None,
+) -> str | None:
+    terminal_answer = (records and records[-1].get("role") == "assistant"
+                       and isinstance(records[-1].get("content"), str)
+                       and bool(records[-1]["content"].strip()))
+    if not terminal_answer:
+        return "Vibe trace must end with one non-empty assistant response"
+    return None
+
+
+def _pi_trace_protocol_error(
+    records: list[dict[str, Any]], pi_stream: PiStream | None,
+) -> str | None:
+    parsed = pi_stream or PiStream.from_records(records)
+    return parsed.protocol_error
+
+
 class TraceFlattener(Protocol):
     def __call__(self, records: list[dict[str, Any]], *,
                  record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]: ...
@@ -4075,18 +6150,29 @@ class TraceDialect:
     flatten: TraceFlattener = identity_flat_records
     stream_semantics: Callable[[list[dict[str, Any]], PiStream | None], tuple[dict[str, Any] | None, str | None]] = _no_stream_semantics
     usage_and_cost: Callable[[str, PiStream | None], tuple[dict[str, Any], dict[str, Any]]] = _generic_usage_and_cost_blocks
+    protocol_error: Callable[[list[dict[str, Any]], PiStream | None], str | None] = _generic_trace_protocol_error
 
 
 GENERIC_TRACE_DIALECT = TraceDialect()
 TRACE_DIALECTS: dict[str, TraceDialect] = {
-    "codex": GENERIC_TRACE_DIALECT,
+    "codex": TraceDialect(protocol_error=_codex_trace_protocol_error),
     "generic": GENERIC_TRACE_DIALECT,
-    "jetty": GENERIC_TRACE_DIALECT,
+    "jetty": TraceDialect(protocol_error=_jetty_trace_protocol_error),
     "subagent": GENERIC_TRACE_DIALECT,
     "stub": GENERIC_TRACE_DIALECT,
-    "vibe": GENERIC_TRACE_DIALECT,
-    "claude": TraceDialect(flatten=claude_stream_flat_records),
-    "pi": TraceDialect(stream_semantics=_pi_stream_semantics, usage_and_cost=_pi_usage_and_cost_blocks),
+    "vibe": TraceDialect(
+        flatten=vibe_stream_flat_records,
+        protocol_error=_vibe_trace_protocol_error,
+    ),
+    "claude": TraceDialect(
+        flatten=claude_stream_flat_records,
+        protocol_error=_claude_trace_protocol_error,
+    ),
+    "pi": TraceDialect(
+        stream_semantics=_pi_stream_semantics,
+        usage_and_cost=_pi_usage_and_cost_blocks,
+        protocol_error=_pi_trace_protocol_error,
+    ),
 }
 
 
@@ -4109,7 +6195,9 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
     events = [normalize_trace_record(record, source=source, index=i, line=line)
               for i, (line, record) in enumerate(flat, 1)]
     commands = [command_text(e) for e in command_events(events)]
-    token_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    token_totals: dict[str, int | None] = {
+        "input_tokens": None, "output_tokens": None, "total_tokens": None,
+    }
     elapsed_ms = 0.0
     terminal_usage, stream_error = dialect.stream_semantics(records, pi_stream)
     if terminal_usage is not None:
@@ -4119,7 +6207,7 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
                 token_totals[key] = value
     elif not stream_error:
         for (_, record), event in zip(flat, events):
-            usage = raw_trace_value(record, "usage", "tokens")
+            usage = record.get("usage") if isinstance(record.get("usage"), dict) else record.get("tokens")
             if isinstance(usage, dict):
                 input_tokens = usage_number(usage, "input_tokens")
                 output_tokens = usage_number(usage, "output_tokens")
@@ -4127,17 +6215,22 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
                 if total_tokens is None and input_tokens is not None and output_tokens is not None:
                     total_tokens = input_tokens + output_tokens
                 for key, value in [("input_tokens", input_tokens), ("output_tokens", output_tokens), ("total_tokens", total_tokens)]:
-                    if isinstance(value, (int, float)):
-                        token_totals[key] += value
+                    if value is not None:
+                        token_totals[key] = (token_totals[key] or 0) + value
             duration = _num(raw_trace_value(record, "duration_ms", "elapsed_ms"))
             if duration is not None:
                 elapsed_ms += duration
             tokens = event.get("tokens")
             if isinstance(tokens, dict) and not isinstance(usage, dict):
-                for key in token_totals:
-                    value = tokens.get(key)
-                    if isinstance(value, (int, float)):
-                        token_totals[key] += value
+                for key in ("input_tokens", "output_tokens", "total_tokens"):
+                    value = usage_number(tokens, key)
+                    if value is not None:
+                        token_totals[key] = (token_totals[key] or 0) + value
+    if (token_totals["total_tokens"] is None
+            and token_totals["input_tokens"] is not None
+            and token_totals["output_tokens"] is not None):
+        token_totals["total_tokens"] = (
+            token_totals["input_tokens"] + token_totals["output_tokens"])
     counts = trace_event_counts(events)
     skill_events = counts["skill_events"]
     metrics: dict[str, Any] = {
@@ -4148,26 +6241,34 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
         "file_reads": counts["file_reads"],
         "file_writes": counts["file_writes"],
         "errors": counts["errors"],
-        "retries": 0,
         "repeated_command_max": repeated_command_max(commands),
         "skill_invoked": bool(skill_events),
         "skill_invocation_evidence": [command_text(e) or e.get("input_summary", "") for e in skill_events[:10]],
     }
+    protocol_errors = [
+        str(record.get("message") or "trace protocol error")
+        for _, record in flat if record.get("_trace_protocol_invalid") is True
+    ]
+    if protocol_errors:
+        metrics["trace_protocol_errors"] = protocol_errors[:20]
     if elapsed_ms:
         metrics["elapsed_ms"] = int(elapsed_ms)
     for key, value in token_totals.items():
-        if value:
-            metrics[key] = int(value)
-    if any(token_totals.values()):
+        if value is not None:
+            metrics[key] = value
+    observed_tokens = {key: value for key, value in token_totals.items()
+                       if value is not None}
+    if observed_tokens:
         # Trace-derived tokens get the normalized block (issue #21). Never a
         # missing marker here — a provider-reported block in run metadata must
         # not be shadowed by an empty trace.
-        metrics["usage_normalized"] = normalize_usage(token_totals, source="trace_normalized")
+        metrics["usage_normalized"] = normalize_usage(
+            observed_tokens, source="trace_normalized")
     otel_usage = {}
-    if token_totals["input_tokens"]:
-        otel_usage["gen_ai.usage.input_tokens"] = int(token_totals["input_tokens"])
-    if token_totals["output_tokens"]:
-        otel_usage["gen_ai.usage.output_tokens"] = int(token_totals["output_tokens"])
+    if token_totals["input_tokens"] is not None:
+        otel_usage["gen_ai.usage.input_tokens"] = token_totals["input_tokens"]
+    if token_totals["output_tokens"] is not None:
+        otel_usage["gen_ai.usage.output_tokens"] = token_totals["output_tokens"]
     if otel_usage:
         metrics["otel"] = otel_usage
     event_doc = {"schema_version": 2, "source": source, "events": events}
@@ -4403,20 +6504,37 @@ def write_trace_artifacts(
         records, parse_errors = parsed_records, parsed_errors
     events, metrics = normalize_trace_records(
         records, source=source, pi_stream=pi_stream, record_lines=record_lines)
+    semantic_protocol_error = trace_dialect_for(source).protocol_error(records, pi_stream)
+    if semantic_protocol_error:
+        existing_protocol_errors = metrics.get("trace_protocol_errors")
+        protocol_errors = (list(existing_protocol_errors)
+                           if isinstance(existing_protocol_errors, list) else [])
+        protocol_errors.append(semantic_protocol_error)
+        metrics["trace_protocol_errors"] = protocol_errors[:20]
     if parse_errors:
         metrics["parse_errors"] = parse_errors[:20]
         metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
     # A trace-derived count is observed only when at least one valid event was
     # captured and parsing completed. Completion is derived here and reserved:
     # arbitrary caller metrics cannot promote an absent trace.
-    trace_observation_complete = bool(records) and not parse_errors
-    reserved = {
-        "trace_observation_complete", "process_observation_complete",
+    trace_observation_complete = (
+        bool(records) and not parse_errors and not metrics.get("trace_protocol_errors"))
+    reserved = set(metrics) | {
+        "observation_complete", "trace_observation_complete", "process_observation_complete",
         "provider_response_complete", "operation_observation_complete",
         "artifact_set_complete", "observation_evidence", "telemetry",
-        "telemetry_schema_version",
+        "telemetry_schema_version", "usage_normalized", "cost_normalized",
+        "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+        "cache_write_tokens", "cache_creation_tokens", "cost_usd", "otel",
+        "parse_errors", "trace_protocol_errors",
+        "skill_invoked", "skill_invocation_evidence", "retries",
+        "repeated_command_max", "commands", "tool_calls", "file_reads",
+        "file_writes", "errors", "schema_version", "source",
     }
-    collisions = reserved & set(extra_metrics or {})
+    # Process-level duration/exit facts are authoritative named observations;
+    # every trace-owned counter and schema field is non-overridable.
+    process_metric_keys = {"returncode", "timed_out", "elapsed_ms"}
+    collisions = (reserved - process_metric_keys) & set(extra_metrics or {})
     if collisions:
         raise ValueError(f"extra_metrics cannot override derived evidence: {', '.join(sorted(collisions))}")
     if extra_metrics:
@@ -4436,7 +6554,16 @@ def write_trace_artifacts(
         telemetry_domain.ObservationEvidence.state(trace_observation_complete),
         telemetry_domain.ObservationEvidence.state(artifact_set_complete),
     )
+    # Retain the legacy single-axis field as a derived compatibility alias for
+    # provider-response completeness.  It is reserved above, so a caller cannot
+    # use extra_metrics to promote a failed or partial provider response.
+    legacy_observation_complete = (
+        provider_response_complete if isinstance(provider_response_complete, bool)
+        else generic_complete if isinstance(generic_complete, bool)
+        else False
+    )
     metrics.update({
+        "observation_complete": legacy_observation_complete,
         "trace_observation_complete": trace_observation_complete,
         "process_observation_complete": process_observation_complete,
         "provider_response_complete": provider_response_complete,
@@ -4453,6 +6580,23 @@ def write_trace_artifacts(
         if isinstance(block, dict) and block.get("source") in {"provider_reported", "trace_normalized", "price_table_estimated", "estimated", "not_applicable"}:
             metrics[key] = block
         metrics.setdefault(key, {"source": "missing"})
+    # Legacy scalar mirrors remain useful to existing report readers, but are
+    # derived here from the authoritative normalized provider/trace blocks.
+    # They are reserved above and cannot be injected through extra_metrics.
+    usage_block = metrics["usage_normalized"]
+    if isinstance(usage_block, dict):
+        for key in ("input_tokens", "output_tokens", "total_tokens",
+                    "cache_read_tokens", "cache_write_tokens"):
+            value = usage_block.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                metrics[key] = value
+        if isinstance(usage_block.get("cache_write_tokens"), int):
+            metrics["cache_creation_tokens"] = usage_block["cache_write_tokens"]
+    cost_block = metrics["cost_normalized"]
+    if (isinstance(cost_block, dict) and cost_block.get("currency") == "USD"
+            and isinstance(cost_block.get("total_cost"), (int, float))
+            and not isinstance(cost_block.get("total_cost"), bool)):
+        metrics["cost_usd"] = float(cost_block["total_cost"])
     # Metrics contains the resolved usage/cost precedence. Metadata is useful
     # for identity/basis but must not let an explicit `source: missing` erase a
     # usable trace-normalized observation.
@@ -4569,7 +6713,7 @@ def write_artifact_commit(run_dir: Path) -> None:
 def artifact_commit_valid(run_dir: Path) -> bool:
     path = run_dir / ARTIFACT_COMMIT_NAME
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = strict_json_loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
     if not isinstance(raw, dict) or raw.get("schema_version") != ARTIFACT_CONTRACT_VERSION:
@@ -4585,6 +6729,16 @@ def artifact_commit_valid(run_dir: Path) -> bool:
     if any(name not in inventory for name in ARTIFACT_REQUIRED_FILES):
         return False
     try:
+        actual_files = {
+            candidate.relative_to(run_dir).as_posix()
+            for candidate in run_dir.rglob("*")
+            if candidate.name != ARTIFACT_COMMIT_NAME and candidate.is_file()
+            and not candidate.is_symlink()
+        }
+        if actual_files != set(inventory):
+            return False
+        if any(candidate.is_symlink() for candidate in run_dir.rglob("*")):
+            return False
         return all(
             (run_dir / name).is_file() and _file_sha256(run_dir / name) == digest
             for name, digest in inventory.items())
@@ -4664,7 +6818,6 @@ def _write_runner_outcome_files(run_dir: Path, outcome: AnswerOutcome,
         **({"elapsed_ms": elapsed} if elapsed is not None else {}),
     }
     extra_metrics = {**dict(context.metrics_extra), "returncode": returncode,
-                     "observation_complete": isinstance(outcome, Completed),
                      **({"elapsed_ms": elapsed} if elapsed is not None else {})}
     events, metrics = write_trace_artifacts(
         run_dir, trace_text, source=context.provider.value, metadata=metadata,
@@ -4730,7 +6883,30 @@ def safe_child_path(root: Path, relative: str) -> Path:
     return dest
 
 
-def build_skill_workspace(pt: PreparedTask, ws: Path) -> tuple[list[str], list[str]]:
+@_dataclass(frozen=True)
+class WorkspaceAttestation:
+    """Hashes recomputed from the exact copied, model-visible workspace surfaces."""
+
+    mounted_skill_tree_hash: str | None
+    fixture_tree_hash: str
+
+
+@_dataclass(frozen=True)
+class WorkspaceBuild:
+    skill_paths: list[str]
+    input_paths: list[str]
+    attestation: WorkspaceAttestation
+
+    def __iter__(self) -> Iterator[list[str]]:
+        # Preserve the long-standing two-value workspace-builder interface while
+        # exposing attestation to execution owners as a typed attribute.
+        yield self.skill_paths
+        yield self.input_paths
+
+
+def build_skill_workspace(
+    pt: PreparedTask, ws: Path,
+) -> WorkspaceBuild:
     """Build an isolated workspace holding ONLY the task's selected skill tree (per
     variant) and fixtures, so executing with cwd here cannot reach the original
     repo skill. For an ablation the PreparedTask's skill_paths are the materialized
@@ -4740,16 +6916,49 @@ def build_skill_workspace(pt: PreparedTask, ws: Path) -> tuple[list[str], list[s
     re-derived from a raw row."""
     if not isinstance(pt, PreparedTask):
         raise TypeError("build_skill_workspace requires a validated PreparedTask")
+    if pt.variant_truth != "without_skill" and not pt.skill_root_keys:
+        # A canonical/materialized tree hash includes every logical root name. A
+        # root-N fallback would hash a different layout and could not attest the
+        # exact mounted surface against the producer's tree identity.
+        if pt.variant_truth == "with_skill" or pt.is_materialized_ablation:
+            die(f"{pt.case_id}: attested skill task is missing skill_root_keys")
+        skill_root_keys = tuple(f"root-{i}" for i in range(len(pt.skill_paths)))
+    else:
+        skill_root_keys = pt.skill_root_keys
+    fixture_names = [Path(raw).name for raw in pt.input_files]
+    duplicate_fixtures = sorted(
+        name for name, count in collections.Counter(fixture_names).items() if count > 1)
+    if duplicate_fixtures:
+        die(
+            f"{pt.case_id}: input fixture destination collision(s): "
+            + ", ".join(duplicate_fixtures)
+        )
     ws.mkdir(parents=True, exist_ok=True)
     skill_rel: list[str] = []
     if pt.variant_truth != "without_skill":
-        for i, sp in enumerate(pt.skill_paths):
+        for key, sp in zip(skill_root_keys, pt.skill_paths, strict=True):
             src = Path(sp)
             src_dir = src if src.is_dir() else src.parent
-            dest = ws / "skills" / f"root-{i}"
+            dest = ws / "skills" / key
+            if dest.exists():
+                die(f"{pt.case_id}: duplicate model-visible skill root destination: {key}")
             _copy_skill_root(src_dir, dest)
             main = dest / "SKILL.md" if (src.is_dir() or src.name == "SKILL.md") else dest / src.name
             skill_rel.append(str((main if main.exists() else dest).relative_to(ws)))
+    mounted_hash = skill_tree_hash(ws / "skills") if (ws / "skills").is_dir() else None
+    expected_hash: str | None = None
+    if pt.variant_truth == "with_skill":
+        expected_hash = pt.skill_tree_hash
+        if not expected_hash:
+            die(f"{pt.case_id}: with_skill task has no canonical skill_tree_hash")
+    elif pt.is_materialized_ablation:
+        assert isinstance(pt.ablation, Provenance)
+        expected_hash = pt.ablation.identity.edited
+    if expected_hash is not None and mounted_hash != expected_hash:
+        die(
+            f"{pt.case_id}: mounted skill tree hash {mounted_hash!r} "
+            f"does not match expected {expected_hash!r}"
+        )
     input_rel: list[str] = []
     for raw in pt.input_files:
         src = Path(raw)
@@ -4757,7 +6966,13 @@ def build_skill_workspace(pt: PreparedTask, ws: Path) -> tuple[list[str], list[s
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
         input_rel.append(str(dest.relative_to(ws)))
-    return skill_rel, input_rel
+    fixture_hash = (
+        skill_tree_hash(ws / "inputs")
+        if (ws / "inputs").is_dir()
+        else hashlib.sha256(b"").hexdigest()
+    )
+    return WorkspaceBuild(
+        skill_rel, input_rel, WorkspaceAttestation(mounted_hash, fixture_hash))
 
 
 def jetty_upload_workspace(pt: PreparedTask, ws: Path) -> None:
@@ -5033,7 +7248,7 @@ def build_vibe_cli_argv(vibe_cmd: str | None = None, *, prompt: str, cwd: Path |
                         max_price: float | None = None, max_tokens: int | None = None) -> list[str]:
     try:
         argv = shlex.split(vibe_cmd or VIBE_DEFAULT_CMD)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid --vibe-cmd: {exc}") from exc
     if not argv:
         argv = [VIBE_DEFAULT_CMD]
@@ -5063,7 +7278,9 @@ def redact_vibe_prompt_arg(argv: list[str]) -> list[str]:
     return redacted
 
 
-def parse_vibe_messages(stdout: str) -> list[dict[str, Any]]:
+def parse_vibe_messages_with_errors(
+    stdout: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Parse Vibe --output json (one list) or --output streaming (JSONL).
 
     The Vibe CLI emits LLMMessage dictionaries, not a provider-enforced answer
@@ -5071,19 +7288,31 @@ def parse_vibe_messages(stdout: str) -> list[dict[str, Any]]:
     the answer/verdict, while preserving all parsed messages as trace JSONL."""
     text = coerce_text(stdout).strip()
     if not text:
-        return []
+        return [], ["Vibe stream is empty"]
     try:
-        parsed = json.loads(text)
+        parsed = strict_json_loads(text)
     except json.JSONDecodeError:
-        records, _ = parse_trace_jsonl_text(text)
-        return records
+        return parse_trace_jsonl_text(text)
     if isinstance(parsed, list):
-        return [item for item in parsed if isinstance(item, dict)]
+        errors = [f"Vibe message {index} is not an object"
+                  for index, item in enumerate(parsed, 1)
+                  if not isinstance(item, dict)]
+        return [item for item in parsed if isinstance(item, dict)], errors
     if isinstance(parsed, dict):
         if isinstance(parsed.get("messages"), list):
-            return [item for item in parsed["messages"] if isinstance(item, dict)]
-        return [parsed]
-    return []
+            values = parsed["messages"]
+            errors = [f"Vibe message {index} is not an object"
+                      for index, item in enumerate(values, 1)
+                      if not isinstance(item, dict)]
+            return [item for item in values if isinstance(item, dict)], errors
+        return [parsed], []
+    return [], ["Vibe output must be a message object, message list, or JSONL"]
+
+
+def parse_vibe_messages(stdout: str) -> list[dict[str, Any]]:
+    """Compatibility projection; execution boundaries consume parser errors too."""
+    messages, _ = parse_vibe_messages_with_errors(stdout)
+    return messages
 
 
 def _vibe_content_text(content: Any) -> str:
@@ -5125,53 +7354,46 @@ def _walk_dicts(value: Any) -> Iterable[dict[str, Any]]:
 
 
 def vibe_usage_and_cost(messages: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, float | None]:
-    usage: dict[str, Any] | None = None
+    terminal = next((message for message in reversed(messages)
+                     if message.get("role") == "assistant"
+                     and isinstance(message.get("content"), str)
+                     and message["content"].strip()), None)
+    if terminal is None:
+        return None, None
+    candidate = terminal.get("usage") or terminal.get("tokens")
+    usage = candidate if (isinstance(candidate, dict)
+                          and normalize_usage(candidate).get("source") != "missing") else None
     cost: float | None = None
-    for obj in _walk_dicts(messages):
-        candidate = obj.get("usage") or obj.get("tokens")
-        if isinstance(candidate, dict):
-            normalized = normalize_usage(candidate, source="provider_reported")
-            if normalized.get("source") != "missing":
-                usage = candidate
-        for key in ("cost_usd", "total_cost_usd", "total_cost", "cost"):
-            value = obj.get(key)
-            if isinstance(value, dict):
-                normalized_cost = normalize_cost(value, source="provider_reported")
-                if normalized_cost.get("source") != "missing" and isinstance(normalized_cost.get("total_cost"), (int, float)):
-                    cost = float(normalized_cost["total_cost"])
-                    break
-            elif _num(value) is not None:
-                cost = float(value)
-                break
+    for key in ("cost_usd", "total_cost_usd", "total_cost", "cost"):
+        value = terminal.get(key)
+        normalized = normalize_cost(value)
+        if normalized.get("source") != "missing":
+            cost = float(normalized["total_cost"])
+            break
     return usage, cost
 
 
 def vibe_trace_text(messages: list[dict[str, Any]], stdout: str) -> str:
-    return jsonl_from_records(messages) if messages else coerce_text(stdout)
+    # Raw provider bytes are the audit artifact. Reserializing the clean subset
+    # would erase malformed/non-object records and manufacture trace completeness.
+    return coerce_text(stdout)
 
 
 def vibe_skill_tool_evidence(stdout: str, skill_names: list[str]) -> list[str]:
-    """Detect Vibe's native `skill` tool calls from json/jsonl messages."""
+    """Detect only completed, schema-valid Vibe `skill` tool lifecycles."""
+    records, errors = parse_trace_jsonl_text(stdout)
+    if errors:
+        return []
+    events, metrics = normalize_trace_records(records, source="vibe")
+    if metrics.get("trace_protocol_errors"):
+        return []
     names = set(skill_names)
-    evidence: list[str] = []
-    for msg in parse_vibe_messages(stdout):
-        for tc in msg.get("tool_calls") or []:
-            if not isinstance(tc, dict):
-                continue
-            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-            if str(fn.get("name") or tc.get("name") or "") != "skill":
-                continue
-            args = fn.get("arguments") or tc.get("arguments") or {}
-            if isinstance(args, str):
-                try:
-                    args_obj = json.loads(args)
-                except json.JSONDecodeError:
-                    args_obj = {"name": args}
-            else:
-                args_obj = args if isinstance(args, dict) else {}
-            invoked = str(args_obj.get("name") or args_obj.get("skill") or "")
-            if invoked in names:
-                evidence.append(f"Vibe skill tool invoked: {invoked}")
+    evidence = []
+    for event in events["events"]:
+        invoked = str(event.get("input_summary") or "")
+        if (event.get("type") == "skill_load" and event_is_completed(event)
+                and invoked in names):
+            evidence.append(f"Vibe skill tool invoked: {invoked}")
     return evidence[:5]
 
 
@@ -5197,12 +7419,15 @@ def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | No
                     "timed_out": False, "elapsed_ms": None, "usage": None, "cost_usd": None,
                     "model": model, "trace_text": "", "environment": env_meta}
         result = run_argv_capture(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
-    messages = parse_vibe_messages(result.stdout)
+    messages, parse_errors = parse_vibe_messages_with_errors(result.stdout)
     answer = vibe_final_answer(messages)
-    usage, cost = vibe_usage_and_cost(messages)
+    usage, cost = vibe_usage_and_cost(messages) if not parse_errors else (None, None)
     return {
         "answer": answer,
-        "provider_error": None if answer or result.returncode != 0 else "Vibe stream has no final assistant message",
+        "provider_error": (
+            f"Vibe stream parse error: {parse_errors[0]}" if parse_errors
+            else None if answer or result.returncode != 0
+            else "Vibe stream has no final assistant message"),
         "stdout": result.stdout,
         "stderr": result.stderr,
         "returncode": result.returncode,
@@ -5255,15 +7480,12 @@ class ClaudeBackend(AgentBackend):
         # process assertion on a Claude run fails closed for missing evidence.
         result = claude_cli_invoke(request.prompt, model=request.model, claude_bin=str(options.get("claude_bin") or "claude"),
                                    timeout=request.timeout_s, cwd=str(request.workspace), output_format="stream-json")
-        claude_metrics = claude_run_metrics(result)
-        metrics_extra = {k: v for k, v in claude_metrics.items() if k not in ("schema_version", "source")}
         return RunnerOutcome(
             provider="claude", answer=result.get("answer") or "",
             returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
             timeout_s=request.timeout_s, elapsed_ms=result.get("elapsed_ms") if isinstance(result.get("elapsed_ms"), (int, float)) else None, stderr=result.get("stderr", ""),
             error=result.get("parse_error"), trace_text=result.get("raw_response") or "",
             usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
-            metadata_extra={"cost_usd": claude_metrics.get("cost_usd")}, metrics_extra=metrics_extra,
             environment={"runner": "claude", "command": result.get("command") or "claude -p", "cwd": "<isolated workspace>"})
 
 
@@ -5310,9 +7532,12 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             pt = PreparedTask.from_row(task)
         except (TypeError, ValueError) as exc:
             die(f"invalid prepared task: {exc}")
-        row_model = task.get("model") or model
-        if row_model is not None and (not isinstance(row_model, str) or not row_model):
-            die("invalid prepared task: model must be null or a non-empty string")
+        try:
+            row_model = prepared_task_model(task, model)
+        except ValueError as exc:
+            die(f"invalid prepared task: {exc}")
+        if task.get("turns"):
+            die(f"{backend.name} backend does not support multi-turn prepared tasks")
         identity = (pt.case_id, row_model, pt.variant_truth, pt.run_number, "answer")
         if identity in seen_identities:
             die(f"duplicate prepared task identity: {identity}")
@@ -5322,6 +7547,8 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             die(f"duplicate prepared task run_dir: {pt.run_dir}")
         seen_destinations.add(base)
         validated.append((task, pt, row_model, base))
+    runs.mkdir(parents=True, exist_ok=True)
+    design = persist_answer_design(runs, tasks, default_model=model)
     for task, pt, row_model, base in validated:
         base.mkdir(parents=True, exist_ok=True)
         prov_extra = {
@@ -5330,12 +7557,21 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             "run_number": pt.run_number,
             "variant": pt.variant_truth,
             "billing_scope": "run",
+            "answer_design_sha256": design["design_sha256"],
+            "answer_task_sha256": answer_design_identity(
+                design, pt, row_model)["task_sha256"],
+            "answer_instruction_sha256": answer_design_identity(
+                design, pt, row_model)["instruction_sha256"],
             **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
-            **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {}),
         }
         with tempfile.TemporaryDirectory(prefix=f"{backend.name}-ws-") as wd:
             ws = Path(wd)
-            skill_rel, input_rel = build_skill_workspace(pt, ws)
+            workspace = build_skill_workspace(pt, ws)
+            skill_rel, input_rel = workspace
+            attestation = workspace.attestation
+            if attestation.mounted_skill_tree_hash is not None:
+                prov_extra["skill_tree_hash"] = attestation.mounted_skill_tree_hash
+            prov_extra["fixture_tree_hash"] = attestation.fixture_tree_hash
             prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             outcome = backend.invoke_answer(InvocationRequest(prompt=prompt, workspace=ws, model=row_model, timeout_s=timeout), **options)
         context = outcome_context(outcome)
@@ -5344,7 +7580,7 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
         env["variant"] = pt.variant_truth
         outcome = outcome_with_context(
             outcome,
-            context.enriched(metadata={**prov_extra, **dict(context.metadata_extra)}, environment=env),
+            context.enriched(metadata=prov_extra, environment=env),
         )
         write_runner_outcome(base, outcome)
     return 0
@@ -5399,38 +7635,58 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     """
     text = stdout if isinstance(stdout, str) else ""
     env: dict[str, Any] | None = None
-    for obj in iter_json_objects(text):
-        if isinstance(obj, dict) and obj.get("type") == "result":
-            env = obj
-    if env is None:
-        try:
-            env = extract_json_object(text)
-        except Exception as exc:
+    stripped = text.strip()
+    try:
+        single = strict_json_loads(stripped)
+    except json.JSONDecodeError:
+        records, errors = parse_trace_jsonl_text(text)
+        results = [record for record in records if record.get("type") == "result"]
+        if errors:
             return {"answer": "", "raw_response": text, "cost_usd": None,
-                    "usage": {}, "parse_error": str(exc)}
+                    "usage": {}, "parse_error": f"malformed Claude stream: {errors[0]}"}
+        if len(results) != 1 or not records or records[-1] is not results[0]:
+            return {"answer": "", "raw_response": text, "cost_usd": None,
+                    "usage": {}, "parse_error": (
+                        "Claude stream must contain exactly one terminal result event")}
+        env = results[0]
+    else:
+        if isinstance(single, dict):
+            env = single
     if not isinstance(env, dict) or "result" not in env:
         return {"answer": "", "raw_response": text, "cost_usd": None,
                 "usage": {}, "parse_error": "not a claude -p json envelope"}
+    if "type" in env and env.get("type") != "result":
+        return {"answer": "", "raw_response": text, "cost_usd": None,
+                "usage": {}, "parse_error": "Claude envelope type must be 'result'"}
+    if "is_error" in env and not isinstance(env.get("is_error"), bool):
+        return {"answer": "", "raw_response": text, "cost_usd": None,
+                "usage": {}, "parse_error": "Claude is_error must be boolean"}
+    api_error_status = env.get("api_error_status")
+    if (api_error_status is not None
+            and (isinstance(api_error_status, bool)
+                 or not isinstance(api_error_status, int)
+                 or not 100 <= api_error_status <= 599)):
+        return {"answer": "", "raw_response": text, "cost_usd": None,
+                "usage": {}, "parse_error": "Claude api_error_status must be an HTTP status integer"}
     raw_usage = env.get("usage") if isinstance(env.get("usage"), dict) else {}
-    usage: dict[str, int] = {}
-    for norm, aliases in CLAUDE_USAGE_KEYS.items():
-        for a in aliases:
-            v = raw_usage.get(a)
-            if isinstance(v, (int, float)):
-                usage[norm] = int(v)
-                break
-    if "input_tokens" in usage and "output_tokens" in usage:
-        usage.setdefault("total_tokens", usage["input_tokens"] + usage["output_tokens"])
+    try:
+        normalized_usage = normalize_usage(raw_usage, source="provider_reported")
+    except ValueError as exc:
+        return {"answer": "", "raw_response": text, "cost_usd": None,
+                "usage": {}, "parse_error": f"invalid Claude usage: {exc}"}
+    usage = {key: value for key, value in normalized_usage.items() if key != "source"}
     cost = env.get("total_cost_usd")
     result = env.get("result")
     result_error = None if isinstance(result, str) else "claude result must be a string"
+    if cost is not None and (_num(cost) is None or float(cost) < 0):
+        result_error = "claude total_cost_usd must be a finite nonnegative number"
     return {
         "answer": result if isinstance(result, str) else "",
-        "cost_usd": cost if isinstance(cost, (int, float)) else None,
+        "cost_usd": float(cost) if _num(cost) is not None and float(cost) >= 0 else None,
         "usage": usage,
         "parse_error": result_error,
-        "is_error": bool(env.get("is_error")),
-        "api_error_status": env.get("api_error_status"),
+        "is_error": env.get("is_error", False),
+        "api_error_status": api_error_status,
     }
 
 
@@ -5511,15 +7767,128 @@ def run_claude(args: argparse.Namespace) -> int:
                            claude_bin=getattr(args, "claude_bin", None) or "claude")
 
 
+SUPPORTED_JSON_SCHEMA_TYPES = {
+    "object", "array", "string", "integer", "number", "boolean", "null",
+}
+SUPPORTED_JSON_SCHEMA_KEYS = {
+    "type", "properties", "required", "additionalProperties", "items",
+    "enum", "const", "minItems", "maxItems",
+}
+
+
+def json_values_equal(left: Any, right: Any) -> bool:
+    """JSON-Schema equality without Python's bool/int aliasing.
+
+    JSON numbers compare by mathematical value (so 1 equals 1.0), while JSON
+    booleans are a distinct instance type (so true does not equal 1).
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if (isinstance(left, (int, float)) and not isinstance(left, bool)
+            and isinstance(right, (int, float)) and not isinstance(right, bool)):
+        return left == right
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if isinstance(left, list) or isinstance(right, list):
+        return (isinstance(left, list) and isinstance(right, list)
+                and len(left) == len(right)
+                and all(json_values_equal(a, b) for a, b in zip(left, right)))
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (isinstance(left, dict) and isinstance(right, dict)
+                and set(left) == set(right)
+                and all(json_values_equal(left[key], right[key]) for key in left))
+    return False
+
+
+def supported_json_schema_errors(schema: Any, path: str = "$") -> list[str]:
+    """Validate the closed JSON-Schema subset implemented by json_schema_errors."""
+    if not isinstance(schema, dict) or not schema:
+        return [f"{path}: schema must be a non-empty object"]
+    errors: list[str] = []
+    unknown = sorted(set(schema) - SUPPORTED_JSON_SCHEMA_KEYS)
+    if unknown:
+        errors.append(f"{path}: unsupported keyword(s): {', '.join(unknown)}")
+    raw_type = schema.get("type")
+    allowed_types: list[str] = []
+    if raw_type is not None:
+        if isinstance(raw_type, str):
+            allowed_types = [raw_type]
+        elif (isinstance(raw_type, list) and raw_type
+              and all(isinstance(item, str) for item in raw_type)
+              and len(raw_type) == len(set(raw_type))):
+            allowed_types = raw_type
+        else:
+            errors.append(f"{path}.type: must be a supported type or unique non-empty type list")
+        bad_types = sorted(set(allowed_types) - SUPPORTED_JSON_SCHEMA_TYPES)
+        if bad_types:
+            errors.append(f"{path}.type: unsupported type(s): {', '.join(bad_types)}")
+
+    object_keywords = {"properties", "required", "additionalProperties"} & set(schema)
+    if object_keywords and "object" not in allowed_types:
+        errors.append(f"{path}: {', '.join(sorted(object_keywords))} require type object")
+    array_keywords = {"items", "minItems", "maxItems"} & set(schema)
+    if array_keywords and "array" not in allowed_types:
+        errors.append(f"{path}: {', '.join(sorted(array_keywords))} require type array")
+
+    properties = schema.get("properties")
+    if properties is not None:
+        if (not isinstance(properties, dict)
+                or not all(isinstance(key, str) and key for key in properties)):
+            errors.append(f"{path}.properties: must map non-empty string names to schemas")
+        else:
+            for key, child in properties.items():
+                errors.extend(supported_json_schema_errors(child, f"{path}.properties.{key}"))
+    required = schema.get("required")
+    if required is not None:
+        if (not isinstance(required, list)
+                or not all(isinstance(key, str) and key for key in required)
+                or len(required) != len(set(required))):
+            errors.append(f"{path}.required: must be a unique list of non-empty strings")
+        elif isinstance(properties, dict):
+            missing = sorted(set(required) - set(properties))
+            if missing:
+                errors.append(f"{path}.required: keys absent from properties: {', '.join(missing)}")
+        else:
+            errors.append(f"{path}.required: requires a properties object")
+    if ("additionalProperties" in schema
+            and not isinstance(schema["additionalProperties"], bool)):
+        errors.append(f"{path}.additionalProperties: must be boolean")
+
+    if "items" in schema:
+        errors.extend(supported_json_schema_errors(schema["items"], f"{path}.items"))
+    minimum, maximum = schema.get("minItems"), schema.get("maxItems")
+    for key, value in (("minItems", minimum), ("maxItems", maximum)):
+        if key in schema and (isinstance(value, bool)
+                              or not isinstance(value, int) or value < 0):
+            errors.append(f"{path}.{key}: must be a nonnegative integer")
+    if (isinstance(minimum, int) and not isinstance(minimum, bool)
+            and isinstance(maximum, int) and not isinstance(maximum, bool)
+            and minimum > maximum):
+        errors.append(f"{path}: minItems must be <= maxItems")
+
+    if "enum" in schema:
+        enum = schema["enum"]
+        if not isinstance(enum, list) or not enum:
+            errors.append(f"{path}.enum: must be a non-empty list")
+        elif any(json_values_equal(value, prior) for index, value in enumerate(enum)
+                 for prior in enum[:index]):
+            errors.append(f"{path}.enum: values must be unique")
+    return errors
+
+
 def json_schema_errors(instance: Any, schema: dict[str, Any], path: str = "$") -> list[str]:
     """Deterministic subset of JSON-Schema for structured_output (roadmap 1.1):
     type, properties, required, additionalProperties:false, items, enum, const,
     minItems/maxItems. Enough to pin a tool-output contract without a new
     dependency."""
     errors: list[str] = []
-    if "const" in schema and instance != schema["const"]:
+    if "const" in schema and not json_values_equal(instance, schema["const"]):
         errors.append(f"{path}: expected const {schema['const']!r}, got {instance!r}")
-    if "enum" in schema and instance not in schema["enum"]:
+    if ("enum" in schema
+            and not any(json_values_equal(instance, candidate)
+                        for candidate in schema["enum"])):
         errors.append(f"{path}: {instance!r} not in enum {schema['enum']!r}")
     expected_type = schema.get("type")
     if expected_type:
@@ -5615,7 +7984,7 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
     command only needs to honor `--output-last-message` for native-judge tests."""
     try:
         argv = shlex.split(codex_cmd)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         return {"answer": "", "trace_text": "", "stderr": f"invalid --codex-cmd: {exc}", "returncode": 127,
                 "timed_out": False, "elapsed_ms": 0, "usage": {}, "cost_usd": None,
                 "model": f"codex/{model}" if model else "codex/default"}
@@ -5675,8 +8044,10 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
     usage: dict[str, Any] = {}
     cost_usd = None
     if result.stdout.strip():
-        records, _ = parse_trace_jsonl_text(result.stdout)
-        if records:
+        records, parse_errors = parse_trace_jsonl_text(result.stdout)
+        protocol_error = (_codex_trace_protocol_error(records, None)
+                          if records and not parse_errors else "invalid Codex JSON stream")
+        if records and not parse_errors and protocol_error is None:
             _, metrics = normalize_trace_records(records, source="codex")
             for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens"):
                 if isinstance(metrics.get(k), (int, float)):
@@ -5717,7 +8088,7 @@ def parse_script_score_line(stdout: str) -> float | None:
         if not (line.startswith("{") and line.endswith("}")):
             continue
         try:
-            obj = json.loads(line)
+            obj = strict_json_loads(line)
         except json.JSONDecodeError:
             continue
         if not isinstance(obj, dict) or not isinstance(obj.get("score"), (int, float)):
@@ -5739,6 +8110,7 @@ def run_script_assertion(assertion: dict[str, Any], output_dir: Path, manifest_d
         proc = subprocess.run(
             command,
             cwd=manifest_dir,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -5806,18 +8178,32 @@ def normalize_golden(text: str, mode: str) -> str:
 
 
 def golden_output_result(assertion: dict[str, Any], text: str, output_path: Path, run_base: Path | None, manifest_dir: Path | None) -> tuple[bool, str]:
-    reference_rel = str(assertion.get("reference", assertion.get("value", "")) or "")
-    if manifest_dir is None or not reference_rel:
+    try:
+        reference_rel = canonical_assertion_path(
+            assertion, "reference", "value", required=True)
+    except ValueError as exc:
+        return False, f"invalid golden_output reference: {exc}"
+    if manifest_dir is None:
         return False, "golden_output requires a `reference` file path relative to the manifest directory"
-    ref_path = Path(manifest_dir) / reference_rel
+    try:
+        ref_path = resolved_assertion_path(Path(manifest_dir), reference_rel)
+    except ValueError as exc:
+        return False, f"invalid golden_output reference: {exc}"
     if not ref_path.is_file():
         return False, f"missing reference file: {reference_rel}"
-    artifact_rel = assertion.get("artifact")
+    try:
+        artifact_rel = canonical_assertion_path(assertion, "artifact")
+    except ValueError as exc:
+        return False, f"invalid golden_output artifact: {exc}"
     actual_text = text
     actual_label = output_path.name
     if artifact_rel:
-        candidate = (run_base or output_path.parent) / str(artifact_rel)
-        actual_label = str(artifact_rel)
+        try:
+            candidate = resolved_assertion_path(
+                run_base or output_path.parent, artifact_rel)
+        except ValueError as exc:
+            return False, f"invalid golden_output artifact: {exc}"
+        actual_label = artifact_rel
         if not candidate.is_file():
             return False, f"missing artifact: {artifact_rel}"
         actual_text = candidate.read_text(encoding="utf-8", errors="replace")
@@ -5848,8 +8234,9 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
     def norm(v: str) -> str:
         return v.lower() if ci else v
 
-    passed = False
+    passed: bool | None = False
     evidence = ""
+    availability = "complete"
     score: float | None = None   # scored detectors set a real value; binary ones mirror passed
     if atype in PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS:
         passed, evidence = process_or_efficiency_assertion_result(assertion, run_base, {})
@@ -5883,17 +8270,29 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
         passed = re.search(pattern, text, flags) is None
         evidence = f"absent /{pattern}/" if passed else f"found banned /{pattern}/"
     elif atype == "file_exists":
-        rel = str(assertion.get("path", assertion.get("value", "")))
-        candidate = output_path.parent / rel
-        passed = candidate.exists()
-        evidence = f"exists: {rel}" if passed else f"missing file: {rel}"
+        try:
+            rel = canonical_assertion_path(
+                assertion, "path", "value", required=True)
+            candidate = resolved_assertion_path(output_path.parent, rel)
+            passed = candidate.is_file()
+            evidence = f"file exists: {rel}" if passed else f"missing file: {rel}"
+        except ValueError as exc:
+            passed = False
+            evidence = f"invalid file_exists path: {exc}"
     elif atype == "json_field_equals":
-        rel = str(assertion.get("path", "metadata.json"))
+        try:
+            rel = canonical_assertion_path(assertion, "path") or "metadata.json"
+            p = resolved_assertion_path(output_path.parent, rel)
+        except ValueError as exc:
+            rel = ""
+            p = output_path.parent
+            evidence = f"json check failed: {exc}"
         field = str(assertion.get("field", ""))
         expected = assertion.get("equals")
-        p = output_path.parent / rel
         try:
-            obj = json.loads(p.read_text(encoding="utf-8"))
+            if not rel:
+                raise ValueError(evidence.removeprefix("json check failed: "))
+            obj = strict_json_loads(p.read_text(encoding="utf-8"))
             actual: Any = obj
             for part in field.split("."):
                 actual = actual[part]
@@ -5912,17 +8311,25 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
         threshold = float(assertion.get("threshold", 0.8))
         compare = text
         if assertion.get("artifact"):
-            candidate = (run_base or output_path.parent) / str(assertion["artifact"])
-            compare = candidate.read_text(encoding="utf-8", errors="replace") if candidate.is_file() else ""
+            try:
+                artifact_rel = canonical_assertion_path(assertion, "artifact")
+                candidate = resolved_assertion_path(
+                    run_base or output_path.parent, artifact_rel or ".")
+                compare = (candidate.read_text(encoding="utf-8", errors="replace")
+                           if candidate.is_file() else "")
+            except ValueError:
+                compare = ""
         mode = str(assertion.get("mode", "ratio"))
         if mode == "embedding":
             if not embed_cmd:
-                passed = False
+                passed = None
+                availability = "partial"
                 evidence = "embedding similarity skipped; rerun grade/benchmark with --embed-cmd to call an external embedding command (kept out of core grading by design)"
             else:
                 ratio, err = embedding_similarity(compare, expected, embed_cmd)
                 if ratio is None:
-                    passed = False
+                    passed = None
+                    availability = "partial"
                     evidence = err
                 else:
                     score = round(ratio, 4)
@@ -5945,8 +8352,10 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
         else:
             try:
                 if rel:
-                    p = (run_base or output_path.parent) / str(rel)
-                    instance = json.loads(p.read_text(encoding="utf-8"))
+                    canonical_rel = canonical_assertion_path(assertion, "path")
+                    p = resolved_assertion_path(
+                        run_base or output_path.parent, canonical_rel or ".")
+                    instance = strict_json_loads(p.read_text(encoding="utf-8"))
                 else:
                     instance = extract_json_object(text)
             except Exception as exc:
@@ -5957,23 +8366,71 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
         evidence = "schema ok" if passed else "; ".join(errors[:5])
     elif atype == "script":
         if not allow_scripts:
-            passed = False
+            passed = None
+            availability = "partial"
             evidence = "script assertion skipped; rerun grade/benchmark with --allow-scripts to execute repo-owned oracle commands"
         else:
             passed, evidence, script_score = run_script_assertion(assertion, run_base or output_path.parent, manifest_dir)
+            if evidence.startswith(("script timed out", "script execution failed")):
+                passed = None
+                availability = "partial"
             if script_score is not None:
                 score = script_score
     else:
         evidence = "qualitative/deferred"
+    if passed is None:
+        availability = "partial"
     if score is not None and isinstance(assertion.get("atLeast"), (int, float)):
         # A scored assertion with an explicit floor: the floor decides passed.
         passed = score >= float(assertion["atLeast"])
         evidence += f" (score={score:g}, atLeast={assertion['atLeast']:g})"
-    return {"name": name, "type": atype, "passed": passed, "evidence": evidence, "score": score if score is not None else (1.0 if passed else 0.0)}
+    return {
+        "name": name, "type": atype, "passed": passed,
+        "availability": availability, "evidence": evidence,
+        "score": (score if score is not None else
+                  1.0 if passed is True else 0.0 if passed is False else None),
+    }
 
 
 def assertion_label(assertion: dict[str, Any]) -> str:
     return str(assertion.get("name") or assertion.get("description") or assertion.get("type") or "assertion")
+
+
+def validate_judge_assertion_ids(
+    case_id: str, assertions: list[Any], turns: list[Any],
+) -> None:
+    """Judge-task assertion labels must be unique after turn qualification.
+
+    ``judge_task_id`` historically ends in the display label. Two qualitative
+    assertions with the same label therefore targeted one stored verdict. Reject
+    that alias at manifest validation instead of relying on last-write wins.
+    """
+    seen: dict[str, str] = {}
+
+    def register(assertion: Any, location: str, *, turn_number: int | None = None) -> None:
+        if (not isinstance(assertion, dict)
+                or assertion.get("type") not in QUALITATIVE_ASSERTIONS):
+            return
+        # Validate the post-preset identity used by grade_case_variant.  A
+        # factuality assertion with only a description, for example, expands
+        # to name="factuality"; validating its pre-expansion display label
+        # would let multiple tasks alias the same stored-verdict key.
+        label = assertion_label(expand_judge_preset(assertion))
+        qualified = f"turn-{turn_number}: {label}" if turn_number is not None else label
+        if qualified in seen:
+            die(
+                f"{case_id}: judge assertion id {qualified!r} is duplicated by "
+                f"{seen[qualified]} and {location}")
+        seen[qualified] = location
+
+    for index, assertion in enumerate(assertions, 1):
+        register(assertion, f"assertion #{index}")
+    for turn_number, turn in enumerate(turns, 1):
+        if not isinstance(turn, dict):
+            continue
+        for index, assertion in enumerate(turn.get("assertions") or [], 1):
+            register(assertion, f"turn #{turn_number} assertion #{index}",
+                     turn_number=turn_number)
 
 
 def depends_on_targets(assertion: dict[str, Any]) -> list[str]:
@@ -6029,6 +8486,88 @@ def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[s
     return f"{case_id}::{model_segment}{variant}::run-{run_number}::{assertion_label(assertion)}"
 
 
+JUDGE_EVIDENCE_MODES = {
+    "text-only", "trajectory", "explore", "trajectory+explore",
+}
+
+
+def judge_explore_surface_sha256(run_base: Path) -> str:
+    """Hash the names/content surface copied for a read-only exploring judge."""
+    if not run_base.is_dir():
+        raise ValueError("judge explore evidence requires a readable run directory")
+    digest = hashlib.sha256()
+    root = run_base.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if not any(marker in name.lower() for marker in JUDGE_LEAK_MARKERS)
+            and not (current / name).is_symlink())
+        for name in dirnames:
+            rel = (current / name).relative_to(root).as_posix()
+            digest.update(b"D\0" + rel.encode("utf-8") + b"\0")
+        for name in sorted(filenames):
+            path = current / name
+            if (any(marker in name.lower() for marker in JUDGE_LEAK_MARKERS)
+                    or path.is_symlink()):
+                continue
+            rel = path.relative_to(root).as_posix()
+            digest.update(b"F\0" + rel.encode("utf-8") + b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    return "sha256:" + digest.hexdigest()
+
+
+def judge_input_material(
+    task: dict[str, Any], candidate_output: str, *, evidence_mode: str = "text-only",
+    run_base: Path | None = None, steps: list[dict[str, Any]] | None = None,
+) -> tuple[str, str, str, str | None]:
+    """Return the exact prompt/context binding for one effective judge mode."""
+    if evidence_mode not in JUDGE_EVIDENCE_MODES:
+        raise ValueError(f"unsupported judge evidence mode {evidence_mode!r}")
+    wants_trajectory = evidence_mode in {"trajectory", "trajectory+explore"}
+    wants_explore = evidence_mode in {"explore", "trajectory+explore"}
+    trajectory = None
+    metrics = None
+    artifacts = None
+    if wants_trajectory:
+        if run_base is None:
+            raise ValueError("requested judge trajectory evidence has no run directory")
+        trajectory, error = read_events_base(run_base)
+        if trajectory is None:
+            raise ValueError(
+                f"requested judge trajectory evidence is incomplete: {error or 'unreadable events.json'}")
+        metrics = read_metrics_base(run_base)
+        artifacts = judge_artifact_inventory(run_base)
+    explore_sha256 = None
+    if wants_explore:
+        if run_base is None:
+            raise ValueError("requested judge explore evidence has no run directory")
+        explore_sha256 = judge_explore_surface_sha256(run_base)
+    prompt = judge_prompt(
+        task, candidate_output, trajectory=trajectory, metrics=metrics,
+        artifacts=artifacts, explore_dir="." if wants_explore else None,
+        steps=steps)
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    fingerprint = canonical_json_sha256({
+        "schema_version": 3,
+        "evidence_mode": evidence_mode,
+        "judge_prompt_sha256": prompt_sha256,
+        "explore_surface_sha256": explore_sha256,
+    })
+    return fingerprint, prompt, prompt_sha256, explore_sha256
+
+
+def judge_input_sha256(
+    task: dict[str, Any], candidate_output: str, *, evidence_mode: str = "text-only",
+    run_base: Path | None = None, steps: list[dict[str, Any]] | None = None,
+) -> str:
+    """Bind a verdict to the exact prompt and evidence surface the judge saw."""
+    return judge_input_material(
+        task, candidate_output, evidence_mode=evidence_mode,
+        run_base=run_base, steps=steps)[0]
+
+
 def load_result_rows(path: Path, *, id_keys: tuple[str, ...], label: str) -> list[dict[str, Any]]:
     """One parser for every verdict/result file the harness reads back (judge
     verdicts, comparison verdicts): accepts JSONL, a JSON array (even
@@ -6040,16 +8579,18 @@ def load_result_rows(path: Path, *, id_keys: tuple[str, ...], label: str) -> lis
     if not text:
         return []
     if text.startswith("["):
-        data = json.loads(text)
+        data = strict_json_loads(text)
         if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
             die(f"{label} must contain only result objects")
         return data
     try:
-        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+        rows = [strict_json_loads(line) for line in text.splitlines() if line.strip()]
     except json.JSONDecodeError:
-        rows = [json.loads(text)]   # one pretty-printed object spanning lines
+        rows = [strict_json_loads(text)]   # one pretty-printed object spanning lines
     if len(rows) == 1 and isinstance(rows[0], dict) and not any(k in rows[0] for k in id_keys):
-        rows = rows[0].get("results", [])
+        wrapper = rows[0]
+        if set(wrapper) == {"results"} and isinstance(wrapper["results"], list):
+            rows = wrapper["results"]
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         die(f"{label} must contain only result objects")
     return rows
@@ -6081,19 +8622,44 @@ def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
-    decoder = json.JSONDecoder()
-    for i, ch in enumerate(text):
+    def reject_constant(constant: str) -> Any:
+        raise json.JSONDecodeError(
+            f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=_unique_json_object,
+        parse_constant=reject_constant)
+    found: list[dict[str, Any]] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
         if ch not in "{[":
+            i += 1
             continue
         try:
-            obj, _ = decoder.raw_decode(text[i:])
-        except json.JSONDecodeError:
+            obj, end = decoder.raw_decode(text[i:])
+        except json.JSONDecodeError as exc:
+            if ("duplicate object key" in exc.msg
+                    or "non-finite numeric constant" in exc.msg):
+                raise ValueError(exc.msg) from exc
+            i += 1
             continue
         if isinstance(obj, dict):
-            return obj
-        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-            return obj[0]
-    raise ValueError("no JSON object found in judge output")
+            found.append(obj)
+        elif isinstance(obj, list):
+            if len(obj) != 1 or not isinstance(obj[0], dict):
+                raise TypeError("judge output JSON array must contain exactly one object")
+            found.append(obj[0])
+        else:
+            raise TypeError("judge output JSON value must be an object")
+        # Skip the complete decoded value so nested objects are not counted as
+        # additional top-level verdicts, then continue looking for ambiguity.
+        i += end
+    if not found:
+        raise ValueError("no JSON object found in judge output")
+    if len(found) != 1:
+        raise ValueError("judge output contains multiple JSON verdict objects")
+    return found[0]
 
 
 def is_per_step_assertion(assertion: dict[str, Any]) -> bool:
@@ -6161,10 +8727,11 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
     """The canonical JSON Schema for a judge verdict of this assertion's shape
     (G4), branching exactly as judge_prompt does. Handed to the model as the
     contract and validated post-hoc by json_schema_errors. `passed` is required
-    for the plain shape so a missing-key verdict is loud instead of silently
-    coerced to failed; score stays optional (judge_verdict_passed reads `passed`
-    first). Kept beside run_one_judge_task/merged_qualitative_entry so the schema
-    and its one consumer of each shape never drift."""
+    for an ordinary plain verdict. A plain assertion with `atLeast` instead
+    requires the normalized score that the harness uses to derive pass/fail, so
+    missing score evidence becomes an incomplete observation rather than a
+    boolean failure. Kept beside run_one_judge_task/merged_qualitative_entry so
+    the schema and its one consumer of each shape never drift."""
     if assertion.get("graded_dimensions"):
         dim_names = [str(d.get("name")) for d in assertion.get("graded_dimensions", []) if isinstance(d, dict) and d.get("name")]
         dim_schema: dict[str, Any] = {"type": "object", "properties": {name: {"type": "number"} for name in dim_names}}
@@ -6180,7 +8747,8 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
     if assertion.get("dynamic_rubric"):
         minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
         return _criteria_verdict_schema(minimum)
-    return {"type": "object", "required": ["passed"],
+    required = ["score"] if "atLeast" in assertion else ["passed"]
+    return {"type": "object", "required": required,
             "properties": {"passed": {"type": "boolean"}, "score": {"type": "number"}, "rationale": {"type": "string"}}}
 
 
@@ -6197,6 +8765,8 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
         "assertion": assertion,
         "candidate_output": output_text,
     }
+    if task.get("conversation"):
+        payload["conversation"] = task["conversation"]
     # G1: an opt-in trajectory judge also weighs HOW the answer was produced. Added
     # only when provided, so the default (text-only) prompt is byte-identical.
     if trajectory is not None:
@@ -6255,9 +8825,16 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
             + schema_hint
             + json.dumps(payload, indent=2, ensure_ascii=False)
         )
+    plain_contract = (
+        "Return only JSON with keys: score (required normalized number in [0, 1]), "
+        "rationale (string). The harness derives pass/fail from atLeast.\n"
+        if "atLeast" in assertion else
+        "Return only JSON with keys: passed (boolean), score (number optional), "
+        "rationale (string).\n"
+    )
     return (
         "You are grading one Skill Eval Harness judge assertion.\n"
-        "Return only JSON with keys: passed (boolean), score (number optional), rationale (string).\n"
+        + plain_contract
         + context_hint
         + schema_hint
         + json.dumps(payload, indent=2, ensure_ascii=False)
@@ -6276,7 +8853,10 @@ def collect_judge_tasks(manifest_path: Path, runs: Path, *, split: str | None = 
         for model_name, variant, run_number, base, text, output_path, meta in discovered_run_units(runs, case, selected_variants):
             # The layout model rides into judge_task_id so a fanned run's
             # verdicts merge back onto the right model's rows.
-            _, judge_tasks = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results={}, model=model_name)
+            _, judge_tasks = grade_case_variant(
+                case, variant, text, output_path, meta,
+                run_number=run_number, run_base=base, judge_results={},
+                manifest_dir=manifest_path.parent, model=model_name)
             tasks.extend(judge_tasks)
     return tasks
 
@@ -6436,6 +9016,9 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
                        judge_backend: str = "claude", codex_cmd: str = "codex exec", vibe_cmd: str = VIBE_DEFAULT_CMD,
                        schema_enforcement: str = "report", include_trajectory: bool = False,
                        explore: bool = False) -> dict[str, Any]:
+    # Compatibility-only since malformed verdicts now always fail closed. Keep
+    # accepting the old argument while callers migrate it away.
+    _ = schema_enforcement
     output_path = Path(task.get("output_path", ""))
     output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
     # A task without an explicit run_base has no run dir to inspect. Do NOT let an
@@ -6452,20 +9035,46 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     per_step_steps: list[dict[str, Any]] | None = None
     per_step_fingerprint: str | None = None
     if is_per_step_assertion(task.get("assertion", {})):
-        step_events, _ = read_events_base(run_base) if has_run_base else (None, None)
-        per_step_steps = trajectory_steps(step_events, run_base if has_run_base else None)
-        if not per_step_steps:
+        step_events, step_error = read_events_base(run_base) if has_run_base else (None, "missing run directory")
+        if step_events is None:
             # No model was invoked BY DESIGN, so judge spend is not_applicable
             # on both channels — never "missing", which would read as lost
             # telemetry from a run that happened.
+            fallback_hash, _, fallback_prompt_hash, _ = judge_input_material(
+                task, output_text)
             return validated_result_row({
                 **_judge_row_identity(task, judge_model=judge_model,
                                       judge_backend=judge_backend, judge_cmd=judge_cmd),
+                "judge_input_sha256": fallback_hash,
+                "judge_prompt_sha256": fallback_prompt_hash,
+                "judge_evidence_mode": "text-only",
+                "judge_observation_complete": False,
+                "availability": "partial",
                 "cost_usd": None,
                 "usage_normalized": normalize_usage(None, source="not_applicable"),
                 "cost_normalized": normalize_cost(None, source="not_applicable"),
                 "passed": False,
-                "evidence": f"{PER_STEP_MISSING_EVIDENCE}: no completed trajectory steps in events.json",
+                "evidence": f"{PER_STEP_MISSING_EVIDENCE}: {step_error or 'unreadable events.json'}",
+                "returncode": 0,
+                "stderr": "",
+            })
+        per_step_steps = trajectory_steps(step_events, run_base if has_run_base else None)
+        if not per_step_steps:
+            complete_hash, _, complete_prompt_hash, _ = judge_input_material(
+                task, output_text, run_base=run_base, steps=[])
+            return validated_result_row({
+                **_judge_row_identity(task, judge_model=judge_model,
+                                      judge_backend=judge_backend, judge_cmd=judge_cmd),
+                "judge_input_sha256": complete_hash,
+                "judge_prompt_sha256": complete_prompt_hash,
+                "judge_evidence_mode": "text-only",
+                "judge_observation_complete": True,
+                "availability": "complete",
+                "cost_usd": None,
+                "usage_normalized": normalize_usage(None, source="not_applicable"),
+                "cost_normalized": normalize_cost(None, source="not_applicable"),
+                "passed": False,
+                "evidence": f"{PER_STEP_MISSING_EVIDENCE}: no completed trajectory steps",
                 "returncode": 0,
                 "stderr": "",
             })
@@ -6477,6 +9086,14 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
             return validated_result_row({
                 **_judge_row_identity(task, judge_model=judge_model,
                                       judge_backend=judge_backend, judge_cmd=judge_cmd),
+                "judge_input_sha256": judge_input_sha256(
+                    task, output_text, run_base=run_base, steps=per_step_steps),
+                "judge_prompt_sha256": judge_input_material(
+                    task, output_text, run_base=run_base,
+                    steps=per_step_steps)[2],
+                "judge_evidence_mode": "text-only",
+                "judge_observation_complete": False,
+                "availability": "partial",
                 "cost_usd": None,
                 "usage_normalized": normalize_usage(None, source="not_applicable"),
                 "cost_normalized": normalize_cost(None, source="not_applicable"),
@@ -6489,6 +9106,28 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
                 "returncode": 0,
                 "stderr": "",
             })
+    planned_input_sha256 = judge_input_sha256(
+        task, output_text, run_base=run_base, steps=per_step_steps)
+    declared_input_sha256 = task.get("judge_input_sha256")
+    if (declared_input_sha256 is not None
+            and declared_input_sha256 != planned_input_sha256):
+        _, _, planned_prompt_sha256, _ = judge_input_material(
+            task, output_text, run_base=run_base, steps=per_step_steps)
+        return validated_result_row({
+            **_judge_row_identity(task, judge_model=judge_model,
+                                  judge_backend=judge_backend, judge_cmd=judge_cmd),
+            "judge_input_sha256": planned_input_sha256,
+            "judge_prompt_sha256": planned_prompt_sha256,
+            "judge_evidence_mode": "text-only",
+            "judge_observation_complete": False,
+            "availability": "partial",
+            "passed": False,
+            "evidence": "judge task input changed after task creation; model was not invoked",
+            "returncode": 0,
+            "stderr": "",
+            "usage_normalized": normalize_usage(None, source="not_applicable"),
+            "cost_normalized": normalize_cost(None, source="not_applicable"),
+        })
     # G1 tool-using follow-on: an opt-in judge may EXPLORE a SANITIZED copy of the run
     # dir (oracle files removed by construction) with read-only tools, rather than only
     # reading a prompt-embedded trajectory. Native adapter only, and only when the run
@@ -6497,19 +9136,39 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     explore_root: Path | None = None
     explore_dir: Path | None = None
     extra_args: list[str] | None = None
-    if explore and judge_model and has_run_base:
+    effective_explore = bool(explore and not judge_cmd and judge_model)
+    evidence_mode = (
+        "trajectory+explore" if include_trajectory and effective_explore else
+        "trajectory" if include_trajectory else
+        "explore" if effective_explore else "text-only")
+    try:
+        current_input_sha256, prompt, prompt_sha256, context_sha256 = judge_input_material(
+            task, output_text, evidence_mode=evidence_mode,
+            run_base=run_base, steps=per_step_steps)
+    except (OSError, ValueError) as exc:
+        _, _, fallback_prompt_sha256, _ = judge_input_material(
+            task, output_text, run_base=run_base, steps=per_step_steps)
+        return validated_result_row({
+            **_judge_row_identity(task, judge_model=judge_model,
+                                  judge_backend=judge_backend, judge_cmd=judge_cmd),
+            "judge_input_sha256": planned_input_sha256,
+            "judge_prompt_sha256": fallback_prompt_sha256,
+            "judge_evidence_mode": evidence_mode,
+            "judge_observation_complete": False,
+            "availability": "partial",
+            "passed": False,
+            "evidence": str(exc),
+            "returncode": 0,
+            "stderr": "",
+            "usage_normalized": normalize_usage(None, source="not_applicable"),
+            "cost_normalized": normalize_cost(None, source="not_applicable"),
+        })
+    if effective_explore and has_run_base:
         explore_root = Path(tempfile.mkdtemp(prefix="judge-explore-"))
         explore_dir = sanitized_run_copy(run_base, explore_root / "run")
         if explore_dir is not None:
             extra_args = ["--add-dir", str(explore_dir), "--allowedTools", JUDGE_EXPLORE_TOOLS]
     explore_hint = str(explore_dir) if explore_dir is not None else None
-    if include_trajectory and has_run_base:
-        # G1: hand the judge the same normalized trajectory the objective detectors
-        # see, plus a denylisted artifact inventory (never the grader's answer key).
-        events, _ = read_events_base(run_base)
-        prompt = judge_prompt(task, output_text, trajectory=events, metrics=read_metrics_base(run_base), artifacts=judge_artifact_inventory(run_base), explore_dir=explore_hint, steps=per_step_steps)
-    else:
-        prompt = judge_prompt(task, output_text, explore_dir=explore_hint, steps=per_step_steps)
     # Native judge backends share a registry-owned invocation seam. A shell
     # `judge_cmd` remains the universal escape hatch; native Codex uses
     # --output-last-message/--output-schema so stdout JSONL is telemetry, not
@@ -6561,8 +9220,14 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     schema_errors = json_schema_errors(parsed, verdict_schema_for(assertion)) if (parse_error is None and isinstance(parsed, dict)) else []
     if schema_errors:
         parse_error = "verdict schema: " + "; ".join(schema_errors[:5])
-    threshold = assertion.get("threshold", parsed.get("threshold", 1))
+    at_least = assertion.get("atLeast")
     score = parsed.get("score")
+    if (at_least is not None and parse_error is None
+            and (isinstance(score, bool) or not isinstance(score, (int, float))
+                 or not math.isfinite(float(score)) or not 0 <= float(score) <= 1)):
+        parse_error = "atLeast judge verdict requires a finite normalized score in [0, 1]"
+    threshold = (at_least if at_least is not None
+                 else assertion.get("threshold", parsed.get("threshold", 1)))
     graded_payload: dict[str, Any] = {}
     if assertion.get("graded_dimensions") and isinstance(parsed.get("dimension_scores"), dict):
         graded_payload["dimension_scores"] = parsed["dimension_scores"]
@@ -6601,9 +9266,15 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         if "dimension_scores" in graded_payload:
             threshold = graded_entry.get("threshold")
     else:
-        plain_payload = ({**parsed, "threshold": threshold}
-                         if parsed.get("score") is not None else parsed)
-        passed = judge_verdict_passed(plain_payload)
+        if at_least is not None:
+            passed = (
+                parse_error is None and isinstance(score, (int, float))
+                and not isinstance(score, bool) and float(score) >= float(at_least)
+            )
+        else:
+            plain_payload = ({**parsed, "threshold": threshold}
+                             if parsed.get("score") is not None else parsed)
+            passed = judge_verdict_passed(plain_payload)
     evidence = parse_error or parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or "judge command completed"
     row = {
         **graded_payload,
@@ -6614,6 +9285,14 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         # the model under test (issue #21); normalized like every runner path.
         "usage_normalized": normalize_usage(judge_usage, source=usage_source),
         "cost_normalized": normalize_cost(cost_usd, source="provider_reported", pricing_model=judge_model_label),
+        "judge_input_sha256": current_input_sha256,
+        "judge_prompt_sha256": prompt_sha256,
+        "judge_evidence_mode": evidence_mode,
+        **({"judge_context_sha256": context_sha256}
+           if context_sha256 is not None else {}),
+        "judge_observation_complete": returncode == 0 and parse_error is None,
+        "availability": ("complete" if returncode == 0 and parse_error is None
+                         else "partial"),
         "passed": passed and returncode == 0 and parse_error is None,
         **({"score": score} if score is not None else {}),
         **({"threshold": threshold} if score is not None and "criteria" not in graded_payload else {}),
@@ -6634,6 +9313,8 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         row.pop("score", None)
         row.pop("threshold", None)
         row.update(verdict_fields(BooleanVerdict(False)))
+        row["judge_observation_complete"] = False
+        row["availability"] = "partial"
         row["verdict_validation_error"] = str(exc)
         if raw_payload:
             row["raw_verdict_payload"] = raw_payload
@@ -6649,6 +9330,81 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     return row
 
 
+def aggregate_judge_member_telemetry(
+    rows: list[dict[str, Any]], out: dict[str, Any],
+) -> None:
+    """Aggregate every billed judge call without collapsing currencies/repeats."""
+    token_aggregates = {
+        key: telemetry_domain.aggregate_numeric([
+            telemetry_domain.measurement_from_envelope_or_usage(
+                row, key, source="judge", population="judge")
+            for row in rows
+        ])
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+    }
+    out["usage_aggregate"] = {
+        key: aggregate.to_dict() for key, aggregate in token_aggregates.items()
+    }
+    if all(aggregate.availability == telemetry_domain.COMPLETE
+           for aggregate in token_aggregates.values()):
+        out["usage_normalized"] = {
+            key: int(aggregate.value) for key, aggregate in token_aggregates.items()
+        } | {"source": "provider_reported"}
+    else:
+        out["usage_normalized"] = {"source": "missing"}
+
+    member_cost = [telemetry_domain.measurement_from_envelope_or_cost(
+        row, source="judge", population="judge") for row in rows]
+    cost_buckets = telemetry_domain.aggregate_money_by_currency(member_cost)
+    out["cost_aggregate"] = {
+        currency: aggregate.to_dict()
+        for currency, aggregate in cost_buckets.items()
+    }
+    usd = cost_buckets.get("USD")
+    if (usd is not None and usd.availability == telemetry_domain.COMPLETE
+            and len(cost_buckets) == 1):
+        out["cost_usd"] = float(usd.value)
+        out["cost_normalized"] = normalize_cost(
+            out["cost_usd"], source="provider_reported", pricing_model="consensus")
+    else:
+        out["cost_usd"] = None
+        out["cost_normalized"] = {"source": "missing"}
+
+
+def _judge_member_errors(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    errors = [
+        {"member": index, "reason": reason}
+        for index, row in enumerate(rows, 1)
+        if (reason := judge_observation_incomplete_reason(row)) is not None
+    ]
+    fingerprints = [row.get("judge_input_sha256") for row in rows]
+    if (any(not isinstance(value, str) for value in fingerprints)
+            or len({value for value in fingerprints if isinstance(value, str)}) != 1):
+        errors.append({
+            "member": "aggregate",
+            "reason": "judge members must share one explicit judge_input_sha256",
+        })
+    return errors
+
+
+def _incomplete_judge_consensus(
+    rows: list[dict[str, Any]], errors: list[dict[str, Any]], *, members_key: str,
+) -> dict[str, Any]:
+    out = dict(rows[0])
+    out[members_key] = rows
+    out["incomplete_judge_members"] = errors
+    out["judge_observation_complete"] = False
+    out["availability"] = "partial"
+    out["returncode"] = 1
+    out["evidence"] = "judge aggregate incomplete: " + "; ".join(
+        str(error["reason"]) for error in errors[:5])
+    aggregate_judge_member_telemetry(rows, out)
+    for key in ("score", "threshold", "dimension_scores", "criteria", "minimum_criteria"):
+        out.pop(key, None)
+    out.update(verdict_fields(ConsensusVerdict(False)))
+    return validated_result_row(out)
+
+
 def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if len(rows) == 1:
         return rows[0]
@@ -6656,6 +9412,10 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     explicit_kinds = {row.get("verdict_kind") for row in rows if row.get("verdict_kind") is not None}
     if len(ids) != 1 or None in ids or len(explicit_kinds) > 1:
         raise ValueError("judge repeats must share one task id and verdict kind")
+    member_errors = _judge_member_errors(rows)
+    if member_errors:
+        return _incomplete_judge_consensus(
+            rows, member_errors, members_key="judge_runs")
     scores = [r.get("score") for r in rows if isinstance(r.get("score"), (int, float))]
     passed_count = sum(1 for r in rows if r.get("passed"))
     first = dict(rows[0])
@@ -6664,6 +9424,10 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         first["score"] = statistics.median(scores)
     first["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
     first["judge_runs"] = rows
+    first["judge_observation_complete"] = True
+    first["availability"] = "complete"
+    first["returncode"] = 0
+    aggregate_judge_member_telemetry(rows, first)
     consensus = ConsensusVerdict(bool(first["passed"]), first.get("score"))
     for key in ("threshold", "dimension_scores", "criteria", "minimum_criteria"):
         first.pop(key, None)
@@ -6695,6 +9459,13 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
         raise ValueError("judge panel models must be non-empty and unique")
     if len(explicit_kinds) > 1:
         raise ValueError("judge panel rows must share one verdict kind")
+    member_errors = _judge_member_errors(rows)
+    if member_errors:
+        out = _incomplete_judge_consensus(
+            rows, member_errors, members_key="judge_panel")
+        out["judge_model"] = "consensus"
+        out["judge_models"] = models
+        return validated_result_row(out)
     n = len(rows)
     concur = sum(1 for r in rows if r.get("passed"))
     scores = [r.get("score") for r in rows if isinstance(r.get("score"), (int, float))]
@@ -6725,20 +9496,11 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
     out["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
     out["agreement"] = {"concur": concur, "n": n, "concur_fraction": round(concur / n, 4),
                         "unanimous": concur in (0, n), "unresolved": unresolved}
-    member_cost = [telemetry_domain.measurement_from_envelope_or_cost(
-        row, source="judge", population="judge") for row in rows]
-    cost_buckets = telemetry_domain.aggregate_money_by_currency(member_cost)
-    out["cost_aggregate"] = {currency: aggregate.to_dict()
-                             for currency, aggregate in cost_buckets.items()}
-    usd = cost_buckets.get("USD")
-    if usd is not None and usd.availability == telemetry_domain.COMPLETE and len(cost_buckets) == 1:
-        out["cost_usd"] = float(usd.value)
-        out["cost_normalized"] = normalize_cost(
-            out["cost_usd"], source="provider_reported", pricing_model="consensus")
-    else:
-        out["cost_usd"] = None
-        out["cost_normalized"] = {"source": "missing"}
+    aggregate_judge_member_telemetry(rows, out)
     out["judge_panel"] = rows
+    out["judge_observation_complete"] = True
+    out["availability"] = "complete"
+    out["returncode"] = 0
     for key in ("threshold", "dimension_scores", "criteria", "minimum_criteria"):
         out.pop(key, None)
     out.update(verdict_fields(ConsensusVerdict(bool(passed), median_score)))
@@ -6795,7 +9557,7 @@ class ToolReplayStore:
         self.recorded: dict[str, list[Any]] = {}
         had_recording = path.is_file()
         if had_recording:
-            doc = json.loads(path.read_text(encoding="utf-8"))
+            doc = strict_json_loads(path.read_text(encoding="utf-8"))
             for row in doc.get("records", []):
                 self.recorded.setdefault(str(row.get("key")), []).append(row.get("output"))
         self.mode = ("replay" if had_recording else "record") if mode == "auto" else mode
@@ -6832,6 +9594,203 @@ def tool_replay_mode(default: str = "off") -> str:
     return mode if mode in TOOL_REPLAY_MODES else default
 
 
+def validate_subagent_response(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError("subagent response must be an object")
+    allowed = {
+        "answer", "trace", "usage", "returncode", "timed_out", "elapsed_ms",
+        "telemetry_scope",
+    }
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"subagent response has unsupported fields: {sorted(unknown)}")
+    if not isinstance(value.get("answer"), str):
+        raise TypeError("subagent response answer must be a string")
+    if "trace" in value and (not isinstance(value["trace"], list)
+                             or not all(isinstance(row, dict) for row in value["trace"])):
+        raise TypeError("subagent response trace must be a list of objects")
+    if "trace" in value:
+        try:
+            json.dumps(value["trace"], ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("subagent response trace must contain only JSON values") from exc
+    if "usage" in value:
+        if not isinstance(value["usage"], dict):
+            raise TypeError("subagent response usage must be an object")
+        # OutcomeContext owns the full numeric-shape contract; normalize_usage
+        # additionally rejects conflicting token aliases.
+        OutcomeContext(provider="subagent", usage=value["usage"])
+        normalize_usage(value["usage"])
+        if "cost_usd" in value["usage"]:
+            normalize_cost(value["usage"]["cost_usd"])
+    if "returncode" in value and (isinstance(value["returncode"], bool)
+                                  or not isinstance(value["returncode"], int)):
+        raise TypeError("subagent response returncode must be an integer")
+    if "timed_out" in value and not isinstance(value["timed_out"], bool):
+        raise TypeError("subagent response timed_out must be boolean")
+    if "elapsed_ms" in value and (isinstance(value["elapsed_ms"], bool)
+                                  or not isinstance(value["elapsed_ms"], (int, float))
+                                  or not math.isfinite(float(value["elapsed_ms"]))
+                                  or value["elapsed_ms"] < 0):
+        raise TypeError("subagent response elapsed_ms must be finite and nonnegative")
+    telemetry_scope = value.get("telemetry_scope")
+    if telemetry_scope is not None and telemetry_scope not in {
+            "turn_delta", "conversation_cumulative"}:
+        raise ValueError(
+            "subagent response telemetry_scope must be turn_delta or "
+            "conversation_cumulative")
+    return dict(value)
+
+
+def _subagent_trace_text(records: Any) -> str:
+    return ("\n".join(json.dumps(record, ensure_ascii=False) for record in records)
+            if isinstance(records, list) and records else "")
+
+
+def _subagent_cost_usd(response: dict[str, Any]) -> float | None:
+    usage = response.get("usage")
+    value = usage.get("cost_usd") if isinstance(usage, dict) else None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+_SUBAGENT_COMPOSITE_TELEMETRY_KEYS = frozenset({
+    "usage", "tokens", "duration_ms", "elapsed_ms", "cost", "cost_usd",
+    "total_cost_usd",
+})
+
+
+def _subagent_composite_trace_record(record: dict[str, Any], turn_number: int) -> dict[str, Any]:
+    """Tag one turn-delta trace record while removing numeric telemetry.
+
+    Per-turn ``trace.jsonl`` remains byte-for-byte provider evidence.  The run
+    trace is a derived concatenation, so usage/cost/duration are aggregated only
+    by the explicit turn-delta path below, never a second time by trace parsing.
+    """
+    out = {key: value for key, value in record.items()
+           if key not in _SUBAGENT_COMPOSITE_TELEMETRY_KEYS}
+    for container_key in ("message", "delta", "data", "item"):
+        nested = out.get(container_key)
+        if isinstance(nested, dict):
+            out[container_key] = {
+                key: value for key, value in nested.items()
+                if key not in _SUBAGENT_COMPOSITE_TELEMETRY_KEYS
+            }
+    out["_subagent_turn"] = turn_number
+    return out
+
+
+def _subagent_multi_turn_aggregate(
+    turn_rows: list[dict[str, Any]], expected_turns: int,
+) -> tuple[int | None, dict[str, int] | None, float | None, dict[str, Any], str]:
+    """Aggregate only complete, explicitly turn-delta multi-turn evidence.
+
+    Cumulative or unspecified provider counters are preserved in each turn's
+    committed artifacts, but cannot become run-level totals by overwrite or sum.
+    Partial safe deltas remain diagnostics under ``observed_delta_*``; headline
+    run telemetry stays unavailable unless every expected turn completed under
+    the same delta contract.
+    """
+    run_complete = (
+        len(turn_rows) == expected_turns
+        and all(row["completed"] for row in turn_rows)
+    )
+    delta_rows = [row for row in turn_rows
+                  if row.get("telemetry_scope") == "turn_delta"]
+    complete_delta_coverage = run_complete and len(delta_rows) == expected_turns
+
+    def availability(complete: bool, observed: int) -> str:
+        return "complete" if complete else "partial" if observed else "unavailable"
+
+    elapsed_rows = [row for row in delta_rows if isinstance(row.get("elapsed_ms"), int)]
+    elapsed_complete = complete_delta_coverage and len(elapsed_rows) == expected_turns
+    observed_elapsed = sum(row["elapsed_ms"] for row in elapsed_rows)
+    aggregate_elapsed = observed_elapsed if elapsed_complete else None
+
+    usage_rows: list[tuple[dict[str, Any], dict[str, int]]] = []
+    for row in delta_rows:
+        block = normalize_usage(row.get("usage"))
+        values = {key: int(value) for key, value in block.items()
+                  if key != "source" and isinstance(value, int) and not isinstance(value, bool)}
+        if values:
+            usage_rows.append((row, values))
+    usage_field_turns = {
+        key: sum(1 for _, values in usage_rows if key in values)
+        for key in USAGE_ALIASES
+    }
+    observed_usage = {
+        key: sum(values[key] for _, values in usage_rows if key in values)
+        for key, count in usage_field_turns.items() if count
+    }
+    common_usage_keys = (
+        set.intersection(*(set(values) for _, values in usage_rows))
+        if usage_rows else set()
+    )
+    usage_complete = (
+        complete_delta_coverage and len(usage_rows) == expected_turns
+        and "total_tokens" in common_usage_keys
+    )
+    aggregate_usage = ({key: sum(values[key] for _, values in usage_rows)
+                        for key in sorted(common_usage_keys)}
+                       if usage_complete else None)
+
+    cost_rows = [row for row in delta_rows if row.get("cost_usd") is not None]
+    observed_cost = sum(float(row["cost_usd"]) for row in cost_rows)
+    cost_complete = complete_delta_coverage and len(cost_rows) == expected_turns
+    aggregate_cost = observed_cost if cost_complete else None
+
+    trace_rows = [row for row in delta_rows if row.get("trace_observation_complete") is True]
+    trace_complete = complete_delta_coverage and len(trace_rows) == expected_turns
+    composite_records = [
+        _subagent_composite_trace_record(record, int(row["turn_number"]))
+        for row in delta_rows
+        for record in row.get("trace_records", [])
+    ]
+    if not trace_complete:
+        composite_records.append({
+            "type": "error", "status": "failed", "_trace_protocol_invalid": True,
+            "message": "multi-turn subagent trace is partial or lacks explicit turn-delta semantics",
+        })
+    composite_trace = _subagent_trace_text(composite_records)
+
+    summary = {
+        "schema_version": 1,
+        "expected_turns": expected_turns,
+        "attempted_turns": len(turn_rows),
+        "completed_turns": sum(1 for row in turn_rows if row["completed"]),
+        "run_complete": run_complete,
+        "delta_semantics_complete": complete_delta_coverage,
+        "elapsed": {
+            "availability": availability(elapsed_complete, len(elapsed_rows)),
+            "observed_delta_ms": observed_elapsed if elapsed_rows else None,
+            "observed_turns": len(elapsed_rows),
+        },
+        "usage": {
+            "availability": availability(usage_complete, len(usage_rows)),
+            "observed_delta_totals": observed_usage,
+            "observed_turns_by_field": usage_field_turns,
+        },
+        "cost": {
+            "availability": availability(cost_complete, len(cost_rows)),
+            "currency": "USD",
+            "observed_delta_total": observed_cost if cost_rows else None,
+            "observed_turns": len(cost_rows),
+        },
+        "trace": {
+            "availability": availability(trace_complete, len(trace_rows)),
+            "observed_turns": len(trace_rows),
+        },
+        "turns": [{
+            "turn_number": row["turn_number"],
+            "completed": row["completed"],
+            "returncode": row["returncode"],
+            "timed_out": row["timed_out"],
+            "telemetry_scope": row.get("telemetry_scope"),
+            "trace_observation_complete": row.get("trace_observation_complete") is True,
+        } for row in turn_rows],
+    }
+    return aggregate_elapsed, aggregate_usage, aggregate_cost, summary, composite_trace
+
+
 def run_subagent_tasks(
     tasks: list[dict[str, Any]],
     runs: Path,
@@ -6847,12 +9806,34 @@ def run_subagent_tasks(
     difference from an in-process eval harness is the boundary: the typed
     return is adapted onto the run-output contract (output.md, metadata.json,
     events.json, metrics.json), so grading stays file-based and re-runnable.
-    Tool replay (2.3) wraps the tool executor per run."""
+    Multi-turn telemetry aggregates only when every response declares
+    ``telemetry_scope: turn_delta``; every attempted turn is retained under
+    ``turn-N/`` regardless. Tool replay (2.3) wraps the executor per run."""
     mode = replay_mode or tool_replay_mode()
+    validated: list[tuple[dict[str, Any], PreparedTask, str | None, Path]] = []
+    seen_identities: set[tuple[str, str | None, str, int, str]] = set()
+    seen_destinations: set[Path] = set()
     for task in tasks:
-        pt = PreparedTask.from_row(task)
-        row_model = task.get("model") or model
+        try:
+            pt = PreparedTask.from_row(task)
+        except (TypeError, ValueError) as exc:
+            die(f"invalid prepared task: {exc}")
+        try:
+            row_model = prepared_task_model(task, model)
+        except ValueError as exc:
+            die(f"invalid prepared task: {exc}")
         base = safe_child_path(runs, pt.run_dir)
+        identity = (pt.case_id, row_model, pt.variant_truth, pt.run_number, "answer")
+        if identity in seen_identities:
+            die(f"duplicate prepared task identity: {identity}")
+        if base in seen_destinations:
+            die(f"duplicate prepared task run_dir: {pt.run_dir}")
+        seen_identities.add(identity)
+        seen_destinations.add(base)
+        validated.append((task, pt, row_model, base))
+    runs.mkdir(parents=True, exist_ok=True)
+    design = persist_answer_design(runs, tasks, default_model=model)
+    for task, pt, row_model, base in validated:
         base.parent.mkdir(parents=True, exist_ok=True)
         sidecars = Path(tempfile.mkdtemp(prefix=f".{base.name}.sidecars-", dir=base.parent))
         prov_extra = {
@@ -6861,8 +9842,12 @@ def run_subagent_tasks(
             "run_number": pt.run_number,
             "variant": pt.variant_truth,
             "billing_scope": "run",
+            "answer_design_sha256": design["design_sha256"],
+            "answer_task_sha256": answer_design_identity(
+                design, pt, row_model)["task_sha256"],
+            "answer_instruction_sha256": answer_design_identity(
+                design, pt, row_model)["instruction_sha256"],
             **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
-            **({"skill_tree_hash": pt.skill_tree_hash} if pt.skill_tree_hash else {}),
         }
         replay_path = sidecars / "tool-replay.json"
         existing_replay = base / "tool-replay.json"
@@ -6879,61 +9864,154 @@ def run_subagent_tasks(
             return replay_store.resolve(tool, payload, live=live)
 
         turns = [str(t) for t in task.get("turns") or [] if str(t)]
+        multi_turn_extra: dict[str, Any] = {}
+        aggregate_cost_usd: float | None = None
         with tempfile.TemporaryDirectory(prefix="subagent-ws-") as wd:
             ws = Path(wd)
-            skill_rel, input_rel = build_skill_workspace(pt, ws)
+            workspace = build_skill_workspace(pt, ws)
+            skill_rel, input_rel = workspace
+            attestation = workspace.attestation
+            if attestation.mounted_skill_tree_hash is not None:
+                prov_extra["skill_tree_hash"] = attestation.mounted_skill_tree_hash
+            prov_extra["fixture_tree_hash"] = attestation.fixture_tree_hash
             prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             started = time.time()
-            try:
-                if turns:
-                    # Scripted multi-turn sequence (roadmap 3.1): the first turn
-                    # carries the workspace/skill preamble; later turns get the
-                    # raw turn prompt plus the conversation so far. Each turn's
-                    # answer lands in turn-<n>/output.md; the final answer is
-                    # also the run's output.md, so single-output consumers work.
-                    outcome = {}
-                    history: list[dict[str, str]] = []
-                    for n, turn_prompt in enumerate(turns, 1):
-                        sent = prompt if n == 1 else turn_prompt
-                        outcome = agent_fn(prompt=sent, workspace=ws, model=row_model, tool_executor=tool_executor, history=list(history)) or {}
-                        turn_answer = str(outcome.get("answer") or "")
-                        turn_dir = sidecars / f"turn-{n}"
-                        turn_dir.mkdir(parents=True, exist_ok=True)
-                        (turn_dir / "output.md").write_text(turn_answer, encoding="utf-8")
-                        history.append({"prompt": sent, "answer": turn_answer})
-                else:
-                    outcome = agent_fn(prompt=prompt, workspace=ws, model=row_model, tool_executor=tool_executor) or {}
-                error = None
-            except ToolReplayMiss as exc:
-                outcome, error = {}, f"tool replay miss: {exc}"
-            except subprocess.TimeoutExpired as exc:
-                # The one timeout encoding (see run_argv_with_timeout): the flag
-                # execution_valid keys on, never a generic error that loses it.
-                outcome, error = {"timed_out": True, "returncode": 124}, f"subagent timeout: {exc}"
-            except Exception as exc:
-                outcome, error = {}, f"subagent error: {exc}"
-            elapsed_ms = outcome.get("elapsed_ms")
-            if not isinstance(elapsed_ms, (int, float)):
-                elapsed_ms = int((time.time() - started) * 1000)
+            if turns:
+                # Each attempted turn is a complete committed run-output subtree.
+                # The root remains the final-answer compatibility surface, with
+                # only explicitly turn-delta evidence eligible for aggregation.
+                outcome: dict[str, Any] = {}
+                error: str | None = None
+                history: list[dict[str, str]] = []
+                turn_rows: list[dict[str, Any]] = []
+                for n, turn_prompt in enumerate(turns, 1):
+                    sent = prompt if n == 1 else turn_prompt
+                    turn_started = time.time()
+                    try:
+                        turn_response = validate_subagent_response(
+                            agent_fn(prompt=sent, workspace=ws, model=row_model,
+                                     tool_executor=tool_executor, history=list(history)))
+                        turn_error: str | None = None
+                    except ToolReplayMiss as exc:
+                        turn_response = {"answer": "", "returncode": 1}
+                        turn_error = f"tool replay miss on subagent turn {n}: {exc}"
+                    except subprocess.TimeoutExpired as exc:
+                        turn_response = {"answer": "", "timed_out": True, "returncode": 124}
+                        turn_error = f"subagent turn {n} timeout: {exc}"
+                    except Exception as exc:
+                        turn_response = {"answer": "", "returncode": 1}
+                        turn_error = f"subagent turn {n} error: {exc}"
+
+                    reported_elapsed = turn_response.get("elapsed_ms")
+                    turn_elapsed = (int(reported_elapsed)
+                                    if isinstance(reported_elapsed, (int, float))
+                                    and not isinstance(reported_elapsed, bool)
+                                    else int((time.time() - turn_started) * 1000))
+                    turn_answer = str(turn_response.get("answer") or "")
+                    turn_rc = turn_response.get("returncode", 0)
+                    turn_timed_out = turn_response.get("timed_out", False)
+                    if turn_error is None and turn_rc == 124 and not turn_timed_out:
+                        turn_error = (
+                            f"subagent turn {n} returned timeout code without timed_out")
+                        turn_rc = 1
+                    if turn_error is None and (turn_timed_out or turn_rc != 0 or not turn_answer):
+                        turn_error = (f"subagent turn {n} did not complete"
+                                      + (" before timeout" if turn_timed_out else ""))
+                    if turn_timed_out:
+                        turn_rc = 124
+                    completed = turn_error is None
+                    if not completed:
+                        turn_answer = ""
+                    turn_response = {
+                        **turn_response, "answer": turn_answer,
+                        "timed_out": bool(turn_timed_out), "returncode": int(turn_rc),
+                    }
+                    turn_trace_records = (turn_response.get("trace")
+                                          if isinstance(turn_response.get("trace"), list) else [])
+                    turn_trace_text = _subagent_trace_text(turn_trace_records)
+                    turn_usage = (turn_response.get("usage")
+                                  if isinstance(turn_response.get("usage"), dict) else None)
+                    turn_cost = _subagent_cost_usd(turn_response)
+                    turn_ro = RunnerOutcome(
+                        provider="subagent", answer=turn_answer,
+                        returncode=int(turn_rc), timed_out=bool(turn_timed_out),
+                        error=turn_error, elapsed_ms=turn_elapsed,
+                        trace_text=turn_trace_text, usage=turn_usage,
+                        cost_usd=turn_cost, model=row_model,
+                        metadata_extra={
+                            "tool_replay_mode": mode, **prov_extra,
+                            "billing_scope": "turn", "turn_number": n,
+                            "expected_turns": len(turns),
+                            "telemetry_scope": turn_response.get("telemetry_scope"),
+                        },
+                        diagnose_returncode=False,
+                    )
+                    _, turn_metrics = write_runner_outcome(
+                        sidecars / f"turn-{n}", turn_ro)
+                    turn_rows.append({
+                        "turn_number": n, "completed": completed,
+                        "returncode": int(turn_rc), "timed_out": bool(turn_timed_out),
+                        "elapsed_ms": turn_elapsed, "usage": turn_usage,
+                        "cost_usd": turn_cost,
+                        "telemetry_scope": turn_response.get("telemetry_scope"),
+                        "trace_records": turn_trace_records,
+                        "trace_observation_complete": turn_metrics.get(
+                            "trace_observation_complete") is True,
+                    })
+                    outcome = turn_response
+                    if not completed:
+                        error = turn_error
+                        break
+                    history.append({"prompt": sent, "answer": turn_answer})
+
+                (elapsed_ms, raw_usage, aggregate_cost_usd,
+                 multi_turn_summary, trace_text) = _subagent_multi_turn_aggregate(
+                     turn_rows, len(turns))
+                multi_turn_extra = {"multi_turn_telemetry": multi_turn_summary}
+            else:
+                try:
+                    outcome = validate_subagent_response(
+                        agent_fn(prompt=prompt, workspace=ws, model=row_model,
+                                 tool_executor=tool_executor))
+                    error = None
+                except ToolReplayMiss as exc:
+                    outcome, error = {}, f"tool replay miss: {exc}"
+                except subprocess.TimeoutExpired as exc:
+                    # The one timeout encoding (see run_argv_with_timeout): the flag
+                    # execution_valid keys on, never a generic error that loses it.
+                    outcome, error = {"timed_out": True, "returncode": 124}, f"subagent timeout: {exc}"
+                except Exception as exc:
+                    outcome, error = {}, f"subagent error: {exc}"
+                elapsed_ms = outcome.get("elapsed_ms")
+                if not isinstance(elapsed_ms, (int, float)):
+                    elapsed_ms = int((time.time() - started) * 1000)
+                trace_records = (outcome.get("trace")
+                                 if isinstance(outcome.get("trace"), list) else [])
+                trace_text = _subagent_trace_text(trace_records)
+                raw_usage = (outcome.get("usage")
+                             if isinstance(outcome.get("usage"), dict) else None)
+                aggregate_cost_usd = _subagent_cost_usd(outcome)
         if store is not None:
             store.save()
-        # The subagent seam returns structured trace records; re-serialize them to
-        # JSONL so the SAME parse→normalize path (and trace.jsonl) that every other
-        # runner uses produces events/metrics — no private normalize call here.
-        trace_records = outcome.get("trace") if isinstance(outcome.get("trace"), list) else []
-        trace_text = "\n".join(json.dumps(r, ensure_ascii=False, default=str) for r in trace_records) if trace_records else ""
-        raw_usage = outcome.get("usage") if isinstance(outcome.get("usage"), dict) else None
-        timed_out = bool(outcome.get("timed_out", False))
+        # The subagent seam returns structured trace records; single-turn traces
+        # remain direct. Multi-turn root traces are safe composites whose exact
+        # provider records live under turn-<n>/trace.jsonl.
+        raw_timed_out = outcome.get("timed_out", False)
+        if not isinstance(raw_timed_out, bool):
+            error = error or "subagent returned malformed timed_out field"
+            raw_timed_out = False
+            outcome = {**outcome, "returncode": 1, "answer": ""}
+        timed_out = raw_timed_out
         ro = RunnerOutcome(
-            provider="subagent", answer=str(outcome.get("answer") or ""),
+            provider="subagent", answer=outcome.get("answer") or "",
             returncode=outcome.get("returncode", 124 if timed_out else (1 if error else 0)), timed_out=timed_out,
             # A timeout keeps its error string (or the subagent's default) so the
             # TIMEOUT marker, not the provider marker, heads the body.
             error=error or ("subagent timed out" if timed_out else None),
-            elapsed_ms=int(elapsed_ms), trace_text=trace_text,
-            usage=raw_usage, cost_usd=(raw_usage or {}).get("cost_usd"), model=row_model,
-            metadata_extra={"tool_replay_mode": mode, **prov_extra},
-            metrics_extra={k: v for k, v in (raw_usage or {}).items() if isinstance(v, (int, float))},
+            elapsed_ms=(int(elapsed_ms) if isinstance(elapsed_ms, (int, float)) else None),
+            trace_text=trace_text,
+            usage=raw_usage, cost_usd=aggregate_cost_usd, model=row_model,
+            metadata_extra={"tool_replay_mode": mode, **prov_extra, **multi_turn_extra},
             diagnose_returncode=False)
         try:
             write_runner_outcome(base, ro, sidecars=sidecars)
@@ -6944,7 +10022,8 @@ def run_subagent_tasks(
 
 def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S) -> Any:
     """Adapt a shell command into the subagent seam: the prompt arrives as JSON
-    on stdin, the reply is JSON on stdout ({answer, trace?, usage?})."""
+    on stdin, the reply is JSON on stdout ({answer, trace?, usage?,
+    telemetry_scope?})."""
     def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
         payload = {"prompt": prompt, "model": model, "workspace": str(workspace)}
         if history:
@@ -6957,9 +10036,11 @@ def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S)
         if proc.returncode != 0:
             return {"answer": "", "returncode": proc.returncode}
         try:
-            return extract_json_object(proc.stdout)
-        except ValueError:
-            return {"answer": proc.stdout}
+            parsed = strict_json_loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"subagent response must be exactly one JSON object: {exc}") from exc
+        return validate_subagent_response(parsed)
     return backend
 
 
@@ -7006,7 +10087,50 @@ def flipped_judge_task(task: dict[str, Any]) -> dict[str, Any]:
     if isinstance(a.get("graded_dimensions"), list):
         a["graded_dimensions"] = list(reversed(a["graded_dimensions"]))
     t["assertion"] = a
+    # This is a deliberately different judge input; run_one_judge_task computes
+    # and stamps the probe's own binding before invocation.
+    t.pop("judge_input_sha256", None)
     return t
+
+
+def judge_observation_incomplete_reason(row: Any) -> str | None:
+    """Why a stored/in-process judge row cannot support derived conclusions.
+
+    A false verdict is valid evidence; a failed call coerced to ``passed=False``
+    is not.  The explicit completion bit is therefore mandatory at derived
+    report boundaries and cannot be reconstructed from verdict polarity.
+    """
+    if not isinstance(row, dict):
+        return "judge result is not an object"
+    if row.get("judge_observation_complete") is not True:
+        return "judge observation is not explicitly complete"
+    if row.get("availability") != "complete":
+        return "judge result availability is not explicitly complete"
+    if row.get("judge_evidence_mode") not in JUDGE_EVIDENCE_MODES:
+        return "judge evidence mode is missing or invalid"
+    input_sha256 = row.get("judge_input_sha256")
+    if (not isinstance(input_sha256, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", input_sha256) is None):
+        return "judge input fingerprint is missing or invalid"
+    prompt_sha256 = row.get("judge_prompt_sha256")
+    if (not isinstance(prompt_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", prompt_sha256) is None):
+        return "judge prompt fingerprint is missing or invalid"
+    if (row.get("judge_evidence_mode") in {"explore", "trajectory+explore"}
+            and (not isinstance(row.get("judge_context_sha256"), str)
+                 or re.fullmatch(
+                     r"sha256:[0-9a-f]{64}", row["judge_context_sha256"])
+                 is None)):
+        return "judge explore context fingerprint is missing"
+    if type(row.get("passed")) is not bool:
+        return "judge verdict passed must be boolean"
+    returncode = row.get("returncode")
+    if (isinstance(returncode, bool) or not isinstance(returncode, int)
+            or returncode != 0):
+        return "judge call did not exit successfully"
+    if row.get("schema_errors") or row.get("verdict_validation_error"):
+        return "judge verdict failed validation"
+    return None
 
 
 def judge_robustness_report(tasks: list[dict[str, Any]], *, tmp_dir: Path, judge_cmd: str | None = None,
@@ -7023,26 +10147,72 @@ def judge_robustness_report(tasks: list[dict[str, Any]], *, tmp_dir: Path, judge
     for i, task in enumerate(tasks):
         base = run(task)
         flip = run(flipped_judge_task(task))
-        consistent = bool(base.get("passed")) == bool(flip.get("passed"))
-        controls: dict[str, bool] = {}
+        base_error = judge_observation_incomplete_reason(base)
+        flip_error = judge_observation_incomplete_reason(flip)
+        consistent = (base["passed"] == flip["passed"]
+                      if base_error is None and flip_error is None else None)
+        call_errors: list[dict[str, str]] = []
+        for probe, problem in (("base", base_error), ("order-flip", flip_error)):
+            if problem is not None:
+                call_errors.append({"probe": probe, "reason": problem})
+                findings.append({
+                    "judge_task_id": task.get("judge_task_id"),
+                    "kind": "judge-call-incomplete", "probe": probe,
+                    "detail": problem,
+                })
+        controls: dict[str, bool | None] = {}
         for name, text in JUDGE_NEGATIVE_CONTROLS.items():
             cf = tmp_dir / f"control-{i}-{name}.md"
             cf.write_text(text, encoding="utf-8")
-            passed = bool(run({**task, "output_path": str(cf)}).get("passed"))
+            control_task = {**task, "output_path": str(cf)}
+            control_task.pop("judge_input_sha256", None)
+            control_row = run(control_task)
+            problem = judge_observation_incomplete_reason(control_row)
+            passed = control_row["passed"] if problem is None else None
             controls[name] = passed
-            if passed:
+            if problem is not None:
+                call_errors.append({"probe": f"control:{name}", "reason": problem})
+                findings.append({
+                    "judge_task_id": task.get("judge_task_id"),
+                    "kind": "judge-call-incomplete", "probe": f"control:{name}",
+                    "detail": problem,
+                })
+            elif passed:
                 findings.append({"judge_task_id": task.get("judge_task_id"), "kind": f"passes-{name}-control",
                                  "detail": f"judge PASSED a {name} negative control it should reject"})
-        if not consistent:
+        if consistent is False:
             findings.append({"judge_task_id": task.get("judge_task_id"), "kind": "order-flip-inconsistent",
                              "detail": "verdict flipped when the rubric / expected-behavior order was reversed"})
-        results.append({"judge_task_id": task.get("judge_task_id"), "order_flip_consistent": consistent, "controls_passed": controls})
+        results.append({
+            "judge_task_id": task.get("judge_task_id"),
+            "order_flip_consistent": consistent, "controls_passed": controls,
+            "judge_call_errors": call_errors,
+        })
     n = len(results)
     denom = n * len(JUDGE_NEGATIVE_CONTROLS)
+    order_values = [r["order_flip_consistent"] for r in results
+                    if isinstance(r["order_flip_consistent"], bool)]
+    control_values = [value for result in results
+                      for value in result["controls_passed"].values()
+                      if isinstance(value, bool)]
+    order_complete = len(order_values) == n
+    controls_complete = len(control_values) == denom
     return {"tasks": results, "findings": findings, "summary": {
         "n": n,
-        "order_flip_consistency": round(sum(1 for r in results if r["order_flip_consistent"]) / n, 4) if n else None,
-        "control_leak_rate": round(sum(1 for r in results for v in r["controls_passed"].values() if v) / denom, 4) if denom else None,
+        "availability": ("complete" if n and order_complete and controls_complete
+                         else "partial" if order_values or control_values
+                         else "unavailable"),
+        "order_flip_consistency": (
+            round(sum(order_values) / n, 4) if n and order_complete else None),
+        "control_leak_rate": (
+            round(sum(control_values) / denom, 4)
+            if denom and controls_complete else None),
+        "observed_order_flip_consistency": (
+            round(sum(order_values) / len(order_values), 4) if order_values else None),
+        "observed_control_leak_rate": (
+            round(sum(control_values) / len(control_values), 4) if control_values else None),
+        "complete_order_flip_tasks": len(order_values),
+        "complete_control_calls": len(control_values),
     }}
 
 
@@ -7057,7 +10227,9 @@ def judge_robustness_command(args: argparse.Namespace) -> int:
     report = judge_robustness_report(tasks, tmp_dir=tmp, judge_cmd=judge_cmd, judge_model=judge_model,
                                      claude_bin=getattr(args, "claude_bin", None) or "claude")
     emit_report(report, getattr(args, "out", None))
-    return 1 if (getattr(args, "fail_on_findings", False) and report["findings"]) else 0
+    gate_failed = (report["summary"].get("availability") != "complete"
+                   or bool(report["findings"]))
+    return 1 if (getattr(args, "fail_on_findings", False) and gate_failed) else 0
 
 
 def judge_command(args: argparse.Namespace) -> int:
@@ -7114,23 +10286,56 @@ def judge_panel_sensitivity(reports_by_judge: dict[str, dict[str, Any]], *, magn
     `judge_sensitive` is either. This is the good-pr finding made first-class: a
     single judge number is not reproducible across judge choice for a subtle skill."""
     per_judge: dict[str, float | None] = {}
+    incomplete: dict[str, str] = {}
     for jm, rep in reports_by_judge.items():
         summ = (rep or {}).get("summary", {}) or {}
-        w = (summ.get("with_skill", {}) or {}).get("mean_combined_pass_rate")
-        wo = (summ.get("without_skill", {}) or {}).get("mean_combined_pass_rate")
-        per_judge[jm] = (w - wo) if isinstance(w, (int, float)) and isinstance(wo, (int, float)) else None
+        with_block = summ.get("with_skill", {}) or {}
+        without_block = summ.get("without_skill", {}) or {}
+        w = with_block.get("mean_combined_pass_rate")
+        wo = without_block.get("mean_combined_pass_rate")
+        valid_w = (_num(w) if not isinstance(w, bool) else None)
+        valid_wo = (_num(wo) if not isinstance(wo, bool) else None)
+        if not isinstance(rep, dict) or rep.get("availability") != "complete":
+            per_judge[jm] = None
+            incomplete[jm] = "benchmark report availability is not complete"
+        elif (with_block.get("availability") != "complete"
+              or without_block.get("availability") != "complete"):
+            per_judge[jm] = None
+            incomplete[jm] = "with_skill/without_skill summary coverage is not complete"
+        elif (valid_w is None or valid_wo is None
+                or not 0 <= valid_w <= 1 or not 0 <= valid_wo <= 1):
+            per_judge[jm] = None
+            incomplete[jm] = "missing or invalid with_skill/without_skill combined pass rate"
+        else:
+            per_judge[jm] = valid_w - valid_wo
     lifts = [v for v in per_judge.values() if v is not None]
     signs = {(1 if v > 1e-9 else -1 if v < -1e-9 else 0) for v in lifts}
-    spread = (max(lifts) - min(lifts)) if len(lifts) >= 2 else 0.0
-    sign_sensitive = len(signs) > 1
-    magnitude_sensitive = spread > magnitude_eps
+    observed_spread = (max(lifts) - min(lifts)) if len(lifts) >= 2 else None
+    observed_sign_sensitive = len(signs) > 1 if len(lifts) >= 2 else None
+    complete = len(reports_by_judge) >= 2 and not incomplete
+    spread = observed_spread if complete else None
+    sign_sensitive = observed_sign_sensitive if complete else None
+    magnitude_sensitive = (spread > magnitude_eps) if spread is not None else None
+    judge_sensitive = (sign_sensitive or magnitude_sensitive
+                       if sign_sensitive is not None and magnitude_sensitive is not None
+                       else None)
     return {
         "judges": sorted(reports_by_judge),
         "lift_by_judge": {k: (round(v, 6) if isinstance(v, (int, float)) else None) for k, v in per_judge.items()},
+        "availability": "complete" if complete else "partial" if lifts else "unavailable",
+        "incomplete_judges": incomplete,
         "sign_sensitive": sign_sensitive,
-        "magnitude_spread": round(spread, 6),
+        "magnitude_spread": round(spread, 6) if spread is not None else None,
         "magnitude_sensitive": magnitude_sensitive,
-        "judge_sensitive": sign_sensitive or magnitude_sensitive,
+        "judge_sensitive": judge_sensitive,
+        "observed": {
+            "judges": sorted(jm for jm, value in per_judge.items() if value is not None),
+            "sign_sensitive": observed_sign_sensitive,
+            "magnitude_spread": (round(observed_spread, 6)
+                                 if observed_spread is not None else None),
+            "magnitude_sensitive": (observed_spread > magnitude_eps
+                                    if observed_spread is not None else None),
+        },
     }
 
 
@@ -7188,42 +10393,79 @@ def judge_alignment_report(human: dict[str, dict[str, Any]], judge: dict[str, di
     kappa, and precision/recall/F1 treating the human label as ground truth and
     'pass' as the positive class — the accuracy check `compare-judges`
     (judge-vs-judge sensitivity) deliberately does not make. Fully model-free."""
-    ids = sorted(set(human) & set(judge))
-    h = [bool(human[i].get("passed")) for i in ids]
-    j = [bool(judge[i].get("passed")) for i in ids]
+    human_ids, judge_ids = set(human), set(judge)
+    invalid_human_ids = sorted(
+        identifier for identifier, row in human.items()
+        if not isinstance(row, dict) or type(row.get("passed")) is not bool)
+    incomplete_judge = {
+        identifier: reason
+        for identifier, row in judge.items()
+        if (reason := judge_observation_incomplete_reason(row)) is not None
+    }
+    ids = sorted(
+        (human_ids & judge_ids)
+        - set(invalid_human_ids)
+        - set(incomplete_judge)
+    )
+    h = [human[i]["passed"] for i in ids]
+    j = [judge[i]["passed"] for i in ids]
     n = len(ids)
-    tp = sum(1 for x, y in zip(h, j) if x and y)
-    tn = sum(1 for x, y in zip(h, j) if not x and not y)
-    fp = sum(1 for x, y in zip(h, j) if not x and y)   # judge passed a human-fail
-    fn = sum(1 for x, y in zip(h, j) if x and not y)    # judge failed a human-pass
-    agreement = (tp + tn) / n if n else None
-    precision = tp / (tp + fp) if (tp + fp) else None
-    recall = tp / (tp + fn) if (tp + fn) else None
-    # F1 from counts, not from precision*recall: precision/recall of 0.0 are falsy,
-    # so the product form returned None for a label-inverting judge (tp=0, the very
-    # worst case this command exists to flag). 2*tp/(2*tp+fp+fn) is 0.0 when any
-    # positive exists and None only when there are no positives at all.
-    f1_den = 2 * tp + fp + fn
-    f1 = (2 * tp / f1_den) if f1_den else None
-    kappa = cohen_kappa(h, j)
+
+    def metrics(left: list[bool], right: list[bool]) -> dict[str, Any]:
+        count = len(left)
+        tp = sum(1 for x, y in zip(left, right) if x and y)
+        tn = sum(1 for x, y in zip(left, right) if not x and not y)
+        fp = sum(1 for x, y in zip(left, right) if not x and y)
+        fn = sum(1 for x, y in zip(left, right) if x and not y)
+        agreement = (tp + tn) / count if count else None
+        precision = tp / (tp + fp) if (tp + fp) else None
+        recall = tp / (tp + fn) if (tp + fn) else None
+        # Count form keeps the label-inverting case at F1=0.0; it is undefined
+        # only when neither rater has a positive.
+        f1_den = 2 * tp + fp + fn
+        f1 = (2 * tp / f1_den) if f1_den else None
+        kappa = cohen_kappa(left, right)
+        return {
+            "n": count,
+            "agreement": round(agreement, 4) if agreement is not None else None,
+            "cohen_kappa": round(kappa, 4) if kappa is not None else None,
+            "kappa_interpretation": kappa_band(kappa),
+            "precision": round(precision, 4) if precision is not None else None,
+            "recall": round(recall, 4) if recall is not None else None,
+            "f1": round(f1, 4) if f1 is not None else None,
+            "confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        }
+
+    observed = metrics(h, j)
+    coverage_complete = (
+        bool(human_ids) and human_ids == judge_ids
+        and not invalid_human_ids and not incomplete_judge
+    )
     warnings = []
+    if not coverage_complete:
+        warnings.append(
+            "alignment population is incomplete or invalid; headline metrics are unavailable")
     if n == 0:
-        warnings.append("no judge_task_id overlap between labels and judge results (nothing to compare)")
+        warnings.append("no complete judge_task_id overlap between labels and judge results (nothing to compare)")
     elif n < min_labels:
-        warnings.append(f"only {n} matched labels (< {min_labels}); alignment metrics are unstable — collect more human labels")
+        warnings.append(f"only {n} complete matched labels (< {min_labels}); alignment metrics are unstable — collect more human labels")
+    headline = observed if coverage_complete else {
+        "agreement": None, "cohen_kappa": None, "kappa_interpretation": None,
+        "precision": None, "recall": None, "f1": None, "confusion": None,
+    }
     return {
+        "availability": ("complete" if coverage_complete
+                         else "partial" if n else "unavailable"),
+        "coverage_complete": coverage_complete,
         "n": n,
         "human_labels": len(human),
         "judge_verdicts": len(judge),
-        "unmatched_human_ids": sorted(set(human) - set(judge))[:20],
-        "unmatched_judge_ids": sorted(set(judge) - set(human))[:20],
-        "agreement": round(agreement, 4) if agreement is not None else None,
-        "cohen_kappa": round(kappa, 4) if kappa is not None else None,
-        "kappa_interpretation": kappa_band(kappa),
-        "precision": round(precision, 4) if precision is not None else None,
-        "recall": round(recall, 4) if recall is not None else None,
-        "f1": round(f1, 4) if f1 is not None else None,
-        "confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        "unmatched_human_ids": sorted(human_ids - judge_ids)[:20],
+        "unmatched_judge_ids": sorted(judge_ids - human_ids)[:20],
+        "invalid_human_ids": invalid_human_ids[:20],
+        "incomplete_judge_ids": dict(sorted(incomplete_judge.items())[:20]),
+        **headline,
+        "observed": observed,
         "warnings": warnings,
     }
 
@@ -7253,7 +10495,9 @@ def first_failure(result: dict[str, Any]) -> dict[str, Any] | None:
     error causes the downstream ones, so anchor on the first). Soft rows feed the
     graded channel only, so they never count as a failure here."""
     for a in result.get("assertions", []) + result.get("qualitative_assertions", []):
-        if not a.get("passed") and a.get("severity") != "soft":
+        if (a.get("passed") is False
+                and a.get("availability", "complete") == "complete"
+                and a.get("severity") != "soft"):
             return {"name": a.get("name"), "type": a.get("type"), "klass": assertion_klass(a.get("type")), "evidence": str(a.get("evidence", ""))[:400]}
     return None
 
@@ -7266,6 +10510,13 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
     pattern is visible. Reuses the report's own case_flags as a second histogram."""
     results = report.get("results", [])
     queue: list[dict[str, Any]] = []
+    blocked = [
+        {"case_id": row.get("case_id"), "model": row.get("model"),
+         "variant": row.get("variant"), "run_base": row.get("run_base"),
+         "blocked_assertions": row.get("blocked_assertions", [])}
+        for row in results
+        if row.get("grading_availability", "complete") != "complete"
+    ]
     taxonomy: dict[str, dict[str, Any]] = {}
     for r in results:
         if r.get("missing_output"):
@@ -7299,13 +10550,25 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
         for flag in cf.get("flags", []):
             key = flag.split(":")[0].strip() if ":" in flag else flag
             flag_hist[key] = flag_hist.get(key, 0) + 1
-    return {
+    observed = {
         "summary": {"failing_or_errored_runs": total, "distinct_categories": len(ranked)},
         "taxonomy": ranked,
         "case_flag_histogram": dict(sorted(flag_hist.items(), key=lambda kv: (-kv[1], kv[0]))),
         "review_queue": queue[:limit],
         "review_queue_truncated": max(0, total - limit),
     }
+    if report.get("availability") != "complete" or blocked:
+        return {
+            "availability": "partial",
+            "reason": "source benchmark or grading evidence is incomplete",
+            "summary": {"failing_or_errored_runs": None,
+                        "distinct_categories": None},
+            "taxonomy": [], "case_flag_histogram": {}, "review_queue": [],
+            "review_queue_truncated": None,
+            "blocked_runs": blocked,
+            "observed": observed,
+        }
+    return {"availability": "complete", **observed}
 
 
 def error_analysis_command(args: argparse.Namespace) -> int:
@@ -7330,6 +10593,7 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
     dims = assertion.get("graded_dimensions")
     dyn = assertion.get("dynamic_rubric")
     per_step = is_per_step_assertion(assertion)
+    at_least = assertion.get("atLeast")
     if dims and isinstance(judged.get("dimension_scores"), dict):
         expected_names = {str(item.get("name")) for item in dims if isinstance(item, dict)}
         if set(judged["dimension_scores"]) != expected_names:
@@ -7341,13 +10605,21 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
         normalized = {k: (v - 1.0) / 4.0 for k, v in raw.items()}
         score = round(statistics.mean(normalized.values()), 4) if normalized else None
         threshold_raw = assertion.get("threshold", 4)
-        threshold = max(0.0, min(1.0, (float(threshold_raw) - 1.0) / 4.0))
+        dimension_threshold = max(
+            0.0, min(1.0, (float(threshold_raw) - 1.0) / 4.0))
+        threshold = max(
+            dimension_threshold,
+            float(at_least) if at_least is not None else dimension_threshold,
+        )
         entry.update({
             "passed": score is not None and score >= threshold,
             "score": score,
             "threshold": threshold,
             "dimension_scores": raw,   # per-dimension scores stay in the row (and evidence)
-            "evidence": f"dimension scores (1-5): {json.dumps(raw, sort_keys=True)}; {evidence}",
+            "evidence": (
+                f"dimension scores (1-5): {json.dumps(raw, sort_keys=True)}; "
+                f"normalized threshold={threshold:g}; {evidence}"
+            ),
         })
         return entry
     if (dyn or per_step) and isinstance(judged.get("criteria"), list):
@@ -7369,6 +10641,31 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
             "criteria_met": met,
             "criteria_total": total,
             "evidence": f"{met}/{total} {label} (minimum {minimum}); {evidence}",
+        })
+        return entry
+    if at_least is not None:
+        score = judged.get("score")
+        if (isinstance(score, bool) or not isinstance(score, (int, float))
+                or not math.isfinite(float(score)) or not 0 <= float(score) <= 1):
+            entry.update({
+                "passed": None,
+                "score": None,
+                "availability": "partial",
+                "evidence": (
+                    "atLeast judge verdict is incomplete: expected a finite "
+                    f"normalized score in [0, 1]; {evidence}"
+                ),
+            })
+            return entry
+        normalized_score = float(score)
+        entry.update({
+            "passed": normalized_score >= float(at_least),
+            "score": normalized_score,
+            "threshold": float(at_least),
+            "evidence": (
+                f"score={normalized_score:g}, atLeast={float(at_least):g}; "
+                f"{evidence}"
+            ),
         })
         return entry
     entry.update({
@@ -7416,24 +10713,32 @@ def grade_case_variant(
     turn_specs = [t for t in (case.get("turns") or []) if isinstance(t, dict)]
     turn_units: list[tuple[dict[str, Any], str | None, Path, Path | None, int]] = []
     turn_summaries: list[dict[str, Any]] = []
+    declared_turn_texts: list[str | None] = []
     if turn_specs and run_base is not None:
         turn_bases = dict(discover_turn_bases(run_base))
-        last_text: str | None = None
+        turn_layout_complete = set(turn_bases) == set(range(1, len(turn_specs) + 1))
         for n, turn in enumerate(turn_specs, 1):
             turn_base = turn_bases.get(n)
             if turn_base is not None:
                 turn_text, turn_output_path = read_output_base(turn_base)
             else:
                 turn_text, turn_output_path = None, run_base / f"turn-{n}" / "output.md"
-            turn_summaries.append({"turn": n, "missing_output": turn_text is None})
+            turn_summaries.append({
+                "turn": n,
+                "missing_output": turn_text is None or not turn_text.strip(),
+            })
+            declared_turn_texts.append(turn_text)
             for assertion in turn.get("assertions", []) or []:
                 turn_units.append((assertion, turn_text, turn_output_path, turn_base or run_base, n))
-            if turn_text is not None:
-                last_text = turn_text
-        if text is None:
-            text = last_text   # the final turn is the answer of record
-    missing_output = text is None
-    exec_valid = execution_valid(metadata, text)
+        # The answer of record is the declared final turn, and it exists only
+        # when the entire declared transcript exists. An earlier available turn
+        # can never be promoted to a final answer after later-turn attrition.
+        text = (declared_turn_texts[-1]
+                if turn_layout_complete and declared_turn_texts
+                and all(t is not None and t.strip() for t in declared_turn_texts)
+                else None)
+    missing_output = text is None or not text.strip()
+    exec_valid = execution_valid(metadata, None if missing_output else text)
     text = text or ""
     judge_results = judge_results or {}
     # G2 inline optimization: label -> passed for already-resolved case-level
@@ -7479,13 +10784,33 @@ def grade_case_variant(
                 # judge task is emitted (no model spend) and a stored verdict
                 # cannot outlive its evidence.
                 step_events, step_error = read_events_base(unit_base) if unit_base is not None else (None, "missing run directory")
+                if step_events is None:
+                    entry = {"name": assertion_label(expanded), "type": atype,
+                             "passed": None, "score": None,
+                             "availability": "partial", "severity": severity,
+                             "oracle": tier,
+                             "evidence": (f"{PER_STEP_MISSING_EVIDENCE}: "
+                                          f"{step_error or 'missing events.json'}")}
+                    if turn_n is not None:
+                        entry["turn"] = turn_n
+                    qualitative.append(entry)
+                    if turn_n is None:
+                        # Unknown evidence cannot satisfy a dependent, but it is
+                        # not a behavioral failure either.
+                        satisfied[assertion_label(assertion)] = False
+                        if case_uses_depends_on:
+                            entry["_dep_label"] = assertion_label(assertion)
+                    return
                 current_steps = trajectory_steps(step_events, unit_base)
                 if not current_steps:
-                    reason = ("no completed trajectory steps" if step_events is not None
-                              else step_error or "missing events.json")
-                    entry = {"name": assertion_label(expanded), "type": atype, "passed": False,
-                             "score": 0.0, "severity": severity, "oracle": tier,
-                             "evidence": f"{PER_STEP_MISSING_EVIDENCE}: {reason}"}
+                    # A readable, valid trace that contains no completed
+                    # actions is a complete observed behavioral failure.
+                    entry = {"name": assertion_label(expanded), "type": atype,
+                             "passed": False, "score": 0.0,
+                             "availability": "complete", "severity": severity,
+                             "oracle": tier,
+                             "evidence": (f"{PER_STEP_MISSING_EVIDENCE}: "
+                                          "no completed trajectory steps")}
                     if turn_n is not None:
                         entry["turn"] = turn_n
                     qualitative.append(entry)
@@ -7496,7 +10821,69 @@ def grade_case_variant(
                     return
                 current_steps_fingerprint = trajectory_steps_sha256(current_steps)
             jid = judge_task_id(case["id"], variant, run_number, expanded, model=model)
+            # A turn-N verdict is about the turn-N instruction, not the case's
+            # opening prompt.  Prior exchanges are included separately so the
+            # judge sees (and the fingerprint binds) the declared conversation
+            # through N without duplicating the current candidate answer.
+            conversation: list[dict[str, Any]] = []
+            if turn_specs:
+                through_turn = turn_n or len(turn_specs)
+                resolved_prompt = str(
+                    turn_specs[through_turn - 1].get("prompt", ""))
+                for prior_n, prior_turn in enumerate(
+                        turn_specs[:through_turn], 1):
+                    exchange: dict[str, Any] = {
+                        "turn": prior_n,
+                        "prompt": str(prior_turn.get("prompt", "")),
+                    }
+                    if (prior_n < through_turn
+                            and prior_n <= len(declared_turn_texts)
+                            and declared_turn_texts[prior_n - 1] is not None):
+                        exchange["assistant_output"] = declared_turn_texts[prior_n - 1]
+                    conversation.append(exchange)
+            else:
+                # Bind the judge to the prompt CONTENT it will see, never
+                # merely to a prompt_ref pathname.
+                resolved_prompt = case_prompt_from_dir(
+                    case, manifest_dir or Path("."))
+            judge_task = {
+                "judge_task_id": jid,
+                "case_id": case["id"],
+                **({"model": model} if model else {}),
+                "variant": variant,
+                "run_number": run_number,
+                "assertion": expanded,
+                "output_path": str(unit_output_path),
+                "run_base": str(unit_base or unit_output_path.parent),
+                "prompt": resolved_prompt,
+                "prompt_ref": case.get("prompt_ref"),
+                "expected_behavior": case.get("expected_behavior", []),
+                "review_rubric": case.get("review_rubric", []),
+                **({"conversation": conversation} if conversation else {}),
+                **({"trajectory_steps_sha256": current_steps_fingerprint}
+                   if current_steps_fingerprint else {}),
+            }
+            current_input_fingerprint = judge_input_sha256(
+                judge_task, unit_text or "", run_base=unit_base,
+                steps=current_steps)
+            judge_task["judge_input_sha256"] = current_input_fingerprint
             judged = judge_results.get(jid)
+            if judged:
+                evidence_mode = judged.get("judge_evidence_mode")
+                try:
+                    (expected_judge_input, _, expected_prompt_sha256,
+                     expected_context_sha256) = judge_input_material(
+                        judge_task, unit_text or "",
+                        evidence_mode=str(evidence_mode), run_base=unit_base,
+                        steps=current_steps)
+                except (OSError, ValueError):
+                    judged = None
+                else:
+                    if (judge_observation_incomplete_reason(judged) is not None
+                            or judged.get("judge_input_sha256") != expected_judge_input
+                            or judged.get("judge_prompt_sha256") != expected_prompt_sha256
+                            or judged.get("judge_context_sha256") != expected_context_sha256):
+                        judged = None
             if judged and current_steps is not None:
                 expected_names = [step["step"] for step in current_steps]
                 criteria = judged.get("criteria")
@@ -7522,22 +10909,7 @@ def grade_case_variant(
                     if case_uses_depends_on:
                         entry["_dep_label"] = assertion_label(assertion)
             else:
-                judge_tasks.append({
-                    "judge_task_id": jid,
-                    "case_id": case["id"],
-                    **({"model": model} if model else {}),
-                    "variant": variant,
-                    "run_number": run_number,
-                    "assertion": expanded,
-                    "output_path": str(unit_output_path),
-                    "run_base": str(unit_base or unit_output_path.parent),
-                    "prompt": case.get("prompt"),
-                    "prompt_ref": case.get("prompt_ref"),
-                    "expected_behavior": case.get("expected_behavior", []),
-                    "review_rubric": case.get("review_rubric", []),
-                    **({"trajectory_steps_sha256": current_steps_fingerprint}
-                       if current_steps_fingerprint else {}),
-                })
+                judge_tasks.append(judge_task)
         else:
             labeled = {**assertion, "name": f"turn-{turn_n}: {assertion_label(assertion)}"} if turn_n is not None else assertion
             entry = assertion_result(labeled, unit_text or "", unit_output_path, run_base=unit_base, allow_scripts=allow_scripts, manifest_dir=manifest_dir, embed_cmd=embed_cmd)
@@ -7591,20 +10963,31 @@ def grade_case_variant(
             r.pop("_dep_label", None)   # transient resolver key; never serialized
     for summary_row in turn_summaries:
         n = summary_row["turn"]
-        rows_for_turn = [r for r in objective + qualitative if r.get("turn") == n and not r.get("skipped")]
+        all_rows_for_turn = [r for r in objective + qualitative
+                             if r.get("turn") == n and not r.get("skipped")]
+        rows_for_turn = [r for r in all_rows_for_turn
+                         if r.get("availability", "complete") == "complete"]
         summary_row["passed"] = sum(1 for r in rows_for_turn if r["passed"])
         summary_row["total"] = len(rows_for_turn)
+        summary_row["availability"] = (
+            "complete" if len(rows_for_turn) == len(all_rows_for_turn) else "partial")
     # Severity split (roadmap 2.2). The pass-rate channel is carried by gate and
     # critical results (the default for every objective assertion, so binary
     # manifests grade identically); soft results leave the denominator and fill
     # the graded `scored` bucket instead. A failing critical assertion is the
     # absorbing barrier: it VETOES the run — every rate collapses to 0.0 and the
     # graded score is withheld, so no mean can average the catastrophe away.
-    gate_objective = [r for r in objective if r.get("severity") in {"gate", "critical"} and not r.get("skipped")]
-    soft_rows = [r for r in objective + qualitative if r.get("severity") == "soft" and not r.get("skipped")]
+    blocked_rows = [r for r in objective + qualitative
+                    if not r.get("skipped")
+                    and r.get("availability", "complete") != "complete"]
+    observed_rows = [r for r in objective + qualitative
+                     if r.get("availability", "complete") == "complete"]
+    gate_objective = [r for r in objective if r in observed_rows
+                      and r.get("severity") in {"gate", "critical"} and not r.get("skipped")]
+    soft_rows = [r for r in observed_rows if r.get("severity") == "soft" and not r.get("skipped")]
     # G2: a SKIPPED dependent is excluded here, so a never-run critical dependent
     # cannot veto — the veto stays owned by the prerequisite's own severity.
-    critical_rows = [r for r in objective + qualitative if r.get("severity") == "critical" and not r.get("skipped")]
+    critical_rows = [r for r in observed_rows if r.get("severity") == "critical" and not r.get("skipped")]
     critical_failures = [r["name"] for r in critical_rows if not r["passed"]]
     vetoed = bool(critical_failures)
     objective_passed = sum(1 for r in gate_objective if r["passed"])
@@ -7617,7 +11000,8 @@ def grade_case_variant(
     # channel; the qualitative/combined pass rates are carried by gate and
     # critical qualitative rows, mirroring the objective split above. Declare
     # severity: "gate" on a judge assertion to keep it in the pass rate.
-    gate_qualitative = [r for r in qualitative if r.get("severity") in {"gate", "critical"} and not r.get("skipped")]
+    gate_qualitative = [r for r in qualitative if r in observed_rows
+                        and r.get("severity") in {"gate", "critical"} and not r.get("skipped")]
     qualitative_passed = sum(1 for r in gate_qualitative if r["passed"])
     qualitative_total = len(gate_qualitative)
     combined_passed = objective_passed + qualitative_passed
@@ -7679,6 +11063,12 @@ def grade_case_variant(
         "assertions": objective,
         "qualitative_assertions": qualitative,
         "deferred_judge_tasks": len(judge_tasks),
+        "grading_availability": "partial" if blocked_rows or judge_tasks else "complete",
+        "blocked_assertions": [
+            {"name": row.get("name"), "type": row.get("type"),
+             "evidence": row.get("evidence")}
+            for row in blocked_rows
+        ],
         "metadata": metadata,
     }
     return result, judge_tasks
@@ -7708,14 +11098,27 @@ def anthropic_grading_json(result: dict[str, Any]) -> dict[str, Any]:
         telemetry_status["total_tool_calls"] = tool_calls.to_dict()
     total = result.get("combined_total", result.get("objective_total", 0))
     passed = result.get("combined_passed", result.get("objective_passed", 0))
+    observed_summary = {
+        "passed": passed,
+        "failed": total - passed,
+        "total": total,
+        "pass_rate": result.get("combined_pass_rate", result.get("objective_pass_rate")),
+    }
+    blocked_assertions = [
+        row for row in result.get("assertions", []) + result.get("qualitative_assertions", [])
+        if row.get("availability") not in (None, "complete")
+    ]
+    complete = (scorable_run(result)
+                and result.get("deferred_judge_tasks", 0) == 0
+                and not blocked_assertions)
     return {
+        "availability": "complete" if complete else "partial",
         "expectations": expectations,
-        "summary": {
-            "passed": passed,
-            "failed": total - passed,
-            "total": total,
-            "pass_rate": result.get("combined_pass_rate", result.get("objective_pass_rate")),
-        },
+        "summary": (observed_summary if complete else {
+            "passed": None, "failed": None, "total": None, "pass_rate": None,
+            "observed": observed_summary,
+            "reason": "run or grading evidence is incomplete",
+        }),
         "execution_metrics": execution_metrics,
         "telemetry": telemetry_status,
         "timing": timing,
@@ -7725,11 +11128,18 @@ def anthropic_grading_json(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def write_grading_files(results: list[dict[str, Any]]) -> None:
+def write_grading_files(results: list[dict[str, Any]], runs: Path) -> None:
+    """Write grader-owned derivatives outside committed execution run trees."""
     for result in results:
         base = Path(result["run_base"])
-        base.mkdir(parents=True, exist_ok=True)
-        write_json(base / "grading.json", anthropic_grading_json(result))
+        try:
+            relative = base.resolve().relative_to(runs.resolve())
+        except ValueError as exc:
+            raise ValueError(f"run_base is outside runs root: {base}") from exc
+        write_json(
+            runs / "_grading" / relative / "grading.json",
+            anthropic_grading_json(result),
+        )
 
 
 def grade(args: argparse.Namespace) -> int:
@@ -7757,7 +11167,7 @@ def grade(args: argparse.Namespace) -> int:
         "judge_task_count": len(all_judge_tasks),
     }
     if getattr(args, "write_grading_files", False):
-        write_grading_files(all_results)
+        write_grading_files(all_results, runs)
     emit_report(report, args.out)
     if args.judge_tasks:
         jt = Path(args.judge_tasks)
@@ -7834,6 +11244,24 @@ def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> f
     return ResultSet(rows).mean_rate(key)
 
 
+def _monte_carlo_upper_bound(hits: int, samples: int, *, failure_probability: float = 0.001) -> float:
+    """Distribution-free upper confidence bound for a sampled tail probability."""
+    if samples < 1:
+        raise ValueError("Monte Carlo samples must be positive")
+    empirical = hits / samples
+    radius = math.sqrt(math.log(1.0 / failure_probability) / (2.0 * samples))
+    return min(1.0, empirical + radius)
+
+
+def _exact_rate(successes: int, observations: int) -> float:
+    """An inference-grade rate: never round before computing a delta/test."""
+    if (isinstance(successes, bool) or not isinstance(successes, int)
+            or isinstance(observations, bool) or not isinstance(observations, int)
+            or observations < 1 or successes < 0 or successes > observations):
+        raise ValueError("rate counts must satisfy 0 <= successes <= observations")
+    return successes / observations
+
+
 def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, samples: int = 4096) -> dict[str, Any]:
     """Two-sided sign-flip permutation test over per-case paired deltas
     (roadmap 2.2): under H0 (the skill does nothing) each case's delta is a
@@ -7842,10 +11270,14 @@ def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, sample
     sample — deterministic, so re-grading stays byte-identical (CF.3)."""
     n = len(deltas)
     if n == 0:
-        return {"method": "sign-flip", "n": 0, "observed_mean_delta": None, "p_value": None, "significant_at_0_05": False}
+        return {"method": "sign-flip", "n": 0, "observed_mean_delta": None,
+                "p_value": None, "p_value_upper_bound": None,
+                "significant_at_0_05": False}
     observed = statistics.mean(deltas)
     if all(abs(d) < 1e-12 for d in deltas):
-        return {"method": "sign-flip", "n": n, "observed_mean_delta": 0.0, "p_value": 1.0, "significant_at_0_05": False}
+        return {"method": "sign-flip", "n": n, "observed_mean_delta": 0.0,
+                "p_value": 1.0, "p_value_upper_bound": 1.0,
+                "significant_at_0_05": False}
     target = abs(observed) - 1e-12
     if n <= max_exact_n:
         total = 1 << n
@@ -7857,11 +11289,17 @@ def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, sample
         method = "sign-flip-exact"
         # Exact enumeration counts the observed sign pattern itself, so p is never 0.
         p = hits / total
+        p_upper = p
     else:
         rng = random.Random(0)
         hits = 0
+        # The null distribution depends on magnitudes, not input ordering or
+        # original signs. Canonicalizing makes the seeded approximation
+        # permutation-invariant.
+        magnitudes = sorted(abs(float(delta)) for delta in deltas)
         for _ in range(samples):
-            s = sum(-d if rng.random() < 0.5 else d for d in deltas)
+            s = sum(-delta if rng.random() < 0.5 else delta
+                    for delta in magnitudes)
             if abs(s / n) >= target:
                 hits += 1
         method = "sign-flip-sampled"
@@ -7869,7 +11307,10 @@ def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, sample
         # pattern is one valid permutation under H0, so a sampled p is never a
         # (statistically impossible) exact 0.
         p = (hits + 1) / (samples + 1)
-    return {"method": method, "n": n, "observed_mean_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
+        p_upper = _monte_carlo_upper_bound(hits, samples)
+    return {"method": method, "n": n, "observed_mean_delta": observed,
+            "p_value": p, "p_value_upper_bound": p_upper,
+            "significant_at_0_05": p_upper <= 0.05}
 
 
 def two_sample_permutation_significance(a: list[float], b: list[float], *, max_exact_total: int = 18, samples: int = 4096) -> dict[str, Any]:
@@ -7884,12 +11325,16 @@ def two_sample_permutation_significance(a: list[float], b: list[float], *, max_e
     re-grade stays byte-identical (CF.3)."""
     na, nb = len(a), len(b)
     if na == 0 or nb == 0:
-        return {"method": "two-sample-permutation", "n_a": na, "n_b": nb, "observed_delta": None, "p_value": None, "significant_at_0_05": False}
+        return {"method": "two-sample-permutation", "n_a": na, "n_b": nb,
+                "observed_delta": None, "p_value": None,
+                "p_value_upper_bound": None, "significant_at_0_05": False}
     observed = statistics.mean(a) - statistics.mean(b)
-    pool = list(a) + list(b)
+    pool = sorted(float(value) for value in list(a) + list(b))
     total_n = na + nb
     if all(abs(x - pool[0]) < 1e-12 for x in pool):
-        return {"method": "two-sample-permutation", "n_a": na, "n_b": nb, "observed_delta": 0.0, "p_value": 1.0, "significant_at_0_05": False}
+        return {"method": "two-sample-permutation", "n_a": na, "n_b": nb,
+                "observed_delta": 0.0, "p_value": 1.0,
+                "p_value_upper_bound": 1.0, "significant_at_0_05": False}
     target = abs(observed) - 1e-12
     total_sum = sum(pool)
     def delta_for(idx_a: Iterable[int]) -> float:
@@ -7906,6 +11351,7 @@ def two_sample_permutation_significance(a: list[float], b: list[float], *, max_e
                 hits += 1
         method = "two-sample-permutation-exact"
         p = hits / combos
+        p_upper = p
     else:
         rng = random.Random(0)
         idx = list(range(total_n))
@@ -7918,7 +11364,11 @@ def two_sample_permutation_significance(a: list[float], b: list[float], *, max_e
         # (b+1)/(m+1) Monte-Carlo estimator: the observed labeling is itself a
         # valid permutation, so a sampled p is never an impossible exact 0.
         p = (hits + 1) / (samples + 1)
-    return {"method": method, "n_a": na, "n_b": nb, "observed_delta": round(observed, 6), "p_value": round(p, 6), "significant_at_0_05": p <= 0.05}
+        p_upper = _monte_carlo_upper_bound(hits, samples)
+    return {"method": method, "n_a": na, "n_b": nb,
+            "observed_delta": observed, "p_value": p,
+            "p_value_upper_bound": p_upper,
+            "significant_at_0_05": p_upper <= 0.05}
 
 
 @_dataclass(frozen=True)
@@ -7927,6 +11377,141 @@ class _TriggerReportRows:
     observations: tuple[TriggerObservation, ...]
     cells: dict[tuple[str, str | None, str], dict[int, TriggerObservation]]
     queries: dict[str, tuple[str, bool]]
+    protocol: dict[str, Any]
+    protocol_sha256: str
+    manifest_identity: dict[str, Any]
+    protocol_observations: dict[tuple[str, str | None, str], dict[int, dict[str, Any]]]
+    protocol_observation_errors: dict[tuple[str, str | None, str], dict[int, str]]
+
+
+def _validated_trigger_protocol(
+    protocol: dict[str, Any], *, label: str, runs_per_query: int,
+    design_pairs: set[tuple[str, str | None]],
+) -> dict[str, dict[str, bool]]:
+    """Type and cross-check the behavior contract against the declared design."""
+    def positive_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    if protocol.get("schema_version") != 1:
+        die(f"{label} protocol schema_version must be 1")
+    if protocol.get("runs_per_query") != runs_per_query:
+        die(f"{label} protocol runs_per_query disagrees with its report")
+    if not positive_int(protocol.get("timeout_seconds")):
+        die(f"{label} protocol timeout_seconds must be a positive integer")
+    if not positive_int(protocol.get("workers")):
+        die(f"{label} protocol workers must be a positive integer")
+    try:
+        validate_trigger_harness_identity(protocol.get("harness_identity"), label)
+    except ValueError as exc:
+        die(str(exc))
+
+    producer = protocol.get("producer")
+    configured_pairs: set[tuple[str, str | None]] = set()
+    requirements: dict[str, dict[str, bool]] = {}
+    if producer == "skill-trigger-matrix":
+        adapters = protocol.get("adapters")
+        if not isinstance(adapters, list) or not adapters:
+            die(f"{label} matrix protocol adapters must be a non-empty list")
+        for position, adapter in enumerate(adapters, 1):
+            if not isinstance(adapter, dict):
+                die(f"{label} matrix protocol adapter {position} must be an object")
+            agent = adapter.get("agent")
+            trace_dialect = adapter.get("trace_dialect")
+            implementation = adapter.get("adapter")
+            implementation_sha256 = adapter.get("implementation_sha256")
+            producer_sha256 = adapter.get("producer_sha256")
+            models = adapter.get("models")
+            required = adapter.get("required_observations")
+            if (not isinstance(agent, str) or not agent.strip()
+                    or trace_dialect != agent
+                    or not isinstance(implementation, str) or not implementation.strip()
+                    or not isinstance(implementation_sha256, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", implementation_sha256) is None
+                    or not isinstance(producer_sha256, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", producer_sha256) is None
+                    or not isinstance(models, list) or not models
+                    or not isinstance(required, dict)
+                    or any(not isinstance(key, str) or type(value) is not bool
+                           for key, value in required.items())):
+                die(f"{label} matrix protocol adapter {position} is malformed")
+            known_implementation = {
+                "claude": "run_trigger_matrix.ClaudeAdapter",
+                "codex": "run_trigger_matrix.CodexAdapter",
+                "pi": "run_trigger_matrix.PiAdapter",
+                "stub": "run_trigger_matrix.StubAdapter",
+                "vibe": "run_trigger_matrix.VibeAdapter",
+            }.get(agent)
+            if known_implementation is not None and implementation != known_implementation:
+                die(
+                    f"{label} matrix protocol adapter {agent!r} must use "
+                    f"{known_implementation}, got {implementation}")
+            known_requirements = {
+                "claude": {"config_isolated": True},
+                "codex": {"codex_home_outside_workdir": True},
+                "pi": {"config_isolated": True},
+                "stub": {},
+                "vibe": {"config_isolated": True,
+                         "vibe_home_outside_workdir": True},
+            }.get(agent)
+            if known_requirements is not None and required != known_requirements:
+                die(
+                    f"{label} matrix protocol adapter {agent!r} must require "
+                    f"{known_requirements}, got {required}")
+            if agent in requirements:
+                die(f"{label} matrix protocol duplicates adapter {agent!r}")
+            requirements[agent] = dict(required)
+            for model in models:
+                if model is not None and (not isinstance(model, str) or not model.strip()):
+                    die(f"{label} matrix protocol adapter {agent!r} has an invalid model")
+                pair = (agent, model)
+                if pair in configured_pairs:
+                    die(f"{label} matrix protocol duplicates agent/model {pair!r}")
+                configured_pairs.add(pair)
+    elif producer == "skill-pi-trigger-eval":
+        model = protocol.get("model")
+        required = protocol.get("required_observations")
+        if (protocol.get("adapter") != "pi"
+                or (model is not None and (not isinstance(model, str) or not model.strip()))
+                or not isinstance(protocol.get("command"), dict)
+                or not isinstance(protocol.get("producer_sha256"), str)
+                or re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", protocol.get("producer_sha256", "")) is None
+                or not isinstance(required, dict)
+                or any(not isinstance(key, str) or type(value) is not bool
+                       for key, value in required.items())):
+            die(f"{label} Pi trigger protocol is malformed")
+        configured_pairs.add(("pi", model))
+        if required != {"config_isolated": True}:
+            die(
+                f"{label} Pi trigger protocol must require config_isolated=true")
+        requirements["pi"] = dict(required)
+    else:
+        die(f"{label} protocol producer must be skill-trigger-matrix or skill-pi-trigger-eval")
+    if configured_pairs != design_pairs:
+        die(
+            f"{label} protocol agent/model design disagrees with its report: "
+            f"protocol={sorted(configured_pairs, key=str)}, design={sorted(design_pairs, key=str)}")
+    return requirements
+
+
+def _trigger_protocol_observation_error(
+    observation: dict[str, Any], required: dict[str, bool],
+) -> str | None:
+    """Return why a row did not satisfy its declared safe runtime controls."""
+    allowed_suffixes = ("_isolated", "_outside_workdir", "_copied", "_warning")
+    for key, value in observation.items():
+        if not isinstance(key, str) or not key.endswith(allowed_suffixes):
+            return f"unsupported protocol observation {key!r}"
+        if key.endswith("_warning"):
+            return f"runtime isolation warning present: {value}"
+        if type(value) is not bool:
+            return f"protocol observation {key!r} must be boolean"
+        if key.endswith(("_isolated", "_outside_workdir")) and value is not True:
+            return f"required runtime control {key!r} is false"
+    for key, expected in required.items():
+        if observation.get(key) is not expected:
+            return f"required protocol observation {key!r} must be {expected}"
+    return None
 
 
 def _trigger_report_rows(report: dict[str, Any], label: str) -> _TriggerReportRows:
@@ -7948,11 +11533,28 @@ def _trigger_report_rows(report: dict[str, Any], label: str) -> _TriggerReportRo
     report_hash = report.get("skill_tree_hash")
     if not isinstance(report_hash, str) or not report_hash:
         die(f"{label} skill_tree_hash must be a non-empty string")
+    protocol = report.get("protocol")
+    protocol_sha256 = report.get("protocol_sha256")
+    if (not isinstance(protocol, dict) or not isinstance(protocol_sha256, str)
+            or canonical_json_sha256(protocol) != protocol_sha256):
+        die(f"{label} protocol must match its protocol_sha256")
+    manifest_identity = report.get("manifest_identity")
+    if not isinstance(manifest_identity, dict):
+        die(f"{label} manifest_identity must be an object")
+    identity_digest = manifest_identity.get("identity_sha256")
+    identity_payload = {key: value for key, value in manifest_identity.items()
+                        if key != "identity_sha256"}
+    if (not isinstance(identity_digest, str)
+            or canonical_json_sha256(identity_payload) != identity_digest):
+        die(f"{label} manifest_identity does not match its identity_sha256")
+    if manifest_identity.get("skill_name") != report.get("skill_name"):
+        die(f"{label} manifest_identity names a different skill")
     design = report.get("design")
     if not isinstance(design, list) or not design:
         die(f"{label} design must be a non-empty list of expected trigger cells")
     expected_cells: set[tuple[str, str | None, str]] = set()
     queries: dict[str, tuple[str, bool]] = {}
+    query_ids_by_definition: dict[str, tuple[str, bool]] = {}
     for position, cell in enumerate(design, 1):
         if not isinstance(cell, dict):
             die(f"{label} design cell {position} must be an object")
@@ -7971,12 +11573,25 @@ def _trigger_report_rows(report: dict[str, Any], label: str) -> _TriggerReportRo
         prior_definition = queries.setdefault(query_id, definition)
         if prior_definition != definition:
             die(f"{label} design query_id {query_id!r} identifies conflicting queries")
+        inference_query = canonical_trigger_query(query)
+        prior = query_ids_by_definition.setdefault(
+            inference_query, (query_id, should))
+        if prior != (query_id, should):
+            die(
+                f"{label} design canonical query aliases must share one query ID and polarity; "
+                f"got {prior!r} and {(query_id, should)!r}")
         cell_key = (agent, model, query_id)
         if cell_key in expected_cells:
             die(f"{label} duplicates design cell ({agent}, {model}, {query_id})")
         expected_cells.add(cell_key)
+    protocol_requirements = _validated_trigger_protocol(
+        protocol, label=label, runs_per_query=runs_per_query,
+        design_pairs={(agent, model) for agent, model, _ in expected_cells},
+    )
     observations: list[TriggerObservation] = []
     cells: dict[tuple[str, str | None, str], dict[int, TriggerObservation]] = {}
+    protocol_observations: dict[tuple[str, str | None, str], dict[int, dict[str, Any]]] = {}
+    protocol_observation_errors: dict[tuple[str, str | None, str], dict[int, str]] = {}
     for position, row in enumerate(rows, 1):
         try:
             observation = TriggerObservation.from_row(row)
@@ -7986,6 +11601,11 @@ def _trigger_report_rows(report: dict[str, Any], label: str) -> _TriggerReportRo
             die(f"{label} results row {position}: trigger repetition identity is required")
         if not isinstance(row, dict) or row.get("skill_tree_hash") != report_hash:
             die(f"{label} results row {position}: skill_tree_hash disagrees with its report")
+        if row.get("protocol_sha256") != protocol_sha256:
+            die(f"{label} results row {position}: protocol_sha256 disagrees with its report")
+        protocol_observation = row.get("protocol_observation")
+        if not isinstance(protocol_observation, dict):
+            die(f"{label} results row {position}: protocol_observation must be an object")
         identity = observation.identity
         definition = (observation.query, observation.expectation.should_trigger)
         cell_key = (observation.agent, observation.model, identity.query_id)
@@ -7999,6 +11619,12 @@ def _trigger_report_rows(report: dict[str, Any], label: str) -> _TriggerReportRo
                 f"{label} duplicates repetition {identity.run_number} for "
                 f"({observation.agent}, {observation.model}, {identity.query_id})")
         cell[identity.run_number] = observation
+        protocol_observations.setdefault(cell_key, {})[identity.run_number] = protocol_observation
+        observation_error = _trigger_protocol_observation_error(
+            protocol_observation, protocol_requirements[observation.agent])
+        if observation_error is not None:
+            protocol_observation_errors.setdefault(cell_key, {})[
+                identity.run_number] = observation_error
         observations.append(observation)
     expected_runs = set(range(1, runs_per_query + 1))
     for agent, model, query_id in expected_cells:
@@ -8009,7 +11635,11 @@ def _trigger_report_rows(report: dict[str, Any], label: str) -> _TriggerReportRo
                 f"{label} has incomplete repetition identities for "
                 f"({agent}, {model}, {query_id}): expected {sorted(expected_runs)}, "
                 f"got {sorted(actual_runs)}")
-    return _TriggerReportRows(runs_per_query, tuple(observations), cells, queries)
+    return _TriggerReportRows(
+        runs_per_query, tuple(observations), cells, queries,
+        protocol, protocol_sha256, manifest_identity, protocol_observations,
+        protocol_observation_errors,
+    )
 
 
 def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any]) -> dict[str, Any]:
@@ -8040,6 +11670,11 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
     reasons: list[str] = []
     if baseline.get("skill_name") != ablation.get("skill_name"):
         reasons.append("baseline and ablation reports name different skills")
+    if base_report.manifest_identity != abl_report.manifest_identity:
+        reasons.append("baseline and ablation reports use different manifest treatment identities")
+    if (base_report.protocol_sha256 != abl_report.protocol_sha256
+            or base_report.protocol != abl_report.protocol):
+        reasons.append("baseline and ablation reports use different experimental protocols")
     base_hash = str(baseline.get("skill_tree_hash") or "")
     if not base_hash:
         reasons.append("baseline report has no skill_tree_hash")
@@ -8064,12 +11699,21 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
                            "the two runs measured a different skill revision")
         if str(ablation.get("skill_tree_hash") or "") != prov.identity.edited:
             reasons.append("ablation report skill_tree_hash does not match its provenance skill_hash")
+        try:
+            expected_provenance = expected_provenance_from_trigger_identity(
+                base_report.manifest_identity, str(ablation.get("ablation") or ""))
+        except (TypeError, ValueError) as exc:
+            reasons.append(f"manifest treatment identity invalid: {exc}")
+        else:
+            if not prov.matches(expected_provenance):
+                reasons.append("ablation provenance does not match the manifest-declared treatment")
     provenance_verified = not reasons
 
     def rates(complete: list[TriggerObservation], total: int) -> dict[str, Any]:
         return {"runs": total, "complete": len(complete),
-                "pass_rate": round(statistics.mean(1.0 if o.passed else 0.0 for o in complete), 6),
-                "trigger_rate": round(statistics.mean(1.0 if o.detection.triggered else 0.0 for o in complete), 6)}
+                "pass_rate": _exact_rate(sum(1 for o in complete if o.passed), len(complete)),
+                "trigger_rate": _exact_rate(
+                    sum(1 for o in complete if o.detection.triggered), len(complete))}
 
     base_cells, abl_cells = base_report.cells, abl_report.cells
     comparable: list[dict[str, Any]] = []
@@ -8078,6 +11722,10 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
         agent, model, query_id = key
         base_by_run = base_cells.get(key, {})
         abl_by_run = abl_cells.get(key, {})
+        base_protocol_observations = base_report.protocol_observations.get(key, {})
+        abl_protocol_observations = abl_report.protocol_observations.get(key, {})
+        base_protocol_errors = base_report.protocol_observation_errors.get(key, {})
+        abl_protocol_errors = abl_report.protocol_observation_errors.get(key, {})
         base_definition = base_report.queries.get(query_id)
         abl_definition = abl_report.queries.get(query_id)
         definition = base_definition or abl_definition
@@ -8094,6 +11742,8 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
                   else "baseline_observations_incomplete" if len(base_complete) != len(base_observations)
                   else "ablation_observations_incomplete" if len(abl_complete) != len(abl_observations)
                   else "repetition_count_mismatch" if set(base_by_run) != set(abl_by_run)
+                  else "protocol_observation_unsafe" if base_protocol_errors or abl_protocol_errors
+                  else "protocol_observation_mismatch" if base_protocol_observations != abl_protocol_observations
                   else None)
         if reason:
             entry = {"agent": agent, "model": model, "query_id": query_id, "query": query,
@@ -8103,6 +11753,11 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
                     "ablation_query": abl_definition[0] if abl_definition else None,
                     "ablation_should_trigger": abl_definition[1] if abl_definition else None,
                 })
+            elif reason == "protocol_observation_unsafe":
+                entry.update({
+                    "baseline_protocol_errors": base_protocol_errors,
+                    "ablation_protocol_errors": abl_protocol_errors,
+                })
             blocked.append(entry)
             continue
         base_block = rates(base_complete, len(base_by_run))
@@ -8111,40 +11766,54 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
             "agent": agent, "model": model, "query_id": query_id,
             "query": query, "should_trigger": should,
             "baseline": base_block, "ablation": abl_block,
-            "pass_delta": round(abl_block["pass_rate"] - base_block["pass_rate"], 6),
-            "trigger_delta": round(abl_block["trigger_rate"] - base_block["trigger_rate"], 6),
+            "pass_delta": abl_block["pass_rate"] - base_block["pass_rate"],
+            "trigger_delta": abl_block["trigger_rate"] - base_block["trigger_rate"],
         })
 
     # Agent/model cells are repeated measurements of the SAME authored query,
     # not independent experimental units. Collapse them before inference so a
     # single query run through many models cannot manufacture significance.
-    grouped_queries: dict[tuple[str, str, bool], list[dict[str, Any]]] = collections.defaultdict(list)
+    grouped_queries: dict[tuple[str, bool], list[dict[str, Any]]] = collections.defaultdict(list)
     for entry in comparable:
-        grouped_queries[(entry["query_id"], entry["query"], entry["should_trigger"])].append(entry)
+        grouped_queries[(canonical_trigger_query(entry["query"]), entry["should_trigger"])].append(entry)
     query_units = [{
-        "query_id": query_id,
-        "query": query,
+        "query_id": entries[0]["query_id"],
+        "query": entries[0]["query"],
+        "inference_query": inference_query,
         "should_trigger": should,
         "cells": len(entries),
-        "pass_delta": round(statistics.mean(e["pass_delta"] for e in entries), 6),
-        "trigger_delta": round(statistics.mean(e["trigger_delta"] for e in entries), 6),
-    } for (query_id, query, should), entries in sorted(
+        "pass_delta": statistics.mean(e["pass_delta"] for e in entries),
+        "trigger_delta": statistics.mean(e["trigger_delta"] for e in entries),
+    } for (inference_query, should), entries in sorted(
         grouped_queries.items(), key=lambda item: item[0])]
-    significance = sign_flip_significance([entry["pass_delta"] for entry in query_units])
+    observed_significance = sign_flip_significance(
+        [entry["pass_delta"] for entry in query_units])
+    significance = observed_significance
+    if blocked:
+        significance = {
+            "method": "unavailable", "n": 0, "p_value": None,
+            "significant_at_0_05": False, "observed": observed_significance,
+            "reason": "incomplete_trigger_pairing",
+        }
     regressed = [entry for entry in query_units if entry["pass_delta"] < 0]
-    mean_delta = significance.get("observed_mean_delta")
+    mean_delta = observed_significance.get("observed_mean_delta")
     aggregate_regression = isinstance(mean_delta, (int, float)) and mean_delta < 0
     # A two-sided test can be significant in the improvement direction. Only a
     # significant aggregate drop can pass the causal-confirmation gate.
     significant_drop = bool(significance.get("significant_at_0_05")) and aggregate_regression
-    evidence_class = causal_confirmation(
-        provenance_verified=provenance_verified,
-        has_coverage=bool(query_units) and not blocked,
-        regression_observed=aggregate_regression,
-        significant=significant_drop,
-    )
+    if prov is not None and prov.mode is AblationMode.INVALID_SKILL:
+        evidence_class = EvidenceClass.INDETERMINATE
+    else:
+        evidence_class = causal_confirmation(
+            provenance_verified=provenance_verified,
+            has_coverage=bool(query_units) and not blocked,
+            regression_observed=aggregate_regression,
+            significant=significant_drop,
+        )
     note = None
-    if not provenance_verified:
+    if prov is not None and prov.mode is AblationMode.INVALID_SKILL:
+        note = "invalid-skill experiment: parser rejection is not behavioral trigger evidence"
+    elif not provenance_verified:
         note = "provenance unverified: " + "; ".join(reasons)
     elif blocked:
         note = f"coverage incomplete: {len(blocked)} trigger cell(s) are blocked"
@@ -8166,13 +11835,16 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
                        "baseline_skill_tree_hash": base_hash,
                        "ablation_skill_tree_hash": ablation.get("skill_tree_hash")},
         "paired": {"comparable_queries": comparable, "query_units": query_units,
-                   "blocked": blocked, "significance": significance},
+                   "blocked": blocked, "significance": significance,
+                   **({"observed_significance": observed_significance} if blocked else {})},
         "regressed_queries": [{k: entry[k] for k in ("query_id", "query", "should_trigger", "pass_delta")}
                               for entry in regressed],
         "summary": {"comparable": len(query_units), "comparable_cells": len(comparable),
                     "blocked": len(blocked),
                     "regressed": len(regressed),
-                    "mean_pass_delta": significance.get("observed_mean_delta")},
+                    "availability": "partial" if blocked else "complete",
+                    "mean_pass_delta": None if blocked else mean_delta,
+                    **({"observed_mean_pass_delta": mean_delta} if blocked else {})},
     }
     if note:
         out["note"] = note
@@ -8235,37 +11907,62 @@ def build_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
     passed (objective_pass_rate == 1.0); n is the scorable run count. by_variant
     pools per-case pass@1 and the all-runs-pass rate so a variant reads as one
     number. Deterministic — the estimators are closed-form over integer counts."""
-    by_cv = ResultSet(results).by_case_variant()
+    by_cv: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for row in results:
+        by_cv.setdefault(str(row.get("case_id")), {}).setdefault(
+            str(row.get("variant")), []).append(row)
     by_case_variant: dict[str, Any] = {}
     variant_pass1: dict[str, list[float]] = {}
     variant_all_pass: dict[str, list[float]] = {}
     for case_id, by_variant in sorted(by_cv.items()):
         for variant, rows in sorted(by_variant.items()):
-            rates = [float(r["objective_pass_rate"]) for r in rows
+            scorable = [r for r in rows if scorable_run(r)]
+            rates = [float(r["objective_pass_rate"]) for r in scorable
                      if isinstance(r.get("objective_pass_rate"), (int, float))
                      and not isinstance(r.get("objective_pass_rate"), bool)
                      and math.isfinite(float(r["objective_pass_rate"]))
                      and 0 <= float(r["objective_pass_rate"]) <= 1]
             n = len(rates)
-            if n == 0:
-                continue
+            attempted = len(rows)
+            blocked = attempted - n
             c = sum(1 for x in rates if x >= 1.0 - 1e-12)
             ks = list(range(1, n + 1))
+            observed_pass_at_1 = round(pass_at_k(n, c, 1), 6) if n else None
+            observed_pass_at_k = {str(k): round(v, 6) for k in ks
+                                  if (v := pass_at_k(n, c, k)) is not None}
+            observed_pass_hat_k = {str(k): round(v, 6) for k in ks
+                                   if (v := pass_hat_k(n, c, k)) is not None}
             entry = {
-                "n": n, "c": c,
-                "pass_at_1": round(pass_at_k(n, c, 1), 6),
-                "pass_at_k": {str(k): round(v, 6) for k in ks if (v := pass_at_k(n, c, k)) is not None},
-                "pass_hat_k": {str(k): round(v, 6) for k in ks if (v := pass_hat_k(n, c, k)) is not None},
+                "attempted": attempted, "n": n, "c": c, "blocked": blocked,
+                "availability": "partial" if blocked else "complete",
+                "pass_at_1": None if blocked else observed_pass_at_1,
+                "pass_at_k": {} if blocked else observed_pass_at_k,
+                "pass_hat_k": {} if blocked else observed_pass_hat_k,
             }
+            if blocked:
+                entry.update({"observed_pass_at_1": observed_pass_at_1,
+                              "observed_pass_at_k": observed_pass_at_k,
+                              "observed_pass_hat_k": observed_pass_hat_k})
             by_case_variant.setdefault(str(case_id), {})[str(variant)] = entry
-            variant_pass1.setdefault(str(variant), []).append(entry["pass_at_1"])
-            variant_all_pass.setdefault(str(variant), []).append(1.0 if c == n else 0.0)
+            if observed_pass_at_1 is not None:
+                variant_pass1.setdefault(str(variant), []).append(observed_pass_at_1)
+                variant_all_pass.setdefault(str(variant), []).append(1.0 if c == n else 0.0)
     by_variant_summary = {
         v: {
             "cases": len(variant_pass1[v]),
-            "mean_pass_at_1": round(statistics.mean(variant_pass1[v]), 6),
+            "partial_cases": sum(1 for blocks in by_case_variant.values()
+                                 if v in blocks and blocks[v]["availability"] == "partial"),
+            "mean_pass_at_1": (
+                None if any(v in blocks and blocks[v]["availability"] == "partial"
+                            for blocks in by_case_variant.values())
+                else round(statistics.mean(variant_pass1[v]), 6)),
             # Share of cases whose every run passed — the pass^n reliability headline.
-            "all_runs_pass_rate": round(statistics.mean(variant_all_pass[v]), 6),
+            "all_runs_pass_rate": (
+                None if any(v in blocks and blocks[v]["availability"] == "partial"
+                            for blocks in by_case_variant.values())
+                else round(statistics.mean(variant_all_pass[v]), 6)),
+            "observed_mean_pass_at_1": round(statistics.mean(variant_pass1[v]), 6),
+            "observed_all_runs_pass_rate": round(statistics.mean(variant_all_pass[v]), 6),
         }
         for v in sorted(variant_pass1)
     }
@@ -8350,6 +12047,32 @@ def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates
     }
 
 
+PAIR_HEADLINE_FIELDS = (
+    "with_skill_objective_pass_rate", "without_skill_objective_pass_rate",
+    "absolute_delta", "normalized_gain",
+)
+
+
+def pairing_aware_block(block: dict[str, Any],
+                        construction: pair_domain.PairConstruction) -> dict[str, Any]:
+    """Make subset-only lift explicitly diagnostic when any identity is blocked."""
+    out = dict(block)
+    out["pairing"] = construction.diagnostics()
+    if not construction.blocked:
+        out["availability"] = "complete"
+        return out
+    out["availability"] = "partial"
+    for key in PAIR_HEADLINE_FIELDS:
+        out[f"observed_{key}"] = out.get(key)
+        out[key] = None
+    out["observed_significance"] = out.get("significance")
+    out["significance"] = {
+        "method": "unavailable", "n": 0, "p_value": None,
+        "significant_at_0_05": False, "reason": "incomplete_pairing",
+    }
+    return out
+
+
 def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     # The pairing key is (case, model) — roadmap 2.1. Each model's rows pair
     # with_skill against without_skill within that model only; the headline
@@ -8370,7 +12093,9 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         all_with.extend(w)
         all_without.extend(n)
         all_negative.extend({**item, "model": model} for item in neg)
-        by_model[model] = paired_block_from_rates(w, n, neg)
+        by_model[model] = pairing_aware_block(
+            paired_block_from_rates(w, n, neg),
+            _metric_pair_construction(rows, "objective_pass_rate"))
         gw, gn, _ = paired_case_rates(rows, key="graded_score")
         graded_with.extend(gw)
         graded_without.extend(gn)
@@ -8383,19 +12108,28 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         gw, gn, _ = paired_case_rates(pool, key="graded_score")
         graded_with.extend(gw)
         graded_without.extend(gn)
-    out = paired_block_from_rates(all_with, all_without, all_negative)
-    out["pairing"] = _metric_pair_construction(results, "objective_pass_rate").diagnostics()
+    out = pairing_aware_block(
+        paired_block_from_rates(all_with, all_without, all_negative),
+        _metric_pair_construction(results, "objective_pass_rate"))
     if graded_with:
         # The graded channel (roadmap 2.2): how much better, after the binary
         # ceiling. Vetoed runs carry no graded_score, so a critical failure can
         # never be averaged into this mean.
         graded_deltas = [w - n for w, n in zip(graded_with, graded_without)]
-        out["graded"] = {
+        graded = {
             "with_skill_mean_score": round(statistics.mean(graded_with), 4),
             "without_skill_mean_score": round(statistics.mean(graded_without), 4),
             "delta": round(statistics.mean(graded_deltas), 4),
             "significance": sign_flip_significance(graded_deltas),
         }
+        graded_construction = _metric_pair_construction(results, "graded_score")
+        if graded_construction.blocked:
+            out["observed_graded"] = graded
+            out["graded"] = {"availability": "partial", "delta": None,
+                             "pairing": graded_construction.diagnostics()}
+        else:
+            out["graded"] = {"availability": "complete", **graded,
+                             "pairing": graded_construction.diagnostics()}
     if by_model:
         out["by_model"] = by_model
     return out
@@ -8446,6 +12180,30 @@ def paired_reliability_block(pairs: list[tuple[str, tuple[int, int], tuple[int, 
     return {"by_case": by_case, "pooled": pooled}
 
 
+def pairing_aware_reliability(block: dict[str, Any],
+                              construction: pair_domain.PairConstruction) -> dict[str, Any]:
+    out = dict(block)
+    out["pairing"] = construction.diagnostics()
+    if not construction.blocked:
+        out["availability"] = "complete"
+        return out
+    observed = dict(out.get("pooled") or {})
+    out["availability"] = "partial"
+    out["observed_pooled"] = observed
+    out["pooled"] = {
+        "availability": "partial",
+        "cases": None,
+        "mean_pass_at_1_delta": None,
+        "mean_pass_at_k_delta": {},
+        "mean_pass_hat_k_delta": {},
+        "significance": {
+            "method": "unavailable", "n": 0, "p_value": None,
+            "significant_at_0_05": False, "reason": "incomplete_pairing",
+        },
+    }
+    return out
+
+
 def build_paired_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
     """Paired pass@k / pass^k lift, mirroring build_paired_summary's (case, model)
     pairing so by_model reliability lift lines up with paired_summary.by_model.
@@ -8458,15 +12216,18 @@ def build_paired_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
     for model in models:
         rows = [r for r in results if str(r.get("model")) == model]
         pairs = paired_case_counts(rows)
-        by_model[model] = paired_reliability_block(pairs)
+        by_model[model] = pairing_aware_reliability(
+            paired_reliability_block(pairs),
+            _metric_pair_construction(rows, "objective_pass_rate"))
         # Pool per-(case, model), tagging the case key so a case measured under
         # several models does not collide in the pooled by_case view.
         all_pairs.extend((f"{cid}@{model}", w, n) for (cid, w, n) in pairs)
     if unlabeled or not models:
         pool = unlabeled if models else results
         all_pairs.extend(paired_case_counts(pool))
-    out = paired_reliability_block(all_pairs)
-    out["pairing"] = _metric_pair_construction(results, "objective_pass_rate").diagnostics()
+    out = pairing_aware_reliability(
+        paired_reliability_block(all_pairs),
+        _metric_pair_construction(results, "objective_pass_rate"))
     if by_model:
         out["by_model"] = by_model
     return out
@@ -8489,8 +12250,17 @@ def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> d
     # re-rolled inline; the value enumeration is over all rows (it lists which
     # slices exist), the scoring is over the scorable subset.
     def slice_stats(rs: ResultSet) -> dict[str, Any]:
+        attempted = len(rs)
         s = rs.scorable()
-        return {"runs": len(s), "mean_objective_pass_rate": s.mean_rate("objective_pass_rate"), "mean_combined_pass_rate": s.mean_rate("combined_pass_rate")}
+        blocked = attempted - len(s)
+        objective = s.mean_rate("objective_pass_rate")
+        combined = s.mean_rate("combined_pass_rate")
+        return {"attempted_runs": attempted, "runs": len(s), "blocked_runs": blocked,
+                "availability": "partial" if blocked else "complete",
+                "mean_objective_pass_rate": None if blocked else objective,
+                "mean_combined_pass_rate": None if blocked else combined,
+                "observed_mean_objective_pass_rate": objective,
+                "observed_mean_combined_pass_rate": combined}
 
     everything = ResultSet(results)
     overall_lift = (build_paired_summary(results) or {}).get("absolute_delta")
@@ -8776,6 +12546,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             # A confirmation is meaningful only for exact matched identities.
             measured_pairs = [cid for cid in cases
                               if any(pair_case == cid for pair_case, _ in pairs_by_case_model)]
+            missing_cases = sorted(set(cases) - set(measured_pairs))
             per_case_sig = {}
             for cid, cohort_model in confirmed_cohorts:
                 matched = pairs_by_case_model[(cid, cohort_model)]
@@ -8787,9 +12558,15 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 "min_p_value": min((s["p_value"] for s in per_case_sig.values() if s.get("p_value") is not None), default=None),
                 "by_case": per_case_sig,
             } if confirmed_cohorts else None
+            relevant_blocked_pairs = [
+                blocked.to_dict() for blocked in ablation_pairing.blocked
+                if blocked.key.case_id in cases
+            ]
             reg = {"summary": spec.get("summary", ""), "cases": cases, "assertions": names,
                    "score_regressed": score_regressed, "evidence": evidence,
                    "assertion_coverage_gaps": assertion_coverage_gaps,
+                   "blocked_pairs": relevant_blocked_pairs,
+                   "missing_cases": missing_cases,
                    "measured_cases": measured_pairs, "confirmed_cases": confirmed_cases,
                    "significance": significance}
             # The verdict goes through the EvidenceClass guard: CONFIRMED_CAUSAL is
@@ -8800,7 +12577,8 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 evidence_class = EvidenceClass.INDETERMINATE
                 reg["note"] = "invalid-skill experiment: a parser/validation rejection is not evidence of a behavioral regression"
             else:
-                has_coverage = bool(measured_pairs) and not assertion_coverage_gaps
+                has_coverage = (bool(cases) and not missing_cases and not assertion_coverage_gaps
+                                and not relevant_blocked_pairs)
                 regression_observed = bool(confirmed_cases)
                 significant = bool(significance and significance.get("significant_at_0_05"))
                 # The significance gate lives INSIDE causal_confirmation (its
@@ -8822,6 +12600,12 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                     reg["note"] = f"provenance unverified: {prov_note}"
                 elif assertion_coverage_gaps:
                     reg["note"] = "insufficient assertion coverage across matched repetitions"
+                elif relevant_blocked_pairs:
+                    reg["note"] = (
+                        "insufficient coverage: cited cases have blocked experimental identities")
+                elif missing_cases:
+                    reg["note"] = (
+                        f"insufficient coverage: cited cases have no matched evidence: {missing_cases}")
                 elif not measured_pairs:
                     reg["note"] = "insufficient coverage: no cited case has a graded run in both with_skill and the ablation arm (missing output?)"
             reg["evidence_class"] = evidence_class.value
@@ -9085,6 +12869,7 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
     by_case = group_spend(rows, lambda r: r["case_id"])
     paired_cost_delta: dict[str, Any] = {}
     deltas_by_currency: dict[str, list[float]] = collections.defaultdict(list)
+    all_cost_pairs_comparable = True
     cost_pairing = pair_domain.pairs_from_rows(rows, population="answer")
     complete_by_case: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
     blocked_by_case: dict[str, list[str]] = collections.defaultdict(list)
@@ -9103,6 +12888,8 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
         comparable = [c for c in comparisons if c.availability == telemetry_domain.COMPARABLE]
         blocked = blocked_by_case.get(case_id, []) + [
             str(c.reason) for c in comparisons if c.availability == telemetry_domain.BLOCKED]
+        if blocked:
+            all_cost_pairs_comparable = False
         if comparable:
             by_currency: dict[str, list[Any]] = collections.defaultdict(list)
             for comparison in comparable:
@@ -9114,11 +12901,14 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
                 values = [float(c.value.amount) for c in currency_comparisons]
                 delta = statistics.mean(values)
                 paired_cost_delta[case_id] = {
-                    "availability": "comparable", "currency": currency,
-                    "delta": round(delta, 6), "eligible_pairs": len(comparable),
+                    "availability": "partial" if blocked else "comparable",
+                    "currency": currency,
+                    "delta": None if blocked else round(delta, 6),
+                    "observed_delta": round(delta, 6), "eligible_pairs": len(comparable),
                     "blocked_pairs": len(blocked), "blocked_reason_counts": dict(collections.Counter(blocked)),
                 }
             else:
+                all_cost_pairs_comparable = False
                 paired_cost_delta[case_id] = {
                     "availability": "blocked", "delta": None, "reason": "mixed_currency_pairs",
                     "by_currency": {currency: {"delta": round(statistics.mean(float(c.value.amount) for c in cs), 6),
@@ -9127,6 +12917,7 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
                     "blocked_reason_counts": dict(collections.Counter(blocked)),
                 }
         else:
+            all_cost_pairs_comparable = False
             paired_cost_delta[case_id] = {
                 "availability": "blocked", "delta": None, "eligible_pairs": 0,
                 "blocked_pairs": len(blocked),
@@ -9144,10 +12935,17 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
         "pairing": cost_pairing.diagnostics(),
         # A bare paired delta is USD-only; foreign-currency results retain their
         # own units rather than being silently labelled dollars.
-        "mean_paired_cost_delta": round(statistics.mean(deltas_by_currency["USD"]), 6) if deltas_by_currency.get("USD") else None,
-        "mean_paired_cost_delta_basis": {"currency": "USD"} if deltas_by_currency.get("USD") else None,
-        "mean_paired_cost_delta_by_currency": {currency: round(statistics.mean(values), 6)
-                                                  for currency, values in sorted(deltas_by_currency.items())},
+        "mean_paired_cost_delta": (round(statistics.mean(deltas_by_currency["USD"]), 6)
+                                    if all_cost_pairs_comparable and deltas_by_currency.get("USD") else None),
+        "mean_paired_cost_delta_basis": ({"currency": "USD"}
+                                          if all_cost_pairs_comparable and deltas_by_currency.get("USD") else None),
+        "mean_paired_cost_delta_by_currency": (
+            {currency: round(statistics.mean(values), 6)
+             for currency, values in sorted(deltas_by_currency.items())}
+            if all_cost_pairs_comparable else {}),
+        "observed_mean_paired_cost_delta_by_currency": {
+            currency: round(statistics.mean(values), 6)
+            for currency, values in sorted(deltas_by_currency.items())},
         "ablations": {
             **ablation_spend,
             "confirmed_regressions": confirmed_regressions,
@@ -9171,18 +12969,33 @@ def judge_cost_usd(row: dict[str, Any]) -> float | None:
         return float(block["total_cost"])
     if isinstance(row.get("cost_usd"), (int, float)):
         return float(row["cost_usd"])
+    aggregate = row.get("cost_aggregate")
+    usd = aggregate.get("USD") if isinstance(aggregate, dict) else None
+    if (isinstance(usd, dict) and usd.get("availability") == telemetry_domain.COMPLETE
+            and isinstance(usd.get("value"), (int, float))):
+        return float(usd["value"])
     return None
 
 
 def judge_cost_block(judge_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    def leaves(row: dict[str, Any]) -> list[dict[str, Any]]:
+        for key in ("judge_panel", "judge_runs"):
+            nested = row.get(key)
+            if isinstance(nested, list) and nested:
+                return [leaf for member in nested if isinstance(member, dict)
+                        for leaf in leaves(member)]
+        return [row]
+
+    billed_rows = [leaf for row in judge_results.values() for leaf in leaves(row)]
     measurements = [
         telemetry_domain.measurement_from_envelope_or_cost(
             row, source=str(row.get("provider") or "judge"), population="judge")
-        for row in judge_results.values()
+        for row in billed_rows
     ]
     available = sum(1 for measurement in measurements if measurement.availability == telemetry_domain.AVAILABLE)
     return {
         "verdicts": len(judge_results),
+        "billed_calls": len(billed_rows),
         "verdicts_with_cost": available,
         **_money_aggregate_fields(measurements),
     }
@@ -9227,7 +13040,9 @@ def qualitative_by_visibility(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    scorable_rows = ResultSet(rows).scorable().all   # the scorable predicate, once
+    scorable_rows = [row for row in ResultSet(rows).scorable().all
+                     if row.get("grading_availability", "complete") == "complete"]
+    blocked_runs = len(rows) - len(scorable_rows)
     objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
     combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
     process_rates = [r["process_pass_rate"] for r in scorable_rows if r.get("process_pass_rate") is not None]
@@ -9247,11 +13062,7 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     cost_total = _money_aggregate_fields(cost_measurements)
     elapsed = [m.value for m in elapsed_measurements if m.availability == telemetry_domain.AVAILABLE]
     tokens = [m.value for m in token_measurements if m.availability == telemetry_domain.AVAILABLE]
-    return {
-        "cases": len({r["case_id"] for r in rows}),
-        "runs": len(rows),
-        "missing_outputs": sum(1 for r in rows if r["missing_output"]),
-        "execution_errors": sum(1 for r in rows if not r["missing_output"] and not r.get("execution_valid", True)),
+    observed_rates = {
         "mean_objective_pass_rate": statistics.mean(objective_rates) if objective_rates else None,
         "mean_combined_pass_rate": statistics.mean(combined_rates) if combined_rates else None,
         "mean_process_pass_rate": statistics.mean(process_rates) if process_rates else None,
@@ -9260,6 +13071,15 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "combined_pass_rate": stats(combined_rates),
         "process_pass_rate": stats(process_rates),
         "efficiency_pass_rate": stats(efficiency_rates),
+    }
+    out = {
+        "cases": len({r["case_id"] for r in rows}),
+        "runs": len(rows),
+        "scorable_runs": len(scorable_rows),
+        "blocked_runs": blocked_runs,
+        "missing_outputs": sum(1 for r in rows if r["missing_output"]),
+        "execution_errors": sum(1 for r in rows if not r["missing_output"] and not r.get("execution_valid", True)),
+        **observed_rates,
         "elapsed_ms": measurement_stats(elapsed_measurements),
         "total_tokens": measurement_stats(token_measurements),
         "command_count": measurement_stats(command_measurements),
@@ -9274,6 +13094,270 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         # Backward-compatible fields used by smoke_report.py callers.
         "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
         "median_total_tokens": statistics.median(tokens) if tokens else None,
+    }
+    if blocked_runs:
+        out["availability"] = "partial"
+        out["reason"] = "unscorable_or_incompletely_graded_attempts"
+        for key, value in observed_rates.items():
+            out[f"observed_{key}"] = value
+            out[key] = None
+    else:
+        out["availability"] = "complete"
+    return out
+
+
+def answer_design_coverage(
+    runs: Path,
+    results: list[dict[str, Any]],
+    *,
+    manifest: dict[str, Any] | None = None,
+    manifest_path: Path | None = None,
+    case_ids: Iterable[str] | None = None,
+    variants: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    path = runs / ANSWER_DESIGN_NAME
+    if not path.is_file():
+        return {"availability": "unverified", "complete": False,
+                "reason": f"missing {ANSWER_DESIGN_NAME}"}
+    try:
+        design = validate_answer_design(strict_json_loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return {"availability": "invalid", "complete": False,
+                "reason": str(exc)}
+    requested_cases = set(case_ids) if case_ids is not None else None
+    requested_variants = set(variants) if variants is not None else None
+    scoped_identities = [
+        row for row in design["identities"]
+        if (requested_cases is None or row["case_id"] in requested_cases)
+        and (requested_variants is None or row["variant"] in requested_variants)
+    ]
+    design_errors: list[dict[str, Any]] = []
+    if manifest is not None and manifest_path is not None:
+        try:
+            contract_cases = [
+                case for case in iter_cases(manifest)
+                if requested_cases is None or case.get("id") in requested_cases
+            ]
+            current_contract = eval_contract_sha256(
+                manifest, manifest_path, cases=contract_cases)
+        except (OSError, ValueError) as exc:
+            design_errors.append({"reason": f"cannot attest current eval contract: {exc}"})
+        else:
+            if design.get("eval_contract_sha256") != current_contract:
+                design_errors.append({
+                    "reason": "persisted answer design does not match current eval contract",
+                    "expected": current_contract,
+                    "observed": design.get("eval_contract_sha256"),
+                })
+        case_lookup = {case["id"]: case for case in contract_cases}
+        expected_skill_hashes: dict[str, str | None] = {}
+        for row in scoped_identities:
+            case = case_lookup.get(row["case_id"])
+            if case is None:
+                design_errors.append({
+                    "run_dir": row["run_dir"],
+                    "reason": "answer design case is absent from current manifest scope",
+                })
+                continue
+            expected_case_sha = manifest_case_input_fingerprint(
+                manifest, manifest_path, case)
+            if row["case_input_sha256"] != expected_case_sha:
+                design_errors.append({
+                    "run_dir": row["run_dir"],
+                    "reason": "prepared case input does not match current manifest",
+                })
+            expected_instruction_sha = canonical_json_sha256({
+                "instruction": variant_instruction(
+                    row["variant"], manifest,
+                    repo_root_for_manifest(manifest_path)),
+            })
+            if row["instruction_sha256"] != expected_instruction_sha:
+                design_errors.append({
+                    "run_dir": row["run_dir"],
+                    "reason": "prepared instruction does not match current manifest",
+                })
+            if row["variant"] not in expected_skill_hashes:
+                try:
+                    expected_skill_hashes[row["variant"]] = manifest_variant_skill_hash(
+                        manifest, manifest_path, row["variant"])
+                except (OSError, ValueError, AblationError) as exc:
+                    design_errors.append({
+                        "variant": row["variant"],
+                        "reason": f"cannot reconstruct current skill treatment: {exc}",
+                    })
+                    continue
+            if row["planned_skill_tree_hash"] != expected_skill_hashes.get(row["variant"]):
+                design_errors.append({
+                    "run_dir": row["run_dir"],
+                    "reason": "prepared skill treatment does not match current manifest",
+                })
+    if requested_cases is not None and requested_variants is not None:
+        for case_id in sorted(requested_cases):
+            coordinates = {
+                variant: {
+                    (row["model"], row["run_number"])
+                    for row in scoped_identities
+                    if row["case_id"] == case_id and row["variant"] == variant
+                }
+                for variant in requested_variants
+            }
+            missing_variants = sorted(
+                variant for variant, values in coordinates.items() if not values)
+            if missing_variants:
+                design_errors.append({
+                    "case_id": case_id,
+                    "reason": "design omits requested case/variant cells",
+                    "variants": missing_variants,
+                })
+            nonempty = [values for values in coordinates.values() if values]
+            if nonempty and any(values != nonempty[0] for values in nonempty[1:]):
+                design_errors.append({
+                    "case_id": case_id,
+                    "reason": "design variants have different model/run coordinates",
+                })
+    # validate_answer_design guarantees unique run_dir values, so this mapping
+    # cannot silently collapse expected attempts.
+    expected = {row["run_dir"]: row for row in scoped_identities}
+    observed: dict[str, dict[str, Any]] = {}
+    errors: list[dict[str, Any]] = []
+    for result in results:
+        base = Path(str(result.get("run_base") or ""))
+        if not base.exists():
+            continue
+        try:
+            relative = base.resolve().relative_to(runs.resolve()).as_posix()
+        except (OSError, ValueError):
+            errors.append({"run_base": str(base), "reason": "outside runs root"})
+            continue
+        if relative in observed:
+            errors.append({"run_dir": relative, "reason": "duplicate discovered run"})
+            continue
+        observed[relative] = result
+        expected_row = expected.get(relative)
+        if expected_row is None:
+            continue
+        metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        identity = {
+            "case_id": metadata.get("case_id"), "model": metadata.get("model"),
+            "variant": metadata.get("variant"), "run_number": metadata.get("run_number"),
+        }
+        expected_identity = {key: expected_row[key]
+                             for key in ("case_id", "model", "variant", "run_number")}
+        if metadata.get("answer_design_sha256") != design["design_sha256"]:
+            errors.append({"run_dir": relative, "reason": "design digest not attested"})
+        if metadata.get("answer_task_sha256") != expected_row["task_sha256"]:
+            errors.append({"run_dir": relative, "reason": "task fingerprint not attested"})
+        if metadata.get("answer_instruction_sha256") != expected_row["instruction_sha256"]:
+            errors.append({"run_dir": relative, "reason": "instruction fingerprint not attested"})
+        if metadata.get("fixture_tree_hash") != expected_row["fixture_tree_hash"]:
+            errors.append({"run_dir": relative, "reason": "fixture surface not attested"})
+        observed_skill_hash = metadata.get("skill_tree_hash")
+        if observed_skill_hash != expected_row["planned_skill_tree_hash"]:
+            errors.append({"run_dir": relative, "reason": "skill surface not attested"})
+        if metadata.get("provider") == "jetty":
+            task_contract_sha256 = metadata.get("jetty_task_contract_sha256")
+            if (not isinstance(task_contract_sha256, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", task_contract_sha256) is None):
+                errors.append({
+                    "run_dir": relative,
+                    "reason": "Jetty model-visible task contract not attested",
+                })
+            else:
+                raw_path = base / "jetty_raw.json"
+                try:
+                    raw = strict_json_loads(raw_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    errors.append({
+                        "run_dir": relative,
+                        "reason": f"Jetty raw result is unavailable or invalid: {exc}",
+                    })
+                else:
+                    raw_harness = raw.get("harness") if isinstance(raw, dict) else None
+                    if (not isinstance(raw_harness, dict)
+                            or raw_harness.get("jetty_task_contract_sha256")
+                            != task_contract_sha256
+                            or raw.get("jetty_task_contract_sha256")
+                            != task_contract_sha256):
+                        errors.append({
+                            "run_dir": relative,
+                            "reason": (
+                                "Jetty raw result does not preserve the attested "
+                                "model-visible task contract"),
+                        })
+        if identity != expected_identity:
+            errors.append({"run_dir": relative, "reason": "metadata identity mismatch",
+                           "expected": expected_identity, "observed": identity})
+    missing = sorted(set(expected) - set(observed))
+    extra = sorted(set(observed) - set(expected))
+    errors = [*design_errors, *errors]
+    complete = not missing and not extra and not errors
+    return {
+        "availability": "complete" if complete else "partial",
+        "complete": complete, "design_sha256": design["design_sha256"],
+        "expected_runs": len(expected), "observed_runs": len(observed),
+        "missing_run_dirs": missing, "extra_run_dirs": extra,
+        "attestation_errors": errors,
+    }
+
+
+def invalidate_report_pairing(block: dict[str, Any], reason: str) -> dict[str, Any]:
+    out = dict(block)
+    if out.get("availability") != "partial":
+        for key in PAIR_HEADLINE_FIELDS:
+            out[f"observed_{key}"] = out.get(key)
+            out[key] = None
+        out["observed_significance"] = out.get("significance")
+        out["significance"] = {"method": "unavailable", "n": 0,
+                               "p_value": None, "significant_at_0_05": False,
+                               "reason": reason}
+    out["availability"] = "partial"
+    out["design_coverage_reason"] = reason
+    if isinstance(out.get("by_model"), dict):
+        out["by_model"] = {model: invalidate_report_pairing(value, reason)
+                           for model, value in out["by_model"].items()}
+    return out
+
+
+def invalidate_design_aggregate(block: Any, reason: str) -> dict[str, Any]:
+    """Expose incomplete aggregates only as explicitly observed diagnostics.
+
+    Consumers must opt into the ``observed`` subset; legacy headline keys are
+    retained as nulls so missing expected attempts cannot masquerade as a full
+    denominator after JSON projection or field selection.
+    """
+    if (isinstance(block, dict) and block.get("availability") == "partial"
+            and "observed" in block):
+        out = dict(block)
+        reasons = [
+            value for value in out.get("incomplete_reasons", [])
+            if isinstance(value, str) and value
+        ]
+        previous = out.get("design_coverage_reason")
+        if isinstance(previous, str) and previous and previous not in reasons:
+            reasons.append(previous)
+        if reason not in reasons:
+            reasons.append(reason)
+        out["design_coverage_reason"] = reason
+        out["incomplete_reasons"] = reasons
+        return out
+    out = {
+        "availability": "partial",
+        "design_coverage_reason": reason,
+        "observed": block,
+    }
+    if isinstance(block, dict):
+        for key in block:
+            if key not in out:
+                out[key] = None
+    return out
+
+
+def invalidate_variant_summaries(
+    summary: dict[str, dict[str, Any]], reason: str,
+) -> dict[str, dict[str, Any]]:
+    return {
+        key: invalidate_design_aggregate(value, reason)
+        for key, value in summary.items()
     }
 
 
@@ -9353,11 +13437,15 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
             "commands_only_with_skill": ordered_unique([c for c in with_commands if c not in without_set]),
             "commands_only_without_skill": ordered_unique([c for c in without_commands if c not in with_set]),
         })
-    return {
+    observed = {
         "pairs_compared": len(construction.pairs),
         "pair_diagnostics": construction.diagnostics(),
         "cases": cases,
     }
+    if construction.blocked:
+        return invalidate_design_aggregate(
+            observed, "incomplete_trajectory_pairing")
+    return observed
 
 
 def build_benchmark_report(
@@ -9374,8 +13462,10 @@ def build_benchmark_report(
     variants = variants_arg or manifest.get("variants", DEFAULT_VARIANTS)
     judge_lookup = load_judge_results(judge_results_path)
     results = []
+    deferred_judge_tasks: list[dict[str, Any]] = []
     skipped_trigger_cases = []
-    for case in iter_cases(manifest, split):
+    selected_cases = list(iter_cases(manifest, split))
+    for case in selected_cases:
         # Trigger/discovery cases belong to the autonomous-trigger adapter, whose
         # output is a raw_autonomous_trigger_measurement. Grading their content here
         # would fold a discovery measurement into the paired ANSWER pass-rate under
@@ -9387,8 +13477,9 @@ def build_benchmark_report(
             skipped_trigger_cases.append(case["id"])
             continue
         for model_name, variant, run_number, base, text, output_path, meta in discovered_run_units(runs, case, variants):
-            result, _ = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name, strict=strict, embed_cmd=embed_cmd)
+            result, pending = grade_case_variant(case, variant, text, output_path, meta, run_number=run_number, run_base=base, judge_results=judge_lookup, allow_scripts=allow_scripts, manifest_dir=path.parent, model=model_name, strict=strict, embed_cmd=embed_cmd)
             results.append(result)
+            deferred_judge_tasks.extend(pending)
 
     by_variant: dict[str, list[dict[str, Any]]] = {v: [] for v in variants}
     for r in results:
@@ -9474,8 +13565,102 @@ def build_benchmark_report(
             "total_by_tier": dict(sorted(total_by_tier.items())),
         }
 
+    answer_case_ids = [case["id"] for case in selected_cases if not is_trigger_case(case)]
+    design_coverage = answer_design_coverage(
+        runs, results, manifest=manifest, manifest_path=path,
+        case_ids=answer_case_ids, variants=variants)
     paired_summary = build_paired_summary(results)
+    unscorable_results = [row for row in results if not scorable_run(row)]
+    grading_blocked_results = [
+        row for row in results
+        if row.get("grading_availability", "complete") != "complete"]
+    if not design_coverage["complete"]:
+        paired_summary = invalidate_report_pairing(
+            paired_summary, "answer_design_incomplete")
+    elif grading_blocked_results:
+        paired_summary = invalidate_report_pairing(
+            paired_summary, "grading_evidence_incomplete")
     ablation_regressions = build_ablation_regression_report(manifest, results)
+    if not design_coverage["complete"]:
+        for entry in ablation_regressions:
+            for regression in entry.get("regressions", []):
+                regression["evidence_class"] = EvidenceClass.INDETERMINATE.value
+                regression["expected_regression_confirmed"] = None
+                regression["note"] = "answer design coverage is incomplete"
+    elif grading_blocked_results:
+        for entry in ablation_regressions:
+            for regression in entry.get("regressions", []):
+                regression["evidence_class"] = EvidenceClass.INDETERMINATE.value
+                regression["expected_regression_confirmed"] = None
+                regression["note"] = "grading evidence is incomplete"
+    oracle_strength_surface: Any = oracle_strength
+    qualitative_surface: Any = qualitative_by_visibility(results)
+    reliability: Any = {**build_reliability(results),
+                        "paired_lift": build_paired_reliability(results)}
+    slice_surface: Any = build_slice_summary(results, variants)
+    trajectory_surface: Any = build_trajectory_diff(results)
+    cost_surface: Any = build_cost_summary(
+        results, judge_results=judge_lookup,
+        confirmed_regressions=confirmed_regression_count(ablation_regressions))
+    case_flags_surface: Any = case_flags
+    observed_case_flags: list[dict[str, Any]] | None = None
+    pairing_incomplete = paired_summary.get("availability") != "complete"
+    if unscorable_results or grading_blocked_results or pairing_incomplete:
+        execution_reason = (
+            "unscorable_answer_attempts" if unscorable_results
+            else "grading_evidence_incomplete" if grading_blocked_results
+            else "incomplete_answer_pairing")
+        if pairing_incomplete:
+            summary = invalidate_variant_summaries(summary, execution_reason)
+            by_model_summary = {
+                model: invalidate_variant_summaries(model_summary, execution_reason)
+                for model, model_summary in by_model_summary.items()
+            }
+        oracle_strength_surface = invalidate_design_aggregate(
+            oracle_strength_surface, execution_reason)
+        qualitative_surface = invalidate_design_aggregate(
+            qualitative_surface, execution_reason)
+        observed_case_flags = case_flags
+        case_flags_surface = []
+        reliability = invalidate_design_aggregate(reliability, execution_reason)
+        slice_surface = invalidate_design_aggregate(slice_surface, execution_reason)
+        trajectory_surface = invalidate_design_aggregate(
+            trajectory_surface, execution_reason)
+        cost_surface = invalidate_design_aggregate(cost_surface, execution_reason)
+    if deferred_judge_tasks:
+        judge_reason = "deferred_judge_verdicts"
+        qualitative_surface = invalidate_design_aggregate(
+            qualitative_surface, judge_reason)
+        oracle_strength_surface = invalidate_design_aggregate(
+            oracle_strength_surface, judge_reason)
+        for block in summary.values():
+            for key in ("mean_combined_pass_rate", "combined_pass_rate"):
+                block[f"observed_{key}"] = block.get(key)
+                block[key] = None
+            block["availability"] = "partial"
+            block["reason"] = judge_reason
+        for model_summary in by_model_summary.values():
+            for block in model_summary.values():
+                for key in ("mean_combined_pass_rate", "combined_pass_rate"):
+                    block[f"observed_{key}"] = block.get(key)
+                    block[key] = None
+                block["availability"] = "partial"
+                block["reason"] = judge_reason
+    if not design_coverage["complete"]:
+        reason = "answer_design_incomplete"
+        summary = invalidate_variant_summaries(summary, reason)
+        by_model_summary = {
+            model: invalidate_variant_summaries(model_summary, reason)
+            for model, model_summary in by_model_summary.items()
+        }
+        oracle_strength_surface = invalidate_design_aggregate(oracle_strength, reason)
+        qualitative_surface = invalidate_design_aggregate(qualitative_surface, reason)
+        reliability = invalidate_design_aggregate(reliability, reason)
+        slice_surface = invalidate_design_aggregate(slice_surface, reason)
+        trajectory_surface = invalidate_design_aggregate(trajectory_surface, reason)
+        cost_surface = invalidate_design_aggregate(cost_surface, reason)
+        observed_case_flags = case_flags
+        case_flags_surface = []
     return {
         "manifest": str(path),
         "skill_name": manifest["skill_name"],
@@ -9488,28 +13673,39 @@ def build_benchmark_report(
         # CONFIRMED_CAUSAL is reserved for the per-ablation causal_confirmation
         # door and lives on ablation_regressions, not on a with/without summary.)
         "population": "answer",
+        "availability": (
+            "complete" if (design_coverage["complete"] and not unscorable_results
+                           and not deferred_judge_tasks and not grading_blocked_results
+                           and not pairing_incomplete)
+            else "partial"),
+        "answer_design": design_coverage,
         "skipped_trigger_cases": skipped_trigger_cases,
+        "deferred_judge_tasks": deferred_judge_tasks,
         "summary": summary,
         "by_model": by_model_summary,
-        "oracle_strength": oracle_strength,
+        "oracle_strength": oracle_strength_surface,
         # 2.7b: held-out rubric scores reported apart from tune-visible ones,
         # so a rubric the skill could see never inflates the held-out number.
-        "qualitative_by_visibility": qualitative_by_visibility(results),
+        "qualitative_by_visibility": qualitative_surface,
         "paired_summary": paired_summary,
         # 5: pass@k / pass^k per (case, variant) from the repeated-run data, plus a
         # pooled per-variant reliability headline. Uses the unbiased estimator.
-        "reliability": {**build_reliability(results), "paired_lift": build_paired_reliability(results)},
+        "reliability": reliability,
         "model_analysis": model_analysis_from_paired(paired_summary),
-        "slice_summary": build_slice_summary(results, variants),
+        "slice_summary": slice_surface,
         # HOW the arms behaved, beside whether they passed: paired event-stream
         # deltas per case, fail-closed on missing trace evidence.
-        "trajectory_diff": build_trajectory_diff(results),
+        "trajectory_diff": trajectory_surface,
         "ablation_regressions": ablation_regressions,
         # Operational spend beside the quality numbers (issue #21): totals over
         # ALL runs (failures included), per-variant/case stats, paired cost
         # deltas, ablation marginal cost, and separated judge spend.
-        "cost_summary": build_cost_summary(results, judge_results=judge_lookup, confirmed_regressions=confirmed_regression_count(ablation_regressions)),
-        "case_flags": case_flags,
+        "cost_summary": cost_surface,
+        "case_flags": case_flags_surface,
+        "case_flags_availability": (
+            "partial" if observed_case_flags is not None else "complete"),
+        **({"observed_case_flags": observed_case_flags}
+           if observed_case_flags is not None else {}),
         "results": results,
     }
 
@@ -9530,7 +13726,9 @@ def result_failure_lines(result: dict[str, Any]) -> list[str]:
     return [
         f"{a.get('name')}: {a.get('evidence', '')}"
         for a in result.get("assertions", []) + result.get("qualitative_assertions", [])
-        if not a.get("passed") and a.get("severity") != "soft"
+        if (a.get("passed") is False
+            and a.get("availability", "complete") == "complete"
+            and a.get("severity") != "soft")
     ]
 
 
@@ -9549,14 +13747,30 @@ def junit_xml_from_report(report: dict[str, Any]) -> str:
         value = paired.get(key)
         ET.SubElement(props, "property", {"name": key, "value": "" if value is None else f"{value:.4f}"})
     failures = 0
+    errors = 0
     total_time = 0.0
     missing_time = 0
+    design = report.get("answer_design") or {}
+    if report.get("availability") != "complete" or design.get("complete") is not True:
+        errors = 1
+        tc = ET.SubElement(suite, "testcase", {
+            "classname": f"{skill}.experiment",
+            "name": "answer-design-coverage",
+        })
+        error = ET.SubElement(tc, "error", {
+            "message": "experiment evidence is incomplete",
+        })
+        error.text = json.dumps({
+            "availability": report.get("availability"),
+            "answer_design": design,
+            "deferred_judge_tasks": report.get("deferred_judge_tasks", []),
+        }, ensure_ascii=False, sort_keys=True)
     for r in results:
         elapsed = telemetry_domain.measurement_from_envelope_or_nonnegative(
             r.get("metadata", {}) or {}, "elapsed_ms")
         attrs = {
-            "classname": f"{skill}.{r.get('case_id')}",
-            "name": f"{r.get('variant')}/run-{r.get('run_number', 1)}",
+            "classname": f"{skill}.{r.get('case_id')}.{r.get('model') or 'default-model'}",
+            "name": f"{r.get('model') or 'default-model'}/{r.get('variant')}/run-{r.get('run_number', 1)}",
         }
         if elapsed.availability == telemetry_domain.AVAILABLE:
             total_time += float(elapsed.value) / 1000.0
@@ -9564,7 +13778,7 @@ def junit_xml_from_report(report: dict[str, Any]) -> str:
         else:
             missing_time += 1
             ET.SubElement(props, "property", {
-                "name": f"telemetry.elapsed_ms.{r.get('case_id')}.{r.get('variant')}.run-{r.get('run_number', 1)}",
+                "name": f"telemetry.elapsed_ms.{r.get('case_id')}.{r.get('model') or 'default-model'}.{r.get('variant')}.run-{r.get('run_number', 1)}",
                 "value": elapsed.availability if elapsed.availability != telemetry_domain.UNAVAILABLE else f"unavailable:{elapsed.reason}",
             })
         tc = ET.SubElement(suite, "testcase", attrs)
@@ -9573,9 +13787,9 @@ def junit_xml_from_report(report: dict[str, Any]) -> str:
             failures += 1
             failure = ET.SubElement(tc, "failure", {"message": f"{len(lines)} failing check(s)"})
             failure.text = "\n".join(lines)
-    suite.set("tests", str(len(results)))
+    suite.set("tests", str(len(results) + errors))
     suite.set("failures", str(failures))
-    suite.set("errors", "0")
+    suite.set("errors", str(errors))
     if missing_time:
         ET.SubElement(props, "property", {"name": "telemetry.elapsed_ms.aggregate", "value": "partial"})
     else:
@@ -9594,6 +13808,22 @@ def github_summary_from_report(report: dict[str, Any]) -> str:
     paired = report.get("paired_summary", {}) or {}
     summary = report.get("summary", {}) or {}
     lines = [f"# Skill eval — {skill}", ""]
+    design = report.get("answer_design") or {}
+    if report.get("availability") != "complete":
+        reasons = []
+        if design.get("complete") is not True:
+            reasons.append("answer-design coverage")
+        if report.get("deferred_judge_tasks"):
+            reasons.append("deferred judge verdicts")
+        if any(row.get("grading_availability", "complete") != "complete"
+               for row in report.get("results", [])):
+            reasons.append("blocked grading evidence")
+        if any(not scorable_run(row) for row in report.get("results", [])):
+            reasons.append("unscorable attempts")
+        lines.extend([
+            "**Experiment status:** incomplete"
+            + (f" ({', '.join(reasons)})" if reasons else ""), "",
+        ])
     delta = paired.get("absolute_delta")
     lines.append(
         f"**Lift (with − without, objective):** {fmt_rate(paired.get('with_skill_objective_pass_rate'))} − "
@@ -9607,6 +13837,8 @@ def github_summary_from_report(report: dict[str, Any]) -> str:
             f"{block.get('missing_outputs', 0)} | {block.get('execution_errors', 0)} |"
         )
     flags = report.get("case_flags", []) or []
+    if not isinstance(flags, list):
+        flags = []
     if flags:
         lines.extend(["", "## Case flags", ""])
         for flag in flags:
@@ -9622,6 +13854,9 @@ def github_summary_from_report(report: dict[str, Any]) -> str:
     ]
     if delta is not None and delta < 0:
         annotations.append(f"::error title=skill-eval {skill}::negative overall lift ({delta:.3f}): the skill measures worse than baseline")
+    if report.get("availability") != "complete":
+        annotations.append(
+            f"::error title=skill-eval {skill}::incomplete experiment evidence")
     return "\n".join(lines + ([""] + annotations if annotations else [])) + "\n"
 
 
@@ -9650,6 +13885,18 @@ def aggregate(args: argparse.Namespace) -> int:
             runs = Path(args.runs)
         reports.append(build_benchmark_report(manifest_path, runs, args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False)))
 
+    skill_names = [report.get("skill_name") for report in reports]
+    if not all(isinstance(name, str) and name for name in skill_names):
+        die("aggregate report is missing a non-empty skill_name identity")
+    duplicate_skill_names = sorted(
+        name for name, count in collections.Counter(skill_names).items()
+        if count > 1
+    )
+    if duplicate_skill_names:
+        die(
+            "aggregate manifests declare duplicate skill_name identities: "
+            + ", ".join(duplicate_skill_names))
+
     # Re-aggregate run facts rather than summing report scalars: a partial
     # per-skill known subtotal is not a complete cross-skill total.
     cross_rows = [
@@ -9673,7 +13920,14 @@ def aggregate(args: argparse.Namespace) -> int:
             for flag in r["case_flags"]
         ],
     }
-    output = {"generated_at": int(time.time()), "summary": aggregate_summary, "reports": reports}
+    complete = all(report.get("availability") == "complete" for report in reports)
+    output = {
+        "generated_at": int(time.time()),
+        "availability": "complete" if complete else "partial",
+        "summary": (aggregate_summary if complete else invalidate_design_aggregate(
+            aggregate_summary, "one_or_more_skill_reports_incomplete")),
+        "reports": reports,
+    }
     emit_report(output, args.out)
     return 0
 
@@ -9681,21 +13935,29 @@ def aggregate(args: argparse.Namespace) -> int:
 
 
 def case_by_id(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {c["id"]: c for c in manifest.get("cases", [])}
+    return {c["id"]: c for c in iter_cases(manifest)}
 
 
 def expectation_texts(result: dict[str, Any]) -> list[dict[str, Any]]:
     out = []
     for assertion in result.get("assertions", []) + result.get("qualitative_assertions", []):
+        raw_passed = assertion.get("passed")
+        passed = raw_passed if isinstance(raw_passed, bool) else None
+        availability = assertion.get("availability", "complete")
         out.append({
             "text": assertion.get("name", assertion.get("type", "assertion")),
-            "passed": bool(assertion.get("passed")),
+            "passed": passed,
+            "availability": availability,
             "evidence": assertion.get("evidence", ""),
         })
     return out
 
 
 def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = "") -> dict[str, Any]:
+    if (report.get("availability") != "complete"
+            or (report.get("answer_design") or {}).get("complete") is not True):
+        raise ValueError(
+            "cannot export an Anthropic benchmark from an incomplete report")
     runs = []
     for r in report["results"]:
         meta = r.get("metadata", {}) or {}
@@ -9724,7 +13986,9 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
         runs.append({
             "eval_id": r["case_id"],
             "eval_name": r["case_id"],
-            "configuration": r["variant"],
+            "configuration": (
+                f"{r.get('model')}::{r['variant']}" if r.get("model") else r["variant"]),
+            "executor_model": r.get("model"),
             "run_number": r.get("run_number", 1),
             "result": result,
             "telemetry": availability,
@@ -9733,7 +13997,14 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
         })
 
     run_summary = {}
-    for variant, summary in report.get("summary", {}).items():
+    model_summaries = report.get("by_model") or {}
+    summary_inputs = (
+        [(f"{model}::{variant}", summary)
+         for model, variants in model_summaries.items()
+         for variant, summary in variants.items()]
+        if model_summaries else list((report.get("summary", {}) or {}).items())
+    )
+    for configuration, summary in summary_inputs:
         pr = summary.get("combined_pass_rate") or summary.get("objective_pass_rate") or {}
         tm = summary.get("elapsed_ms") or {}
         tk = summary.get("total_tokens") or {}
@@ -9744,25 +14015,46 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
                 out["availability"] = values.get("availability")
             return out
 
-        run_summary[variant] = {
+        run_summary[configuration] = {
             "pass_rate": copied_stats(pr),
             "time_seconds": copied_stats(tm, divide=1000),
             "tokens": copied_stats(tk),
         }
-    configs = [k for k in run_summary if k != "delta"]
-    if len(configs) >= 2:
-        a, b = configs[0], configs[1]
+    configuration_deltas: dict[str, Any] = {}
+    if (not model_summaries
+            and {"with_skill", "without_skill"}.issubset(run_summary)):
+        a, b = "with_skill", "without_skill"
         deltas = {}
         for key, digits in (("pass_rate", 2), ("time_seconds", 1), ("tokens", 0)):
             left = run_summary[a][key]["mean"]
             right = run_summary[b][key]["mean"]
             deltas[key] = f"{left - right:+.{digits}f}" if left is not None and right is not None else None
         run_summary["delta"] = deltas
+        configuration_deltas["all"] = {
+            "from": "without_skill", "to": "with_skill", "delta": deltas,
+        }
+    elif model_summaries:
+        for model, variant_blocks in model_summaries.items():
+            if not {"with_skill", "without_skill"}.issubset(variant_blocks):
+                continue
+            a, b = f"{model}::with_skill", f"{model}::without_skill"
+            deltas = {}
+            for key, digits in (("pass_rate", 2), ("time_seconds", 1), ("tokens", 0)):
+                left = run_summary[a][key]["mean"]
+                right = run_summary[b][key]["mean"]
+                deltas[key] = (
+                    f"{left - right:+.{digits}f}"
+                    if left is not None and right is not None else None)
+            configuration_deltas[model] = {
+                "from": "without_skill", "to": "with_skill",
+                "delta": deltas,
+            }
     return {
         "metadata": {
             "skill_name": report.get("skill_name", "<skill-name>"),
             "skill_path": skill_path,
-            "executor_model": "<captured per run where available>",
+            "executor_models": sorted({str(r.get("model")) for r in report.get("results", [])
+                                       if r.get("model")}),
             "analyzer_model": "<not-run>",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(report.get("generated_at", int(time.time())))),
             "evals_run": sorted({r["case_id"] for r in report.get("results", [])}),
@@ -9770,6 +14062,8 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
         },
         "runs": runs,
         "run_summary": run_summary,
+        **({"configuration_deltas": configuration_deltas}
+           if configuration_deltas else {}),
         "notes": ["Generated by shared skill eval harness Anthropic-compatible exporter."],
     }
 
@@ -9781,41 +14075,313 @@ def export_anthropic(args: argparse.Namespace) -> int:
     return 0
 
 
+def comparison_output_sha256(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def comparison_task_identity(task: dict[str, Any]) -> dict[str, Any]:
+    """The complete judge-visible comparison input, excluding local paths."""
+    return {
+        "schema_version": 1,
+        "comparison_task_id": task["comparison_task_id"],
+        "case_id": task["case_id"],
+        "model": task.get("model"),
+        "run_number": task["run_number"],
+        "answer_design_sha256": task["answer_design_sha256"],
+        "blind_nonce": task["blind_nonce"],
+        "prompt": task["prompt"],
+        "expectations": task["expectations"],
+        "rubric": task["rubric"],
+        "output_a_sha256": task["output_a_sha256"],
+        "output_b_sha256": task["output_b_sha256"],
+        "result_schema": task["result_schema"],
+    }
+
+
+def comparison_truth_sha256(row: dict[str, Any]) -> str:
+    """Bind the private role assignment independently of the blinded task."""
+    return canonical_json_sha256({
+        "schema_version": 1,
+        "comparison_task_sha256": row["comparison_task_sha256"],
+        "answer_design_sha256": row["answer_design_sha256"],
+        "case_id": row["case_id"],
+        "model": row.get("model"),
+        "run_number": row["run_number"],
+        "candidate_paths": row["candidate_paths"],
+        "A": {key: row["A"][key] for key in ("role", "variant", "model", "run_number")},
+        "B": {key: row["B"][key] for key in ("role", "variant", "model", "run_number")},
+    })
+
+
+def comparison_design_sha256(rows: Iterable[dict[str, Any]]) -> str:
+    """Bind the exact comparison population so truncating truth cannot pass."""
+    identities = sorted(
+        ({
+            "comparison_task_id": row["comparison_task_id"],
+            "comparison_task_sha256": row["comparison_task_sha256"],
+            "comparison_truth_sha256": row["comparison_truth_sha256"],
+        } for row in rows),
+        key=lambda row: row["comparison_task_id"],
+    )
+    return canonical_json_sha256({"schema_version": 1, "tasks": identities})
+
+
+def index_comparison_runs(case_id: str, role: str,
+                          found: list[tuple[int, Path]]) -> dict[int, Path]:
+    indexed: dict[int, Path] = {}
+    for run_number, base in found:
+        if run_number in indexed:
+            die(f"{case_id}: duplicate {role} run identity {run_number}")
+        indexed[run_number] = base
+    return indexed
+
+
+def comparison_run_artifact(base: Path) -> tuple[str | None, Path, dict[str, Any]]:
+    """Read one candidate and enforce the shared scorable-run boundary."""
+    text, output_path = read_output_base(base)
+    metadata = read_metadata_base(base)
+    missing_output = not output_path.is_file() or text is None or not text.strip()
+    exec_valid = execution_valid(metadata, None if missing_output else text)
+    if not scorable_run({
+        "missing_output": missing_output,
+        "execution_valid": exec_valid,
+    }):
+        reasons = []
+        if missing_output:
+            reasons.append(f"missing or blank output {output_path}")
+        if not exec_valid:
+            lifecycle_error = metadata.get("metadata_error") or metadata_lifecycle_error(metadata)
+            reasons.append(str(lifecycle_error or "execution lifecycle is invalid"))
+        raise ValueError("; ".join(reasons) or "run is unscorable")
+    return text, output_path, metadata
+
+
 def compare_tasks(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest)
     manifest = validate_manifest(manifest_path)
     runs = Path(args.runs)
+    if args.primary == args.baseline:
+        die("compare-tasks primary and baseline variants must be different")
+    answer_design_path = runs / ANSWER_DESIGN_NAME
+    try:
+        answer_design = validate_answer_design(strict_json_loads(
+            answer_design_path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        die(f"compare-tasks requires a valid {ANSWER_DESIGN_NAME}: {exc}")
+    contract_cases = iter_cases(manifest, args.split)
+    selected_cases = [case for case in contract_cases if not is_trigger_case(case)]
+    try:
+        current_contract_sha256 = eval_contract_sha256(
+            manifest, manifest_path, cases=contract_cases)
+    except (OSError, ValueError) as exc:
+        die(f"compare-tasks cannot attest current eval contract: {exc}")
+    if answer_design.get("eval_contract_sha256") != current_contract_sha256:
+        die("compare-tasks answer design does not match the current eval contract")
+    selected_case_ids = {case["id"] for case in selected_cases}
+    expected_design_rows = {
+        (row["case_id"], row["model"], row["variant"], row["run_number"]): row
+        for row in answer_design["identities"]
+        if row["case_id"] in selected_case_ids
+        and row["variant"] in {args.primary, args.baseline}
+    }
+    observed_design_rows: set[tuple[str, str | None, str, int]] = set()
     rng = random.Random(args.seed)
     truth = []
     tasks = []
+    task_ids: set[str] = set()
     for case in iter_cases(manifest, args.split):
-        pairs = zip(discover_run_bases(runs, case["id"], args.primary), discover_run_bases(runs, case["id"], args.baseline))
-        for (p_run, p_base), (b_run, b_base) in pairs:
-            _, p_out = read_output_base(p_base)
-            _, b_out = read_output_base(b_base)
-            if not p_out.exists() and not p_out.is_dir():
-                continue
-            if not b_out.exists() and not b_out.is_dir():
-                continue
-            sides = [("primary", args.primary, p_run, p_out), ("baseline", args.baseline, b_run, b_out)]
-            rng.shuffle(sides)
-            task_id = f"{case['id']}::run-{p_run}::blind-{args.primary}-vs-{args.baseline}"
-            task = {
-                "comparison_task_id": task_id,
-                "case_id": case["id"],
-                "run_number": p_run,
-                "prompt": case_prompt(case, manifest_path, allow_missing=args.allow_missing_prompts),
-                "expectations": [assertion_label(a) for a in case.get("assertions", [])],
-                "output_a_path": str(sides[0][3]),
-                "output_b_path": str(sides[1][3]),
-                "result_schema": {"winner": "A|B|TIE", "reasoning": "string", "rubric": "object optional"},
-            }
-            tasks.append(task)
-            truth.append({
-                "comparison_task_id": task_id,
-                "A": {"role": sides[0][0], "variant": sides[0][1], "run_number": sides[0][2]},
-                "B": {"role": sides[1][0], "variant": sides[1][1], "run_number": sides[1][2]},
-            })
+        if is_trigger_case(case):
+            continue
+        for rubric_field in ("expected_behavior", "review_rubric"):
+            rubric_values = case.get(rubric_field, [])
+            if (not isinstance(rubric_values, list)
+                    or not all(isinstance(value, str) for value in rubric_values)):
+                die(f"{case['id']}: {rubric_field} must be a list of strings for comparison")
+        model_roots = discover_case_model_roots(
+            runs, case["id"], [args.primary, args.baseline])
+        for root_model, model_root in model_roots:
+            model_label = root_model or "<legacy>"
+            try:
+                primary_runs = discover_run_bases_under(model_root / args.primary)
+                baseline_runs = discover_run_bases_under(model_root / args.baseline)
+            except ValueError as exc:
+                die(
+                    f"{case['id']} model {model_label}: "
+                    f"cannot construct comparison run population: {exc}")
+
+            identity_label = f"{case['id']} model {model_label}"
+            primary_by_run = index_comparison_runs(
+                identity_label, "primary", primary_runs)
+            baseline_by_run = index_comparison_runs(
+                identity_label, "baseline", baseline_runs)
+            primary_ids = set(primary_by_run)
+            baseline_ids = set(baseline_by_run)
+            if primary_ids != baseline_ids:
+                missing_primary = sorted(baseline_ids - primary_ids)
+                missing_baseline = sorted(primary_ids - baseline_ids)
+                die(
+                    f"{identity_label}: comparison run identities differ; "
+                    f"missing primary runs={missing_primary}, "
+                    f"missing baseline runs={missing_baseline}"
+                )
+
+            for run_number in sorted(primary_ids):
+                p_base = primary_by_run[run_number]
+                b_base = baseline_by_run[run_number]
+                try:
+                    _, p_out, p_meta = comparison_run_artifact(p_base)
+                    _, b_out, b_meta = comparison_run_artifact(b_base)
+                except ValueError as exc:
+                    die(
+                        f"{identity_label} run {run_number}: "
+                        f"cannot construct comparison from unscorable arm: {exc}")
+
+                persisted_models = []
+                for role, metadata in (("primary", p_meta), ("baseline", b_meta)):
+                    persisted_model = metadata.get("model")
+                    if (persisted_model is not None
+                            and (not isinstance(persisted_model, str)
+                                 or not persisted_model.strip())):
+                        die(
+                            f"{identity_label} run {run_number}: {role} metadata "
+                            "model must be null or a non-empty string")
+                    if (root_model is not None and persisted_model is not None
+                            and persisted_model != root_model):
+                        die(
+                            f"{identity_label} run {run_number}: {role} metadata "
+                            f"model {persisted_model!r} disagrees with model directory")
+                    persisted_models.append(persisted_model)
+                if root_model is None and persisted_models[0] != persisted_models[1]:
+                    die(
+                        f"{identity_label} run {run_number}: arms have different "
+                        f"persisted models {persisted_models!r}")
+                model = root_model if root_model is not None else persisted_models[0]
+
+                for role, variant, base, metadata in (
+                        ("primary", args.primary, p_base, p_meta),
+                        ("baseline", args.baseline, b_base, b_meta)):
+                    design_key = (case["id"], model, variant, run_number)
+                    design_row = expected_design_rows.get(design_key)
+                    if design_row is None:
+                        die(
+                            f"{identity_label} run {run_number}: {role} arm is absent "
+                            "from the answer design")
+                    try:
+                        expected_base = safe_child_path(runs.resolve(), design_row["run_dir"])
+                    except ValueError as exc:
+                        die(f"{identity_label} run {run_number}: invalid answer design path: {exc}")
+                    if base.resolve() != expected_base:
+                        die(
+                            f"{identity_label} run {run_number}: {role} run path "
+                            "does not match the answer design")
+                    expected_attestations = {
+                        "answer_design_sha256": answer_design["design_sha256"],
+                        "answer_task_sha256": design_row["task_sha256"],
+                        "answer_instruction_sha256": design_row["instruction_sha256"],
+                        "fixture_tree_hash": design_row["fixture_tree_hash"],
+                        "skill_tree_hash": design_row["planned_skill_tree_hash"],
+                        "case_id": case["id"],
+                        "model": model,
+                        "variant": variant,
+                        "run_number": run_number,
+                    }
+                    mismatched = [
+                        field for field, expected in expected_attestations.items()
+                        if metadata.get(field) != expected
+                    ]
+                    if mismatched:
+                        die(
+                            f"{identity_label} run {run_number}: {role} answer-design "
+                            f"attestation mismatch in {mismatched}")
+                    observed_design_rows.add(design_key)
+
+                sides = [
+                    ("primary", args.primary, model, run_number, p_out),
+                    ("baseline", args.baseline, model, run_number, b_out),
+                ]
+                rng.shuffle(sides)
+                model_segment = f"{model}::" if model else ""
+                task_id = (
+                    f"{case['id']}::{model_segment}run-{run_number}::"
+                    f"blind-{args.primary}-vs-{args.baseline}")
+                if task_id in task_ids:
+                    die(f"duplicate comparison task identity {task_id!r}")
+                result_schema = {
+                    "schema_version": "integer 1",
+                    "observation_complete": "boolean true",
+                    "returncode": "integer 0",
+                    "answer_design_sha256": "echo exact task value",
+                    "comparison_design_sha256": "echo exact task value",
+                    "comparison_task_sha256": "echo exact task value",
+                    "winner": "A|B|TIE",
+                    "reasoning": "string",
+                    "rubric": "object optional",
+                }
+                task = {
+                    "comparison_task_id": task_id,
+                    "case_id": case["id"],
+                    "model": model,
+                    "run_number": run_number,
+                    "answer_design_sha256": answer_design["design_sha256"],
+                    "blind_nonce": f"{rng.getrandbits(128):032x}",
+                    "prompt": case_prompt(
+                        case, manifest_path,
+                        allow_missing=args.allow_missing_prompts),
+                    "expectations": [
+                        assertion_label(a) for a in case.get("assertions", [])],
+                    "rubric": {
+                        "expected_behavior": case.get("expected_behavior", []),
+                        "review_rubric": case.get("review_rubric", []),
+                    },
+                    "output_a_path": str(sides[0][4]),
+                    "output_b_path": str(sides[1][4]),
+                    "output_a_sha256": comparison_output_sha256(sides[0][4]),
+                    "output_b_sha256": comparison_output_sha256(sides[1][4]),
+                    "result_schema": result_schema,
+                }
+                task_identity = comparison_task_identity(task)
+                task_sha256 = canonical_json_sha256(task_identity)
+                task["comparison_task_sha256"] = task_sha256
+                tasks.append(task)
+                task_ids.add(task_id)
+                truth_row = {
+                    "comparison_task_id": task_id,
+                    "case_id": case["id"],
+                    "model": model,
+                    "run_number": run_number,
+                    "answer_design_sha256": answer_design["design_sha256"],
+                    "comparison_task": task_identity,
+                    "comparison_task_sha256": task_sha256,
+                    "candidate_paths": {
+                        "A": str(sides[0][4]), "B": str(sides[1][4]),
+                    },
+                    "A": {
+                        "role": sides[0][0], "variant": sides[0][1],
+                        "model": sides[0][2], "run_number": sides[0][3]},
+                    "B": {
+                        "role": sides[1][0], "variant": sides[1][1],
+                        "model": sides[1][2], "run_number": sides[1][3]},
+                }
+                truth_row["comparison_truth_sha256"] = comparison_truth_sha256(
+                    truth_row)
+                truth.append(truth_row)
+    if observed_design_rows != set(expected_design_rows):
+        missing = sorted(
+            set(expected_design_rows) - observed_design_rows,
+            key=lambda key: (key[0], str(key[1] or ""), key[2], key[3]),
+        )
+        extra = sorted(
+            observed_design_rows - set(expected_design_rows),
+            key=lambda key: (key[0], str(key[1] or ""), key[2], key[3]),
+        )
+        die(
+            "compare-tasks run population does not exactly cover the answer design; "
+            f"missing={missing}, unexpected={extra}")
+    if not tasks:
+        die("compare-tasks selected no answer-population tasks")
+    design_sha256 = comparison_design_sha256(truth)
+    for task in tasks:
+        task["comparison_design_sha256"] = design_sha256
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -9824,38 +14390,284 @@ def compare_tasks(args: argparse.Namespace) -> int:
         for t in tasks:
             print(json.dumps(t, ensure_ascii=False))
     if args.truth_out:
-        write_json(Path(args.truth_out), {"generated_at": int(time.time()), "tasks": truth})
+        write_json(Path(args.truth_out), {
+            "generated_at": int(time.time()),
+            "answer_design_sha256": answer_design["design_sha256"],
+            "comparison_design_sha256": design_sha256,
+            "tasks": truth,
+        })
     return 0
 
 
 def load_comparison_results(path: Path) -> list[dict[str, Any]]:
-    return load_result_rows(path, id_keys=("comparison_task_id", "id"), label="comparison results")
+    rows = load_result_rows(path, id_keys=("comparison_task_id", "id"), label="comparison results")
+    validated_rows: list[dict[str, Any]] = []
+    positions: dict[str, int] = {}
+    for position, row in enumerate(rows, 1):
+        primary, legacy = row.get("comparison_task_id"), row.get("id")
+        if primary is not None and legacy is not None and primary != legacy:
+            die(f"comparison results row {position}: conflicting comparison_task_id and id")
+        task_id = primary if primary is not None else legacy
+        if not isinstance(task_id, str) or not task_id.strip():
+            die(f"comparison results row {position}: missing non-empty comparison_task_id")
+        if task_id in positions:
+            die(f"comparison results duplicate id {task_id!r} at rows {positions[task_id]} and {position}")
+        if row.get("schema_version") != 1:
+            die(f"comparison results row {position} ({task_id}): schema_version must be 1")
+        if row.get("observation_complete") is not True:
+            die(
+                f"comparison results row {position} ({task_id}): "
+                "observation_complete must be boolean true")
+        returncode = row.get("returncode")
+        if isinstance(returncode, bool) or returncode != 0:
+            die(
+                f"comparison results row {position} ({task_id}): "
+                "returncode must be integer 0")
+        lifecycle_error = metadata_lifecycle_error(row)
+        if lifecycle_error is not None:
+            die(f"comparison results row {position} ({task_id}): {lifecycle_error}")
+        completeness_fields = (
+            "provider_response_complete", "process_observation_complete",
+            "trace_observation_complete", "operation_observation_complete",
+            "artifact_set_complete",
+        )
+        if (row.get("timed_out") is True or row.get("timeout") is True
+                or any(row.get(field) is False for field in completeness_fields)
+                or row.get("schema_error") not in (None, False, "")
+                or row.get("error") not in (None, "")):
+            die(
+                f"comparison results row {position} ({task_id}): "
+                "comparison observation lifecycle is incomplete or failed")
+        for hash_field in (
+                "answer_design_sha256", "comparison_design_sha256",
+                "comparison_task_sha256"):
+            digest = row.get(hash_field)
+            if (not isinstance(digest, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None):
+                die(f"comparison results row {position} ({task_id}): missing valid {hash_field}")
+        reasoning = row.get("reasoning", "")
+        if not isinstance(reasoning, str):
+            die(f"comparison results row {position} ({task_id}): reasoning must be a string")
+        canonical = dict(row)
+        canonical["comparison_task_id"] = task_id
+        canonical["reasoning"] = reasoning
+        validated_rows.append(canonical)
+        positions[task_id] = position
+    return validated_rows
+
+
+def load_comparison_truth(path: Path) -> dict[str, dict[str, Any]]:
+    """Load the private A/B mapping without dict-comprehension data loss.
+
+    Comparison truth is the causal bridge between a model-facing side and an
+    experimental role, so duplicate IDs, cross-run pairing, and ambiguous side
+    roles are integrity errors rather than rows that can be overwritten.
+    """
+    data = load_json(path)
+    rows = data.get("tasks")
+    if not isinstance(rows, list) or not rows:
+        die("comparison truth must contain a non-empty tasks array")
+    answer_design_sha256 = data.get("answer_design_sha256")
+    if (not isinstance(answer_design_sha256, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", answer_design_sha256) is None):
+        die("comparison truth must carry a valid answer_design_sha256")
+    truth: dict[str, dict[str, Any]] = {}
+    positions: dict[str, int] = {}
+    for position, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            die(f"comparison truth row {position}: must be an object")
+        task_id = row.get("comparison_task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            die(f"comparison truth row {position}: missing non-empty comparison_task_id")
+        if task_id in truth:
+            die(f"comparison truth duplicate id {task_id!r} at rows {positions[task_id]} and {position}")
+        task_identity = row.get("comparison_task")
+        if not isinstance(task_identity, dict):
+            die(f"comparison truth row {position} ({task_id}): comparison_task must be an object")
+        task_sha256 = row.get("comparison_task_sha256")
+        if (not isinstance(task_sha256, str)
+                or canonical_json_sha256(task_identity) != task_sha256):
+            die(f"comparison truth row {position} ({task_id}): comparison_task_sha256 does not bind comparison_task")
+        case_id = row.get("case_id")
+        model = row.get("model")
+        run_number = row.get("run_number")
+        row_answer_design_sha256 = row.get("answer_design_sha256")
+        if (not isinstance(case_id, str) or not case_id.strip()
+                or model is not None
+                and (not isinstance(model, str) or not model.strip())
+                or isinstance(run_number, bool)
+                or not isinstance(run_number, int) or run_number < 1):
+            die(f"comparison truth row {position} ({task_id}): invalid case/model/run identity")
+        if (row_answer_design_sha256 != answer_design_sha256
+                or task_identity.get("answer_design_sha256") != answer_design_sha256):
+            die(
+                f"comparison truth row {position} ({task_id}): "
+                "answer design digest is incoherent")
+        candidate_paths = row.get("candidate_paths")
+        if (not isinstance(candidate_paths, dict)
+                or set(candidate_paths) != {"A", "B"}
+                or not all(isinstance(value, str) and value
+                           for value in candidate_paths.values())):
+            die(
+                f"comparison truth row {position} ({task_id}): "
+                "candidate_paths must bind A and B")
+        if (task_identity.get("schema_version") != 1
+                or task_identity.get("comparison_task_id") != task_id
+                or task_identity.get("case_id") != case_id
+                or task_identity.get("model") != model
+                or task_identity.get("run_number") != run_number):
+            die(f"comparison truth row {position} ({task_id}): comparison_task identity is incoherent")
+        if (not isinstance(task_identity.get("blind_nonce"), str)
+                or re.fullmatch(r"[0-9a-f]{32}", task_identity["blind_nonce"]) is None):
+            die(f"comparison truth row {position} ({task_id}): comparison_task has invalid blind_nonce")
+        if not isinstance(task_identity.get("prompt"), str):
+            die(f"comparison truth row {position} ({task_id}): comparison_task prompt must be a string")
+        if (not isinstance(task_identity.get("expectations"), list)
+                or not all(isinstance(value, str) for value in task_identity["expectations"])):
+            die(f"comparison truth row {position} ({task_id}): comparison_task expectations must be strings")
+        rubric = task_identity.get("rubric")
+        if (not isinstance(rubric, dict)
+                or not isinstance(rubric.get("expected_behavior"), list)
+                or not all(isinstance(value, str) for value in rubric["expected_behavior"])
+                or not isinstance(rubric.get("review_rubric"), list)
+                or not all(isinstance(value, str) for value in rubric["review_rubric"])):
+            die(f"comparison truth row {position} ({task_id}): comparison_task rubric is invalid")
+        for label in ("a", "b"):
+            digest = task_identity.get(f"output_{label}_sha256")
+            if (not isinstance(digest, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None):
+                die(f"comparison truth row {position} ({task_id}): output_{label}_sha256 is invalid")
+        result_schema = task_identity.get("result_schema")
+        if (not isinstance(result_schema, dict)
+                or result_schema.get("schema_version") != "integer 1"
+                or result_schema.get("observation_complete") != "boolean true"
+                or result_schema.get("returncode") != "integer 0"
+                or result_schema.get("answer_design_sha256") != "echo exact task value"
+                or result_schema.get("comparison_design_sha256") != "echo exact task value"
+                or result_schema.get("comparison_task_sha256") != "echo exact task value"
+                or result_schema.get("winner") != "A|B|TIE"):
+            die(f"comparison truth row {position} ({task_id}): result_schema must be an object")
+        sides: dict[str, dict[str, Any]] = {}
+        for label in ("A", "B"):
+            side = row.get(label)
+            if not isinstance(side, dict):
+                die(f"comparison truth row {position} ({task_id}): side {label} must be an object")
+            role = side.get("role")
+            variant = side.get("variant")
+            side_model = side.get("model")
+            side_run_number = side.get("run_number")
+            if role not in {"primary", "baseline"}:
+                die(f"comparison truth row {position} ({task_id}): side {label} has invalid role {role!r}")
+            if not isinstance(variant, str) or not variant.strip():
+                die(f"comparison truth row {position} ({task_id}): side {label} needs a non-empty variant")
+            if side_model != model:
+                die(f"comparison truth row {position} ({task_id}): side {label} model disagrees with task")
+            if (isinstance(side_run_number, bool)
+                    or not isinstance(side_run_number, int)
+                    or side_run_number < 1):
+                die(f"comparison truth row {position} ({task_id}): side {label} needs a positive integer run_number")
+            sides[label] = side
+        if {sides["A"]["role"], sides["B"]["role"]} != {"primary", "baseline"}:
+            die(f"comparison truth row {position} ({task_id}): A and B must map to distinct primary/baseline roles")
+        if sides["A"]["variant"] == sides["B"]["variant"]:
+            die(f"comparison truth row {position} ({task_id}): A and B must map to distinct variants")
+        if sides["A"]["run_number"] != sides["B"]["run_number"]:
+            die(f"comparison truth row {position} ({task_id}): A and B must map to the same run identity")
+        if sides["A"]["run_number"] != run_number:
+            die(f"comparison truth row {position} ({task_id}): side run identity disagrees with task")
+        by_role = {sides[label]["role"]: sides[label] for label in ("A", "B")}
+        model_segment = f"{model}::" if model else ""
+        expected_task_id = (
+            f"{case_id}::{model_segment}run-{run_number}::"
+            f"blind-{by_role['primary']['variant']}-vs-{by_role['baseline']['variant']}")
+        if task_id != expected_task_id:
+            die(f"comparison truth row {position} ({task_id}): task id disagrees with its identity")
+        truth_sha256 = row.get("comparison_truth_sha256")
+        if (not isinstance(truth_sha256, str)
+                or comparison_truth_sha256(row) != truth_sha256):
+            die(f"comparison truth row {position} ({task_id}): comparison_truth_sha256 does not bind side mapping")
+        truth[task_id] = row
+        positions[task_id] = position
+    design_sha256 = data.get("comparison_design_sha256")
+    if (not isinstance(design_sha256, str)
+            or comparison_design_sha256(truth.values()) != design_sha256):
+        die("comparison truth comparison_design_sha256 does not bind its complete task population")
+    return truth
 
 
 def compare_results(args: argparse.Namespace) -> int:
-    truth_data = load_json(Path(args.truth))
-    truth = {row["comparison_task_id"]: row for row in truth_data.get("tasks", [])}
+    truth_path = Path(args.truth)
+    truth = load_comparison_truth(truth_path)
+    truth_document = load_json(truth_path)
+    answer_design_sha256 = truth_document["answer_design_sha256"]
     rows = load_comparison_results(Path(args.results))
+    result_ids = {row["comparison_task_id"] for row in rows}
+    truth_ids = set(truth)
+    if result_ids != truth_ids:
+        die(
+            "comparison results do not exactly cover comparison truth; "
+            f"missing result ids={sorted(truth_ids - result_ids)}, "
+            f"unexpected result ids={sorted(result_ids - truth_ids)}"
+        )
+
+    normalized_winners: dict[str, str] = {}
+    expected_design_sha256 = comparison_design_sha256(truth.values())
+    for row in rows:
+        task_id = row["comparison_task_id"]
+        task_identity = truth[task_id]["comparison_task"]
+        for label in ("A", "B"):
+            candidate_path = Path(truth[task_id]["candidate_paths"][label])
+            try:
+                observed_candidate_sha256 = comparison_output_sha256(candidate_path)
+            except OSError as exc:
+                die(
+                    f"comparison results row {task_id!r}: candidate {label} "
+                    f"is unavailable: {exc}")
+            if observed_candidate_sha256 != task_identity[f"output_{label.casefold()}_sha256"]:
+                die(
+                    f"comparison results row {task_id!r}: candidate {label} "
+                    "changed after comparison task construction")
+        if row["answer_design_sha256"] != answer_design_sha256:
+            die(f"comparison results row {task_id!r}: stale or mismatched answer_design_sha256")
+        if row["comparison_design_sha256"] != expected_design_sha256:
+            die(f"comparison results row {task_id!r}: stale or mismatched comparison_design_sha256")
+        if row["comparison_task_sha256"] != truth[task_id]["comparison_task_sha256"]:
+            die(f"comparison results row {task_id!r}: stale or mismatched comparison_task_sha256")
+        winner = row.get("winner")
+        if not isinstance(winner, str) or winner.strip().upper() not in {"A", "B", "TIE"}:
+            die(f"comparison results row {task_id!r}: winner must be one of A, B, or TIE")
+        normalized_winners[task_id] = winner.strip().upper()
+
     wins = {"primary": 0, "baseline": 0, "tie": 0, "unknown": 0}
     details = []
     for row in rows:
-        tid = row.get("comparison_task_id") or row.get("id")
-        winner = str(row.get("winner", "")).upper()
-        t = truth.get(tid)
-        if not t:
-            wins["unknown"] += 1
-            continue
+        tid = row["comparison_task_id"]
+        winner = normalized_winners[tid]
+        t = truth[tid]
         if winner == "TIE":
             wins["tie"] += 1
             role = "tie"
-        elif winner in {"A", "B"}:
-            role = t[winner]["role"]
-            wins[role] = wins.get(role, 0) + 1
         else:
-            role = "unknown"
-            wins["unknown"] += 1
-        details.append({"comparison_task_id": tid, "winner": winner, "winning_role": role, "reasoning": row.get("reasoning", "")})
-    output = {"generated_at": int(time.time()), "summary": wins, "details": details}
+            role = t[winner]["role"]
+            wins[role] += 1
+        details.append({
+            "comparison_task_id": tid,
+            "answer_design_sha256": row["answer_design_sha256"],
+            "comparison_design_sha256": row["comparison_design_sha256"],
+            "comparison_task_sha256": row["comparison_task_sha256"],
+            "winner": winner,
+            "winning_role": role,
+            "reasoning": row["reasoning"],
+        })
+    output = {
+        "generated_at": int(time.time()),
+        "comparison_complete": True,
+        "answer_design_sha256": answer_design_sha256,
+        "comparison_design_sha256": expected_design_sha256,
+        "coverage": {"expected": len(truth), "received": len(rows)},
+        "summary": wins,
+        "details": details,
+    }
     emit_report(output, args.out)
     return 0
 
@@ -9923,25 +14735,32 @@ def benchmark_report_diff(previous: dict[str, Any], current: dict[str, Any]) -> 
             variant_deltas[variant] = pairs
     flags = lambda report: {f"{flag.get('case_id')}::{f}" for flag in report.get("case_flags", []) for f in flag.get("flags", [])}
     prev_flags, curr_flags = flags(previous), flags(current)
-    return {
+    observed = {
         "variant_deltas": variant_deltas,
         "case_deltas": case_deltas,
         "new_flags": sorted(curr_flags - prev_flags),
         "resolved_flags": sorted(prev_flags - curr_flags),
     }
+    if (previous.get("availability") != "complete"
+            or current.get("availability") != "complete"):
+        return invalidate_design_aggregate(observed, "incomplete_report_comparison")
+    return {"availability": "complete", **observed}
 
 
 def persist_feedback(workspace: Path, entry: dict[str, Any]) -> Path:
     """Feedback capture (roadmap 2.8, eval-viewer's feedback.json): entries are
-    keyed by case/variant/run — a re-submission replaces its prior entry."""
+    keyed by case/model/variant/run — a re-submission replaces its prior entry."""
     path = workspace / "feedback.json"
     doc = {"entries": []}
     if path.is_file():
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        loaded = strict_json_loads(path.read_text(encoding="utf-8"))
         if isinstance(loaded, dict) and isinstance(loaded.get("entries"), list):
             doc = loaded
-    key = (entry.get("case_id"), entry.get("variant"), entry.get("run_number", 1))
-    doc["entries"] = [e for e in doc["entries"] if (e.get("case_id"), e.get("variant"), e.get("run_number", 1)) != key]
+    key = (entry.get("case_id"), entry.get("model"), entry.get("variant"),
+           entry.get("run_number", 1))
+    doc["entries"] = [e for e in doc["entries"] if (
+        e.get("case_id"), e.get("model"), e.get("variant"),
+        e.get("run_number", 1)) != key]
     doc["entries"].append(entry)
     write_json(path, doc)
     return path
@@ -9964,14 +14783,15 @@ def viewer_html(report: dict[str, Any], runs_root: Path | None = None, *, previo
     if serve_mode:
         parts.append(
             "<h2>Feedback</h2><form id='fb'>"
-            "<input name='case_id' placeholder='case id'> <input name='variant' placeholder='variant'>"
+            "<input name='case_id' placeholder='case id'> <input name='model' placeholder='model'> "
+            "<input name='variant' placeholder='variant'>"
             " <select name='verdict'><option>good</option><option>bad</option><option>unsure</option></select>"
             " <input name='note' placeholder='note' size='40'> <button>save</button> <span id='fb-status'></span></form>"
             "<script>document.getElementById('fb').addEventListener('submit',async e=>{e.preventDefault();"
             "const data=Object.fromEntries(new FormData(e.target));"
             "const r=await fetch('/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});"
             "document.getElementById('fb-status').textContent=r.ok?'saved':'error';});</script>")
-    parts.append("<h2>Runs</h2><table><tr><th>Case</th><th>Variant</th><th>Run</th><th>Pass</th><th>Assertions</th><th>Output</th><th>Artifacts</th></tr>")
+    parts.append("<h2>Runs</h2><table><tr><th>Case</th><th>Model</th><th>Variant</th><th>Run</th><th>Pass</th><th>Assertions</th><th>Output</th><th>Artifacts</th></tr>")
     for r in rows:
         assertions = []
         for a in r.get("assertions", []) + r.get("qualitative_assertions", []):
@@ -9991,6 +14811,7 @@ def viewer_html(report: dict[str, Any], runs_root: Path | None = None, *, previo
                 artifacts_html = "".join(rendered)
         parts.append("<tr>" +
             f"<td>{html.escape(str(r.get('case_id')))}</td>" +
+            f"<td>{html.escape(str(r.get('model') or ''))}</td>" +
             f"<td>{html.escape(str(r.get('variant')))}</td>" +
             f"<td>{html.escape(str(r.get('run_number',1)))}</td>" +
             f"<td>{html.escape(str(r.get('objective_pass_rate')))}</td>" +
@@ -10045,7 +14866,7 @@ def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
                 return
             length = int(self.headers.get("Content-Length", 0))
             try:
-                entry = json.loads(self.rfile.read(length).decode("utf-8"))
+                entry = strict_json_loads(self.rfile.read(length).decode("utf-8"))
                 persist_feedback(workspace, entry)
                 self.send_response(204)
             except (json.JSONDecodeError, OSError):
@@ -10387,7 +15208,7 @@ def trend_entry(label: str, report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def severity_weighted_failures(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def severity_weighted_failures(reports: list[dict[str, Any]]) -> Any:
     """Recurring failures ranked by prevalence x severity (roadmap 2.6): a rare
     critical failure outranks a common trivial one — the floor-raising
     principle made quantitative."""
@@ -10395,8 +15216,12 @@ def severity_weighted_failures(reports: list[dict[str, Any]]) -> list[dict[str, 
     for report in reports:
         seen: set[tuple] = set()
         for r in report.get("results", []):
+            if (not scorable_run(r)
+                    or r.get("grading_availability", "complete") != "complete"):
+                continue
             for a in r.get("assertions", []) + r.get("qualitative_assertions", []):
-                if a.get("passed"):
+                if (a.get("availability", "complete") != "complete"
+                        or a.get("passed") is not False):
                     continue
                 key = (r.get("case_id"), str(a.get("name")), a.get("severity", "gate"))
                 seen.add(key)
@@ -10414,10 +15239,15 @@ def severity_weighted_failures(reports: list[dict[str, Any]]) -> list[dict[str, 
             "prevalence": round(prevalence, 4),
             "rank": round(prevalence * weight, 4),
         })
-    return sorted(ranked, key=lambda row: (-row["rank"], str(row["case_id"]), row["assertion"]))
+    observed = sorted(
+        ranked, key=lambda row: (-row["rank"], str(row["case_id"]), row["assertion"]))
+    if any(report.get("availability") != "complete" for report in reports):
+        return invalidate_design_aggregate(
+            observed, "incomplete_history_report_population")
+    return observed
 
 
-def stale_case_candidates(reports: list[dict[str, Any]], *, min_runs: int = 2) -> list[dict[str, Any]]:
+def stale_case_candidates(reports: list[dict[str, Any]], *, min_runs: int = 2) -> Any:
     """Staleness hygiene (roadmap 1.9), the inverse of the saturation flag: a
     case that across the whole history never failed and never discriminated
     (with == without == 1.0 every time) is a prune CANDIDATE. The harness
@@ -10445,6 +15275,9 @@ def stale_case_candidates(reports: list[dict[str, Any]], *, min_runs: int = 2) -
             continue
         if all(w == 1.0 and n == 1.0 for w, n in pairs):
             candidates.append({"case_id": case_id, "runs_observed": len(pairs), "reason": "never failed and never showed lift across the history"})
+    if any(report.get("availability") != "complete" for report in reports):
+        return invalidate_design_aggregate(
+            candidates, "incomplete_history_report_population")
     return candidates
 
 
@@ -10454,11 +15287,14 @@ def build_trend_report(history_entries: list[tuple[str, dict[str, Any]]]) -> dic
     for (prev_label, prev), (curr_label, curr) in itertools.pairwise(history_entries):
         diffs.append({"from": prev_label, "to": curr_label, "diff": benchmark_report_diff(prev, curr)})
     reports = [report for _, report in history_entries]
+    recurring = severity_weighted_failures(reports)
+    if isinstance(recurring, list):
+        recurring = recurring[:50]
     return {
         "runs": len(series),
         "series": series,
         "diffs": diffs,
-        "recurring_failures": severity_weighted_failures(reports)[:50],
+        "recurring_failures": recurring,
         "prune_candidates": stale_case_candidates(reports),
     }
 
@@ -10862,45 +15698,63 @@ def paired_token_overhead_report(
     lift_per_1k = [p["objective_lift_per_1k_total_tokens"] for p in pairs if p.get("objective_lift_per_1k_total_tokens") is not None]
     static_skill_tokens = profile["summary"].get("skill_tokens") or 0
     static_reference_tokens = profile["summary"].get("reference_tokens") or 0
+    observed_summary = {
+        "skill_name": manifest.get("skill_name"),
+        "static_skill_tokens": static_skill_tokens,
+        "static_reference_tokens": static_reference_tokens,
+        "static_total_tokens": static_skill_tokens + static_reference_tokens,
+        "reference_files": profile["summary"].get("reference_files"),
+        "paired_runtime_rows": len(pairs),
+        "total_token_delta": stats(total_deltas),
+        "input_token_delta": stats(input_deltas),
+        "output_token_delta": stats(output_deltas),
+        "objective_delta": stats(objective_deltas),
+        "objective_lift_per_1k_total_tokens": stats(lift_per_1k),
+        "cost_delta_usd": stats(cost_deltas),
+        "cost_delta_coverage": {
+            "eligible_pairs": len(cost_deltas),
+            "blocked_reason_counts": dict(collections.Counter(
+                p.get("cost_delta_comparison", {}).get("reason") for p in all_pair_rows
+                if p.get("cost_delta_comparison", {}).get("availability") == telemetry_domain.BLOCKED)),
+        },
+        "objective_lift_per_dollar": stats(lift_per_dollar),
+        "objective_lift_per_dollar_coverage": {
+            "eligible_pairs": len(lift_per_dollar),
+            "blocked_reason_counts": dict(collections.Counter(
+                p.get("objective_lift_per_dollar_comparison", {}).get("reason") for p in all_pair_rows
+                if p.get("objective_lift_per_dollar_comparison", {}).get("availability") == telemetry_domain.BLOCKED)),
+        },
+        "saturated_or_no_lift_cost_usd": waste_cost,
+        "saturated_or_no_lift_cost_usd_aggregate": waste_usd.to_dict(),
+        **({"known_saturated_or_no_lift_cost_usd": float(waste_usd.known_subtotal)}
+           if waste_usd.availability == telemetry_domain.PARTIAL else {}),
+        "mean_total_overhead_per_static_skill_token": (
+            statistics.mean(total_deltas) / static_skill_tokens
+            if total_deltas and static_skill_tokens else None),
+    }
+    design_coverage = None
+    report_pairs = pairs
+    observed_pairs = None
+    if runs is not None:
+        benchmark_surface = build_benchmark_report(
+            manifest_path, runs, split=split,
+            variants_arg=[with_variant, without_variant])
+        design_coverage = benchmark_surface["answer_design"]
+        if benchmark_surface.get("availability") != "complete":
+            observed_pairs = pairs
+            report_pairs = []
+            observed_summary = invalidate_design_aggregate(
+                observed_summary, "answer_run_coverage_incomplete")
     return {
         "generated_at": int(time.time()),
         "manifest": str(manifest_path),
         "runs": str(runs) if runs is not None else None,
         "skill_name": manifest.get("skill_name"),
-        "summary": {
-            "skill_name": manifest.get("skill_name"),
-            "static_skill_tokens": static_skill_tokens,
-            "static_reference_tokens": static_reference_tokens,
-            "static_total_tokens": static_skill_tokens + static_reference_tokens,
-            "reference_files": profile["summary"].get("reference_files"),
-            "paired_runtime_rows": len(pairs),
-            "total_token_delta": stats(total_deltas),
-            "input_token_delta": stats(input_deltas),
-            "output_token_delta": stats(output_deltas),
-            "objective_delta": stats(objective_deltas),
-            "objective_lift_per_1k_total_tokens": stats(lift_per_1k),
-            "cost_delta_usd": stats(cost_deltas),
-            "cost_delta_coverage": {
-                "eligible_pairs": len(cost_deltas),
-                "blocked_reason_counts": dict(collections.Counter(
-                    p.get("cost_delta_comparison", {}).get("reason") for p in all_pair_rows
-                    if p.get("cost_delta_comparison", {}).get("availability") == telemetry_domain.BLOCKED)),
-            },
-            "objective_lift_per_dollar": stats(lift_per_dollar),
-            "objective_lift_per_dollar_coverage": {
-                "eligible_pairs": len(lift_per_dollar),
-                "blocked_reason_counts": dict(collections.Counter(
-                    p.get("objective_lift_per_dollar_comparison", {}).get("reason") for p in all_pair_rows
-                    if p.get("objective_lift_per_dollar_comparison", {}).get("availability") == telemetry_domain.BLOCKED)),
-            },
-            "saturated_or_no_lift_cost_usd": waste_cost,
-            "saturated_or_no_lift_cost_usd_aggregate": waste_usd.to_dict(),
-            **({"known_saturated_or_no_lift_cost_usd": float(waste_usd.known_subtotal)}
-               if waste_usd.availability == telemetry_domain.PARTIAL else {}),
-            "mean_total_overhead_per_static_skill_token": (statistics.mean(total_deltas) / static_skill_tokens) if total_deltas and static_skill_tokens else None,
-        },
+        **({"answer_design": design_coverage} if design_coverage is not None else {}),
+        "summary": observed_summary,
         "profile": profile,
-        "pairs": pairs,
+        "pairs": report_pairs,
+        **({"observed_pairs": observed_pairs} if observed_pairs is not None else {}),
         "blocked_pairs": blocked_pairs,
     }
 
@@ -10913,15 +15767,34 @@ def token_overhead(args: argparse.Namespace) -> int:
         if runs is None and args.runs_subdir:
             runs = repo_root_for_manifest(manifest_path) / args.runs_subdir
         reports.append(paired_token_overhead_report(manifest_path, runs=runs, split=args.split))
+    observed_summary = {
+        "skills": len(reports),
+        "skills_with_runtime_pairs": sum(
+            1 for r in reports
+            if isinstance(r["summary"].get("paired_runtime_rows"), int)
+            and r["summary"]["paired_runtime_rows"] > 0),
+        "runtime_pairs": sum(
+            r["summary"].get("paired_runtime_rows") or 0 for r in reports),
+        "mean_static_skill_tokens": statistics.mean([
+            r["summary"].get("static_skill_tokens")
+            if isinstance(r["summary"].get("static_skill_tokens"), (int, float))
+            else (r["summary"].get("observed") or {}).get("static_skill_tokens", 0)
+            for r in reports]) if reports else None,
+        "mean_static_reference_tokens": statistics.mean([
+            r["summary"].get("static_reference_tokens")
+            if isinstance(r["summary"].get("static_reference_tokens"), (int, float))
+            else (r["summary"].get("observed") or {}).get("static_reference_tokens", 0)
+            for r in reports]) if reports else None,
+    }
+    complete = all(
+        r.get("answer_design", {}).get("complete") is not False
+        and r["summary"].get("availability") != "partial"
+        for r in reports)
     output = {
         "generated_at": int(time.time()),
-        "summary": {
-            "skills": len(reports),
-            "skills_with_runtime_pairs": sum(1 for r in reports if r["summary"].get("paired_runtime_rows", 0)),
-            "runtime_pairs": sum(r["summary"].get("paired_runtime_rows", 0) for r in reports),
-            "mean_static_skill_tokens": statistics.mean([r["summary"]["static_skill_tokens"] for r in reports]) if reports else None,
-            "mean_static_reference_tokens": statistics.mean([r["summary"]["static_reference_tokens"] for r in reports]) if reports else None,
-        },
+        "availability": "complete" if complete else "partial",
+        "summary": (observed_summary if complete else invalidate_design_aggregate(
+            observed_summary, "one_or_more_runtime_designs_incomplete")),
         "reports": reports,
     }
     if args.format == "markdown":
@@ -10988,21 +15861,12 @@ def profile_skill(args: argparse.Namespace) -> int:
     return 0
 
 
-TRIGGER_NEGATION_RE = re.compile(r"NO_TRIGGER|not trigger|should not", re.IGNORECASE)
-
-
 def expected_trigger_polarity(case: dict[str, Any]) -> str:
-    """THE one resolver for 'does this trigger case expect the skill to fire?'.
-    Reads expected_behavior + assertion patterns; a negation marker (NO_TRIGGER,
-    'not trigger', 'should not') means NO_TRIGGER, otherwise TRIGGER (the default the
-    autonomous-trigger eval uses). Both the eval (run_pi_trigger_eval) and the
-    manifest audit consume this, so they cannot disagree on a case's polarity — the
-    prior token-only audit resolver returned None for prose like 'should trigger',
-    silently dropping the case from both the positive and negative tallies."""
-    text = " ".join(str(x) for x in case.get("expected_behavior", []))
-    for assertion in case.get("assertions", []):
-        text += " " + str(assertion.get("pattern", assertion.get("value", "")))
-    return "NO_TRIGGER" if TRIGGER_NEGATION_RE.search(text) else "TRIGGER"
+    """Resolve discovery polarity only from the validated explicit boolean."""
+    value = case.get("should_trigger")
+    if not isinstance(value, bool):
+        raise TypeError("trigger case requires an explicit boolean should_trigger")
+    return "TRIGGER" if value else "NO_TRIGGER"
 
 
 def case_polarity(case: dict[str, Any]) -> str:
@@ -11058,7 +15922,7 @@ def _mean_or_none(xs: list[float] | None) -> float | None:
     return statistics.mean(xs) if xs else None
 
 
-def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9) -> dict[str, list]:
+def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9) -> dict[str, Any]:
     """From a benchmark report's per-case scorable results, surface the cases a
     static manifest audit CANNOT see — the ones where the *measured* numbers say
     the case can't discriminate the skill:
@@ -11116,9 +15980,21 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
             on = statistics.mean(right for _, right in objective)
             if abs(ow - on) <= eps and cw > cn + eps:
                 qualitative_only.append(cid)
-    return {"base_saturated_cases": sorted(base_saturated, key=str),
-            "base_saturated_expected_cases": sorted(base_saturated_expected, key=str),
-            "qualitative_only_cases": sorted(qualitative_only, key=str)}
+    observed = {
+        "base_saturated_cases": sorted(base_saturated, key=str),
+        "base_saturated_expected_cases": sorted(base_saturated_expected, key=str),
+        "qualitative_only_cases": sorted(qualitative_only, key=str),
+    }
+    if benchmark_report.get("availability") != "complete":
+        return {
+            "availability": "partial",
+            "reason": "benchmark report population is incomplete",
+            "base_saturated_cases": [],
+            "base_saturated_expected_cases": [],
+            "qualitative_only_cases": [],
+            "observed": observed,
+        }
+    return {"availability": "complete", **observed}
 
 
 def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str | None = None, leakage_min_chars: int = 4, benchmark_report: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -11438,8 +16314,31 @@ def audit_manifest_report(
     # Cost-quality findings (issue #21): where money is being spent without
     # buying signal. Only computable when run data is supplied.
     if bench_report:
-        cost_by_case = (bench_report.get("cost_summary", {}) or {}).get("by_case", {})
-        flags_by_case = {flag.get("case_id"): flag.get("flags", []) for flag in bench_report.get("case_flags", [])}
+        cost_summary = bench_report.get("cost_summary", {}) or {}
+        # An unrelated incomplete grading channel (for example, a deferred
+        # judge on another case) makes the report-wide cost surface partial,
+        # but does not erase already observed provider-reported spend. Audit
+        # findings are diagnostics rather than experiment headlines, so they
+        # may consume that explicitly labelled ``observed`` projection while
+        # the benchmark itself remains partial. Never fall back to a hidden or
+        # unlabeled subtotal.
+        if (isinstance(cost_summary, dict)
+                and cost_summary.get("availability") == "partial"
+                and isinstance(cost_summary.get("observed"), dict)):
+            cost_summary = cost_summary["observed"]
+        cost_by_case = (cost_summary or {}).get("by_case", {})
+        if not isinstance(cost_by_case, dict):
+            cost_by_case = {}
+        case_flags = bench_report.get("case_flags", [])
+        if (bench_report.get("case_flags_availability") == "partial"
+                and isinstance(bench_report.get("observed_case_flags"), list)):
+            case_flags = bench_report["observed_case_flags"]
+        if not isinstance(case_flags, list):
+            case_flags = []
+        flags_by_case = {
+            flag.get("case_id"): flag.get("flags", [])
+            for flag in case_flags if isinstance(flag, dict)
+        }
         for case_id, spend in sorted(cost_by_case.items()):
             cost = spend.get("total_cost_usd")
             # A partial/unavailable subtotal cannot establish that the case is
@@ -11679,7 +16578,7 @@ def _load_suite_pins(pins_file: Path | None) -> dict[str, Any]:
         return {}
     if not pins_file.exists():
         die(f"pins file not found: {pins_file}")
-    data = json.loads(pins_file.read_text(encoding="utf-8"))
+    data = strict_json_loads(pins_file.read_text(encoding="utf-8"))
     skills = data.get("skills")
     if not isinstance(skills, dict):
         die(f"pins file must contain a skills object: {pins_file}")
@@ -11976,7 +16875,7 @@ def suite_cost_estimate(scope: dict[str, Any], *, history_dir: Path | None = Non
         cost_rates: list[float] = []
         for f in sorted(history_dir.glob("*.json")):
             try:
-                doc = json.loads(f.read_text(encoding="utf-8"))
+                doc = strict_json_loads(f.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
             # Legacy ledgers do not carry enough availability/basis evidence to
@@ -12213,7 +17112,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--codex-cmd", default="codex exec", help="argv-style Codex command prefix for --judge-backend codex; the harness adds --json/--output-last-message/--output-schema and shell metacharacters are not interpreted")
     p.add_argument("--vibe-cmd", default=VIBE_DEFAULT_CMD, help="argv-style Vibe command prefix for --judge-backend vibe; the harness adds --prompt/--output/--workdir and shell metacharacters are not interpreted")
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
-    p.add_argument("--strict-judge-schema", action="store_true", help="fail a judge verdict whose JSON violates its canonical schema (default: surface violations in a schema_errors field only)")
+    p.add_argument("--strict-judge-schema", action="store_true", help="deprecated compatibility flag (no-op): malformed judge verdicts always fail closed and retain schema_errors diagnostics")
     p.add_argument("--judge-trajectory", action="store_true", help="also give the judge the run's normalized trajectory (events/metrics) and a denylisted artifact inventory, not just the final output (G1)")
     p.add_argument("--judge-explore", action="store_true", help="let a native tool-using judge explore a SANITIZED copy of the run dir (oracle files removed) with read-only tools (G1 follow-on; requires --judge-model/--judge-panel)")
     p.add_argument("--judge-panel", action="append", help="judge model for a consensus panel; repeat for >=2 to ensemble verdicts across judges (G3)")
@@ -12271,7 +17170,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--judge-cmd", help="shell command that reads a judge prompt on stdin and emits JSON on stdout (any provider)")
     p.add_argument("--judge-model", help="judge natively with `claude -p <model>` (captures cost)")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable when using --judge-model")
-    p.add_argument("--fail-on-findings", action="store_true", help="exit non-zero if any robustness finding fires (CI gate)")
+    p.add_argument("--fail-on-findings", action="store_true", help="exit non-zero if a robustness finding fires or the report is incomplete/unavailable (CI gate)")
     p.add_argument("--out")
 
     p = sub.add_parser("export-anthropic")

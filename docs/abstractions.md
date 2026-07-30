@@ -120,6 +120,13 @@ executable. `PreparedTaskDraft.validate()` / `PreparedTask.from_row()` construct
 repetition is positive, `run_dir` is safe and relative, and `without_skill` cannot carry skill
 paths. Every native runner and Jetty exporter requires the executable type.
 
+The prepared rows also form a persisted `answer-design.json`: the exact expected
+case/model/repetition identities plus a digest of manifest inputs, referenced oracles, and
+variant instructions. Each produced run repeats the design, task, and instruction digests.
+Report builders re-derive the current eval contract and require exact design coverage before
+publishing paired or aggregate headlines; surviving rows from an incomplete design are retained
+only as explicitly observed diagnostics.
+
 ## Run-output contract
 
 The contract is the file boundary between any runner and the harness:
@@ -139,10 +146,10 @@ editor. This boundary is the main extension seam in the codebase.
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:5363`), Claude (`run_claude:5508`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:7599`), Claude (`run_claude:7764`, capturing real
 per-run cost), Mistral Vibe (`run-agent --agent vibe`, using isolated `VIBE_HOME` outside the workdir), the in-process
-subagent runner (`run_subagent:6966`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:2289` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:10047`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:3559` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -198,7 +205,7 @@ those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplica
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:413`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:614`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 ## What changes when you extend the tool

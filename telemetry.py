@@ -743,9 +743,10 @@ def _basis_compatibility(left: Measurement[Any], right: Measurement[Any]) -> str
             return "basis_missing"
         if left_value != right_value:
             return "population_mismatch" if field_name == "population" else "pair_key_mismatch" if field_name in {"case_id", "run_number"} else "basis_mismatch"
-    # Revision identifiers are optional during migration, but if either arm
-    # supplies one it must agree; a stale tree/report cannot claim paired lift.
-    for field_name in ("manifest_revision", "skill_tree_hash"):
+    # The manifest revision must agree when supplied. skill_tree_hash is the
+    # treatment variable in a with-vs-without comparison (and is absent on the
+    # control arm), so requiring equality would block every valid experiment.
+    for field_name in ("manifest_revision",):
         left_value = left.basis.get(field_name)
         right_value = right.basis.get(field_name)
         if left_value is not None or right_value is not None:

@@ -28,7 +28,8 @@ from skill_benchmark import (
     AblationError,
     PiStream,
     build_canonical_skill_tree,
-    canonical_skill_tree_hash,
+    canonical_json_sha256,
+    canonical_trigger_query,
     detect_trigger,
     detect_trigger_records,
     event_texts_for_tool_input,
@@ -42,6 +43,10 @@ from skill_benchmark import (
     pi_stream_terminal_error,
     repo_root_for_manifest,
     safe_trace_label,
+    skill_tree_hash,
+    strict_json_loads,
+    trigger_harness_identity,
+    trigger_manifest_identity,
     write_json,
     write_trace_artifacts,
 )
@@ -65,9 +70,9 @@ def skill_name_from_manifest(manifest: dict[str, Any]) -> str:
 
 
 def seed_config_dir(config_dir: Path) -> None:
-    """Copy provider/auth config, but not user skills, into an isolated temp config dir."""
+    """Copy authentication only; ambient settings/system prompts are behavior."""
     source = Path(os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent")))
-    for name in ["auth.json", "settings.json", "APPEND_SYSTEM.md"]:
+    for name in ["auth.json"]:
         src = source / name
         if src.exists() and src.is_file():
             shutil.copy2(src, config_dir / name)
@@ -84,7 +89,10 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
             res = materialize_trigger_ablation(repo_root, manifest, ablation_id, config_dir / "_materialized")
         except AblationError as exc:
             raise RuntimeError(str(exc)) from exc
-        return mount_skill_tree(Path(res["dir"]), skills_dir), res
+        copied = mount_skill_tree(Path(res["dir"]), skills_dir)
+        if skill_tree_hash(skills_dir) != res["skill_hash"]:
+            raise RuntimeError("mounted ablation tree does not match its materialized skill_hash")
+        return copied, res
     # Baseline (no ablation): build the SAME canonical tree the ablation arm starts
     # from, so the two arms are file-for-file identical apart from the declared
     # edit — never differing by an ad-hoc copier that dropped or renamed files.
@@ -92,7 +100,39 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
     # ablation run from the same skill revision (baseline.skill_tree_hash ==
     # ablation.parent_skill_hash).
     tree = build_canonical_skill_tree(repo_root, manifest, config_dir / "_canonical")
-    return mount_skill_tree(Path(tree), skills_dir), {"mode": "baseline", "skill_tree_hash": canonical_skill_tree_hash(repo_root, manifest)}
+    tree_hash = skill_tree_hash(Path(tree))
+    copied = mount_skill_tree(Path(tree), skills_dir)
+    if skill_tree_hash(skills_dir) != tree_hash:
+        raise RuntimeError("mounted baseline tree does not match its canonical snapshot")
+    return copied, {"mode": "baseline", "skill_tree_hash": tree_hash}
+
+
+def pi_trigger_protocol(
+    *, timeout: int, runs_per_query: int, workers: int, model: str | None,
+) -> dict[str, Any]:
+    resolved = shutil.which("pi")
+    executable = {"requested": "pi", "resolved": str(Path(resolved).resolve()) if resolved else None}
+    if resolved:
+        try:
+            executable["sha256"] = "sha256:" + hashlib.sha256(
+                Path(resolved).read_bytes()).hexdigest()
+        except OSError as exc:
+            executable["identity_error"] = f"{type(exc).__name__}: {exc}"
+    return {
+        "schema_version": 1,
+        "producer": "skill-pi-trigger-eval",
+        "producer_sha256": "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "harness_identity": trigger_harness_identity(),
+        "timeout_seconds": timeout,
+        "runs_per_query": runs_per_query,
+        "workers": workers,
+        "adapter": "pi",
+        "model": model,
+        "command": {"executable": executable,
+                    "argv_flags": pi_argv("<QUERY>", model)[:-1]},
+        "isolation_policy": "isolated PI_CODING_AGENT_DIR seeded without user skills",
+        "required_observations": {"config_isolated": True},
+    }
 
 
 def pi_terminal_error(raw_text: str) -> str | None:
@@ -140,8 +180,6 @@ def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, 
             "elapsed_ms": result.get("elapsed_ms"),
             "returncode": result.get("returncode"),
             "timed_out": result.get("timed_out"),
-            "skill_invoked": result.get("triggered"),
-            "skill_invocation_evidence": result.get("evidence", []),
         },
         environment={"runner": "pi", "mode": "json", "trigger_eval": True},
         write_metadata=True,
@@ -152,7 +190,8 @@ def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, 
 def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int,
               model: str | None, trace_dir: Path | None = None,
               ablation: str | None = None,
-              identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
+              identity: TriggerRepetitionIdentity | None = None,
+              protocol_sha256: str | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     with tempfile.TemporaryDirectory(prefix="pi-trigger-") as td:
         config_dir = Path(td)
@@ -166,7 +205,8 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
         stream = invocation.provider_payload
         if not isinstance(stream, PiStream):
             raise TypeError("Pi invocation did not retain its parsed provider stream")
-        detection = detect_trigger_records(stream.records, copied)
+        detection = detect_trigger_records(
+            stream.records, copied, source="pi", pi_stream=stream)
         if invocation.observation_complete:
             usage_normalized = dict(stream.usage_normalized)
             cost_normalized = dict(stream.cost_normalized)
@@ -200,6 +240,9 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
                 "measurement": EvidenceClass.RAW_MEASUREMENT.value,
                 "ablation": ablation_field,
                 "skill_tree_hash": skill_tree_hash,
+                **({"protocol_sha256": protocol_sha256,
+                    "protocol_observation": {"config_isolated": True}}
+                   if protocol_sha256 is not None else {}),
             },
             identity=identity,
         )
@@ -245,6 +288,7 @@ def validate_trigger_rows(rows: Any, source: str) -> list[dict[str, Any]]:
         raise SystemExit(f"{source}: expected a list of trigger rows or an object with evals/queries")
     out: list[dict[str, Any]] = []
     seen: dict[str, tuple[str, bool]] = {}
+    seen_definitions: dict[str, tuple[str, bool]] = {}
     for i, row in enumerate(rows, 1):
         if not isinstance(row, dict):
             raise SystemExit(f"{source}: row {i} must be an object")
@@ -253,6 +297,10 @@ def validate_trigger_rows(rows: Any, source: str) -> list[dict[str, Any]]:
             raise SystemExit(f"{source}: row {i} query must be a non-empty string")
         if not isinstance(row.get("should_trigger"), bool):
             raise SystemExit(f"{source}: row {i} should_trigger must be true or false")
+        if ("query_id" in row and "id" in row
+                and row.get("query_id") != row.get("id")):
+            raise SystemExit(
+                f"{source}: row {i} has conflicting query_id and id aliases")
         query_id = row.get("query_id", row.get("id"))
         if query_id is None or query_id == "":
             encoded = json.dumps([query, row["should_trigger"]], ensure_ascii=False,
@@ -266,6 +314,13 @@ def validate_trigger_rows(rows: Any, source: str) -> list[dict[str, Any]]:
                 raise SystemExit(
                     f"{source}: duplicate query_id {query_id!r} identifies conflicting queries")
             raise SystemExit(f"{source}: duplicate query_id {query_id!r}")
+        inference_query = canonical_trigger_query(query)
+        prior = seen_definitions.setdefault(
+            inference_query, (query_id, row["should_trigger"]))
+        if prior != (query_id, row["should_trigger"]):
+            raise SystemExit(
+                f"{source}: canonical query aliases alias the same query and must share one query ID and polarity; "
+                f"got {prior!r} and {(query_id, row['should_trigger'])!r}")
         seen[query_id] = authored
         normalized = dict(row)
         normalized.pop("id", None)
@@ -281,9 +336,13 @@ def eval_rows_from_args(args: Any, manifest_path: Path) -> list[dict[str, Any]]:
     file ({query, should_trigger} rows, bare list or under evals/queries), else
     the manifest's kind:'trigger' cases. Shared with run_trigger_matrix."""
     if args.eval_set:
-        rows = json.loads(Path(args.eval_set).read_text(encoding="utf-8"))
+        rows = strict_json_loads(Path(args.eval_set).read_text(encoding="utf-8"))
         if isinstance(rows, dict):
-            rows = rows.get("evals", rows.get("queries", []))
+            aliases = [key for key in ("evals", "queries") if key in rows]
+            if len(aliases) != 1:
+                raise SystemExit(
+                    f"{args.eval_set}: expected exactly one of evals or queries")
+            rows = rows[aliases[0]]
         return validate_trigger_rows(rows, str(args.eval_set))
     return validate_trigger_rows(cases_from_manifest(load_manifest(manifest_path), args.split), str(manifest_path))
 
@@ -318,6 +377,10 @@ def main() -> int:
         raise SystemExit("--runs-per-query must be a positive integer")
     futures = []
     results = []
+    protocol = pi_trigger_protocol(
+        timeout=args.timeout, runs_per_query=args.runs_per_query,
+        workers=args.workers, model=args.model)
+    protocol_sha256 = canonical_json_sha256(protocol)
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         for i, row in enumerate(rows, 1):
             for run_number in range(1, args.runs_per_query + 1):
@@ -328,11 +391,15 @@ def main() -> int:
                 identity = TriggerRepetitionIdentity(row["query_id"], run_number)
                 futures.append(ex.submit(
                     run_query, manifest_path, row["query"], row["should_trigger"],
-                    args.timeout, args.model, trace_dir, args.ablation, identity))
+                    args.timeout, args.model, trace_dir, args.ablation, identity,
+                    protocol_sha256))
         for fut in as_completed(futures):
             results.append(fut.result())
     results.sort(key=lambda row: (str(row["query_id"]), int(row["run_number"])))
-    passed = sum(1 for r in results if r["pass"])
+    complete_results = [r for r in results if r["observation_complete"]]
+    passed = sum(1 for r in complete_results if r["pass"])
+    incomplete = len(results) - len(complete_results)
+    observed_pass_rate = passed / len(complete_results) if complete_results else None
     tree_hashes = {r.get("skill_tree_hash") for r in results}
     if len(tree_hashes) != 1 or not next(iter(tree_hashes), None):
         raise SystemExit("trigger rows did not retain one consistent skill_tree_hash")
@@ -360,13 +427,20 @@ def main() -> int:
         "skill_tree_hash": tree_hash,
         "ablation": args.ablation,
         "provenance": provenance,
+        "manifest_identity": trigger_manifest_identity(manifest),
+        "protocol": protocol,
+        "protocol_sha256": protocol_sha256,
         "runs_per_query": args.runs_per_query,
         "design": [
             {"agent": "pi", "model": args.model, "query_id": row["query_id"],
              "query": row["query"], "should_trigger": row["should_trigger"]}
             for row in rows
         ],
-        "summary": {"total": len(results), "passed": passed, "failed": len(results) - passed, "pass_rate": (passed / len(results)) if results else None},
+        "summary": {"total": len(results), "complete": len(complete_results),
+                    "incomplete": incomplete,
+                    "passed": passed, "failed": len(complete_results) - passed,
+                    "pass_rate": None if incomplete else observed_pass_rate,
+                    "observed_pass_rate": observed_pass_rate},
         "results": results,
     }
     write_json(Path(args.out), output)

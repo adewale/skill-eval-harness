@@ -52,7 +52,7 @@ class DocCodeReferenceTests(unittest.TestCase):
         text = (
             "See `known_fn:115` and `OTHER` (`skill_benchmark.py:35`).\n"
             "Also `known_fn` (`:118`) changes.\n"
-            "Example `mystery_fn:99` is unclaimed. <!-- doc-ref-ignore -->\n"
+            "Example `mystery_fn:99`. <!-- doc-ref-ignore -->\n"
             "See `known_fn` for context. This prose region starts here (`:99`).\n"
         )
         rewritten, count = fixer.rewrite_doc_text(text, maps)
@@ -60,7 +60,7 @@ class DocCodeReferenceTests(unittest.TestCase):
         self.assertEqual(rewritten, (
             "See `known_fn:120` and `OTHER` (`skill_benchmark.py:40`).\n"
             "Also `known_fn` (`:120`) changes.\n"
-            "Example `mystery_fn:99` is unclaimed. <!-- doc-ref-ignore -->\n"
+            "Example `mystery_fn:99`. <!-- doc-ref-ignore -->\n"
             "See `known_fn` for context. This prose region starts here (`:99`).\n"
         ))
 
@@ -92,6 +92,19 @@ class DocCodeReferenceTests(unittest.TestCase):
         self.assertEqual(fixer.rewrite_doc_text(ignored, maps), (ignored, 0))
         with self.assertRaisesRegex(ValueError, "unknown code-reference module"):
             fixer.rewrite_doc_text("See `known` (`other.py:12`).", maps)
+
+    def test_ignore_marker_applies_only_to_immediately_preceding_reference(self):
+        maps = {"skill_benchmark.py": {"known": 10}}
+        text = "See `mystery:12` and `example:13`. <!-- doc-ref-ignore -->"
+        with self.assertRaisesRegex(ValueError, "mystery"):
+            fixer.rewrite_doc_text(text, maps)
+
+    def test_markdown_line_references_are_rejected_in_favor_of_anchors(self):
+        with self.assertRaisesRegex(ValueError, "heading anchor"):
+            fixer.rewrite_doc_text(
+                "See `trace-aware-eval-spec.md:290`.",
+                {"skill_benchmark.py": {}},
+            )
 
     def test_ambiguous_unqualified_reference_is_rejected(self):
         maps = {

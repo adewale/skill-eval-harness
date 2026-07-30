@@ -289,6 +289,27 @@ class TriggerObservationTruthTableTests(unittest.TestCase):
                     metadata={reserved: "collision"},
                 )
 
+    def test_invocation_metadata_cannot_shadow_experiment_metadata(self):
+        base = self._observation(usage={"source": "missing"}, cost={"source": "missing"})
+        for key in ("skill_tree_hash", "ablation", "protocol_sha256",
+                    "protocol_observation"):
+            invocation = base.invocation.with_metadata({key: "forged"})
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "collides"):
+                TriggerObservation(
+                    agent=base.agent, model=base.model, query=base.query,
+                    expectation=base.expectation, invocation=invocation,
+                    detection=base.detection, usage=base.usage, cost=base.cost,
+                    metadata={key: "authoritative"},
+                )
+
+            with self.subTest(key=f"{key}-without-observation-copy"), \
+                 self.assertRaisesRegex(ValueError, "collides"):
+                TriggerObservation(
+                    agent=base.agent, model=base.model, query=base.query,
+                    expectation=base.expectation, invocation=invocation,
+                    detection=base.detection, usage=base.usage, cost=base.cost,
+                )
+
     def test_nonzero_completion_and_each_evidence_kind_round_trip_through_json_row(self):
         invocation = InvocationOutcome.from_process(
             stdout="", stderr="", returncode=1, elapsed_ms=2,

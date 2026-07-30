@@ -59,7 +59,7 @@ The point of the adapter work is not only feature parity. The refactor should ma
 | Failure semantics | Nonzero/timeout produces a failure body and metadata that `execution_valid` excludes from quality scoring while cost still counts. |
 | Native judge | `skill-benchmark judge --judge-model <claude-model>` invokes Claude directly and captures judge cost/usage. |
 | Judge transcripts | `--transcripts` records exact prompt, stdout, stderr, and parsed result per judge task. |
-| Judge schema | Passes the canonical verdict schema to Claude via `--json-schema`; `--strict-judge-schema` remains the harness-side fail-closed backstop. |
+| Judge schema | Passes the canonical verdict schema to Claude via `--json-schema`; harness validation always fails malformed verdicts closed. The accepted `--strict-judge-schema` flag is a deprecated compatibility no-op. |
 | Judge repeats | `--judge-runs` majority-votes pass/fail and medians scores. |
 | Judge panels | `--judge-panel` aggregates multiple Claude models into consensus verdicts with agreement metadata. |
 | Judge trajectory | `--judge-trajectory` passes normalized trajectory, metrics, and artifact inventory. |
@@ -146,7 +146,7 @@ A native Gemini judge can use:
 gemini -p "$JUDGE_PROMPT" --model "$MODEL" --output-format json --approval-mode=plan --sandbox
 ```
 
-Then parse `response` as the verdict JSON. If Gemini does not enforce an external JSON schema, keep enforcement in the harness exactly as today (`verdict_schema_for` + `--strict-judge-schema`). If Gemini adds schema-constrained output, wire it through the same native judge schema path as Codex.
+Then parse `response` as the verdict JSON. If Gemini does not enforce an external JSON schema, keep enforcement in the harness exactly as today (`verdict_schema_for` always fails malformed verdicts closed; the old `--strict-judge-schema` flag is a deprecated no-op). If Gemini adds schema-constrained output, wire it through the same native judge schema path as Codex.
 
 ### Gemini autonomous trigger
 

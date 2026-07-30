@@ -14,6 +14,7 @@ That makes the materialized ablations produce a real, confirmable regression wit
 zero model calls — the example runs in CI.
 """
 import glob
+import json
 import sys
 
 sys.stdin.read()  # the task prompt; we deliberately key off the MOUNTED skill, not the text
@@ -40,5 +41,18 @@ if "--output-last-message" in sys.argv:
     output_path = sys.argv[sys.argv.index("--output-last-message") + 1]
     with open(output_path, "w", encoding="utf-8") as output_file:
         output_file.write(answer)
+    # run-codex consumes stdout as the provider trace. Emit the real lifecycle
+    # shape so the offline example exercises the same fail-closed dialect as a
+    # Codex CLI run instead of relying on a permissive empty-stream stub seam.
+    print(json.dumps({"type": "thread.started", "thread_id": "offline-demo"}))
+    print(json.dumps({"type": "turn.started"}))
+    print(json.dumps({
+        "type": "item.completed",
+        "item": {"id": "answer", "type": "agent_message", "text": answer},
+    }))
+    print(json.dumps({
+        "type": "turn.completed",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }))
 else:
     print(answer)

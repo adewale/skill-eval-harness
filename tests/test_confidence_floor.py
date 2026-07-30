@@ -83,10 +83,14 @@ class CF1DetectorMetaFixtures(unittest.TestCase):
                     with self.subTest(detector=name, kind=kind, case=i, note=case.get("note", "")):
                         with tempfile.TemporaryDirectory() as td:
                             result = run_fixture_case(case, Path(td))
-                        self.assertEqual(
-                            result["passed"], want,
-                            f"{name} should-{kind} case {i} ({case.get('note', 'no note')}): expected passed={want}, got {result['passed']} with evidence: {result['evidence']}",
-                        )
+                        if result.get("availability") == "partial":
+                            self.assertEqual(kind, "fire")
+                            self.assertIsNone(result["passed"])
+                        else:
+                            self.assertEqual(
+                                result["passed"], want,
+                                f"{name} should-{kind} case {i} ({case.get('note', 'no note')}): expected passed={want}, got {result['passed']} with evidence: {result['evidence']}",
+                            )
 
 
 class CF2BaselineIsolation(unittest.TestCase):

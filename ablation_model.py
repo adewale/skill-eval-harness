@@ -70,16 +70,47 @@ TIMEOUT_FAILURE = "[TIMEOUT"
 RUNNER_FAILURE_MARKERS = (CODEX_FAILURE, JETTY_FAILURE, CLAUDE_FAILURE, VIBE_FAILURE, TIMEOUT_FAILURE)
 
 
+def metadata_lifecycle_error(metadata: dict[str, Any] | None) -> str | None:
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        return "metadata must be an object"
+    boolean_fields = (
+        "timed_out", "timeout", "provider_response_complete",
+        "process_observation_complete", "trace_observation_complete",
+        "operation_observation_complete", "artifact_set_complete",
+        "observation_complete",
+    )
+    for field in boolean_fields:
+        if field in metadata and not isinstance(metadata[field], bool):
+            return f"metadata.{field} must be boolean"
+    rc = metadata.get("returncode")
+    if rc is not None and (isinstance(rc, bool) or not isinstance(rc, int)):
+        return "metadata.returncode must be an integer or null"
+    version = metadata.get("artifact_contract_version")
+    if version is not None and (isinstance(version, bool) or version != 1):
+        return "metadata.artifact_contract_version is unsupported"
+    timed_out = metadata.get("timed_out") is True or metadata.get("timeout") is True
+    if timed_out and rc is not None and rc != 124:
+        return "timed-out metadata must use returncode 124"
+    return None
+
+
 def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:
     """False when a run is an INFRASTRUCTURE failure — a nonzero exit, a timeout,
     or a synthetic failure body a runner wrote when it never got a real answer."""
     m = metadata or {}
+    if (metadata_lifecycle_error(m) is not None
+            or m.get("metadata_artifact_valid") is False or m.get("metadata_error")):
+        return False
     rc = m.get("returncode")
     if rc not in (0, None):
         return False
     if m.get("timed_out") or m.get("timeout"):
         return False
     if m.get("provider_response_complete") is False:
+        return False
+    if m.get("artifact_set_complete") is False:
         return False
     if m.get("artifact_contract_version") == 1 and m.get("artifact_set_complete") is not True:
         return False
@@ -673,6 +704,7 @@ class PreparedTask:
     ablation: AblationRecord | None = None
     skill_tree_hash: str | None = None
     answer_key: dict[str, Any] | None = None
+    skill_root_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for label, value in (("case_id", self.case_id), ("kind", self.kind),
@@ -694,9 +726,29 @@ class PreparedTask:
         run_path = Path(self.run_dir)
         if run_path.is_absolute() or run_path == Path(".") or ".." in run_path.parts:
             raise ValueError("PreparedTask.run_dir must be a safe non-root relative path")
-        for label, values in (("skill_paths", self.skill_paths), ("input_files", self.input_files), ("tags", self.tags)):
+        parts = run_path.parts
+        if not parts or parts[0] != self.case_id:
+            raise ValueError("PreparedTask.run_dir must start with its case_id")
+        has_run_segment = bool(re.fullmatch(r"run-[1-9]\d*", parts[-1]))
+        if self.run_number > 1 and not has_run_segment:
+            raise ValueError("repeated PreparedTask.run_dir must end in run-N")
+        if has_run_segment and parts[-1] != f"run-{self.run_number}":
+            raise ValueError("PreparedTask.run_dir repetition disagrees with run_number")
+        variant_index = -2 if has_run_segment else -1
+        if parts[variant_index] != self.variant_truth:
+            raise ValueError("PreparedTask.run_dir arm disagrees with variant")
+        for label, values in (("skill_paths", self.skill_paths),
+                              ("skill_root_keys", self.skill_root_keys),
+                              ("input_files", self.input_files), ("tags", self.tags)):
             if not isinstance(values, tuple) or not all(isinstance(item, str) for item in values):
                 raise ValueError(f"PreparedTask.{label} must be a tuple of strings")
+        if self.skill_root_keys:
+            if len(self.skill_root_keys) != len(self.skill_paths):
+                raise ValueError("PreparedTask.skill_root_keys must align one-to-one with skill_paths")
+            if (len(set(self.skill_root_keys)) != len(self.skill_root_keys)
+                    or any(not key or Path(key).name != key or key in {".", ".."}
+                           for key in self.skill_root_keys)):
+                raise ValueError("PreparedTask.skill_root_keys must be unique safe path segments")
         if self.variant_truth == "without_skill" and self.skill_paths:
             raise ValueError("without_skill task cannot carry skill paths")
         if self.is_ablation:
@@ -769,6 +821,8 @@ class PreparedTask:
             row["ablation"] = self.ablation.as_dict()
         if self.skill_tree_hash is not None:
             row["skill_tree_hash"] = self.skill_tree_hash
+        if self.skill_root_keys:
+            row["skill_root_keys"] = list(self.skill_root_keys)
         if self.answer_key:
             row.update(self.answer_key)
         row["tags"] = list(self.tags)
@@ -783,7 +837,7 @@ class PreparedTask:
         rec = ablation_record_from_dict(row["ablation"]) if row.get("ablation") else None
         answer_key = {k: row[k] for k in ("expected_behavior", "review_rubric") if k in row} or None
         collections: dict[str, tuple[str, ...]] = {}
-        for key in ("skill_paths", "input_files", "tags"):
+        for key in ("skill_paths", "skill_root_keys", "input_files", "tags"):
             raw = row.get(key, [])
             if not isinstance(raw, (list, tuple)) or not all(isinstance(item, str) for item in raw):
                 raise ValueError(f"PreparedTask row field {key!r} must be a list of strings")
@@ -805,6 +859,7 @@ class PreparedTask:
             ablation=rec,
             skill_tree_hash=row.get("skill_tree_hash"),
             answer_key=answer_key,
+            skill_root_keys=collections["skill_root_keys"],
         )
 
 

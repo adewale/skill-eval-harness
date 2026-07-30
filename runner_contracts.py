@@ -29,6 +29,13 @@ def _finite_nonnegative(value: Any, label: str, *, integer: bool = False) -> int
 
 
 _RESERVED_EVIDENCE_KEYS = frozenset({
+    "schema_version", "source", "tool_calls", "commands", "file_reads",
+    "file_writes", "errors", "retries", "repeated_command_max",
+    "skill_invoked", "skill_invocation_evidence", "parse_errors",
+    "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+    "cache_write_tokens", "cache_creation_tokens", "cost_usd",
+    "usage_normalized", "cost_normalized", "otel",
+    "returncode", "timed_out", "elapsed_ms",
     "observation_complete", "process_observation_complete",
     "provider_response_complete", "trace_observation_complete",
     "operation_observation_complete", "artifact_set_complete",
@@ -69,7 +76,7 @@ def _validate_usage(value: Any, label: str) -> None:
         return
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} must contain only numeric measurements")
-    _finite_nonnegative(value, label)
+    _finite_nonnegative(value, label, integer=label.casefold().endswith("tokens"))
 
 
 @dataclass(frozen=True)

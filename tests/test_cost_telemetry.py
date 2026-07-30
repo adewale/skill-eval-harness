@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from helpers import attest_answer_design
+
 import skill_benchmark as sb
 
 
@@ -36,10 +38,12 @@ class NormalizeUsageCostTests(unittest.TestCase):
         self.assertEqual(sb.normalize_usage({}), {"source": "missing"})
         self.assertEqual(sb.normalize_usage({"input_tokens": 5}, source="not_applicable"), {"source": "not_applicable"})
 
-    def test_non_finite_numbers_are_missing_not_exceptions(self):
-        self.assertEqual(sb.normalize_usage({"input_tokens": float("inf")}), {"source": "missing"})
-        self.assertEqual(sb.normalize_usage({"input_tokens": float("nan")}), {"source": "missing"})
-        self.assertEqual(sb.normalize_cost(float("inf")), {"source": "missing"})
+    def test_non_finite_numbers_are_rejected_at_the_boundary(self):
+        for value in (float("inf"), float("nan")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                sb.normalize_usage({"input_tokens": value})
+        with self.assertRaises(ValueError):
+            sb.normalize_cost(float("inf"))
 
     def test_invalid_source_raises(self):
         with self.assertRaises(ValueError):
@@ -52,7 +56,9 @@ class NormalizeUsageCostTests(unittest.TestCase):
         self.assertEqual(simple["total_cost"], 0.02368)
         self.assertEqual(simple["currency"], "USD")
         self.assertEqual(simple["pricing_model"], "claude-x")
-        parts = sb.normalize_cost({"input_cost": 0.006, "output_cost": 0.017}, source="price_table_estimated", pricing_table_version="2026-06")
+        parts = sb.normalize_cost({"input_cost": 0.006, "output_cost": 0.017,
+                                   "components_complete": True},
+                                  source="price_table_estimated", pricing_table_version="2026-06")
         self.assertEqual(parts["total_cost"], 0.023)
         self.assertEqual(parts["source"], "price_table_estimated")
         self.assertEqual(parts["pricing_table_version"], "2026-06")
@@ -60,7 +66,8 @@ class NormalizeUsageCostTests(unittest.TestCase):
         eur = sb.normalize_cost({"amount": 1, "currency": "EUR"})
         self.assertEqual(eur["currency"], "EUR")
         self.assertEqual(eur["total_cost"], 1.0)
-        self.assertEqual(sb.normalize_cost({"amount": 1, "currency": "eur"}), {"source": "missing"})
+        with self.assertRaises(ValueError):
+            sb.normalize_cost({"amount": 1, "currency": "eur"})
 
     def test_run_cost_facts_prefers_normalized_and_falls_back_to_legacy(self):
         normalized = sb.run_cost_facts({
@@ -142,7 +149,10 @@ class RunnerStampTests(unittest.TestCase):
 
     def test_caller_metrics_cannot_override_derived_evidence(self):
         with tempfile.TemporaryDirectory() as td:
-            for key in ("trace_observation_complete", "process_observation_complete",
+            for key in ("schema_version", "source", "commands", "tool_calls",
+                        "input_tokens", "total_tokens", "cost_usd",
+                        "usage_normalized", "cost_normalized", "observation_complete",
+                        "trace_observation_complete", "process_observation_complete",
                         "provider_response_complete", "operation_observation_complete",
                         "artifact_set_complete", "observation_evidence", "telemetry"):
                 with self.subTest(key=key), self.assertRaisesRegex(ValueError, "derived evidence"):
@@ -163,7 +173,7 @@ class RunnerStampTests(unittest.TestCase):
             run_dir = Path(td) / "run"
             trace = json.dumps({"type": "usage", "usage": {"input_tokens": 30, "output_tokens": 12}})
             sb.write_trace_artifacts(
-                run_dir, trace, source="codex",
+                run_dir, trace, source="generic",
                 process_observation_complete=True,
                 provider_response_complete=True,
             )
@@ -176,7 +186,7 @@ class RunnerStampTests(unittest.TestCase):
             run_dir = Path(td) / "run"
             trace = json.dumps({"type": "usage", "usage": {"input_tokens": 3, "output_tokens": 2}})
             sb.write_trace_artifacts(
-                run_dir, trace, source="codex",
+                run_dir, trace, source="generic",
                 metadata={"usage_normalized": {"source": "missing"},
                           "cost_normalized": {"source": "missing"}},
                 process_observation_complete=True,
@@ -188,22 +198,15 @@ class RunnerStampTests(unittest.TestCase):
             self.assertEqual(measured["availability"], "available")
             self.assertEqual(measured["value"], 5)
 
-    def test_trace_artifacts_tolerate_non_finite_json_numbers(self):
+    def test_trace_artifacts_reject_non_finite_json_numbers(self):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "run"
-            sb.write_trace_artifacts(
-                run_dir,
-                '{"usage":{"input_tokens":1e999},"duration_ms":1e999,"cost":NaN}',
-                source="codex",
-            )
-            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
-            event = json.loads((run_dir / "events.json").read_text(encoding="utf-8"))["events"][0]
-            self.assertEqual(metrics["usage_normalized"], {"source": "missing"})
-            self.assertNotIn("elapsed_ms", metrics)
-            self.assertEqual(metrics["telemetry"]["measurements"]["total_tokens"]["availability"], "unavailable")
-            self.assertEqual(metrics["telemetry"]["measurements"]["elapsed_ms"]["availability"], "unavailable")
-            self.assertEqual(event.get("tokens"), {})
-            self.assertNotIn("duration_ms", event)
+            with self.assertRaises(ValueError):
+                sb.write_trace_artifacts(
+                    run_dir,
+                    '{"usage":{"input_tokens":1e999},"duration_ms":1e999,"cost":NaN}',
+                    source="generic",
+                )
 
     def test_incomplete_trace_cannot_pass_zero_activity_process_assertion(self):
         with tempfile.TemporaryDirectory() as td:
@@ -290,42 +293,38 @@ class RunnerStampTests(unittest.TestCase):
 
     def test_non_pi_lifecycle_records_keep_their_existing_delta_semantics(self):
         usage = {"input": 10, "output": 3, "totalTokens": 15}
-        assistant = {"role": "assistant", "usage": usage}
         records = [
-            {"type": "message_end", "message": assistant},
-            {"type": "turn_end", "message": assistant},
-            {"type": "agent_end", "messages": [assistant]},
+            {"type": "message_end", "usage": usage},
+            {"type": "turn_end", "usage": usage},
         ]
         stream = "\n".join(json.dumps(record) for record in records)
-        normalized_usage, _ = sb.stream_usage_and_cost(stream, source="codex")
+        normalized_usage, _ = sb.stream_usage_and_cost(stream, source="generic")
         self.assertEqual(normalized_usage["total_tokens"], 30)
-        _, metrics = sb.normalize_trace_records(records, source="codex")
+        _, metrics = sb.normalize_trace_records(records, source="generic")
         self.assertEqual(metrics["total_tokens"], 30)
 
-    def test_stream_usage_and_cost_tolerates_non_finite_json_numbers(self):
-        usage, cost = sb.stream_usage_and_cost('{"type":"result","usage":{"input_tokens":1e999},"total_cost_usd":NaN}')
-        self.assertEqual(usage, {"source": "missing"})
-        self.assertEqual(cost, {"source": "missing"})
+    def test_stream_usage_and_cost_rejects_non_finite_json_numbers(self):
+        with self.assertRaises(ValueError):
+            sb.stream_usage_and_cost(
+                '{"type":"result","usage":{"input_tokens":1e999},"total_cost_usd":NaN}')
 
-    def test_stream_usage_and_cost_ignores_non_finite_sibling_costs(self):
+    def test_stream_usage_and_cost_rejects_non_finite_sibling_costs(self):
         stream = "\n".join([
             json.dumps({"cost": 0.25}),
             '{"cost": 1e999}',
         ])
-        _, cost = sb.stream_usage_and_cost(stream)
-        self.assertEqual(cost["total_cost"], 0.25)
-        self.assertEqual(cost["source"], "trace_normalized")
+        # A malformed later record cannot be projected away merely because an
+        # earlier sibling supplied a plausible subtotal.
+        with self.assertRaises(ValueError):
+            sb.stream_usage_and_cost(stream)
 
-    def test_stream_usage_and_cost_uses_last_valid_cumulative_blocks(self):
+    def test_stream_usage_and_cost_rejects_invalid_late_cumulative_blocks(self):
         stream = "\n".join([
             json.dumps({"type": "result", "usage": {"input_tokens": 7, "output_tokens": 3}, "cost": 0.25}),
             '{"type":"result","usage":{"input_tokens":1e999},"cost":1e999}',
         ])
-        usage, cost = sb.stream_usage_and_cost(stream)
-        self.assertEqual(usage["input_tokens"], 7)
-        self.assertEqual(usage["output_tokens"], 3)
-        self.assertEqual(usage["total_tokens"], 10)
-        self.assertEqual(cost["total_cost"], 0.25)
+        with self.assertRaises(ValueError):
+            sb.stream_usage_and_cost(stream)
 
     def test_stream_usage_prefers_cumulative_result_usage(self):
         stream = "\n".join([
@@ -495,6 +494,7 @@ class CostSummaryTests(unittest.TestCase):
                     "usage_normalized": {"total_tokens": 100, "source": "provider_reported"},
                     "cost_normalized": {"currency": "USD", "total_cost": cost, "source": "provider_reported"},
                 }), encoding="utf-8")
+            attest_answer_design(path, runs)
             report = sb.build_benchmark_report(path, runs)
         self.assertEqual(report["cost_summary"]["totals"]["total_cost_usd"], 0.5)
         self.assertEqual(report["cost_summary"]["coverage"]["runs_with_dollar_cost"], 2)
@@ -648,6 +648,7 @@ class TokenOverheadDollarTests(unittest.TestCase):
                     "usage_normalized": {"total_tokens": tokens, "input_tokens": tokens - 10, "output_tokens": 10, "source": "provider_reported"},
                     "cost_normalized": {"currency": "EUR", "total_cost": cost, "source": "provider_reported"},
                 }), encoding="utf-8")
+            attest_answer_design(path, runs)
             report = sb.paired_token_overhead_report(path, runs=runs)
         pair = report["pairs"][0]
         self.assertIsNone(pair["cost_delta_usd"])
@@ -682,6 +683,7 @@ class TokenOverheadDollarTests(unittest.TestCase):
                     "usage_normalized": {"total_tokens": 100, "source": "provider_reported"},
                     "cost_normalized": {"currency": "USD", "total_cost": 0.25, "source": "provider_reported"},
                 }), encoding="utf-8")
+            attest_answer_design(path, runs)
             report = sb.paired_token_overhead_report(path, runs=runs)
         self.assertEqual(report["summary"]["saturated_or_no_lift_cost_usd"], 0.5)
 
@@ -700,7 +702,8 @@ class CostAuditFindingTests(unittest.TestCase):
                 {"id": "sat-case", "split": "tune", "kind": "behavior", "prompt": "p",
                  "assertions": [{"name": "a", "type": "contains", "value": "alpha"}]},
                 {"id": "judge-case", "split": "tune", "kind": "behavior", "prompt": "q",
-                 "assertions": [{"name": "j", "type": "judge", "rubric": ["good"]}]},
+                 "assertions": [{"name": "j", "type": "judge", "severity": "gate",
+                                  "rubric": ["good"]}]},
             ],
         }), encoding="utf-8")
         runs = root / "runs"
@@ -712,6 +715,7 @@ class CostAuditFindingTests(unittest.TestCase):
                 (base / "metadata.json").write_text(json.dumps({
                     "cost_normalized": {"currency": "USD", "total_cost": case_cost, "source": "provider_reported"},
                 }), encoding="utf-8")
+        attest_answer_design(path, runs)
         return path
 
     def test_expensive_saturated_and_judge_only_findings_fire(self):

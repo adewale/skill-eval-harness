@@ -339,6 +339,10 @@ _TRIGGER_RESERVED_METADATA = {
     "usage_normalized", "cost_normalized", "stderr", "provider_error",
     "query_id", "run_number",
 }
+_TRIGGER_EXPERIMENT_METADATA = {
+    "measurement", "ablation", "skill_tree_hash", "protocol_sha256",
+    "protocol_observation", "trace_dir", "trace_error",
+}
 
 
 def _usage_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -481,6 +485,13 @@ class TriggerObservation:
         collisions = sorted(_TRIGGER_RESERVED_METADATA & set(metadata))
         if collisions:
             raise ValueError(f"trigger metadata collides with derived field(s): {', '.join(collisions)}")
+        invocation_collisions = sorted(
+            set(self.invocation.metadata)
+            & (_TRIGGER_RESERVED_METADATA | _TRIGGER_EXPERIMENT_METADATA | set(metadata)))
+        if invocation_collisions:
+            raise ValueError(
+                "invocation metadata collides with trigger-owned field(s): "
+                + ", ".join(invocation_collisions))
         object.__setattr__(self, "usage", usage)
         object.__setattr__(self, "cost", cost)
         object.__setattr__(self, "metadata", MappingProxyType(metadata))
@@ -516,15 +527,13 @@ class TriggerObservation:
             "stderr": self.invocation.stderr[-1000:],
         }
         for key, value in self.invocation.metadata.items():
-            if key not in row:
-                row[key] = value
+            row[key] = value
         if self.invocation.provider_error is not None:
             row["provider_error"] = self.invocation.provider_error
         if self.identity is not None:
             row.update(self.identity.as_dict())
         for key, value in self.metadata.items():
-            if key not in row:
-                row[key] = value
+            row[key] = value
         return row
 
     @classmethod

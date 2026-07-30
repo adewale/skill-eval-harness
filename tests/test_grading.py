@@ -6,19 +6,22 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from helpers import (
+    attest_answer_design,
+    trace_event,
+    write_run,
+)
+from helpers import (
     demo_manifest as base_manifest,
 )
 from helpers import (
     good_pr_manifest as _manifest,
-)
-from helpers import (
-    trace_event,
-    write_run,
 )
 from helpers import (
     write_demo_manifest as write_manifest,
@@ -30,6 +33,34 @@ from helpers import (
 import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def complete_judge_fixtures(case, text, output_path, rows, *, run_base=None,
+                            model=None):
+    """Attach the lifecycle/input binding a real judge invocation persists."""
+    _, tasks = sb.grade_case_variant(
+        case, "with_skill", text, output_path, {}, run_base=run_base,
+        judge_results={}, model=model)
+    by_id = {task["judge_task_id"]: task for task in tasks}
+    complete = {}
+    for jid, row in rows.items():
+        task = by_id[jid]
+        derived = sb.merged_qualitative_entry(task["assertion"], row, jid)
+        steps = None
+        if sb.is_per_step_assertion(task["assertion"]):
+            events, _ = sb.read_events_base(run_base)
+            steps = sb.trajectory_steps(events, run_base)
+        _, _, prompt_sha256, _ = sb.judge_input_material(
+            task, text, run_base=run_base, steps=steps)
+        complete[jid] = {
+            **row, "judge_task_id": jid, "passed": derived["passed"],
+            "returncode": 0, "judge_observation_complete": True,
+            "availability": "complete",
+            "judge_input_sha256": task["judge_input_sha256"],
+            "judge_prompt_sha256": prompt_sha256,
+            "judge_evidence_mode": "text-only",
+        }
+    return complete
 
 
 class GoldenOutputAssertionTests(unittest.TestCase):
@@ -87,7 +118,7 @@ class GoldenOutputAssertionTests(unittest.TestCase):
                 "see artifact", run / "output.md", run_base=run, manifest_dir=manifest_dir)
         self.assertTrue(r["passed"], r["evidence"])
 
-    def test_missing_reference_fails_closed_and_validates(self):
+    def test_missing_reference_fails_closed_and_invalidates_manifest(self):
         with tempfile.TemporaryDirectory() as td:
             r = self.grade_one({"type": "golden_output", "reference": "golden/expected.md"}, "a", None, Path(td))
             self.assertFalse(r["passed"])
@@ -95,8 +126,134 @@ class GoldenOutputAssertionTests(unittest.TestCase):
             manifest = base_manifest()
             manifest["cases"][0]["assertions"] = [{"type": "golden_output", "reference": "golden/expected.md"}]
             path = write_manifest(Path(td), manifest)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+
+
+class OracleSchemaClosureTests(unittest.TestCase):
+    def validate_assertion(self, assertion):
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"].append(assertion)
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            return sb.validate_manifest(path)
+
+    def test_structured_output_schema_subset_is_validated_recursively(self):
+        valid = {
+            "name": "shape", "type": "structured_output",
+            "schema": {
+                "type": "object", "required": ["items"],
+                "additionalProperties": False,
+                "properties": {"items": {
+                    "type": "array", "minItems": 1, "maxItems": 2,
+                    "items": {"type": "object", "required": ["ok"],
+                              "properties": {"ok": {"type": "boolean"}}},
+                }},
+            },
+        }
+        self.assertEqual(
+            self.validate_assertion(valid)["cases"][0]["assertions"][1]["schema"],
+            valid["schema"])
+
+        bad_schemas = [
+            {"type": "object", "properties": {"x": {"type": "string", "pattern": "x"}}},
+            {"type": "object", "properties": {"x": "not-a-schema"}},
+            {"type": "object", "required": ["missing"], "properties": {}},
+            {"type": "array", "items": {"type": "mystery"}},
+            {"type": "array", "minItems": 2, "maxItems": 1},
+            {"type": "string", "properties": {}},
+        ]
+        for schema in bad_schemas:
+            assertion = {"name": "shape", "type": "structured_output",
+                         "schema": schema}
+            with self.subTest(schema=schema), self.assertRaises(SystemExit):
+                self.validate_assertion(assertion)
+
+    def test_script_command_rejects_absolute_non_executable_argument(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = Path(td) / "evals" / "shared-benchmark.json"
+            manifest.parent.mkdir()
+            with self.assertRaises(SystemExit):
+                sb.validate_script_assertion(
+                    {"type": "script", "command": "cat /etc/hosts {run_dir}"},
+                    manifest, "case-1", 0,
+                )
+
+    def test_script_command_allows_absolute_executable_at_token_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = Path(td) / "evals" / "shared-benchmark.json"
+            manifest.parent.mkdir()
+            sb.validate_script_assertion(
+                {"type": "script", "command": [
+                    sys.executable, "-c", "print('ok')", "{output_dir}",
+                ]},
+                manifest, "case-1", 0,
+            )
+
+    def test_enum_and_const_use_json_typed_equality(self):
+        self.assertTrue(sb.json_schema_errors(True, {"const": 1}))
+        self.assertTrue(sb.json_schema_errors(True, {"enum": [1]}))
+        self.assertFalse(sb.json_schema_errors(1, {"const": 1.0}))
+        self.assertFalse(sb.json_schema_errors(1.0, {"enum": [1]}))
+        self.assertEqual(
+            sb.supported_json_schema_errors({"enum": [True, 1]}), [])
+        self.assertTrue(
+            sb.supported_json_schema_errors({"enum": [1, 1.0]}))
+
+    def test_file_and_golden_aliases_are_canonical_and_root_is_rejected(self):
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"] += [
+            {"name": "artifact", "type": "file_exists",
+             "value": "./outputs/result.json"},
+            {"name": "gold", "type": "golden_output",
+             "value": "./golden/expected.md"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            golden = path.parent / "golden" / "expected.md"
+            golden.parent.mkdir(parents=True)
+            golden.write_text("expected", encoding="utf-8")
             validated = sb.validate_manifest(path)
-            self.assertEqual(validated["skill_name"], "demo")
+            rows = validated["cases"][0]["assertions"]
+            self.assertEqual(rows[1]["path"], "outputs/result.json")
+            self.assertNotIn("value", rows[1])
+            self.assertEqual(rows[2]["reference"], "golden/expected.md")
+            self.assertNotIn("value", rows[2])
+
+        for assertion in (
+                {"name": "f", "type": "file_exists", "path": "."},
+                {"name": "f", "type": "file_exists", "value": "../escape"},
+                {"name": "g", "type": "golden_output", "reference": "."}):
+            with self.subTest(assertion=assertion), self.assertRaises(SystemExit):
+                self.validate_assertion(assertion)
+
+    def test_assertion_schema_rejects_unknown_fields(self):
+        with self.assertRaises(SystemExit):
+            self.validate_assertion({
+                "name": "quality", "type": "judge", "prompt": "is it good?",
+                "severty": "critical",
+            })
+
+    def test_file_exists_requires_a_file_and_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run = root / "run"
+            (run / "directory").mkdir(parents=True)
+            output = run / "output.md"
+            output.write_text("x", encoding="utf-8")
+            directory = sb.assertion_result(
+                {"type": "file_exists", "path": "directory"},
+                "x", output, run_base=run)
+            self.assertFalse(directory["passed"])
+
+            outside = root / "outside.txt"
+            outside.write_text("secret", encoding="utf-8")
+            os.symlink(outside, run / "linked.txt")
+            escaped = sb.assertion_result(
+                {"type": "file_exists", "path": "linked.txt"},
+                "x", output, run_base=run)
+            self.assertFalse(escaped["passed"])
+            self.assertIn("escapes", escaped["evidence"])
 
 
 class GradedScoringSeverityTests(unittest.TestCase):
@@ -106,6 +263,10 @@ class GradedScoringSeverityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             (base / "output.md").write_text(output, encoding="utf-8")
+            if judge_results:
+                judge_results = complete_judge_fixtures(
+                    case, output, base / "output.md", judge_results,
+                    run_base=base)
             result, _ = sb.grade_case_variant(
                 case, "with_skill", output, base / "output.md", {},
                 run_base=base, judge_results=judge_results or {}, strict=strict)
@@ -200,6 +361,35 @@ class GradedScoringSeverityTests(unittest.TestCase):
         result = self.grade(case, "text", judge_results=judged)
         self.assertFalse(result["qualitative_assertions"][0]["passed"])
 
+    def test_plain_qualitative_at_least_is_authoritative(self):
+        entry = sb.merged_qualitative_entry(
+            {"name": "q", "type": "judge", "atLeast": 0.9},
+            {"passed": True, "score": 0.8, "evidence": "model said pass"},
+            "j",
+        )
+        self.assertFalse(entry["passed"])
+        self.assertEqual(entry["threshold"], 0.9)
+
+    def test_plain_qualitative_at_least_missing_score_is_incomplete(self):
+        entry = sb.merged_qualitative_entry(
+            {"name": "q", "type": "judge", "atLeast": 0.9},
+            {"passed": True, "evidence": "no score"},
+            "j",
+        )
+        self.assertIsNone(entry["passed"])
+        self.assertEqual(entry["availability"], "partial")
+
+    def test_dimension_at_least_tightens_normalized_threshold(self):
+        assertion = {
+            "name": "q", "type": "judge", "threshold": 3,
+            "atLeast": 0.9,
+            "graded_dimensions": [{"name": "d", "rubric": "anchored"}],
+        }
+        entry = sb.merged_qualitative_entry(
+            assertion, {"dimension_scores": {"d": 4}}, "j")
+        self.assertFalse(entry["passed"])
+        self.assertEqual(entry["threshold"], 0.9)
+
     def test_dynamic_rubric_minimum_criteria_cutoff(self):
         assertion = {"name": "dyn", "type": "judge", "dynamic_rubric": {"instruction": "draft criteria", "minimum_criteria": 3}}
         case = self.behavior_case([assertion])
@@ -232,6 +422,30 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertEqual(sb.sign_flip_significance(deltas), sb.sign_flip_significance(deltas))
         self.assertEqual(sb.sign_flip_significance(deltas)["method"], "sign-flip-sampled")
 
+    def test_sampled_sign_flip_is_order_invariant_and_conservative_at_gate(self):
+        # The deterministic Monte-Carlo point estimate is below .05, while
+        # exact enumeration is just above it.  A point-estimate gate would
+        # therefore manufacture a causal confirmation.
+        deltas = [-1, -.9, -.6, .5, .1, -.5, .4, .4, -.1, .4,
+                  -.4, -1, -.8, -.6, -.6]
+        sampled = sb.sign_flip_significance(deltas)
+        reversed_sampled = sb.sign_flip_significance(list(reversed(deltas)))
+        exact = sb.sign_flip_significance(deltas, max_exact_n=20)
+        self.assertEqual(sampled, reversed_sampled)
+        self.assertAlmostEqual(exact["p_value"], 0.05010986328125)
+        self.assertLess(sampled["p_value"], 0.05)  # point estimate alone is unsafe
+        self.assertGreater(sampled["p_value_upper_bound"], 0.05)
+        self.assertFalse(sampled["significant_at_0_05"])
+
+    def test_inference_rates_keep_sub_millionth_regressions(self):
+        baseline = sb._exact_rate(3_000_000, 3_000_000)
+        ablation = sb._exact_rate(2_999_999, 3_000_000)
+        delta = ablation - baseline
+        self.assertLess(delta, 0)
+        result = sb.sign_flip_significance([delta] * 6)
+        self.assertLess(result["observed_mean_delta"], 0)
+        self.assertTrue(result["significant_at_0_05"])
+
     def test_paired_summary_carries_significance_and_graded_channel(self):
         results = []
         for case_id in ["c1", "c2", "c3"]:
@@ -257,6 +471,8 @@ class GradedScoringSeverityTests(unittest.TestCase):
                 {"name": "d", "rubric": "5 = other; 1 = bad"},
             ]}]},
             {"assertions": [{"type": "judge", "dynamic_rubric": {"minimum_criteria": 3}}]},
+            {"assertions": [{"type": "judge", "atLeast": 0.8,
+                              "dynamic_rubric": {"instruction": "draft criteria"}}]},
             {"assertions": [{"type": "contains", "value": "x"}], "reference_score": 2},
         ]
         for shape in bad_shapes:
@@ -383,6 +599,7 @@ class OracleTierTests(unittest.TestCase):
                 base = runs / "case-1" / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text("alpha", encoding="utf-8")
+            attest_answer_design(path, runs)
             report = sb.build_benchmark_report(path, runs, allow_scripts=True)
         strength = report["oracle_strength"]["case-1"]
         self.assertEqual(strength["strong_pass_share"], 0.5)
@@ -391,7 +608,8 @@ class OracleTierTests(unittest.TestCase):
     def test_weak_oracle_only_audit_finding(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = base_manifest()
-            manifest["cases"][0]["assertions"] = [{"type": "judge", "rubric": ["good"]}]
+            manifest["cases"][0]["assertions"] = [
+                {"type": "judge", "severity": "gate", "rubric": ["good"]}]
             path = write_manifest(Path(td), manifest)
             report = sb.audit_manifest_report(path)
             kinds = [f["kind"] for f in report["findings"]]
@@ -481,8 +699,10 @@ class MultiTurnCaseTests(unittest.TestCase):
         self.assertEqual(result["objective_total"], 3)
         self.assertEqual(result["objective_pass_rate"], 1.0)
         self.assertEqual(result["turns"], [
-            {"turn": 1, "missing_output": False, "passed": 1, "total": 1},
-            {"turn": 2, "missing_output": False, "passed": 1, "total": 1},
+            {"turn": 1, "missing_output": False, "passed": 1, "total": 1,
+             "availability": "complete"},
+            {"turn": 2, "missing_output": False, "passed": 1, "total": 1,
+             "availability": "complete"},
         ])
         names = [a["name"] for a in result["assertions"]]
         self.assertIn("turn-1: asks-question", names)
@@ -496,6 +716,46 @@ class MultiTurnCaseTests(unittest.TestCase):
             result, _ = sb.grade_case_variant(case, "with_skill", None, base / "output.md", {}, run_base=base)
         self.assertAlmostEqual(result["objective_pass_rate"], 2 / 3)
         self.assertEqual(result["turns"][0]["passed"], 0)
+
+    def test_turn_judge_tasks_bind_current_prompt_and_prior_transcript(self):
+        case = {
+            "id": "conv-j", "split": "tune", "kind": "behavior",
+            "turns": [
+                {"prompt": "First instruction", "assertions": [
+                    {"name": "first-quality", "type": "judge",
+                     "severity": "gate", "rubric": ["correct"]}]},
+                {"prompt": "Second instruction", "assertions": [
+                    {"name": "second-quality", "type": "judge",
+                     "severity": "gate", "rubric": ["correct"]}]},
+            ],
+            "assertions": [
+                {"name": "final", "type": "contains", "value": "final"}],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            self.write_turn_run(base, ["first answer", "final answer"])
+            _, tasks = sb.grade_case_variant(
+                case, "with_skill", None, base / "output.md", {}, run_base=base)
+            by_id = {task["judge_task_id"]: task for task in tasks}
+            first = by_id["conv-j::with_skill::run-1::turn-1: first-quality"]
+            second = by_id["conv-j::with_skill::run-1::turn-2: second-quality"]
+            self.assertEqual(first["prompt"], "First instruction")
+            self.assertEqual(second["prompt"], "Second instruction")
+            self.assertEqual(first["conversation"], [
+                {"turn": 1, "prompt": "First instruction"}])
+            self.assertEqual(second["conversation"], [
+                {"turn": 1, "prompt": "First instruction",
+                 "assistant_output": "first answer"},
+                {"turn": 2, "prompt": "Second instruction"},
+            ])
+
+            (base / "turn-1" / "output.md").write_text(
+                "changed first answer", encoding="utf-8")
+            _, changed_tasks = sb.grade_case_variant(
+                case, "with_skill", None, base / "output.md", {}, run_base=base)
+            changed = {task["judge_task_id"]: task for task in changed_tasks}
+            self.assertNotEqual(first["judge_input_sha256"], changed[first["judge_task_id"]]["judge_input_sha256"])
+            self.assertNotEqual(second["judge_input_sha256"], changed[second["judge_task_id"]]["judge_input_sha256"])
 
     def test_missing_turn_fails_closed(self):
         case = self.multi_turn_case()
@@ -611,10 +871,14 @@ class ReviewFixRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             (base / "output.md").write_text("t", encoding="utf-8")
-            verdicts = {
-                sb.judge_task_id("case-1", "with_skill", 1, assertion, model="m1"): {"passed": True, "score": 5},
-                sb.judge_task_id("case-1", "with_skill", 1, assertion, model="m2"): {"passed": False, "score": 1},
-            }
+            verdicts = {}
+            for model, passed, score in (("m1", True, 5), ("m2", False, 1)):
+                model_jid = sb.judge_task_id(
+                    "case-1", "with_skill", 1, assertion, model=model)
+                verdicts.update(complete_judge_fixtures(
+                    case, "t", base / "output.md",
+                    {model_jid: {"passed": passed, "score": score}},
+                    run_base=base, model=model))
             m1, _ = sb.grade_case_variant(case, "with_skill", "t", base / "output.md", {}, run_base=base, judge_results=verdicts, model="m1")
             m2, _ = sb.grade_case_variant(case, "with_skill", "t", base / "output.md", {}, run_base=base, judge_results=verdicts, model="m2")
         self.assertTrue(m1["qualitative_assertions"][0]["passed"])
@@ -644,12 +908,18 @@ class ReviewFixRegressionTests(unittest.TestCase):
             base = Path(td)
             (base / "output.md").write_text("alpha", encoding="utf-8")
             jid = sb.judge_task_id("c", "with_skill", 1, assertion)
+            soft_verdict = complete_judge_fixtures(
+                case, "alpha", base / "output.md",
+                {jid: {"passed": False, "score": 0.0}}, run_base=base)
             soft, _ = sb.grade_case_variant(case, "with_skill", "alpha", base / "output.md", {}, run_base=base,
-                                            judge_results={jid: {"passed": False, "score": 0.0}})
+                                            judge_results=soft_verdict)
             case_gate = json.loads(json.dumps(case))
             case_gate["assertions"][1]["severity"] = "gate"
+            gate_verdict = complete_judge_fixtures(
+                case_gate, "alpha", base / "output.md",
+                {jid: {"passed": False, "score": 0.0}}, run_base=base)
             gate, _ = sb.grade_case_variant(case_gate, "with_skill", "alpha", base / "output.md", {}, run_base=base,
-                                            judge_results={jid: {"passed": False, "score": 0.0}})
+                                            judge_results=gate_verdict)
         self.assertEqual(soft["combined_pass_rate"], 1.0)   # soft failure feeds graded only
         self.assertEqual(soft["graded_score"], 0.0)
         self.assertEqual(gate["combined_pass_rate"], 0.5)   # gate judge stays in the rate
@@ -699,6 +969,9 @@ class AssertionDependenciesTests(unittest.TestCase):
 
     def _grade(self, assertions, text="alpha", judge_results=None):
         case = {"id": "c", "split": "tune", "kind": "behavior", "assertions": assertions}
+        if judge_results:
+            judge_results = complete_judge_fixtures(
+                case, text, Path("out.md"), judge_results)
         result, tasks = sb.grade_case_variant(case, "with_skill", text, Path("out.md"), {}, judge_results=judge_results or {})
         return result, tasks
 
@@ -860,6 +1133,24 @@ class ToolCallTaxonomyTests(unittest.TestCase):
         bad = sb.assertion_result({"type": "tool_call", "tool": "Read", "expected_no_call": True}, "t", base / "output.md", run_base=base)
         self.assertFalse(bad["passed"])  # Read WAS called
 
+    def test_expected_no_call_fails_on_started_or_failed_invocation(self):
+        tmp = tempfile.TemporaryDirectory(prefix="toolcall-negative-")
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        events = [
+            {"type": "tool_call", "name": "Read", "status": "in_progress"},
+            {"type": "command", "name": "Bash", "command": "curl example.test",
+             "status": "failed"},
+        ]
+        (base / "events.json").write_text(json.dumps(events), encoding="utf-8")
+        (base / "output.md").write_text("out", encoding="utf-8")
+        self.assertFalse(sb.assertion_result(
+            {"type": "tool_call", "tool": "Read", "expected_no_call": True},
+            "out", base / "output.md", run_base=base)["passed"])
+        self.assertFalse(sb.assertion_result(
+            {"type": "tool_call", "expected_no_call": True, "pattern": "bash"},
+            "out", base / "output.md", run_base=base)["passed"])
+
     def test_required_calls_subset(self):
         base = self._events(["Read", "Grep", "Edit"])
         ok = sb.assertion_result({"type": "tool_call", "required_calls": ["Read", "Edit"]}, "t", base / "output.md", run_base=base)
@@ -976,7 +1267,7 @@ class TriggerNotGradedIntoAnswerTests(unittest.TestCase):
             cases = [
                 {"id": "ans", "split": "tune", "kind": "pr-review", "prompt": "review",
                  "assertions": [{"name": "k", "type": "contains", "value": "X"}]},
-                {"id": "trg", "split": "tune", "kind": "trigger", "prompt": "would you load?",
+                {"id": "trg", "split": "tune", "kind": "trigger", "should_trigger": True, "prompt": "would you load?",
                  "assertions": [{"name": "k", "type": "contains", "value": "X"}]},
             ]
             p = _manifest(rp, cases)
@@ -991,7 +1282,7 @@ class TriggerNotGradedIntoAnswerTests(unittest.TestCase):
             cases = [
                 {"id": "ans", "split": "tune", "kind": "pr-review", "prompt": "review",
                  "assertions": [{"name": "k", "type": "contains", "value": "GOOD"}]},
-                {"id": "trg", "split": "tune", "kind": "trigger", "prompt": "would you load?",
+                {"id": "trg", "split": "tune", "kind": "trigger", "should_trigger": True, "prompt": "would you load?",
                  "assertions": [{"name": "k", "type": "contains", "value": "GOOD"}]},
             ]
             p = _manifest(rp, cases)
@@ -1019,6 +1310,10 @@ class PerStepGradingTests(unittest.TestCase):
                           raw_ref={"file": "trace.jsonl", "line": 1})]
 
     def _grade(self, base, judge_results=None):
+        if judge_results:
+            judge_results = complete_judge_fixtures(
+                self.CASE, "the answer", base / "output.md", judge_results,
+                run_base=base)
         return sb.grade_case_variant(self.CASE, "with_skill", "the answer",
                                      base / "output.md", {}, run_base=base,
                                      judge_results=judge_results or {})
@@ -1030,7 +1325,10 @@ class PerStepGradingTests(unittest.TestCase):
         self.assertEqual(tasks, [])
         rows = result["qualitative_assertions"]
         self.assertEqual(len(rows), 1)
-        self.assertFalse(rows[0]["passed"])
+        self.assertIsNone(rows[0]["passed"])
+        self.assertEqual(rows[0]["availability"], "partial")
+        self.assertEqual(len(result["blocked_assertions"]), 1)
+        self.assertEqual(result["qualitative_total"], 0)
         self.assertIn("trajectory", rows[0]["evidence"])
 
     def test_no_completed_steps_fails_closed(self):
@@ -1040,6 +1338,9 @@ class PerStepGradingTests(unittest.TestCase):
             result, tasks = self._grade(base)
         self.assertEqual(tasks, [])
         self.assertFalse(result["qualitative_assertions"][0]["passed"])
+        self.assertEqual(
+            result["qualitative_assertions"][0]["availability"], "complete")
+        self.assertEqual(result["blocked_assertions"], [])
 
     def test_steps_present_defers_one_judge_task(self):
         with tempfile.TemporaryDirectory() as td:

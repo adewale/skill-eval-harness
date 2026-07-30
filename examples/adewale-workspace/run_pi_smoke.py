@@ -316,8 +316,6 @@ def run_case(repo: str, manifest: dict[str, Any], case: dict[str, Any], variant:
         "elapsed_ms": elapsed_ms,
         "returncode": returncode,
         "timed_out": timed_out,
-        "skill_invoked": runner_skill_invoked,
-        "skill_invocation_evidence": copied_skill_evidence if runner_skill_invoked else [],
     }
     write_trace_artifacts(
         out_dir,

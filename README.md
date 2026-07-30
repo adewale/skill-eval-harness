@@ -290,11 +290,20 @@ Objective assertion types:
 | `skill_invoked` | Trace/process check that the runner loaded the skill, or did not, as expected. |
 | `command_ran` / `command_not_ran` | Trace/process checks over normalized command events. |
 | `command_order` | Trace/process check that commands appeared in a required order. |
-| `tool_call` | A tool call matching `tool`/`pattern` occurred (with `min_count`/`max_count` bounds), or an ordered `order` list of calls. BFCL-style set relations over completed-call **tool names** (exact, case-insensitive — *not* substring): `expected_no_call` (the named tool, or any name matching `pattern`, must *not* have been called), `required_calls` (an order-independent subset of tool names that must all appear, extras allowed), `call_set` (an exact multiset of tool names — same names and multiplicities, no unexpected named calls). Use `pattern`/`order`/`command_ran` for regex or command-text matching. Matches completed call inputs, never outputs. |
+| `tool_call` | A tool call matching `tool`/`pattern` occurred (with `min_count`/`max_count` bounds), or an ordered `order` list of calls. BFCL-style set relations over completed-call **tool names** (exact, case-insensitive — *not* substring): `expected_no_call` (the named tool, or any name matching `pattern`, must never have been observed—even as started, failed, or in progress), `required_calls` (an order-independent subset of completed tool names that must all appear, extras allowed), `call_set` (an exact multiset of completed tool names—same names and multiplicities, no unexpected named calls). Use `pattern`/`order`/`command_ran` for regex or command-text matching. Positive selectors match completed call inputs, never outputs. |
 | `tool_count_le` / `no_repeated_command_loop` | Trace/process budgets for tool use and thrashing. |
 | `total_tokens_le` / `elapsed_seconds_le` / `command_count_le` | Efficiency checks over `metrics.json`, `metadata.json`, or normalized events. |
 
-Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict` on `grade`/`benchmark` promotes soft to gate. An `atLeast` floor on a scored assertion decides its pass. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for text/process/efficiency), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`).
+Assertion objects are closed contracts, including nested `graded_dimensions` and
+`dynamic_rubric` objects: unknown fields and fields that do not apply to the selected assertion
+type are validation errors, so a misspelled severity or path cannot silently change the grader.
+A `golden_output` reference must already be a regular file. A local script oracle must live in a
+dedicated subdirectory (for example `oracles/check.py`); the harness binds that oracle tree into
+the eval-contract digest and rejects symlinks. Changing an imported helper or data file therefore
+invalidates stale prepared runs, while generated files beside the manifest cannot make the
+contract self-referential.
+
+Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict` on `grade`/`benchmark` promotes soft to gate. An `atLeast` floor on a plain scored judge requires a normalized 0–1 score and decides its pass; on `graded_dimensions` it tightens the normalized form of the dimension threshold. Missing score evidence remains unavailable rather than becoming a failure. Dynamic and per-step judges use `minimum_criteria` and `min_met_fraction` respectively instead of `atLeast`. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for text/process/efficiency), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`).
 
 Use `script` when a keyword check is too weak for the property you care about. The command sees the candidate run directory, so it can inspect `output.md`, generated files under `outputs/`, or metadata. Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `benchmark`, `aggregate`, or `export-anthropic`:
 
@@ -362,13 +371,16 @@ runs/<case_id>/<variant>/run-1/events.json       # normalized events used by pro
 runs/<case_id>/<variant>/run-1/metrics.json      # tokens, commands, tool calls, elapsed time, retries
 runs/<case_id>/<variant>/run-1/environment.json  # runner/model/sandbox details where available
 runs/<case_id>/<variant>/run-1/artifact-commit.json # required-file SHA-256 inventory, written last by current runners
+runs/answer-design.json                          # exact expected answer experiment and eval-contract digest
 ```
 
 Current answer and Jetty writers record independent process, provider-response, trace,
 and artifact-set evidence. Tool/command/file/retry/skill measurements are available only
 when the first three channels are complete; readers derive artifact completeness by
 verifying `artifact-commit.json`. Legacy directories without a marker remain readable but
-cannot acquire committed-artifact provenance.
+cannot acquire committed-artifact provenance. Current runners also attest every run to
+`answer-design.json`; reports with missing, extra, duplicated, or stale task identities remain
+partial and expose any surviving calculations only under explicitly labelled observed fields.
 
 `metadata.json` is optional, but include what your runner can capture:
 

@@ -37,6 +37,7 @@
       "id": "trig-pos-review-change",
       "split": "tune",
       "kind": "trigger",
+      "should_trigger": true,
       "prompt": "Review this proposed change and label how serious each finding is:\n\n```diff\n+app.get(\"/admin/users\", (req, res) => db.users.all().then(u => res.json(u)))\n```\n\nIt ships without any test.",
       "expected_behavior": ["The demo-reviewer skill loads autonomously from its description alone."],
       "tags": ["demo", "trigger"]
@@ -45,6 +46,7 @@
       "id": "trig-neg-unrelated-question",
       "split": "tune",
       "kind": "trigger",
+      "should_trigger": false,
       "prompt": "What is the capital of France?",
       "expected_behavior": ["The demo-reviewer skill should not trigger on an unrelated factual question."],
       "tags": ["demo", "trigger"]

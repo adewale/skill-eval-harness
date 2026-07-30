@@ -6,6 +6,7 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
+import hashlib
 import json
 import os
 import tempfile
@@ -485,7 +486,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             "variants": ["with_skill", "without_skill"],
             "cases": [
                 {"id": "ans", "split": "tune", "kind": "behavior", "prompt": "Review.", "assertions": [{"name": "a", "type": "contains", "value": "x"}]},
-                {"id": "trig", "split": "tune", "kind": "trigger", "prompt": "Trigger decision eval. User prompt: review my PR", "expected_behavior": ["should trigger"], "assertions": []},
+                {"id": "trig", "split": "tune", "kind": "trigger", "should_trigger": True, "prompt": "Trigger decision eval. User prompt: review my PR", "expected_behavior": ["should trigger"], "assertions": []},
             ],
             "ablations": ablations,
         }
@@ -905,6 +906,32 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertTrue(reg["significance"]["significant_at_0_05"])   # replicated, not eyeballed
         self.assertEqual(reg["evidence"][0]["case"], "c1")
         self.assertEqual(reg["evidence"][0]["assertion"], "detect-weak")
+
+    def test_blocked_cited_repetition_prevents_answer_causal_confirmation(self):
+        results = []
+        for run_number in range(1, 8):
+            results.append({
+                "case_id": "c1", "variant": "with_skill", "run_number": run_number,
+                "objective_pass_rate": 1.0,
+                "assertions": [{"name": "detect-weak", "passed": True}],
+                "qualitative_assertions": [], **self.ws(),
+            })
+            if run_number <= 6:
+                results.append({
+                    "case_id": "c1", "variant": "ablation:no-rp",
+                    "run_number": run_number, "objective_pass_rate": 0.0,
+                    "assertions": [{"name": "detect-weak", "passed": False}],
+                    "qualitative_assertions": [], **self.prov(),
+                })
+        entry = self.report(self.MANIFEST, results)[0]
+        reg = entry["regressions"][0]
+        self.assertEqual(entry["pairing"]["eligible_pairs"], 6)
+        self.assertEqual(entry["pairing"]["blocked_pairs"], 1)
+        self.assertTrue(reg["significance"]["significant_at_0_05"])
+        self.assertEqual(len(reg["blocked_pairs"]), 1)
+        self.assertIsNone(reg["expected_regression_confirmed"])
+        self.assertEqual(reg["evidence_class"], "indeterminate")
+        self.assertIn("blocked experimental identities", reg["note"])
 
     def test_cross_model_or_mismatched_repetition_cannot_confirm_causal_ablation(self):
         for mismatch in ("model", "run"):
@@ -1531,8 +1558,12 @@ class AblationReviewFixesTests(unittest.TestCase):
             "skill_paths": ["/tmp/SKILL.md"], "input_files": [], "run_dir": "c/with_skill",
             "instruction": "", "prompt": "x", "tags": [], **row,
         }
+        if "run_dir" not in row:
+            merged["run_dir"] = f"c/{merged['variant']}"
         if merged["variant"] == "without_skill":
             merged["skill_paths"] = []
+            merged["skill_root_keys"] = []
+            merged.pop("skill_tree_hash", None)
         if (merged.get("ablation") or {}).get("mode") == "materialized":
             merged["skill_tree_hash"] = merged["ablation"]["parent_skill_hash"]
         return sb.PreparedTask.from_row(merged)
@@ -1655,7 +1686,16 @@ class AblationReviewFixesTests(unittest.TestCase):
             skill = root / "skills" / "good-pr"
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text(self.MIN_SKILL, encoding="utf-8")
-            base = {"skill_paths": [str(skill / "SKILL.md")], "input_files": [], "prompt": "x"}
+            key = sb._skill_root_key("skills/good-pr/SKILL.md")
+            canonical = root / "canonical"
+            sb._copy_skill_root(skill, canonical / key)
+            base = {
+                "repo_root": str(root),
+                "skill_paths": [str(skill / "SKILL.md")],
+                "skill_root_keys": [key],
+                "skill_tree_hash": sb.skill_tree_hash(canonical),
+                "input_files": [], "prompt": "x",
+            }
             with tempfile.TemporaryDirectory() as w1:
                 ws = Path(w1)
                 sk, _ = sb.build_skill_workspace(self.task({**base, "variant": "without_skill"}), ws)
@@ -2523,6 +2563,160 @@ class OldSkillParityTests(unittest.TestCase):
             old_files = [f for f in payload["upload_plan"]["files"] if f["role"] == "old_skill"]
             self.assertTrue(old_files)
             self.assertIn("OLD-MARKER", Path(old_files[0]["local_path"]).read_text(encoding="utf-8"))
+
+
+class AnswerWorkspaceAttestationTests(unittest.TestCase):
+    SKILL = "---\nname: {name}\ndescription: {name} guidance. Use for tests.\n---\n\n# {name}\n\n## Remove\n\nremove me\n\n## Keep\n\nkeep me\n"
+
+    def manifest(self, root: Path, *, multi_turn: bool = False) -> Path:
+        repo_root = root / "repo"
+        for name in ("alpha", "beta"):
+            skill = repo_root / "skills" / name
+            (skill / "references").mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                self.SKILL.format(name=name), encoding="utf-8")
+            (skill / "references" / "guide.md").write_text(
+                f"{name} guide\n", encoding="utf-8")
+        evals = repo_root / "evals"
+        evals.mkdir()
+        case = {
+            "id": "case", "split": "tune",
+            "assertions": [{"name": "answer", "type": "contains", "value": "ok"}],
+            **({"turns": [{"prompt": "first"}, {"prompt": "second"}]}
+               if multi_turn else {"prompt": "answer"}),
+        }
+        manifest = {
+            "version": 1, "skill_name": "multi",
+            "skill_paths": ["skills/alpha/SKILL.md", "skills/beta/SKILL.md"],
+            "variants": ["with_skill", "without_skill"],
+            "cases": [case],
+            "ablations": [{
+                "id": "drop-section", "removed_component": "alpha section",
+                "expected_regressions": ["misses alpha guidance"],
+                "components": [{
+                    "class": "instructions", "mechanism": "section",
+                    "skill_root": "skills/alpha/SKILL.md",
+                    "target": {"skill_root": "skills/alpha/SKILL.md",
+                               "heading": "## Remove"},
+                }],
+            }],
+        }
+        path = evals / "shared-benchmark.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path
+
+    def test_multi_root_with_skill_hashes_exact_copied_layout_and_bytes(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as wd:
+            path = self.manifest(Path(td))
+            rows = sb.prepared_task_rows(path, sb.validate_manifest(path))
+            row = next(item for item in rows if item["variant"] == "with_skill")
+            build = sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd))
+            skill_paths, _ = build
+            self.assertEqual(
+                build.attestation.mounted_skill_tree_hash, row["skill_tree_hash"])
+            self.assertEqual(
+                build.attestation.mounted_skill_tree_hash,
+                sb.skill_tree_hash(Path(wd) / "skills"))
+            self.assertEqual(
+                {path.name for path in (Path(wd) / "skills").iterdir()},
+                set(row["skill_root_keys"]))
+            self.assertEqual(len(skill_paths), 2)
+
+    def test_with_skill_rejects_source_mutation_after_preparation(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as wd:
+            path = self.manifest(Path(td))
+            rows = sb.prepared_task_rows(path, sb.validate_manifest(path))
+            row = next(item for item in rows if item["variant"] == "with_skill")
+            source = Path(row["skill_paths"][0]).parent / "references" / "guide.md"
+            source.write_text("changed after prepare\n", encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd))
+
+    def test_materialized_mount_matches_edited_not_parent_hash(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as wd:
+            root = Path(td)
+            path = self.manifest(root)
+            rows = sb.prepared_task_rows(
+                path, sb.validate_manifest(path), include_ablations=True,
+                ablation_dir=root / "ablations")
+            row = next(item for item in rows if item["variant"] == "ablation:drop-section")
+            build = sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd))
+            self.assertEqual(
+                build.attestation.mounted_skill_tree_hash,
+                row["ablation"]["skill_hash"])
+            self.assertNotEqual(
+                build.attestation.mounted_skill_tree_hash,
+                row["ablation"]["parent_skill_hash"])
+            Path(row["skill_paths"][0]).write_text(
+                "changed after materialization\n", encoding="utf-8")
+            with tempfile.TemporaryDirectory() as changed_wd, self.assertRaises(SystemExit):
+                sb.build_skill_workspace(
+                    sb.PreparedTask.from_row(row), Path(changed_wd))
+
+    def test_answer_runner_persists_recomputed_mount_and_fixture_hashes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = self.manifest(root)
+            row = next(
+                item for item in sb.prepared_task_rows(path, sb.validate_manifest(path))
+                if item["variant"] == "with_skill")
+
+            def agent(**_kwargs):
+                return {"answer": "ok", "returncode": 0, "trace": []}
+
+            runs = root / "runs"
+            sb.run_subagent_tasks([row], runs, agent, replay_mode="off")
+            metadata = json.loads(
+                (runs / row["run_dir"] / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["skill_tree_hash"], row["skill_tree_hash"])
+            self.assertEqual(
+                metadata["fixture_tree_hash"], hashlib.sha256(b"").hexdigest())
+
+    def test_fixture_destination_collision_is_rejected_before_copy(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as wd:
+            root = Path(td)
+            path = self.manifest(root)
+            rows = sb.prepared_task_rows(path, sb.validate_manifest(path))
+            row = next(item for item in rows if item["variant"] == "without_skill")
+            first, second = root / "one" / "data.txt", root / "two" / "data.txt"
+            first.parent.mkdir(); second.parent.mkdir()
+            first.write_text("one", encoding="utf-8")
+            second.write_text("two", encoding="utf-8")
+            row["input_files"] = [str(first), str(second)]
+            with self.assertRaises(SystemExit):
+                sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd))
+            self.assertFalse((Path(wd) / "inputs").exists())
+
+    def test_jetty_rejects_multi_turn_before_writing_export(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = self.manifest(root, multi_turn=True)
+            out = root / "jetty.jsonl"
+            with self.assertRaises(SystemExit):
+                sb.export_jetty(argparse.Namespace(manifest=str(path), out=str(out)))
+            self.assertFalse(out.exists())
+
+    def test_jetty_execution_rechecks_attested_upload_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = self.manifest(root)
+            out = root / "jetty.jsonl"
+            sb.export_jetty(argparse.Namespace(manifest=str(path), out=str(out)))
+            payloads = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+            payload = next(
+                item for item in payloads if item["harness"]["variant"] == "with_skill")
+            skill_item = next(
+                item for item in payload["upload_plan"]["files"]
+                if item.get("role") == "skill")
+            Path(skill_item["local_path"]).write_text("changed after export\n", encoding="utf-8")
+
+            class MustNotUpload:
+                def upload(self, *_args, **_kwargs):
+                    raise AssertionError("attestation failure must precede upload")
+
+            [record] = list(sb.execute_jetty_payloads([payload], client=MustNotUpload()))
+            self.assertEqual(record["status"], "failed")
+            self.assertIn("changed after attestation", record["error"])
 
 
 if __name__ == "__main__":

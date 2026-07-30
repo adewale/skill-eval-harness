@@ -16,13 +16,14 @@ from helpers import (
     CONTAINS_APPROVED_CASE as CASE,
 )
 from helpers import (
+    attest_answer_design,
+    make_eval_repo,
+)
+from helpers import (
     demo_manifest as base_manifest,
 )
 from helpers import (
     good_pr_manifest as _manifest,
-)
-from helpers import (
-    make_eval_repo,
 )
 from helpers import (
     write_demo_manifest as write_manifest,
@@ -43,9 +44,11 @@ class D3_TriggerPolarityTests(unittest.TestCase):
     disagree on a prose-authored case."""
 
     POS = {"id": "t1", "kind": "trigger", "split": "tune", "prompt": "q1",
+           "should_trigger": True,
            "expected_behavior": ["the skill should trigger here"],
            "assertions": [{"name": "a", "type": "contains", "value": "ok"}]}
     NEG = {"id": "t2", "kind": "trigger", "split": "tune", "prompt": "q2",
+           "should_trigger": False,
            "expected_behavior": ["the skill should not fire"],
            "assertions": [{"name": "b", "type": "contains", "value": "ok"}]}
 
@@ -184,7 +187,7 @@ class ReadinessRunSignalTests(unittest.TestCase):
                 "missing_output": False, "execution_valid": True}
 
     def test_run_signals_classify_cases(self):
-        report = {"results": [
+        report = {"availability": "complete", "results": [
             # base-saturated: combined identical across arms
             self._res("base", "with_skill", 1.0, 1.0), self._res("base", "without_skill", 1.0, 1.0),
             # qualitative-only: objective identical, combined lifts with_skill
@@ -199,14 +202,14 @@ class ReadinessRunSignalTests(unittest.TestCase):
     def test_unmatched_models_do_not_create_readiness_comparisons(self):
         left = {**self._res("c", "with_skill", 1.0, 1.0), "model": "a"}
         right = {**self._res("c", "without_skill", 1.0, 1.0), "model": "b"}
-        signals = sb.readiness_run_signals({"results": [left, right]})
+        signals = sb.readiness_run_signals({"availability": "complete", "results": [left, right]})
         self.assertEqual(signals["base_saturated_cases"], [])
         self.assertEqual(signals["qualitative_only_cases"], [])
 
     def test_out_of_range_rates_do_not_become_readiness_signals(self):
         rows = [self._res("c", "with_skill", 2.0, 2.0),
                 self._res("c", "without_skill", 2.0, 2.0)]
-        signals = sb.readiness_run_signals({"results": rows})
+        signals = sb.readiness_run_signals({"availability": "complete", "results": rows})
         self.assertEqual(signals["base_saturated_cases"], [])
         self.assertEqual(signals["qualitative_only_cases"], [])
 
@@ -216,7 +219,7 @@ class ReadinessRunSignalTests(unittest.TestCase):
             cases = [{"id": "obj", "split": "tune", "kind": "pr-review", "prompt": "review this",
                       "assertions": [{"name": "k", "type": "contains", "value": "TOKEN-NOT-IN-PROMPT"}]},
                      {"id": "adv", "split": "tune", "kind": "adversarial", "prompt": "tricky near-miss to hold",
-                      "assertions": [{"name": "q", "type": "judge", "prompt": "held?"}]}]
+                      "assertions": [{"name": "q", "type": "judge", "severity": "gate", "prompt": "held?"}]}]
             p = _manifest(rp, cases)
             # static: the objective-only positive case is flagged, the judge case isn't
             r = sb.eval_readiness(sb.validate_manifest(p), p)
@@ -224,7 +227,7 @@ class ReadinessRunSignalTests(unittest.TestCase):
             self.assertNotIn("adv", r["objective_only_cases"])
             self.assertEqual(r["base_saturated_cases"], [])            # no run data => empty
             # with run data showing obj is base-saturated, it becomes a blocker
-            bench = {"results": [
+            bench = {"availability": "complete", "results": [
                 {"case_id": "obj", "variant": "with_skill", "run_number": 1,
                  "objective_pass_rate": 1.0, "combined_pass_rate": 1.0,
                  "missing_output": False, "execution_valid": True},
@@ -362,7 +365,7 @@ class HeldOutRubricTests(unittest.TestCase):
         manifest["cases"].append({
             "id": "held-1", "split": "holdout", "kind": "behavior", "prompt": "Review the design.",
             "review_rubric": [self.RUBRIC],
-            "assertions": [{"name": "quality", "type": "judge", "rubric": [self.RUBRIC]}],
+            "assertions": [{"name": "quality", "type": "judge", "severity": "gate", "rubric": [self.RUBRIC]}],
         })
         return manifest
 
@@ -500,6 +503,7 @@ class MigrationTests(unittest.TestCase):
                 base = runs / "case-1" / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text(text, encoding="utf-8")
+            attest_answer_design(path, runs)
             report = sb.build_benchmark_report(path, runs)
         self.assertEqual(loaded["version"], 2)
         self.assertEqual(report["paired_summary"]["absolute_delta"], 1.0)
@@ -600,7 +604,7 @@ class CapabilityRegressionIntentTests(unittest.TestCase):
         self.assertEqual(intent["cap"], "capability")   # default when untagged
 
     def test_readiness_splits_saturation_by_intent(self):
-        report = {"results": self._rows("cap", "capability", 1.0, 1.0) + self._rows("reg", "regression", 1.0, 1.0)}
+        report = {"availability": "complete", "results": self._rows("cap", "capability", 1.0, 1.0) + self._rows("reg", "regression", 1.0, 1.0)}
         sig = sb.readiness_run_signals(report)
         self.assertIn("cap", sig["base_saturated_cases"])
         self.assertIn("reg", sig["base_saturated_expected_cases"])
@@ -610,13 +614,13 @@ class CapabilityRegressionIntentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             p = self._write_manifest(td, [self._case("reg", "regression")])
             m = sb.validate_manifest(p)
-            readiness = sb.eval_readiness(m, p, benchmark_report={"results": self._rows("reg", "regression", 1.0, 1.0)})
+            readiness = sb.eval_readiness(m, p, benchmark_report={"availability": "complete", "results": self._rows("reg", "regression", 1.0, 1.0)})
         self.assertIn("reg", readiness["regression_guards_holding"])
         self.assertNotIn("reg", readiness["base_saturated_cases"])
         self.assertFalse(any("base-saturated" in b for b in readiness["blockers"]))
 
     def test_stale_exempts_regression_guard(self):
-        rep = {"results": self._rows("cap", "capability", 1.0, 1.0) + self._rows("reg", "regression", 1.0, 1.0)}
+        rep = {"availability": "complete", "results": self._rows("cap", "capability", 1.0, 1.0) + self._rows("reg", "regression", 1.0, 1.0)}
         ids = {c["case_id"] for c in sb.stale_case_candidates([rep, rep])}
         self.assertIn("cap", ids)          # all-green capability probe -> prune candidate
         self.assertNotIn("reg", ids)       # all-green regression guard -> exempt
@@ -731,11 +735,70 @@ class ContaminationPerimeterTests(unittest.TestCase):
         self.assertEqual(report["cases"][0]["findings"][0]["kind"], "canary-hit")
 
 
+class ClosedManifestBoundaryTests(unittest.TestCase):
+    def _validate(self, case: dict, *, judge: dict | None = None):
+        manifest = base_manifest()
+        manifest["cases"] = [case]
+        if judge is not None:
+            manifest["judge"] = judge
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            return sb.validate_manifest(path)
+
+    def test_prompt_sources_are_mutually_exclusive(self):
+        base = {
+            "id": "case-1", "split": "tune", "prompt": "inline",
+            "assertions": [{"name": "a", "type": "contains", "value": "x"}],
+        }
+        for second in (
+            {"prompt_ref": "private.txt"},
+            {"turns": [{"prompt": "turn one"}]},
+        ):
+            with self.assertRaises(SystemExit):
+                self._validate({**base, **second})
+
+    def test_turns_are_a_complete_prompt_source(self):
+        case = {
+            "id": "case-1", "split": "tune",
+            "turns": [{"prompt": "turn one"}, {"prompt": "turn two"}],
+            "assertions": [{"name": "a", "type": "contains", "value": "x"}],
+        }
+        loaded = self._validate(case)
+        self.assertEqual(len(loaded["cases"][0]["turns"]), 2)
+
+    def test_nested_qualitative_objects_are_closed(self):
+        assertions = [
+            {"name": "q", "type": "judge", "graded_dimensions": [
+                {"name": "quality", "rubric": "5 = good; 1 = bad", "rubirc": "typo"}
+            ]},
+            {"name": "q", "type": "judge", "dynamic_rubric": {
+                "instruction": "draft criteria", "minimum_criterai": 5,
+            }},
+        ]
+        for assertion in assertions:
+            case = {
+                "id": "case-1", "split": "tune", "prompt": "do it",
+                "assertions": [assertion],
+            }
+            with self.assertRaises(SystemExit):
+                self._validate(case)
+
+    def test_judge_panel_aliases_cannot_both_be_set(self):
+        case = {
+            "id": "case-1", "split": "tune", "prompt": "do it",
+            "assertions": [{"name": "a", "type": "contains", "value": "x"}],
+        }
+        with self.assertRaises(SystemExit):
+            self._validate(case, judge={"panel": ["a"], "models": ["b"]})
+
+
 class PerStepValidationTests(unittest.TestCase):
     """per_step is a judge-only assertion field: true, or an object whose only
     key is min_met_fraction in (0, 1]."""
 
     def _validate(self, assertion):
+        if assertion.get("type") in sb.QUALITATIVE_ASSERTIONS and "severity" not in assertion:
+            assertion = {**assertion, "severity": "gate"}
         manifest = base_manifest()
         manifest["cases"][0]["assertions"] = [assertion]
         with tempfile.TemporaryDirectory() as td:

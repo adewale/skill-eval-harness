@@ -57,6 +57,45 @@ class JettyLifecycleTruthTableTests(unittest.TestCase):
 
 
 class JettyBoundaryIntegrationTests(unittest.TestCase):
+    def test_telemetry_aliases_must_agree_before_normalization(self):
+        base = {
+            "status": "completed", "trajectory_id": "t", "jetty": {},
+            "trajectory": {"events": [], "total_tool_calls": 0},
+        }
+        conflicts = [
+            {"elapsed_ms": 1, "duration_ms": 2},
+            {"input_tokens": 1, "usage": {"input_tokens": 2}},
+            {"output_tokens": 1, "usage": {"completion_tokens": 2}},
+            {"total_tokens": 1, "usage": {"total_tokens": 2}},
+            {"cost": 1.0, "cost_usd": 2.0},
+            {"cost": 1.0, "usage": {"cost": 2.0}},
+        ]
+        for telemetry in conflicts:
+            with self.subTest(telemetry=telemetry):
+                record = {**base, "trajectory": {
+                    **base["trajectory"], **telemetry}}
+                with self.assertRaisesRegex(ValueError, "conflicting Jetty"):
+                    sb.normalized_jetty_metadata(record, success=True)
+                with self.assertRaisesRegex(ValueError, "conflicting Jetty"):
+                    sb.jetty_trace_records(record, [], success=True)
+
+    def test_equal_telemetry_aliases_are_canonicalized_once(self):
+        record = {
+            "status": "completed", "trajectory_id": "t", "jetty": {},
+            "trajectory": {
+                "events": [], "total_tool_calls": 0,
+                "elapsed_ms": 3, "duration_ms": 3,
+                "input_tokens": 2,
+                "usage": {"input_tokens": 2, "prompt_tokens": 2,
+                          "cost": 0.25},
+                "cost_usd": 0.25,
+            },
+        }
+        metadata = sb.normalized_jetty_metadata(record, success=True)
+        self.assertEqual(metadata["elapsed_ms"], 3)
+        self.assertEqual(metadata["usage_normalized"]["input_tokens"], 2)
+        self.assertEqual(metadata["cost_normalized"]["total_cost"], 0.25)
+
     def test_executor_rejects_blank_submitted_trajectory_id_before_poll(self):
         class Client:
             polled = False
@@ -76,11 +115,186 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
                 "model_provider": "anthropic", "snapshot": "s"}},
             "upload_plan": {"files": []},
         }
+        payload["harness"]["jetty_task_contract_sha256"] = (
+            sb.jetty_task_contract_sha256(payload))
         record = next(iter(sb.execute_jetty_payloads([payload], client=client)))
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["lifecycle"]["kind"], "failed")
         self.assertIn("trajectory_id", record["error"])
         self.assertFalse(client.polled)
+
+    def test_executor_rejects_model_visible_task_substitution_before_upload(self):
+        class Client:
+            uploaded = False
+
+            def upload(self, *args, **kwargs):
+                self.uploaded = True
+                raise AssertionError("changed task must be rejected before upload")
+
+        for changed_field in ("task", "runbook"):
+            with self.subTest(changed_field=changed_field):
+                client = Client()
+                payload = {
+                    "harness": {"executable": True},
+                    "jetty_request": {
+                        "model": "m",
+                        "messages": [{"role": "system", "content": "runbook"}],
+                        "jetty": {"collection": "c", "task": "t"},
+                    },
+                    "upload_plan": {"files": [{
+                        "role": "task", "placeholder": "upload://task",
+                        "remote_path_hint": "task.json", "private": True,
+                        "content": {"prompt": "original"},
+                    }]},
+                }
+                payload["harness"]["jetty_task_contract_sha256"] = (
+                    sb.jetty_task_contract_sha256(payload))
+                if changed_field == "task":
+                    payload["upload_plan"]["files"][0]["content"]["prompt"] = "substituted"
+                else:
+                    payload["jetty_request"]["messages"][0]["content"] = "substituted"
+
+                record = next(iter(sb.execute_jetty_payloads([payload], client=client)))
+
+                self.assertEqual(record["status"], "failed")
+                self.assertIn("changed after attestation", record["error"])
+                self.assertFalse(client.uploaded)
+
+    def test_executor_rejects_causal_harness_substitution_before_upload(self):
+        class Client:
+            uploaded = False
+
+            def upload(self, *args, **kwargs):
+                self.uploaded = True
+                raise AssertionError("changed harness must be rejected before upload")
+
+        client = Client()
+        payload = {
+            "harness": {
+                "executable": True, "case_id": "case-1",
+                "variant": "with_skill", "run_number": 1,
+                "run_dir": "case-1/with_skill",
+            },
+            "jetty_request": {
+                "model": "m", "messages": [],
+                "jetty": {"collection": "c", "task": "t"},
+            },
+            "upload_plan": {"files": [{
+                "role": "task", "placeholder": "upload://task",
+                "remote_path_hint": "task.json", "content": {},
+            }]},
+        }
+        payload["harness"]["jetty_task_contract_sha256"] = (
+            sb.jetty_task_contract_sha256(payload))
+        payload["harness"]["run_dir"] = "case-1/without_skill"
+
+        record = next(iter(sb.execute_jetty_payloads([payload], client=client)))
+
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("changed after attestation", record["error"])
+        self.assertFalse(client.uploaded)
+
+    def test_executor_snapshots_every_local_upload_before_network_io(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first = root / "first.txt"
+            second = root / "second.txt"
+            first.write_bytes(b"first-before")
+            second.write_bytes(b"second-before")
+
+            class Client:
+                uploaded: list[bytes] = []
+
+                def upload(self, item, collection):
+                    self.uploaded.append(item["content"])
+                    if len(self.uploaded) == 1:
+                        second.write_bytes(b"second-after")
+                    return f"remote-{len(self.uploaded)}"
+
+                def submit(self, request):
+                    return {"trajectory_id": "trajectory-1"}
+
+                def poll(self, *args, **kwargs):
+                    return {"status": "completed", "artifacts": []}
+
+            files = [
+                {"role": "fixture", "placeholder": "upload://first",
+                 "remote_path_hint": "fixtures/first.txt", "local_path": str(first)},
+                {"role": "fixture", "placeholder": "upload://second",
+                 "remote_path_hint": "fixtures/second.txt", "local_path": str(second)},
+                {"role": "task", "placeholder": "upload://task",
+                 "remote_path_hint": "tasks/task.json",
+                 "content": json.dumps({
+                     "files": ["upload://first", "upload://second"],
+                 })},
+            ]
+            payload = {
+                "harness": {"executable": True},
+                "jetty_request": {
+                    "model": "m", "messages": [],
+                    "jetty": {"collection": "c", "task": "t"},
+                },
+                "upload_plan": {"files": files},
+            }
+            payload["harness"]["jetty_task_contract_sha256"] = (
+                sb.jetty_task_contract_sha256(payload))
+            client = Client()
+
+            record = next(iter(sb.execute_jetty_payloads([payload], client=client)))
+
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(client.uploaded[:2], [b"first-before", b"second-before"])
+            uploaded_task = json.loads(client.uploaded[2])
+            self.assertEqual(uploaded_task["files"], ["remote-1", "remote-2"])
+            self.assertNotIn(b"upload://", client.uploaded[2])
+
+    def test_placeholder_replacement_treats_prefix_tokens_atomically(self):
+        mapping = {"upload://1": "remote-I", "upload://10": "remote-J"}
+
+        replaced = sb.replace_placeholders(
+            {"one": "upload://1", "ten": "upload://10"}, mapping)
+
+        self.assertEqual(replaced, {"one": "remote-I", "ten": "remote-J"})
+
+    def test_old_skill_variant_verifies_the_old_skill_upload_surface(self):
+        with tempfile.TemporaryDirectory() as td:
+            skill = Path(td) / "SKILL.md"
+            skill.write_text("old skill", encoding="utf-8")
+            files = [{
+                "role": "old_skill", "placeholder": "upload://old-skill",
+                "remote_path_hint": "skills/demo/SKILL.md",
+                "local_path": str(skill),
+            }]
+            payload = {
+                "harness": {
+                    "executable": True, "variant": "old_skill",
+                    "skill_name": "demo",
+                    "skill_tree_hash": sb.planned_file_surface_hash(
+                        files, role="old_skill", path_prefix="skills/demo/"),
+                },
+                "jetty_request": {
+                    "model": "m", "messages": [],
+                    "jetty": {"collection": "c", "task": "t"},
+                },
+                "upload_plan": {"files": files},
+            }
+            payload["harness"]["jetty_task_contract_sha256"] = (
+                sb.jetty_task_contract_sha256(payload))
+
+            class Client:
+                def upload(self, item, collection):
+                    return "remote-old-skill"
+
+                def submit(self, request):
+                    return {"trajectory_id": "trajectory-1"}
+
+                def poll(self, *args, **kwargs):
+                    return {"status": "completed", "artifacts": []}
+
+            record = next(iter(
+                sb.execute_jetty_payloads([payload], client=Client())))
+
+            self.assertEqual(record["status"], "completed")
 
     def test_failed_trajectory_cannot_promote_partial_events_to_complete_operations(self):
         record = {
@@ -99,7 +313,7 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
                 provider_response_complete=False,
             )
             metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
-        self.assertTrue(metrics["trace_observation_complete"])
+        self.assertFalse(metrics["trace_observation_complete"])
         self.assertFalse(metrics["operation_observation_complete"])
         command = metrics["telemetry"]["measurements"]["commands"]
         self.assertEqual(command["availability"], "unavailable")
