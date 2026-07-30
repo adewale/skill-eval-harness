@@ -30,6 +30,68 @@ The existing `otel` blocks in `events.json` and `metrics.json` are normalized
 offline evidence; this plan does not replay them as live spans or make successful
 export part of evaluation validity.
 
+## Repository prerequisites and landing order
+
+This order follows an audit of all 102 commits reachable from `main`, the 117
+additional commits on remote branch tips, and every open PR and issue as of
+2026-07-30. The history repeatedly succeeds by stabilizing a typed owner before
+instrumenting its callers; large cross-cutting changes are then rebased once,
+after their prerequisites, rather than repeatedly merged around one another.
+
+Land the current work in this order:
+
+1. [#60](https://github.com/adewale/skill-eval-harness/pull/60), the focused
+   `ty` gate. Its selected modules pass on the current #47, #57, and #58 heads,
+   and it reserves `observability.py` and `text_contracts.py` as zero-debt typed
+   boundaries.
+2. [#59](https://github.com/adewale/skill-eval-harness/pull/59), this plan. It is
+   documentation-only and merge-clean with every current branch, so it can set
+   policy before runtime instrumentation begins.
+3. [#57](https://github.com/adewale/skill-eval-harness/pull/57), the fail-closed
+   evidence construction change. It rewrites the shared invocation, artifact,
+   trigger, judge, and telemetry seams that later spans must wrap.
+4. Rebase and land [#58](https://github.com/adewale/skill-eval-harness/pull/58)
+   on #57, closing [#55](https://github.com/adewale/skill-eval-harness/issues/55).
+   The branches currently conflict in the grading owner and six documentation
+   files; resolving once in this direction makes the narrower Unicode contract
+   adapt to the new fail-closed construction boundary.
+5. Resolve [#54](https://github.com/adewale/skill-eval-harness/issues/54) in a
+   small PR on the post-#57 matrix. Preserve #57's completed-observation
+   denominators, add the omitted incomplete count to terminal output, and return
+   nonzero when the run cannot support the requested measurement. This must land
+   before trigger spans could make an operationally incomplete matrix look valid.
+6. Rebase and land [#47](https://github.com/adewale/skill-eval-harness/pull/47)
+   last among the current runtime branches. It is based before #50–#53 and
+   conflicts with #57/#58 in `skill_benchmark.py` and shared docs; one final
+   rebase preserves its live Jetty evidence without repeatedly resolving the
+   same ownership changes.
+
+Slices 0–1 may begin after steps 1, 3, and 4. Slice 2 additionally requires
+steps 5–6. Slice 3 additionally requires the typed judge-invocation result from
+[#52 item 5](https://github.com/adewale/skill-eval-harness/issues/52); adding
+span lifecycle to the current untyped backend/parse/merge dictionary would make
+that boundary harder to close later.
+
+The remaining issues are sequenced by when they change telemetry identity:
+
+- [#48](https://github.com/adewale/skill-eval-harness/issues/48), native skill
+  discovery, does not block slices 0–1. If it lands before Slice 2, the slice must
+  include its typed activation mode and invocation-evidence availability; if it
+  lands later, that parity extension is a separate PR with the same conformance
+  gate.
+- [#49](https://github.com/adewale/skill-eval-harness/issues/49), composition
+  attribution, follows #48 and precedes Slice 4. Run-group identity must carry a
+  bounded composition-arm/component-set digest, not component names as span
+  names or an unbounded attribute list.
+- [#52 item 4](https://github.com/adewale/skill-eval-harness/issues/52) becomes
+  mandatory before OTel would otherwise add parallel hooks to the answer,
+  trigger, and judge registries; avoid creating a fourth registry-spanning rule.
+  Items 1–3 already shipped in #53 and should be checked off independently.
+- [#37](https://github.com/adewale/skill-eval-harness/issues/37) is upstream-
+  capability-driven and is not on the OTel critical path. Missing Vibe usage,
+  schema enforcement, or native telemetry stays explicitly unavailable; OTel
+  must not infer or manufacture it.
+
 ## MVP goal
 
 Given one `run-agent` attempt, an operator with an OTLP backend should be able to:
@@ -123,6 +185,13 @@ and signal-failure cases, but not evidence that current public-branch CI runs th
 - Add a small `observability.py` facade. With no SDK or with support disabled it
   returns valid no-op spans. Programmatic callers can supply a tracer provider;
   otherwise the facade uses the global provider.
+- Keep `observability.py` in #60's blocking `ty` include from its first commit
+  and add it to the packaged `py-modules` list. Its public seam consists of
+  closed, immutable config/correlation/outcome values and narrow protocols or
+  context managers—not `dict[str, Any]` attribute bags or raw SDK objects.
+- Install the `otel` extra in the CI job that exercises the in-memory SDK while
+  keeping the normal package usable with API-only no-ops. Optional-SDK imports
+  must type-check without broad missing-import or `Any` suppressions.
 - Put the attribute allowlist, sanitization, instrumentation schema revision, and
   pinned upstream semantic-convention revision behind that one facade. Adapters
   provide typed values; they do not write arbitrary span attributes.
@@ -236,12 +305,16 @@ Add the remaining live execution producers while retaining one root per attempt:
 taxonomy, secret allowlist, concurrency isolation, and artifact correlation for
 every runner that claims tracing support. Unsupported remote propagation is
 reported as unavailable, never silently fabricated. Owner completion also proves
-that no descendant span remains open after interruption.
+that no descendant span remains open after interruption. #54 is closed and the
+rebased #47 live contract is the source of truth for Jetty submission, polling,
+artifact commit, and failure states.
 
 ### Slice 3: grading and judge correlation
 
 **Entry:** slice 1 correlation metadata is stable and grading can consume old
-runs whose metadata has no observability block.
+runs whose metadata has no observability block. #58 has fixed the comparison
+view, and #52 item 5 has replaced the judge invocation dictionary with a closed
+typed result.
 
 Instrument work that may happen minutes or days after generation without making
 one misleading long-lived trace:
@@ -344,13 +417,17 @@ Use the SDK's in-memory exporter; no live collector or model call belongs in CI.
 6. A throwing exporter leaves exit code, `execution_valid`, and the pre-existing
    artifact contract unchanged.
 7. Concurrent attempts have distinct root spans and no cross-task parentage.
+8. `ty check` passes with `observability.py` in the project-owned include and no
+   OTel-specific broad ignore; an optional-SDK-disabled run follows the same
+   typed facade as an exporting run.
 
 ## Delivery units
 
 Each numbered slice is a separate review and release decision. Slices 0–1 may
 share one focused implementation PR if it stays reviewable:
 
-1. add the optional dependency/facade and no-op tests;
+1. after #60 and #57 land, add the optional dependency, typed facade, packaging,
+   and no-op tests;
 2. instrument the shared native answer path and subprocess propagation;
 3. persist trace correlation and add the acceptance tests; and
 4. document one local OTLP example plus the privacy/default behavior.
