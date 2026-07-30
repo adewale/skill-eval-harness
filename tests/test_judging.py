@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from helpers import (
     demo_manifest as base_manifest,
@@ -120,8 +121,16 @@ class JudgePresetTests(unittest.TestCase):
             self.assertEqual(len(tasks), 1)
             self.assertTrue(tasks[0]["assertion"]["rubric"])   # canned rubric rides the judge task
             jid = tasks[0]["judge_task_id"]
+            _, _, prompt_sha256, _ = sb.judge_input_material(
+                tasks[0], "claims", run_base=base)
+            verdict = {"passed": True, "score": 5, "rationale": "grounded",
+                       "returncode": 0, "judge_observation_complete": True,
+                       "availability": "complete",
+                       "judge_input_sha256": tasks[0]["judge_input_sha256"],
+                       "judge_prompt_sha256": prompt_sha256,
+                       "judge_evidence_mode": "text-only"}
             merged, _ = sb.grade_case_variant(case, "with_skill", "claims", base / "output.md", {}, run_base=base,
-                                              judge_results={jid: {"passed": True, "score": 5, "rationale": "grounded"}})
+                                              judge_results={jid: verdict})
         # factuality is soft by default: the verdict fills the soft/graded channel.
         self.assertEqual(merged["soft_passed"], 1)
         self.assertTrue(merged["qualitative_assertions"][0]["passed"])
@@ -136,7 +145,197 @@ class JudgePresetTests(unittest.TestCase):
                 sb.validate_manifest(path)
 
 
+class JudgeObservationBindingTests(unittest.TestCase):
+    def test_validation_rejects_post_preset_task_id_collisions(self):
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"] += [
+            {"type": "factuality", "description": "first"},
+            {"type": "factuality", "description": "second"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+
+    def test_prompt_ref_contents_not_path_are_bound_into_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = base_manifest()
+            case = manifest["cases"][0]
+            case.pop("prompt")
+            case["prompt_ref"] = "prompts/case.txt"
+            case["assertions"].append(
+                {"name": "quality", "type": "judge", "severity": "gate",
+                 "rubric": ["Pass only when the answer is correct."]})
+            path = write_manifest(root, manifest)
+            prompt = path.parent / "prompts" / "case.txt"
+            prompt.parent.mkdir()
+            prompt.write_text("exact prompt bytes\n", encoding="utf-8")
+            run = root / "runs" / "case-1" / "with_skill"
+            run.mkdir(parents=True)
+            (run / "output.md").write_text("alpha", encoding="utf-8")
+
+            first = sb.collect_judge_tasks(
+                path, root / "runs", variants=["with_skill"])[0]
+            same_bytes_other_path = {**first, "prompt_ref": "renamed.txt"}
+            self.assertEqual(first["prompt"], "exact prompt bytes\n")
+            self.assertEqual(
+                sb.judge_input_sha256(first, "alpha"),
+                sb.judge_input_sha256(same_bytes_other_path, "alpha"))
+
+            prompt.write_text("changed prompt bytes\n", encoding="utf-8")
+            changed = sb.collect_judge_tasks(
+                path, root / "runs", variants=["with_skill"])[0]
+            self.assertNotEqual(
+                first["judge_input_sha256"], changed["judge_input_sha256"])
+
+    def test_grading_accepts_only_complete_current_bound_verdict(self):
+        case = {"id": "c", "split": "tune", "prompt": "original prompt",
+                "review_rubric": ["original rubric"], "assertions": [
+                    {"name": "quality", "type": "judge", "severity": "gate"}]}
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "output.md"
+            output.write_text("candidate", encoding="utf-8")
+            _, tasks = sb.grade_case_variant(
+                case, "with_skill", "candidate", output, {})
+            task = tasks[0]
+            _, _, prompt_sha256, _ = sb.judge_input_material(task, "candidate")
+            verdict = {
+                "judge_task_id": task["judge_task_id"], "passed": True,
+                "returncode": 0, "judge_observation_complete": True,
+                "availability": "complete",
+                "judge_input_sha256": task["judge_input_sha256"],
+                "judge_prompt_sha256": prompt_sha256,
+                "judge_evidence_mode": "text-only",
+            }
+            accepted, accepted_tasks = sb.grade_case_variant(
+                case, "with_skill", "candidate", output, {},
+                judge_results={task["judge_task_id"]: verdict})
+            self.assertEqual(accepted_tasks, [])
+            self.assertTrue(accepted["qualitative_assertions"][0]["passed"])
+
+            mutations = [
+                (case, "changed candidate", verdict),
+                ({**case, "prompt": "changed prompt"}, "candidate", verdict),
+                ({**case, "review_rubric": ["changed rubric"]}, "candidate", verdict),
+                (case, "candidate", {**verdict,
+                                      "judge_observation_complete": False}),
+                (case, "candidate", {**verdict, "availability": "partial"}),
+            ]
+            for changed_case, candidate, stored in mutations:
+                with self.subTest(case=changed_case, candidate=candidate, stored=stored):
+                    result, pending = sb.grade_case_variant(
+                        changed_case, "with_skill", candidate, output, {},
+                        judge_results={task["judge_task_id"]: stored})
+                    self.assertEqual(len(pending), 1)
+                    self.assertEqual(result["qualitative_assertions"], [])
+
+    def test_execution_refuses_task_whose_candidate_changed_after_collection(self):
+        case = {"id": "c", "split": "tune", "prompt": "p", "assertions": [
+            {"name": "quality", "type": "judge", "severity": "gate"}]}
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "output.md"
+            output.write_text("candidate", encoding="utf-8")
+            _, tasks = sb.grade_case_variant(
+                case, "with_skill", "candidate", output, {})
+            output.write_text("changed after collection", encoding="utf-8")
+            with mock.patch.object(sb.subprocess, "run") as invoked:
+                row = sb.run_one_judge_task(tasks[0], judge_cmd="unused")
+            invoked.assert_not_called()
+            self.assertFalse(row["judge_observation_complete"])
+            self.assertFalse(row["passed"])
+            self.assertNotEqual(
+                row["judge_input_sha256"], tasks[0]["judge_input_sha256"])
+
+    def test_successful_call_stamps_complete_lifecycle_and_binding(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "output.md"
+            verdict_file = Path(td) / "verdict.json"
+            output.write_text("candidate", encoding="utf-8")
+            verdict_file.write_text('{"passed": true}', encoding="utf-8")
+            task = {"judge_task_id": "c::with_skill::run-1::quality",
+                    "case_id": "c", "variant": "with_skill", "run_number": 1,
+                    "prompt": "p", "output_path": str(output),
+                    "assertion": {"name": "quality", "type": "judge"}}
+            task["judge_input_sha256"] = sb.judge_input_sha256(task, "candidate")
+            row = sb.run_one_judge_task(task, judge_cmd=f"cat {verdict_file}")
+        self.assertTrue(row["judge_observation_complete"])
+        self.assertEqual(row["returncode"], 0)
+        self.assertEqual(row["judge_input_sha256"], task["judge_input_sha256"])
+        self.assertRegex(row["judge_prompt_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_trajectory_mode_has_distinct_binding_and_stale_context_requeues(self):
+        case = {"id": "c", "split": "tune", "prompt": "p", "assertions": [
+            {"name": "quality", "type": "judge", "severity": "gate"}]}
+        with tempfile.TemporaryDirectory() as td:
+            run = Path(td) / "run"
+            write_run(run, "candidate", events={"events": [
+                trace_event("command", name="Bash", input_summary="one")]})
+            _, tasks = sb.grade_case_variant(
+                case, "with_skill", "candidate", run / "output.md", {}, run_base=run)
+            verdict_file = Path(td) / "verdict.json"
+            verdict_file.write_text('{"passed": true}', encoding="utf-8")
+            text_row = sb.run_one_judge_task(
+                tasks[0], judge_cmd=f"cat {verdict_file}")
+            trajectory_row = sb.run_one_judge_task(
+                tasks[0], judge_cmd=f"cat {verdict_file}", include_trajectory=True)
+            self.assertEqual(text_row["judge_evidence_mode"], "text-only")
+            self.assertEqual(trajectory_row["judge_evidence_mode"], "trajectory")
+            self.assertNotEqual(
+                text_row["judge_input_sha256"], trajectory_row["judge_input_sha256"])
+            self.assertNotEqual(
+                text_row["judge_prompt_sha256"], trajectory_row["judge_prompt_sha256"])
+
+            accepted, pending = sb.grade_case_variant(
+                case, "with_skill", "candidate", run / "output.md", {},
+                run_base=run,
+                judge_results={trajectory_row["judge_task_id"]: trajectory_row})
+            self.assertEqual(pending, [])
+            self.assertTrue(accepted["qualitative_assertions"][0]["passed"])
+
+            (run / "events.json").write_text(json.dumps({"events": [
+                trace_event("command", name="Bash", input_summary="changed")]}),
+                encoding="utf-8")
+            stale, pending = sb.grade_case_variant(
+                case, "with_skill", "candidate", run / "output.md", {},
+                run_base=run,
+                judge_results={trajectory_row["judge_task_id"]: trajectory_row})
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(stale["qualitative_assertions"], [])
+
+    def test_requested_missing_trajectory_is_incomplete_without_invocation(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = Path(td) / "run"
+            run.mkdir()
+            (run / "output.md").write_text("candidate", encoding="utf-8")
+            task = {"judge_task_id": "c::with_skill::run-1::quality",
+                    "case_id": "c", "variant": "with_skill", "run_number": 1,
+                    "prompt": "p", "output_path": str(run / "output.md"),
+                    "run_base": str(run),
+                    "assertion": {"name": "quality", "type": "judge"}}
+            task["judge_input_sha256"] = sb.judge_input_sha256(
+                task, "candidate", run_base=run)
+            with mock.patch.object(sb.subprocess, "run") as invoked:
+                row = sb.run_one_judge_task(
+                    task, judge_cmd="unused", include_trajectory=True)
+            invoked.assert_not_called()
+        self.assertFalse(row["judge_observation_complete"])
+        self.assertEqual(row["judge_evidence_mode"], "trajectory")
+        self.assertIn("incomplete", row["evidence"])
+
+
 class VerdictSchemaTests(unittest.TestCase):
+    def test_json_extraction_rejects_lossy_or_ambiguous_aggregates(self):
+        self.assertEqual(sb.extract_json_object('result: {"passed": true}'), {"passed": True})
+        self.assertEqual(sb.extract_json_object('[{"passed": true}]'), {"passed": True})
+        for text in (
+                '{"passed": true}\n{"passed": false}',
+                '[{"passed": true}, {"passed": false}]',
+                '[1]',
+                '{"passed": true} trailing {"score": 1}'):
+            with self.subTest(text=text), self.assertRaises((TypeError, ValueError)):
+                sb.extract_json_object(text)
+
     """G4 — canonical JSON schema per judge verdict shape + post-hoc gate."""
 
     GRADED = {"type": "judge", "graded_dimensions": [{"name": "clarity"}]}
@@ -146,6 +345,10 @@ class VerdictSchemaTests(unittest.TestCase):
     def test_schema_per_shape(self):
         self.assertEqual(sb.verdict_schema_for(self.PLAIN)["required"], ["passed"])
         self.assertEqual(sb.verdict_schema_for(self.PLAIN)["properties"]["passed"]["type"], "boolean")
+        self.assertEqual(
+            sb.verdict_schema_for({**self.PLAIN, "atLeast": 0.8})["required"],
+            ["score"],
+        )
         self.assertEqual(sb.verdict_schema_for(self.GRADED)["required"], ["dimension_scores"])
         d = sb.verdict_schema_for({"type": "judge", "dynamic_rubric": {"minimum_criteria": 4}})
         self.assertEqual(d["required"], ["criteria"])
@@ -176,7 +379,7 @@ class VerdictSchemaTests(unittest.TestCase):
         f.write_text(json.dumps(obj), encoding="utf-8")
         return f"cat {f}"
 
-    def test_report_surfaces_and_strict_fails_on_wrong_keys(self):
+    def test_deprecated_schema_modes_both_surface_and_fail_closed(self):
         with tempfile.TemporaryDirectory() as td:
             task = self._task(td)
             cmd = self._cmd(td, {"verdict": "good", "score": 5})   # valid JSON, but no `passed`
@@ -186,6 +389,9 @@ class VerdictSchemaTests(unittest.TestCase):
         self.assertIn("schema_errors", strict_row)
         self.assertFalse(report_row["passed"])        # report surfaces diagnostics but cannot promote malformed evidence
         self.assertFalse(strict_row["passed"])        # strict is also fail-closed
+        self.assertEqual(
+            report_row["judge_observation_complete"],
+            strict_row["judge_observation_complete"])
 
     def test_wellformed_verdict_stays_clean_and_default_is_report(self):
         with tempfile.TemporaryDirectory() as td:
@@ -215,7 +421,7 @@ class VerdictSchemaTests(unittest.TestCase):
                 "assert set(schema['required']) == {'passed', 'score', 'rationale'}\n"
                 "assert 'null' in schema['properties']['score']['type']\n"
                 "out.write_text(json.dumps({'passed': True, 'score': 1, 'rationale': 'codex ok'}))\n"
-                "print(json.dumps({'type':'usage','usage':{'input_tokens':2,'output_tokens':3}}))\n",
+                "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':2,'output_tokens':3}}))\n",
                 encoding="utf-8")
             row = sb.run_one_judge_task(task, judge_backend="codex", judge_model="gpt-mini", codex_cmd=f"{sys.executable} {fake}")
         self.assertTrue(row["passed"])
@@ -408,14 +614,17 @@ class TrajectoryJudgeTests(unittest.TestCase):
         self.assertTrue(traj_row["passed"])
         self.assertEqual(traj_row["judge_task_id"], "c::with_skill::run-1::j")
 
-    def test_malformed_events_degrades_without_crashing(self):
+    def test_malformed_requested_trajectory_is_incomplete(self):
         with tempfile.TemporaryDirectory() as td:
             run = self._run_dir(td, events="malformed")
             task = self._task(run)
             vf = Path(td) / "verdict.json"
             vf.write_text(json.dumps({"passed": True}), encoding="utf-8")
             row = sb.run_one_judge_task(task, judge_cmd=f"cat {vf}", include_trajectory=True)
-        self.assertTrue(row["passed"])   # bad events.json -> trajectory omitted, judge still runs
+        self.assertFalse(row["passed"])
+        self.assertFalse(row["judge_observation_complete"])
+        self.assertEqual(row["judge_evidence_mode"], "trajectory")
+        self.assertIn("invalid JSON", row["evidence"])
 
 
 STEP_EVENTS = [
@@ -557,6 +766,8 @@ class PerStepJudgeTests(unittest.TestCase):
             merged = sb.merge_repeated_judge_rows(rows)
         self.assertEqual({row["verdict_kind"] for row in rows}, {"dynamic"})
         self.assertFalse(merged["passed"])
+        self.assertFalse(merged["judge_observation_complete"])
+        self.assertTrue(merged["incomplete_judge_members"])
 
     def test_missing_step_evidence_fails_closed_without_model_spend(self):
         with tempfile.TemporaryDirectory() as td:
@@ -574,7 +785,11 @@ class CrossJudgeConsensusTests(unittest.TestCase):
     @staticmethod
     def _row(model, passed, score=None, cost=None):
         r = {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
-             "run_number": 1, "judge_model": model, "passed": passed, "threshold": 3, "evidence": f"{model}-ev"}
+             "run_number": 1, "judge_model": model, "passed": passed, "threshold": 3,
+             "evidence": f"{model}-ev", "returncode": 0,
+             "judge_observation_complete": True, "availability": "complete",
+             "judge_input_sha256": "sha256:" + "f" * 64,
+             "judge_prompt_sha256": "a" * 64, "judge_evidence_mode": "text-only"}
         if score is not None:
             r["score"] = score
         if cost is not None:
@@ -651,6 +866,25 @@ class CrossJudgeConsensusTests(unittest.TestCase):
             sb.merge_cross_judge_rows([self._row("m1", True, 4),
                                        {**self._row("m2", True, 4), "judge_task_id": "other"}])
 
+    def test_incomplete_panel_member_blocks_consensus(self):
+        failed_call = {**self._row("m2", False, 1), "returncode": 7,
+                       "judge_observation_complete": False}
+        out = sb.merge_cross_judge_rows(
+            [self._row("m1", True, 5), failed_call])
+        self.assertFalse(out["judge_observation_complete"])
+        self.assertFalse(out["passed"])
+        self.assertEqual(out["judge_model"], "consensus")
+        self.assertTrue(out["incomplete_judge_members"])
+
+    def test_mismatched_input_bindings_block_repeat_consensus(self):
+        rows = [self._row("m1", True, 5),
+                {**self._row("m1", True, 5),
+                 "judge_input_sha256": "sha256:" + "e" * 64}]
+        out = sb.merge_repeated_judge_rows(rows)
+        self.assertFalse(out["judge_observation_complete"])
+        self.assertFalse(out["passed"])
+        self.assertTrue(out["incomplete_judge_members"])
+
     def test_effective_judge_models_precedence(self):
         self.assertEqual(sb.effective_judge_models({}, ["a", "b"], "x"), ["a", "b"])                       # cli panel wins
         self.assertEqual(sb.effective_judge_models({"judge": {"panel": ["p1", "p2"]}}, None, None), ["p1", "p2"])
@@ -659,12 +893,31 @@ class CrossJudgeConsensusTests(unittest.TestCase):
         self.assertEqual(sb.effective_judge_models({}, None, "cli"), ["cli"])
         self.assertEqual(sb.effective_judge_models({}, None, None), [])
 
+    def test_effective_judge_models_rejects_duplicates_before_calls(self):
+        with self.assertRaises(SystemExit):
+            sb.effective_judge_models({}, ["same", "same"])
+
+    def test_judge_task_identity_rejects_ambiguous_delimiter_segments(self):
+        assertion = {"name": "j", "type": "judge"}
+        with self.assertRaisesRegex(ValueError, "delimiter"):
+            sb.judge_task_id(
+                "a::b", "with_skill", 1, assertion, model="c")
+        with self.assertRaisesRegex(ValueError, "delimiter"):
+            sb.judge_task_id(
+                "a", "with_skill", 1, assertion, model="b::c")
+
     def test_consensus_row_joins_like_a_single_verdict(self):
         jassert = {"name": "j", "type": "judge", "severity": "gate"}
         jid = sb.judge_task_id("c", "with_skill", 1, sb.expand_judge_preset(jassert))
         consensus = sb.merge_cross_judge_rows([{**self._row("m1", True, 5), "judge_task_id": jid},
                                                {**self._row("m2", True, 5), "judge_task_id": jid}])
         case = {"id": "c", "split": "tune", "kind": "behavior", "assertions": [jassert]}
+        _, pending = sb.grade_case_variant(
+            case, "with_skill", "x", Path("o.md"), {}, judge_results={})
+        consensus["judge_input_sha256"] = pending[0]["judge_input_sha256"]
+        consensus["judge_prompt_sha256"] = sb.judge_input_material(
+            pending[0], "x")[2]
+        consensus["judge_evidence_mode"] = "text-only"
         result, _ = sb.grade_case_variant(case, "with_skill", "x", Path("o.md"), {}, judge_results={jid: consensus})
         self.assertEqual(len(result["qualitative_assertions"]), 1)                 # exactly one merged verdict per jid
         self.assertEqual((result["qualitative_total"], result["qualitative_passed"]), (1, 1))
@@ -677,7 +930,13 @@ class CrossJudgeConsensusTests(unittest.TestCase):
     def test_even_tie_with_scores_but_no_threshold_is_unresolved(self):
         # a bare raw-score panel (no calibrated threshold) must NOT pass on the default-1
         # fallback (median >= 1 is ~always true) — it resolves to unresolved.
-        row = lambda m, p, s: {"judge_task_id": "j", "judge_model": m, "passed": p, "score": s, "evidence": "e"}
+        row = lambda m, p, s: {
+            "judge_task_id": "j", "judge_model": m, "passed": p,
+            "score": s, "evidence": "e", "returncode": 0,
+            "judge_observation_complete": True, "availability": "complete",
+            "judge_input_sha256": "sha256:" + "f" * 64,
+            "judge_prompt_sha256": "a" * 64, "judge_evidence_mode": "text-only",
+        }
         out = sb.merge_cross_judge_rows([row("m1", True, 3), row("m2", False, 2)])   # no threshold key
         self.assertFalse(out["passed"])
         self.assertTrue(out["agreement"]["unresolved"])
@@ -750,7 +1009,10 @@ class JudgeRobustnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             rep = self._report(td, "robust", self.ROBUST)
         self.assertEqual(rep["findings"], [])                                             # clean, exactly
-        self.assertEqual(rep["summary"], {"n": 1, "order_flip_consistency": 1.0, "control_leak_rate": 0.0})
+        self.assertEqual(rep["summary"]["availability"], "complete")
+        self.assertEqual(rep["summary"]["n"], 1)
+        self.assertEqual(rep["summary"]["order_flip_consistency"], 1.0)
+        self.assertEqual(rep["summary"]["control_leak_rate"], 0.0)
         self.assertEqual(rep["tasks"][0]["controls_passed"], {"empty": False, "master-key": False})
         self.assertIs(rep["tasks"][0]["order_flip_consistent"], True)
 
@@ -781,6 +1043,30 @@ class JudgeRobustnessTests(unittest.TestCase):
         self.assertEqual(rep["summary"]["order_flip_consistency"], 0.0)                   # the one task flipped
         self.assertEqual(rep["summary"]["control_leak_rate"], 0.0)                        # still rejects both controls
         self.assertIs(rep["tasks"][0]["order_flip_consistent"], False)
+
+    def test_incomplete_calls_block_robustness_conclusions(self):
+        failed = {"passed": False, "returncode": 7,
+                  "judge_observation_complete": False}
+        complete = {"passed": False, "returncode": 0,
+                    "judge_observation_complete": True,
+                    "availability": "complete",
+                    "judge_input_sha256": "sha256:" + "f" * 64,
+                    "judge_prompt_sha256": "a" * 64,
+                    "judge_evidence_mode": "text-only"}
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+                sb, "run_one_judge_task",
+                side_effect=[failed, complete, failed, complete]):
+            report = sb.judge_robustness_report(
+                [self._task(td)], tmp_dir=Path(td))
+        self.assertIsNone(report["summary"]["order_flip_consistency"])
+        self.assertIsNone(report["summary"]["control_leak_rate"])
+        self.assertEqual(report["summary"]["availability"], "partial")
+        self.assertIsNone(report["tasks"][0]["order_flip_consistent"])
+        self.assertIsNone(report["tasks"][0]["controls_passed"]["empty"])
+        self.assertEqual(
+            [finding["kind"] for finding in report["findings"]],
+            ["judge-call-incomplete", "judge-call-incomplete"],
+        )
 
     def test_flip_reverses_and_does_not_mutate(self):
         import copy
@@ -813,7 +1099,7 @@ class JudgeRobustnessTests(unittest.TestCase):
         p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
             "variants": ["with_skill", "without_skill"], "ablations": [],
             "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
-                       "assertions": [{"name": "j", "type": "judge", "review_rubric": ["is it good"]}]}]}), encoding="utf-8")
+                       "assertions": [{"name": "j", "type": "judge", "severity": "gate", "review_rubric": ["is it good"]}]}]}), encoding="utf-8")
         runs = root / "runs"
         (runs / "c" / "with_skill").mkdir(parents=True)
         (runs / "c" / "with_skill" / "output.md").write_text("GOODANSWER is present", encoding="utf-8")
@@ -838,6 +1124,18 @@ class JudgeRobustnessTests(unittest.TestCase):
             # Always-pass judge leaks controls: findings present, and the gate flips exit code.
             self.assertEqual(sb.judge_robustness_command(self._args(td, p, runs, "yes", self.ALWAYS_PASS, fail_on_findings=False)), 0)
             self.assertEqual(sb.judge_robustness_command(self._args(td, p, runs, "yes", self.ALWAYS_PASS, fail_on_findings=True)), 1)
+
+    def test_ci_gate_fails_when_no_judge_tasks_are_available(self):
+        with tempfile.TemporaryDirectory() as td:
+            p, runs = self._cli_manifest(td)
+            args = self._args(
+                td, p, runs, "robust", self.ROBUST,
+                fail_on_findings=True)
+            with mock.patch.object(sb, "collect_judge_tasks", return_value=[]):
+                self.assertEqual(sb.judge_robustness_command(args), 1)
+            report = json.loads(Path(args.out).read_text(encoding="utf-8"))
+        self.assertEqual(report["summary"]["availability"], "unavailable")
+        self.assertEqual(report["findings"], [])
 
 
 class ToolUsingJudgeTests(unittest.TestCase):
@@ -970,6 +1268,35 @@ class ToolUsingJudgeTests(unittest.TestCase):
         self.assertNotEqual(probe["cwd"], os.getcwd())                     # native judges never inherit repo cwd
         self.assertIn("claude-invoke-cwd-", probe["cwd"])                 # isolated empty cwd by construction
 
+    def test_explore_surface_is_bound_and_changed_artifact_requeues(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = self._run_dir(td)
+            case = {"id": "c", "split": "tune", "prompt": "p",
+                    "assertions": [{"name": "j", "type": "judge"}]}
+            _, tasks = sb.grade_case_variant(
+                case, "with_skill", "the candidate answer", run / "output.md", {},
+                run_base=run)
+            task = tasks[0]
+            row = sb.run_one_judge_task(
+                task, judge_model="m", claude_bin=str(self._stub_claude(td)),
+                explore=True)
+            self.assertEqual(row["judge_evidence_mode"], "explore")
+            self.assertRegex(row["judge_context_sha256"], r"^sha256:[0-9a-f]{64}$")
+            self.assertNotEqual(row["judge_input_sha256"], task["judge_input_sha256"])
+
+            accepted, pending = sb.grade_case_variant(
+                case, "with_skill", "the candidate answer", run / "output.md", {},
+                run_base=run, judge_results={row["judge_task_id"]: row})
+            self.assertEqual(pending, [])
+            self.assertTrue(accepted["qualitative_assertions"][0]["passed"])
+
+            (run / "notes.txt").write_text("changed evidence", encoding="utf-8")
+            stale, pending = sb.grade_case_variant(
+                case, "with_skill", "the candidate answer", run / "output.md", {},
+                run_base=run, judge_results={row["judge_task_id"]: row})
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(stale["qualitative_assertions"], [])
+
     def test_copy_drops_innocent_named_symlink_to_oracle(self):
         # KEYSTONE: copytree(symlinks=False) dereferences a link, copying the target's
         # CONTENT under the link's name — an oracle smuggled past the name denylist.
@@ -984,7 +1311,7 @@ class ToolUsingJudgeTests(unittest.TestCase):
         self.assertNotIn("data.txt", present)                          # link escaping run_base not followed
         self.assertIn("output.md", present)                            # real files still copied
 
-    def test_explore_skipped_when_run_base_missing(self):
+    def test_requested_explore_without_run_base_is_incomplete(self):
         # A task with no run_base must NOT resolve to '.' (repo root) and copy it.
         with tempfile.TemporaryDirectory() as td:
             stub = self._stub_claude(td)
@@ -993,12 +1320,11 @@ class ToolUsingJudgeTests(unittest.TestCase):
                     "assertion": {"type": "judge", "name": "j"}}   # NO run_base key
             before = self._tmp_explore_dirs()
             row = sb.run_one_judge_task(task, judge_model="m", claude_bin=str(stub), explore=True)
-            probe = json.loads((Path(td) / "probe.json").read_text(encoding="utf-8"))
             after = self._tmp_explore_dirs()
-        self.assertTrue(row["passed"])
-        self.assertIsNone(probe["add_dir"])          # no run dir -> no copy, no --add-dir over the repo
-        self.assertNotEqual(probe["cwd"], os.getcwd())
-        self.assertIn("claude-invoke-cwd-", probe["cwd"])
+        self.assertFalse(row["passed"])
+        self.assertFalse(row["judge_observation_complete"])
+        self.assertEqual(row["judge_evidence_mode"], "explore")
+        self.assertFalse((Path(td) / "probe.json").exists())  # judge never invoked
         self.assertEqual(after, before)
 
     def test_explore_is_inert_on_shell_judge_cmd(self):
@@ -1056,6 +1382,7 @@ class StrictJudgeVerdictTests(unittest.TestCase):
             [valid, valid],
             [{"passed": True}],
             [{**valid, "id": "other"}],
+            [{**valid, "judge_task_id": "1", "id": 1}],
             [{**valid, "passed": "false"}],
             [valid, "not-an-object"],
         ]
@@ -1132,8 +1459,19 @@ class JudgeVerdictPassedTests(unittest.TestCase):
                     "assertions": [{"name": "quality", "type": "judge",
                                     "prompt": "is it good?"}]}
             jid = sb.judge_task_id("c", "with_skill", 1, case["assertions"][0])
-            judged = {jid: {"passed": True, "score": None, "threshold": 1,
-                            "evidence": "looks good"}}
+            _, pending = sb.grade_case_variant(
+                case, "with_skill", "some candidate answer",
+                base / "output.md", {}, run_number=1, run_base=base)
+            judged = {jid: {
+                "passed": True, "score": None, "threshold": 1,
+                "evidence": "looks good", "returncode": 0,
+                "judge_observation_complete": True,
+                "availability": "complete",
+                "judge_input_sha256": pending[0]["judge_input_sha256"],
+                "judge_prompt_sha256": sb.judge_input_material(
+                    pending[0], "some candidate answer", run_base=base)[2],
+                "judge_evidence_mode": "text-only",
+            }}
             result, tasks = sb.grade_case_variant(
                 case, "with_skill", "some candidate answer",
                 base / "output.md", {}, run_number=1, run_base=base,
@@ -1177,6 +1515,15 @@ class JudgeTaskScorabilityTests(unittest.TestCase):
 
 
 class JudgeAlignmentTests(unittest.TestCase):
+    @staticmethod
+    def _judge(passed):
+        return {"passed": passed, "returncode": 0,
+                "judge_observation_complete": True,
+                "availability": "complete",
+                "judge_input_sha256": "sha256:" + "f" * 64,
+                "judge_prompt_sha256": "a" * 64,
+                "judge_evidence_mode": "text-only"}
+
     def test_cohen_kappa_chance_corrects(self):
         self.assertEqual(sb.cohen_kappa([True, False, True, False], [True, False, True, False]), 1.0)
         self.assertEqual(sb.cohen_kappa([True, True], [True, True]), 1.0)  # degenerate-agree
@@ -1184,7 +1531,7 @@ class JudgeAlignmentTests(unittest.TestCase):
 
     def test_alignment_confusion_and_warnings(self):
         human = {"a": {"passed": True}, "b": {"passed": False}, "c": {"passed": True}}
-        judge = {"a": {"passed": True}, "b": {"passed": True}, "c": {"passed": True}}   # b is a false positive
+        judge = {key: self._judge(True) for key in ("a", "b", "c")}   # b is a false positive
         rep = sb.judge_alignment_report(human, judge)
         self.assertEqual(rep["confusion"], {"tp": 2, "fp": 1, "fn": 0, "tn": 0})
         self.assertAlmostEqual(rep["agreement"], 2 / 3, places=4)   # report rounds to 4dp
@@ -1193,7 +1540,8 @@ class JudgeAlignmentTests(unittest.TestCase):
         self.assertTrue(any("unstable" in w for w in rep["warnings"]))  # n=3 < 50
 
     def test_no_overlap_is_flagged_not_crashed(self):
-        rep = sb.judge_alignment_report({"x": {"passed": True}}, {"y": {"passed": True}})
+        rep = sb.judge_alignment_report(
+            {"x": {"passed": True}}, {"y": self._judge(True)})
         self.assertEqual(rep["n"], 0)
         self.assertIsNone(rep["agreement"])
         self.assertTrue(rep["warnings"])
@@ -1202,7 +1550,7 @@ class JudgeAlignmentTests(unittest.TestCase):
         # the worst judge (inverts every label -> tp=0) must report F1=0.0, not None,
         # or a reviewer scanning for low F1 skips the null. Regression for the audit bug.
         human = {"a": {"passed": True}, "b": {"passed": False}}
-        judge = {"a": {"passed": False}, "b": {"passed": True}}
+        judge = {"a": self._judge(False), "b": self._judge(True)}
         rep = sb.judge_alignment_report(human, judge)
         self.assertEqual(rep["confusion"], {"tp": 0, "fp": 1, "fn": 1, "tn": 0})
         self.assertEqual(rep["f1"], 0.0)
@@ -1211,9 +1559,31 @@ class JudgeAlignmentTests(unittest.TestCase):
 
     def test_f1_none_only_when_no_positives_exist(self):
         # tp=fp=fn=0 (everything a true negative) -> F1 genuinely undefined
-        rep = sb.judge_alignment_report({"a": {"passed": False}}, {"a": {"passed": False}})
+        rep = sb.judge_alignment_report(
+            {"a": {"passed": False}}, {"a": self._judge(False)})
         self.assertIsNone(rep["f1"])
         self.assertEqual(rep["confusion"], {"tp": 0, "fp": 0, "fn": 0, "tn": 1})
+
+    def test_alignment_requires_exact_population_coverage(self):
+        human = {"a": {"passed": True}, "b": {"passed": False}}
+        report = sb.judge_alignment_report(human, {"a": self._judge(True)})
+        self.assertFalse(report["coverage_complete"])
+        self.assertEqual(report["availability"], "partial")
+        self.assertIsNone(report["agreement"])
+        self.assertIsNone(report["confusion"])
+        self.assertEqual(report["observed"]["agreement"], 1.0)
+        self.assertEqual(report["unmatched_human_ids"], ["b"])
+
+    def test_alignment_rejects_failed_or_unbound_judge_rows(self):
+        human = {"a": {"passed": True}, "b": {"passed": False}}
+        failed = {"passed": False, "returncode": 7,
+                  "judge_observation_complete": False}
+        report = sb.judge_alignment_report(
+            human, {"a": self._judge(True), "b": failed})
+        self.assertFalse(report["coverage_complete"])
+        self.assertIsNone(report["cohen_kappa"])
+        self.assertIn("b", report["incomplete_judge_ids"])
+        self.assertEqual(report["observed"]["n"], 1)
 
     def test_kappa_band_thresholds(self):
         self.assertEqual(sb.kappa_band(0.9), "almost-perfect")

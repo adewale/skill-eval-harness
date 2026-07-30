@@ -10,6 +10,7 @@ helpers and only spell out the fields the behavior under test cares about.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import stat
@@ -26,6 +27,30 @@ DEFAULT_CASE = {
     "prompt": "Do the task.",
     "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}],
 }
+
+
+def attach_jetty_task_contract(
+    record: dict[str, Any], *, marker: Any = None
+) -> dict[str, Any]:
+    """Attach a self-consistent causal contract to a synthetic Jetty record."""
+    import skill_benchmark as sb
+
+    harness = record["harness"]
+    contract = {
+        "schema_version": 1,
+        "harness": {
+            key: value
+            for key, value in harness.items()
+            if key != "jetty_task_contract_sha256"
+        },
+        "jetty_request": {"test_marker": marker},
+        "upload_plan": {"files": []},
+    }
+    digest = sb.canonical_json_sha256(contract)
+    harness["jetty_task_contract_sha256"] = digest
+    record["jetty_task_contract_sha256"] = digest
+    record["jetty_task_contract"] = contract
+    return record
 
 
 def load_example_module(name: str, relpath: str):
@@ -123,7 +148,12 @@ def report_fixture(case_rates: dict[str, tuple[float, float]], *, failures: list
         "without_skill_objective_pass_rate": statistics.mean([n for _, n in case_rates.values()]),
     }
     paired["absolute_delta"] = paired["with_skill_objective_pass_rate"] - paired["without_skill_objective_pass_rate"]
-    return {"generated_at": 1, "summary": {}, "paired_summary": paired, "case_flags": flags, "results": results}
+    return {
+        "generated_at": 1, "availability": "complete",
+        "answer_design": {"complete": True},
+        "summary": {}, "paired_summary": paired,
+        "case_flags": flags, "results": results,
+    }
 
 
 def make_eval_repo(
@@ -195,6 +225,109 @@ def write_run(
     if trace is not None:
         (base / "trace.jsonl").write_text("\n".join(json.dumps(r) for r in trace) + "\n", encoding="utf-8")
     return base
+
+
+def attest_answer_design(
+    manifest_path: Path, runs: Path, *, variants: list[str] | None = None,
+) -> dict[str, Any]:
+    """Attest hand-written run fixtures that are not produced by a runner.
+
+    Unit tests outside the answer-design contract use this after arranging a
+    run tree. The coordinate union is crossed with every requested arm, so a
+    missing arm remains an expected (and therefore partial) attempt.
+    """
+    import skill_benchmark as sb
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    requested = variants or manifest.get("variants", ["with_skill", "without_skill"])
+    identities: list[dict[str, Any]] = []
+    empty_fixture_hash = hashlib.sha256(b"").hexdigest()
+    # Mirror production discovery so dataset-backed and inline cases receive
+    # identical design attestations in tests.
+    for case in sb.iter_cases(manifest):
+        if case.get("kind") == "trigger":
+            continue
+        case_id = case["id"]
+        case_input_sha = sb.manifest_case_input_fingerprint(
+            manifest, manifest_path, case)
+        coordinates: dict[tuple[str | None, int], tuple[bool, bool]] = {}
+        for variant in requested:
+            for model, model_root in sb.discover_case_model_roots(
+                    runs, case_id, requested):
+                variant_root = model_root / variant
+                if not variant_root.exists():
+                    continue
+                for run_number, base in sb.discover_run_bases_under(variant_root):
+                    metadata = sb.read_metadata_base(base)
+                    row_model = metadata.get("model", model)
+                    old = coordinates.get((row_model, run_number), (False, False))
+                    coordinates[(row_model, run_number)] = (
+                        old[0] or model is not None,
+                        old[1] or base.name == f"run-{run_number}",
+                    )
+        for (model, run_number), (model_in_path, explicit_run_dir) in sorted(
+                coordinates.items(), key=lambda item: (str(item[0][0] or ""), item[0][1])):
+            repeated = sum(
+                1 for coordinate_model, _ in coordinates
+                if coordinate_model == model) > 1
+            for variant in requested:
+                task_sha = sb.canonical_json_sha256({
+                    "test_fixture": True, "case_id": case_id,
+                    "model": model, "variant": variant,
+                })
+                instruction_sha = sb.canonical_json_sha256({
+                    "instruction": sb.variant_instruction(
+                        variant, manifest, sb.repo_root_for_manifest(manifest_path))})
+                planned_skill_hash = sb.manifest_variant_skill_hash(
+                    manifest, manifest_path, variant)
+                prefix = f"{case_id}/{model}" if model_in_path else case_id
+                run_dir = (f"{prefix}/{variant}/run-{run_number}"
+                           if repeated or explicit_run_dir
+                           else f"{prefix}/{variant}")
+                identities.append({
+                    "case_id": case_id, "model": model, "variant": variant,
+                    "run_number": run_number, "run_dir": run_dir,
+                    "task_sha256": task_sha,
+                    "case_input_sha256": case_input_sha,
+                    "instruction_sha256": instruction_sha,
+                    "planned_skill_tree_hash": planned_skill_hash,
+                    "fixture_tree_hash": empty_fixture_hash,
+                })
+    identities.sort(key=lambda row: (
+        row["case_id"], str(row["model"] or ""), row["variant"], row["run_number"]))
+    payload = {
+        "schema_version": 2,
+        "population": "answer",
+        "eval_contract_sha256": sb.eval_contract_sha256(manifest, manifest_path),
+        "identities": identities,
+    }
+    design = {**payload, "design_sha256": sb.canonical_json_sha256(payload)}
+    sb.persist_answer_design_value(runs, design)
+    for identity in identities:
+        base = runs / identity["run_dir"]
+        if not base.exists():
+            continue
+        metadata_path = base / "metadata.json"
+        metrics_path = base / "metrics.json"
+        metadata = (json.loads(metrics_path.read_text(encoding="utf-8"))
+                    if metrics_path.is_file() else {})
+        if metadata_path.is_file():
+            metadata.update(json.loads(metadata_path.read_text(encoding="utf-8")))
+        metadata.update({
+            "population": "answer", "case_id": identity["case_id"],
+            "model": identity["model"], "variant": identity["variant"],
+            "run_number": identity["run_number"],
+            "answer_design_sha256": design["design_sha256"],
+            "answer_task_sha256": identity["task_sha256"],
+            "answer_instruction_sha256": identity["instruction_sha256"],
+            "fixture_tree_hash": identity["fixture_tree_hash"],
+        })
+        if identity["planned_skill_tree_hash"] is None:
+            metadata.pop("skill_tree_hash", None)
+        else:
+            metadata["skill_tree_hash"] = identity["planned_skill_tree_hash"]
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    return design
 
 
 def trace_event(type_: str, *, index: int = 1, status: str = "completed", **fields: Any) -> dict[str, Any]:

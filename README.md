@@ -290,11 +290,20 @@ Objective assertion types:
 | `skill_invoked` | Trace/process check that the runner loaded the skill, or did not, as expected. |
 | `command_ran` / `command_not_ran` | Trace/process checks over normalized command events. |
 | `command_order` | Trace/process check that commands appeared in a required order. |
-| `tool_call` | A tool call matching `tool`/`pattern` occurred (with `min_count`/`max_count` bounds), or an ordered `order` list of calls. BFCL-style set relations over completed-call **tool names** (exact, case-insensitive — *not* substring): `expected_no_call` (the named tool, or any name matching `pattern`, must *not* have been called), `required_calls` (an order-independent subset of tool names that must all appear, extras allowed), `call_set` (an exact multiset of tool names — same names and multiplicities, no unexpected named calls). Use `pattern`/`order`/`command_ran` for regex or command-text matching. Matches completed call inputs, never outputs. |
+| `tool_call` | A tool call matching `tool`/`pattern` occurred (with `min_count`/`max_count` bounds), or an ordered `order` list of calls. BFCL-style set relations over completed-call **tool names** (exact, case-insensitive — *not* substring): `expected_no_call` (the named tool, or any name matching `pattern`, must never have been observed—even as started, failed, or in progress), `required_calls` (an order-independent subset of completed tool names that must all appear, extras allowed), `call_set` (an exact multiset of completed tool names—same names and multiplicities, no unexpected named calls). Use `pattern`/`order`/`command_ran` for regex or command-text matching. Positive selectors match completed call inputs, never outputs. |
 | `tool_count_le` / `no_repeated_command_loop` | Trace/process budgets for tool use and thrashing. |
 | `total_tokens_le` / `elapsed_seconds_le` / `command_count_le` | Efficiency checks over `metrics.json`, `metadata.json`, or normalized events. |
 
-Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict` on `grade`/`benchmark` promotes soft to gate. An `atLeast` floor on a scored assertion decides its pass. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for text/process/efficiency), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`).
+Assertion objects are closed contracts, including nested `graded_dimensions` and
+`dynamic_rubric` objects: unknown fields and fields that do not apply to the selected assertion
+type are validation errors, so a misspelled severity or path cannot silently change the grader.
+A `golden_output` reference must already be a regular file. A local script oracle must live in a
+dedicated subdirectory (for example `oracles/check.py`); the harness binds that oracle tree into
+the eval-contract digest and rejects symlinks. Changing an imported helper or data file therefore
+invalidates stale prepared runs, while generated files beside the manifest cannot make the
+contract self-referential.
+
+Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict` on `grade`/`benchmark` promotes soft to gate. An `atLeast` floor on a plain scored judge requires a normalized 0–1 score and decides its pass; on `graded_dimensions` it tightens the normalized form of the dimension threshold. Missing score evidence remains unavailable rather than becoming a failure. Dynamic and per-step judges use `minimum_criteria` and `min_met_fraction` respectively instead of `atLeast`. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for text/process/efficiency), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`).
 
 Use `script` when a keyword check is too weak for the property you care about. The command sees the candidate run directory, so it can inspect `output.md`, generated files under `outputs/`, or metadata. Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `benchmark`, `aggregate`, or `export-anthropic`:
 
@@ -362,13 +371,16 @@ runs/<case_id>/<variant>/run-1/events.json       # normalized events used by pro
 runs/<case_id>/<variant>/run-1/metrics.json      # tokens, commands, tool calls, elapsed time, retries
 runs/<case_id>/<variant>/run-1/environment.json  # runner/model/sandbox details where available
 runs/<case_id>/<variant>/run-1/artifact-commit.json # required-file SHA-256 inventory, written last by current runners
+runs/answer-design.json                          # exact expected answer experiment and eval-contract digest
 ```
 
 Current answer and Jetty writers record independent process, provider-response, trace,
 and artifact-set evidence. Tool/command/file/retry/skill measurements are available only
 when the first three channels are complete; readers derive artifact completeness by
 verifying `artifact-commit.json`. Legacy directories without a marker remain readable but
-cannot acquire committed-artifact provenance.
+cannot acquire committed-artifact provenance. Current runners also attest every run to
+`answer-design.json`; reports with missing, extra, duplicated, or stale task identities remain
+partial and expose any surviving calculations only under explicitly labelled observed fields.
 
 `metadata.json` is optional, but include what your runner can capture:
 
@@ -409,10 +421,10 @@ Each declared ablation is written to `ablated/<id>/` as a complete altered skill
 
 The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), the autonomous-trigger runners (`skill-trigger-matrix --ablation <id>` with any registered adapter, or `run_pi_trigger_eval.py --ablation <id>`) trigger-test a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. A discovery ablation graduates from raw measurement to a causal evidence class through `skill-benchmark trigger-compare`, which pairs the baseline and `--ablation` matrix reports of the same revision under the same provenance/coverage/significance gate the answer path uses. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the autonomous-trigger runners. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision **and** the replicated regression clears a significance test (a two-sided paired sign-flip test run **per (case, model)** over exact repetition-level deltas; a regression is significant iff at least one confirmed cohort clears p≤0.05). Because the exact test discretizes, a cohort needs **≥6 matched pairs** to ever reach significance (`2/2^6=0.03125`; five pairs floor at `0.0625`); fewer pairs are reported `INDETERMINATE`, never confirmed. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
 
-**Evidence asymmetry (discovery vs answer).** The two paths do not yet have equal evidentiary strength:
+**Evidence paths (discovery vs answer).** A single runner report and a paired comparison have deliberately different evidentiary strength:
 
 - **Answer-population** ablations get *confirmed* causal evidence: a provenance-gated, paired with_skill-vs-ablation comparison where a confirmation requires verified provenance and a same-revision canonical hash on both arms.
-- **Discovery** ablations run through `run_pi_trigger_eval.py --ablation`, which currently emits a **raw autonomous-trigger measurement for a single arm** (`evidence_class: raw_autonomous_trigger_measurement`), not a paired, provenance-verified baseline-vs-ablation comparison. Each result records a `skill_tree_hash` (baseline = canonical tree; ablation = parent tree) so a future pairing can verify both arms ran the same revision, but until that pairing exists, **read a trigger pass-rate as a measurement, not a confirmed ablation effect.**
+- **Discovery** runners emit a **raw autonomous-trigger measurement for one arm** (`evidence_class: raw_autonomous_trigger_measurement`). Each report records its declared agent/model/query design and every `(query_id, run_number)` repetition; `skill_tree_hash` names the bytes actually mounted (canonical in the baseline arm, edited in the ablation arm), while ablation provenance records the canonical parent. `skill-benchmark trigger-compare` validates exact cardinality, rejects duplicates and missing cells, verifies same-revision provenance, and only then computes a causal verdict. Until two reports pass that gate, **read a trigger pass-rate as a measurement, not a confirmed ablation effect.**
 
 ## Commands
 
@@ -488,7 +500,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 |---|---|
 | `skill-trigger-matrix` | Autonomous trigger rate per (agent × model), split by should-fire / should-not-fire. |
 | `skill-pi-trigger-eval` | The deeper Pi-specific trigger tool: discovery-population ablation arms, traces, cost. |
-| `skill-benchmark trigger-compare` | Pair a baseline trigger-matrix report with an `--ablation` report of the same skill revision: agent/model cells collapsed to authored-query pass-rate deltas, direction-aware sign-flip significance, and a causal-confirmation evidence class — the trigger population's version of the answer path's ablation confirmation gate. |
+| `skill-benchmark trigger-compare` | Pair baseline and `--ablation` trigger reports of the same skill revision: declared-cell/repetition completeness, duplicate rejection, agent/model cells collapsed by stable authored-query ID, direction-aware sign-flip significance, and a causal-confirmation evidence class. |
 
 ## Compatibility notes
 
@@ -506,6 +518,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, validation commands, a
 pip install -e ".[test]"
 python3 -m py_compile *.py examples/adewale-workspace/*.py
 ty check
+python3 scripts/check_ty_regressions.py
 python3 -m unittest discover tests -v
 ```
 
@@ -558,6 +571,7 @@ skill-eval-harness/
 pip install -e ".[test]"
 python3 -m py_compile *.py examples/adewale-workspace/*.py
 ty check
+python3 scripts/check_ty_regressions.py
 python3 -m unittest discover tests -v
 ```
 

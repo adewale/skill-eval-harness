@@ -39,8 +39,9 @@ Five adapters ship:
 To add another agent: subclass AgentAdapter, implement mount() (copy the
 canonical tree where that agent discovers skills) and invoke() (run the agent
 headless on the raw query, return its JSON event stream), then register it in
-ADAPTERS and agent_capabilities.AGENT_CAPABILITIES. detect() only needs
-overriding when load evidence is not a file path in the stream.
+ADAPTERS, agent_capabilities.AGENT_CAPABILITIES, and the explicit trace-dialect
+registry (choose the generic dialect deliberately when appropriate). detect()
+only needs overriding when load evidence is not a file path in the stream.
 
 Every number this emits is a RAW autonomous-trigger measurement (the same
 evidence class as run_pi_trigger_eval.py) — a rate to steer description edits,
@@ -49,6 +50,8 @@ not a provenance-verified causal comparison.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
 import json
 import os
 import re
@@ -81,7 +84,7 @@ from skill_benchmark import (
     PiStream,
     build_canonical_skill_tree,
     build_vibe_cli_argv,
-    canonical_skill_tree_hash,
+    canonical_json_sha256,
     codex_env_for_home,
     detect_trigger_detection,
     detect_trigger_records,
@@ -90,10 +93,18 @@ from skill_benchmark import (
     iter_json_objects,
     materialize_trigger_ablation,
     mount_skill_tree,
+    normalize_trace_records,
+    parse_trace_jsonl_text,
     repo_root_for_manifest,
     safe_trace_label,
+    skill_tree_hash,
     stream_usage_and_cost,
+    strict_json_loads,
+    trace_dialect_for,
+    trigger_harness_identity,
+    trigger_manifest_identity,
     vibe_env_for_home,
+    vibe_final_answer,
     vibe_skill_tool_evidence,
     write_json,
     write_trace_artifacts,
@@ -106,6 +117,9 @@ from trigger_contracts import (
     TriggerEvidenceKind,
     TriggerExpectation,
     TriggerObservation,
+    TriggerRepetitionIdentity,
+    validated_trigger_model,
+    validated_trigger_protocol_limits,
 )
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
@@ -152,6 +166,43 @@ def validate_invoke_result(agent: str, result: InvocationOutcome | dict[str, Any
     if isinstance(result, InvocationOutcome):
         return result
     return InvocationOutcome.from_legacy_dict(agent, result)
+
+
+def json_stream_protocol_error(stdout: str, agent: str) -> str | None:
+    """Reject malformed/empty event streams as incomplete observations."""
+    records, errors = parse_trace_jsonl_text(stdout)
+    if errors:
+        return f"{agent} JSON stream is malformed: {errors[0]}"
+    if not records:
+        return f"{agent} JSON stream contains no event objects"
+    return None
+
+
+def codex_stream_protocol_error(stdout: str) -> str | None:
+    """Require Codex's semantic turn terminator, not merely parseable JSON."""
+    error = json_stream_protocol_error(stdout, "codex")
+    if error is not None:
+        return error
+    records, _ = parse_trace_jsonl_text(stdout)
+    terminals = [i for i, record in enumerate(records)
+                 if str(record.get("type") or "").casefold() == "turn.completed"]
+    if terminals != [len(records) - 1]:
+        return "Codex JSON stream must contain exactly one final turn.completed event"
+    return None
+
+
+def vibe_stream_protocol_error(stdout: str) -> str | None:
+    """Require a final assistant answer so empty event objects cannot certify absence."""
+    error = json_stream_protocol_error(stdout, "vibe")
+    if error is not None:
+        return error
+    records, _ = parse_trace_jsonl_text(stdout)
+    terminal_answer = (records[-1].get("role") == "assistant"
+                       and isinstance(records[-1].get("content"), str)
+                       and bool(records[-1]["content"].strip()))
+    if not terminal_answer:
+        return "Vibe JSON stream must end with one non-empty assistant response"
+    return None
 
 
 def seed_claude_config_dir(config_dir: Path, source_config: Path | None = None) -> bool:
@@ -201,7 +252,7 @@ def _text_secret_values(text: str) -> list[str]:
     if len(text.strip()) >= 8:
         secrets.append(text)
     try:
-        secrets.extend(_json_secret_values(json.loads(text)))
+        secrets.extend(_json_secret_values(strict_json_loads(text)))
     except json.JSONDecodeError:
         secrets.extend(m.group(1) for m in re.finditer(r"""["']([^"']{8,})["']""", text))
         for line in text.splitlines():
@@ -292,13 +343,30 @@ class AgentAdapter:
 
     def detect(self, invocation: InvocationOutcome, skill_names: list[str], copied: list[Path]) -> TriggerDetection:
         if isinstance(invocation.provider_payload, PiStream):
-            return detect_trigger_records(invocation.provider_payload.records, copied)
-        return detect_trigger_detection(invocation.stdout, copied)
+            return detect_trigger_records(
+                invocation.provider_payload.records, copied, source=self.name,
+                pi_stream=invocation.provider_payload)
+        return detect_trigger_detection(invocation.stdout, copied, source=self.name)
 
     # The shared mount and subprocess conventions (skill_benchmark owns them;
     # the Pi runner uses the very same functions, so adapters cannot drift).
     _mount_tree = staticmethod(mount_skill_tree)
     _run_argv = staticmethod(invoke_argv_with_timeout)
+
+    def protocol_parameters(self) -> dict[str, Any]:
+        """Behavior-affecting adapter inputs, excluding prompt and treatment."""
+        try:
+            source = inspect.getsource(type(self))
+        except (OSError, TypeError):
+            source = f"{type(self).__module__}.{type(self).__qualname__}"
+        return {
+            "adapter": f"{type(self).__module__}.{type(self).__qualname__}",
+            "agent": self.name,
+            "implementation_sha256": "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "producer_sha256": "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "trace_dialect": self.name,
+            "required_observations": {},
+        }
 
 
 class ClaudeAdapter(AgentAdapter):
@@ -315,6 +383,16 @@ class ClaudeAdapter(AgentAdapter):
     def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
         # Project skills: Claude Code discovers <cwd>/.claude/skills on its own.
         return self._mount_tree(tree_dir, workspace / ".claude" / "skills")
+
+    def protocol_parameters(self) -> dict[str, Any]:
+        return {
+            **super().protocol_parameters(),
+            "command": executable_identity(self.claude_bin),
+            "max_turns": self.max_turns,
+            "allowed_tools": ["Skill", "Read", "Glob", "Grep"],
+            "isolation_policy": "isolated config when portable auth exists; otherwise normal config",
+            "required_observations": {"config_isolated": True},
+        }
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         # Use a fresh config dir when auth is portable, so personal config does
@@ -348,6 +426,23 @@ class ClaudeAdapter(AgentAdapter):
         if (result.state is InvocationState.PROCESS_FAILED
                 and self._result_subtype(result.stdout) == "error_max_turns"):
             result = result.as_agent_window_complete()
+        if result.observation_complete:
+            error = json_stream_protocol_error(result.stdout, self.name)
+            records, _ = parse_trace_jsonl_text(result.stdout)
+            terminal = next((record for record in reversed(records)
+                             if record.get("type") == "result"), None)
+            if error is None and terminal is None:
+                error = "Claude JSON stream has no terminal result event"
+            if error is None:
+                _, metrics = normalize_trace_records(records, source="claude")
+                protocol_errors = metrics.get("trace_protocol_errors")
+                if isinstance(protocol_errors, list) and protocol_errors:
+                    error = f"Claude JSON stream protocol error: {protocol_errors[0]}"
+            if (error is None and isinstance(terminal, dict)
+                    and terminal.get("is_error") is True
+                    and terminal.get("subtype") != "error_max_turns"):
+                error = "Claude terminal result reports an error"
+            result = result.with_provider_error(error)
         return result
 
     @staticmethod
@@ -396,6 +491,14 @@ class CodexAdapter(AgentAdapter):
         # invoke() grants the skills directory only via --add-dir.
         return self._mount_tree(tree_dir, self._codex_home(workspace) / "skills")
 
+    def protocol_parameters(self) -> dict[str, Any]:
+        return {
+            **super().protocol_parameters(),
+            "command": executable_identity(self.codex_cmd),
+            "isolation_policy": "external ephemeral CODEX_HOME plus skills-only add-dir",
+            "required_observations": {"codex_home_outside_workdir": True},
+        }
+
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         argv = shlex.split(self.codex_cmd)
         codex_home = self._codex_home(workspace)
@@ -412,6 +515,9 @@ class CodexAdapter(AgentAdapter):
             )
         finally:
             shutil.rmtree(codex_home, ignore_errors=True)
+        if result.observation_complete:
+            result = result.with_provider_error(
+                codex_stream_protocol_error(result.stdout))
         return result.with_metadata(
             {k: v for k, v in meta.items() if k != "codex_home"},
             codex_home_outside_workdir=True,
@@ -431,13 +537,23 @@ class PiAdapter(AgentAdapter):
         seed_config_dir(config_dir)   # auth/settings, never the user's skills
         return self._mount_tree(tree_dir, config_dir / "skills")
 
+    def protocol_parameters(self) -> dict[str, Any]:
+        return {
+            **super().protocol_parameters(),
+            "command": executable_identity("pi"),
+            "tools": ["read", "grep", "find", "ls"],
+            "thinking": "minimal",
+            "isolation_policy": "isolated PI_CODING_AGENT_DIR seeded without user skills",
+            "required_observations": {"config_isolated": True},
+        }
+
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(workspace / ".pi-config")
         return pi_invocation_outcome(validate_invoke_result(
             self.name,
             self._run_argv(pi_argv(query, model), cwd=workspace, env=env, timeout=timeout),
-        ))
+        )).with_metadata(config_isolated=True)
 
 
 class VibeAdapter(AgentAdapter):
@@ -454,6 +570,18 @@ class VibeAdapter(AgentAdapter):
 
     def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
         return self._mount_tree(tree_dir, workspace / ".agents" / "skills")
+
+    def protocol_parameters(self) -> dict[str, Any]:
+        return {
+            **super().protocol_parameters(),
+            "command": executable_identity(self.vibe_cmd),
+            "max_turns": self.max_turns,
+            "tools": list(VIBE_READ_ONLY_TOOLS),
+            "isolation_policy": "temporary VIBE_HOME outside model workdir",
+            "required_observations": {
+                "config_isolated": True, "vibe_home_outside_workdir": True,
+            },
+        }
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         with tempfile.TemporaryDirectory(prefix=f"{workspace.name}-vibe-home-") as vibe_home:
@@ -474,6 +602,9 @@ class VibeAdapter(AgentAdapter):
                 self.name,
                 self._run_argv(argv, input_text="", cwd=workspace, env=env, timeout=timeout),
             )
+            if result.observation_complete:
+                result = result.with_provider_error(
+                    vibe_stream_protocol_error(result.stdout))
         return result.with_metadata(
             config_isolated=True,
             vibe_env_file_copied=bool(env_meta.get("vibe_env_file_copied", False)),
@@ -511,8 +642,8 @@ class StubAdapter(AgentAdapter):
             if len(self._content_words(query) & self._content_words(description)) >= 2:
                 # Same stream shape the real agents emit, so the shared
                 # detector — not stub-private logic — decides "triggered".
-                lines.append(json.dumps({"type": "assistant", "message": {"content": [
-                    {"type": "tool_use", "name": "Read", "input": {"file_path": str(skill_md)}}]}}))
+                lines.append(json.dumps({"type": "file_read", "path": str(skill_md),
+                                         "status": "completed"}))
         lines.append(json.dumps({"type": "result", "subtype": "success"}))
         return InvocationOutcome.from_process(
             stdout="\n".join(lines) + "\n", stderr="", returncode=0,
@@ -521,6 +652,80 @@ class StubAdapter(AgentAdapter):
 
 
 ADAPTERS: dict[str, type[AgentAdapter]] = {"claude": ClaudeAdapter, "codex": CodexAdapter, "pi": PiAdapter, "vibe": VibeAdapter, "stub": StubAdapter}
+
+
+def executable_identity(command: str) -> dict[str, Any]:
+    """Command declaration plus content identity of its resolved executable."""
+    try:
+        argv = shlex.split(command)
+        executable = argv[0]
+    except (ValueError, IndexError):
+        argv = [command] if command else []
+        executable = command
+    resolved = shutil.which(executable)
+    payload: dict[str, Any] = {"spec": command, "resolved": resolved}
+    if resolved:
+        path = Path(resolved)
+        if path.is_file():
+            digest = hashlib.sha256()
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            payload["executable_sha256"] = "sha256:" + digest.hexdigest()
+    argument_files: dict[str, str] = {}
+    for argument in argv[1:]:
+        candidate = Path(argument).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        if not candidate.is_file():
+            continue
+        resolved_argument = candidate.resolve()
+        argument_files[str(resolved_argument)] = (
+            "sha256:" + hashlib.sha256(resolved_argument.read_bytes()).hexdigest())
+    if argument_files:
+        payload["argument_files"] = argument_files
+    interpreter = Path(executable).name.casefold()
+    if (interpreter.startswith("python") or interpreter in {"bash", "sh", "zsh", "node", "bun"}):
+        if "-m" in argv:
+            raise ValueError(
+                "module-based wrapper commands are not fingerprintable; use a script path")
+        inline = any(flag in argv for flag in ("-c", "-e", "--eval"))
+        if len(argv) > 1 and not inline and not argument_files:
+            raise ValueError(
+                "interpreter wrapper command must name an existing script file")
+    return payload
+
+
+def trigger_protocol(
+    adapters: list[AgentAdapter], models: list[str | None] | None, *,
+    runs_per_query: int, timeout: int, workers: int,
+) -> dict[str, Any]:
+    timeout, runs_per_query, workers = validated_trigger_protocol_limits(
+        timeout_seconds=timeout, runs_per_query=runs_per_query, workers=workers)
+    effective_models: dict[AgentAdapter, list[str | None]] = {}
+    for adapter in adapters:
+        candidates = models if models is not None else adapter.default_models
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError(
+                f"models for adapter {adapter.name!r} must be a non-empty list")
+        effective_models[adapter] = [
+            validated_trigger_model(
+                model, f"models[{index}] for adapter {adapter.name!r}")
+            for index, model in enumerate(candidates)
+        ]
+    return {
+        "schema_version": 1,
+        "producer": "skill-trigger-matrix",
+        "harness_identity": trigger_harness_identity(),
+        "timeout_seconds": timeout,
+        "runs_per_query": runs_per_query,
+        "workers": workers,
+        "adapters": [
+            {**adapter.protocol_parameters(),
+             "models": effective_models[adapter]}
+            for adapter in adapters
+        ],
+    }
 
 
 def adapter_instance(name: str, *, claude_bin: str = "claude", codex_cmd: str | None = None, vibe_cmd: str | None = None, max_turns: int = 6) -> AgentAdapter:
@@ -545,7 +750,7 @@ def trigger_tree_for_manifest(repo_root: Path, manifest: dict[str, Any], work_di
     ablation, so Claude/Pi/Codex all measure the same altered bytes."""
     if not ablation:
         tree_dir = Path(build_canonical_skill_tree(repo_root, manifest, work_dir / "canonical"))
-        tree_hash = canonical_skill_tree_hash(repo_root, manifest)
+        tree_hash = skill_tree_hash(tree_dir)
         return tree_dir, tree_hash, {"mode": "baseline", "skill_tree_hash": tree_hash}
 
     try:
@@ -553,11 +758,12 @@ def trigger_tree_for_manifest(repo_root: Path, manifest: dict[str, Any], work_di
     except AblationError as exc:
         raise SystemExit(str(exc)) from exc
     prov = Provenance.from_dict(provenance)
-    return Path(provenance["dir"]), prov.identity.canonical, prov.as_dict()
+    return Path(provenance["dir"]), prov.identity.edited, prov.as_dict()
 
 
 def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger: bool,
-                       exc: BaseException, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+                       exc: BaseException, metadata: dict[str, Any] | None = None,
+                       identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
     return TriggerObservation.harness_failure(
         agent=agent,
         model=model,
@@ -565,17 +771,28 @@ def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger
         expectation=TriggerExpectation.from_bool(should_trigger),
         error=exc,
         metadata=metadata,
+        identity=identity,
     ).as_row()
 
 
 def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_trigger: bool,
                    model: str | None, timeout: int, trace_dir: Path | None = None,
-                   metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+                   metadata: dict[str, Any] | None = None,
+                   identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
     """One typed observation of one query in one (agent, model) cell."""
     secrets: list[str] = []
     with tempfile.TemporaryDirectory(prefix=f"trigger-{adapter.name}-") as td:
         workspace = Path(td)
         copied = adapter.mount(tree_dir, workspace)
+        mounted_roots = [path.parent if path.name == "SKILL.md" else path for path in copied]
+        mounted_parents = {root.parent.resolve() for root in mounted_roots}
+        if not mounted_roots or len(mounted_parents) != 1:
+            raise ValueError(f"{adapter.name} mount did not expose one complete skill tree")
+        mounted_hash = skill_tree_hash(next(iter(mounted_parents)))
+        expected_hash = str((metadata or {}).get("skill_tree_hash") or "")
+        if mounted_hash != expected_hash:
+            raise ValueError(
+                f"{adapter.name} mounted skill tree hash {mounted_hash} does not match {expected_hash}")
         names = mounted_skill_names(copied)
         invocation = validate_invoke_result(adapter.name, adapter.invoke(query, model, workspace, timeout))
         secrets = workspace_secret_values(workspace) + ambient_secret_values()
@@ -618,6 +835,10 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
         usage, cost = {"source": "missing"}, {"source": "missing"}
 
     observation_metadata = redact_sensitive_value(dict(metadata or {}), secrets)
+    observation_metadata["protocol_observation"] = {
+        key: value for key, value in dict(redacted_invocation.metadata).items()
+        if key.endswith(("_isolated", "_outside_workdir", "_copied", "_warning"))
+    }
     if telemetry_error:
         observation_metadata["telemetry_error"] = telemetry_error
     if trace_dir is not None:
@@ -632,6 +853,7 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
         usage=usage,
         cost=cost,
         metadata=observation_metadata,
+        identity=identity,
     )
     row = observation.as_row()
 
@@ -647,6 +869,7 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
             "evidence": row["evidence"],
             "usage_normalized": usage,
             "cost_normalized": cost,
+            **(identity.as_dict() if identity is not None else {}),
             **dict(redacted_invocation.metadata),
             **observation_metadata,
         }
@@ -665,15 +888,15 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
                     "elapsed_ms": row["elapsed_ms"],
                     "returncode": row["returncode"],
                     "timed_out": row["timed_out"],
-                    "skill_invoked": row["triggered"],
-                    "skill_invocation_evidence": row["evidence"],
                 },
                 environment={"runner": adapter.name, "model": model, "trigger_eval": True},
                 write_metadata=True,
                 pi_stream=artifact_pi_stream,
             )
         except Exception as exc:
-            row["trace_error"] = f"{type(exc).__name__}: {exc}"
+            trace_error = f"{type(exc).__name__}: {exc}"
+            row["trace_error"] = trace_error
+            row["observation_metadata"]["trace_error"] = trace_error
     return row
 
 
@@ -686,28 +909,52 @@ def summarize_matrix(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cells.setdefault((r["agent"], r["model"]), []).append(r)
     matrix = []
     for (agent, model), rows in sorted(cells.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
-        queries: dict[tuple[str, bool], list[dict[str, Any]]] = {}
+        queries: dict[tuple[str, str, bool], list[dict[str, Any]]] = {}
         for r in rows:
-            queries.setdefault((r["query"], r["should_trigger"]), []).append(r)
+            queries.setdefault(
+                (r["query_id"], r["query"], r["should_trigger"]), []).append(r)
         query_rows = []
-        for (query, should), runs in queries.items():
-            triggered = sum(1 for r in runs if r["triggered"])
+        for (query_id, query, should), runs in queries.items():
+            complete = [r for r in runs if r["observation_complete"]]
+            triggered = sum(1 for r in complete if r["triggered"])
+            passed_runs = sum(1 for r in complete if r["pass"])
+            incomplete = len(runs) - len(complete)
+            observed_trigger_rate = triggered / len(complete) if complete else None
+            observed_pass_rate = passed_runs / len(complete) if complete else None
             query_rows.append({
-                "query": query, "should_trigger": should, "runs": len(runs),
-                "triggered_runs": triggered, "trigger_rate": triggered / len(runs),
-                "passed_runs": sum(1 for r in runs if r["pass"]),
+                "query_id": query_id, "query": query, "should_trigger": should,
+                "runs": len(runs), "complete": len(complete),
+                "incomplete": incomplete,
+                "triggered_runs": triggered,
+                "trigger_rate": None if incomplete else observed_trigger_rate,
+                "observed_trigger_rate": observed_trigger_rate,
+                "passed_runs": passed_runs,
+                "pass_rate": None if incomplete else observed_pass_rate,
+                "observed_pass_rate": observed_pass_rate,
             })
 
         def polarity(result_rows: list[dict[str, Any]], should: bool) -> dict[str, Any]:
             pol = [r for r in result_rows if r["should_trigger"] is should]
-            return {"total": len(pol), "passed": sum(1 for r in pol if r["pass"]),
-                    "pass_rate": (sum(1 for r in pol if r["pass"]) / len(pol)) if pol else None}
-        passed = sum(1 for r in rows if r["pass"])
+            complete = [r for r in pol if r["observation_complete"]]
+            passed = sum(1 for r in complete if r["pass"])
+            incomplete = len(pol) - len(complete)
+            observed_pass_rate = (passed / len(complete)) if complete else None
+            return {"total": len(pol), "complete": len(complete),
+                    "incomplete": incomplete, "passed": passed,
+                    "pass_rate": None if incomplete else observed_pass_rate,
+                    "observed_pass_rate": observed_pass_rate}
+        complete_rows = [r for r in rows if r["observation_complete"]]
+        passed = sum(1 for r in complete_rows if r["pass"])
+        incomplete = len(rows) - len(complete_rows)
+        observed_pass_rate = passed / len(complete_rows) if complete_rows else None
         matrix.append({
             "agent": agent, "model": model,
-            "summary": {"total": len(rows), "passed": passed, "pass_rate": passed / len(rows),
+            "summary": {"total": len(rows), "complete": len(complete_rows),
+                        "passed": passed,
+                        "pass_rate": None if incomplete else observed_pass_rate,
+                        "observed_pass_rate": observed_pass_rate,
                         "should_trigger": polarity(rows, True), "should_not_trigger": polarity(rows, False),
-                        "incomplete_observations": sum(1 for r in rows if not r["observation_complete"])},
+                        "incomplete_observations": incomplete},
             "queries": query_rows,
         })
     return matrix
@@ -721,18 +968,33 @@ def print_matrix(matrix: list[dict[str, Any]]) -> None:
         s = cell["summary"]
 
         def frac(block: dict[str, Any]) -> str:
-            return f"{block['passed']}/{block['total']}" if block["total"] else "-"
+            return f"{block['passed']}/{block['complete']}" if block["complete"] else "-"
         print(f"{cell['agent']:<8} {cell['model'] or 'default'!s:<10} "
               f"{frac(s['should_trigger']):>12} {frac(s['should_not_trigger']):>16} "
-              f"{str(s['passed']) + '/' + str(s['total']):>9}")
+              f"{str(s['passed']) + '/' + str(s['complete']):>9}")
 
 
 def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str],
-               models: list[str] | None, runs_per_query: int, timeout: int, workers: int,
+               models: list[str | None] | None, runs_per_query: int, timeout: int, workers: int,
                claude_bin: str = "claude", codex_cmd: str | None = None,
                vibe_cmd: str | None = None, max_turns: int = 6,
                trace_runs: Path | None = None, ablation: str | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
+    rows = validate_trigger_rows(rows, "trigger matrix rows")
+    if not rows:
+        raise SystemExit("no trigger queries")
+    if not agents:
+        raise SystemExit("select at least one --agent")
+    if models is not None and not models:
+        raise SystemExit("select at least one --model or omit --model for adapter defaults")
+    try:
+        timeout, runs_per_query, workers = validated_trigger_protocol_limits(
+            timeout_seconds=timeout,
+            runs_per_query=runs_per_query,
+            workers=workers,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     repo_root = repo_root_for_manifest(manifest_path)
     reject_duplicates(agents, "--agent")
     if models is not None:
@@ -743,6 +1005,10 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         if name not in ADAPTERS:
             raise SystemExit(f"unknown agent {name!r}; known: {sorted(ADAPTERS)} (subclass AgentAdapter to add one)")
         cap = require_agent_capabilities(name)
+        try:
+            trace_dialect_for(name)
+        except ValueError as exc:
+            raise SystemExit(f"agent {name!r} has no registered trace dialect") from exc
         if not cap.autonomous_trigger:
             raise SystemExit(f"agent {name!r} is not registered for autonomous trigger measurement")
         if ablation and not cap.trigger_ablation:
@@ -756,17 +1022,27 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         # One skill tree for the whole matrix: every cell mounts the exact same
         # bytes, and the recorded hash/provenance proves which revision was measured.
         tree_dir, tree_hash, provenance = trigger_tree_for_manifest(repo_root, manifest, Path(td), ablation)
+        protocol = trigger_protocol(
+            adapters, models, runs_per_query=runs_per_query,
+            timeout=timeout, workers=workers)
+        protocol_sha256 = canonical_json_sha256(protocol)
+        manifest_identity = trigger_manifest_identity(manifest)
         trace_root = None
         if trace_runs is not None:
             trace_runs.mkdir(parents=True, exist_ok=True)
             trace_root = Path(tempfile.mkdtemp(prefix="matrix-", dir=trace_runs))
-        futures, results = [], []
-        future_context: dict[Any, tuple[str, str | None, str, bool, dict[str, Any]]] = {}
+        futures, results, design = [], [], []
+        future_context: dict[Any, tuple[str, str | None, str, bool, dict[str, Any], TriggerRepetitionIdentity]] = {}
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for adapter in adapters:
                 for model in (models if models is not None else adapter.default_models):
                     for row_index, row in enumerate(rows, 1):
                         query = str(row["query"])
+                        design.append({
+                            "agent": adapter.name, "model": model,
+                            "query_id": row["query_id"], "query": query,
+                            "should_trigger": row["should_trigger"],
+                        })
                         for run_number in range(1, runs_per_query + 1):
                             trace_dir = None
                             if trace_root is not None:
@@ -779,21 +1055,33 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
                                 "measurement": EvidenceClass.RAW_MEASUREMENT.value,
                                 "ablation": ablation,
                                 "skill_tree_hash": tree_hash,
+                                "protocol_sha256": protocol_sha256,
+                                "protocol_observation": {},
                             }
                             should_trigger = row["should_trigger"]
+                            identity = TriggerRepetitionIdentity(row["query_id"], run_number)
                             future = ex.submit(run_cell_query, adapter, tree_dir,
                                                query, should_trigger,
-                                               model, timeout, trace_dir, metadata)
+                                               model, timeout, trace_dir, metadata, identity)
                             futures.append(future)
-                            future_context[future] = (adapter.name, model, query, should_trigger, metadata)
+                            future_context[future] = (
+                                adapter.name, model, query, should_trigger, metadata, identity)
             for fut in as_completed(futures):
                 try:
                     results.append(fut.result())
                 except Exception as exc:
-                    agent, model, query, should_trigger, metadata = future_context[fut]
-                    results.append(matrix_failure_row(agent, model, query, should_trigger, exc, metadata))
+                    agent, model, query, should_trigger, metadata, identity = future_context[fut]
+                    results.append(matrix_failure_row(
+                        agent, model, query, should_trigger, exc, metadata, identity))
+    results.sort(key=lambda row: (
+        str(row["agent"]), str(row.get("model") or ""),
+        str(row["query_id"]), int(row["run_number"]),
+    ))
     matrix = summarize_matrix(results)
-    passed = sum(1 for r in results if r["pass"])
+    complete_results = [r for r in results if r["observation_complete"]]
+    passed = sum(1 for r in complete_results if r["pass"])
+    incomplete = len(results) - len(complete_results)
+    observed_pass_rate = passed / len(complete_results) if complete_results else None
     return {
         "skill_name": skill_name_from_manifest(manifest),
         "generated_at": int(time.time()),
@@ -805,10 +1093,16 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         "skill_tree_hash": tree_hash,
         "ablation": ablation,
         "provenance": provenance,
+        "manifest_identity": manifest_identity,
+        "protocol": protocol,
+        "protocol_sha256": protocol_sha256,
         "agents": {name: capability_rows[name].as_dict() for name in sorted(capability_rows)},
         "runs_per_query": runs_per_query,
-        "summary": {"total": len(results), "passed": passed,
-                    "pass_rate": (passed / len(results)) if results else None},
+        "design": design,
+        "summary": {"total": len(results), "complete": len(complete_results),
+                    "incomplete": incomplete, "passed": passed,
+                    "pass_rate": None if incomplete else observed_pass_rate,
+                    "observed_pass_rate": observed_pass_rate},
         "matrix": matrix,
         "results": results,
     }

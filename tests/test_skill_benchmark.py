@@ -7,7 +7,11 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from helpers import load_example_module
+from helpers import (
+    attach_jetty_task_contract,
+    attest_answer_design,
+    load_example_module,
+)
 
 import run_pi_trigger_eval as tr
 
@@ -38,13 +42,24 @@ class SkillBenchmarkTests(unittest.TestCase):
         variants = ["with_skill", "without_skill"]
         clean_paired = sb.build_paired_summary(clean)
         polluted_paired = sb.build_paired_summary(polluted)
-        self.assertEqual(polluted_paired["absolute_delta"], clean_paired["absolute_delta"])
+        self.assertIsNone(polluted_paired["absolute_delta"])
+        self.assertEqual(
+            polluted_paired["observed_absolute_delta"], clean_paired["absolute_delta"])
         self.assertEqual(polluted_paired["pairing"]["blocked_reason_counts"], {"missing_without_skill": 1})
         clean_slices = sb.build_slice_summary(clean, variants)
         polluted_slices = sb.build_slice_summary(polluted, variants)
-        self.assertEqual(polluted_slices["domain"]["d"]["lift"], clean_slices["domain"]["d"]["lift"])
-        self.assertEqual(polluted_slices["success_goals"]["g"]["lift"], clean_slices["success_goals"]["g"]["lift"])
-        self.assertEqual(polluted_slices["domain"]["d"]["pairing"]["blocked_pairs"], 1)
+        domain = polluted_slices["domain"]["d"]
+        goal = polluted_slices["success_goals"]["g"]
+        self.assertEqual(
+            domain["with_skill"]["observed_mean_objective_pass_rate"]
+            - domain["without_skill"]["observed_mean_objective_pass_rate"],
+            clean_slices["domain"]["d"]["lift"])
+        self.assertEqual(
+            goal["with_skill"]["observed_mean_objective_pass_rate"]
+            - goal["without_skill"]["observed_mean_objective_pass_rate"],
+            clean_slices["success_goals"]["g"]["lift"])
+        self.assertNotIn("lift", domain)
+        self.assertEqual(domain["pairing"]["blocked_pairs"], 1)
         self.assertEqual(sb.mean_rate([good, crashed]), sb.mean_rate([good]))
         self.assertEqual(sb.mean_rate([good, crashed]), 1.0)   # the crash did not drag it to 0.5
 
@@ -68,7 +83,6 @@ class SkillBenchmarkTests(unittest.TestCase):
                     "assertions": [
                         {"name": "has-alpha", "type": "contains", "value": "alpha"},
                         {"name": "has-beta", "type": "contains", "value": "beta"},
-                        {"name": "quality", "type": "judge", "rubric": ["Complete"]},
                     ],
                 }
             ],
@@ -91,11 +105,11 @@ class SkillBenchmarkTests(unittest.TestCase):
                     base = runs / "case-1" / variant / f"run-{i}"
                     base.mkdir(parents=True)
                     if variant == "with_skill" and i == 1:
-                        (base / "outputs").mkdir()
-                        (base / "outputs" / "answer.md").write_text(text, encoding="utf-8")
+                        (base / "response.md").write_text(text, encoding="utf-8")
                     else:
                         (base / "output.md").write_text(text, encoding="utf-8")
                     (base / "metadata.json").write_text(json.dumps({"elapsed_ms": 1000 * i, "total_tokens": 100 + i}), encoding="utf-8")
+            attest_answer_design(manifest, runs)
             report = sb.build_benchmark_report(manifest, runs)
             self.assertEqual(len(report["results"]), 4)
             self.assertEqual(report["summary"]["with_skill"]["objective_pass_rate"]["n"], 2)
@@ -107,12 +121,29 @@ class SkillBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = self.make_manifest(root)
+            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+            manifest_data["cases"][0]["assertions"].append(
+                {"name": "quality", "type": "judge", "rubric": ["Complete"]})
+            manifest.write_text(json.dumps(manifest_data), encoding="utf-8")
             runs = root / "repo" / "eval-runs" / "latest"
             base = runs / "case-1" / "with_skill"
             base.mkdir(parents=True)
             (base / "output.md").write_text("alpha beta", encoding="utf-8")
+            task = sb.collect_judge_tasks(
+                manifest, runs, variants=["with_skill"])[0]
             judge_results = root / "judge.jsonl"
-            judge_results.write_text(json.dumps({"judge_task_id": "case-1::with_skill::run-1::quality", "passed": True, "evidence": "complete"}) + "\n", encoding="utf-8")
+            _, _, prompt_sha256, _ = sb.judge_input_material(
+                task, "alpha beta", run_base=base)
+            judge_results.write_text(json.dumps({
+                "judge_task_id": "case-1::with_skill::run-1::quality",
+                "passed": True, "evidence": "complete", "returncode": 0,
+                "judge_observation_complete": True,
+                "availability": "complete",
+                "judge_input_sha256": task["judge_input_sha256"],
+                "judge_prompt_sha256": prompt_sha256,
+                "judge_evidence_mode": "text-only",
+            }) + "\n", encoding="utf-8")
+            attest_answer_design(manifest, runs, variants=["with_skill"])
             report = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"], judge_results_path=str(judge_results))
             result = report["results"][0]
             # The default judge is soft: its merged verdict fills the graded/soft
@@ -126,6 +157,16 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertIn("expectations", grading)
             self.assertEqual(grading["summary"]["pass_rate"], 1.0)
             self.assertTrue(all({"text", "passed", "evidence"}.issubset(e) for e in grading["expectations"]))
+
+    def test_anthropic_expectations_preserve_unavailable_truth(self):
+        expectations = sb.expectation_texts({
+            "assertions": [{
+                "name": "blocked", "passed": None,
+                "availability": "partial", "evidence": "missing trace",
+            }],
+        })
+        self.assertIsNone(expectations[0]["passed"])
+        self.assertEqual(expectations[0]["availability"], "partial")
 
     def test_prepare_omits_answer_key_by_default(self):
         with tempfile.TemporaryDirectory() as td:
@@ -156,6 +197,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                 base = runs / "case-1" / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text("alpha beta" if variant == "with_skill" else "alpha", encoding="utf-8")
+            attest_answer_design(manifest, runs)
             report = sb.build_benchmark_report(manifest, runs)
             exported = sb.anthropic_benchmark_from_report(report, "skill/SKILL.md")
             self.assertIn("metadata", exported)
@@ -163,6 +205,15 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertIn("run_summary", exported)
             self.assertEqual(exported["runs"][0]["configuration"], "with_skill")
             self.assertIn("delta", exported["run_summary"])
+            self.assertEqual(exported["configuration_deltas"]["all"]["from"], "without_skill")
+            self.assertEqual(exported["configuration_deltas"]["all"]["to"], "with_skill")
+            report["summary"] = {
+                "without_skill": report["summary"]["without_skill"],
+                "with_skill": report["summary"]["with_skill"],
+            }
+            reordered = sb.anthropic_benchmark_from_report(report, "skill/SKILL.md")
+            self.assertEqual(
+                reordered["run_summary"]["delta"], exported["run_summary"]["delta"])
 
     def test_audit_manifest_reports_missing_categories_and_fixtures(self):
         with tempfile.TemporaryDirectory() as td:
@@ -185,6 +236,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                 base = runs / "case-1" / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text("alpha beta", encoding="utf-8")
+            attest_answer_design(manifest, runs)
             report = sb.audit_manifest_report(manifest, runs=str(runs))
             kinds = {f["kind"] for f in report["findings"]}
             self.assertIn("saturated-eval", kinds)
@@ -208,6 +260,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                 base = runs / "case-1" / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text("alpha beta", encoding="utf-8")
+            attest_answer_design(manifest, runs)
             report = sb.build_benchmark_report(manifest, runs)
             flagged_ids = {f["case_id"] for f in report["case_flags"]}
             self.assertNotIn("case-2", flagged_ids)
@@ -220,16 +273,22 @@ class SkillBenchmarkTests(unittest.TestCase):
 
     def test_trigger_detector_uses_copied_skill_paths_not_bare_skill_name(self):
         copied = [Path("/tmp/pi-trigger-x/skills/good-readme/SKILL.md")]
-        repo_event = json.dumps({"tool_input": {"path": "good-readme/README.md"}})
+        repo_event = json.dumps({
+            "type": "file_read", "status": "completed",
+            "path": "good-readme/README.md"})
         self.assertEqual(tr.detect_trigger(repo_event, copied), (False, []))
-        skill_event = json.dumps({"tool_input": {"path": "/tmp/pi-trigger-x/skills/good-readme/SKILL.md"}})
+        skill_event = json.dumps({
+            "type": "file_read", "status": "completed",
+            "path": "/tmp/pi-trigger-x/skills/good-readme/SKILL.md"})
         triggered, evidence = tr.detect_trigger(skill_event, copied)
         self.assertTrue(triggered)
         self.assertIn("/tmp/pi-trigger-x/skills/good-readme/SKILL.md", evidence[0])
 
     def test_trigger_detector_reads_command_array_events(self):
         copied = [Path("/tmp/codex-trigger-x/.codex/skills/good-readme/SKILL.md")]
-        event = json.dumps({"type": "command", "command": ["bash", "-lc", f"cat {copied[0]}"]})
+        event = json.dumps({
+            "type": "command", "status": "completed",
+            "command": ["bash", "-lc", f"cat {copied[0]}"]})
         triggered, evidence = tr.detect_trigger(event, copied)
         self.assertTrue(triggered)
         self.assertIn("SKILL.md", evidence[0])
@@ -306,7 +365,7 @@ class SkillBenchmarkTests(unittest.TestCase):
             {"type": "agent_end", "messages": [assistant]},
         ]
         events, metrics = sb.normalize_trace_records(records, source="pi")
-        self.assertEqual([e["type"] for e in events["events"]], ["skill_load", "message", "event"])
+        self.assertEqual([e["type"] for e in events["events"]], ["tool_call", "message", "event"])
         self.assertEqual(metrics["total_tokens"], 15)
         self.assertTrue(metrics["skill_invoked"])
 
@@ -358,6 +417,8 @@ class SkillBenchmarkTests(unittest.TestCase):
                 "jetty": {"collection": "skill-evals", "task": "demo-case-1-without-skill-1", "agent": "claude-code", "model": "claude-sonnet-4-6", "model_provider": "anthropic", "snapshot": "python312-uv"},
                 "trajectory": {"error": "boom"},
             }
+            for index, record in enumerate((completed, failed), 1):
+                attach_jetty_task_contract(record, marker=index)
             jetty_runs.write_text(json.dumps(completed) + "\n" + json.dumps(failed) + "\n", encoding="utf-8")
             sb.import_jetty_results(SimpleNamespace(manifest=str(manifest), jetty_runs=str(jetty_runs), runs=str(runs)))
             self.assertEqual((runs / "case-1" / "with_skill" / "output.md").read_text(encoding="utf-8"), "alpha beta")
@@ -367,12 +428,14 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertTrue((runs / "case-1" / "with_skill" / "trace.jsonl").exists())
             events = json.loads((runs / "case-1" / "with_skill" / "events.json").read_text(encoding="utf-8"))
             metrics = json.loads((runs / "case-1" / "with_skill" / "metrics.json").read_text(encoding="utf-8"))
-            self.assertTrue(any(e["type"] == "skill_load" for e in events["events"]))
+            self.assertTrue(any(e["type"] == "tool_call" for e in events["events"]))
+            self.assertTrue(metrics["skill_invoked"])
             self.assertEqual(metrics["commands"], 1)
             self.assertEqual(metrics["total_tokens"], 12)
             self.assertIn("JETTY FAILURE", (runs / "case-1" / "without_skill" / "output.md").read_text(encoding="utf-8"))
             report = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"])
-            self.assertEqual(report["summary"]["with_skill"]["mean_objective_pass_rate"], 1.0)
+            self.assertEqual(report["availability"], "partial")
+            self.assertEqual(report["results"][0]["objective_pass_rate"], 1.0)
 
     def test_import_jetty_rejects_unsafe_missing_and_duplicate_execution_identity(self):
         with tempfile.TemporaryDirectory() as td:
@@ -383,6 +446,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                             "run_dir": "../escape"},
                 "status": "failed", "jetty": {"model": "m"}, "artifacts": [],
             }
+            attach_jetty_task_contract(base)
             path = root / "jetty.jsonl"
             cases = [
                 [base],
@@ -419,6 +483,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                 "jetty": {"collection": "c", "task": "t", "agent": "claude-code", "model": "m", "model_provider": "anthropic", "snapshot": "s"},
                 "artifacts": [{"path": "/app/results/output.md", "content": "x"}],
             }
+            attach_jetty_task_contract(rec)
             jetty_runs.write_text(json.dumps(rec) + "\n", encoding="utf-8")
             sb.import_jetty_results(SimpleNamespace(manifest=str(manifest), jetty_runs=str(jetty_runs), runs=str(runs)))
             meta = json.loads((runs / "case-1" / "ablation:no-rp" / "metadata.json").read_text(encoding="utf-8"))
@@ -487,7 +552,8 @@ class SkillBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "trigger-run"
             stdout = "\n".join([
-                json.dumps({"type": "tool_use", "tool_input": {"path": "/tmp/pi-trigger/skills/demo/SKILL.md"}}),
+                json.dumps({"type": "tool_execution_end", "toolName": "read",
+                            "args": {"path": "/tmp/pi-trigger/skills/demo/SKILL.md"}}),
                 json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 3, "output": 2, "totalTokens": 5}}}),
                 json.dumps({"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 3, "output": 2, "totalTokens": 5}}]}),
             ]) + "\n"
@@ -525,8 +591,10 @@ class SkillBenchmarkTests(unittest.TestCase):
             base = runs / "case-1" / "with_skill"
             base.mkdir(parents=True)
             (base / "output.md").write_text("alpha beta", encoding="utf-8")
+            attest_answer_design(manifest, runs, variants=["with_skill"])
             blocked = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"])
-            self.assertEqual(blocked["results"][0]["objective_pass_rate"], 0.0)
+            self.assertIsNone(blocked["results"][0]["objective_pass_rate"])
+            self.assertEqual(blocked["results"][0]["grading_availability"], "partial")
             self.assertIn("--allow-scripts", blocked["results"][0]["assertions"][0]["evidence"])
             allowed = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"], allow_scripts=True)
             self.assertEqual(allowed["results"][0]["objective_pass_rate"], 1.0)
@@ -543,6 +611,10 @@ class SkillBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = self.make_manifest(root)
+            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+            manifest_data["cases"][0]["assertions"].append(
+                {"name": "quality", "type": "judge", "rubric": ["Complete"]})
+            manifest.write_text(json.dumps(manifest_data), encoding="utf-8")
             runs = root / "repo" / "eval-runs" / "latest"
             base = runs / "case-1" / "with_skill"
             base.mkdir(parents=True)
@@ -590,26 +662,43 @@ class SkillBenchmarkTests(unittest.TestCase):
             (run_dir / "output.md").write_text("alpha beta", encoding="utf-8")
             trace = run_dir / "trace.jsonl"
             rows = [
-                {"type": "file_read", "status": "completed", "path": str(root / "repo" / "skill" / "SKILL.md")},
-                {"type": "exec_command", "status": "completed", "command": "npm install", "duration_ms": 1000},
-                {"type": "exec_command", "status": "completed", "command": "npm test", "duration_ms": 1200},
-                {"type": "usage", "usage": {"input_tokens": 80, "output_tokens": 20, "total_tokens": 100}},
+                {"type": "thread.started", "thread_id": "thread-1"},
+                {"type": "turn.started"},
+                {"type": "item.completed", "item": {
+                    "id": "read-skill", "type": "command_execution", "status": "completed",
+                    "command": f"cat {root / 'repo' / 'skill' / 'SKILL.md'}", "exit_code": 0}},
+                {"type": "item.completed", "item": {
+                    "id": "install", "type": "command_execution", "status": "completed",
+                    "command": "npm install", "duration_ms": 1000, "exit_code": 0}},
+                {"type": "item.completed", "item": {
+                    "id": "test", "type": "command_execution", "status": "completed",
+                    "command": "npm test", "duration_ms": 1200, "exit_code": 0}},
+                {"type": "item.completed", "item": {
+                    "id": "answer", "type": "agent_message", "text": "alpha beta"}},
+                {"type": "turn.completed", "usage": {
+                    "input_tokens": 80, "output_tokens": 20}},
             ]
             trace.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
             sb.import_trace(SimpleNamespace(source="codex", trace=str(trace), run_dir=str(run_dir), out_events=None, out_metrics=None, write_metadata=False))
             self.assertTrue((run_dir / "metadata.json").is_file())
             events = json.loads((run_dir / "events.json").read_text(encoding="utf-8"))
             metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
-            self.assertEqual([e["type"] for e in events["events"]][:3], ["skill_load", "command", "command"])
+            self.assertEqual(
+                sum(e["type"] == "command" for e in events["events"]), 3)
             self.assertTrue(metrics["skill_invoked"])
-            self.assertEqual(metrics["commands"], 2)
+            self.assertEqual(metrics["commands"], 3)
             report = sb.build_benchmark_report(manifest, root / "repo" / "eval-runs" / "latest", variants_arg=["with_skill"])
             result = report["results"][0]
             self.assertEqual(result["objective_pass_rate"], 1.0)
             self.assertEqual(result["process_pass_rate"], 1.0)
             self.assertEqual(result["efficiency_pass_rate"], 1.0)
-            self.assertEqual(report["summary"]["with_skill"]["telemetry_availability"]["events"], 1)
-            self.assertEqual(report["slice_summary"]["domain"]["writing"]["with_skill"]["runs"], 1)
+            observed_summary = report["summary"]["with_skill"]["observed"]
+            self.assertEqual(observed_summary["telemetry_availability"]["events"], 1)
+            observed_slices = report["slice_summary"]["observed"]
+            arm = observed_slices["domain"]["writing"]["with_skill"]
+            self.assertEqual(arm["attempted_runs"], 1)
+            self.assertEqual(arm["runs"], 0)
+            self.assertEqual(arm["blocked_runs"], 1)
 
     def test_variant_scoped_process_assertions_do_not_penalize_other_variants(self):
         with tempfile.TemporaryDirectory() as td:
@@ -626,15 +715,17 @@ class SkillBenchmarkTests(unittest.TestCase):
                 base = runs / "case-1" / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text("alpha beta", encoding="utf-8")
+                record = ({"type": "skill_load", "path": "/skills/demo/SKILL.md",
+                           "status": "completed"}
+                          if invoked else
+                          {"type": "message", "role": "assistant", "content": "done"})
                 sb.write_trace_artifacts(
-                    base, json.dumps({"type": "message", "role": "assistant", "content": "done"}),
-                    source="test",
-                    extra_metrics={"skill_invoked": invoked,
-                                   "skill_invocation_evidence": [variant] if invoked else []},
+                    base, json.dumps(record), source="generic",
                     write_metadata=True,
                     process_observation_complete=True,
                     provider_response_complete=True,
                 )
+            attest_answer_design(manifest, runs)
             report = sb.build_benchmark_report(manifest, runs)
             by_variant = {r["variant"]: r for r in report["results"]}
             self.assertEqual(by_variant["with_skill"]["objective_total"], 1)
@@ -655,9 +746,14 @@ class SkillBenchmarkTests(unittest.TestCase):
             run_dir = root / "repo" / "eval-runs" / "latest" / "case-1" / "with_skill"
             run_dir.mkdir(parents=True)
             (run_dir / "output.md").write_text("alpha beta", encoding="utf-8")
-            report = sb.build_benchmark_report(manifest, root / "repo" / "eval-runs" / "latest", variants_arg=["with_skill"])
+            runs = root / "repo" / "eval-runs" / "latest"
+            attest_answer_design(manifest, runs, variants=["with_skill"])
+            report = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"])
             result = report["results"][0]
-            self.assertEqual(result["objective_pass_rate"], 0.0)
+            self.assertIsNone(result["objective_pass_rate"])
+            self.assertEqual(result["grading_availability"], "partial")
+            self.assertTrue(all(row["availability"] == "partial"
+                                for row in result["assertions"]))
             self.assertIn("missing", result["assertions"][0]["evidence"])
             self.assertIn("missing", result["assertions"][1]["evidence"])
 
@@ -689,6 +785,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                 base = runs / case_id / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text(text, encoding="utf-8")
+            attest_answer_design(manifest, runs)
             report = sb.build_benchmark_report(manifest, runs)
             self.assertAlmostEqual(report["paired_summary"]["absolute_delta"], 0.25)
             self.assertEqual(report["paired_summary"]["negative_delta_cases"][0]["case_id"], "case-1")
@@ -735,6 +832,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                     },
                     "skill_invoked": variant == "with_skill",
                 }), encoding="utf-8")
+            attest_answer_design(manifest, runs)
             report = sb.paired_token_overhead_report(manifest, runs=runs)
             self.assertEqual(report["summary"]["paired_runtime_rows"], 1)
             self.assertEqual(report["pairs"][0]["total_token_delta"], 90)
@@ -757,6 +855,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                         "provider": "test-provider", "model": model, "billing_scope": "run",
                         "usage_normalized": {"total_tokens": tokens, "source": "provider_reported"},
                     }), encoding="utf-8")
+            attest_answer_design(manifest, runs)
             report = sb.paired_token_overhead_report(manifest, runs=runs)
         self.assertEqual(report["summary"]["paired_runtime_rows"], 2)
         self.assertEqual({pair["model"] for pair in report["pairs"]}, {"model-a", "model-b"})
@@ -769,9 +868,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             without_dir = runs / "case" / "without_skill" / "run-1"
             with_dir.mkdir(parents=True)
             without_dir.mkdir(parents=True)
-            pairs = list(sb.paired_run_bases(runs, "case", "with_skill", "without_skill"))
-        self.assertEqual([(run, left is None, right is None) for _, run, left, right in pairs],
-                         [(1, True, False), (2, False, True)])
+            with self.assertRaisesRegex(ValueError, "non-contiguous run identities"):
+                list(sb.paired_run_bases(
+                    runs, "case", "with_skill", "without_skill"))
 
     def test_token_overhead_reports_missing_and_unscorable_pairs_as_blocked(self):
         with tempfile.TemporaryDirectory() as td:
@@ -785,10 +884,13 @@ class SkillBenchmarkTests(unittest.TestCase):
                 "provider": "test-provider", "model": "test-model", "billing_scope": "run",
                 "usage_normalized": {"total_tokens": 10, "source": "provider_reported"},
             }), encoding="utf-8")
+            attest_answer_design(manifest, runs)
             missing_report = sb.paired_token_overhead_report(manifest, runs=runs)
             self.assertEqual(missing_report["pairs"], [])
             self.assertEqual(missing_report["blocked_pairs"][0]["pair_status"]["reason"], "missing_right")
-            self.assertEqual(missing_report["summary"]["cost_delta_coverage"]["blocked_reason_counts"], {"missing_right": 1})
+            self.assertEqual(
+                missing_report["summary"]["observed"]["cost_delta_coverage"]["blocked_reason_counts"],
+                {"missing_right": 1})
 
             without_base = runs / "case-1" / "without_skill"
             without_base.mkdir(parents=True)
@@ -798,10 +900,13 @@ class SkillBenchmarkTests(unittest.TestCase):
                 "provider": "test-provider", "model": "test-model", "billing_scope": "run", "returncode": 1,
                 "usage_normalized": {"total_tokens": 5, "source": "provider_reported"},
             }), encoding="utf-8")
+            attest_answer_design(manifest, runs)
             unscorable_report = sb.paired_token_overhead_report(manifest, runs=runs)
         self.assertEqual(unscorable_report["pairs"], [])
         self.assertEqual(unscorable_report["blocked_pairs"][0]["pair_status"]["reason"], "unscorable_arm")
-        self.assertEqual(unscorable_report["summary"]["cost_delta_coverage"]["blocked_reason_counts"], {"unscorable_arm": 1})
+        self.assertEqual(
+            unscorable_report["summary"]["observed"]["cost_delta_coverage"]["blocked_reason_counts"],
+            {"unscorable_arm": 1})
 
     def test_command_assertions_match_command_inputs_not_outputs(self):
         with tempfile.TemporaryDirectory() as td:
@@ -828,7 +933,9 @@ class SkillBenchmarkTests(unittest.TestCase):
                     "output_summary": "docs mention npm test and rm -rf as examples",
                 }],
             }), encoding="utf-8")
-            report = sb.build_benchmark_report(manifest, root / "repo" / "eval-runs" / "latest", variants_arg=["with_skill"])
+            runs = root / "repo" / "eval-runs" / "latest"
+            attest_answer_design(manifest, runs, variants=["with_skill"])
+            report = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"])
             assertions = {a["name"]: a for a in report["results"][0]["assertions"]}
             self.assertTrue(assertions["did-not-run-rm"]["passed"])
             self.assertFalse(assertions["ran-tests"]["passed"])
@@ -919,6 +1026,8 @@ class SkillBenchmarkTests(unittest.TestCase):
             },
             "upload_plan": {"files": [{"role": "task", "placeholder": "upload://task-json", "content": "{}", "remote_path_hint": "task.json", "private": True}]},
         }
+        row["harness"]["jetty_task_contract_sha256"] = (
+            sb.jetty_task_contract_sha256(row))
 
         class FakeClient:
             def __init__(self):

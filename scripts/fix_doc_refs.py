@@ -11,6 +11,7 @@ and the fixer can never disagree about what a reference means.
 """
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -37,21 +38,43 @@ DOC_PATHS = [
     *sorted((ROOT / "docs").glob("*.md")),
 ]
 
-INLINE_REF_RE = re.compile(r"`([A-Za-z_]\w*):(\d{2,5})`")
+DOC_REF_IGNORE = "<!-- doc-ref-ignore -->"
+
+INLINE_REF_RE = re.compile(r"`([A-Za-z_]\w*):(\d+)`")
 PAREN_REF_RE = re.compile(
-    r"`([A-Za-z_]\w*)`\s+\(`(?:([\w.]+\.py))?:(\d{2,5})`\)")
+    r"`([A-Za-z_]\w*)`\s+\(`(?:([\w.]+\.py))?:(\d+)`\)")
+MARKDOWN_LINE_REF_RE = re.compile(r"`([\w.-]+\.md):(\d+)`")
+LINK_LINE_FRAGMENT_RE = re.compile(
+    r"(?:\]\((?P<markdown_url>[^\n)]*#L\d+(?:-L\d+)?)\)|"
+    r"<(?P<angle_url>[^\n>]*#L\d+(?:-L\d+)?)>)",
+    re.IGNORECASE,
+)
+IMMUTABLE_GITHUB_LINE_REF_RE = re.compile(
+    r"https://github\.com/[^/\s]+/[^/\s]+/blob/[0-9a-f]{40}/"
+    r"[^#\s]+#L\d+(?:-L\d+)?",
+    re.IGNORECASE,
+)
 
 
 def line_map(path: Path) -> dict[str, int]:
     marks: dict[str, int] = {}
-    for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        m = re.match(r"^(?:def|class)\s+([A-Za-z_]\w*)", line)
-        if m:
-            marks.setdefault(m.group(1), i)
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            marks.setdefault(node.name, node.lineno)
             continue
-        m = re.match(r"^([A-Z][A-Z0-9_]*)\s*[:=]", line)
-        if m:
-            marks.setdefault(m.group(1), i)
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        pending = list(targets)
+        while pending:
+            target = pending.pop()
+            if isinstance(target, ast.Name) and re.fullmatch(r"[A-Z][A-Z0-9_]*", target.id):
+                marks.setdefault(target.id, node.lineno)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                pending.extend(target.elts)
     return marks
 
 
@@ -59,11 +82,13 @@ def module_line_maps() -> dict[str, dict[str, int]]:
     return {name: line_map(path) for name, path in MODULES.items()}
 
 
-def resolve(name: str, module: str | None, maps: dict[str, dict[str, int]]) -> tuple[str, int] | None:
+def resolve(name: str, module: str | None, maps: dict[str, dict[str, int]]) -> tuple[str, int]:
     if module:
-        if module in maps and name in maps[module]:
-            return module, maps[module][name]
-        return None
+        if module not in maps:
+            raise ValueError(f"unknown code-reference module {module!r}")
+        if name not in maps[module]:
+            raise ValueError(f"unknown code reference {name!r} in {module}")
+        return module, maps[module][name]
     matches = [(candidate, maps[candidate][name]) for candidate in MODULE_SEARCH_ORDER
                if name in maps.get(candidate, {})]
     if len(matches) > 1:
@@ -71,30 +96,66 @@ def resolve(name: str, module: str | None, maps: dict[str, dict[str, int]]) -> t
         raise ValueError(f"ambiguous unqualified code reference {name!r}; qualify one of: {modules}")
     if matches:
         return matches[0]
-    return None
+    raise ValueError(f"unknown unqualified code reference {name!r}")
+
+
+def _reference_is_ignored(text: str, reference_end: int) -> bool:
+    """The marker opts out only the immediately preceding reference."""
+    end = text.find("\n", reference_end)
+    if end < 0:
+        end = len(text)
+    suffix = text[reference_end:end]
+    # Normal sentence punctuation may sit between the reference and marker,
+    # but intervening prose or another reference may not.
+    return re.fullmatch(
+        rf"[ \t]*[.,;:!?)]?[ \t]*{re.escape(DOC_REF_IGNORE)}[ \t]*",
+        suffix,
+    ) is not None
+
+
+def _is_immutable_github_line_reference(match: re.Match[str]) -> bool:
+    """Return whether a linked line range is pinned to an exact Git commit."""
+    url = match.group("markdown_url") or match.group("angle_url")
+    return IMMUTABLE_GITHUB_LINE_REF_RE.fullmatch(url) is not None
 
 
 def doc_references(text: str) -> list[dict]:
     """Extract (name, module?, cited_line, offset) references from doc text."""
+    markdown_line_refs = [
+        *MARKDOWN_LINE_REF_RE.finditer(text),
+        *(match for match in LINK_LINE_FRAGMENT_RE.finditer(text)
+          if not _is_immutable_github_line_reference(match)),
+    ]
+    if markdown_line_refs:
+        rendered = ", ".join(match.group(0) for match in markdown_line_refs[:3])
+        raise ValueError(
+            f"Mutable Markdown line references are unstable ({rendered}); "
+            "use a heading anchor or a GitHub URL pinned to a full commit SHA")
     refs = []
     for m in INLINE_REF_RE.finditer(text):
+        if _reference_is_ignored(text, m.end()):
+            continue
         refs.append({"name": m.group(1), "module": None, "cited": int(m.group(2)),
                      "offset": m.start(), "form": "inline", "span": m.span(2)})
     for m in PAREN_REF_RE.finditer(text):
+        if _reference_is_ignored(text, m.end()):
+            continue
         refs.append({"name": m.group(1), "module": m.group(2), "cited": int(m.group(3)),
                      "offset": m.start(), "form": "paren", "span": m.span(3)})
     return refs
 
 
 def rewrite_doc_text(text: str, maps: dict[str, dict[str, int]]) -> tuple[str, int]:
-    """Return the text with every resolvable stale reference re-pointed at the
-    definition's actual line, and how many were rewritten. Unresolvable
-    references are left untouched, exactly as the test skips them."""
+    """Return text with every stale reference re-pointed at the definition.
+
+    Unknown references fail closed. A prose example that intentionally looks
+    like a code reference must put DOC_REF_IGNORE immediately after that one
+    reference. Markdown citations use stable heading anchors; external source
+    line citations are allowed only when pinned to a full GitHub commit SHA.
+    """
     edits: list[tuple[int, int, str]] = []
     for ref in doc_references(text):
         target = resolve(ref["name"], ref["module"], maps)
-        if target is None:
-            continue
         _, actual = target
         if actual != ref["cited"]:
             start, end = ref["span"]

@@ -42,6 +42,7 @@ class SuiteRunTests(unittest.TestCase):
                     "id": "trig-one",
                     "split": "tune",
                     "kind": "trigger",
+                    "should_trigger": True,
                     "prompt": "Trigger decision eval. User prompt: do the thing",
                     "expected_behavior": ["Should trigger"],
                     "assertions": [{"name": "label", "type": "regex", "pattern": "TRIGGER"}],

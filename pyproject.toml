@@ -39,7 +39,7 @@ skill-pi-trigger-eval = "run_pi_trigger_eval:main"
 skill-trigger-matrix = "run_trigger_matrix:main"
 
 [tool.setuptools]
-py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model", "agent_capabilities", "telemetry", "trigger_contracts", "trace_contracts", "runner_contracts", "judge_verdict", "experimental_pairs", "jetty_contracts"]
+py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model", "agent_capabilities", "telemetry", "trigger_contracts", "trace_contracts", "runner_contracts", "judge_verdict", "experimental_pairs", "jetty_contracts", "json_contracts"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -49,13 +49,20 @@ pythonpath = ["."]
 # modules in this gate instead of inheriting the legacy CLI's diagnostic debt.
 include = [
   "agent_capabilities.py",
+  "ablation_model.py",
   "experimental_pairs.py",
   "jetty_contracts.py",
+  "judge_verdict.py",
+  "json_contracts.py",
+  "run_pi_trigger_eval.py",
   "run_trigger_matrix.py",
+  "runner_contracts.py",
+  "scripts/check_ty_regressions.py",
   "telemetry.py",
   "trace_contracts.py",
   "text_contracts.py",
   "observability.py",
+  "trigger_contracts.py",
 ]
 
 [tool.ruff]

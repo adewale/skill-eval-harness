@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from helpers import (
     CODEX_CRASH_OUTPUT as CRASH,
@@ -18,16 +19,17 @@ from helpers import (
     CONTAINS_APPROVED_CASE as CASE,
 )
 from helpers import (
-    demo_manifest as base_manifest,
-)
-from helpers import (
-    good_pr_manifest as _manifest,
-)
-from helpers import (
+    attest_answer_design,
     report_fixture,
     result_row,
     trace_event,
     write_run,
+)
+from helpers import (
+    demo_manifest as base_manifest,
+)
+from helpers import (
+    good_pr_manifest as _manifest,
 )
 from helpers import (
     write_demo_manifest as write_manifest,
@@ -64,6 +66,8 @@ class ReportFormatsTests(unittest.TestCase):
     """1.2 — JUnit XML and GitHub job-summary serialization of benchmark.json."""
 
     REPORT = {
+        "availability": "complete",
+        "answer_design": {"complete": True},
         "skill_name": "demo",
         "summary": {
             "with_skill": {"cases": 1, "runs": 2, "missing_outputs": 0, "execution_errors": 0, "mean_objective_pass_rate": 1.0, "mean_combined_pass_rate": 1.0},
@@ -93,8 +97,8 @@ class ReportFormatsTests(unittest.TestCase):
         self.assertIn('testsuite name="skill-eval:demo"', xml)
         self.assertIn('tests="3"', xml)
         self.assertIn('failures="2"', xml)
-        self.assertIn('classname="demo.case-1"', xml)
-        self.assertIn('name="with_skill/run-1"', xml)
+        self.assertIn('classname="demo.case-1.default-model"', xml)
+        self.assertIn('name="default-model/with_skill/run-1"', xml)
         self.assertIn("has-alpha: missing 'alpha'", xml)
         self.assertIn("missing output", xml)
         self.assertIn('property name="absolute_delta" value="0.5000"', xml)
@@ -129,6 +133,22 @@ class ReportFormatsTests(unittest.TestCase):
             rc = sb.report_command(SimpleNamespace(benchmark=str(bench), format="junit", out=str(out)))
             self.assertEqual(rc, 0)
             self.assertIn("testsuite", out.read_text(encoding="utf-8"))
+
+    def test_aggregate_rejects_duplicate_skill_identities_before_mapping(self):
+        report = {
+            "availability": "complete", "skill_name": "demo",
+            "summary": {}, "results": [], "case_flags": [],
+            "cost_summary": {"totals": {}},
+        }
+        for manifests in (["same.json", "same.json"], ["one.json", "two.json"]):
+            with self.subTest(manifests=manifests), mock.patch.object(
+                sb, "build_benchmark_report", side_effect=[report, report]
+            ), self.assertRaises(SystemExit):
+                sb.aggregate(SimpleNamespace(
+                    manifests=manifests, runs_root=".", runs_subdir="runs",
+                    runs=None, split=None, variant=None, judge_results=None,
+                    allow_scripts=False, out=None,
+                ))
 
 
 class MultiModelFanOutTests(unittest.TestCase):
@@ -186,6 +206,7 @@ class MultiModelFanOutTests(unittest.TestCase):
     def test_report_groups_by_model_and_pairs_lift_per_model(self):
         with tempfile.TemporaryDirectory() as td:
             path, runs = make_two_model_runs(Path(td))
+            attest_answer_design(path, runs)
             report = sb.build_benchmark_report(path, runs)
         self.assertEqual(set(report["by_model"]), {"m1", "m2"})
         self.assertEqual(report["by_model"]["m1"]["with_skill"]["mean_objective_pass_rate"], 1.0)
@@ -209,6 +230,7 @@ class MultiModelFanOutTests(unittest.TestCase):
                 base = runs / "case-1" / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text(text, encoding="utf-8")
+            attest_answer_design(path, runs)
             report = sb.build_benchmark_report(path, runs)
         self.assertEqual(report["by_model"], {})
         self.assertNotIn("by_model", report["paired_summary"])
@@ -267,6 +289,7 @@ class PerModelAnalysisTests(unittest.TestCase):
     def test_benchmark_report_carries_model_analysis(self):
         with tempfile.TemporaryDirectory() as td:
             path, runs = make_two_model_runs(Path(td))
+            attest_answer_design(path, runs)
             report = sb.build_benchmark_report(path, runs)
         self.assertEqual([r["model"] for r in report["model_analysis"]["ranking"]], ["m1", "m2"])
         self.assertEqual(report["model_analysis"]["lift_losers"], ["m2"])
@@ -343,11 +366,13 @@ class IterationWorkflowTests(unittest.TestCase):
 
     def test_benchmark_report_diff(self):
         previous = {
+            "availability": "complete",
             "summary": {"with_skill": {"mean_objective_pass_rate": 0.5, "mean_combined_pass_rate": 0.5}},
             "results": [{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 0.5}],
             "case_flags": [{"case_id": "c1", "flags": ["no objective lift"]}],
         }
         current = {
+            "availability": "complete",
             "summary": {"with_skill": {"mean_objective_pass_rate": 1.0, "mean_combined_pass_rate": 1.0}},
             "results": [{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0},
                         {"case_id": "c2", "variant": "with_skill", "objective_pass_rate": 0.0}],
@@ -391,13 +416,13 @@ class TrendTrackingTests(unittest.TestCase):
         # A critical failure in 1 of 2 runs (0.5 x 3 = 1.5) outranks a soft
         # failure in 2 of 2 runs (1.0 x 1 = 1.0).
         fail_critical = {"case_id": "c-crit", "variant": "with_skill", "missing_output": False, "execution_valid": True,
-                         "objective_pass_rate": 0.0, "metadata": {},
+                         "objective_pass_rate": 0.0, "metadata": {}, "grading_availability": "complete",
                          "assertions": [{"name": "guard", "passed": False, "severity": "critical"}], "qualitative_assertions": []}
         fail_soft = {"case_id": "c-soft", "variant": "with_skill", "missing_output": False, "execution_valid": True,
-                     "objective_pass_rate": 1.0, "metadata": {},
+                     "objective_pass_rate": 1.0, "metadata": {}, "grading_availability": "complete",
                      "assertions": [{"name": "styling", "passed": False, "severity": "soft"}], "qualitative_assertions": []}
-        run1 = {"results": [fail_critical, fail_soft]}
-        run2 = {"results": [fail_soft]}
+        run1 = {"availability": "complete", "results": [fail_critical, fail_soft]}
+        run2 = {"availability": "complete", "results": [fail_soft]}
         ranked = sb.severity_weighted_failures([run1, run2])
         self.assertEqual(ranked[0]["assertion"], "guard")
         self.assertEqual(ranked[0]["rank"], 1.5)
@@ -479,11 +504,12 @@ class LivingEvalLoopTests(unittest.TestCase):
 class ErrorAnalysisTests(unittest.TestCase):
     def test_taxonomy_and_review_queue(self):
         report = {
+            "availability": "complete",
             "results": [
-                {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "x", "passed": True}], "qualitative_assertions": []},
-                {"case_id": "c1", "variant": "without_skill", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "type": "contains", "passed": False, "evidence": "missing"}], "qualitative_assertions": []},
-                {"case_id": "c2", "variant": "without_skill", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "type": "contains", "passed": False, "evidence": "missing"}], "qualitative_assertions": []},
-                {"case_id": "c3", "variant": "with_skill", "missing_output": True, "assertions": [], "qualitative_assertions": []},
+                {"case_id": "c1", "variant": "with_skill", "grading_availability": "complete", "objective_pass_rate": 1.0, "assertions": [{"name": "x", "passed": True}], "qualitative_assertions": []},
+                {"case_id": "c1", "variant": "without_skill", "grading_availability": "complete", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "type": "contains", "passed": False, "evidence": "missing"}], "qualitative_assertions": []},
+                {"case_id": "c2", "variant": "without_skill", "grading_availability": "complete", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "type": "contains", "passed": False, "evidence": "missing"}], "qualitative_assertions": []},
+                {"case_id": "c3", "variant": "with_skill", "grading_availability": "complete", "missing_output": True, "assertions": [], "qualitative_assertions": []},
             ],
             "case_flags": [{"case_id": "c1", "flags": ["saturated/non-discriminating", "flaky repeated pass rates: with_skill"]}],
         }
@@ -497,10 +523,10 @@ class ErrorAnalysisTests(unittest.TestCase):
         self.assertEqual(out["case_flag_histogram"]["saturated/non-discriminating"], 1)
 
     def test_execution_error_critical_and_judge_categories(self):
-        report = {"results": [
-            {"case_id": "c1", "variant": "with_skill", "execution_valid": False, "assertions": [], "qualitative_assertions": []},
-            {"case_id": "c2", "variant": "with_skill", "vetoed": True, "critical_failures": ["wrote-outside-results"], "assertions": [], "qualitative_assertions": []},
-            {"case_id": "c3", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "ok", "passed": True}],
+        report = {"availability": "complete", "results": [
+            {"case_id": "c1", "variant": "with_skill", "grading_availability": "complete", "execution_valid": False, "assertions": [], "qualitative_assertions": []},
+            {"case_id": "c2", "variant": "with_skill", "grading_availability": "complete", "vetoed": True, "critical_failures": ["wrote-outside-results"], "assertions": [], "qualitative_assertions": []},
+            {"case_id": "c3", "variant": "with_skill", "grading_availability": "complete", "objective_pass_rate": 1.0, "assertions": [{"name": "ok", "passed": True}],
              "qualitative_assertions": [{"name": "rubric", "type": "judge", "passed": False, "evidence": "weak"}]},
         ], "case_flags": []}
         out = sb.error_analysis_report(report)
@@ -510,8 +536,9 @@ class ErrorAnalysisTests(unittest.TestCase):
         self.assertIn("judge:rubric", cats)   # a qualitative first-failure classifies as judge
 
     def test_review_queue_limit_truncates(self):
-        report = {"results": [
+        report = {"availability": "complete", "results": [
             {"case_id": f"c{i}", "variant": "without_skill", "objective_pass_rate": 0.0,
+             "grading_availability": "complete",
              "assertions": [{"name": "x", "type": "contains", "passed": False}], "qualitative_assertions": []}
             for i in range(5)
         ], "case_flags": []}
@@ -531,11 +558,13 @@ class G1_TokenOverheadScorableTests(unittest.TestCase):
             p = _manifest(rp, [CASE]); runs = root / "runs"
             write_run(runs / "c" / "with_skill", CRASH, metadata={"returncode": 1}, metrics={"total_tokens": 5000})
             write_run(runs / "c" / "without_skill", "APPROVED", metadata={"returncode": 0}, metrics={"total_tokens": 1000})
+            attest_answer_design(p, runs)
             rep = sb.paired_token_overhead_report(p, runs=runs)
             # Before the fix: the crashed with_skill arm graded 0.0 and the pair was
             # differenced -> objective_delta.mean == -1.0 ("the skill hurts accuracy").
-            self.assertEqual(rep["summary"]["paired_runtime_rows"], 0)
-            self.assertIsNone(rep["summary"]["objective_delta"]["mean"])
+            self.assertEqual(rep["summary"]["availability"], "partial")
+            self.assertEqual(rep["summary"]["observed"]["paired_runtime_rows"], 0)
+            self.assertIsNone(rep["summary"]["observed"]["objective_delta"]["mean"])
 
 
 class G2_BenchmarkMetricsScorableTests(unittest.TestCase):
@@ -548,11 +577,14 @@ class G2_BenchmarkMetricsScorableTests(unittest.TestCase):
             p = _manifest(rp, [CASE]); runs = root / "runs"
             write_run(runs / "c" / "with_skill" / "run-1", "APPROVED", metadata={"returncode": 0}, metrics={"total_tokens": 1000})
             write_run(runs / "c" / "with_skill" / "run-2", CRASH, metadata={"returncode": 1}, metrics={"total_tokens": 5000})
+            attest_answer_design(p, runs, variants=["with_skill"])
             rep = sb.build_benchmark_report(p, runs, variants_arg=["with_skill"])
             s = rep["summary"]["with_skill"]
-            self.assertEqual(s["total_tokens"]["mean"], 1000)        # was 3000 (timeout dragged it)
-            self.assertEqual(s["median_total_tokens"], 1000)
-            self.assertEqual(s["execution_errors"], 1)               # the failure is still disclosed
+            self.assertIsNone(s["mean_objective_pass_rate"])
+            observed = s["observed"]
+            self.assertEqual(observed["total_tokens"]["mean"], 1000)  # telemetry describes scorable rows
+            self.assertEqual(observed["median_total_tokens"], 1000)
+            self.assertEqual(observed["execution_errors"], 1)         # the failure is still disclosed
 
 
 class TrajectoryDiffTests(unittest.TestCase):
@@ -602,9 +634,10 @@ class TrajectoryDiffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             rows = self._rows(td, with_events=self._events(["ls"]), without_events=None)
             diff = sb.build_trajectory_diff(rows)
-        self.assertEqual(diff["pairs_compared"], 0)
-        self.assertEqual(diff["cases"], [])
-        self.assertEqual(diff["pair_diagnostics"]["blocked_reason_counts"],
+        observed = diff["observed"]
+        self.assertEqual(observed["pairs_compared"], 0)
+        self.assertEqual(observed["cases"], [])
+        self.assertEqual(observed["pair_diagnostics"]["blocked_reason_counts"],
                          {"missing_trace_evidence": 1})
 
     def test_empty_events_are_missing_trace_evidence(self):
@@ -612,8 +645,9 @@ class TrajectoryDiffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             rows = self._rows(td, with_events=self._events(["ls"]), without_events=empty)
             diff = sb.build_trajectory_diff(rows)
-        self.assertEqual(diff["pairs_compared"], 0)
-        self.assertEqual(diff["pair_diagnostics"]["blocked_reason_counts"],
+        observed = diff["observed"]
+        self.assertEqual(observed["pairs_compared"], 0)
+        self.assertEqual(observed["pair_diagnostics"]["blocked_reason_counts"],
                          {"missing_trace_evidence": 1})
 
     def test_command_exclusivity_is_aggregated_across_repetitions(self):
@@ -639,8 +673,9 @@ class TrajectoryDiffTests(unittest.TestCase):
             rows = self._rows(td, with_events=self._events(["ls"]),
                               without_events=self._events(["ls"]), exec_valid=False)
             diff = sb.build_trajectory_diff(rows)
-        self.assertEqual(diff["pairs_compared"], 0)
-        self.assertEqual(diff["pair_diagnostics"]["blocked_reason_counts"],
+        observed = diff["observed"]
+        self.assertEqual(observed["pairs_compared"], 0)
+        self.assertEqual(observed["pair_diagnostics"]["blocked_reason_counts"],
                          {"unscorable_arm": 1})
 
     def test_benchmark_report_carries_the_section(self):
@@ -654,6 +689,7 @@ class TrajectoryDiffTests(unittest.TestCase):
                               trace_event("message", role="assistant", input_summary="done")]})
                 write_run(runs / "c" / variant, "APPROVED", metadata={},
                           events=events)
+            attest_answer_design(p, runs)
             report = sb.build_benchmark_report(p, runs, split="tune",
                                                variants_arg=["with_skill", "without_skill"])
         diff = report["trajectory_diff"]

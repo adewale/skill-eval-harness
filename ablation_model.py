@@ -28,13 +28,16 @@ adopt it without a cycle.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import statistics
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from json_contracts import freeze_json_value
 
 
 def _require(d: dict[str, Any], key: str, types: type | tuple[type, ...], ctx: str) -> Any:
@@ -70,10 +73,39 @@ TIMEOUT_FAILURE = "[TIMEOUT"
 RUNNER_FAILURE_MARKERS = (CODEX_FAILURE, JETTY_FAILURE, CLAUDE_FAILURE, VIBE_FAILURE, TIMEOUT_FAILURE)
 
 
+def metadata_lifecycle_error(metadata: dict[str, Any] | None) -> str | None:
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        return "metadata must be an object"
+    boolean_fields = (
+        "timed_out", "timeout", "provider_response_complete",
+        "process_observation_complete", "trace_observation_complete",
+        "operation_observation_complete", "artifact_set_complete",
+        "observation_complete",
+    )
+    for field in boolean_fields:
+        if field in metadata and not isinstance(metadata[field], bool):
+            return f"metadata.{field} must be boolean"
+    rc = metadata.get("returncode")
+    if rc is not None and (isinstance(rc, bool) or not isinstance(rc, int)):
+        return "metadata.returncode must be an integer or null"
+    version = metadata.get("artifact_contract_version")
+    if version is not None and (isinstance(version, bool) or version != 1):
+        return "metadata.artifact_contract_version is unsupported"
+    timed_out = metadata.get("timed_out") is True or metadata.get("timeout") is True
+    if timed_out and rc is not None and rc != 124:
+        return "timed-out metadata must use returncode 124"
+    return None
+
+
 def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:
     """False when a run is an INFRASTRUCTURE failure — a nonzero exit, a timeout,
     or a synthetic failure body a runner wrote when it never got a real answer."""
     m = metadata or {}
+    if (metadata_lifecycle_error(m) is not None
+            or m.get("metadata_artifact_valid") is False or m.get("metadata_error")):
+        return False
     rc = m.get("returncode")
     if rc not in (0, None):
         return False
@@ -81,12 +113,14 @@ def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:
         return False
     if m.get("provider_response_complete") is False:
         return False
+    if m.get("artifact_set_complete") is False:
+        return False
     if m.get("artifact_contract_version") == 1 and m.get("artifact_set_complete") is not True:
         return False
     return not (text or "").lstrip().startswith(RUNNER_FAILURE_MARKERS)
 
 
-def scorable_run(row: dict[str, Any]) -> bool:
+def scorable_run(row: Mapping[str, Any]) -> bool:
     """THE predicate for 'this run counts toward scoring': it produced output AND
     was not an infrastructure failure. Every report view filters through this."""
     return not row.get("missing_output") and row.get("execution_valid", True)
@@ -187,7 +221,7 @@ TRIGGER_MEASUREMENT_EVIDENCE_CLASS = "raw_autonomous_trigger_measurement"
 
 
 def causal_confirmation(*, provenance_verified: bool, has_coverage: bool, regression_observed: bool,
-                        significant: bool | None) -> EvidenceClass:
+                        significant: bool) -> EvidenceClass:
     """The ONLY path to CONFIRMED_CAUSAL. `regression_observed` is the domain's
     already-resolved behavioral verdict (for the report: at least one cited case
     showed a named flip AND a same-case score drop). The guard adds the
@@ -198,17 +232,24 @@ def causal_confirmation(*, provenance_verified: bool, has_coverage: bool, regres
     `significant` is the replication gate, inside the door so no caller can
     forget it: an OBSERVED regression that fails its significance test is
     INDETERMINATE — seen, but the noise floor cannot be ruled out — never
-    REFUTED, which would wrongly claim "no regression". Pass None only when a
-    caller has no replication-level test and gates separately; it must still be
-    passed explicitly so a future replicated caller cannot forget the gate. A
-    refutation is a refutation regardless of significance machinery."""
-    if significant is not None and type(significant) is not bool:
-        raise TypeError("significant must be boolean or None")
+    REFUTED, which would wrongly claim "no regression". All four gates are
+    strict booleans: truthy strings, integers, and a missing replication verdict
+    cannot cross this sole confirmation boundary. A refutation is a refutation
+    regardless of significance machinery."""
+    gates = {
+        "provenance_verified": provenance_verified,
+        "has_coverage": has_coverage,
+        "regression_observed": regression_observed,
+        "significant": significant,
+    }
+    for name, value in gates.items():
+        if type(value) is not bool:
+            raise TypeError(f"{name} must be boolean")
     if not provenance_verified or not has_coverage:
         return EvidenceClass.INDETERMINATE
     if not regression_observed:
         return EvidenceClass.REFUTED
-    if significant is False:
+    if not significant:
         return EvidenceClass.INDETERMINATE
     return EvidenceClass.CONFIRMED_CAUSAL
 
@@ -248,23 +289,8 @@ class Mechanism(str, Enum):
     PREPROCESS = "preprocess"
 
 
-class _FrozenDict(dict):
-    def _immutable(self, *args: Any, **kwargs: Any) -> None:
-        raise TypeError("frozen component target cannot be mutated")
-
-    __setitem__ = __delitem__ = __ior__ = clear = pop = popitem = setdefault = update = _immutable
-
-
 def _freeze_json(value: Any, label: str) -> Any:
-    if isinstance(value, dict):
-        if not all(isinstance(key, str) for key in value):
-            raise ValueError(f"{label} object keys must be strings")
-        return _FrozenDict({key: _freeze_json(item, label) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_json(item, label) for item in value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    raise ValueError(f"{label} must contain only JSON-compatible values")
+    return freeze_json_value(value, label)
 
 
 def _nonempty_identifier(value: Any, label: str, *, slug: bool = False) -> str:
@@ -572,7 +598,10 @@ class MaterializedArm:
     def as_legacy_dict(self) -> dict[str, Any]:
         """The historical materialize_ablation() dict shape, derived from the typed
         core so the on-disk/on-wire contract is unchanged for existing consumers."""
-        d = dict(self.arm.provenance.as_dict())
+        provenance = self.arm.provenance
+        if provenance is None:  # guarded structurally by __post_init__
+            raise AssertionError("MaterializedArm lost its required provenance")
+        d = dict(provenance.as_dict())
         d["dir"] = self.dir
         d["skill_files"] = dict(self.skill_files)
         d["isolation_warnings"] = list(self.isolation_warnings)
@@ -666,6 +695,7 @@ class PreparedTask:
     ablation: AblationRecord | None = None
     skill_tree_hash: str | None = None
     answer_key: dict[str, Any] | None = None
+    skill_root_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for label, value in (("case_id", self.case_id), ("kind", self.kind),
@@ -687,9 +717,29 @@ class PreparedTask:
         run_path = Path(self.run_dir)
         if run_path.is_absolute() or run_path == Path(".") or ".." in run_path.parts:
             raise ValueError("PreparedTask.run_dir must be a safe non-root relative path")
-        for label, values in (("skill_paths", self.skill_paths), ("input_files", self.input_files), ("tags", self.tags)):
+        parts = run_path.parts
+        if not parts or parts[0] != self.case_id:
+            raise ValueError("PreparedTask.run_dir must start with its case_id")
+        has_run_segment = bool(re.fullmatch(r"run-[1-9]\d*", parts[-1]))
+        if self.run_number > 1 and not has_run_segment:
+            raise ValueError("repeated PreparedTask.run_dir must end in run-N")
+        if has_run_segment and parts[-1] != f"run-{self.run_number}":
+            raise ValueError("PreparedTask.run_dir repetition disagrees with run_number")
+        variant_index = -2 if has_run_segment else -1
+        if parts[variant_index] != self.variant_truth:
+            raise ValueError("PreparedTask.run_dir arm disagrees with variant")
+        for label, values in (("skill_paths", self.skill_paths),
+                              ("skill_root_keys", self.skill_root_keys),
+                              ("input_files", self.input_files), ("tags", self.tags)):
             if not isinstance(values, tuple) or not all(isinstance(item, str) for item in values):
                 raise ValueError(f"PreparedTask.{label} must be a tuple of strings")
+        if self.skill_root_keys:
+            if len(self.skill_root_keys) != len(self.skill_paths):
+                raise ValueError("PreparedTask.skill_root_keys must align one-to-one with skill_paths")
+            if (len(set(self.skill_root_keys)) != len(self.skill_root_keys)
+                    or any(not key or Path(key).name != key or key in {".", ".."}
+                           for key in self.skill_root_keys)):
+                raise ValueError("PreparedTask.skill_root_keys must be unique safe path segments")
         if self.variant_truth == "without_skill" and self.skill_paths:
             raise ValueError("without_skill task cannot carry skill paths")
         if self.is_ablation:
@@ -762,6 +812,8 @@ class PreparedTask:
             row["ablation"] = self.ablation.as_dict()
         if self.skill_tree_hash is not None:
             row["skill_tree_hash"] = self.skill_tree_hash
+        if self.skill_root_keys:
+            row["skill_root_keys"] = list(self.skill_root_keys)
         if self.answer_key:
             row.update(self.answer_key)
         row["tags"] = list(self.tags)
@@ -776,28 +828,30 @@ class PreparedTask:
         rec = ablation_record_from_dict(row["ablation"]) if row.get("ablation") else None
         answer_key = {k: row[k] for k in ("expected_behavior", "review_rubric") if k in row} or None
         collections: dict[str, tuple[str, ...]] = {}
-        for key in ("skill_paths", "input_files", "tags"):
+        for key in ("skill_paths", "skill_root_keys", "input_files", "tags"):
             raw = row.get(key, [])
             if not isinstance(raw, (list, tuple)) or not all(isinstance(item, str) for item in raw):
                 raise ValueError(f"PreparedTask row field {key!r} must be a list of strings")
             collections[key] = tuple(raw)
+        ctx = "PreparedTask row"
         return cls(
-            case_id=row.get("case_id"),
-            split=row.get("split"),
+            case_id=_require(row, "case_id", str, ctx),
+            split=_require(row, "split", str, ctx),
             kind=row.get("kind", "behavior"),
             variant_truth=str(row.get("variant")),
-            run_number=row.get("run_number"),
-            skill_name=row.get("skill_name"),
-            repo_root=row.get("repo_root"),
+            run_number=_require(row, "run_number", int, ctx),
+            skill_name=_require(row, "skill_name", str, ctx),
+            repo_root=_require(row, "repo_root", str, ctx),
             skill_paths=collections["skill_paths"],
             input_files=collections["input_files"],
-            run_dir=row.get("run_dir"),
+            run_dir=_require(row, "run_dir", str, ctx),
             instruction=row.get("instruction", ""),
             prompt=row.get("prompt", ""),
             tags=collections["tags"],
             ablation=rec,
             skill_tree_hash=row.get("skill_tree_hash"),
             answer_key=answer_key,
+            skill_root_keys=collections["skill_root_keys"],
         )
 
 
@@ -843,5 +897,14 @@ class ResultSet:
         return out
 
     def mean_rate(self, key: str = "objective_pass_rate") -> float | None:
-        vals = [r.get(key) for r in self.scorable()._rows if r.get(key) is not None]
+        vals: list[int | float] = []
+        for row in self.scorable()._rows:
+            value = row.get(key)
+            if value is None:
+                continue
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or not 0 <= value <= 1):
+                raise ValueError(
+                    f"result field {key!r} must be a finite rate in [0, 1] or null")
+            vals.append(value)
         return statistics.mean(vals) if vals else None

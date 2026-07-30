@@ -147,7 +147,8 @@ def construct_pairs(arms: Iterable[ExperimentalArm]) -> PairConstruction:
 
     pairs: list[ExperimentalPair] = []
     blocked: list[BlockedExperimentalPair] = []
-    for key in sorted(indexed):
+    for key in sorted(indexed, key=lambda item: (
+            item.case_id, item.model or "", item.run_number, item.population)):
         slots = indexed[key]
         left = slots.get("with_skill")
         right = slots.get("without_skill")

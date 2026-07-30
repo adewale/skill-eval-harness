@@ -33,7 +33,11 @@ import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
 import skill_benchmark as sb
 from agent_capabilities import AGENT_CAPABILITIES
-from trigger_contracts import InvocationOutcome, InvocationState
+from trigger_contracts import (
+    InvocationOutcome,
+    InvocationState,
+    TriggerRepetitionIdentity,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEMO_MANIFEST = ROOT / "examples" / "demo-skill" / "evals" / "shared-benchmark.json"
@@ -58,13 +62,94 @@ class TriggerRowBoundaryTests(unittest.TestCase):
                 tm.eval_rows_from_args(args, DEMO_MANIFEST)
         self.assertIn("should_trigger must be true or false", str(ctx.exception))
 
+    def test_protocol_producers_reject_nonpositive_concurrency_limits(self):
+        for field, mutation in (
+            ("timeout_seconds", {"timeout": 0, "runs_per_query": 1, "workers": 1}),
+            ("runs_per_query", {"timeout": 1, "runs_per_query": 0, "workers": 1}),
+            ("workers", {"timeout": 1, "runs_per_query": 1, "workers": 0}),
+            ("workers", {"timeout": 1, "runs_per_query": 1, "workers": False}),
+        ):
+            with self.subTest(producer="pi", field=field), \
+                 self.assertRaisesRegex(ValueError, field):
+                tr.pi_trigger_protocol(model=None, **mutation)
+            with self.subTest(producer="matrix", field=field), \
+                 self.assertRaisesRegex(ValueError, field):
+                tm.trigger_protocol([], None, **mutation)
+
+    def test_matrix_rejects_zero_workers_before_constructing_an_executor(self):
+        with self.assertRaisesRegex(SystemExit, "workers must be a positive integer"):
+            tm.run_matrix(
+                DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                models=[None], runs_per_query=1, timeout=30, workers=0,
+            )
+
+    def test_protocol_producers_reject_ambiguous_model_identities(self):
+        for model in ("", "   ", False):
+            with self.subTest(producer="pi", model=model), self.assertRaises(ValueError):
+                tr.pi_trigger_protocol(
+                    timeout=1, runs_per_query=1, workers=1, model=model)
+            with self.subTest(producer="matrix", model=model), self.assertRaises(ValueError):
+                tm.trigger_protocol(
+                    [tm.AgentAdapter()], [model],
+                    timeout=1, runs_per_query=1, workers=1)
+
     def test_eval_set_preserves_false_boolean(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "rows.json"
             path.write_text(json.dumps({"evals": [{"query": "hello", "should_trigger": False}]}), encoding="utf-8")
             args = SimpleNamespace(eval_set=str(path), split="tune")
             rows = tm.eval_rows_from_args(args, DEMO_MANIFEST)
-        self.assertEqual(rows, [{"query": "hello", "should_trigger": False}])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["query"], "hello")
+        self.assertIs(rows[0]["should_trigger"], False)
+        self.assertRegex(rows[0]["query_id"], r"^query-[0-9a-f]{64}$")
+
+    def test_duplicate_query_id_is_rejected_before_runs_are_scheduled(self):
+        rows = [
+            {"query_id": "same", "query": "one", "should_trigger": True},
+            {"query_id": "same", "query": "two", "should_trigger": False},
+        ]
+        with self.assertRaisesRegex(SystemExit, "conflicting queries"):
+            tr.validate_trigger_rows(rows, "fixture")
+
+    def test_exact_duplicate_query_id_is_rejected_before_runs_are_scheduled(self):
+        rows = [
+            {"query_id": "same", "query": "one", "should_trigger": True},
+            {"query_id": "same", "query": "one", "should_trigger": True},
+        ]
+        with self.assertRaisesRegex(SystemExit, "duplicate query_id"):
+            tr.validate_trigger_rows(rows, "fixture")
+
+    def test_distinct_ids_cannot_alias_the_same_authored_query(self):
+        rows = [
+            {"query_id": "first", "query": "one", "should_trigger": True},
+            {"query_id": "second", "query": "one", "should_trigger": True},
+        ]
+        with self.assertRaisesRegex(SystemExit, "alias the same query"):
+            tr.validate_trigger_rows(rows, "fixture")
+
+    def test_cosmetic_query_variants_are_one_inference_identity(self):
+        rows = [
+            {"query_id": "first", "query": "Caf\u00e9   prompt", "should_trigger": True},
+            {"query_id": "second", "query": "  CAFE\u0301 prompt\t", "should_trigger": True},
+        ]
+        with self.assertRaisesRegex(SystemExit, "alias the same query"):
+            tr.validate_trigger_rows(rows, "fixture")
+
+    def test_conflicting_id_aliases_are_rejected(self):
+        rows = [{"id": "first", "query_id": "second",
+                 "query": "one", "should_trigger": True}]
+        with self.assertRaisesRegex(SystemExit, "conflicting query_id and id"):
+            tr.validate_trigger_rows(rows, "fixture")
+
+    def test_eval_set_rejects_evals_and_queries_aliases_together(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "rows.json"
+            row = {"query": "one", "should_trigger": True}
+            path.write_text(json.dumps({"evals": [row], "queries": [row]}), encoding="utf-8")
+            args = SimpleNamespace(eval_set=str(path), split="tune")
+            with self.assertRaisesRegex(SystemExit, "exactly one of evals or queries"):
+                tr.eval_rows_from_args(args, DEMO_MANIFEST)
 
     def test_pi_trigger_runner_invokes_pi_from_isolated_workspace(self):
         seen = {}
@@ -82,6 +167,86 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         self.assertEqual(seen["cwd"], seen["config_dir"])
         self.assertIn("pi-trigger-", seen["cwd"])
         self.assertNotEqual(Path(seen["cwd"]).resolve(), ROOT.resolve())
+
+    def test_pi_ablation_row_names_edited_tree_and_repetition(self):
+        def fake_run(*args, **kwargs):
+            return InvocationOutcome.from_process(
+                stdout=json.dumps({
+                    "type": "agent_end",
+                    "messages": [{"role": "assistant", "stopReason": "stop"}],
+                }) + "\n",
+                stderr="", returncode=0, elapsed_ms=1,
+            )
+
+        identity = TriggerRepetitionIdentity("pi-query", 2)
+        with mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=fake_run):
+            result = tr.run_query(
+                DEMO_MANIFEST, "ordinary chat", False, 12, None,
+                ablation="weaker-description", identity=identity)
+        self.assertEqual(result["skill_tree_hash"], result["ablation"]["skill_hash"])
+        self.assertNotEqual(result["skill_tree_hash"],
+                            result["ablation"]["parent_skill_hash"])
+        self.assertEqual((result["query_id"], result["run_number"]),
+                         ("pi-query", 2))
+
+    def test_pi_main_reports_are_accepted_by_trigger_comparer(self):
+        terminal = InvocationOutcome.from_process(
+            stdout=json.dumps({
+                "type": "agent_end",
+                "messages": [{"role": "assistant", "stopReason": "stop"}],
+            }) + "\n",
+            stderr="", returncode=0, elapsed_ms=1,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            eval_set = root / "rows.json"
+            eval_set.write_text(json.dumps([
+                {"query_id": "negative", "query": "ordinary chat",
+                 "should_trigger": False},
+            ]), encoding="utf-8")
+            reports = []
+            for ablation in (None, "weaker-description"):
+                out = root / ("ablation.json" if ablation else "baseline.json")
+                argv = ["skill-pi-trigger-eval", str(DEMO_MANIFEST),
+                        "--eval-set", str(eval_set), "--runs-per-query", "1",
+                        "--workers", "1", "--timeout", "12", "--out", str(out)]
+                if ablation:
+                    argv.extend(["--ablation", ablation])
+                with mock.patch.object(sys, "argv", argv), \
+                     mock.patch.object(tr, "invoke_argv_with_timeout", return_value=terminal), \
+                     mock.patch("builtins.print"):
+                    self.assertEqual(tr.main(), 0)
+                reports.append(json.loads(out.read_text(encoding="utf-8")))
+        compared = sb.build_trigger_comparison(reports[0], reports[1])
+        self.assertTrue(compared["provenance"]["verified"])
+        self.assertEqual(compared["paired"]["blocked"], [])
+
+    def test_pi_main_excludes_incomplete_runs_from_pass_rate_denominator(self):
+        timed_out = InvocationOutcome.from_process(
+            stdout=json.dumps({"type": "agent_start"}) + "\n",
+            stderr="timeout", returncode=124, elapsed_ms=1,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            eval_set = root / "rows.json"
+            out = root / "report.json"
+            eval_set.write_text(json.dumps([
+                {"query_id": "negative", "query": "ordinary chat",
+                 "should_trigger": False},
+            ]), encoding="utf-8")
+            argv = ["skill-pi-trigger-eval", str(DEMO_MANIFEST),
+                    "--eval-set", str(eval_set), "--runs-per-query", "1",
+                    "--workers", "1", "--timeout", "1", "--out", str(out)]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(tr, "invoke_argv_with_timeout", return_value=timed_out), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(tr.main(), 0)
+            summary = json.loads(out.read_text(encoding="utf-8"))["summary"]
+        self.assertEqual(summary, {
+            "total": 1, "complete": 0, "incomplete": 1,
+            "passed": 0, "failed": 0, "pass_rate": None,
+            "observed_pass_rate": None,
+        })
 
 
     def test_pi_json_provider_error_cannot_pass_a_negative_trigger(self):
@@ -141,6 +306,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
                          "usage": {"input": 4, "output": 1, "totalTokens": 5}}
             stdout = "\n".join([
                 json.dumps({"type": "tool_execution_start", "toolName": "read", "args": {"path": str(skill)}}),
+                json.dumps({"type": "tool_execution_end", "toolName": "read", "args": {"path": str(skill)}, "result": "ok"}),
                 json.dumps({"type": "agent_end", "messages": [assistant]}),
             ]) + "\n"
             return InvocationOutcome.from_process(
@@ -154,7 +320,10 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             skill = tree / "demo"
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
-            row = tm.run_cell_query(tm.PiAdapter(), tree, "review this", True, None, 12)
+            row = tm.run_cell_query(
+                tm.PiAdapter(), tree, "review this", True, None, 12,
+                metadata={"skill_tree_hash": sb.skill_tree_hash(tree)},
+            )
         self.assertEqual(parse_stream.call_count, 1)
         self.assertTrue(row["triggered"])
         self.assertEqual(row["usage_normalized"]["total_tokens"], 5)
@@ -175,6 +344,9 @@ class TriggerRowBoundaryTests(unittest.TestCase):
 
 
 class StubMatrixOfflineTests(unittest.TestCase):
+    def test_every_matrix_adapter_has_an_explicit_trace_dialect(self):
+        self.assertLessEqual(set(tm.ADAPTERS), set(sb.TRACE_DIALECTS))
+
     def test_demo_manifest_has_both_polarities(self):
         rows = demo_trigger_rows()
         self.assertEqual(len(rows), 2)
@@ -255,7 +427,7 @@ class StubMatrixOfflineTests(unittest.TestCase):
             _, tree_hash, provenance = tm.trigger_tree_for_manifest(repo_root, manifest, Path(td), "weaker-description")
         self.assertEqual(provenance["id"], "weaker-description")
         self.assertEqual(provenance["population"], "trigger")
-        self.assertEqual(tree_hash, provenance["parent_skill_hash"])
+        self.assertEqual(tree_hash, provenance["skill_hash"])
         self.assertNotIn("dir", provenance)
         self.assertNotIn("skill_files", provenance)
 
@@ -296,13 +468,18 @@ class StubMatrixOfflineTests(unittest.TestCase):
         finally:
             tm.ADAPTERS["stub"] = old
         self.assertEqual(report["summary"]["total"], 1)
+        self.assertEqual(report["summary"]["complete"], 0)
+        self.assertEqual(report["summary"]["incomplete"], 1)
         self.assertEqual(report["summary"]["passed"], 0)
+        self.assertIsNone(report["summary"]["pass_rate"])
         self.assertEqual(report["matrix"][0]["summary"]["incomplete_observations"], 1)
+        self.assertEqual(report["matrix"][0]["queries"][0]["complete"], 0)
+        self.assertIsNone(report["matrix"][0]["queries"][0]["trigger_rate"])
         self.assertIn("disk full", report["results"][0]["error"])
 
     def test_trace_redacts_workspace_credentials(self):
         class SecretEchoAdapter(tm.AgentAdapter):
-            name = "secret"
+            name = "generic"
 
             def mount(self, tree_dir, workspace):
                 (workspace / ".codex").mkdir(parents=True)
@@ -321,17 +498,19 @@ class StubMatrixOfflineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tree = tm.build_canonical_skill_tree(tm.repo_root_for_manifest(DEMO_MANIFEST), tm.load_manifest(DEMO_MANIFEST), Path(td) / "tree")
             trace_dir = Path(td) / "trace"
-            row = tm.run_cell_query(SecretEchoAdapter(), tree, "q", True, None, 12, trace_dir)
+            row = tm.run_cell_query(
+                SecretEchoAdapter(), tree, "q", True, None, 12, trace_dir,
+                metadata={"skill_tree_hash": sb.skill_tree_hash(tree)},
+            )
             trace_text = (trace_dir / "trace.jsonl").read_text(encoding="utf-8")
             metadata_text = (trace_dir / "metadata.json").read_text(encoding="utf-8")
             metrics_text = (trace_dir / "metrics.json").read_text(encoding="utf-8")
-        self.assertTrue(row["triggered"])
+        self.assertFalse(row["triggered"])
         self.assertNotIn("SECRET-TOKEN-12345", trace_text)
         self.assertNotIn("SECRET-TOKEN-12345", json.dumps(row))
         self.assertNotIn("SECRET-TOKEN-12345", metadata_text)
         self.assertNotIn("SECRET-TOKEN-12345", metrics_text)
         self.assertIn("[REDACTED]", trace_text)
-        self.assertIn("[REDACTED]", json.dumps(row))
 
     def test_weakened_description_under_triggers_offline(self):
         """The loop's core signal, deterministic: strip the description of the
@@ -394,8 +573,14 @@ class ClaudeDetectionTests(unittest.TestCase):
 
     def test_reading_the_mounted_skill_md_is_fallback_evidence(self):
         mounted = Path("/tmp/trigger-x/.claude/skills/demo-reviewer/SKILL.md")
-        stream = json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "name": "Read", "input": {"file_path": str(mounted)}}]}})
+        stream = "\n".join([
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "read-1", "name": "Read",
+                 "input": {"file_path": str(mounted)}}]}}),
+            json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "read-1", "content": "ok"}]}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "done"}),
+        ])
         detection = self._adapter().detect(completed_invocation(stream), ["demo-reviewer"], [mounted])
         self.assertTrue(detection.triggered)
 
@@ -432,7 +617,8 @@ class ClaudeDetectionTests(unittest.TestCase):
             config_dir = Path(env["CLAUDE_CONFIG_DIR"])
             seen["config_dir"] = config_dir
             seen["credentials"] = (config_dir / ".credentials.json").read_text(encoding="utf-8")
-            return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False,
+            return {"stdout": json.dumps({"type": "result", "subtype": "success"}) + "\n",
+                    "stderr": "", "returncode": 0, "timed_out": False,
                     "elapsed_ms": 1, "observation_complete": True}
 
         with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)):
@@ -452,7 +638,8 @@ class ClaudeDetectionTests(unittest.TestCase):
 
         def fake_run(argv, *, cwd, env, timeout):
             seen["config_dir"] = env.get("CLAUDE_CONFIG_DIR")
-            return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False,
+            return {"stdout": json.dumps({"type": "result", "subtype": "success"}) + "\n",
+                    "stderr": "", "returncode": 0, "timed_out": False,
                     "elapsed_ms": 1, "observation_complete": True}
 
         with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)):
@@ -466,6 +653,26 @@ class ClaudeDetectionTests(unittest.TestCase):
         self.assertFalse((workspace / ".trigger-config").exists())
         self.assertFalse(result.metadata["config_isolated"])
         self.assertIn("personal config may influence", result.metadata["config_isolation_warning"])
+
+    def test_claude_malformed_stream_is_not_a_valid_negative_observation(self):
+        def fake_run(*args, **kwargs):
+            return InvocationOutcome.from_process(
+                stdout="\n".join([
+                    json.dumps({
+                        "type": "assistant",
+                        "message": {"content": {"type": "tool_use", "name": "Skill"}},
+                    }),
+                    json.dumps({"type": "result", "subtype": "success"}),
+                ]) + "\n",
+                stderr="", returncode=0, elapsed_ms=1,
+            )
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)), \
+             mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
+            result = tm.ClaudeAdapter().invoke("q", "haiku", Path(td), 1)
+        self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
+        self.assertIn("protocol error", result.provider_error or "")
 
 
 class CodexAdapterTests(unittest.TestCase):
@@ -484,17 +691,41 @@ class CodexAdapterTests(unittest.TestCase):
         mounted = Path("/tmp/trigger-x/.codex/skills/demo-reviewer/SKILL.md")
         stream = json.dumps({"type": "command", "command": ["bash", "-lc", f"cat {mounted}"]})
         detection = tm.CodexAdapter().detect(completed_invocation(stream), ["demo-reviewer"], [mounted])
-        self.assertTrue(detection.triggered)
-        self.assertTrue(detection.evidence)
+        self.assertFalse(detection.triggered)
+        self.assertFalse(detection.evidence)
         prose = json.dumps({"type": "message", "content": "I would use demo-reviewer."})
         self.assertFalse(tm.CodexAdapter().detect(completed_invocation(prose), ["demo-reviewer"], [mounted]).triggered)
+
+    def test_codex_malformed_stream_is_not_a_valid_negative_observation(self):
+        def fake_run(*args, **kwargs):
+            return InvocationOutcome.from_process(
+                stdout="not-json\n", stderr="", returncode=0, elapsed_ms=1,
+            )
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
+            workspace = Path(td) / "workspace"
+            workspace.mkdir()
+            result = tm.CodexAdapter().invoke("q", None, workspace, 1)
+        self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
+
+    def test_codex_parseable_but_unterminated_stream_is_not_a_valid_negative_observation(self):
+        def fake_run(*args, **kwargs):
+            return InvocationOutcome.from_process(
+                stdout="{}\n", stderr="", returncode=0, elapsed_ms=1,
+            )
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
+            workspace = Path(td) / "workspace"
+            workspace.mkdir()
+            result = tm.CodexAdapter().invoke("q", None, workspace, 1)
+        self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
 
     def test_codex_invoke_appends_raw_query_model_and_external_skill_dir(self):
         seen = {}
 
         def fake_run(argv, *, cwd, env, timeout):
             seen.update({"argv": argv, "cwd": cwd, "env": env, "timeout": timeout})
-            return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False,
+            return {"stdout": '{"type":"turn.completed"}\n', "stderr": "", "returncode": 0, "timed_out": False,
                     "elapsed_ms": 1, "observation_complete": True}
 
         with mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
@@ -523,7 +754,7 @@ class CodexAdapterTests(unittest.TestCase):
             seen["user_skills_not_copied"] = not (codex_home / "skills" / "personal").exists()
             seen["workspace_auth_present"] = (Path(cwd) / ".codex" / "auth.json").exists()
             seen["workspace_config_present"] = (Path(cwd) / ".codex" / "config.toml").exists()
-            return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False,
+            return {"stdout": '{"type":"turn.completed"}\n', "stderr": "", "returncode": 0, "timed_out": False,
                     "elapsed_ms": 1, "observation_complete": True}
 
         with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
@@ -570,7 +801,8 @@ class CodexAdapterTests(unittest.TestCase):
             row = tm.run_cell_query(
                 LeakyAdapter(), tree, "q", False, None, 12,
                 trace_dir=Path(td) / "trace",
-                metadata={"external": {"token": "ambient-secret-token"}},
+                metadata={"skill_tree_hash": sb.skill_tree_hash(tree),
+                          "external": {"token": "ambient-secret-token"}},
             )
             trace_text = (Path(row["trace_dir"]) / "trace.jsonl").read_text(encoding="utf-8")
             trace_metadata = json.loads((Path(row["trace_dir"]) / "metadata.json").read_text(encoding="utf-8"))
@@ -598,8 +830,34 @@ class CodexAdapterTests(unittest.TestCase):
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
             with self.assertRaises(KeyError) as ctx:
-                tm.run_cell_query(BrokenAdapter(), tree, "q", True, None, 12)
+                tm.run_cell_query(
+                    BrokenAdapter(), tree, "q", True, None, 12,
+                    metadata={"skill_tree_hash": sb.skill_tree_hash(tree)},
+                )
         self.assertIn("observation_complete", str(ctx.exception))
+
+    def test_run_cell_query_rejects_mount_bytes_that_differ_from_scheduled_tree(self):
+        class MutatingAdapter(tm.AgentAdapter):
+            name = "stub"
+
+            def mount(self, tree_dir, workspace):
+                copied = self._mount_tree(tree_dir, workspace / "skills")
+                copied[0].write_text("mutated after scheduling\n", encoding="utf-8")
+                return copied
+
+            def invoke(self, query, model, workspace, timeout):
+                raise AssertionError("mismatched mounted bytes must fail before invocation")
+
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td) / "tree"
+            skill = tree / "demo"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "mounted skill tree hash"):
+                tm.run_cell_query(
+                    MutatingAdapter(), tree, "q", True, None, 12,
+                    metadata={"skill_tree_hash": sb.skill_tree_hash(tree)},
+                )
 
     def test_missing_capability_row_fails_before_any_runs(self):
         class UnregisteredAdapter(tm.AgentAdapter):
@@ -628,6 +886,16 @@ class CodexAdapterTests(unittest.TestCase):
         codex_action = next(a for a in parser._actions if "--codex-cmd" in getattr(a, "option_strings", ()))
         self.assertEqual(codex_action.default, tm.DEFAULT_CODEX_CMD)
 
+    def test_interpreter_wrapper_identity_binds_script_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "wrapper.py"
+            script.write_text("print('first')\n", encoding="utf-8")
+            first = tm.executable_identity(f"{sys.executable} {script}")
+            script.write_text("print('second')\n", encoding="utf-8")
+            second = tm.executable_identity(f"{sys.executable} {script}")
+        self.assertNotEqual(first, second)
+        self.assertIn(str(script.resolve()), first["argument_files"])
+
 
 class VibeAdapterTests(unittest.TestCase):
     """Mistral Vibe trigger support without a live API key."""
@@ -655,12 +923,42 @@ class VibeAdapterTests(unittest.TestCase):
         self.assertIn(".agents", str(copied[0]))
 
     def test_vibe_detects_native_skill_tool_call(self):
-        stream = json.dumps({"role": "assistant", "tool_calls": [{"function": {"name": "skill", "arguments": json.dumps({"name": "demo-reviewer"})}}]})
+        stream = "\n".join([
+            json.dumps({"role": "assistant", "tool_calls": [{
+                "id": "call-1", "function": {"name": "skill",
+                "arguments": json.dumps({"name": "demo-reviewer"})}}]}),
+            json.dumps({"role": "tool", "tool_call_id": "call-1", "content": "loaded"}),
+            json.dumps({"role": "assistant", "content": "done"}),
+        ])
         detection = tm.VibeAdapter().detect(completed_invocation(stream), ["demo-reviewer"], [])
         self.assertTrue(detection.triggered)
         self.assertIn("Vibe skill tool invoked: demo-reviewer", detection.legacy_evidence)
         other = json.dumps({"role": "assistant", "tool_calls": [{"function": {"name": "skill", "arguments": json.dumps({"name": "other"})}}]})
         self.assertFalse(tm.VibeAdapter().detect(completed_invocation(other), ["demo-reviewer"], []).triggered)
+
+    def test_vibe_malformed_stream_is_not_a_valid_negative_observation(self):
+        def fake_run(*args, **kwargs):
+            return InvocationOutcome.from_process(
+                stdout="not-json\n", stderr="", returncode=0, elapsed_ms=1,
+            )
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.VibeAdapter, "_run_argv", staticmethod(fake_run)):
+            workspace = Path(td) / "workspace"
+            workspace.mkdir()
+            result = tm.VibeAdapter().invoke("q", None, workspace, 1)
+        self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
+
+    def test_vibe_parseable_but_answerless_stream_is_not_a_valid_negative_observation(self):
+        def fake_run(*args, **kwargs):
+            return InvocationOutcome.from_process(
+                stdout="{}\n", stderr="", returncode=0, elapsed_ms=1,
+            )
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.VibeAdapter, "_run_argv", staticmethod(fake_run)):
+            workspace = Path(td) / "workspace"
+            workspace.mkdir()
+            result = tm.VibeAdapter().invoke("q", None, workspace, 1)
+        self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
 
     def test_vibe_invoke_uses_isolated_home_model_env_and_prompt_arg(self):
         seen = {}
@@ -884,12 +1182,14 @@ class VibeMatrixSmokeTests(unittest.TestCase):
                         "no Vibe run loaded the skill — detection, auth, or mounting is broken")
 
 
-def trigger_row(query, should, *, triggered, complete=True, agent="stub", model=None):
+def trigger_row(query, should, *, triggered, complete=True, agent="stub", model=None,
+                query_id=None, run_number=1):
     """One persisted trigger-matrix result row, valid under
     TriggerObservation.from_row's contract."""
     evidence = ["skills/demo/SKILL.md"] if (complete and triggered) else []
     return {
         "population": "trigger", "agent": agent, "model": model, "query": query,
+        "query_id": query_id or query, "run_number": run_number,
         "should_trigger": should, "triggered": complete and triggered,
         "pass": complete and (triggered == should),
         "observation_complete": complete,
@@ -897,6 +1197,7 @@ def trigger_row(query, should, *, triggered, complete=True, agent="stub", model=
         "elapsed_ms": 5, "completion_evidence": "normal_exit" if complete else None,
         "evidence": evidence,
         "evidence_typed": [{"kind": "mounted_path", "text": t} for t in evidence],
+        "protocol_observation": {},
         "usage_normalized": {"source": "missing"}, "cost_normalized": {"source": "missing"},
         "stderr": "",
     }
@@ -911,13 +1212,57 @@ ABLATION_PROVENANCE = {
                     "skill_root": "skills/demo", "target": {"field": "description"}}],
 }
 
+TRIGGER_MANIFEST = {
+    "skill_name": "demo",
+    "skill_paths": ["skills/demo"],
+    "ablations": [{
+        "id": "drop-description", "population": "trigger",
+        "components": [{"class": "discovery", "mechanism": "frontmatter_field",
+                        "skill_root": "skills/demo", "target": {"field": "description"}}],
+    }],
+}
 
-def trigger_report(rows, *, ablation=None, provenance=None, tree_hash=BASE_HASH):
+
+def trigger_report(rows, *, ablation=None, provenance=None, tree_hash=BASE_HASH,
+                   runs_per_query=2):
+    design = []
+    seen = set()
+    for row in rows:
+        key = (row["agent"], row["model"], row["query_id"])
+        if key not in seen:
+            design.append({k: row[k] for k in (
+                "agent", "model", "query_id", "query", "should_trigger")})
+            seen.add(key)
+    adapter_models = {}
+    for row in rows:
+        adapter_models.setdefault(row["agent"], [])
+        if row["model"] not in adapter_models[row["agent"]]:
+            adapter_models[row["agent"]].append(row["model"])
+    protocol = {
+        "schema_version": 1, "producer": "skill-trigger-matrix",
+        "harness_identity": sb.trigger_harness_identity(),
+        "timeout_seconds": 30, "runs_per_query": runs_per_query, "workers": 1,
+        "adapters": [
+            {"adapter": f"run_trigger_matrix.{agent.title()}Adapter", "agent": agent,
+             "trace_dialect": agent,
+             "implementation_sha256": "sha256:" + ("0" * 64),
+             "producer_sha256": "sha256:" + ("1" * 64),
+             "required_observations": {}, "models": models}
+            for agent, models in sorted(adapter_models.items())
+        ],
+    }
+    protocol_sha256 = sb.canonical_json_sha256(protocol)
+    rows = [{**row, "skill_tree_hash": tree_hash,
+             "protocol_sha256": protocol_sha256,
+             "protocol_observation": row.get("protocol_observation", {})}
+            for row in rows]
     return {"skill_name": "demo", "generated_at": 1,
             "evidence_class": tm.TRIGGER_MEASUREMENT_EVIDENCE_CLASS,
             "skill_tree_hash": tree_hash, "ablation": ablation,
             "provenance": provenance if provenance is not None else {"mode": "baseline", "skill_tree_hash": tree_hash},
-            "runs_per_query": 2, "results": rows}
+            "manifest_identity": sb.trigger_manifest_identity(TRIGGER_MANIFEST),
+            "protocol": protocol, "protocol_sha256": protocol_sha256,
+            "runs_per_query": runs_per_query, "design": design, "results": rows}
 
 
 class TriggerComparisonTests(unittest.TestCase):
@@ -929,17 +1274,26 @@ class TriggerComparisonTests(unittest.TestCase):
     QUERIES = [f"query {n}" for n in range(1, 7)]   # 6 paired deltas: exact p ~= 0.031
 
     def _baseline_rows(self):
-        return [trigger_row(q, True, triggered=True) for q in self.QUERIES for _ in range(2)]
+        return [trigger_row(q, True, triggered=True, run_number=run_number)
+                for q in self.QUERIES for run_number in range(1, 3)]
 
     def _ablation_rows(self, *, triggered=False):
-        return [trigger_row(q, True, triggered=triggered) for q in self.QUERIES for _ in range(2)]
+        return [trigger_row(q, True, triggered=triggered, run_number=run_number)
+                for q in self.QUERIES for run_number in range(1, 3)]
 
-    def _compare(self, base_rows=None, abl_rows=None, *, provenance=None, abl_hash=EDIT_HASH):
-        baseline = trigger_report(base_rows if base_rows is not None else self._baseline_rows())
+    def _compare(self, base_rows=None, abl_rows=None, *, provenance=None,
+                 abl_hash=EDIT_HASH, base_runs_per_query=2,
+                 abl_runs_per_query=None):
+        baseline = trigger_report(
+            base_rows if base_rows is not None else self._baseline_rows(),
+            runs_per_query=base_runs_per_query)
         ablation = trigger_report(abl_rows if abl_rows is not None else self._ablation_rows(),
                                   ablation="drop-description",
                                   provenance=provenance if provenance is not None else ABLATION_PROVENANCE,
-                                  tree_hash=abl_hash)
+                                  tree_hash=abl_hash,
+                                  runs_per_query=(abl_runs_per_query
+                                                  if abl_runs_per_query is not None
+                                                  else base_runs_per_query))
         return sb.build_trigger_comparison(baseline, ablation)
 
     def test_verified_significant_drop_confirms_causal(self):
@@ -952,6 +1306,22 @@ class TriggerComparisonTests(unittest.TestCase):
         self.assertTrue(out["paired"]["significance"]["significant_at_0_05"])
         self.assertEqual(out["paired"]["comparable_queries"][0]["pass_delta"], -1.0)
 
+    def test_comparer_keeps_sub_millionth_rate_deltas(self):
+        epsilon = 1 / 3_000_000
+        # Four rates per cell: baseline pass/trigger, then ablation pass/trigger.
+        full_precision_rates = iter(
+            value
+            for _ in self.QUERIES
+            for value in (1.0, 1.0, 1.0 - epsilon, 1.0 - epsilon)
+        )
+        with mock.patch.object(sb, "_exact_rate", side_effect=full_precision_rates) as exact_rate:
+            out = self._compare()
+        self.assertEqual(exact_rate.call_count, 4 * len(self.QUERIES))
+        self.assertLess(out["paired"]["comparable_queries"][0]["pass_delta"], 0)
+        self.assertAlmostEqual(
+            out["paired"]["comparable_queries"][0]["pass_delta"], -epsilon)
+        self.assertLess(out["summary"]["mean_pass_delta"], 0)
+
     def test_no_drop_is_refuted(self):
         out = self._compare(abl_rows=self._ablation_rows(triggered=True))
         self.assertEqual(out["evidence_class"], "refuted")
@@ -959,7 +1329,8 @@ class TriggerComparisonTests(unittest.TestCase):
 
     def test_observed_but_insignificant_drop_is_indeterminate(self):
         # one regressed query out of six cannot clear the sign-flip bar
-        abl = [trigger_row(q, True, triggered=(q != "query 1")) for q in self.QUERIES for _ in range(2)]
+        abl = [trigger_row(q, True, triggered=(q != "query 1"), run_number=run_number)
+               for q in self.QUERIES for run_number in range(1, 3)]
         out = self._compare(abl_rows=abl)
         self.assertEqual(out["evidence_class"], "indeterminate")
         self.assertEqual(len(out["regressed_queries"]), 1)
@@ -974,7 +1345,8 @@ class TriggerComparisonTests(unittest.TestCase):
             # this confirmed merely because at least one cell was negative.
             baseline.append(trigger_row(query, True, triggered=(i == 0)))
             ablation.append(trigger_row(query, True, triggered=(i != 0)))
-        out = self._compare(base_rows=baseline, abl_rows=ablation)
+        out = self._compare(base_rows=baseline, abl_rows=ablation,
+                            base_runs_per_query=1)
         self.assertTrue(out["paired"]["significance"]["significant_at_0_05"])
         self.assertGreater(out["summary"]["mean_pass_delta"], 0)
         self.assertEqual(out["evidence_class"], "refuted")
@@ -986,7 +1358,8 @@ class TriggerComparisonTests(unittest.TestCase):
                     for n in range(6)]
         ablation = [trigger_row("one query", True, triggered=False, model=f"m{n}")
                     for n in range(6)]
-        out = self._compare(base_rows=baseline, abl_rows=ablation)
+        out = self._compare(base_rows=baseline, abl_rows=ablation,
+                            base_runs_per_query=1)
         self.assertEqual(out["summary"]["comparable_cells"], 6)
         self.assertEqual(out["paired"]["significance"]["n"], 1)
         self.assertEqual(out["evidence_class"], "indeterminate")
@@ -998,6 +1371,28 @@ class TriggerComparisonTests(unittest.TestCase):
         self.assertFalse(out["provenance"]["verified"])
         self.assertTrue(any("different skill revision" in r for r in out["provenance"]["reasons"]))
 
+    def test_baseline_provenance_must_attest_its_top_level_hash(self):
+        baseline = trigger_report(self._baseline_rows())
+        baseline["provenance"]["skill_tree_hash"] = "sha256:other"
+        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
+                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
+        out = sb.build_trigger_comparison(baseline, ablation)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertTrue(any("baseline provenance" in reason
+                            for reason in out["provenance"]["reasons"]))
+
+    def test_skill_name_mismatch_is_indeterminate(self):
+        baseline = trigger_report(self._baseline_rows())
+        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
+                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
+        ablation["skill_name"] = "other"
+        ablation["manifest_identity"] = sb.trigger_manifest_identity(
+            {**TRIGGER_MANIFEST, "skill_name": "other"})
+        out = sb.build_trigger_comparison(baseline, ablation)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertTrue(any("different skills" in reason
+                            for reason in out["provenance"]["reasons"]))
+
     def test_top_level_ablation_id_must_match_provenance(self):
         provenance = {**ABLATION_PROVENANCE, "id": "some-other-ablation"}
         out = self._compare(provenance=provenance)
@@ -1007,29 +1402,228 @@ class TriggerComparisonTests(unittest.TestCase):
                             for reason in out["provenance"]["reasons"]))
 
     def test_missing_and_incomplete_arms_are_blocked_pairs(self):
-        base = self._baseline_rows() + [trigger_row("only baseline", True, triggered=True)]
-        abl = self._ablation_rows() + [trigger_row("timed out", True, triggered=False, complete=False)]
-        base += [trigger_row("timed out", True, triggered=True)]
+        base = self._baseline_rows() + [
+            trigger_row("only baseline", True, triggered=True, run_number=n)
+            for n in range(1, 3)
+        ]
+        abl = self._ablation_rows() + [
+            trigger_row("timed out", True, triggered=False,
+                        complete=(n == 1), run_number=n)
+            for n in range(1, 3)
+        ]
+        base += [trigger_row("timed out", True, triggered=True, run_number=n)
+                 for n in range(1, 3)]
         out = self._compare(base_rows=base, abl_rows=abl)
         reasons = {b["query"]: b["reason"] for b in out["paired"]["blocked"]}
         self.assertEqual(reasons["only baseline"], "missing_ablation_arm")
         self.assertEqual(reasons["timed out"], "ablation_observations_incomplete")
         self.assertEqual(out["summary"]["comparable"], 6)
+        self.assertFalse(out["paired"]["significance"]["significant_at_0_05"])
+        self.assertTrue(out["paired"]["observed_significance"]["significant_at_0_05"])
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertIn("coverage incomplete", out["note"])
 
-    def test_partial_or_mismatched_repetitions_are_blocked(self):
-        base = [trigger_row("partial", True, triggered=True) for _ in range(2)]
-        abl = [trigger_row("partial", True, triggered=False),
-               trigger_row("partial", True, triggered=False, complete=False)]
-        base += [trigger_row("mismatched", True, triggered=True) for _ in range(2)]
-        abl += [trigger_row("mismatched", True, triggered=False)]
+    def test_incomplete_repetition_is_blocked(self):
+        base = [trigger_row("partial", True, triggered=True, run_number=n)
+                for n in range(1, 3)]
+        abl = [trigger_row("partial", True, triggered=False,
+                           complete=(n == 1), run_number=n)
+               for n in range(1, 3)]
         out = self._compare(base_rows=base, abl_rows=abl)
-        reasons = {entry["query"]: entry["reason"] for entry in out["paired"]["blocked"]}
-        self.assertEqual(reasons, {
-            "mismatched": "repetition_count_mismatch",
-            "partial": "ablation_observations_incomplete",
-        })
+        self.assertEqual(out["paired"]["blocked"][0]["reason"],
+                         "ablation_observations_incomplete")
         self.assertEqual(out["summary"]["comparable"], 0)
         self.assertEqual(out["evidence_class"], "indeterminate")
+
+    def test_mismatched_declared_repetition_sets_are_blocked(self):
+        base = [trigger_row("mismatched", True, triggered=True, run_number=n)
+                for n in range(1, 3)]
+        abl = [trigger_row("mismatched", True, triggered=False)]
+        out = self._compare(base_rows=base, abl_rows=abl,
+                            abl_runs_per_query=1)
+        self.assertEqual(out["paired"]["blocked"][0]["reason"],
+                         "repetition_count_mismatch")
+        self.assertEqual(out["evidence_class"], "indeterminate")
+
+    def test_declared_repetition_shortfall_is_rejected(self):
+        short = [trigger_row("short", True, triggered=True, run_number=1)]
+        with self.assertRaises(SystemExit):
+            self._compare(base_rows=short, abl_rows=self._ablation_rows())
+
+    def test_whole_declared_cell_missing_from_results_is_rejected(self):
+        baseline = trigger_report(self._baseline_rows())
+        baseline["results"] = [row for row in baseline["results"]
+                               if row["query_id"] != self.QUERIES[0]]
+        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
+                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
+        with self.assertRaises(SystemExit):
+            sb.build_trigger_comparison(baseline, ablation)
+
+    def test_duplicate_repetition_identity_is_rejected(self):
+        duplicate = [trigger_row("duplicate", True, triggered=True, run_number=1),
+                     trigger_row("duplicate", True, triggered=True, run_number=1),
+                     trigger_row("duplicate", True, triggered=True, run_number=2)]
+        with self.assertRaises(SystemExit):
+            self._compare(base_rows=duplicate, abl_rows=self._ablation_rows())
+
+    def test_design_cannot_omit_a_persisted_result_cell(self):
+        baseline = trigger_report(self._baseline_rows())
+        baseline["design"] = baseline["design"][1:]
+        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
+                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
+        with self.assertRaises(SystemExit):
+            sb.build_trigger_comparison(baseline, ablation)
+
+    def test_manifest_declared_component_target_is_authoritative(self):
+        wrong = {
+            **ABLATION_PROVENANCE,
+            "components": [{**ABLATION_PROVENANCE["components"][0],
+                            "target": {"field": "name"}}],
+        }
+        out = self._compare(provenance=wrong)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertTrue(any("manifest-declared treatment" in reason
+                            for reason in out["provenance"]["reasons"]))
+
+    def test_invalid_skill_ablation_can_never_confirm_behavioral_causality(self):
+        invalid_manifest = {
+            **TRIGGER_MANIFEST,
+            "ablations": [{**TRIGGER_MANIFEST["ablations"][0], "invalid_skill": True}],
+        }
+        invalid_provenance = {**ABLATION_PROVENANCE, "mode": "invalid_skill"}
+        baseline = trigger_report(self._baseline_rows())
+        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
+                                  provenance=invalid_provenance, tree_hash=EDIT_HASH)
+        identity = sb.trigger_manifest_identity(invalid_manifest)
+        baseline["manifest_identity"] = identity
+        ablation["manifest_identity"] = identity
+        out = sb.build_trigger_comparison(baseline, ablation)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertIn("invalid-skill experiment", out["note"])
+
+    def test_protocol_drift_is_indeterminate_even_when_rows_regress(self):
+        baseline = trigger_report(self._baseline_rows())
+        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
+                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
+        ablation["protocol"] = {**ablation["protocol"], "timeout_seconds": 31}
+        ablation["protocol_sha256"] = sb.canonical_json_sha256(ablation["protocol"])
+        for row in ablation["results"]:
+            row["protocol_sha256"] = ablation["protocol_sha256"]
+        out = sb.build_trigger_comparison(baseline, ablation)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertTrue(any("experimental protocols" in reason
+                            for reason in out["provenance"]["reasons"]))
+
+    def test_protocol_semantics_must_match_report_design(self):
+        for mutation in (
+            lambda protocol: protocol.update(runs_per_query=999),
+            lambda protocol: protocol["adapters"][0].update(agent="not-the-row-agent"),
+        ):
+            with self.subTest(mutation=mutation):
+                baseline = trigger_report(self._baseline_rows())
+                mutation(baseline["protocol"])
+                baseline["protocol_sha256"] = sb.canonical_json_sha256(baseline["protocol"])
+                for row in baseline["results"]:
+                    row["protocol_sha256"] = baseline["protocol_sha256"]
+                ablation = trigger_report(
+                    self._ablation_rows(), ablation="drop-description",
+                    provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
+                with self.assertRaises(SystemExit):
+                    sb.build_trigger_comparison(baseline, ablation)
+
+    def test_protocol_dependency_identity_cannot_omit_a_module(self):
+        baseline = trigger_report(self._baseline_rows())
+        identity = baseline["protocol"]["harness_identity"]
+        identity["modules"].pop("trigger_contracts.py")
+        payload = {key: value for key, value in identity.items()
+                   if key != "identity_sha256"}
+        identity["identity_sha256"] = sb.canonical_json_sha256(payload)
+        baseline["protocol_sha256"] = sb.canonical_json_sha256(baseline["protocol"])
+        for row in baseline["results"]:
+            row["protocol_sha256"] = baseline["protocol_sha256"]
+        ablation = trigger_report(
+            self._ablation_rows(), ablation="drop-description",
+            provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
+        with self.assertRaises(SystemExit):
+            sb.build_trigger_comparison(baseline, ablation)
+
+    def test_observed_isolation_drift_blocks_the_cell(self):
+        base = [trigger_row("isolation", True, triggered=True, run_number=n)
+                for n in range(1, 3)]
+        abl = [trigger_row("isolation", True, triggered=False, run_number=n)
+               for n in range(1, 3)]
+        for row in base:
+            row["protocol_observation"] = {"config_isolated": True}
+        for row in abl:
+            row["protocol_observation"] = {"config_isolated": False}
+        out = self._compare(base_rows=base, abl_rows=abl)
+        self.assertEqual(out["paired"]["blocked"][0]["reason"],
+                         "protocol_observation_unsafe")
+        self.assertEqual(out["evidence_class"], "indeterminate")
+
+    def test_matching_unsafe_isolation_cannot_confirm(self):
+        base = self._baseline_rows()
+        abl = self._ablation_rows()
+        unsafe = {"config_isolated": False,
+                  "config_isolation_warning": "personal config may influence this measurement"}
+        for row in base + abl:
+            row["protocol_observation"] = unsafe
+        out = self._compare(base_rows=base, abl_rows=abl)
+        self.assertEqual(out["evidence_class"], "indeterminate")
+        self.assertTrue(out["paired"]["blocked"])
+        self.assertTrue(all(item["reason"] == "protocol_observation_unsafe"
+                            for item in out["paired"]["blocked"]))
+
+    def test_cosmetic_query_aliases_cannot_manufacture_six_units(self):
+        queries = ["identical prompt" + (" " * n) for n in range(6)]
+        base = [trigger_row(query, True, triggered=True, query_id=f"q{n}")
+                for n, query in enumerate(queries)]
+        abl = [trigger_row(query, True, triggered=False, query_id=f"q{n}")
+               for n, query in enumerate(queries)]
+        with self.assertRaises(SystemExit):
+            self._compare(base_rows=base, abl_rows=abl, base_runs_per_query=1)
+
+    def test_negative_polarity_overtriggering_is_a_causal_regression(self):
+        queries = [f"negative {n}" for n in range(1, 7)]
+        baseline = [trigger_row(q, False, triggered=False, run_number=n)
+                    for q in queries for n in range(1, 3)]
+        ablation = [trigger_row(q, False, triggered=True, run_number=n)
+                    for q in queries for n in range(1, 3)]
+        out = self._compare(base_rows=baseline, abl_rows=ablation)
+        self.assertEqual(out["evidence_class"], "confirmed_causal")
+        self.assertTrue(all(row["should_trigger"] is False
+                            for row in out["regressed_queries"]))
+
+    def test_query_id_definition_mismatch_is_blocked(self):
+        base = [trigger_row("baseline text", True, triggered=True,
+                            query_id="shared", run_number=n) for n in range(1, 3)]
+        abl = [trigger_row("different text", True, triggered=False,
+                           query_id="shared", run_number=n) for n in range(1, 3)]
+        out = self._compare(base_rows=base, abl_rows=abl)
+        self.assertEqual(out["paired"]["blocked"][0]["reason"],
+                         "query_definition_mismatch")
+        self.assertEqual(out["evidence_class"], "indeterminate")
+
+    def test_row_hash_must_match_report_hash(self):
+        baseline = trigger_report(self._baseline_rows())
+        baseline["results"][0]["skill_tree_hash"] = "sha256:other"
+        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
+                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
+        with self.assertRaises(SystemExit):
+            sb.build_trigger_comparison(baseline, ablation)
+
+    def test_real_matrix_reports_feed_the_comparer_without_provenance_drift(self):
+        baseline = tm.run_matrix(
+            DEMO_MANIFEST, demo_trigger_rows(), agents=["stub"], models=["offline"],
+            runs_per_query=1, timeout=30, workers=1)
+        ablation = tm.run_matrix(
+            DEMO_MANIFEST, demo_trigger_rows(), agents=["stub"], models=["offline"],
+            runs_per_query=1, timeout=30, workers=1, ablation="weaker-description")
+        out = sb.build_trigger_comparison(baseline, ablation)
+        self.assertTrue(out["provenance"]["verified"])
+        self.assertEqual(out["paired"]["blocked"], [])
+        self.assertEqual(ablation["skill_tree_hash"],
+                         ablation["provenance"]["skill_hash"])
 
     def test_malformed_row_is_rejected(self):
         bad = self._baseline_rows()

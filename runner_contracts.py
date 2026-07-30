@@ -11,6 +11,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, TypeAlias
 
+from json_contracts import freeze_json_mapping
+
 
 class Provider(str, Enum):
     CODEX = "codex"
@@ -29,37 +31,18 @@ def _finite_nonnegative(value: Any, label: str, *, integer: bool = False) -> int
 
 
 _RESERVED_EVIDENCE_KEYS = frozenset({
+    "schema_version", "source", "tool_calls", "commands", "file_reads",
+    "file_writes", "errors", "retries", "repeated_command_max",
+    "skill_invoked", "skill_invocation_evidence", "parse_errors",
+    "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+    "cache_write_tokens", "cache_creation_tokens", "cost_usd",
+    "usage_normalized", "cost_normalized", "otel",
+    "returncode", "timed_out", "elapsed_ms",
     "observation_complete", "process_observation_complete",
     "provider_response_complete", "trace_observation_complete",
     "operation_observation_complete", "artifact_set_complete",
     "observation_evidence", "telemetry", "telemetry_schema_version",
 })
-
-
-class FrozenDict(dict):
-    """JSON-serializable recursively immutable mapping."""
-    def _immutable(self, *args: Any, **kwargs: Any) -> None:
-        raise TypeError("frozen mapping cannot be mutated")
-
-    __setitem__ = __delitem__ = __ior__ = clear = pop = popitem = setdefault = update = _immutable
-
-
-def _freeze_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return FrozenDict({str(key): _freeze_value(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_value(item) for item in value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    raise TypeError(f"outcome context contains non-JSON value {type(value).__name__}")
-
-
-def _freeze_mapping(value: Mapping[str, Any] | None, label: str) -> Mapping[str, Any]:
-    if value is None:
-        return FrozenDict()
-    if not isinstance(value, Mapping):
-        raise TypeError(f"{label} must be a mapping")
-    return _freeze_value(value)
 
 
 def _validate_usage(value: Any, label: str) -> None:
@@ -69,7 +52,7 @@ def _validate_usage(value: Any, label: str) -> None:
         return
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} must contain only numeric measurements")
-    _finite_nonnegative(value, label)
+    _finite_nonnegative(value, label, integer=label.casefold().endswith("tokens"))
 
 
 @dataclass(frozen=True)
@@ -103,25 +86,35 @@ class OutcomeContext:
             if not isinstance(self.usage, Mapping):
                 raise TypeError("usage must be a mapping or None")
             _validate_usage(self.usage, "usage")
-            object.__setattr__(self, "usage", _freeze_mapping(self.usage, "usage"))
+            object.__setattr__(self, "usage", freeze_json_mapping(self.usage, "usage"))
         for label, values in (("metadata_extra", self.metadata_extra),
                               ("metrics_extra", self.metrics_extra)):
             collisions = _RESERVED_EVIDENCE_KEYS & set(values)
             if collisions:
                 raise ValueError(f"{label} cannot override derived evidence: {', '.join(sorted(collisions))}")
-        object.__setattr__(self, "metadata_extra", _freeze_mapping(self.metadata_extra, "metadata_extra"))
-        object.__setattr__(self, "metrics_extra", _freeze_mapping(self.metrics_extra, "metrics_extra"))
+        object.__setattr__(self, "metadata_extra", freeze_json_mapping(self.metadata_extra, "metadata_extra"))
+        object.__setattr__(self, "metrics_extra", freeze_json_mapping(self.metrics_extra, "metrics_extra"))
         if self.environment is not None:
-            object.__setattr__(self, "environment", _freeze_mapping(self.environment, "environment"))
+            object.__setattr__(self, "environment", freeze_json_mapping(self.environment, "environment"))
         if not isinstance(self.diagnose_returncode, bool):
             raise TypeError("diagnose_returncode must be boolean")
 
     def enriched(self, *, metadata: Mapping[str, Any] | None = None,
                  environment: Mapping[str, Any] | None = None) -> OutcomeContext:
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise TypeError("metadata must be a mapping or None")
+        if environment is not None and not isinstance(environment, Mapping):
+            raise TypeError("environment must be a mapping or None")
         return replace(
             self,
-            metadata_extra={**dict(self.metadata_extra), **dict(metadata or {})},
-            environment={**dict(self.environment or {}), **dict(environment or {})},
+            metadata_extra={
+                **dict(self.metadata_extra),
+                **dict({} if metadata is None else metadata),
+            },
+            environment={
+                **dict({} if self.environment is None else self.environment),
+                **dict({} if environment is None else environment),
+            },
         )
 
 
@@ -134,6 +127,8 @@ class Completed:
     def __post_init__(self) -> None:
         if not isinstance(self.context, OutcomeContext):
             raise TypeError("Completed context must be OutcomeContext")
+        if type(self.returncode) is not int:
+            raise TypeError("Completed returncode must be an integer")
         if self.returncode != 0:
             raise ValueError("Completed returncode must be 0")
         if not isinstance(self.answer, str):
@@ -152,6 +147,8 @@ class TimedOut:
     def __post_init__(self) -> None:
         if not isinstance(self.context, OutcomeContext):
             raise TypeError("TimedOut context must be OutcomeContext")
+        if type(self.returncode) is not int:
+            raise TypeError("TimedOut returncode must be an integer")
         if self.returncode != 124:
             raise ValueError("TimedOut returncode must be 124")
         if self.timeout_s is not None and (isinstance(self.timeout_s, bool) or not isinstance(self.timeout_s, int) or self.timeout_s <= 0):
@@ -169,6 +166,8 @@ class SpawnFailed:
     def __post_init__(self) -> None:
         if not isinstance(self.context, OutcomeContext):
             raise TypeError("SpawnFailed context must be OutcomeContext")
+        if type(self.returncode) is not int:
+            raise TypeError("SpawnFailed returncode must be an integer")
         if self.returncode != 127:
             raise ValueError("SpawnFailed returncode must be 127")
         if not isinstance(self.reason, str) or not self.reason.strip():
@@ -185,7 +184,9 @@ class ProviderFailed:
     def __post_init__(self) -> None:
         if not isinstance(self.context, OutcomeContext):
             raise TypeError("ProviderFailed context must be OutcomeContext")
-        if isinstance(self.returncode, bool) or not isinstance(self.returncode, int) or self.returncode in {124, 127}:
+        if type(self.returncode) is not int:
+            raise TypeError("ProviderFailed returncode must be an integer")
+        if self.returncode in {124, 127}:
             raise ValueError("ProviderFailed requires an actual exited-process returncode")
         if self.reason is not None and (not isinstance(self.reason, str) or not self.reason.strip()):
             raise ValueError("provider failure reason must be non-empty or None")
@@ -229,10 +230,18 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
     """Strict compatibility factory for the historical constructor spelling."""
     if not isinstance(timed_out, bool):
         raise TypeError("timed_out must be boolean")
+    if returncode is not None and type(returncode) is not int:
+        raise TypeError("returncode must be an integer or None")
+    if answer is not None and not isinstance(answer, str):
+        raise TypeError("answer must be a string or None")
+    if error is not None and (not isinstance(error, str) or not error.strip()):
+        raise ValueError("error must be a non-empty string or None")
     context = OutcomeContext(
         provider=Provider(provider), model=model, elapsed_ms=elapsed_ms, stderr=stderr,
-        trace_text=trace_text or "", usage=usage, cost_usd=cost_usd,
-        metadata_extra=metadata_extra or {}, metrics_extra=metrics_extra or {},
+        trace_text="" if trace_text is None else trace_text,
+        usage=usage, cost_usd=cost_usd,
+        metadata_extra={} if metadata_extra is None else metadata_extra,
+        metrics_extra={} if metrics_extra is None else metrics_extra,
         environment=environment, diagnose_returncode=diagnose_returncode,
     )
     if timed_out:
@@ -245,7 +254,9 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
     if code == 127:
         return SpawnFailed(context, reason=error or stderr or "process spawn failed")
     if code != 0 or error:
-        return ProviderFailed(context, returncode=code, reason=error, answer=answer or "")
+        return ProviderFailed(
+            context, returncode=code, reason=error,
+            answer="" if answer is None else answer)
     if not answer:
         return ProviderFailed(context, returncode=0, reason="provider produced no final answer")
     return Completed(context, answer=answer)

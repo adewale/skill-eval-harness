@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from helpers import attest_answer_design
+
 import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -233,6 +235,7 @@ class PairedReliabilityLiftTests(unittest.TestCase):
                 base = runs / "case-1" / variant
                 base.mkdir(parents=True)
                 (base / "output.md").write_text(text, encoding="utf-8")
+            attest_answer_design(path, runs)
             report = sb.build_benchmark_report(path, runs)
         rel = report["reliability"]
         self.assertIn("by_case_variant", rel)   # per-arm keys untouched
@@ -271,6 +274,26 @@ class TwoSamplePermutationTests(unittest.TestCase):
         r1, r2 = sb.two_sample_permutation_significance(a, b), sb.two_sample_permutation_significance(a, b)
         self.assertEqual(r1, r2)
         self.assertEqual(r1["method"], "two-sample-permutation-sampled")   # actually exercising the sampled path
+
+    def test_sampled_permutation_is_invariant_to_within_group_order(self):
+        a = [1, .9, .8, .7, .6, .5, .4, .3, .2, .1, 0, 0]
+        b = [0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1, 1]
+        first = sb.two_sample_permutation_significance(a, b)
+        reordered = sb.two_sample_permutation_significance(
+            [a[i] for i in (5, 1, 10, 0, 8, 3, 11, 6, 2, 9, 4, 7)],
+            list(reversed(b)),
+        )
+        self.assertEqual(first, reordered)
+
+    def test_sampled_permutation_uses_conservative_bound_at_gate(self):
+        result = sb.two_sample_permutation_significance(
+            [0.0] * 10, [1.0] * 5 + [0.0] * 5)
+        self.assertEqual(result["method"], "two-sample-permutation-sampled")
+        self.assertAlmostEqual(result["p_value"], 0.035147669, places=8)
+        self.assertAlmostEqual(result["p_value_upper_bound"], 0.063950568, places=8)
+        self.assertLess(result["p_value"], 0.05)
+        self.assertGreater(result["p_value_upper_bound"], 0.05)
+        self.assertFalse(result["significant_at_0_05"])
 
     def test_noisy_non_degenerate_effects(self):
         # not perfect separation: a strong noisy effect (7-1 vs 1-7) is significant;

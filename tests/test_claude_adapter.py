@@ -7,6 +7,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from helpers import claude_stream_records as _canonical_stream_records
 from helpers import make_eval_repo
@@ -57,11 +58,11 @@ class ParseClaudeEnvelopeTests(unittest.TestCase):
         self.assertEqual(p["answer"], "")
         self.assertEqual(p["parse_error"], "claude result must be a string")
 
-    def test_tolerates_fenced_json_envelope(self):
+    def test_rejects_fenced_json_envelope(self):
         out = "```json\n" + json.dumps({"result": "x", "total_cost_usd": 0.01, "usage": {}}) + "\n```"
         p = sb.parse_claude_cli_json(out)
-        self.assertEqual(p["answer"], "x")
-        self.assertEqual(p["cost_usd"], 0.01)
+        self.assertEqual(p["answer"], "")
+        self.assertIsNotNone(p["parse_error"])
 
 
 class ParseClaudeStreamTests(unittest.TestCase):
@@ -85,14 +86,25 @@ class ParseClaudeStreamTests(unittest.TestCase):
         self.assertEqual(p["answer"], "")
         self.assertIsNotNone(p["parse_error"])
 
-    def test_last_result_event_wins(self):
-        # Claude emits exactly one result event; if a retrying wrapper ever
-        # concatenates two streams, the LAST terminal event is authoritative.
+    def test_multiple_result_events_are_protocol_invalid(self):
         records = claude_stream_records() + claude_stream_records()
         records[-1] = {**records[-1], "result": "second attempt", "total_cost_usd": 0.09}
         p = sb.parse_claude_cli_json(stream_text(records))
-        self.assertEqual(p["answer"], "second attempt")
-        self.assertEqual(p["cost_usd"], 0.09)
+        self.assertEqual(p["answer"], "")
+        self.assertIsNotNone(p["parse_error"])
+
+    def test_malformed_line_before_terminal_result_is_protocol_invalid(self):
+        text = "not-json\n" + stream_text(claude_stream_records())
+        p = sb.parse_claude_cli_json(text)
+        self.assertEqual(p["answer"], "")
+        self.assertIn("malformed Claude stream", p["parse_error"])
+
+    def test_fractional_usage_is_rejected_not_truncated(self):
+        p = sb.parse_claude_cli_json(json.dumps({
+            "result": "answer", "usage": {"input_tokens": 10.9, "output_tokens": 0},
+        }))
+        self.assertEqual(p["answer"], "")
+        self.assertIn("invalid Claude usage", p["parse_error"])
 
 
 class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
@@ -100,7 +112,7 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
     normalizer-native records: a tool_use OPENS a call (in progress), its
     tool_result COMPLETES it, and only the terminal result event carries usage.
     An orphaned call therefore counts zero, per the completed-events-only
-    metrics contract."""
+    metrics contract, while making the trace structurally incomplete."""
 
     def test_paired_tool_use_counts_once_and_orphan_counts_zero(self):
         events_doc, metrics = sb.normalize_trace_records(
@@ -115,6 +127,7 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
         grep_events = [e for e in events if e.get("name") == "Grep"]
         self.assertTrue(grep_events)
         self.assertTrue(all(e.get("status") == "in_progress" for e in grep_events))
+        self.assertTrue(metrics["trace_protocol_errors"])
 
     def test_unmatched_tool_result_is_error_evidence_not_a_completed_call(self):
         records = [{"type": "user", "message": {"content": [
@@ -128,6 +141,53 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
         self.assertIn("unmatched Claude tool_result", event["input_summary"])
         self.assertEqual(event["raw_ref"], {"file": "trace.jsonl", "line": 1})
         self.assertEqual(event["raw_result_ref"], {"file": "trace.jsonl", "line": 1})
+
+    def test_duplicate_open_tool_id_is_error_and_cannot_replace_first_call(self):
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "same", "name": "Read",
+                 "input": {"file_path": "first.txt"}}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "same", "name": "Write",
+                 "input": {"file_path": "second.txt"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "same", "content": "first"}]}},
+        ]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        completed = [event for event in events_doc["events"]
+                     if event.get("status") == "completed"]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["type"], "file_read")
+        self.assertIn("first.txt", completed[0]["input_summary"])
+        self.assertNotIn("second.txt", completed[0]["input_summary"])
+        self.assertEqual(metrics["errors"], 1)
+        self.assertTrue(any("duplicate open Claude tool_use" in event.get("input_summary", "")
+                            for event in events_doc["events"]))
+
+    def test_tool_use_without_id_is_error_not_an_open_call(self):
+        records = [{"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "x"}}]}}]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        self.assertEqual(metrics["tool_calls"], 0)
+        self.assertEqual(metrics["errors"], 1)
+        self.assertEqual(events_doc["events"][0]["status"], "failed")
+
+    def test_completed_tool_id_cannot_be_reused_later(self):
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "same", "name": "Read",
+                 "input": {"file_path": "first.txt"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "same", "content": "ok"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "same", "name": "Write",
+                 "input": {"file_path": "second.txt"}}]}},
+        ]
+        events_doc, metrics = sb.normalize_trace_records(records, source="claude")
+        self.assertEqual(metrics["file_reads"], 1)
+        self.assertEqual(metrics["errors"], 1)
+        self.assertTrue(any("duplicate reused Claude tool_use" in event.get("input_summary", "")
+                            for event in events_doc["events"]))
 
     def test_skill_md_read_is_skill_load_evidence(self):
         _, metrics = sb.normalize_trace_records(claude_stream_records(), source="claude")
@@ -308,7 +368,8 @@ class RunClaudeAdapterTests(unittest.TestCase):
             td = Path(t)
             p, runs, _ = self._run(td, cost=0.02)
             report = sb.build_benchmark_report(p, runs, split="tune", variants_arg=["with_skill"])
-            self.assertAlmostEqual(report["summary"]["with_skill"]["cost_usd_total"], 0.02, places=6)
+            observed = report["summary"]["with_skill"]["observed"]
+            self.assertAlmostEqual(observed["cost_usd_total"], 0.02, places=6)
 
     def test_stream_json_run_writes_a_real_trace(self):
         # The answer runner requests stream-json (the stub refuses otherwise),
@@ -372,10 +433,12 @@ class ClaudeJudgeAndPanelTests(unittest.TestCase):
 
     def test_panel_flags_magnitude_sensitivity(self):
         # good-pr: both judges positive, but Sonnet sees a much bigger lift
-        haiku = {"summary": {"with_skill": {"mean_combined_pass_rate": 0.92},
-                             "without_skill": {"mean_combined_pass_rate": 0.89}}}   # +0.03
-        sonnet = {"summary": {"with_skill": {"mean_combined_pass_rate": 0.79},
-                              "without_skill": {"mean_combined_pass_rate": 0.61}}}  # +0.18
+        haiku = {"availability": "complete", "summary": {
+            "with_skill": {"availability": "complete", "mean_combined_pass_rate": 0.92},
+            "without_skill": {"availability": "complete", "mean_combined_pass_rate": 0.89}}}   # +0.03
+        sonnet = {"availability": "complete", "summary": {
+            "with_skill": {"availability": "complete", "mean_combined_pass_rate": 0.79},
+            "without_skill": {"availability": "complete", "mean_combined_pass_rate": 0.61}}}  # +0.18
         s = sb.judge_panel_sensitivity({"haiku": haiku, "sonnet": sonnet})
         self.assertFalse(s["sign_sensitive"])                 # both positive
         self.assertTrue(s["magnitude_sensitive"])             # spread 0.15 > 0.1
@@ -383,21 +446,57 @@ class ClaudeJudgeAndPanelTests(unittest.TestCase):
         self.assertAlmostEqual(s["lift_by_judge"]["haiku"], 0.03, places=6)
 
     def test_panel_flags_sign_disagreement(self):
-        a = {"summary": {"with_skill": {"mean_combined_pass_rate": 0.6},
-                         "without_skill": {"mean_combined_pass_rate": 0.55}}}       # +0.05
-        b = {"summary": {"with_skill": {"mean_combined_pass_rate": 0.5},
-                         "without_skill": {"mean_combined_pass_rate": 0.55}}}       # -0.05
+        a = {"availability": "complete", "summary": {
+            "with_skill": {"availability": "complete", "mean_combined_pass_rate": 0.6},
+            "without_skill": {"availability": "complete", "mean_combined_pass_rate": 0.55}}}       # +0.05
+        b = {"availability": "complete", "summary": {
+            "with_skill": {"availability": "complete", "mean_combined_pass_rate": 0.5},
+            "without_skill": {"availability": "complete", "mean_combined_pass_rate": 0.55}}}       # -0.05
         s = sb.judge_panel_sensitivity({"a": a, "b": b})
         self.assertTrue(s["sign_sensitive"])
         self.assertTrue(s["judge_sensitive"])
 
     def test_panel_agreement_is_not_sensitive(self):
-        a = {"summary": {"with_skill": {"mean_combined_pass_rate": 0.9},
-                         "without_skill": {"mean_combined_pass_rate": 0.78}}}       # +0.12
-        b = {"summary": {"with_skill": {"mean_combined_pass_rate": 0.8},
-                         "without_skill": {"mean_combined_pass_rate": 0.68}}}       # +0.12
+        a = {"availability": "complete", "summary": {
+            "with_skill": {"availability": "complete", "mean_combined_pass_rate": 0.9},
+            "without_skill": {"availability": "complete", "mean_combined_pass_rate": 0.78}}}       # +0.12
+        b = {"availability": "complete", "summary": {
+            "with_skill": {"availability": "complete", "mean_combined_pass_rate": 0.8},
+            "without_skill": {"availability": "complete", "mean_combined_pass_rate": 0.68}}}       # +0.12
         s = sb.judge_panel_sensitivity({"a": a, "b": b})
         self.assertFalse(s["judge_sensitive"])
+
+    def test_incomplete_panel_report_nulls_all_headline_sensitivity(self):
+        complete = {"availability": "complete", "summary": {
+            "with_skill": {"availability": "complete", "mean_combined_pass_rate": 0.8},
+            "without_skill": {"availability": "complete", "mean_combined_pass_rate": 0.7}}}
+        partial = {"availability": "partial", "summary": {
+            "with_skill": {"availability": "partial", "mean_combined_pass_rate": 0.0},
+            "without_skill": {"availability": "complete", "mean_combined_pass_rate": 0.0}}}
+        result = sb.judge_panel_sensitivity({"complete": complete, "partial": partial})
+        self.assertEqual(result["availability"], "partial")
+        self.assertEqual(result["lift_by_judge"]["partial"], None)
+        for key in ("sign_sensitive", "magnitude_spread",
+                    "magnitude_sensitive", "judge_sensitive"):
+            self.assertIsNone(result[key])
+        self.assertEqual(result["observed"]["judges"], ["complete"])
+
+    def test_compare_judges_rejects_blank_and_duplicate_identities_before_loading(self):
+        def rejected(message):
+            raise ValueError(message)
+
+        for reports, message in (
+            (["=first.json", "b=second.json"], "non-empty"),
+            (["same=first.json", "same=second.json", "b=third.json"], "duplicate"),
+            (["a=", "b=second.json"], "path"),
+        ):
+            args = argparse.Namespace(report=reports, magnitude_eps=0.1, out=None)
+            with self.subTest(reports=reports), \
+                 mock.patch.object(sb, "load_json") as load_json, \
+                 mock.patch.object(sb, "die", side_effect=rejected), \
+                 self.assertRaisesRegex(ValueError, message):
+                sb.compare_judges(args)
+            load_json.assert_not_called()
 
 
 if __name__ == "__main__":

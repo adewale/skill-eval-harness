@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import Any
 
 import telemetry as telemetry_domain
+from json_contracts import freeze_json_mapping, strict_json_equal
 
 
 class InvocationState(str, Enum):
@@ -101,11 +102,11 @@ class InvocationOutcome:
         elif self.returncode is None or self.elapsed_ms is None:
             raise ValueError("process invocation states require returncode and elapsed_ms")
 
-        metadata = dict(self.metadata)
+        metadata = freeze_json_mapping(self.metadata, "invocation metadata")
         collisions = sorted(_INVOCATION_RESERVED_METADATA & set(metadata))
         if collisions:
             raise ValueError(f"invocation metadata collides with derived field(s): {', '.join(collisions)}")
-        object.__setattr__(self, "metadata", MappingProxyType(metadata))
+        object.__setattr__(self, "metadata", metadata)
 
     @property
     def observation_complete(self) -> bool:
@@ -132,7 +133,7 @@ class InvocationOutcome:
             state = InvocationState.PROCESS_FAILED
             evidence = None
         return cls(stdout, stderr, returncode, elapsed_ms, state, evidence,
-                   metadata=metadata or {})
+                   metadata={} if metadata is None else metadata)
 
     @classmethod
     def harness_failed(cls, message: str, *,
@@ -140,7 +141,7 @@ class InvocationOutcome:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("harness failure requires a non-empty message")
         return cls("", message, None, None, InvocationState.HARNESS_FAILED,
-                   metadata=metadata or {})
+                   metadata={} if metadata is None else metadata)
 
     @classmethod
     def from_legacy_dict(cls, agent: str, raw: Mapping[str, Any], *,
@@ -219,7 +220,13 @@ class InvocationOutcome:
                                 elapsed_ms=elapsed_ms).with_metadata(metadata)
 
     def with_metadata(self, values: Mapping[str, Any] | None = None, **extra: Any) -> InvocationOutcome:
-        merged = {**dict(self.metadata), **dict(values or {}), **extra}
+        if values is not None and not isinstance(values, Mapping):
+            raise TypeError("invocation metadata must be a mapping or None")
+        merged = {
+            **dict(self.metadata),
+            **dict({} if values is None else values),
+            **extra,
+        }
         return replace(self, metadata=merged)
 
     def with_provider_payload(self, payload: Any) -> InvocationOutcome:
@@ -337,7 +344,37 @@ _TRIGGER_RESERVED_METADATA = {
     "triggered", "pass", "observation_complete", "returncode", "timed_out",
     "elapsed_ms", "completion_evidence", "evidence", "evidence_typed",
     "usage_normalized", "cost_normalized", "stderr", "provider_error",
+    "query_id", "run_number", "invocation_metadata", "observation_metadata",
 }
+_TRIGGER_EXPERIMENT_METADATA = {
+    "measurement", "ablation", "skill_tree_hash", "protocol_sha256",
+    "protocol_observation", "trace_dir", "trace_error", "telemetry_error",
+    "error",
+}
+
+
+def validated_trigger_protocol_limits(
+    *, timeout_seconds: Any, runs_per_query: Any, workers: Any,
+) -> tuple[int, int, int]:
+    """Return protocol concurrency limits only when all are positive integers."""
+    values = {
+        "timeout_seconds": timeout_seconds,
+        "runs_per_query": runs_per_query,
+        "workers": workers,
+    }
+    for label, value in values.items():
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{label} must be a positive integer")
+    return timeout_seconds, runs_per_query, workers
+
+
+def validated_trigger_model(value: Any, label: str = "model") -> str | None:
+    """Return a protocol model only when its persisted identity is unambiguous."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be None or a non-empty string")
+    return value
 
 
 def _usage_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -379,7 +416,7 @@ def _cost_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
     if source in {"missing", "not_applicable"}:
         if set(block) != {"source"}:
             raise ValueError(f"{source} cost telemetry cannot carry numeric evidence")
-        return MappingProxyType(dict(block))
+        return freeze_json_mapping(block, "cost telemetry")
     numeric_keys = {
         "total_cost", "input_cost", "output_cost", "cache_read_cost",
         "cache_write_cost", "reasoning_cost",
@@ -406,7 +443,40 @@ def _cost_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
     notes = block.get("pricing_notes")
     if notes is not None and (not isinstance(notes, list) or not all(isinstance(item, str) for item in notes)):
         raise ValueError("cost telemetry pricing_notes must be a list of strings")
-    return MappingProxyType(dict(block))
+    return freeze_json_mapping(block, "cost telemetry")
+
+
+@dataclass(frozen=True, order=True)
+class TriggerRepetitionIdentity:
+    """Stable identity for one persisted trigger-matrix repetition.
+
+    Trigger rates do not assume matched randomness across arms, but causal
+    comparison still needs to prove that no repetition was duplicated, lost,
+    or silently replaced before rates are aggregated.
+    """
+
+    query_id: str
+    run_number: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.query_id, str) or not self.query_id.strip():
+            raise ValueError("trigger query_id must be a non-empty string")
+        if (isinstance(self.run_number, bool) or not isinstance(self.run_number, int)
+                or self.run_number < 1):
+            raise ValueError("trigger run_number must be a positive integer")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"query_id": self.query_id, "run_number": self.run_number}
+
+    @classmethod
+    def from_row(cls, raw: Mapping[str, Any]) -> TriggerRepetitionIdentity | None:
+        has_query_id = "query_id" in raw
+        has_run_number = "run_number" in raw
+        if has_query_id != has_run_number:
+            raise ValueError("trigger repetition identity requires both query_id and run_number")
+        if not has_query_id:
+            return None
+        return cls(raw["query_id"], raw["run_number"])
 
 
 @dataclass(frozen=True)
@@ -420,6 +490,7 @@ class TriggerObservation:
     usage: Mapping[str, Any]
     cost: Mapping[str, Any]
     metadata: Mapping[str, Any] = field(default_factory=dict, compare=False)
+    identity: TriggerRepetitionIdentity | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.agent, str) or not self.agent.strip():
@@ -434,19 +505,28 @@ class TriggerObservation:
             raise TypeError("trigger observation invocation must be InvocationOutcome")
         if not isinstance(self.detection, TriggerDetection):
             raise TypeError("trigger observation detection must be TriggerDetection")
+        if self.identity is not None and not isinstance(self.identity, TriggerRepetitionIdentity):
+            raise TypeError("trigger observation identity must be TriggerRepetitionIdentity or None")
         usage = _usage_block(self.usage)
         cost = _cost_block(self.cost)
         if not self.invocation.observation_complete and (
             usage.get("source") != "missing" or cost.get("source") != "missing"
         ):
             raise ValueError("incomplete trigger observations must carry missing usage and cost")
-        metadata = dict(self.metadata)
+        metadata = freeze_json_mapping(self.metadata, "trigger observation metadata")
         collisions = sorted(_TRIGGER_RESERVED_METADATA & set(metadata))
         if collisions:
             raise ValueError(f"trigger metadata collides with derived field(s): {', '.join(collisions)}")
+        invocation_collisions = sorted(
+            set(self.invocation.metadata)
+            & (_TRIGGER_RESERVED_METADATA | _TRIGGER_EXPERIMENT_METADATA | set(metadata)))
+        if invocation_collisions:
+            raise ValueError(
+                "invocation metadata collides with trigger-owned field(s): "
+                + ", ".join(invocation_collisions))
         object.__setattr__(self, "usage", usage)
         object.__setattr__(self, "cost", cost)
-        object.__setattr__(self, "metadata", MappingProxyType(metadata))
+        object.__setattr__(self, "metadata", metadata)
 
     @property
     def passed(self) -> bool:
@@ -477,15 +557,17 @@ class TriggerObservation:
             "usage_normalized": dict(self.usage),
             "cost_normalized": dict(self.cost),
             "stderr": self.invocation.stderr[-1000:],
+            "invocation_metadata": dict(self.invocation.metadata),
+            "observation_metadata": dict(self.metadata),
         }
         for key, value in self.invocation.metadata.items():
-            if key not in row:
-                row[key] = value
+            row[key] = value
         if self.invocation.provider_error is not None:
             row["provider_error"] = self.invocation.provider_error
+        if self.identity is not None:
+            row.update(self.identity.as_dict())
         for key, value in self.metadata.items():
-            if key not in row:
-                row[key] = value
+            row[key] = value
         return row
 
     @classmethod
@@ -498,8 +580,64 @@ class TriggerObservation:
         agent = raw.get("agent", default_agent)
         model = raw.get("model")
         query = raw.get("query")
-        expectation = TriggerExpectation.from_bool(raw.get("should_trigger"))
+        should_trigger = raw.get("should_trigger")
+        usage = raw.get("usage_normalized")
+        cost = raw.get("cost_normalized")
+        if not isinstance(agent, str) or not agent.strip():
+            raise ValueError("trigger observation agent must be non-empty")
+        if model is not None and not isinstance(model, str):
+            raise TypeError("trigger observation model must be a string or null")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("trigger observation query must be non-empty")
+        if not isinstance(should_trigger, bool):
+            raise TypeError("trigger observation should_trigger must be boolean")
+        if not isinstance(usage, Mapping) or not isinstance(cost, Mapping):
+            raise TypeError("trigger observation usage and cost must be mappings")
+        has_invocation_namespace = "invocation_metadata" in raw
+        has_observation_namespace = "observation_metadata" in raw
+        if has_invocation_namespace != has_observation_namespace:
+            raise ValueError(
+                "trigger observation metadata requires both explicit namespaces")
+        if has_invocation_namespace:
+            raw_invocation_metadata = raw["invocation_metadata"]
+            raw_observation_metadata = raw["observation_metadata"]
+            if (not isinstance(raw_invocation_metadata, Mapping)
+                    or not isinstance(raw_observation_metadata, Mapping)):
+                raise TypeError("trigger observation metadata namespaces must be mappings")
+            invocation_metadata = freeze_json_mapping(
+                raw_invocation_metadata, "persisted invocation metadata")
+            observation_metadata = freeze_json_mapping(
+                raw_observation_metadata, "persisted observation metadata")
+            declared_flat_keys = set(invocation_metadata) | set(observation_metadata)
+            undeclared_flat_keys = (
+                set(raw) - _TRIGGER_RESERVED_METADATA - declared_flat_keys)
+            if undeclared_flat_keys:
+                raise ValueError(
+                    "persisted trigger row has undeclared flattened metadata: "
+                    + ", ".join(sorted(str(key) for key in undeclared_flat_keys)))
+            for namespace, values in (
+                ("invocation", invocation_metadata),
+                ("observation", observation_metadata),
+            ):
+                for key, value in values.items():
+                    if key not in raw or not strict_json_equal(raw[key], value):
+                        raise ValueError(
+                            f"persisted {namespace} metadata disagrees with flattened field {key!r}")
+        else:
+            # Legacy rows flattened both mappings. Known experiment-owned keys
+            # remain observation metadata; other non-reserved keys came from the
+            # invocation compatibility mapping.
+            observation_metadata = {
+                key: raw[key] for key in _TRIGGER_EXPERIMENT_METADATA if key in raw
+            }
+            invocation_metadata = {
+                key: value for key, value in raw.items()
+                if key not in _TRIGGER_RESERVED_METADATA
+                and key not in _TRIGGER_EXPERIMENT_METADATA
+            }
+        expectation = TriggerExpectation.from_bool(should_trigger)
         legacy_invocation = {
+            **invocation_metadata,
             "stdout": "",
             "stderr": raw.get("stderr", ""),
             "returncode": raw.get("returncode"),
@@ -515,7 +653,8 @@ class TriggerObservation:
                 and raw.get("completion_evidence") is None
                 and "provider_error" not in raw
                 and isinstance(raw.get("error"), str) and raw.get("error", "").strip()):
-            invocation = InvocationOutcome.harness_failed(raw["error"])
+            invocation = InvocationOutcome.harness_failed(
+                raw["error"], metadata=invocation_metadata)
         else:
             allow_nonzero = (
                 raw.get("completion_evidence") == CompletionEvidence.AGENT_WINDOW_EXHAUSTED.value
@@ -552,7 +691,9 @@ class TriggerObservation:
         observation = cls(
             agent=agent, model=model, query=query, expectation=expectation,
             invocation=invocation, detection=detection,
-            usage=raw.get("usage_normalized"), cost=raw.get("cost_normalized"),
+            usage=usage, cost=cost,
+            metadata=observation_metadata,
+            identity=TriggerRepetitionIdentity.from_row(raw),
         )
         if not isinstance(raw.get("pass"), bool) or raw["pass"] != observation.passed:
             raise ValueError("persisted pass flag disagrees with the typed observation")
@@ -561,9 +702,13 @@ class TriggerObservation:
     @classmethod
     def harness_failure(cls, *, agent: str, model: str | None, query: str,
                         expectation: TriggerExpectation, error: BaseException,
-                        metadata: Mapping[str, Any] | None = None) -> TriggerObservation:
+                        metadata: Mapping[str, Any] | None = None,
+                        identity: TriggerRepetitionIdentity | None = None) -> TriggerObservation:
         message = f"{type(error).__name__}: {error}"
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise TypeError("trigger failure metadata must be a mapping or None")
         invocation = InvocationOutcome.harness_failed(message)
         return cls(agent, model, query, expectation, invocation, TriggerDetection.absent(),
                    {"source": "missing"}, {"source": "missing"},
-                   {"error": message, **dict(metadata or {})})
+                   {"error": message, **dict({} if metadata is None else metadata)},
+                   identity)

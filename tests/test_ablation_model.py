@@ -52,8 +52,11 @@ class ProvenanceSchemaTests(unittest.TestCase):
         self.assertEqual(component.target["nested"]["items"], ("a",))
         with self.assertRaises(TypeError):
             component.target["nested"]["x"] = 1
-        with self.assertRaises(ValueError):
+        with self.assertRaises((TypeError, ValueError)):
             am.Component("instructions", "section", "s", {"bad": {"set"}})
+        for target in ({1: "not a JSON object key"}, {"rate": float("nan")}):
+            with self.subTest(target=target), self.assertRaises((TypeError, ValueError)):
+                am.Component("instructions", "section", "s", target)
 
     def test_removed_bytes_is_recorded_but_not_part_of_identity(self):
         a = self.prov(components=(am.Component("instructions", "section", "skills/x/SKILL.md", {"heading": "## H"}, removed_bytes=42),))
@@ -200,17 +203,17 @@ class EvidenceClassTests(unittest.TestCase):
     def test_confirmed_causal_only_reachable_through_the_guard(self):
         # CONFIRMED_CAUSAL requires verified provenance AND coverage AND the observed regression.
         self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=True, significant=None),
+                                                regression_observed=True, significant=True),
                          am.EvidenceClass.CONFIRMED_CAUSAL)
         # Missing any precondition cannot reach a confirmation.
         self.assertEqual(am.causal_confirmation(provenance_verified=False, has_coverage=True,
-                                                regression_observed=True, significant=None),
+                                                regression_observed=True, significant=True),
                          am.EvidenceClass.INDETERMINATE)
         self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=False,
-                                                regression_observed=True, significant=None),
+                                                regression_observed=True, significant=True),
                          am.EvidenceClass.INDETERMINATE)
         self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=False, significant=None),
+                                                regression_observed=False, significant=True),
                          am.EvidenceClass.REFUTED)
 
     def test_raw_measurement_is_not_a_confirmation(self):
@@ -228,20 +231,16 @@ class EvidenceClassTests(unittest.TestCase):
         self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
                                                 regression_observed=True, significant=True),
                          am.EvidenceClass.CONFIRMED_CAUSAL)
-        # significant=None keeps the historical contract for callers that gate
-        # separately (or have no replication to test).
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=True, significant=None),
-                         am.EvidenceClass.CONFIRMED_CAUSAL)
-
     def test_significance_must_be_explicit_and_strictly_typed(self):
         with self.assertRaises(TypeError):
             am.causal_confirmation(provenance_verified=True, has_coverage=True,
                                    regression_observed=True)
-        for invalid in (0, 1, "false", [], {}):
-            with self.subTest(invalid=invalid), self.assertRaises(TypeError):
-                am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                       regression_observed=True, significant=invalid)
+        valid = {"provenance_verified": True, "has_coverage": True,
+                 "regression_observed": True, "significant": True}
+        for name in valid:
+            for invalid in (None, 0, 1, "false", [], {}):
+                with self.subTest(name=name, invalid=invalid), self.assertRaises(TypeError):
+                    am.causal_confirmation(**{**valid, name: invalid})
 
     def test_significance_never_rescues_or_flips_the_other_gates(self):
         # A refutation is a refutation regardless of significance machinery,
@@ -272,6 +271,21 @@ class ResultSetTests(unittest.TestCase):
 
     def test_mean_rate_ignores_non_scorable(self):
         self.assertEqual(am.ResultSet(self.rows()).mean_rate(), 1.0)   # the 0.0 crash/missing do not drag it down
+
+    def test_mean_rate_rejects_invalid_rate_evidence(self):
+        for value in (
+            True, "1.0", float("nan"), float("inf"), -1e-12, 1.0 + 1e-12,
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, r"finite rate in \[0, 1\] or null"
+            ):
+                am.ResultSet([{
+                    "case_id": "c1",
+                    "variant": "with_skill",
+                    "objective_pass_rate": value,
+                    "missing_output": False,
+                    "execution_valid": True,
+                }]).mean_rate()
 
     def test_all_is_the_explicit_escape_hatch(self):
         self.assertEqual(len(am.ResultSet(self.rows()).all), 3)   # raw access is opt-in, not the default

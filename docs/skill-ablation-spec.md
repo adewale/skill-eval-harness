@@ -346,8 +346,9 @@ A cross-runner test asserts the materialized content actually reaches the model
   unchanged. `build_ablation_regression_report` computes both from the graded
   results — it marks `expected_regression_confirmed` only when the named
   assertion(s) flip pass→fail, and otherwise reports just `score_regressed`.
-- Token-overhead tie-in (`vocabulary.md:84`) and weighting materialized above
-  simulated in `negative_delta_cases` (`trace-aware-eval-spec.md:290`) as before.
+- [Token-overhead](vocabulary.md#report-signals) tie-in and weighting materialized
+  above simulated in `negative_delta_cases` under the
+  [report additions](trace-aware-eval-spec.md#report-additions) as before.
 
 ## Invalid-skill experiments (separate mode)
 
@@ -362,7 +363,7 @@ Opt in with `"invalid_skill": true` on the ablation: the run is tagged
 
 ## Validation additions
 
-`validate_manifest` (`skill_benchmark.py:588`), per ablation:
+`validate_manifest` (`skill_benchmark.py:991`), per ablation:
 
 - `id` unique and slug-formatted; keep `removed_component`.
 - If a removal is declared: exactly one of `mechanism`+`target` or `components`;

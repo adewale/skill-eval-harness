@@ -101,6 +101,39 @@ class MeasurementModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Comparison.comparable(float("nan"))
 
+    def test_evidence_mappings_are_strict_and_recursively_immutable(self):
+        basis = {"nested": {"labels": ["original"]}}
+        measurement = Measurement.available(
+            1, provenance="provider_reported", basis=basis)
+        comparison = Comparison.comparable(1.0, basis=basis)
+        basis["nested"]["labels"].append("mutated")
+        expected = {"nested": {"labels": ("original",)}}
+        self.assertEqual(measurement.basis, expected)
+        self.assertEqual(comparison.basis, expected)
+
+        reasons = {"missing": 1}
+        aggregate = Aggregate(
+            "unavailable", unavailable_count=1, reason_counts=reasons)
+        reasons["missing"] = 2
+        self.assertEqual(aggregate.reason_counts, {"missing": 1})
+
+        for basis_value in ([], {1: "bad key"}, {"score": float("nan")}):
+            with self.subTest(measurement_basis=basis_value), \
+                 self.assertRaises((TypeError, ValueError)):
+                Measurement.available(
+                    1, provenance="provider_reported", basis=basis_value)
+            with self.subTest(comparison_basis=basis_value), \
+                 self.assertRaises((TypeError, ValueError)):
+                Comparison.comparable(1.0, basis=basis_value)
+
+        for kwargs in (
+            {"observed_count": True},
+            {"reason_counts": {1: 1}},
+            {"reason_counts": {"missing": True}},
+        ):
+            with self.subTest(aggregate=kwargs), self.assertRaises((TypeError, ValueError)):
+                Aggregate("complete", value=1, **kwargs)
+
 
 class AggregateTests(unittest.TestCase):
     def test_zero_complete_partial_and_unavailable_are_distinct(self):
