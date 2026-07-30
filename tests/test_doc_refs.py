@@ -106,6 +106,33 @@ class DocCodeReferenceTests(unittest.TestCase):
                 {"skill_benchmark.py": {}},
             )
 
+    def test_full_commit_github_line_references_are_stable(self):
+        url = (
+            "https://github.com/withastro/flue/blob/"
+            "b814b82b2ce45dc941c77bb010140070e1bd48d5/"
+            "packages/opentelemetry/src/index.ts#L76-L538"
+        )
+        text = f"See [the implementation]({url}) or <{url}>."
+        self.assertEqual(
+            fixer.rewrite_doc_text(text, {"skill_benchmark.py": {}}),
+            (text, 0),
+        )
+
+    def test_mutable_or_unpinned_link_line_references_are_rejected(self):
+        links = [
+            "docs/spec.md#L10-L20",
+            "https://github.com/owner/repo/blob/main/src/code.py#L10-L20",
+            "https://github.com/owner/repo/blob/deadbeef/src/code.py#L10-L20",
+        ]
+        for link in links:
+            with self.subTest(link=link), self.assertRaisesRegex(
+                ValueError, "heading anchor"
+            ):
+                fixer.rewrite_doc_text(
+                    f"See [implementation]({link}).",
+                    {"skill_benchmark.py": {}},
+                )
+
     def test_ambiguous_unqualified_reference_is_rejected(self):
         maps = {
             "skill_benchmark.py": {"main": 120},

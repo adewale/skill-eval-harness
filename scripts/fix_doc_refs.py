@@ -45,7 +45,13 @@ PAREN_REF_RE = re.compile(
     r"`([A-Za-z_]\w*)`\s+\(`(?:([\w.]+\.py))?:(\d+)`\)")
 MARKDOWN_LINE_REF_RE = re.compile(r"`([\w.-]+\.md):(\d+)`")
 LINK_LINE_FRAGMENT_RE = re.compile(
-    r"(?:\]\([^\n)]*#L\d+(?:-L\d+)?\)|<[^\n>]*#L\d+(?:-L\d+)?>)",
+    r"(?:\]\((?P<markdown_url>[^\n)]*#L\d+(?:-L\d+)?)\)|"
+    r"<(?P<angle_url>[^\n>]*#L\d+(?:-L\d+)?)>)",
+    re.IGNORECASE,
+)
+IMMUTABLE_GITHUB_LINE_REF_RE = re.compile(
+    r"https://github\.com/[^/\s]+/[^/\s]+/blob/[0-9a-f]{40}/"
+    r"[^#\s]+#L\d+(?:-L\d+)?",
     re.IGNORECASE,
 )
 
@@ -107,16 +113,24 @@ def _reference_is_ignored(text: str, reference_end: int) -> bool:
     ) is not None
 
 
+def _is_immutable_github_line_reference(match: re.Match[str]) -> bool:
+    """Return whether a linked line range is pinned to an exact Git commit."""
+    url = match.group("markdown_url") or match.group("angle_url")
+    return IMMUTABLE_GITHUB_LINE_REF_RE.fullmatch(url) is not None
+
+
 def doc_references(text: str) -> list[dict]:
     """Extract (name, module?, cited_line, offset) references from doc text."""
     markdown_line_refs = [
         *MARKDOWN_LINE_REF_RE.finditer(text),
-        *LINK_LINE_FRAGMENT_RE.finditer(text),
+        *(match for match in LINK_LINE_FRAGMENT_RE.finditer(text)
+          if not _is_immutable_github_line_reference(match)),
     ]
     if markdown_line_refs:
         rendered = ", ".join(match.group(0) for match in markdown_line_refs[:3])
         raise ValueError(
-            f"Markdown line references are unstable ({rendered}); use a heading anchor")
+            f"Mutable Markdown line references are unstable ({rendered}); "
+            "use a heading anchor or a GitHub URL pinned to a full commit SHA")
     refs = []
     for m in INLINE_REF_RE.finditer(text):
         if _reference_is_ignored(text, m.end()):
@@ -136,7 +150,8 @@ def rewrite_doc_text(text: str, maps: dict[str, dict[str, int]]) -> tuple[str, i
 
     Unknown references fail closed. A prose example that intentionally looks
     like a code reference must put DOC_REF_IGNORE immediately after that one
-    reference. Markdown citations use stable heading anchors, never line numbers.
+    reference. Markdown citations use stable heading anchors; external source
+    line citations are allowed only when pinned to a full GitHub commit SHA.
     """
     edits: list[tuple[int, int, str]] = []
     for ref in doc_references(text):
