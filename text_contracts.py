@@ -54,10 +54,10 @@ _RENDERED_V1_TRANSLATION = str.maketrans({codepoint: None for codepoint in RENDE
 
 # When rendered-v1 joins text across removable controls it can synthesize a
 # backtracking input that did not exist in the raw artifact.  The exact-pinned
-# regex engine supplies an in-process operation timeout for that new input.
-# Ordinary exact/unchanged searches stay on stdlib re, preserving their
-# pre-existing behavior.  The normalized verdict and raw diagnostic share one
-# monotonic budget.
+# regex engine supplies an in-process operation timeout for that profile.  One
+# engine owns every rendered-v1 verdict, so inserting a removable character
+# cannot silently switch Unicode character-class semantics.  Exact searches
+# stay on stdlib re.  A normalized verdict and raw diagnostic share one budget.
 REGEX_SEARCH_TIMEOUT_SECONDS = 0.25
 BOUNDED_REGEX_ENGINE = f"regex {timeout_regex.__version__} VERSION0"
 
@@ -420,12 +420,14 @@ class RegexTextAssertion:
 
     def evaluate(self, text: str) -> MatchObservation:
         candidate = ComparisonText.from_text(text, self.profile)
-        if candidate.changed:
+        if self.profile is ComparisonProfile.RENDERED_V1:
             if self.bounded_regex is None:
                 raise RegexEvaluationUnavailable(
                     "rendered-v1 regex evaluation has no bounded engine")
-            hit, raw_hit = _bounded_regex_searches(
-                self.bounded_regex, (candidate.value, text))
+            compared_texts = (candidate.value, text) if candidate.changed else (candidate.value,)
+            bounded_hits = _bounded_regex_searches(self.bounded_regex, compared_texts)
+            hit = bounded_hits[0]
+            raw_hit = bounded_hits[1] if candidate.changed else hit
         else:
             hit = self.comparison_regex.search(candidate.value) is not None
             raw_hit = hit
@@ -435,7 +437,7 @@ class RegexTextAssertion:
             evidence = f"matched /{self.pattern}/" if passed else f"missing /{self.pattern}/"
         else:
             evidence = f"absent /{self.pattern}/" if passed else f"found banned /{self.pattern}/"
-        if candidate.changed:
+        if self.profile is ComparisonProfile.RENDERED_V1:
             evidence += (
                 f"; bounded by {BOUNDED_REGEX_ENGINE} under one "
                 f"{REGEX_SEARCH_TIMEOUT_SECONDS:g}s deadline")

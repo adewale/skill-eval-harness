@@ -211,13 +211,13 @@ class TypedTextAssertionTests(unittest.TestCase):
                     self.assertIn("regex 2026.7.19 VERSION0", result["evidence"])
         self.assertLess(time.monotonic() - started, 1.0)
 
-        # Timeout is confined to the changed candidate; a safe ordinary regex
-        # immediately afterward still derives a complete stdlib verdict.
+        # Timeout is confined to the rendered assertion; a safe rendered regex
+        # immediately afterward still derives a complete verdict.
         recovered = self.result({"type": "regex", "pattern": "^ok$"}, "ok")
         self.assertTrue(recovered["passed"])
         self.assertEqual(recovered["availability"], "complete")
 
-    def test_changed_regex_bound_is_worker_thread_safe(self):
+    def test_rendered_regex_bound_is_worker_thread_safe(self):
         assertion = parse_human_text_assertion(
             {"type": "regex", "pattern": r"androidx\.[\w.]+:[\w-]+"})
         self.assertIsInstance(assertion, RegexTextAssertion)
@@ -250,30 +250,48 @@ class TypedTextAssertionTests(unittest.TestCase):
              self.assertRaisesRegex(tc.RegexEvaluationUnavailable, "shared safety limit"):
             tc._bounded_regex_searches(TimingOutPattern(), ("normalized", "raw"))
 
-    def test_version0_bound_matches_stdlib_for_existing_pattern_shapes(self):
+    def test_rendered_regex_engine_is_stable_across_removable_insertions(self):
         cases = [
-            (r"androidx\.[\w.]+:[\w-]+", f"`{OBSCURED_COORDINATE}`"),
-            (r"^(?=abc)[a-z]+$", "a\u200bbc"),
-            (r"^(a+)b\1$", "a\u200bba"),
-            (r"(?:foo|bar)+$", "fo\u200boobar"),
+            (r"^\w+$", "²", False, False),
+            (r"^\w+$", "x\u0301", False, True),
+            (r"^\d+$", "٢", False, True),
+            (r"^\s+$", "\u00a0", False, True),
+            (r"^k$", "\u212a", True, True),
         ]
-        for pattern, raw in cases:
-            with self.subTest(pattern=pattern):
-                assertion = parse_human_text_assertion(
-                    {"type": "regex", "pattern": pattern, "ci": False})
-                self.assertIsInstance(assertion, RegexTextAssertion)
-                normalized = ComparisonText.from_text(raw, ComparisonProfile.RENDERED_V1).value
-                observation = assertion.evaluate(raw)
-                self.assertEqual(observation.passed, re.search(pattern, normalized) is not None)
+        for pattern, normalized, ci, expected in cases:
+            assertion = parse_human_text_assertion(
+                {"type": "regex", "pattern": pattern, "ci": ci})
+            self.assertIsInstance(assertion, RegexTextAssertion)
+            unchanged = assertion.evaluate(normalized)
+            self.assertEqual(unchanged.passed, expected)
+            for codepoint in sorted(RENDERED_V1_REMOVED_CODEPOINTS):
+                with self.subTest(pattern=pattern, text=normalized, codepoint=codepoint):
+                    changed = assertion.evaluate(normalized + chr(codepoint))
+                    self.assertEqual(changed.passed, expected)
+                    self.assertEqual(unchanged.passed, changed.passed)
 
-    def test_non_cpython_changed_regex_fails_closed_without_changing_ordinary_regex(self):
+        # VERSION0 deliberately differs from stdlib for some Unicode classes;
+        # the profile, not the presence of a removable control, selects it.
+        self.assertIsNotNone(re.search(r"^\w+$", "²"))
+        exact = parse_human_text_assertion(
+            {"type": "regex", "pattern": r"^\w+$", "ci": False, "comparison": "exact"})
+        self.assertIsInstance(exact, RegexTextAssertion)
+        self.assertTrue(exact.evaluate("²").passed)
+
+    def test_non_cpython_rendered_regex_fails_closed_while_exact_uses_stdlib(self):
         with mock.patch.object(tc.platform, "python_implementation", return_value="PyPy"):
             changed = self.result({"type": "regex", "pattern": "^xy$"}, "x\u200by")
             unchanged = self.result({"type": "regex", "pattern": "^xy$"}, "xy")
+            exact = self.result(
+                {"type": "regex", "pattern": "^xy$", "comparison": "exact"}, "xy")
         self.assertIsNone(changed["passed"])
         self.assertEqual(changed["availability"], "partial")
         self.assertIn("unavailable on PyPy", changed["evidence"])
-        self.assertTrue(unchanged["passed"])
+        self.assertIsNone(unchanged["passed"])
+        self.assertEqual(unchanged["availability"], "partial")
+        self.assertIn("unavailable on PyPy", unchanged["evidence"])
+        self.assertTrue(exact["passed"])
+        self.assertEqual(exact["availability"], "complete")
 
     def test_bounded_engine_incompatibility_rejects_rendered_but_exact_remains_available(self):
         failure = tc.timeout_regex.error("unsupported")

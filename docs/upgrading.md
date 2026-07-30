@@ -32,9 +32,8 @@ A fresh virtual environment keeps the old CLI usable while the new report is che
 - Legacy token and cost fields remain readable beside the schema-v3 telemetry envelope.
 - Schema-v1 trace events and the older single-model run-directory layout remain readable.
 - Python 3.10, 3.11, and 3.12 remain supported. The runtime now includes PyYAML plus
-  exact-pinned `regex==2026.7.19`; the latter supplies a native timeout only when
-  `rendered-v1` changes a regex candidate. Ordinary exact/unchanged regex matching keeps
-  stdlib `re` behavior.
+  exact-pinned `regex==2026.7.19`; the latter supplies one Unicode semantics and a native
+  timeout for every `rendered-v1` regex. `comparison: "exact"` keeps stdlib `re` behavior.
 
 `skill-benchmark migrate` still means **manifest version 1 → 2**. The new
 `migrate-telemetry` command upgrades saved `metadata.json` and `metrics.json`; the two
