@@ -24,7 +24,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "hypothesis>=6", "ruff==0.16.0"]
+test = ["pytest>=8", "hypothesis>=6", "ruff==0.16.0", "ty==0.0.65"]
 
 [project.urls]
 Homepage = "https://github.com/adewale/skill-eval-harness"
@@ -43,6 +43,20 @@ py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "a
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.ty.src]
+# Start with the type-clean contract and registry seams. Keep new boundary
+# modules in this gate instead of inheriting the legacy CLI's diagnostic debt.
+include = [
+  "agent_capabilities.py",
+  "experimental_pairs.py",
+  "jetty_contracts.py",
+  "run_trigger_matrix.py",
+  "telemetry.py",
+  "trace_contracts.py",
+  "text_contracts.py",
+  "observability.py",
+]
 
 [tool.ruff]
 required-version = "==0.16.0"
