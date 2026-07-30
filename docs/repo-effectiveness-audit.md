@@ -34,7 +34,7 @@ The repo has a clear README, install path, CI, releases, changelog, contribution
 | Docs + architecture | 14 | 15 | `docs/`, `examples/`, tests, `TODO.md`, and `LESSONS_LEARNED.md` route readers to depth without bloating the README. |
 | GitHub metadata + discoverability | 5 | 10 | GitHub API shows empty repo description, no topics, and no homepage URL. No separate docs site was found, so an empty homepage is acceptable unless one is created. |
 | Trust + governance + maintenance | 12 | 15 | Root `LICENSE`, `CHANGELOG.md`, `CONTRIBUTING.md`, PR template, issue forms, releases, and lessons doc exist. `SECURITY.md`/support policy should wait for an owner contact and supported-version policy. |
-| Automation + release hygiene | 9 | 10 | GitHub Actions runs Python 3.10/3.11/3.12 compile, unit tests, and CLI help. Tags/releases exist. Dependency automation is not currently needed: the only runtime dependency is PyYAML (per `pyproject.toml`). |
+| Automation + release hygiene | 9 | 10 | GitHub Actions runs Python 3.10/3.11/3.12 compile, unit tests, and CLI help, plus a Windows 3.12 text-contract smoke. Tags/releases exist. Runtime dependencies remain narrow: PyYAML plus an exact-pinned regex engine whose version is grading policy (per `pyproject.toml`). |
 | **Total** | **86** | **100** | Strong repo surface with a few owner-controlled metadata gaps. |
 
 ## Strengths

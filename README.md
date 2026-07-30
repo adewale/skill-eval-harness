@@ -191,7 +191,7 @@ skill-benchmark --help
 | `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
 | `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
 | `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
-| `docs/correctness-by-construction-audit.md` | The closed trigger, experimental-pair, answer-outcome, judge-verdict, prepared-task, Jetty, trace, and ablation-provenance constructions, their proof tests, and residual risks. |
+| `docs/correctness-by-construction-audit.md` | The closed trigger, experimental-pair, answer-outcome, judge-verdict, prepared-task, Jetty, trace, human-text comparison, and ablation-provenance constructions, their proof tests, and residual risks. |
 | `TODO.md` | Status tracker: the eval-framework roadmap (implemented, bar two `(TODO-native)` items), the remaining Jetty adapter work (streaming/concurrency, live API validation, judge export, per-variant overrides, the `swap:<id>` ablation follow-on), the agent-backend parity follow-ups (Gemini CLI open; Vibe done), and the migration/user-journey doc backlog. |
 | `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two answer-path materialized ablations, one discovery ablation for trigger examples, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per answer-path ablation; exercised by `tests/test_example_demo.py`. Also carries should-fire/should-not-fire trigger cases for `skill-trigger-matrix` (offline via `--agent stub`; live smoke via `RUN_TRIGGER_SMOKE=1`). Start here. |
 | `examples/adewale-workspace/` | Adewale-specific Pi smoke runner and cross-repo aggregate report (the trigger runners are the top-level `skill-pi-trigger-eval` and `skill-trigger-matrix`). |
@@ -302,6 +302,40 @@ dedicated subdirectory (for example `oracles/check.py`); the harness binds that 
 the eval-contract digest and rejects symlinks. Changing an imported helper or data file therefore
 invalidates stale prepared runs, while generated files beside the manifest cannot make the
 contract self-referential.
+
+Human-readable answer assertions (`contains`, `contains_any`, `contains_all`,
+`excludes_any`, `regex`, `not_regex`, and `similarity`) compare through the
+versioned `rendered-v1` view by default. The raw `output.md` is never rewritten:
+the comparison view applies NFC canonical normalization and removes only a
+narrow allow-list of zero-width, non-ordering controls: `U+200B ZERO WIDTH
+SPACE`, `U+2060 WORD JOINER`, and `U+FEFF ZERO WIDTH NO-BREAK SPACE`. Controls
+that can change visible glyph order (including bidi overrides/isolates) and
+`U+00AD SOFT HYPHEN` remain exact. Case-insensitive literal and ratio comparisons
+use Unicode case-folding.
+Results record `comparison: "rendered-v1"`; when normalization changes the input
+they also record the affected code points and, for deterministic matchers,
+whether it changed the verdict. Embedding similarity records that field as
+`null` because determining the raw verdict would require a second external
+embedding call. Similarity scores are rounded to four decimals before either
+`threshold` or `atLeast` derives the verdict, so a published score cannot
+contradict `passed`. Embedding vectors must contain finite, non-boolean numbers;
+negative cosine values map to the 0.0 floor of the public 0-1 score domain. Use
+`"comparison": "exact"` when an assertion deliberately tests formatting
+characters (and `"ci": false` when case must also remain exact). A rendered operand may not become empty, and regex
+source must already be NFC/control-stable so normalization cannot create an
+empty regex branch. Every `rendered-v1` regex verdict uses exact-pinned
+`regex==2026.7.19` in `VERSION0` compatibility mode under a 0.25-second native
+operation deadline; inserting a removable control therefore cannot switch regex
+engines or Unicode character-class semantics. When normalization changes the
+candidate, its normalized verdict and optional raw diagnostic share that deadline.
+Timeout or resource exhaustion produces partial/unavailable evidence rather
+than a positive or negative verdict. This path is in-process, works in worker
+threads, and owns no process signal or timer. Because that engine targets
+CPython for non-ASCII text, `rendered-v1` regex evaluation is unavailable on
+PyPy; `comparison: "exact"` retains the existing stdlib `re` behavior.
+Negative assertions use the same view, so invisible
+characters cannot hide banned content. `golden_output`, structured JSON,
+scripts, commands, tool names, and paths retain their exact/protocol semantics.
 
 Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict` on `grade`/`benchmark` promotes soft to gate. An `atLeast` floor on a plain scored judge requires a normalized 0–1 score and decides its pass; on `graded_dimensions` it tightens the normalized form of the dimension threshold. Missing score evidence remains unavailable rather than becoming a failure. Dynamic and per-step judges use `minimum_criteria` and `min_met_fraction` respectively instead of `atLeast`. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for text/process/efficiency), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`).
 
@@ -575,7 +609,7 @@ python3 scripts/check_ty_regressions.py
 python3 -m unittest discover tests -v
 ```
 
-The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics and pair identity (`test_stats.py`, `test_experimental_pairs.py`), runner/Jetty adapters and lifecycle contracts (`test_runners.py`, `test_jetty_contracts.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus three executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), and relative-link resolution across the docs (`test_doc_links.py`). Shared fixture builders live in `tests/helpers.py`.
+The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), human-text construction and matching (`test_text_contracts.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics and pair identity (`test_stats.py`, `test_experimental_pairs.py`), runner/Jetty adapters and lifecycle contracts (`test_runners.py`, `test_jetty_contracts.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus three executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), and relative-link resolution across the docs (`test_doc_links.py`). Shared fixture builders live in `tests/helpers.py`.
 
 ## Source checked
 

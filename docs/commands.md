@@ -296,7 +296,7 @@ skill-benchmark contamination ../repo/evals/shared-benchmark.json \
   --out contamination.json
 ```
 
-Three model-free checks over saved outputs: a canary tripwire (a case's declared canary string appearing verbatim in an output), output↔answer-key n-gram containment (`--ngram`, flagged above `--overlap-threshold`), and a `released_at`-vs-`--model-cutoff` gate for cases the model may have seen in training. `--fail-on-contamination` makes it a CI gate.
+Three model-free checks over saved outputs: a canary tripwire (a case's declared canary string appearing through the `rendered-v1` human-text view), output↔answer-key n-gram containment through that same view (`--ngram`, flagged above `--overlap-threshold`), and a `released_at`-vs-`--model-cutoff` gate for cases the model may have seen in training. `--fail-on-contamination` makes it a CI gate.
 
 ## Judge robustness probes
 

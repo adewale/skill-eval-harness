@@ -171,6 +171,58 @@ optimistically completed. Command grading, tool/file counts, skill-invocation me
 logic consume completed events only. Start/end fixture pairs prove a real operation counts once;
 unknown lifecycle records cannot become phantom tool calls.
 
+## Human-text comparison
+
+Human-readable answer matching has one internal state pipeline:
+
+```text
+raw output string
+  -> ComparisonText(raw, rendered-v1, changes)
+       |-> LiteralTextAssertion | RegexTextAssertion -> MatchObservation ---------|
+       `-> SimilarityTextAssertion -> SimilarityObservation / SimilarityDecision -|
+                                                                                   `-> derived verdict and normalization evidence
+```
+
+- `output.md` remains the faithful artifact. `ComparisonText` creates a separate immutable view;
+  no matcher can normalize the evidence on disk.
+- `ComparisonProfile` is closed over `exact` and the versioned `rendered-v1`. The latter applies
+  NFC and removes only zero-width controls whose removal does not reorder visible glyphs (`U+200B`,
+  `U+2060`, and `U+FEFF`). It deliberately preserves direction-changing bidi controls, soft
+  hyphens, joiners, Unicode line/paragraph separators, invisible mathematical operators, variation
+  selectors, and emoji tag characters rather than treating every `Cf` character alike.
+- Literal, regex, and similarity assertion dictionaries cross one strict parser. Missing/empty or
+  rendered-empty operands, conflicting alias fields, scalar value lists, non-boolean `ci`, invalid
+  regexes, normalization-unstable regex source, unknown comparison modes, and non-finite/out-of-range
+  thresholds cannot become executable assertions. The legacy list-valued `value` alias remains valid
+  for the multi-value literal assertions when `values` is absent.
+- Positive and negative assertions derive their verdicts from the same match/negation observation;
+  similarity verdicts derive from a finite 0-1 ratio rounded to the same four-decimal score that is
+  published in results. A zero-width character therefore cannot make `regex` spuriously fail while
+  making `not_regex` spuriously pass, and contradictory score/verdict fields are not constructor
+  inputs. External embedding vectors reject boolean/non-finite elements before cosine construction;
+  negative cosine occupies the public score domain's 0.0 floor.
+- Every rendered-v1 regex verdict uses exact-pinned `regex==2026.7.19` in `VERSION0`
+  compatibility mode under one monotonic 0.25-second budget, so inserting a removable control
+  cannot switch regex engines or Unicode character-class semantics. When normalization changes the
+  candidate, the normalized search and optional raw diagnostic share that budget. Expiry, resource
+  exhaustion, or a non-CPython implementation constructs unavailable evidence rather than letting a
+  synthesized candidate produce a negative pass. `comparison: "exact"` retains stdlib behavior. The
+  bounded path works in worker threads and owns no process-global timer or handler; it adds no
+  subprocess, model, or network call.
+- Results identify the comparison profile. When normalization changes an operand, the result also
+  records the affected code points, the raw deterministic similarity score where applicable, and
+  whether normalization changed a deterministic verdict. Embedding mode records that last value as
+  unknown (`null`) rather than paying for a second external embedding call.
+- Prompt leakage, held-out-rubric leakage, canary detection, and answer-key n-gram overlap consume
+  the same human-text view, including minimum-length and non-vacuity decisions. Protocol and
+  machine-identity checks (`golden_output` by default, structured JSON, scripts, command text, tool
+  names, and paths) remain exact; graded script scores still cross a finite 0-1 numeric boundary.
+- The project's focused `ty` gate includes `text_contracts.py`, so this module's constructors,
+  closed assertion union, and return types are statically checked without suppressions. That gate
+  complements rather than replaces runtime parsing: manifest dictionaries and external
+  embedding/script values remain untrusted wire data, while the legacy `skill_benchmark.py`
+  integration is not yet in ty's configured source set.
+
 ## Ablation provenance vocabulary
 
 Answer-population ablation confirmation uses the same exact case/model/repetition pairs, requires

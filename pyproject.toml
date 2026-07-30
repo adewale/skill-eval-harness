@@ -7,7 +7,7 @@ name = "skill-eval-harness"
 version = "0.6.0"
 description = "Repo-agnostic Agent Skill evaluation harness with paired variants, holdout splits, repeated-run stats, script assertions, judge command backends, Anthropic-compatible exports, Jetty adapter support, and static review output."
 requires-python = ">=3.10"
-dependencies = ["pyyaml>=6"]
+dependencies = ["pyyaml>=6", "regex==2026.7.19"]
 readme = "README.md"
 license = "MIT"
 authors = [{name = "Adewale"}]
@@ -39,7 +39,7 @@ skill-pi-trigger-eval = "run_pi_trigger_eval:main"
 skill-trigger-matrix = "run_trigger_matrix:main"
 
 [tool.setuptools]
-py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model", "agent_capabilities", "telemetry", "trigger_contracts", "trace_contracts", "runner_contracts", "judge_verdict", "experimental_pairs", "jetty_contracts", "json_contracts"]
+py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model", "agent_capabilities", "telemetry", "trigger_contracts", "trace_contracts", "runner_contracts", "judge_verdict", "experimental_pairs", "jetty_contracts", "json_contracts", "text_contracts"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
