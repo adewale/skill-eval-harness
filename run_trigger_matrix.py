@@ -118,6 +118,7 @@ from trigger_contracts import (
     TriggerExpectation,
     TriggerObservation,
     TriggerRepetitionIdentity,
+    validated_trigger_protocol_limits,
 )
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
@@ -698,6 +699,8 @@ def trigger_protocol(
     adapters: list[AgentAdapter], models: list[str] | None, *,
     runs_per_query: int, timeout: int, workers: int,
 ) -> dict[str, Any]:
+    timeout, runs_per_query, workers = validated_trigger_protocol_limits(
+        timeout_seconds=timeout, runs_per_query=runs_per_query, workers=workers)
     return {
         "schema_version": 1,
         "producer": "skill-trigger-matrix",
@@ -879,7 +882,9 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
                 pi_stream=artifact_pi_stream,
             )
         except Exception as exc:
-            row["trace_error"] = f"{type(exc).__name__}: {exc}"
+            trace_error = f"{type(exc).__name__}: {exc}"
+            row["trace_error"] = trace_error
+            row["observation_metadata"]["trace_error"] = trace_error
     return row
 
 
@@ -970,8 +975,14 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         raise SystemExit("select at least one --agent")
     if models is not None and not models:
         raise SystemExit("select at least one --model or omit --model for adapter defaults")
-    if isinstance(runs_per_query, bool) or not isinstance(runs_per_query, int) or runs_per_query < 1:
-        raise SystemExit("--runs-per-query must be a positive integer")
+    try:
+        timeout, runs_per_query, workers = validated_trigger_protocol_limits(
+            timeout_seconds=timeout,
+            runs_per_query=runs_per_query,
+            workers=workers,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     repo_root = repo_root_for_manifest(manifest_path)
     reject_duplicates(agents, "--agent")
     if models is not None:

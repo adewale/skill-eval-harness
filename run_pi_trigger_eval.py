@@ -55,6 +55,7 @@ from trigger_contracts import (
     TriggerExpectation,
     TriggerObservation,
     TriggerRepetitionIdentity,
+    validated_trigger_protocol_limits,
 )
 
 
@@ -110,6 +111,8 @@ def copy_skill_to_config(manifest_path: Path, manifest: dict[str, Any], config_d
 def pi_trigger_protocol(
     *, timeout: int, runs_per_query: int, workers: int, model: str | None,
 ) -> dict[str, Any]:
+    timeout, runs_per_query, workers = validated_trigger_protocol_limits(
+        timeout_seconds=timeout, runs_per_query=runs_per_query, workers=workers)
     resolved = shutil.which("pi")
     executable = {"requested": "pi", "resolved": str(Path(resolved).resolve()) if resolved else None}
     if resolved:
@@ -374,17 +377,23 @@ def main() -> int:
     rows = eval_rows_from_args(args, manifest_path)
     if not rows:
         raise SystemExit("no trigger queries: add kind:'trigger' cases to the manifest or pass --eval-set")
-    if isinstance(args.runs_per_query, bool) or args.runs_per_query < 1:
-        raise SystemExit("--runs-per-query must be a positive integer")
+    try:
+        timeout, runs_per_query, workers = validated_trigger_protocol_limits(
+            timeout_seconds=args.timeout,
+            runs_per_query=args.runs_per_query,
+            workers=args.workers,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     futures = []
     results = []
     protocol = pi_trigger_protocol(
-        timeout=args.timeout, runs_per_query=args.runs_per_query,
-        workers=args.workers, model=args.model)
+        timeout=timeout, runs_per_query=runs_per_query,
+        workers=workers, model=args.model)
     protocol_sha256 = canonical_json_sha256(protocol)
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         for i, row in enumerate(rows, 1):
-            for run_number in range(1, args.runs_per_query + 1):
+            for run_number in range(1, runs_per_query + 1):
                 trace_dir = None
                 if args.trace_runs:
                     label = safe_trace_label(str(row.get("query", f"query-{i}")), f"query-{i}")
@@ -392,7 +401,7 @@ def main() -> int:
                 identity = TriggerRepetitionIdentity(row["query_id"], run_number)
                 futures.append(ex.submit(
                     run_query, manifest_path, row["query"], row["should_trigger"],
-                    args.timeout, args.model, trace_dir, args.ablation, identity,
+                    timeout, args.model, trace_dir, args.ablation, identity,
                     protocol_sha256))
         for fut in as_completed(futures):
             results.append(fut.result())

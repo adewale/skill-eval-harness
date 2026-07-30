@@ -1,4 +1,5 @@
 """Finite-state and recorded-wire proofs for trigger correctness by construction."""
+import json
 import unittest
 from pathlib import Path
 
@@ -349,6 +350,56 @@ class TriggerObservationTruthTableTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(TriggerObservation.from_row(first.as_row()).identity,
                          TriggerRepetitionIdentity("query-a", 1))
+
+    def test_invocation_and_observation_metadata_round_trip_without_aggregation_loss(self):
+        invocation = InvocationOutcome.from_process(
+            stdout="", stderr="", returncode=0, elapsed_ms=1,
+            metadata={"adapter_tag": "codex-v1", "nested": {"isolated": True}},
+        )
+        original = TriggerObservation(
+            agent="codex", model="m", query="q",
+            expectation=TriggerExpectation.DO_NOT_TRIGGER,
+            invocation=invocation, detection=TriggerDetection.absent(),
+            usage={"source": "missing"}, cost={"source": "missing"},
+            metadata={
+                "skill_tree_hash": "tree",
+                "protocol_sha256": "protocol",
+                "protocol_observation": {"config_isolated": True},
+            },
+            identity=TriggerRepetitionIdentity("query-a", 1),
+        )
+        row = json.loads(json.dumps(original.as_row(), allow_nan=False))
+        restored = TriggerObservation.from_row(row)
+        self.assertEqual(dict(restored.invocation.metadata), dict(invocation.metadata))
+        self.assertEqual(dict(restored.metadata), dict(original.metadata))
+
+    def test_explicit_metadata_namespaces_must_agree_with_flattened_wire_fields(self):
+        row = self._observation(
+            usage={"source": "missing"}, cost={"source": "missing"},
+        ).as_row()
+        row["invocation_metadata"] = {"adapter_tag": "typed"}
+        row["adapter_tag"] = "forged"
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            TriggerObservation.from_row(row)
+
+    def test_metadata_rejects_non_string_keys_and_nonfinite_values(self):
+        for metadata in ({1: "bad key"}, {"score": float("nan")}):
+            with self.subTest(metadata=metadata), self.assertRaises((TypeError, ValueError)):
+                InvocationOutcome.from_process(
+                    stdout="", stderr="", returncode=0, elapsed_ms=1,
+                    metadata=metadata,
+                )
+            base = self._observation(
+                usage={"source": "missing"}, cost={"source": "missing"},
+            )
+            with self.subTest(observation_metadata=metadata), \
+                 self.assertRaises((TypeError, ValueError)):
+                TriggerObservation(
+                    agent=base.agent, model=base.model, query=base.query,
+                    expectation=base.expectation, invocation=base.invocation,
+                    detection=base.detection, usage=base.usage, cost=base.cost,
+                    metadata=metadata,
+                )
 
     def test_partial_or_invalid_repetition_identity_is_rejected(self):
         row = self._observation(

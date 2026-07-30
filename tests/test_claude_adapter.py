@@ -7,6 +7,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from helpers import claude_stream_records as _canonical_stream_records
 from helpers import make_eval_repo
@@ -479,6 +480,23 @@ class ClaudeJudgeAndPanelTests(unittest.TestCase):
                     "magnitude_sensitive", "judge_sensitive"):
             self.assertIsNone(result[key])
         self.assertEqual(result["observed"]["judges"], ["complete"])
+
+    def test_compare_judges_rejects_blank_and_duplicate_identities_before_loading(self):
+        def rejected(message):
+            raise ValueError(message)
+
+        for reports, message in (
+            (["=first.json", "b=second.json"], "non-empty"),
+            (["same=first.json", "same=second.json", "b=third.json"], "duplicate"),
+            (["a=", "b=second.json"], "path"),
+        ):
+            args = argparse.Namespace(report=reports, magnitude_eps=0.1, out=None)
+            with self.subTest(reports=reports), \
+                 mock.patch.object(sb, "load_json") as load_json, \
+                 mock.patch.object(sb, "die", side_effect=rejected), \
+                 self.assertRaisesRegex(ValueError, message):
+                sb.compare_judges(args)
+            load_json.assert_not_called()
 
 
 if __name__ == "__main__":

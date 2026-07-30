@@ -518,6 +518,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, validation commands, a
 pip install -e ".[test]"
 python3 -m py_compile *.py examples/adewale-workspace/*.py
 ty check
+python3 scripts/check_ty_regressions.py
 python3 -m unittest discover tests -v
 ```
 
@@ -570,6 +571,7 @@ skill-eval-harness/
 pip install -e ".[test]"
 python3 -m py_compile *.py examples/adewale-workspace/*.py
 ty check
+python3 scripts/check_ty_regressions.py
 python3 -m unittest discover tests -v
 ```
 

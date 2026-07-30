@@ -907,6 +907,31 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertEqual(reg["evidence"][0]["case"], "c1")
         self.assertEqual(reg["evidence"][0]["assertion"], "detect-weak")
 
+    def test_incomplete_grading_cannot_construct_confirmed_causal_evidence(self):
+        results = []
+        for run_number in range(1, 7):
+            results.append({
+                "case_id": "c1", "variant": "with_skill", "run_number": run_number,
+                "objective_pass_rate": 1.0, "grading_availability": "partial",
+                "assertions": [{"name": "detect-weak", "passed": True}],
+                "qualitative_assertions": [], **self.ws(),
+            })
+            results.append({
+                "case_id": "c1", "variant": "ablation:no-rp", "run_number": run_number,
+                "objective_pass_rate": 0.0, "grading_availability": "partial",
+                "assertions": [{"name": "detect-weak", "passed": False}],
+                "qualitative_assertions": [], **self.prov(),
+            })
+        entry = self.report(self.MANIFEST, results)[0]
+        regression = entry["regressions"][0]
+        self.assertEqual(entry["pairing"]["eligible_pairs"], 0)
+        self.assertEqual(
+            entry["pairing"]["blocked_reason_counts"],
+            {"grading_evidence_incomplete": 6},
+        )
+        self.assertEqual(regression["evidence_class"], "indeterminate")
+        self.assertIsNone(regression["expected_regression_confirmed"])
+
     def test_blocked_cited_repetition_prevents_answer_causal_confirmation(self):
         results = []
         for run_number in range(1, 8):

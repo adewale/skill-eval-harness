@@ -36,13 +36,15 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from typing import Any, NoReturn, Protocol
 
 import yaml
+from yaml.constructor import ConstructorError
+from yaml.resolver import BaseResolver
 
 import experimental_pairs as pair_domain
 import telemetry as telemetry_domain
@@ -71,6 +73,7 @@ from ablation_model import (
     PreparedTask,
     PreparedTaskDraft,
     Provenance,
+    Provider,
     ProviderFailed,
     ResultSet,
     RunnerOutcome,
@@ -108,6 +111,7 @@ from trigger_contracts import (
     TriggerDetection,
     TriggerEvidenceKind,
     TriggerObservation,
+    validated_trigger_protocol_limits,
 )
 
 VALID_SPLITS = {"tune", "holdout", "holdback"}
@@ -310,6 +314,17 @@ def reject_nonfinite_numbers(value: Any, *, location: str = "$") -> None:
             reject_nonfinite_numbers(child, location=f"{location}[{index}]")
 
 
+def string_keyed_dict(value: Any, label: str) -> dict[str, Any]:
+    """Reify an untrusted JSON/YAML object without coercing or losing keys."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{label} must be an object")
+    if not all(isinstance(key, str) for key in value):
+        raise TypeError(f"{label} object keys must be strings")
+    return {
+        key: item for key, item in value.items() if isinstance(key, str)
+    }
+
+
 class UniqueKeySafeLoader(yaml.SafeLoader):
     """PyYAML safe loader that rejects duplicate mapping keys."""
 
@@ -322,7 +337,7 @@ def _construct_unique_yaml_mapping(
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
         if key in result:
-            raise yaml.constructor.ConstructorError(
+            raise ConstructorError(
                 "while constructing a mapping", node.start_mark,
                 f"found duplicate key {key!r}", key_node.start_mark)
         result[key] = loader.construct_object(value_node, deep=deep)
@@ -330,7 +345,7 @@ def _construct_unique_yaml_mapping(
 
 
 UniqueKeySafeLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    BaseResolver.DEFAULT_MAPPING_TAG,
     _construct_unique_yaml_mapping,
 )
 
@@ -405,19 +420,32 @@ def materialize_dataset_cases(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         die("manifest.cases must be a list")
     datasets = manifest.get("datasets") or {}
     out: list[dict[str, Any]] = []
-    for case in cases:
-        dataset_id = case.get("template") if isinstance(case, dict) else None
+    for case_index, case in enumerate(cases, 1):
+        if (not isinstance(case, dict)
+                or not all(isinstance(key, str) for key in case)):
+            die(f"manifest case #{case_index} must be an object with string keys")
+        case_row = {
+            key: value for key, value in case.items() if isinstance(key, str)
+        }
+        dataset_id = case_row.get("template")
         if not dataset_id:
-            out.append(case)
+            out.append(case_row)
             continue
         rows = datasets.get(str(dataset_id))
         if not isinstance(rows, list) or not rows:
             die(f"case {case.get('id')!r}: template references unknown or empty dataset {dataset_id!r}")
         for i, row in enumerate(rows, 1):
-            if not isinstance(row, dict):
-                die(f"dataset {dataset_id!r}: row #{i} must be an object")
-            materialized = {key: apply_dataset_row(value, row) for key, value in case.items() if key != "template"}
-            materialized["id"] = f"{case.get('id')}-{row.get('id', i)}"
+            if (not isinstance(row, dict)
+                    or not all(isinstance(key, str) for key in row)):
+                die(f"dataset {dataset_id!r}: row #{i} must be an object with string keys")
+            dataset_row = {
+                key: value for key, value in row.items() if isinstance(key, str)
+            }
+            materialized = {
+                key: apply_dataset_row(value, dataset_row)
+                for key, value in case_row.items() if key != "template"
+            }
+            materialized["id"] = f"{case_row.get('id')}-{dataset_row.get('id', i)}"
             materialized["dataset"] = str(dataset_id)
             out.append(materialized)
     return out
@@ -480,7 +508,7 @@ def script_command_list(assertion: dict[str, Any]) -> list[str]:
     if isinstance(command, str):
         return [command]
     if isinstance(command, list) and command and all(isinstance(part, str) for part in command):
-        return list(command)
+        return [part for part in command if isinstance(part, str)]
     return []
 
 
@@ -655,7 +683,7 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
         die(f"{where} has unsupported type {atype!r}")
     unknown_fields = set(assertion) - ASSERTION_COMMON_FIELDS - ASSERTION_TYPE_FIELDS[atype]
     if unknown_fields:
-        die(f"{where} has unknown field(s): {', '.join(sorted(unknown_fields))}")
+        die(f"{where} has unknown field(s): {', '.join(sorted(map(str, unknown_fields)))}")
     if "ci" in assertion and not isinstance(assertion["ci"], bool):
         die(f"{where} ci must be boolean")
     shorthand = [key for key in ("critical", "gate", "soft")
@@ -768,12 +796,15 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
             if unknown:
                 die(
                     f"{where} graded_dimensions[{k}] has unknown field(s): "
-                    f"{', '.join(sorted(unknown))}")
+                    f"{', '.join(sorted(map(str, unknown)))}")
             if dim.get("scale", "1-5") != "1-5":
                 die(f"{where} graded_dimensions[{k}].scale must be '1-5'")
             if not isinstance(dim.get("rubric"), str) or not dim.get("rubric"):
                 die(f"{where} graded_dimensions[{k}] needs an anchored string rubric")
-            names.append(dim["name"])
+            dimension_name = dim.get("name")
+            if not isinstance(dimension_name, str):
+                die(f"{where} graded_dimensions[{k}] needs a string name")
+            names.append(dimension_name)
         if len(set(names)) != len(names):
             die(f"{where} graded_dimensions names must be unique")
     dyn = assertion.get("dynamic_rubric")
@@ -784,7 +815,7 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
         if unknown:
             die(
                 f"{where} dynamic_rubric has unknown field(s): "
-                f"{', '.join(sorted(unknown))}")
+                f"{', '.join(sorted(map(str, unknown)))}")
         minimum = dyn.get("minimum_criteria", 3)
         if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
             die(f"{where} dynamic_rubric.minimum_criteria must be a positive integer")
@@ -797,7 +828,7 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
         if isinstance(per_step, dict):
             unknown = set(per_step) - {"min_met_fraction"}
             if unknown:
-                die(f"{where} per_step has unknown field(s): {', '.join(sorted(unknown))}")
+                die(f"{where} per_step has unknown field(s): {', '.join(sorted(map(str, unknown)))}")
             if "min_met_fraction" not in per_step:
                 die(f"{where} per_step object must contain min_met_fraction")
             fraction = per_step["min_met_fraction"]
@@ -1191,6 +1222,8 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
         )
     if is_ablation_variant(variant):
         aid = ablation_id_of(variant)
+        if aid is None:
+            raise ValueError(f"invalid ablation variant: {variant}")
         ab = ablation_by_id(manifest, aid)
         if not ab:
             return f"Use an ablated skill variant {aid}; ablation metadata was not found."
@@ -1403,10 +1436,13 @@ def prepared_task_rows(
         trees = materialize_declared_ablations(repo_root, manifest, ablation_dir)
     # Every materialized ablation derives from the same canonical (unedited) tree,
     # so its parent_skill_hash is the canonical hash recorded on the with_skill arm.
-    canonical_hash = (
-        next(iter(trees.values())).arm.identity.canonical
-        if trees else canonical_skill_tree_hash(repo_root, manifest)
-    )
+    if trees:
+        first_identity = next(iter(trees.values())).arm.identity
+        if first_identity is None:
+            raise ValueError("materialized ablation tree is missing its typed identity")
+        canonical_hash = first_identity.canonical
+    else:
+        canonical_hash = canonical_skill_tree_hash(repo_root, manifest)
     contract_sha256 = eval_contract_sha256(
         manifest, manifest_path, cases=cases)
     rows: list[dict[str, Any]] = []
@@ -1654,7 +1690,10 @@ def manifest_variant_skill_hash(
         return canonical_skill_tree_hash(
             repo_root, {**manifest, "skill_paths": old_paths})
     if is_ablation_variant(variant):
-        ablation = ablation_by_id(manifest, ablation_id_of(variant))
+        ablation_id = ablation_id_of(variant)
+        if ablation_id is None:
+            raise ValueError(f"invalid ablation arm: {variant}")
+        ablation = ablation_by_id(manifest, ablation_id)
         if ablation is None:
             raise ValueError(f"unknown ablation arm: {variant}")
         if ablation_components(ablation):
@@ -2694,20 +2733,19 @@ def expected_provenance_for_ablation(
     components = ablation_components(ablation)
     if not components:
         raise ValueError(f"ablation {ablation_id!r} has no materialized components")
+    raw_skill_paths = manifest.get("skill_paths", [])
+    if (not isinstance(raw_skill_paths, list)
+            or not all(isinstance(path, str) for path in raw_skill_paths)):
+        raise ValueError("manifest skill_paths must be a list of strings")
+    skill_paths = [path for path in raw_skill_paths if isinstance(path, str)]
     return ExpectedProvenance(
         id=ablation_id,
         mode=(AblationMode.INVALID_SKILL if ablation.get("invalid_skill")
               else AblationMode.MATERIALIZED),
         population=Population(derived_population(components)),
         components=tuple(
-            Component(
-                cls=(component.get("class") or component_class(component)),
-                mechanism=component.get("mechanism"),
-                skill_root=resolve_skill_root(component, manifest.get("skill_paths", [])),
-                target=component.get("target", {}),
-            )
-            for component in components
-        ),
+            _expected_component(component, skill_paths)
+            for component in components),
     )
 
 
@@ -3853,8 +3891,7 @@ def validate_jetty_artifacts(raw_artifacts: Any) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
     destinations: set[str] = set()
     for index, artifact in enumerate(raw_artifacts, 1):
-        if not isinstance(artifact, dict):
-            raise TypeError(f"Jetty artifacts[{index}] must be an object")
+        artifact = string_keyed_dict(artifact, f"Jetty artifacts[{index}]")
         rel = artifact_rel_path(artifact)
         if rel is None:
             raise ValueError(f"Jetty artifacts[{index}] has an unsafe or ambiguous path")
@@ -4013,10 +4050,8 @@ def jetty_trace_records(record: dict[str, Any], artifacts: list[dict[str, Any]],
         if not isinstance(values, list):
             raise TypeError(f"Jetty trajectory.{key} must be a list")
         for index, item in enumerate(values, 1):
-            if not isinstance(item, dict):
-                raise TypeError(
-                    f"Jetty trajectory.{key}[{index}] must be an object")
-            records.append(item)
+            records.append(string_keyed_dict(
+                item, f"Jetty trajectory.{key}[{index}]"))
     telemetry_values = jetty_telemetry_values(record)
     metric_record: dict[str, Any] = {"type": "usage"}
     canonical_usage = {
@@ -7676,13 +7711,16 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
                 "usage": {}, "parse_error": f"invalid Claude usage: {exc}"}
     usage = {key: value for key, value in normalized_usage.items() if key != "source"}
     cost = env.get("total_cost_usd")
+    normalized_cost = _num(cost)
     result = env.get("result")
     result_error = None if isinstance(result, str) else "claude result must be a string"
-    if cost is not None and (_num(cost) is None or float(cost) < 0):
+    if cost is not None and (normalized_cost is None or normalized_cost < 0):
         result_error = "claude total_cost_usd must be a finite nonnegative number"
     return {
         "answer": result if isinstance(result, str) else "",
-        "cost_usd": float(cost) if _num(cost) is not None and float(cost) >= 0 else None,
+        "cost_usd": (normalized_cost
+                     if normalized_cost is not None and normalized_cost >= 0
+                     else None),
         "usage": usage,
         "parse_error": result_error,
         "is_error": env.get("is_error", False),
@@ -7806,6 +7844,11 @@ def supported_json_schema_errors(schema: Any, path: str = "$") -> list[str]:
     """Validate the closed JSON-Schema subset implemented by json_schema_errors."""
     if not isinstance(schema, dict) or not schema:
         return [f"{path}: schema must be a non-empty object"]
+    if not all(isinstance(key, str) for key in schema):
+        return [f"{path}: schema object keys must be strings"]
+    schema = {
+        key: value for key, value in schema.items() if isinstance(key, str)
+    }
     errors: list[str] = []
     unknown = sorted(set(schema) - SUPPORTED_JSON_SCHEMA_KEYS)
     if unknown:
@@ -7847,7 +7890,9 @@ def supported_json_schema_errors(schema: Any, path: str = "$") -> list[str]:
                 or len(required) != len(set(required))):
             errors.append(f"{path}.required: must be a unique list of non-empty strings")
         elif isinstance(properties, dict):
-            missing = sorted(set(required) - set(properties))
+            required_names = [key for key in required if isinstance(key, str)]
+            property_names = [key for key in properties if isinstance(key, str)]
+            missing = sorted(set(required_names) - set(property_names))
             if missing:
                 errors.append(f"{path}.required: keys absent from properties: {', '.join(missing)}")
         else:
@@ -8183,6 +8228,8 @@ def golden_output_result(assertion: dict[str, Any], text: str, output_path: Path
             assertion, "reference", "value", required=True)
     except ValueError as exc:
         return False, f"invalid golden_output reference: {exc}"
+    if reference_rel is None:
+        return False, "golden_output requires a reference path"
     if manifest_dir is None:
         return False, "golden_output requires a `reference` file path relative to the manifest directory"
     try:
@@ -8273,6 +8320,8 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
         try:
             rel = canonical_assertion_path(
                 assertion, "path", "value", required=True)
+            if rel is None:
+                raise ValueError("file_exists needs a path")
             candidate = resolved_assertion_path(output_path.parent, rel)
             passed = candidate.is_file()
             evidence = f"file exists: {rel}" if passed else f"missing file: {rel}"
@@ -9347,9 +9396,14 @@ def aggregate_judge_member_telemetry(
     }
     if all(aggregate.availability == telemetry_domain.COMPLETE
            for aggregate in token_aggregates.values()):
-        out["usage_normalized"] = {
-            key: int(aggregate.value) for key, aggregate in token_aggregates.items()
-        } | {"source": "provider_reported"}
+        normalized_tokens: dict[str, Any] = {"source": "provider_reported"}
+        for key, aggregate in token_aggregates.items():
+            value = aggregate.value
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    f"complete judge {key} aggregate must be an integer")
+            normalized_tokens[key] = value
+        out["usage_normalized"] = normalized_tokens
     else:
         out["usage_normalized"] = {"source": "missing"}
 
@@ -9363,7 +9417,10 @@ def aggregate_judge_member_telemetry(
     usd = cost_buckets.get("USD")
     if (usd is not None and usd.availability == telemetry_domain.COMPLETE
             and len(cost_buckets) == 1):
-        out["cost_usd"] = float(usd.value)
+        usd_value = usd.value
+        if not isinstance(usd_value, Decimal):
+            raise TypeError("complete judge USD aggregate must be Decimal")
+        out["cost_usd"] = float(usd_value)
         out["cost_normalized"] = normalize_cost(
             out["cost_usd"], source="provider_reported", pricing_model="consensus")
     else:
@@ -9595,15 +9652,15 @@ def tool_replay_mode(default: str = "off") -> str:
 
 
 def validate_subagent_response(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise TypeError("subagent response must be an object")
+    value = string_keyed_dict(value, "subagent response")
     allowed = {
         "answer", "trace", "usage", "returncode", "timed_out", "elapsed_ms",
         "telemetry_scope",
     }
     unknown = set(value) - allowed
     if unknown:
-        raise ValueError(f"subagent response has unsupported fields: {sorted(unknown)}")
+        raise ValueError(
+            f"subagent response has unsupported fields: {sorted(map(str, unknown))}")
     if not isinstance(value.get("answer"), str):
         raise TypeError("subagent response answer must be a string")
     if "trace" in value and (not isinstance(value["trace"], list)
@@ -9619,7 +9676,7 @@ def validate_subagent_response(value: Any) -> dict[str, Any]:
             raise TypeError("subagent response usage must be an object")
         # OutcomeContext owns the full numeric-shape contract; normalize_usage
         # additionally rejects conflicting token aliases.
-        OutcomeContext(provider="subagent", usage=value["usage"])
+        OutcomeContext(provider=Provider.SUBAGENT, usage=value["usage"])
         normalize_usage(value["usage"])
         if "cost_usd" in value["usage"]:
             normalize_cost(value["usage"]["cost_usd"])
@@ -9639,7 +9696,7 @@ def validate_subagent_response(value: Any) -> dict[str, Any]:
         raise ValueError(
             "subagent response telemetry_scope must be turn_delta or "
             "conversation_cumulative")
-    return dict(value)
+    return value
 
 
 def _subagent_trace_text(records: Any) -> str:
@@ -9908,8 +9965,20 @@ def run_subagent_tasks(
                                     and not isinstance(reported_elapsed, bool)
                                     else int((time.time() - turn_started) * 1000))
                     turn_answer = str(turn_response.get("answer") or "")
-                    turn_rc = turn_response.get("returncode", 0)
-                    turn_timed_out = turn_response.get("timed_out", False)
+                    raw_turn_rc = turn_response.get("returncode", 0)
+                    raw_turn_timed_out = turn_response.get("timed_out", False)
+                    if type(raw_turn_rc) is not int:
+                        turn_error = turn_error or (
+                            f"subagent turn {n} returned malformed returncode")
+                        turn_rc = 1
+                    else:
+                        turn_rc = raw_turn_rc
+                    if not isinstance(raw_turn_timed_out, bool):
+                        turn_error = turn_error or (
+                            f"subagent turn {n} returned malformed timed_out")
+                        turn_timed_out = False
+                    else:
+                        turn_timed_out = raw_turn_timed_out
                     if turn_error is None and turn_rc == 124 and not turn_timed_out:
                         turn_error = (
                             f"subagent turn {n} returned timeout code without timed_out")
@@ -9929,8 +9998,11 @@ def run_subagent_tasks(
                     turn_trace_records = (turn_response.get("trace")
                                           if isinstance(turn_response.get("trace"), list) else [])
                     turn_trace_text = _subagent_trace_text(turn_trace_records)
-                    turn_usage = (turn_response.get("usage")
-                                  if isinstance(turn_response.get("usage"), dict) else None)
+                    raw_turn_usage = turn_response.get("usage")
+                    turn_usage: dict[str, Any] | None = (
+                        string_keyed_dict(raw_turn_usage, "subagent turn usage")
+                        if isinstance(raw_turn_usage, dict) else None
+                    )
                     turn_cost = _subagent_cost_usd(turn_response)
                     turn_ro = RunnerOutcome(
                         provider="subagent", answer=turn_answer,
@@ -9988,8 +10060,11 @@ def run_subagent_tasks(
                 trace_records = (outcome.get("trace")
                                  if isinstance(outcome.get("trace"), list) else [])
                 trace_text = _subagent_trace_text(trace_records)
-                raw_usage = (outcome.get("usage")
-                             if isinstance(outcome.get("usage"), dict) else None)
+                raw_single_usage = outcome.get("usage")
+                raw_usage: dict[str, Any] | None = (
+                    string_keyed_dict(raw_single_usage, "subagent usage")
+                    if isinstance(raw_single_usage, dict) else None
+                )
                 aggregate_cost_usd = _subagent_cost_usd(outcome)
         if store is not None:
             store.save()
@@ -10002,9 +10077,18 @@ def run_subagent_tasks(
             raw_timed_out = False
             outcome = {**outcome, "returncode": 1, "answer": ""}
         timed_out = raw_timed_out
+        raw_answer = outcome.get("answer")
+        answer = raw_answer if isinstance(raw_answer, str) else ""
+        raw_returncode = outcome.get(
+            "returncode", 124 if timed_out else (1 if error else 0))
+        if type(raw_returncode) is not int:
+            error = error or "subagent returned malformed returncode field"
+            returncode = 1
+        else:
+            returncode = raw_returncode
         ro = RunnerOutcome(
-            provider="subagent", answer=outcome.get("answer") or "",
-            returncode=outcome.get("returncode", 124 if timed_out else (1 if error else 0)), timed_out=timed_out,
+            provider="subagent", answer=answer,
+            returncode=returncode, timed_out=timed_out,
             # A timeout keeps its error string (or the subagent's default) so the
             # TIMEOUT marker, not the provider marker, heads the body.
             error=error or ("subagent timed out" if timed_out else None),
@@ -10343,14 +10427,26 @@ def compare_judges(args: argparse.Namespace) -> int:
     """Compare judged benchmark reports produced by different judge models and flag
     judge-sensitivity. Each --report is `name=path` where path is a benchmark report
     JSON that was merged with that judge's results (`benchmark --judge-results`)."""
-    reports_by_judge: dict[str, dict[str, Any]] = {}
+    parsed_specs: list[tuple[str, str]] = []
+    seen_names: set[str] = set()
     for spec in args.report or []:
         if "=" not in spec:
             die(f"--report expects name=path, got {spec!r}")
         name, path = spec.split("=", 1)
-        reports_by_judge[name] = load_json(Path(path))
-    if len(reports_by_judge) < 2:
+        name, path = name.strip(), path.strip()
+        if not name:
+            die("--report judge name must be non-empty")
+        if name in seen_names:
+            die(f"duplicate --report judge name {name!r}")
+        if not path:
+            die(f"--report path for judge {name!r} must be non-empty")
+        seen_names.add(name)
+        parsed_specs.append((name, path))
+    if len(parsed_specs) < 2:
         die("compare-judges needs at least two --report name=path entries (a panel)")
+    reports_by_judge: dict[str, dict[str, Any]] = {}
+    for name, path in parsed_specs:
+        reports_by_judge[name] = load_json(Path(path))
     result = judge_panel_sensitivity(reports_by_judge, magnitude_eps=float(getattr(args, "magnitude_eps", 0.1)))
     emit_report(result, getattr(args, "out", None))
     return 0
@@ -11389,17 +11485,18 @@ def _validated_trigger_protocol(
     design_pairs: set[tuple[str, str | None]],
 ) -> dict[str, dict[str, bool]]:
     """Type and cross-check the behavior contract against the declared design."""
-    def positive_int(value: Any) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
     if protocol.get("schema_version") != 1:
         die(f"{label} protocol schema_version must be 1")
-    if protocol.get("runs_per_query") != runs_per_query:
+    try:
+        _, protocol_runs_per_query, _ = validated_trigger_protocol_limits(
+            timeout_seconds=protocol.get("timeout_seconds"),
+            runs_per_query=protocol.get("runs_per_query"),
+            workers=protocol.get("workers"),
+        )
+    except ValueError as exc:
+        die(f"{label} protocol {exc}")
+    if protocol_runs_per_query != runs_per_query:
         die(f"{label} protocol runs_per_query disagrees with its report")
-    if not positive_int(protocol.get("timeout_seconds")):
-        die(f"{label} protocol timeout_seconds must be a positive integer")
-    if not positive_int(protocol.get("workers")):
-        die(f"{label} protocol workers must be a positive integer")
     try:
         validate_trigger_harness_identity(protocol.get("harness_identity"), label)
     except ValueError as exc:
@@ -11422,6 +11519,13 @@ def _validated_trigger_protocol(
             producer_sha256 = adapter.get("producer_sha256")
             models = adapter.get("models")
             required = adapter.get("required_observations")
+            required_mapping = (
+                string_keyed_dict(
+                    required,
+                    f"{label} matrix protocol adapter {position} required_observations",
+                )
+                if isinstance(required, dict) else None
+            )
             if (not isinstance(agent, str) or not agent.strip()
                     or trace_dialect != agent
                     or not isinstance(implementation, str) or not implementation.strip()
@@ -11430,9 +11534,9 @@ def _validated_trigger_protocol(
                     or not isinstance(producer_sha256, str)
                     or re.fullmatch(r"sha256:[0-9a-f]{64}", producer_sha256) is None
                     or not isinstance(models, list) or not models
-                    or not isinstance(required, dict)
+                    or required_mapping is None
                     or any(not isinstance(key, str) or type(value) is not bool
-                           for key, value in required.items())):
+                           for key, value in required_mapping.items())):
                 die(f"{label} matrix protocol adapter {position} is malformed")
             known_implementation = {
                 "claude": "run_trigger_matrix.ClaudeAdapter",
@@ -11453,13 +11557,17 @@ def _validated_trigger_protocol(
                 "vibe": {"config_isolated": True,
                          "vibe_home_outside_workdir": True},
             }.get(agent)
-            if known_requirements is not None and required != known_requirements:
+            if (known_requirements is not None
+                    and required_mapping != known_requirements):
                 die(
                     f"{label} matrix protocol adapter {agent!r} must require "
-                    f"{known_requirements}, got {required}")
+                    f"{known_requirements}, got {required_mapping}")
             if agent in requirements:
                 die(f"{label} matrix protocol duplicates adapter {agent!r}")
-            requirements[agent] = dict(required)
+            requirements[agent] = {
+                key: value for key, value in required_mapping.items()
+                if type(value) is bool
+            }
             for model in models:
                 if model is not None and (not isinstance(model, str) or not model.strip()):
                     die(f"{label} matrix protocol adapter {agent!r} has an invalid model")
@@ -11470,21 +11578,29 @@ def _validated_trigger_protocol(
     elif producer == "skill-pi-trigger-eval":
         model = protocol.get("model")
         required = protocol.get("required_observations")
+        required_mapping = (
+            string_keyed_dict(
+                required, f"{label} Pi protocol required_observations")
+            if isinstance(required, dict) else None
+        )
         if (protocol.get("adapter") != "pi"
                 or (model is not None and (not isinstance(model, str) or not model.strip()))
                 or not isinstance(protocol.get("command"), dict)
                 or not isinstance(protocol.get("producer_sha256"), str)
                 or re.fullmatch(
                     r"sha256:[0-9a-f]{64}", protocol.get("producer_sha256", "")) is None
-                or not isinstance(required, dict)
+                or required_mapping is None
                 or any(not isinstance(key, str) or type(value) is not bool
-                       for key, value in required.items())):
+                       for key, value in required_mapping.items())):
             die(f"{label} Pi trigger protocol is malformed")
         configured_pairs.add(("pi", model))
-        if required != {"config_isolated": True}:
+        if required_mapping != {"config_isolated": True}:
             die(
                 f"{label} Pi trigger protocol must require config_isolated=true")
-        requirements["pi"] = dict(required)
+        requirements["pi"] = {
+            key: value for key, value in required_mapping.items()
+            if type(value) is bool
+        }
     else:
         die(f"{label} protocol producer must be skill-trigger-matrix or skill-pi-trigger-eval")
     if configured_pairs != design_pairs:
@@ -11594,18 +11710,24 @@ def _trigger_report_rows(report: dict[str, Any], label: str) -> _TriggerReportRo
     protocol_observation_errors: dict[tuple[str, str | None, str], dict[int, str]] = {}
     for position, row in enumerate(rows, 1):
         try:
-            observation = TriggerObservation.from_row(row)
+            row_mapping = string_keyed_dict(
+                row, f"{label} results row {position}")
+            observation = TriggerObservation.from_row(row_mapping)
         except (TypeError, ValueError, KeyError) as exc:
             die(f"{label} results row {position}: {exc}")
         if observation.identity is None:
             die(f"{label} results row {position}: trigger repetition identity is required")
-        if not isinstance(row, dict) or row.get("skill_tree_hash") != report_hash:
+        if row_mapping.get("skill_tree_hash") != report_hash:
             die(f"{label} results row {position}: skill_tree_hash disagrees with its report")
-        if row.get("protocol_sha256") != protocol_sha256:
+        if row_mapping.get("protocol_sha256") != protocol_sha256:
             die(f"{label} results row {position}: protocol_sha256 disagrees with its report")
-        protocol_observation = row.get("protocol_observation")
+        protocol_observation = row_mapping.get("protocol_observation")
         if not isinstance(protocol_observation, dict):
             die(f"{label} results row {position}: protocol_observation must be an object")
+        protocol_observation = string_keyed_dict(
+            protocol_observation,
+            f"{label} results row {position} protocol_observation",
+        )
         identity = observation.identity
         definition = (observation.query, observation.expectation.should_trigger)
         cell_key = (observation.agent, observation.model, identity.query_id)
@@ -11786,8 +11908,14 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
         "trigger_delta": statistics.mean(e["trigger_delta"] for e in entries),
     } for (inference_query, should), entries in sorted(
         grouped_queries.items(), key=lambda item: item[0])]
-    observed_significance = sign_flip_significance(
-        [entry["pass_delta"] for entry in query_units])
+    pass_deltas: list[int | float] = []
+    for entry in query_units:
+        delta = entry.get("pass_delta")
+        if (isinstance(delta, bool) or not isinstance(delta, (int, float))
+                or not math.isfinite(float(delta))):
+            raise ValueError("trigger comparison produced an invalid pass delta")
+        pass_deltas.append(delta)
+    observed_significance = sign_flip_significance(pass_deltas)
     significance = observed_significance
     if blocked:
         significance = {
@@ -11795,7 +11923,12 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
             "significant_at_0_05": False, "observed": observed_significance,
             "reason": "incomplete_trigger_pairing",
         }
-    regressed = [entry for entry in query_units if entry["pass_delta"] < 0]
+    regressed = [
+        entry for entry in query_units
+        if isinstance(entry.get("pass_delta"), (int, float))
+        and not isinstance(entry.get("pass_delta"), bool)
+        and float(entry["pass_delta"]) < 0
+    ]
     mean_delta = observed_significance.get("observed_mean_delta")
     aggregate_regression = isinstance(mean_delta, (int, float)) and mean_delta < 0
     # A two-sided test can be significant in the improvement direction. Only a
@@ -11927,7 +12060,10 @@ def build_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
             blocked = attempted - n
             c = sum(1 for x in rates if x >= 1.0 - 1e-12)
             ks = list(range(1, n + 1))
-            observed_pass_at_1 = round(pass_at_k(n, c, 1), 6) if n else None
+            pass_at_1_value = pass_at_k(n, c, 1) if n else None
+            observed_pass_at_1 = (
+                round(pass_at_1_value, 6)
+                if pass_at_1_value is not None else None)
             observed_pass_at_k = {str(k): round(v, 6) for k in ks
                                   if (v := pass_at_k(n, c, k)) is not None}
             observed_pass_hat_k = {str(k): round(v, 6) for k in ks
@@ -12305,7 +12441,10 @@ def _expected_component(comp: dict[str, Any], skill_paths: list[str]) -> Compone
     """A manifest-declared component as a Component with a resolved skill_root, so
     its fingerprint can be compared against the runner-recorded one."""
     root = resolve_skill_root(comp, skill_paths)
-    return Component(cls=(comp.get("class") or component_class(comp)), mechanism=comp.get("mechanism"),
+    if root is None:
+        raise ValueError("ablation component has no resolvable skill_root")
+    return Component(cls=ComponentClass(comp.get("class") or component_class(comp)),
+                     mechanism=Mechanism(comp.get("mechanism")),
                      skill_root=root, target=comp.get("target", {}))
 
 
@@ -12451,9 +12590,11 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             {**r, "variant": "without_skill", "_ablation_variant": variant}
             for r in results if r.get("variant") == variant
         ]
-        def ablation_eligibility(row: dict[str, Any]) -> tuple[bool, str | None]:
+        def ablation_eligibility(row: Mapping[str, Any]) -> tuple[bool, str | None]:
             if not scorable_run(row):
                 return False, "unscorable_arm"
+            if row.get("grading_availability", "complete") != "complete":
+                return False, "grading_evidence_incomplete"
             rate = row.get("combined_pass_rate", row.get("objective_pass_rate"))
             if (isinstance(rate, bool) or not isinstance(rate, (int, float))
                     or not math.isfinite(float(rate)) or not 0 <= float(rate) <= 1):
@@ -13236,7 +13377,11 @@ def answer_design_coverage(
         expected_row = expected.get(relative)
         if expected_row is None:
             continue
-        metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        raw_metadata = result.get("metadata")
+        metadata = (
+            string_keyed_dict(raw_metadata, f"{relative} metadata")
+            if isinstance(raw_metadata, dict) else {}
+        )
         identity = {
             "case_id": metadata.get("case_id"), "model": metadata.get("model"),
             "variant": metadata.get("variant"), "run_number": metadata.get("run_number"),
@@ -13888,8 +14033,11 @@ def aggregate(args: argparse.Namespace) -> int:
     skill_names = [report.get("skill_name") for report in reports]
     if not all(isinstance(name, str) and name for name in skill_names):
         die("aggregate report is missing a non-empty skill_name identity")
+    typed_skill_names = [
+        name for name in skill_names if isinstance(name, str) and name
+    ]
     duplicate_skill_names = sorted(
-        name for name, count in collections.Counter(skill_names).items()
+        name for name, count in collections.Counter(typed_skill_names).items()
         if count > 1
     )
     if duplicate_skill_names:
@@ -13996,7 +14144,7 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
             "notes": [],
         })
 
-    run_summary = {}
+    run_summary: dict[str, Any] = {}
     model_summaries = report.get("by_model") or {}
     summary_inputs = (
         [(f"{model}::{variant}", summary)
@@ -14473,17 +14621,24 @@ def load_comparison_truth(path: Path) -> dict[str, dict[str, Any]]:
         die("comparison truth must carry a valid answer_design_sha256")
     truth: dict[str, dict[str, Any]] = {}
     positions: dict[str, int] = {}
-    for position, row in enumerate(rows, 1):
-        if not isinstance(row, dict):
-            die(f"comparison truth row {position}: must be an object")
+    for position, raw_row in enumerate(rows, 1):
+        try:
+            row = string_keyed_dict(
+                raw_row, f"comparison truth row {position}")
+        except TypeError as exc:
+            die(str(exc))
         task_id = row.get("comparison_task_id")
         if not isinstance(task_id, str) or not task_id.strip():
             die(f"comparison truth row {position}: missing non-empty comparison_task_id")
         if task_id in truth:
             die(f"comparison truth duplicate id {task_id!r} at rows {positions[task_id]} and {position}")
-        task_identity = row.get("comparison_task")
-        if not isinstance(task_identity, dict):
+        raw_task_identity = row.get("comparison_task")
+        if not isinstance(raw_task_identity, dict):
             die(f"comparison truth row {position} ({task_id}): comparison_task must be an object")
+        task_identity = string_keyed_dict(
+            raw_task_identity,
+            f"comparison truth row {position} ({task_id}) comparison_task",
+        )
         task_sha256 = row.get("comparison_task_sha256")
         if (not isinstance(task_sha256, str)
                 or canonical_json_sha256(task_identity) != task_sha256):
@@ -14517,20 +14672,29 @@ def load_comparison_truth(path: Path) -> dict[str, dict[str, Any]]:
                 or task_identity.get("model") != model
                 or task_identity.get("run_number") != run_number):
             die(f"comparison truth row {position} ({task_id}): comparison_task identity is incoherent")
-        if (not isinstance(task_identity.get("blind_nonce"), str)
-                or re.fullmatch(r"[0-9a-f]{32}", task_identity["blind_nonce"]) is None):
+        blind_nonce = task_identity.get("blind_nonce")
+        if (not isinstance(blind_nonce, str)
+                or re.fullmatch(r"[0-9a-f]{32}", blind_nonce) is None):
             die(f"comparison truth row {position} ({task_id}): comparison_task has invalid blind_nonce")
         if not isinstance(task_identity.get("prompt"), str):
             die(f"comparison truth row {position} ({task_id}): comparison_task prompt must be a string")
-        if (not isinstance(task_identity.get("expectations"), list)
-                or not all(isinstance(value, str) for value in task_identity["expectations"])):
+        expectations = task_identity.get("expectations")
+        if (not isinstance(expectations, list)
+                or not all(isinstance(value, str) for value in expectations)):
             die(f"comparison truth row {position} ({task_id}): comparison_task expectations must be strings")
-        rubric = task_identity.get("rubric")
-        if (not isinstance(rubric, dict)
-                or not isinstance(rubric.get("expected_behavior"), list)
-                or not all(isinstance(value, str) for value in rubric["expected_behavior"])
-                or not isinstance(rubric.get("review_rubric"), list)
-                or not all(isinstance(value, str) for value in rubric["review_rubric"])):
+        raw_rubric = task_identity.get("rubric")
+        if not isinstance(raw_rubric, dict):
+            die(f"comparison truth row {position} ({task_id}): comparison_task rubric is invalid")
+        rubric = string_keyed_dict(
+            raw_rubric,
+            f"comparison truth row {position} ({task_id}) rubric",
+        )
+        expected_behavior = rubric.get("expected_behavior")
+        review_rubric = rubric.get("review_rubric")
+        if (not isinstance(expected_behavior, list)
+                or not all(isinstance(value, str) for value in expected_behavior)
+                or not isinstance(review_rubric, list)
+                or not all(isinstance(value, str) for value in review_rubric)):
             die(f"comparison truth row {position} ({task_id}): comparison_task rubric is invalid")
         for label in ("a", "b"):
             digest = task_identity.get(f"output_{label}_sha256")
@@ -14549,9 +14713,13 @@ def load_comparison_truth(path: Path) -> dict[str, dict[str, Any]]:
             die(f"comparison truth row {position} ({task_id}): result_schema must be an object")
         sides: dict[str, dict[str, Any]] = {}
         for label in ("A", "B"):
-            side = row.get(label)
-            if not isinstance(side, dict):
+            raw_side = row.get(label)
+            if not isinstance(raw_side, dict):
                 die(f"comparison truth row {position} ({task_id}): side {label} must be an object")
+            side = string_keyed_dict(
+                raw_side,
+                f"comparison truth row {position} ({task_id}) side {label}",
+            )
             role = side.get("role")
             variant = side.get("variant")
             side_model = side.get("model")

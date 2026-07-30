@@ -356,6 +356,18 @@ class ClosedRunnerOutcomeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             rc.Completed(context, answer="")
 
+    def test_closed_outcomes_require_exact_integer_returncodes(self):
+        context = rc.OutcomeContext(provider=rc.Provider.CODEX)
+        for constructor, kwargs, returncode in (
+            (rc.Completed, {"answer": "ok"}, False),
+            (rc.Completed, {"answer": "ok"}, 0.0),
+            (rc.TimedOut, {}, 124.0),
+            (rc.SpawnFailed, {"reason": "spawn"}, 127.0),
+        ):
+            with self.subTest(constructor=constructor.__name__, returncode=returncode), \
+                 self.assertRaises(TypeError):
+                constructor(context, returncode=returncode, **kwargs)
+
     def test_context_rejects_unknown_provider_and_invalid_measurements(self):
         for kwargs in (
             {"provider": "unknown"}, {"provider": "codex", "elapsed_ms": -1},
@@ -374,6 +386,18 @@ class ClosedRunnerOutcomeTests(unittest.TestCase):
                     provider="codex",
                     **{field: {"trace_observation_complete": True}},
                 )
+
+    def test_context_rejects_lossy_or_non_json_evidence_mappings(self):
+        for field in ("metadata_extra", "metrics_extra", "environment"):
+            for value in (
+                {1: "integer key", "1": "string key"},
+                {"nested": {2: "integer key"}},
+                {"measurement": float("nan")},
+                {"measurement": float("inf")},
+            ):
+                with self.subTest(field=field, value=value), \
+                     self.assertRaises((TypeError, ValueError)):
+                    rc.OutcomeContext(provider="codex", **{field: value})
 
     def test_context_and_outcome_are_recursively_immutable(self):
         source = {"x": 1, "nested": {"value": 2}, "items": [{"value": 3}]}

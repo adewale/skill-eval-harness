@@ -9,7 +9,9 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, NoReturn, TypeAlias
+from typing import Any, TypeAlias
+
+from json_contracts import freeze_json_mapping
 
 
 class Provider(str, Enum):
@@ -41,32 +43,6 @@ _RESERVED_EVIDENCE_KEYS = frozenset({
     "operation_observation_complete", "artifact_set_complete",
     "observation_evidence", "telemetry", "telemetry_schema_version",
 })
-
-
-class FrozenDict(dict):
-    """JSON-serializable recursively immutable mapping."""
-    def _immutable(self, *args: Any, **kwargs: Any) -> NoReturn:
-        raise TypeError("frozen mapping cannot be mutated")
-
-    __setitem__ = __delitem__ = __ior__ = clear = pop = popitem = setdefault = update = _immutable
-
-
-def _freeze_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return FrozenDict({str(key): _freeze_value(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_value(item) for item in value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    raise TypeError(f"outcome context contains non-JSON value {type(value).__name__}")
-
-
-def _freeze_mapping(value: Mapping[str, Any] | None, label: str) -> Mapping[str, Any]:
-    if value is None:
-        return FrozenDict()
-    if not isinstance(value, Mapping):
-        raise TypeError(f"{label} must be a mapping")
-    return _freeze_value(value)
 
 
 def _validate_usage(value: Any, label: str) -> None:
@@ -110,16 +86,16 @@ class OutcomeContext:
             if not isinstance(self.usage, Mapping):
                 raise TypeError("usage must be a mapping or None")
             _validate_usage(self.usage, "usage")
-            object.__setattr__(self, "usage", _freeze_mapping(self.usage, "usage"))
+            object.__setattr__(self, "usage", freeze_json_mapping(self.usage, "usage"))
         for label, values in (("metadata_extra", self.metadata_extra),
                               ("metrics_extra", self.metrics_extra)):
             collisions = _RESERVED_EVIDENCE_KEYS & set(values)
             if collisions:
                 raise ValueError(f"{label} cannot override derived evidence: {', '.join(sorted(collisions))}")
-        object.__setattr__(self, "metadata_extra", _freeze_mapping(self.metadata_extra, "metadata_extra"))
-        object.__setattr__(self, "metrics_extra", _freeze_mapping(self.metrics_extra, "metrics_extra"))
+        object.__setattr__(self, "metadata_extra", freeze_json_mapping(self.metadata_extra, "metadata_extra"))
+        object.__setattr__(self, "metrics_extra", freeze_json_mapping(self.metrics_extra, "metrics_extra"))
         if self.environment is not None:
-            object.__setattr__(self, "environment", _freeze_mapping(self.environment, "environment"))
+            object.__setattr__(self, "environment", freeze_json_mapping(self.environment, "environment"))
         if not isinstance(self.diagnose_returncode, bool):
             raise TypeError("diagnose_returncode must be boolean")
 
@@ -141,6 +117,8 @@ class Completed:
     def __post_init__(self) -> None:
         if not isinstance(self.context, OutcomeContext):
             raise TypeError("Completed context must be OutcomeContext")
+        if type(self.returncode) is not int:
+            raise TypeError("Completed returncode must be an integer")
         if self.returncode != 0:
             raise ValueError("Completed returncode must be 0")
         if not isinstance(self.answer, str):
@@ -159,6 +137,8 @@ class TimedOut:
     def __post_init__(self) -> None:
         if not isinstance(self.context, OutcomeContext):
             raise TypeError("TimedOut context must be OutcomeContext")
+        if type(self.returncode) is not int:
+            raise TypeError("TimedOut returncode must be an integer")
         if self.returncode != 124:
             raise ValueError("TimedOut returncode must be 124")
         if self.timeout_s is not None and (isinstance(self.timeout_s, bool) or not isinstance(self.timeout_s, int) or self.timeout_s <= 0):
@@ -176,6 +156,8 @@ class SpawnFailed:
     def __post_init__(self) -> None:
         if not isinstance(self.context, OutcomeContext):
             raise TypeError("SpawnFailed context must be OutcomeContext")
+        if type(self.returncode) is not int:
+            raise TypeError("SpawnFailed returncode must be an integer")
         if self.returncode != 127:
             raise ValueError("SpawnFailed returncode must be 127")
         if not isinstance(self.reason, str) or not self.reason.strip():

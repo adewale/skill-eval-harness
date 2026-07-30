@@ -62,6 +62,27 @@ class TriggerRowBoundaryTests(unittest.TestCase):
                 tm.eval_rows_from_args(args, DEMO_MANIFEST)
         self.assertIn("should_trigger must be true or false", str(ctx.exception))
 
+    def test_protocol_producers_reject_nonpositive_concurrency_limits(self):
+        for field, mutation in (
+            ("timeout_seconds", {"timeout": 0, "runs_per_query": 1, "workers": 1}),
+            ("runs_per_query", {"timeout": 1, "runs_per_query": 0, "workers": 1}),
+            ("workers", {"timeout": 1, "runs_per_query": 1, "workers": 0}),
+            ("workers", {"timeout": 1, "runs_per_query": 1, "workers": False}),
+        ):
+            with self.subTest(producer="pi", field=field), \
+                 self.assertRaisesRegex(ValueError, field):
+                tr.pi_trigger_protocol(model=None, **mutation)
+            with self.subTest(producer="matrix", field=field), \
+                 self.assertRaisesRegex(ValueError, field):
+                tm.trigger_protocol([], None, **mutation)
+
+    def test_matrix_rejects_zero_workers_before_constructing_an_executor(self):
+        with self.assertRaisesRegex(SystemExit, "workers must be a positive integer"):
+            tm.run_matrix(
+                DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                models=[None], runs_per_query=1, timeout=30, workers=0,
+            )
+
     def test_eval_set_preserves_false_boolean(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "rows.json"

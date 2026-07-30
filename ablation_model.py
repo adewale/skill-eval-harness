@@ -31,11 +31,13 @@ import hashlib
 import math
 import re
 import statistics
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
+
+from json_contracts import freeze_json_value
 
 
 def _require(d: dict[str, Any], key: str, types: type | tuple[type, ...], ctx: str) -> Any:
@@ -118,7 +120,7 @@ def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:
     return not (text or "").lstrip().startswith(RUNNER_FAILURE_MARKERS)
 
 
-def scorable_run(row: dict[str, Any]) -> bool:
+def scorable_run(row: Mapping[str, Any]) -> bool:
     """THE predicate for 'this run counts toward scoring': it produced output AND
     was not an infrastructure failure. Every report view filters through this."""
     return not row.get("missing_output") and row.get("execution_valid", True)
@@ -287,23 +289,8 @@ class Mechanism(str, Enum):
     PREPROCESS = "preprocess"
 
 
-class _FrozenDict(dict):
-    def _immutable(self, *args: Any, **kwargs: Any) -> NoReturn:
-        raise TypeError("frozen component target cannot be mutated")
-
-    __setitem__ = __delitem__ = __ior__ = clear = pop = popitem = setdefault = update = _immutable
-
-
 def _freeze_json(value: Any, label: str) -> Any:
-    if isinstance(value, dict):
-        if not all(isinstance(key, str) for key in value):
-            raise ValueError(f"{label} object keys must be strings")
-        return _FrozenDict({key: _freeze_json(item, label) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_json(item, label) for item in value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    raise ValueError(f"{label} must contain only JSON-compatible values")
+    return freeze_json_value(value, label)
 
 
 def _nonempty_identifier(value: Any, label: str, *, slug: bool = False) -> str:

@@ -52,8 +52,11 @@ class ProvenanceSchemaTests(unittest.TestCase):
         self.assertEqual(component.target["nested"]["items"], ("a",))
         with self.assertRaises(TypeError):
             component.target["nested"]["x"] = 1
-        with self.assertRaises(ValueError):
+        with self.assertRaises((TypeError, ValueError)):
             am.Component("instructions", "section", "s", {"bad": {"set"}})
+        for target in ({1: "not a JSON object key"}, {"rate": float("nan")}):
+            with self.subTest(target=target), self.assertRaises((TypeError, ValueError)):
+                am.Component("instructions", "section", "s", target)
 
     def test_removed_bytes_is_recorded_but_not_part_of_identity(self):
         a = self.prov(components=(am.Component("instructions", "section", "skills/x/SKILL.md", {"heading": "## H"}, removed_bytes=42),))
