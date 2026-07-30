@@ -7,6 +7,7 @@
 Run the smallest command that proves the change:
 
 - [ ] `python3 -m py_compile *.py examples/adewale-workspace/*.py`
+- [ ] `ty check`
 - [ ] `python3 -m unittest discover tests -v`
 - [ ] Manifest/eval command, if changed: `skill-benchmark validate ...`
 
