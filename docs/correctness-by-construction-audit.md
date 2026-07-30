@@ -209,6 +209,11 @@ raw output string
   the same human-text view, including minimum-length and non-vacuity decisions. Protocol and
   machine-identity checks (`golden_output` by default, structured JSON, scripts, command text, tool
   names, and paths) remain exact; graded script scores still cross a finite 0-1 numeric boundary.
+- The project's focused `ty` gate includes `text_contracts.py`, so this module's constructors,
+  closed assertion union, and return types are statically checked without suppressions. That gate
+  complements rather than replaces runtime parsing: manifest dictionaries and external
+  embedding/script values remain untrusted wire data, while the legacy `skill_benchmark.py`
+  integration is not yet in ty's configured source set.
 
 ## Ablation provenance vocabulary
 
