@@ -249,8 +249,13 @@ class TypedTextAssertionTests(unittest.TestCase):
         self.assertEqual(result["evidence"], "embedding similarity=0.8000 vs threshold=0.8")
 
     def test_embedding_vectors_reject_non_finite_and_boolean_values(self):
-        invalid_values = [True, float("nan"), float("inf"), float("-inf")]
-        for invalid in invalid_values:
+        invalid_values = [
+            (True, "finite numeric vectors"),
+            (float("nan"), "no JSON object"),
+            (float("inf"), "no JSON object"),
+            (float("-inf"), "no JSON object"),
+        ]
+        for invalid, expected_error in invalid_values:
             proc = SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps({"embeddings": [[invalid, 0], [1, 0]]}),
@@ -259,7 +264,7 @@ class TypedTextAssertionTests(unittest.TestCase):
             with self.subTest(invalid=invalid), mock.patch.object(sb.subprocess, "run", return_value=proc):
                 ratio, error = sb.embedding_similarity("candidate", "expected", "stub")
             self.assertIsNone(ratio)
-            self.assertIn("finite numeric vectors", error)
+            self.assertIn(expected_error, error)
 
     def test_embedding_cosine_is_closed_over_the_unit_score_domain(self):
         proc = SimpleNamespace(
