@@ -32,6 +32,13 @@ OBSCURED_COORDINATE = "androidx.lifecycle:\u200blifecycle-viewmodel"
 
 
 class ComparisonTextConstructionTests(unittest.TestCase):
+    def test_contract_module_remains_packaged_and_in_the_focused_ty_gate(self):
+        project = (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+        packaged = project.split("[tool.setuptools]", 1)[1].split("\n[", 1)[0]
+        ty_sources = project.split("[tool.ty.src]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('"text_contracts"', packaged)
+        self.assertIn('"text_contracts.py"', ty_sources)
+
     def test_rendered_v1_removes_issue_55_character_and_records_it(self):
         value = ComparisonText.from_text(OBSCURED_COORDINATE, ComparisonProfile.RENDERED_V1)
         self.assertEqual(value.value, COORDINATE)
