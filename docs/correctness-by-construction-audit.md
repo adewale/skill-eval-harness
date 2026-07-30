@@ -201,6 +201,11 @@ raw output string
   making `not_regex` spuriously pass, and contradictory score/verdict fields are not constructor
   inputs. External embedding vectors reject boolean/non-finite elements before cosine construction;
   negative cosine occupies the public score domain's 0.0 floor.
+- When rendered-v1 changes a regex candidate, the normalized search and optional raw diagnostic
+  share one 0.25-second process-local deadline. Expiry, an already-owned process timer, a
+  worker-thread call, or a platform without interval timers constructs unavailable evidence rather
+  than letting the synthesized candidate produce a negative pass. Exact and unchanged inputs retain
+  their existing local behavior. The bound adds no subprocess, model, network, or runtime dependency.
 - Results identify the comparison profile. When normalization changes an operand, the result also
   records the affected code points, the raw deterministic similarity score where applicable, and
   whether normalization changed a deterministic verdict. Embedding mode records that last value as

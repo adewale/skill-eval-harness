@@ -2,6 +2,7 @@
 import hashlib
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -189,6 +190,28 @@ class TypedTextAssertionTests(unittest.TestCase):
         self.assertFalse(similarity["passed"])
         self.assertLess(similarity["score"], 1.0)
         self.assertNotIn("normalization", similarity)
+
+    def test_normalized_regex_backtracking_expires_as_unavailable_evidence(self):
+        obscured_catastrophic_run = ("a\u200b" * 24) + "!"
+        started = time.monotonic()
+        with mock.patch.object(tc, "REGEX_SEARCH_TIMEOUT_SECONDS", 0.02):
+            for atype in ("regex", "not_regex"):
+                with self.subTest(atype=atype):
+                    result = self.result(
+                        {"type": atype, "pattern": "^(a+)+$", "ci": False},
+                        obscured_catastrophic_run,
+                    )
+                    self.assertIsNone(result["passed"])
+                    self.assertIsNone(result["score"])
+                    self.assertEqual(result["availability"], "partial")
+                    self.assertIn("regex evaluation exceeded 0.02s safety limit", result["evidence"])
+        self.assertLess(time.monotonic() - started, 1.0)
+
+        # The signal handler and timer are restored after expiry; a safe regex
+        # immediately afterward still derives an ordinary complete verdict.
+        recovered = self.result({"type": "regex", "pattern": "^ok$"}, "ok")
+        self.assertTrue(recovered["passed"])
+        self.assertEqual(recovered["availability"], "complete")
 
     def test_list_valued_value_alias_remains_supported(self):
         result = self.result({"type": "contains_any", "value": [COORDINATE]}, OBSCURED_COORDINATE)
@@ -428,6 +451,36 @@ class TextAssertionValidationTests(unittest.TestCase):
         self.assertIsInstance(parse_human_text_assertion({"type": "regex", "pattern": "x"}), RegexTextAssertion)
         self.assertIsInstance(parse_human_text_assertion({"type": "similarity", "expected": "x"}), SimilarityTextAssertion)
 
+    def test_manifest_accepts_and_grades_profiles_for_every_human_text_assertion(self):
+        assertions = [
+            {"name": "contains", "type": "contains", "value": "xy", "comparison": "exact"},
+            {"name": "contains-any", "type": "contains_any", "values": ["xy"], "comparison": "exact"},
+            {"name": "contains-all", "type": "contains_all", "values": ["xy"], "comparison": "exact"},
+            {"name": "excludes-any", "type": "excludes_any", "values": ["xy"], "comparison": "exact"},
+            {"name": "regex", "type": "regex", "pattern": "^xy$", "comparison": "exact"},
+            {"name": "not-regex", "type": "not_regex", "pattern": "^xy$", "comparison": "exact"},
+            {"name": "similarity", "type": "similarity", "expected": "xy", "threshold": 1.0, "comparison": "exact"},
+            {"name": "explicit-rendered", "type": "contains", "value": "xy", "comparison": "rendered-v1"},
+        ]
+        manifest = demo_manifest()
+        manifest["cases"][0]["assertions"] = assertions
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_demo_manifest(root, manifest)
+            validated = sb.validate_manifest(path)
+            output = "x\u200by"
+            output_path = root / "output.md"
+            output_path.write_text(output, encoding="utf-8")
+            results = [
+                sb.assertion_result(assertion, output, output_path, run_base=root)
+                for assertion in validated["cases"][0]["assertions"]
+            ]
+
+        self.assertEqual([result["comparison"] for result in results], ["exact"] * 7 + ["rendered-v1"])
+        self.assertEqual([result["passed"] for result in results], [False, False, False, True, False, True, False, True])
+        self.assertNotIn("normalization", results[0])
+        self.assertTrue(results[-1]["normalization"]["verdict_changed"])
+
     def test_manifest_validation_rejects_invalid_text_and_process_regex_states(self):
         invalid = [
             {"type": "contains_all", "values": []},
@@ -436,6 +489,7 @@ class TextAssertionValidationTests(unittest.TestCase):
             {"type": "command_ran", "pattern": "["},
             {"type": "command_order", "patterns": "npm test"},
             {"type": "tool_call", "required_calls": ["Read"], "pattern": "Read"},
+            {"type": "contains", "value": "x", "comparison": "loose"},
         ]
         for assertion in invalid:
             with self.subTest(assertion=assertion), tempfile.TemporaryDirectory() as td:

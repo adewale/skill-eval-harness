@@ -110,6 +110,7 @@ from text_contracts import (
     LiteralKind,
     LiteralTextAssertion,
     MatchObservation,
+    RegexEvaluationUnavailable,
     RegexTextAssertion,
     SimilarityDecision,
     SimilarityTextAssertion,
@@ -181,16 +182,16 @@ ASSERTION_COMMON_FIELDS = {
     "depends_on", "atLeast", "_migrate_todo",
 }
 ASSERTION_TYPE_FIELDS: dict[str, set[str]] = {
-    "contains": {"value"},
-    "contains_any": {"values", "value"},
-    "contains_all": {"values", "value"},
-    "excludes_any": {"values", "value"},
-    "regex": {"pattern", "value"},
-    "not_regex": {"pattern", "value"},
+    "contains": {"value", "comparison"},
+    "contains_any": {"values", "value", "comparison"},
+    "contains_all": {"values", "value", "comparison"},
+    "excludes_any": {"values", "value", "comparison"},
+    "regex": {"pattern", "value", "comparison"},
+    "not_regex": {"pattern", "value", "comparison"},
     "file_exists": {"path", "value"},
     "json_field_equals": {"path", "field", "equals"},
     "golden_output": {"reference", "value", "artifact", "normalize"},
-    "similarity": {"expected", "value", "artifact", "threshold", "mode"},
+    "similarity": {"expected", "value", "artifact", "threshold", "mode", "comparison"},
     "structured_output": {"path", "schema"},
     "script": {"command", "timeout_s", "pass_exit_code"},
     "skill_invoked": {"expected"},
@@ -8360,13 +8361,26 @@ def assertion_result(assertion: dict[str, Any], text: str, output_path: Path, *,
     normalization: dict[str, Any] | None = None
     if atype in PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS:
         passed, evidence = process_or_efficiency_assertion_result(assertion, run_base, {})
-    elif isinstance(parsed_text_assertion, (LiteralTextAssertion, RegexTextAssertion)):
+    elif isinstance(parsed_text_assertion, LiteralTextAssertion):
         observation: MatchObservation = parsed_text_assertion.evaluate(text)
         passed = observation.passed
         evidence = observation.evidence_with_normalization()
         comparison = observation.candidate.profile.value
         if observation.changed:
             normalization = observation.normalization_dict()
+    elif isinstance(parsed_text_assertion, RegexTextAssertion):
+        comparison = parsed_text_assertion.profile.value
+        try:
+            observation = parsed_text_assertion.evaluate(text)
+        except RegexEvaluationUnavailable as exc:
+            passed = None
+            availability = "partial"
+            evidence = str(exc)
+        else:
+            passed = observation.passed
+            evidence = observation.evidence_with_normalization()
+            if observation.changed:
+                normalization = observation.normalization_dict()
     elif atype == "file_exists":
         try:
             rel = canonical_assertion_path(
