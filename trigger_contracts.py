@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeAlias
 
 import telemetry as telemetry_domain
 from json_contracts import freeze_json_mapping, strict_json_equal
@@ -345,6 +345,7 @@ _TRIGGER_RESERVED_METADATA = {
     "elapsed_ms", "completion_evidence", "evidence", "evidence_typed",
     "usage_normalized", "cost_normalized", "stderr", "provider_error",
     "query_id", "run_number", "invocation_metadata", "observation_metadata",
+    "measurement_status", "trigger_evidence_observed",
 }
 _TRIGGER_EXPERIMENT_METADATA = {
     "measurement", "ablation", "skill_tree_hash", "protocol_sha256",
@@ -446,6 +447,38 @@ def _cost_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
     return freeze_json_mapping(block, "cost telemetry")
 
 
+@dataclass(frozen=True)
+class CompleteTriggerResult:
+    """A quality result backed by a complete observation window."""
+
+    expectation: TriggerExpectation
+    triggered: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.expectation, TriggerExpectation):
+            raise TypeError("complete trigger results require a typed expectation")
+        if not isinstance(self.triggered, bool):
+            raise TypeError("complete trigger results require a boolean triggered value")
+
+    @property
+    def passed(self) -> bool:
+        return self.triggered == self.expectation.should_trigger
+
+
+@dataclass(frozen=True)
+class IncompleteTriggerResult:
+    """An invocation outcome that cannot inhabit the quality-result state."""
+
+    state: InvocationState
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, InvocationState) or self.state is InvocationState.COMPLETE:
+            raise ValueError("incomplete trigger results require a non-complete invocation state")
+
+
+TriggerResult: TypeAlias = CompleteTriggerResult | IncompleteTriggerResult
+
+
 @dataclass(frozen=True, order=True)
 class TriggerRepetitionIdentity:
     """Stable identity for one persisted trigger-matrix repetition.
@@ -529,18 +562,34 @@ class TriggerObservation:
         object.__setattr__(self, "metadata", metadata)
 
     @property
-    def passed(self) -> bool:
-        return self.invocation.observation_complete and self.detection.triggered == self.expectation.should_trigger
+    def result(self) -> TriggerResult:
+        """Classify evidence before exposing a quality verdict."""
+        if self.invocation.observation_complete:
+            return CompleteTriggerResult(self.expectation, self.detection.triggered)
+        return IncompleteTriggerResult(self.invocation.state)
+
+    @property
+    def passed(self) -> bool | None:
+        """Compatibility projection; incomplete evidence has no pass value."""
+        result = self.result
+        return result.passed if isinstance(result, CompleteTriggerResult) else None
+
+    def with_metadata(self, values: Mapping[str, Any]) -> TriggerObservation:
+        return replace(self, metadata={**dict(self.metadata), **dict(values)})
 
     def as_row(self) -> dict[str, Any]:
+        result = self.result
+        complete = isinstance(result, CompleteTriggerResult)
         row: dict[str, Any] = {
             "population": "trigger",
             "agent": self.agent,
             "model": self.model,
             "query": self.query,
             "should_trigger": self.expectation.should_trigger,
-            "triggered": self.detection.triggered,
-            "pass": self.passed,
+            "trigger_evidence_observed": self.detection.triggered,
+            "triggered": result.triggered if complete else None,
+            "pass": result.passed if complete else None,
+            "measurement_status": "complete" if complete else "incomplete",
             "observation_complete": self.invocation.observation_complete,
             "returncode": self.invocation.returncode,
             "timed_out": self.invocation.timed_out,
@@ -686,8 +735,6 @@ class TriggerObservation:
                 for item in legacy_evidence
             ]
         detection = TriggerDetection(tuple(evidence_items))
-        if not isinstance(raw.get("triggered"), bool) or raw["triggered"] != detection.triggered:
-            raise ValueError("persisted triggered flag disagrees with trigger evidence")
         observation = cls(
             agent=agent, model=model, query=query, expectation=expectation,
             invocation=invocation, detection=detection,
@@ -695,8 +742,38 @@ class TriggerObservation:
             metadata=observation_metadata,
             identity=TriggerRepetitionIdentity.from_row(raw),
         )
-        if not isinstance(raw.get("pass"), bool) or raw["pass"] != observation.passed:
-            raise ValueError("persisted pass flag disagrees with the typed observation")
+        result = observation.result
+        expected_status = (
+            "complete" if isinstance(result, CompleteTriggerResult) else "incomplete"
+        )
+        stored_status = raw.get("measurement_status")
+        if stored_status is not None and stored_status != expected_status:
+            raise ValueError("persisted measurement_status disagrees with the typed observation")
+        stored_evidence = raw.get("trigger_evidence_observed")
+        if stored_evidence is not None and (
+            not isinstance(stored_evidence, bool) or stored_evidence != detection.triggered
+        ):
+            raise ValueError("persisted trigger evidence flag disagrees with trigger evidence")
+        stored_triggered = raw.get("triggered")
+        stored_pass = raw.get("pass")
+        if isinstance(result, CompleteTriggerResult):
+            if not isinstance(stored_triggered, bool) or stored_triggered != result.triggered:
+                raise ValueError("persisted triggered flag disagrees with the typed observation")
+            if not isinstance(stored_pass, bool) or stored_pass != result.passed:
+                raise ValueError("persisted pass flag disagrees with the typed observation")
+        else:
+            # Historical rows encoded incomplete evidence as false. Accept those
+            # rows at the wire boundary, but never produce that lossy projection.
+            if stored_triggered is not None and (
+                not isinstance(stored_triggered, bool) or stored_triggered != detection.triggered
+            ):
+                raise ValueError(
+                    "persisted triggered flag disagrees with incomplete trigger evidence")
+            if stored_pass is not None and (
+                not isinstance(stored_pass, bool) or stored_pass
+            ):
+                raise ValueError(
+                    "an incomplete trigger observation cannot carry a passing verdict")
         return observation
 
     @classmethod

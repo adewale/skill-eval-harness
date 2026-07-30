@@ -121,6 +121,11 @@ from trigger_contracts import (
     validated_trigger_model,
     validated_trigger_protocol_limits,
 )
+from trigger_reporting import (
+    summarize_trigger_cohort,
+    summarize_trigger_matrix,
+    trigger_cohort_as_dict,
+)
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
 DEFAULT_CODEX_CMD = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules"
@@ -761,9 +766,15 @@ def trigger_tree_for_manifest(repo_root: Path, manifest: dict[str, Any], work_di
     return Path(provenance["dir"]), prov.identity.edited, prov.as_dict()
 
 
-def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger: bool,
-                       exc: BaseException, metadata: dict[str, Any] | None = None,
-                       identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
+def matrix_failure_observation(
+    agent: str,
+    model: str | None,
+    query: str,
+    should_trigger: bool,
+    exc: BaseException,
+    metadata: dict[str, Any] | None = None,
+    identity: TriggerRepetitionIdentity | None = None,
+) -> TriggerObservation:
     return TriggerObservation.harness_failure(
         agent=agent,
         model=model,
@@ -772,14 +783,30 @@ def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger
         error=exc,
         metadata=metadata,
         identity=identity,
+    )
+
+
+def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger: bool,
+                       exc: BaseException, metadata: dict[str, Any] | None = None,
+                       identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
+    """Compatibility wire adapter; matrix aggregation retains the typed value."""
+    return matrix_failure_observation(
+        agent, model, query, should_trigger, exc, metadata, identity,
     ).as_row()
 
 
-def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_trigger: bool,
-                   model: str | None, timeout: int, trace_dir: Path | None = None,
-                   metadata: dict[str, Any] | None = None,
-                   identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
-    """One typed observation of one query in one (agent, model) cell."""
+def observe_cell_query(
+    adapter: AgentAdapter,
+    tree_dir: Path,
+    query: str,
+    should_trigger: bool,
+    model: str | None,
+    timeout: int,
+    trace_dir: Path | None = None,
+    metadata: dict[str, Any] | None = None,
+    identity: TriggerRepetitionIdentity | None = None,
+) -> TriggerObservation:
+    """Observe one cell without erasing its domain type before aggregation."""
     secrets: list[str] = []
     with tempfile.TemporaryDirectory(prefix=f"trigger-{adapter.name}-") as td:
         workspace = Path(td)
@@ -895,69 +922,24 @@ def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_tri
             )
         except Exception as exc:
             trace_error = f"{type(exc).__name__}: {exc}"
-            row["trace_error"] = trace_error
-            row["observation_metadata"]["trace_error"] = trace_error
-    return row
+            observation = observation.with_metadata({"trace_error": trace_error})
+    return observation
 
 
-def summarize_matrix(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Fold per-run rows into per-(agent, model) cells with per-query trigger
-    rates, split by polarity so an over-trigger cannot hide behind an
-    under-trigger in the same aggregate."""
-    cells: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
-    for r in results:
-        cells.setdefault((r["agent"], r["model"]), []).append(r)
-    matrix = []
-    for (agent, model), rows in sorted(cells.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
-        queries: dict[tuple[str, str, bool], list[dict[str, Any]]] = {}
-        for r in rows:
-            queries.setdefault(
-                (r["query_id"], r["query"], r["should_trigger"]), []).append(r)
-        query_rows = []
-        for (query_id, query, should), runs in queries.items():
-            complete = [r for r in runs if r["observation_complete"]]
-            triggered = sum(1 for r in complete if r["triggered"])
-            passed_runs = sum(1 for r in complete if r["pass"])
-            incomplete = len(runs) - len(complete)
-            observed_trigger_rate = triggered / len(complete) if complete else None
-            observed_pass_rate = passed_runs / len(complete) if complete else None
-            query_rows.append({
-                "query_id": query_id, "query": query, "should_trigger": should,
-                "runs": len(runs), "complete": len(complete),
-                "incomplete": incomplete,
-                "triggered_runs": triggered,
-                "trigger_rate": None if incomplete else observed_trigger_rate,
-                "observed_trigger_rate": observed_trigger_rate,
-                "passed_runs": passed_runs,
-                "pass_rate": None if incomplete else observed_pass_rate,
-                "observed_pass_rate": observed_pass_rate,
-            })
+def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_trigger: bool,
+                   model: str | None, timeout: int, trace_dir: Path | None = None,
+                   metadata: dict[str, Any] | None = None,
+                   identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
+    """Compatibility wire adapter for callers that need one persisted row."""
+    return observe_cell_query(
+        adapter, tree_dir, query, should_trigger, model, timeout, trace_dir,
+        metadata, identity,
+    ).as_row()
 
-        def polarity(result_rows: list[dict[str, Any]], should: bool) -> dict[str, Any]:
-            pol = [r for r in result_rows if r["should_trigger"] is should]
-            complete = [r for r in pol if r["observation_complete"]]
-            passed = sum(1 for r in complete if r["pass"])
-            incomplete = len(pol) - len(complete)
-            observed_pass_rate = (passed / len(complete)) if complete else None
-            return {"total": len(pol), "complete": len(complete),
-                    "incomplete": incomplete, "passed": passed,
-                    "pass_rate": None if incomplete else observed_pass_rate,
-                    "observed_pass_rate": observed_pass_rate}
-        complete_rows = [r for r in rows if r["observation_complete"]]
-        passed = sum(1 for r in complete_rows if r["pass"])
-        incomplete = len(rows) - len(complete_rows)
-        observed_pass_rate = passed / len(complete_rows) if complete_rows else None
-        matrix.append({
-            "agent": agent, "model": model,
-            "summary": {"total": len(rows), "complete": len(complete_rows),
-                        "passed": passed,
-                        "pass_rate": None if incomplete else observed_pass_rate,
-                        "observed_pass_rate": observed_pass_rate,
-                        "should_trigger": polarity(rows, True), "should_not_trigger": polarity(rows, False),
-                        "incomplete_observations": incomplete},
-            "queries": query_rows,
-        })
-    return matrix
+
+def summarize_matrix(observations: list[TriggerObservation]) -> list[dict[str, Any]]:
+    """Serialize the shared typed matrix aggregation at the report boundary."""
+    return summarize_trigger_matrix(observations)
 
 
 def print_matrix(matrix: list[dict[str, Any]]) -> None:
@@ -968,10 +950,13 @@ def print_matrix(matrix: list[dict[str, Any]]) -> None:
         s = cell["summary"]
 
         def frac(block: dict[str, Any]) -> str:
-            return f"{block['passed']}/{block['complete']}" if block["complete"] else "-"
+            if block["measurement_status"] == "incomplete":
+                return f"INCOMPLETE {block['observed']}/{block['total']}"
+            return f"{block['passed']}/{block['total']}" if block["total"] else "-"
+        overall = frac(s)
         print(f"{cell['agent']:<8} {cell['model'] or 'default'!s:<10} "
               f"{frac(s['should_trigger']):>12} {frac(s['should_not_trigger']):>16} "
-              f"{str(s['passed']) + '/' + str(s['complete']):>9}")
+              f"{overall:>9}")
 
 
 def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str],
@@ -1031,7 +1016,7 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         if trace_runs is not None:
             trace_runs.mkdir(parents=True, exist_ok=True)
             trace_root = Path(tempfile.mkdtemp(prefix="matrix-", dir=trace_runs))
-        futures, results, design = [], [], []
+        futures, observations, design = [], [], []
         future_context: dict[Any, tuple[str, str | None, str, bool, dict[str, Any], TriggerRepetitionIdentity]] = {}
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for adapter in adapters:
@@ -1060,7 +1045,7 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
                             }
                             should_trigger = row["should_trigger"]
                             identity = TriggerRepetitionIdentity(row["query_id"], run_number)
-                            future = ex.submit(run_cell_query, adapter, tree_dir,
+                            future = ex.submit(observe_cell_query, adapter, tree_dir,
                                                query, should_trigger,
                                                model, timeout, trace_dir, metadata, identity)
                             futures.append(future)
@@ -1068,20 +1053,18 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
                                 adapter.name, model, query, should_trigger, metadata, identity)
             for fut in as_completed(futures):
                 try:
-                    results.append(fut.result())
+                    observations.append(fut.result())
                 except Exception as exc:
                     agent, model, query, should_trigger, metadata, identity = future_context[fut]
-                    results.append(matrix_failure_row(
+                    observations.append(matrix_failure_observation(
                         agent, model, query, should_trigger, exc, metadata, identity))
-    results.sort(key=lambda row: (
-        str(row["agent"]), str(row.get("model") or ""),
-        str(row["query_id"]), int(row["run_number"]),
+    observations.sort(key=lambda observation: (
+        observation.agent, str(observation.model or ""),
+        str(observation.identity.query_id if observation.identity else ""),
+        int(observation.identity.run_number if observation.identity else 0),
     ))
-    matrix = summarize_matrix(results)
-    complete_results = [r for r in results if r["observation_complete"]]
-    passed = sum(1 for r in complete_results if r["pass"])
-    incomplete = len(results) - len(complete_results)
-    observed_pass_rate = passed / len(complete_results) if complete_results else None
+    matrix = summarize_matrix(observations)
+    summary = trigger_cohort_as_dict(summarize_trigger_cohort(observations))
     return {
         "skill_name": skill_name_from_manifest(manifest),
         "generated_at": int(time.time()),
@@ -1099,12 +1082,9 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         "agents": {name: capability_rows[name].as_dict() for name in sorted(capability_rows)},
         "runs_per_query": runs_per_query,
         "design": design,
-        "summary": {"total": len(results), "complete": len(complete_results),
-                    "incomplete": incomplete, "passed": passed,
-                    "pass_rate": None if incomplete else observed_pass_rate,
-                    "observed_pass_rate": observed_pass_rate},
+        "summary": summary,
         "matrix": matrix,
-        "results": results,
+        "results": [observation.as_row() for observation in observations],
     }
 
 
@@ -1150,7 +1130,7 @@ def main() -> int:
     write_json(Path(args.out), report)
     print_matrix(report["matrix"])
     print(f"\nreport: {args.out}")
-    return 0
+    return 0 if report["summary"]["measurement_status"] == "complete" else 1
 
 
 if __name__ == "__main__":

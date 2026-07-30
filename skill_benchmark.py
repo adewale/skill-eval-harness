@@ -133,6 +133,7 @@ HARNESS_SEMANTIC_MODULES = (
     "jetty_contracts.py", "judge_verdict.py", "json_contracts.py", "run_pi_trigger_eval.py",
     "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
     "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
+    "trigger_reporting.py",
 )
 DEFAULT_VARIANTS = ["with_skill", "without_skill"]
 TEXT_ASSERTIONS = {

@@ -36,6 +36,8 @@ from agent_capabilities import AGENT_CAPABILITIES
 from trigger_contracts import (
     InvocationOutcome,
     InvocationState,
+    TriggerExpectation,
+    TriggerObservation,
     TriggerRepetitionIdentity,
 )
 
@@ -240,13 +242,15 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), \
                  mock.patch.object(tr, "invoke_argv_with_timeout", return_value=timed_out), \
                  mock.patch("builtins.print"):
-                self.assertEqual(tr.main(), 0)
+                self.assertEqual(tr.main(), 1)
             summary = json.loads(out.read_text(encoding="utf-8"))["summary"]
-        self.assertEqual(summary, {
-            "total": 1, "complete": 0, "incomplete": 1,
-            "passed": 0, "failed": 0, "pass_rate": None,
-            "observed_pass_rate": None,
-        })
+        self.assertEqual(summary["measurement_status"], "incomplete")
+        self.assertEqual(
+            (summary["complete"], summary["incomplete"], summary["total"]),
+            (0, 1, 1),
+        )
+        self.assertNotIn("pass_rate", summary)
+        self.assertNotIn("observed_pass_rate", summary)
 
 
     def test_pi_json_provider_error_cannot_pass_a_negative_trigger(self):
@@ -274,7 +278,8 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             ]
         self.assertEqual(parse_stream.call_count, 1)
         self.assertFalse(result["observation_complete"])
-        self.assertFalse(result["pass"])
+        self.assertIsNone(result["pass"])
+        self.assertIsNone(result["triggered"])
         self.assertEqual(result["usage_normalized"], {"source": "missing"})
         self.assertEqual(result["cost_normalized"], {"source": "missing"})
         self.assertIn("Invalid model", result["provider_error"])
@@ -471,11 +476,20 @@ class StubMatrixOfflineTests(unittest.TestCase):
         self.assertEqual(report["summary"]["complete"], 0)
         self.assertEqual(report["summary"]["incomplete"], 1)
         self.assertEqual(report["summary"]["passed"], 0)
-        self.assertIsNone(report["summary"]["pass_rate"])
+        self.assertNotIn("pass_rate", report["summary"])
         self.assertEqual(report["matrix"][0]["summary"]["incomplete_observations"], 1)
         self.assertEqual(report["matrix"][0]["queries"][0]["complete"], 0)
-        self.assertIsNone(report["matrix"][0]["queries"][0]["trigger_rate"])
+        self.assertNotIn("trigger_rate", report["matrix"][0]["queries"][0])
+        self.assertIsNone(report["results"][0]["pass"])
+        self.assertIsNone(report["results"][0]["triggered"])
         self.assertIn("disk full", report["results"][0]["error"])
+
+        with mock.patch("sys.stdout") as stdout:
+            tm.print_matrix(report["matrix"])
+        rendered = " ".join(
+            str(call.args[0]) for call in stdout.write.call_args_list if call.args
+        )
+        self.assertIn("INCOMPLETE", rendered)
 
     def test_trace_redacts_workspace_credentials(self):
         class SecretEchoAdapter(tm.AgentAdapter):
@@ -546,6 +560,40 @@ class StubMatrixOfflineTests(unittest.TestCase):
             tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["missing-agent"], models=None,
                           runs_per_query=1, timeout=30, workers=1)
         self.assertIn("AgentAdapter", str(ctx.exception))
+
+
+class TriggerCliStatusTests(unittest.TestCase):
+    def test_matrix_cli_exits_nonzero_for_an_incomplete_report(self):
+        report = {
+            "summary": {"measurement_status": "incomplete"},
+            "matrix": [],
+            "results": [],
+        }
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm, "run_matrix", return_value=report), \
+             mock.patch.object(tm, "print_matrix"), \
+             mock.patch.object(sys, "argv", [
+                 "skill-trigger-matrix", str(DEMO_MANIFEST), "--agent", "stub",
+                 "--out", str(Path(td) / "report.json"),
+             ]):
+            self.assertEqual(tm.main(), 1)
+
+    def test_pi_cli_exits_nonzero_for_incomplete_observations(self):
+        failed = TriggerObservation.harness_failure(
+            agent="pi",
+            model=None,
+            query="q",
+            expectation=TriggerExpectation.TRIGGER,
+            error=RuntimeError("provider unavailable"),
+            metadata={"skill_tree_hash": "sha256:test"},
+        )
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tr, "observe_query", return_value=failed), \
+             mock.patch.object(sys, "argv", [
+                 "skill-pi-trigger-eval", str(DEMO_MANIFEST), "--runs-per-query", "1",
+                 "--out", str(Path(td) / "report.json"),
+             ]):
+            self.assertEqual(tr.main(), 1)
 
 
 class ClaudeDetectionTests(unittest.TestCase):
@@ -1534,7 +1582,8 @@ class TriggerComparisonTests(unittest.TestCase):
     def test_protocol_dependency_identity_cannot_omit_a_module(self):
         baseline = trigger_report(self._baseline_rows())
         identity = baseline["protocol"]["harness_identity"]
-        identity["modules"].pop("trigger_contracts.py")
+        self.assertIn("trigger_reporting.py", identity["modules"])
+        identity["modules"].pop("trigger_reporting.py")
         payload = {key: value for key, value in identity.items()
                    if key != "identity_sha256"}
         identity["identity_sha256"] = sb.canonical_json_sha256(payload)

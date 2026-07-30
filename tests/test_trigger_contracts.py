@@ -6,7 +6,9 @@ from pathlib import Path
 import skill_benchmark as sb
 from run_pi_trigger_eval import pi_invocation_outcome
 from trigger_contracts import (
+    CompleteTriggerResult,
     CompletionEvidence,
+    IncompleteTriggerResult,
     InvocationOutcome,
     InvocationState,
     TriggerDetection,
@@ -203,7 +205,8 @@ class PiStreamContractTests(unittest.TestCase):
             detection=TriggerDetection.absent(),
             usage={"source": "missing"}, cost={"source": "missing"},
         )
-        self.assertFalse(observation.passed)
+        self.assertIsNone(observation.passed)
+        self.assertIsInstance(observation.result, IncompleteTriggerResult)
         with self.assertRaises(ValueError):
             TriggerObservation(
                 agent="pi", model="invalid", query="ordinary chat",
@@ -250,7 +253,7 @@ class TriggerObservationTruthTableTests(unittest.TestCase):
         self.assertEqual(valid.usage["total_tokens"], 0)
         self.assertEqual(valid.cost["total_cost"], 0.0)
 
-    def test_pass_is_total_and_derived_for_every_finite_state_combination(self):
+    def test_only_complete_observations_inhabit_the_quality_result(self):
         complete = InvocationOutcome.from_process(
             stdout="", stderr="", returncode=0, elapsed_ms=0,
         )
@@ -271,12 +274,20 @@ class TriggerObservationTruthTableTests(unittest.TestCase):
                             usage={"source": "missing"}, cost={"source": "missing"},
                         )
                         expected = (
-                            invocation.observation_complete
-                            and detection.triggered == expectation.should_trigger
+                            detection.triggered == expectation.should_trigger
+                            if invocation.observation_complete else None
                         )
+                        if invocation.observation_complete:
+                            self.assertIsInstance(observation.result, CompleteTriggerResult)
+                        else:
+                            self.assertIsInstance(observation.result, IncompleteTriggerResult)
                         self.assertIs(observation.passed, expected)
                         row = observation.as_row()
                         self.assertIs(row["pass"], expected)
+                        self.assertIs(
+                            row["triggered"],
+                            detection.triggered if invocation.observation_complete else None,
+                        )
                         self.assertIs(row["observation_complete"], invocation.observation_complete)
 
     def test_observation_metadata_cannot_shadow_derived_row_fields(self):

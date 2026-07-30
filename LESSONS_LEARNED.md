@@ -456,3 +456,37 @@ Latest allowlisted Pi generation cost snapshot (`safe-suite-20260630-201448-pi`;
 - Build run artifacts in a staging directory, write the digest inventory last, and atomically replace the destination. Restore the prior committed run if installation fails; stale or mixed-generation files must never look like one durable observation.
 - Verify the producer-owned inventory when reading. Files added later by downstream grading do not retroactively invalidate the committed producer set, while legacy directories without a marker remain readable with artifact-set state unknown.
 - Test the full finite-state product and the monotonicity rule: changing one axis to complete must not change another axis or make a multi-axis claim eligible by itself. Add provider-shaped malformed-wire, tamper, stale-file, and fault-injected rollback cases—not only happy paths.
+
+## 2026-07-29 — A proof erased to a dictionary is not architecture
+
+**Problem:** The typed-trigger change constructed a valid `TriggerObservation` and immediately
+called `as_row()`. The pre-existing matrix and Pi summarizers still consumed `dict[str, Any]` and
+computed `sum(row["pass"]) / len(rows)`. Because the row encoded incomplete as `pass=false`, a
+failed invocation became a `0/N` skill-quality result. The worker-failure test even pinned
+`passed == 0`, so it certified the lossy projection instead of the measurement invariant.
+
+The repository history shows the same sequence elsewhere: first add a local missing-output filter;
+then add `execution_valid`; then route known views through `scorable_run`; then add `ResultSet`; then
+discover an example or newly added report that still iterates raw rows. Source-inspection guards
+made named consumers call the preferred helper, but could not stop a new consumer or an equivalent
+hand-written loop.
+
+**Lesson:** A domain value is proof only while downstream APIs require that value. Converting it to
+an open dictionary before aggregation discards the type-level distinction and returns correctness
+to convention. Static analysis helps when the architecture exposes a real sum type; it cannot infer
+the semantics of `dict[str, Any]`, and an AST rule that bans one loop spelling only protects syntax.
+
+**Rule:**
+- Parse external data once, retain the closed domain value through every semantic operation, and
+  serialize only at the artifact/UI boundary: **parse → retain → aggregate → serialize**.
+- Model measured/incomplete/empty as variants. Put numeric rates only on the measured variant, so
+  an unavailable rate is absent by construction rather than represented by a sentinel number.
+- Give every aggregation surface the same typed owner. Overall, per-cell, per-polarity, and
+  per-query summaries must not each re-derive coverage.
+- Use `ty` on proof-carrying islands first. Expand the island when a raw boundary is replaced; do
+  not make the whole legacy repository pass by adding `Any` or broad ignores.
+- Prefer model-gap and reversion tests: construct incomplete evidence and prove no rate exists, the
+  terminal calls it incomplete, and the CLI exits nonzero. A test that only checks a false pass bit
+  repeats the bug's assumption.
+- Treat source/AST guards as migration scaffolding for facts the language cannot express, not as
+  the primary architecture. If a sum type and API ownership can encode the rule, use them.
