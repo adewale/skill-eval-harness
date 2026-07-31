@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -439,6 +440,39 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "duplicate backend registration 'offline'"):
             ac.backend_registry(row, row)
+
+    def test_export_import_entrypoints_are_owned_by_the_backend_row(self):
+        jetty = ac.BACKENDS["jetty"]
+        with self.assertRaisesRegex(
+            ValueError,
+            "entrypoint 'export-jetty' is not owned by backend 'other'",
+        ):
+            other = replace(
+                jetty,
+                name="other",
+                smoke=ac.DedicatedSmokeTarget("other", ("true",)),
+                failure_marker="[OTHER FAILURE",
+            )
+            ac.backend_registry(jetty, other)
+
+    def test_registry_rejects_invalid_lazy_reference_fields(self):
+        with self.assertRaisesRegex(TypeError, "lazy workspace builder"):
+            replace(
+                ac.BACKENDS["codex"],
+                workspace_builder=object(),  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(TypeError, "lazy object reference"):
+            ac.SurfaceBinding(object())  # type: ignore[arg-type]
+        with self.assertRaisesRegex(TypeError, "typed surface binding"):
+            replace(
+                ac.BACKENDS["codex"],
+                answer=object(),  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(TypeError, "typed answer entrypoints"):
+            replace(
+                ac.BACKENDS["codex"],
+                answer_entrypoints=(object(),),  # type: ignore[arg-type]
+            )
 
     def test_registry_rejects_wrong_implementation_identity_and_cli_collisions(self):
         generic_trace = ac.ObjectRef(

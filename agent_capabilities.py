@@ -204,6 +204,8 @@ class SurfaceBinding:
     extra_parameters: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.implementation, ObjectRef):
+            raise TypeError("surface bindings need a lazy object reference")
         destinations = [option.dest for option in self.cli_options]
         if len(destinations) != len(set(destinations)):
             raise ValueError("surface binding repeats a CLI option destination")
@@ -265,6 +267,8 @@ class BackendRegistration:
         if not isinstance(self.name, str) or BACKEND_NAME_RE.fullmatch(self.name) is None:
             raise ValueError(
                 "backend names must use lower-case letters, digits, underscores, or hyphens")
+        if not isinstance(self.capabilities, AgentCapabilities):
+            raise TypeError(f"backend {self.name!r} needs typed capabilities")
         if self.answer_route not in {"native", "export_import", "subagent", "none"}:
             raise ValueError(f"backend {self.name!r} has an unknown answer route")
         if (self.trace is not None) != self.capabilities.trace_artifacts:
@@ -272,6 +276,20 @@ class BackendRegistration:
                 f"backend {self.name!r} trace binding disagrees with its capability")
         if self.trace is not None and not isinstance(self.trace, ObjectRef):
             raise TypeError(f"backend {self.name!r} needs a lazy trace binding")
+        if (not isinstance(self.answer_entrypoints, tuple)
+                or any(not isinstance(entrypoint, AnswerEntrypoint)
+                       for entrypoint in self.answer_entrypoints)):
+            raise TypeError(
+                f"backend {self.name!r} needs typed answer entrypoints")
+        for surface in ("answer", "trigger", "judge"):
+            binding = getattr(self, surface)
+            if binding is not None and not isinstance(binding, SurfaceBinding):
+                raise TypeError(
+                    f"backend {self.name!r} {surface} needs a typed surface binding")
+        if (self.workspace_builder is not None
+                and not isinstance(self.workspace_builder, ObjectRef)):
+            raise TypeError(
+                f"backend {self.name!r} needs a lazy workspace builder")
         has_answer_route = self.answer_route != "none"
         if has_answer_route != self.capabilities.answer_runner:
             raise ValueError(f"backend {self.name!r} answer route disagrees with its capability")
@@ -292,12 +310,20 @@ class BackendRegistration:
                 raise ValueError(
                     f"subagent answer backend {self.name!r} must bind only "
                     "the run-subagent entrypoint")
-        elif (self.answer_route == "export_import"
-              and (len(phases) != 3
-                   or set(phases) != {"export", "run", "import"})):
-            raise ValueError(
-                f"export/import answer backend {self.name!r} needs exactly "
-                "one export, run, and import entrypoint")
+        elif self.answer_route == "export_import":
+            if (len(phases) != 3
+                    or set(phases) != {"export", "run", "import"}):
+                raise ValueError(
+                    f"export/import answer backend {self.name!r} needs exactly "
+                    "one export, run, and import entrypoint")
+            for entrypoint in self.answer_entrypoints:
+                owned_prefix = f"{entrypoint.phase}-{self.name}"
+                if (entrypoint.command != owned_prefix
+                        and not entrypoint.command.startswith(f"{owned_prefix}-")):
+                    raise ValueError(
+                        f"export/import answer backend {self.name!r} entrypoint "
+                        f"{entrypoint.command!r} is not owned by backend "
+                        f"{self.name!r}")
         if (self.answer is not None) != (self.answer_route == "native"):
             raise ValueError(f"backend {self.name!r} native answer binding disagrees with its route")
         if self.capabilities.trigger_ablation and not self.capabilities.autonomous_trigger:
