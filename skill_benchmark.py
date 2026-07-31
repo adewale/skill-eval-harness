@@ -126,6 +126,7 @@ from trigger_contracts import (
     TriggerObservation,
     validated_trigger_protocol_limits,
 )
+from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 
 VALID_SPLITS = {"tune", "holdout", "holdback"}
 HARNESS_SEMANTIC_MODULES = (
@@ -11985,11 +11986,9 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
                 reasons.append("ablation provenance does not match the manifest-declared treatment")
     provenance_verified = not reasons
 
-    def rates(complete: list[TriggerObservation], total: int) -> dict[str, Any]:
-        return {"runs": total, "complete": len(complete),
-                "pass_rate": _exact_rate(sum(1 for o in complete if o.passed), len(complete)),
-                "trigger_rate": _exact_rate(
-                    sum(1 for o in complete if o.detection.triggered), len(complete))}
+    def rates(cohort: CompleteTriggerCohort) -> dict[str, Any]:
+        return {"runs": cohort.total, "complete": cohort.total,
+                "pass_rate": cohort.pass_rate, "trigger_rate": cohort.trigger_rate}
 
     base_cells, abl_cells = base_report.cells, abl_report.cells
     comparable: list[dict[str, Any]] = []
@@ -12010,13 +12009,15 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
         query, should = definition
         base_observations = [base_by_run[n] for n in sorted(base_by_run)]
         abl_observations = [abl_by_run[n] for n in sorted(abl_by_run)]
-        base_complete = [o for o in base_observations if o.invocation.observation_complete]
-        abl_complete = [o for o in abl_observations if o.invocation.observation_complete]
+        base_cohort = summarize_trigger_cohort(base_observations)
+        abl_cohort = summarize_trigger_cohort(abl_observations)
         reason = ("missing_baseline_arm" if key not in base_cells
                   else "missing_ablation_arm" if key not in abl_cells
                   else "query_definition_mismatch" if base_definition != abl_definition
-                  else "baseline_observations_incomplete" if len(base_complete) != len(base_observations)
-                  else "ablation_observations_incomplete" if len(abl_complete) != len(abl_observations)
+                  else "baseline_observations_incomplete"
+                  if not isinstance(base_cohort, CompleteTriggerCohort)
+                  else "ablation_observations_incomplete"
+                  if not isinstance(abl_cohort, CompleteTriggerCohort)
                   else "repetition_count_mismatch" if set(base_by_run) != set(abl_by_run)
                   else "protocol_observation_unsafe" if base_protocol_errors or abl_protocol_errors
                   else "protocol_observation_mismatch" if base_protocol_observations != abl_protocol_observations
@@ -12036,8 +12037,11 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
                 })
             blocked.append(entry)
             continue
-        base_block = rates(base_complete, len(base_by_run))
-        abl_block = rates(abl_complete, len(abl_by_run))
+        if (not isinstance(base_cohort, CompleteTriggerCohort)
+                or not isinstance(abl_cohort, CompleteTriggerCohort)):
+            raise TypeError("a comparable trigger cell must contain two complete cohorts")
+        base_block = rates(base_cohort)
+        abl_block = rates(abl_cohort)
         comparable.append({
             "agent": agent, "model": model, "query_id": query_id,
             "query": query, "should_trigger": should,

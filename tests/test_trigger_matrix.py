@@ -1356,15 +1356,22 @@ class TriggerComparisonTests(unittest.TestCase):
 
     def test_comparer_keeps_sub_millionth_rate_deltas(self):
         epsilon = 1 / 3_000_000
-        # Four rates per cell: baseline pass/trigger, then ablation pass/trigger.
-        full_precision_rates = iter(
-            value
-            for _ in self.QUERIES
-            for value in (1.0, 1.0, 1.0 - epsilon, 1.0 - epsilon)
+        pass_rates = iter(
+            value for _ in self.QUERIES for value in (1.0, 1.0 - epsilon)
         )
-        with mock.patch.object(sb, "_exact_rate", side_effect=full_precision_rates) as exact_rate:
+        trigger_rates = iter(
+            value for _ in self.QUERIES for value in (1.0, 1.0 - epsilon)
+        )
+        with mock.patch.object(
+            sb.CompleteTriggerCohort, "pass_rate",
+            new_callable=mock.PropertyMock, side_effect=pass_rates,
+        ) as pass_rate, mock.patch.object(
+            sb.CompleteTriggerCohort, "trigger_rate",
+            new_callable=mock.PropertyMock, side_effect=trigger_rates,
+        ) as trigger_rate:
             out = self._compare()
-        self.assertEqual(exact_rate.call_count, 4 * len(self.QUERIES))
+        self.assertEqual(pass_rate.call_count, 2 * len(self.QUERIES))
+        self.assertEqual(trigger_rate.call_count, 2 * len(self.QUERIES))
         self.assertLess(out["paired"]["comparable_queries"][0]["pass_delta"], 0)
         self.assertAlmostEqual(
             out["paired"]["comparable_queries"][0]["pass_delta"], -epsilon)

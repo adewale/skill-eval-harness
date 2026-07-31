@@ -14,6 +14,7 @@ from typing import Any, NoReturn, TypeAlias
 from trigger_contracts import (
     CompleteTriggerResult,
     IncompleteTriggerResult,
+    InvocationState,
     TriggerExpectation,
     TriggerObservation,
 )
@@ -50,6 +51,21 @@ class CompleteTriggerCohort:
 
 
 @dataclass(frozen=True)
+class IncompleteTriggerReason:
+    """A counted, closed reason why a trigger observation is incomplete."""
+
+    state: InvocationState
+    count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, InvocationState) or self.state is InvocationState.COMPLETE:
+            raise ValueError("incomplete cohort reasons require a non-complete invocation state")
+        _natural(self.count, "incomplete reason count")
+        if self.count == 0:
+            raise ValueError("incomplete cohort reason counts must be positive")
+
+
+@dataclass(frozen=True)
 class IncompleteTriggerCohort:
     """At least one attempt lacks the evidence required for a rate."""
 
@@ -57,7 +73,7 @@ class IncompleteTriggerCohort:
     observed: int
     passed: int
     triggered: int
-    reasons: tuple[tuple[str, int], ...]
+    reasons: tuple[IncompleteTriggerReason, ...]
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -71,11 +87,13 @@ class IncompleteTriggerCohort:
             raise ValueError("an incomplete cohort requires at least one unobserved attempt")
         if self.passed > self.observed or self.triggered > self.observed:
             raise ValueError("incomplete cohort successes cannot exceed observed attempts")
-        if not self.reasons or any(not reason or count <= 0 for reason, count in self.reasons):
-            raise ValueError("an incomplete cohort requires positive reason counts")
-        if len({reason for reason, _ in self.reasons}) != len(self.reasons):
+        if (not isinstance(self.reasons, tuple) or not self.reasons
+                or not all(isinstance(reason, IncompleteTriggerReason)
+                           for reason in self.reasons)):
+            raise TypeError("an incomplete cohort requires an immutable tuple of typed reasons")
+        if len({reason.state for reason in self.reasons}) != len(self.reasons):
             raise ValueError("incomplete cohort reason keys must be unique")
-        if sum(count for _, count in self.reasons) != self.total - self.observed:
+        if sum(reason.count for reason in self.reasons) != self.total - self.observed:
             raise ValueError("incomplete reason counts must account for every unobserved attempt")
 
 
@@ -92,13 +110,13 @@ def summarize_trigger_cohort(observations: Sequence[TriggerObservation]) -> Trig
         return EmptyTriggerCohort()
 
     measured: list[CompleteTriggerResult] = []
-    reasons: Counter[str] = Counter()
+    reasons: Counter[InvocationState] = Counter()
     for observation in observations:
         result = observation.result
         if isinstance(result, CompleteTriggerResult):
             measured.append(result)
         elif isinstance(result, IncompleteTriggerResult):
-            reasons[result.state.value] += 1
+            reasons[result.state] += 1
         else:
             _assert_never(result)
 
@@ -110,7 +128,10 @@ def summarize_trigger_cohort(observations: Sequence[TriggerObservation]) -> Trig
             observed=len(measured),
             passed=passed,
             triggered=triggered,
-            reasons=tuple(sorted(reasons.items())),
+            reasons=tuple(
+                IncompleteTriggerReason(state, count)
+                for state, count in sorted(reasons.items(), key=lambda item: item[0].value)
+            ),
         )
     return CompleteTriggerCohort(len(observations), passed, triggered)
 
@@ -143,7 +164,9 @@ def trigger_cohort_as_dict(cohort: TriggerCohort) -> dict[str, Any]:
             "passed": cohort.passed,
             "failed": cohort.observed - cohort.passed,
             "triggered": cohort.triggered,
-            "incomplete_reasons": dict(cohort.reasons),
+            "incomplete_reasons": {
+                reason.state.value: reason.count for reason in cohort.reasons
+            },
         }
     if isinstance(cohort, EmptyTriggerCohort):
         return {

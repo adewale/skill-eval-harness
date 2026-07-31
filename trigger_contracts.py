@@ -747,10 +747,10 @@ class TriggerObservation:
             "complete" if isinstance(result, CompleteTriggerResult) else "incomplete"
         )
         stored_status = raw.get("measurement_status")
-        if stored_status is not None and stored_status != expected_status:
+        if "measurement_status" in raw and stored_status != expected_status:
             raise ValueError("persisted measurement_status disagrees with the typed observation")
         stored_evidence = raw.get("trigger_evidence_observed")
-        if stored_evidence is not None and (
+        if "trigger_evidence_observed" in raw and (
             not isinstance(stored_evidence, bool) or stored_evidence != detection.triggered
         ):
             raise ValueError("persisted trigger evidence flag disagrees with trigger evidence")

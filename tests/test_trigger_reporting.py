@@ -12,6 +12,7 @@ from trigger_reporting import (
     CompleteTriggerCohort,
     EmptyTriggerCohort,
     IncompleteTriggerCohort,
+    IncompleteTriggerReason,
     summarize_trigger_cohort,
     summarize_trigger_matrix,
     trigger_cohort_as_dict,
@@ -72,6 +73,7 @@ class TriggerCohortTypeTests(unittest.TestCase):
         block = trigger_cohort_as_dict(cohort)
         self.assertEqual(block["measurement_status"], "empty")
         self.assertNotIn("pass_rate", block)
+        self.assertNotIn("trigger_rate", block)
         self.assertEqual(trigger_cohort_exit_code(cohort), 1)
 
     def test_invalid_aggregate_states_cannot_be_constructed(self):
@@ -79,7 +81,19 @@ class TriggerCohortTypeTests(unittest.TestCase):
             CompleteTriggerCohort(total=0, passed=0, triggered=0)
         with self.assertRaises(ValueError):
             IncompleteTriggerCohort(total=2, observed=2, passed=2, triggered=2,
-                                    reasons=(("timed_out", 0),))
+                                    reasons=(IncompleteTriggerReason(
+                                        InvocationState.TIMED_OUT, 1),))
+        for state, count in (
+            (InvocationState.COMPLETE, 1),
+            ("timed_out", 1),
+            (InvocationState.TIMED_OUT, True),
+        ):
+            with self.subTest(state=state, count=count), self.assertRaises(ValueError):
+                IncompleteTriggerReason(state, count)  # type: ignore[arg-type]
+        reason = IncompleteTriggerReason(InvocationState.TIMED_OUT, 1)
+        with self.assertRaises(TypeError):
+            IncompleteTriggerCohort(total=1, observed=0, passed=0, triggered=0,
+                                    reasons=[reason])  # type: ignore[arg-type]
 
     def test_matrix_queries_and_polarities_share_the_same_coverage_rule(self):
         cells = summarize_trigger_matrix([

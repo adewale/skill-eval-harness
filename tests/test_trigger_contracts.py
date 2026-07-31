@@ -460,6 +460,8 @@ class TriggerObservationTruthTableTests(unittest.TestCase):
             {"population": "answer"},
             {"evidence": ["legacy-only"]},
             {"triggered": True},
+            {"measurement_status": None},
+            {"trigger_evidence_observed": None},
             {"timed_out": True},
             {"provider_error": "bad", "pass": False},
             {"provider_error": "bad", "pass": False,
