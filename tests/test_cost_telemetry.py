@@ -404,6 +404,12 @@ def result_row(case_id: str, variant: str, *, cost: float | None, tokens: int | 
 
 
 class CostSummaryTests(unittest.TestCase):
+    def test_cost_rows_require_a_string_variant_before_grouping(self):
+        row = result_row("c", "with_skill", cost=1.0, tokens=10)
+        row["variant"] = None
+        with self.assertRaisesRegex(ValueError, "string variant"):
+            sb.build_cost_summary([row])
+
     def test_paired_cost_does_not_invent_missing_repetition_identity(self):
         rows = [
             {"case_id": "c", "variant": "with_skill", "objective_pass_rate": 1.0,

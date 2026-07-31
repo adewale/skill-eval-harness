@@ -133,23 +133,24 @@ Current status and remaining order:
    after repairing its current Python 3.12 failure. Preserve its token-backed
    live Jetty evidence while adapting the old branch to the typed evidence and
    unified-registry owners.
-5. Complete the relevant [#64](https://github.com/adewale/skill-eval-harness/issues/64)
-   type-clean slices and [#52 item 5](https://github.com/adewale/skill-eval-harness/issues/52)
-   typed judge-invocation result before instrumenting those central-CLI regions.
+5. Preserve the central-CLI type-clean gate completed by
+   [#64](https://github.com/adewale/skill-eval-harness/issues/64), and the typed
+   judge-invocation result completed by
+   [#67](https://github.com/adewale/skill-eval-harness/pull/67) for
+   [#52 item 5](https://github.com/adewale/skill-eval-harness/issues/52), before
+   instrumenting those regions.
 6. Rebase and preferably split [#62](https://github.com/adewale/skill-eval-harness/pull/62)
    over #65 and the typed judge boundary. Agy then joins answer, trigger, judge,
    telemetry, privacy, and conformance coverage by registry capability. If #62
    lands after an OTel slice, add Agy in a focused parity PR rather than weakening
    an already-passing gate.
 
-Slice 0 may begin after #63 because its facade is isolated and type-clean. Slice
-1 waits for the runner/artifact portion of #64 or an explicit proof that the
-identity-aware `ty` regression gate introduces no new diagnostic. Slice 2 applies
-the same rule to command/control-plane code. Slice 3 requires #61, #65, the
+Slice 0 may begin after #63 because its facade is isolated and type-clean. With
+#64 complete, Slices 1 and 2 use the permanent central-CLI `ty` gate for the
+runner/artifact and command/control-plane code. Slice 3 requires #61, #65, the
 rebased #47 live Jetty contract, and an atomic owner for `import-trace` /
-`migrate-telemetry` augmentation. Slice 4 additionally requires #52 item 5;
-adding span lifecycle to the current untyped backend/parse/merge dictionary
-would make that boundary harder to close later.
+`migrate-telemetry` augmentation. Slice 4 additionally requires the #52 item 5
+typed judge result now supplied by #67.
 
 The remaining issues are sequenced by when they change telemetry identity:
 
@@ -167,11 +168,12 @@ The remaining issues are sequenced by when they change telemetry identity:
   Component names never become span names or an unbounded attribute list.
 - [#52 item 4](https://github.com/adewale/skill-eval-harness/issues/52) is now
   represented by #65 and must land before backend-specific OTel hooks. Items 1–3
-  shipped in #53; item 5 remains the Slice 4 typed-result prerequisite.
-- [#64](https://github.com/adewale/skill-eval-harness/issues/64) records the 38
-  diagnostics that remain in the central CLI after #58. It does not block the
-  new type-clean facade, but its runner, command, grading, judge, and reporting
-  regions should become clean before the corresponding OTel slice edits them.
+  shipped in #53; item 5 shipped in #67 and remains the satisfied Slice 4
+  typed-result prerequisite.
+- [#64](https://github.com/adewale/skill-eval-harness/issues/64) retired the 38
+  diagnostics that remained in the central CLI after #58. Runner, command,
+  grading, judge, and reporting changes now enter through the same zero-diagnostic
+  project gate as the type-clean facade.
 - [#37](https://github.com/adewale/skill-eval-harness/issues/37) is upstream-
   capability-driven and is not on the OTel critical path. Missing Vibe usage,
   schema enforcement, or native telemetry stays explicitly unavailable; OTel
@@ -472,7 +474,7 @@ intact.
 
 **Entry:** slices 1–2 correlation metadata is stable; grading can consume old or
 external runs whose metadata has no observability block; #58's comparison view
-is on `main`; and #52 item 5 has replaced the judge invocation dictionary with a
+is on `main`; and #67 has replaced the judge invocation dictionary with a
 closed typed result.
 
 Instrument work that may happen minutes or days after generation without making

@@ -36,10 +36,6 @@ jobs:
       - name: Run ty
         run: ty check
 
-      - name: Reject new central CLI type diagnostics
-        if: matrix.python-version == '3.12'
-        run: python scripts/check_ty_regressions.py
-
       - name: Run unit tests
         run: python -m unittest discover tests -v
 

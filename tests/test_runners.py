@@ -339,6 +339,17 @@ class ToolReplayTests(unittest.TestCase):
 
 
 class ClosedRunnerOutcomeTests(unittest.TestCase):
+    def test_capture_rejects_a_non_process_outcome_from_the_subprocess_owner(self):
+        outcome = sb.InvocationOutcome.harness_failed("fixture setup failed")
+        with mock.patch.object(sb, "invoke_argv_with_timeout", return_value=outcome), \
+             self.assertRaisesRegex(RuntimeError, "non-process invocation"):
+            sb.run_argv_capture(
+                ["unused"], input_text="", cwd=Path.cwd(), timeout=1)
+
+    def test_pi_message_boundary_rejects_non_string_object_keys(self):
+        with self.assertRaisesRegex(TypeError, "keys must be strings"):
+            sb._pi_final_message({"message": {1: "not JSON"}})
+
     def test_outcome_variants_make_contradictory_states_unconstructible(self):
         context = rc.OutcomeContext(provider=rc.Provider.CODEX, elapsed_ms=0)
         with self.assertRaises(ValueError):
