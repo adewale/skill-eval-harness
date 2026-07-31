@@ -309,11 +309,12 @@ raw output string
   the same human-text view, including minimum-length and non-vacuity decisions. Protocol and
   machine-identity checks (`golden_output` by default, structured JSON, scripts, command text, tool
   names, and paths) remain exact; graded script scores still cross a finite 0-1 numeric boundary.
-- The project's focused `ty` gate includes `text_contracts.py`, so this module's constructors,
-  closed assertion union, and return types are statically checked without suppressions. That gate
-  complements rather than replaces runtime parsing: manifest dictionaries and external
-  embedding/script values remain untrusted wire data, while the legacy `skill_benchmark.py`
-  integration is not yet in ty's configured source set.
+- The project's `ty` gate automatically includes every project-owned top-level Python module,
+  including `text_contracts.py` and `skill_benchmark.py`, plus explicit static contract assertions
+  under `type_tests/`. Constructors, closed unions, return types, and exhaustive consumers are
+  therefore checked without a per-module registration step. That gate complements rather than
+  replaces runtime parsing: manifest dictionaries and external embedding/script values remain
+  untrusted wire data.
 
 ## Ablation provenance vocabulary
 

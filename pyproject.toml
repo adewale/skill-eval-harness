@@ -45,28 +45,9 @@ py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "a
 pythonpath = ["."]
 
 [tool.ty.src]
-# Project-owned source gate for the central CLI and its type-clean contract,
-# registry, runner, telemetry, and observability seams.
-include = [
-  "agent_capabilities.py",
-  "ablation_model.py",
-  "experimental_pairs.py",
-  "gemini_contracts.py",
-  "jetty_contracts.py",
-  "judge_contracts.py",
-  "judge_verdict.py",
-  "json_contracts.py",
-  "run_pi_trigger_eval.py",
-  "run_trigger_matrix.py",
-  "runner_contracts.py",
-  "skill_benchmark.py",
-  "telemetry.py",
-  "trace_contracts.py",
-  "text_contracts.py",
-  "observability.py",
-  "trigger_contracts.py",
-  "trigger_reporting.py",
-]
+# Every project-owned top-level module is checked automatically. Type-only
+# contract assertions pin the precision and exhaustiveness of closed domains.
+include = ["*.py", "type_tests/*.py"]
 
 [tool.ruff]
 required-version = "==0.16.0"
