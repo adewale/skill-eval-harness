@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import jetty_contracts as jc
 import skill_benchmark as sb
@@ -678,6 +679,31 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
         record = Client().poll("c", "task", "t", timeout_s=1, poll_interval_s=0)
         self.assertEqual(record["status"], "protocol_invalid")
         self.assertEqual(record["lifecycle"]["kind"], "protocol_invalid")
+
+    def test_poller_local_deadline_preserves_the_pending_provider_state(self):
+        class Client(sb.JettyClient):
+            def __init__(self):
+                pass
+
+            def _json_request(self, method, path, body=None):
+                return {
+                    "status": "running",
+                    "trajectory_id": "trajectory-1",
+                }
+
+        with (
+            mock.patch.object(sb.time, "time", side_effect=[0, 0, 2]),
+            mock.patch.object(sb.time, "sleep"),
+            self.assertRaises(sb.JettyPollWaitExpired) as caught,
+        ):
+            Client().poll(
+                "c", "task", "trajectory-1",
+                timeout_s=1, poll_interval_s=0,
+            )
+
+        self.assertEqual(caught.exception.last["status"], "running")
+        self.assertEqual(
+            caught.exception.last["provider_status"], "running")
 
 
 class JettyObservationTests(unittest.TestCase):

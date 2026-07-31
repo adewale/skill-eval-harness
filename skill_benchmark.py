@@ -4026,11 +4026,8 @@ class JettyClient:
                 last["lifecycle"] = canonical.to_dict()
                 return last
             time.sleep(poll_interval_s)
-        lifecycle = lifecycle_from_status("timeout")
         last["provider_status"] = last.get("status", last.get("state"))
-        last["status"] = lifecycle.status
-        last["lifecycle"] = lifecycle.to_dict()
-        return last
+        raise JettyPollWaitExpired(last)
 
 
 def build_jetty_bundle(files: list[dict[str, Any]]) -> bytes:
@@ -4290,6 +4287,79 @@ JETTY_ATTEMPT_TRANSITIONS = {
 
 class JettySubmissionUnknown(RuntimeError):
     """The provider may have accepted a submit whose receipt was not usable."""
+
+
+class JettyPollWaitExpired(TimeoutError):
+    """The local polling budget ended while the provider attempt may still run."""
+
+    def __init__(self, last: dict[str, Any]):
+        super().__init__(
+            "local Jetty polling wait expired; the acknowledged provider "
+            "attempt remains resumable")
+        self.last = copy.deepcopy(last)
+
+
+class JettyJournalInUse(RuntimeError):
+    """Another process currently owns a Jetty attempt journal."""
+
+
+class JettyAttemptJournalLock:
+    """Cross-process exclusive ownership for one journal's submit lifecycle."""
+
+    def __init__(self, journal_path: Path):
+        self.journal_path = journal_path
+        self.path = Path(str(journal_path) + ".lock")
+        self._fh: Any = None
+
+    def acquire(self) -> None:
+        if self._fh is not None:
+            raise RuntimeError(
+                f"Jetty attempt journal lock is already held: {self.path}")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        fh = os.fdopen(fd, "r+b")
+        try:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(
+                    fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError) as exc:
+            fh.close()
+            raise JettyJournalInUse(
+                f"Jetty attempt journal is already owned by another "
+                f"run-jetty process: {self.journal_path}") from exc
+        self._fh = fh
+
+    def release(self) -> None:
+        fh = self._fh
+        if fh is None:
+            return
+        try:
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+            self._fh = None
+
+    def __enter__(self) -> JettyAttemptJournalLock:  # noqa: PYI034
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release()
 
 
 class JettyAttemptJournal:
@@ -4688,7 +4758,7 @@ def execute_jetty_payloads(
                 except BaseException as exc:
                     if journal is not None:
                         if (isinstance(exc, urllib.error.HTTPError)
-                                and 400 <= exc.code < 500):
+                                and exc.code == 429):
                             attempt_entry = journal.mark_submit_rejected(
                                 actual_task_contract_sha256, exc)
                             attempt_state = "upload_completed"
@@ -4745,10 +4815,37 @@ def execute_jetty_payloads(
 
             if attempt_state == "submission_acknowledged":
                 inject("before_poll")
-                polled = client.poll(
-                    collection, task_name, trajectory_id,
-                    timeout_s=timeout_s, poll_interval_s=poll_interval_s,
-                )
+                try:
+                    polled = client.poll(
+                        collection, task_name, trajectory_id,
+                        timeout_s=timeout_s, poll_interval_s=poll_interval_s,
+                    )
+                except JettyPollWaitExpired as exc:
+                    lifecycle = lifecycle_from_status("timeout")
+                    yield {
+                        "harness": harness,
+                        "status": lifecycle.status,
+                        "lifecycle": lifecycle.to_dict(),
+                        "attempt_state": "submission_acknowledged",
+                        "trajectory_id": trajectory_id,
+                        "jetty_task_contract_sha256":
+                            actual_task_contract_sha256,
+                        "jetty_task_contract": actual_task_contract,
+                        "jetty": {
+                            "collection": collection,
+                            "task": task_name,
+                            "agent": jetty.get("agent"),
+                            "model": request.get("model"),
+                            "model_provider": jetty.get("model_provider"),
+                            "snapshot": jetty.get("snapshot"),
+                        },
+                        "submitted_request": request,
+                        "submission_response": submission,
+                        "trajectory": merged_jetty_trajectory(exc.last, {}),
+                        "error": str(exc),
+                        "artifacts": [],
+                    }
+                    continue
                 poll_record = string_keyed_dict(polled, "Jetty poll response")
                 lifecycle = lifecycle_from_record(poll_record)
                 if not lifecycle.terminal:
@@ -4885,7 +4982,8 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def run_jetty(args: argparse.Namespace) -> int:
-    payloads = load_jsonl(Path(args.payloads))
+    payloads_path = Path(args.payloads)
+    payloads = load_jsonl(payloads_path)
     out = Path(args.out) if getattr(args, "out", None) else None
     if getattr(args, "dry_run", False):
         records = [{"harness": p.get("harness", {}), "status": "dry_run", "jetty": p.get("jetty_request", {}).get("jetty", {})} for p in payloads]
@@ -4896,6 +4994,10 @@ def run_jetty(args: argparse.Namespace) -> int:
                 print(json.dumps(record, ensure_ascii=False, allow_nan=False))
         return 0
 
+    if out is None:
+        die(
+            "live run-jetty requires --out so result publication can be "
+            "coordinated atomically with the attempt journal")
     token = os.environ.get("JETTY_API_TOKEN")
     if not token:
         die("JETTY_API_TOKEN is required for run-jetty (use --dry-run to validate payload loading only)")
@@ -4904,36 +5006,45 @@ def run_jetty(args: argparse.Namespace) -> int:
     raw_journal = getattr(args, "journal", None)
     journal_path = (
         Path(raw_journal) if raw_journal
-        else Path(str(out) + ".attempts.json") if out
-        else Path(str(args.payloads) + ".attempts.json")
+        else Path(str(out) + ".attempts.json")
     )
-    protected_paths = {Path(args.payloads).resolve()}
-    if out is not None:
-        protected_paths.add(out.resolve())
+    protected_paths = {payloads_path.resolve()}
+    if out.resolve() in protected_paths:
+        die("Jetty result JSONL must not overwrite payload JSONL")
+    protected_paths.add(out.resolve())
     if journal_path.resolve() in protected_paths:
         die("Jetty attempt journal must not overwrite payload or result JSONL")
-    journal = JettyAttemptJournal(journal_path)
-    records: list[dict[str, Any]] = []
-    for record in execute_jetty_payloads(
-        payloads,
-        client=client,
-        timeout_s=getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S),
-        poll_interval_s=getattr(args, "poll_interval", 5),
-        journal=journal,
-        resubmit_unknown=getattr(args, "resubmit_unknown", False),
-    ):
-        records.append(record)
-        if out:
+    lock = JettyAttemptJournalLock(journal_path)
+    if lock.path.resolve() in protected_paths:
+        die(
+            "Jetty attempt journal lock must not overwrite payload or "
+            "result JSONL")
+    try:
+        lock.acquire()
+    except JettyJournalInUse as exc:
+        die(str(exc))
+    try:
+        journal = JettyAttemptJournal(journal_path)
+        records: list[dict[str, Any]] = []
+        atomic_write_jsonl(out, records)
+        for record in execute_jetty_payloads(
+            payloads,
+            client=client,
+            timeout_s=getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S),
+            poll_interval_s=getattr(args, "poll_interval", 5),
+            journal=journal,
+            resubmit_unknown=getattr(args, "resubmit_unknown", False),
+        ):
+            records.append(record)
             atomic_write_jsonl(out, records)
-        else:
-            print(json.dumps(
-                record, ensure_ascii=False, allow_nan=False), flush=True)
-        digest = record.get("jetty_task_contract_sha256")
-        entry = journal.entry(digest) if isinstance(digest, str) else None
-        if isinstance(entry, dict) and entry.get("state") in {
-            "artifacts_downloaded", "result_committed",
-        }:
-            journal.mark_result_committed(digest, record)
+            digest = record.get("jetty_task_contract_sha256")
+            entry = journal.entry(digest) if isinstance(digest, str) else None
+            if isinstance(entry, dict) and entry.get("state") in {
+                "artifacts_downloaded", "result_committed",
+            }:
+                journal.mark_result_committed(digest, record)
+    finally:
+        lock.release()
     return 0
 
 
@@ -18593,11 +18704,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run-jetty")
     p.add_argument("--payloads", required=True)
-    p.add_argument("--out")
+    p.add_argument(
+        "--out",
+        help="result JSONL path (required for live crash-resumable execution)",
+    )
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
     p.add_argument("--poll-interval", type=float, default=5)
     p.add_argument("--concurrency", type=int, default=1, help="reserved; current implementation runs sequentially")
-    p.add_argument("--journal", help="durable attempt journal (default: <out>.attempts.json)")
+    p.add_argument(
+        "--journal",
+        help="durable attempt journal (default: <out>.attempts.json)",
+    )
     p.add_argument(
         "--resubmit-unknown", action="store_true",
         help=(
