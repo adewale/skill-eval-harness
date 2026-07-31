@@ -8,6 +8,7 @@ the intended precise types.
 
 from typing import NoReturn
 
+from ablation_model import PreparedTask
 from judge_verdict import (
     BooleanVerdict,
     ConsensusVerdict,
@@ -16,6 +17,7 @@ from judge_verdict import (
     JudgeVerdict,
     ScoredVerdict,
 )
+from manifest_contracts import CaseKind, ExecutionVariant, Split
 from runner_contracts import (
     AnswerOutcome,
     Completed,
@@ -87,3 +89,10 @@ def judge_verdict_is_exhaustive(verdict: JudgeVerdict) -> None:
         _consensus_passed: bool = verdict.passed
     else:
         _assert_never(verdict)
+
+
+def prepared_task_identity_is_precise(task: PreparedTask) -> None:
+    _split: Split = task.split
+    _kind: CaseKind = task.kind
+    _variant: ExecutionVariant = task.variant_truth
+    _visible_variant: ExecutionVariant = task.model_facing_variant()

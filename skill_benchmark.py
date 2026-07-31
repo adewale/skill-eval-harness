@@ -137,6 +137,13 @@ from judge_verdict import (
     verdict_fields,
     verdict_from_dict,
 )
+from manifest_contracts import (
+    DEFAULT_EXECUTION_VARIANTS,
+    CaseKind,
+    CasePopulation,
+    ExecutionVariant,
+    Split,
+)
 from text_contracts import (
     ComparisonProfile,
     ComparisonText,
@@ -162,16 +169,16 @@ from trigger_contracts import (
 )
 from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 
-VALID_SPLITS = {"tune", "holdout", "holdback"}
+VALID_SPLITS = frozenset(Split.values())
 HARNESS_SEMANTIC_MODULES = (
     "ablation_model.py", "agent_capabilities.py", "experimental_pairs.py",
     "gemini_contracts.py",
-    "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "run_pi_trigger_eval.py",
+    "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "manifest_contracts.py", "run_pi_trigger_eval.py",
     "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
     "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
     "trigger_reporting.py",
 )
-DEFAULT_VARIANTS = ["with_skill", "without_skill"]
+DEFAULT_VARIANTS = list(DEFAULT_EXECUTION_VARIANTS)
 TEXT_ASSERTIONS = {
     "contains",
     "contains_any",
@@ -598,7 +605,11 @@ def is_trigger_case(case: dict[str, Any]) -> bool:
     output is a raw_autonomous_trigger_measurement — a different population from
     answer runs. Every grading path (benchmark, grade, judge) must exclude them
     through THIS predicate so the boundary cannot drift per-command."""
-    return case.get("kind") == "trigger"
+    try:
+        kind = CaseKind.parse(case.get("kind", "behavior"))
+    except ValueError:
+        return False
+    return kind.population is CasePopulation.TRIGGER
 
 
 def is_judge_only_case(case: dict[str, Any]) -> bool:
@@ -1216,10 +1227,14 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         if cid in seen:
             die(f"duplicate case id: {cid}")
         seen.add(cid)
+        try:
+            case_kind = CaseKind.parse(case.get("kind", "behavior"))
+        except ValueError:
+            die(f"{cid}: kind must be a non-empty string")
         split = case.get("split")
         if split not in VALID_SPLITS:
             die(f"{cid}: split must be one of {sorted(VALID_SPLITS)}")
-        trigger_case = is_trigger_case(case)
+        trigger_case = case_kind.population is CasePopulation.TRIGGER
         if trigger_case:
             if not isinstance(case.get("should_trigger"), bool):
                 die(f"{cid}: trigger cases require an explicit boolean should_trigger")
@@ -1411,15 +1426,21 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
     return f"Run variant {variant}."
 
 
-def task_variants(manifest: dict[str, Any], *, include_old_skill: bool = False, include_ablations: bool = False) -> list[str]:
-    variants = list(manifest.get("variants", DEFAULT_VARIANTS))
+def task_variants(manifest: dict[str, Any], *, include_old_skill: bool = False, include_ablations: bool = False) -> list[ExecutionVariant]:
+    variants = [
+        ExecutionVariant.parse(value)
+        for value in manifest.get("variants", DEFAULT_VARIANTS)
+    ]
     if include_old_skill:
         old_paths = manifest.get("old_skill_paths") or []
         if not old_paths:
             die("--include-old-skill requires manifest.old_skill_paths to be populated")
-        variants.append("old_skill")
+        variants.append(ExecutionVariant("old_skill"))
     if include_ablations:
-        variants.extend(f"ablation:{a['id']}" for a in manifest.get("ablations", []))
+        variants.extend(
+            ExecutionVariant.ablation(ablation["id"])
+            for ablation in manifest.get("ablations", [])
+        )
     return variants
 
 

@@ -13,8 +13,8 @@ This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md
 |---|---|---|
 | Manifest | `validate_manifest` | The full test definition for one skill. |
 | Case | `iter_cases` | One scenario with a prompt and graders. |
-| Variant | `task_variants` | The arm a case runs under; the lift axis. |
-| Split | `VALID_SPLITS` | Which cases are visible during iteration. |
+| Variant | `manifest_contracts.ExecutionVariant` / `task_variants` | The arm a case runs under; the lift axis. |
+| Split | `manifest_contracts.Split` | Which cases are visible during iteration. |
 | Assertion | `assertion_result` | A single pass/fail check over one run. |
 | Prepared task row | `prepared_task_rows` | A runner-neutral unit of work. |
 | Run-output contract | `discover_run_bases` | The files a runner leaves on disk. |
@@ -51,6 +51,11 @@ case, so the variant axis is where skill effect becomes measurable. `variant_ins
 writes the per-arm instruction; the baseline must run from a workspace that cannot read the
 skill files, or the comparison means nothing.
 
+In process, every arm is an `ExecutionVariant`: a validated `str` subtype that closes the base
+vocabulary and owns the `ablation:<id>` encoding. It retains the existing JSON/path spelling, so
+the type strengthens the boundary without changing persisted artifacts. `task_variants` returns
+these typed values instead of unchecked strings.
+
 ## Split
 
 `tune`, `holdout`, and `holdback` label the intended evaluation phase. Tune cases are for
@@ -58,6 +63,11 @@ iteration; holdout is intended for end-of-round scoring; holdback is intended to
 skill/docs/eval descriptions until after scoring. The harness filters and reports these labels but
 does not provide access control—repositories and CI must keep private material private. `prepare` refuses to emit a hidden case with no
 `prompt_ref` unless you pass `--allow-missing-prompts` for dry-run planning.
+
+`Split` is the corresponding closed `str` subtype. `CaseKind` remains intentionally extensible
+for descriptive labels, but it owns the only structural classification the runners need:
+`answer` versus `trigger`. `PreparedTask.from_row` parses all three identity values at the wire
+boundary, and the executable task carries their precise types thereafter.
 
 ## Assertion
 
@@ -151,10 +161,10 @@ in the codebase.
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10504`), Claude (`run_claude:10685`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10525`), Claude (`run_claude:10706`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13225`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:3978` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13246`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:3999` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -223,7 +233,7 @@ those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplica
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:778`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:789`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 ## What changes when you extend the tool
