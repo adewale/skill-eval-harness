@@ -234,6 +234,10 @@ class AnswerEntrypoint:
             raise TypeError("answer entrypoints need a lazy object reference")
         if self.phase not in {"run", "export", "import"}:
             raise ValueError("answer entrypoint phases must be run, export, or import")
+        if not self.command.startswith(f"{self.phase}-"):
+            raise ValueError(
+                f"answer entrypoint {self.command!r} must use the "
+                f"{self.phase!r} command prefix")
         expected_handler = self.command.replace("-", "_")
         if self.handler.attribute.rsplit(".", 1)[-1] != expected_handler:
             raise ValueError(
@@ -247,8 +251,8 @@ class BackendRegistration:
 
     name: str
     capabilities: AgentCapabilities
-    trace_dialect: str
     answer_route: AnswerRoute
+    trace: ObjectRef | None = None
     answer_entrypoints: tuple[AnswerEntrypoint, ...] = ()
     answer: SurfaceBinding | None = None
     trigger: SurfaceBinding | None = None
@@ -263,10 +267,11 @@ class BackendRegistration:
                 "backend names must use lower-case letters, digits, underscores, or hyphens")
         if self.answer_route not in {"native", "export_import", "subagent", "none"}:
             raise ValueError(f"backend {self.name!r} has an unknown answer route")
-        if self.trace_dialect != self.name:
+        if (self.trace is not None) != self.capabilities.trace_artifacts:
             raise ValueError(
-                f"backend {self.name!r} trace dialect must use the same stable identity; "
-                "artifact sources drive dialect lookup")
+                f"backend {self.name!r} trace binding disagrees with its capability")
+        if self.trace is not None and not isinstance(self.trace, ObjectRef):
+            raise TypeError(f"backend {self.name!r} needs a lazy trace binding")
         has_answer_route = self.answer_route != "none"
         if has_answer_route != self.capabilities.answer_runner:
             raise ValueError(f"backend {self.name!r} answer route disagrees with its capability")
@@ -477,8 +482,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             tool_replay=True, live_smoke_env="RUN_TRIGGER_SMOKE",
             notes="run-claude drives stream-json so answer runs keep the full tool-use stream as trace evidence and capture the Claude CLI cost envelope; trigger matrix detects Skill tool-use plus path evidence.",
         ),
-        trace_dialect="claude",
         answer_route="native",
+        trace=ObjectRef("skill_benchmark", "CLAUDE_TRACE_DIALECT"),
         answer_entrypoints=(_RUN_AGENT, _RUN_CLAUDE),
         answer=_CLAUDE_ANSWER,
         trigger=_CLAUDE_TRIGGER,
@@ -496,8 +501,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             live_smoke_env="RUN_CODEX_TRIGGER_SMOKE",
             notes="Codex answer/trigger support uses codex exec JSONL; native judging uses codex exec --output-last-message/--output-schema. Dollar cost remains explicit missing unless the stream reports cost or a wrapper estimates it.",
         ),
-        trace_dialect="codex",
         answer_route="native",
+        trace=ObjectRef("skill_benchmark", "CODEX_TRACE_DIALECT"),
         answer_entrypoints=(_RUN_AGENT, _RUN_CODEX),
         answer=_CODEX_ANSWER,
         trigger=_CODEX_TRIGGER,
@@ -515,8 +520,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             tool_replay=False, live_smoke_env="RUN_PI_TRIGGER_SMOKE",
             notes="Pi trigger support is shared by skill-pi-trigger-eval and skill-trigger-matrix; cost is parsed when the JSON stream reports it.",
         ),
-        trace_dialect="pi",
         answer_route="none",
+        trace=ObjectRef("skill_benchmark", "PI_TRACE_DIALECT"),
         trigger=SurfaceBinding(ObjectRef("run_trigger_matrix", "PiAdapter")),
         smoke=SmokeTarget("pi", "SMOKE_PI_MODEL", "openai-codex/gpt-5.4-mini", "trigger"),
     ),
@@ -529,8 +534,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             tool_replay=False, live_smoke_env="RUN_JETTY_SMOKE",
             notes="Jetty supports answer-path export/run/import; autonomous trigger and judge export/import remain separate Jetty TODOs.",
         ),
-        trace_dialect="jetty",
         answer_route="export_import",
+        trace=ObjectRef("skill_benchmark", "JETTY_TRACE_DIALECT"),
         answer_entrypoints=(_EXPORT_JETTY, _RUN_JETTY, _IMPORT_JETTY),
         workspace_builder=ObjectRef("skill_benchmark", "jetty_upload_workspace"),
         smoke=DedicatedSmokeTarget(
@@ -548,8 +553,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             live_smoke_env="RUN_VIBE_TRIGGER_SMOKE",
             notes="Mistral Vibe support uses isolated VIBE_HOME, programmatic JSON/streaming output, Agent Skills discovery from .agents/skills, and VIBE_ACTIVE_MODEL for model selection. Current Vibe JSON/streaming output does not export usage/cost telemetry, so both are explicit missing unless a future CLI adds fields.",
         ),
-        trace_dialect="vibe",
         answer_route="native",
+        trace=ObjectRef("skill_benchmark", "VIBE_TRACE_DIALECT"),
         answer_entrypoints=(_RUN_AGENT,),
         answer=_VIBE_ANSWER,
         trigger=_VIBE_TRIGGER,
@@ -566,8 +571,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             judge_backend=False, tool_replay=True, live_smoke_env=None,
             notes="Generic in-process/shell seam for answer runs and tool replay; not an autonomous discovery adapter.",
         ),
-        trace_dialect="subagent",
         answer_route="subagent",
+        trace=ObjectRef("skill_benchmark", "GENERIC_TRACE_DIALECT"),
         answer_entrypoints=(_RUN_SUBAGENT,),
         workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
         failure_marker="[CLAUDE FAILURE",
@@ -582,8 +587,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             usage_not_applicable=True,
             notes="Offline deterministic demo/CI adapter; never spends model tokens.",
         ),
-        trace_dialect="stub",
         answer_route="none",
+        trace=ObjectRef("skill_benchmark", "GENERIC_TRACE_DIALECT"),
         trigger=SurfaceBinding(ObjectRef("run_trigger_matrix", "StubAdapter")),
     ),
 )
@@ -625,6 +630,25 @@ def surface_implementations(
                     f"backend {name!r} {surface} implementation identifies as "
                     f"{actual_name!r}")
         implementations[name] = projected
+    return implementations
+
+
+def trace_dialect_implementations(
+    registrations: Mapping[str, BackendRegistration] | None = None,
+) -> dict[str, Any]:
+    """Materialize registered trace semantics after their module is ready."""
+    rows = BACKENDS if registrations is None else registrations
+    implementations: dict[str, Any] = {}
+    required_methods = ("flatten", "stream_semantics", "usage_and_cost", "protocol_error")
+    for name, registration in rows.items():
+        if registration.trace is None:
+            continue
+        implementation = registration.trace.resolve()
+        if any(not callable(getattr(implementation, method, None))
+               for method in required_methods):
+            raise TypeError(
+                f"backend {name!r} trace binding did not resolve to trace semantics")
+        implementations[name] = implementation
     return implementations
 
 
@@ -697,7 +721,7 @@ def registry_payload() -> dict[str, Any]:
                 entrypoint.command for entrypoint in registration.answer_entrypoints
             ],
             "native_bindings": registration.native_bindings(),
-            "trace_dialect": registration.trace_dialect,
+            "trace_dialect": name if registration.trace is not None else None,
             "smoke": asdict(registration.smoke) if registration.smoke else None,
         }
         for name, registration in BACKENDS.items()

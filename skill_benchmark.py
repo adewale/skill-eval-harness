@@ -112,6 +112,7 @@ from agent_capabilities import (
     registry_payload,
     surface_implementations,
     surface_option_values,
+    trace_dialect_implementations,
 )
 from jetty_contracts import (
     JettyObservation,
@@ -6726,25 +6727,28 @@ class TraceDialect:
 
 
 GENERIC_TRACE_DIALECT = TraceDialect()
+CODEX_TRACE_DIALECT = TraceDialect(protocol_error=_codex_trace_protocol_error)
+JETTY_TRACE_DIALECT = TraceDialect(protocol_error=_jetty_trace_protocol_error)
+VIBE_TRACE_DIALECT = TraceDialect(
+    flatten=vibe_stream_flat_records,
+    protocol_error=_vibe_trace_protocol_error,
+)
+CLAUDE_TRACE_DIALECT = TraceDialect(
+    flatten=claude_stream_flat_records,
+    protocol_error=_claude_trace_protocol_error,
+)
+PI_TRACE_DIALECT = TraceDialect(
+    stream_semantics=_pi_stream_semantics,
+    usage_and_cost=_pi_usage_and_cost_blocks,
+    protocol_error=_pi_trace_protocol_error,
+)
+
+# ``generic`` is the explicit source for unowned imported traces. Every backend
+# key is projected from its declarative row instead of being registered here a
+# second time.
 TRACE_DIALECTS: dict[str, TraceDialect] = {
-    "codex": TraceDialect(protocol_error=_codex_trace_protocol_error),
     "generic": GENERIC_TRACE_DIALECT,
-    "jetty": TraceDialect(protocol_error=_jetty_trace_protocol_error),
-    "subagent": GENERIC_TRACE_DIALECT,
-    "stub": GENERIC_TRACE_DIALECT,
-    "vibe": TraceDialect(
-        flatten=vibe_stream_flat_records,
-        protocol_error=_vibe_trace_protocol_error,
-    ),
-    "claude": TraceDialect(
-        flatten=claude_stream_flat_records,
-        protocol_error=_claude_trace_protocol_error,
-    ),
-    "pi": TraceDialect(
-        stream_semantics=_pi_stream_semantics,
-        usage_and_cost=_pi_usage_and_cost_blocks,
-        protocol_error=_pi_trace_protocol_error,
-    ),
+    **trace_dialect_implementations(),
 }
 
 

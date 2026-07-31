@@ -19,8 +19,9 @@ skill-benchmark agent-capabilities --out backend-registry.json
 `agent-capabilities` renders the unified `agent_capabilities.BACKENDS` rows as
 JSON: capability and telemetry contracts, explicit answer route and executable
 command entrypoints, native answer/trigger/judge bindings, trace dialect, and
-live-smoke policy. Serialization does not dereference lazy handlers, and the
-command does not invoke provider implementations or CLIs; normal CLI import
+live-smoke policy. Serialization does not dereference lazy handlers or trace
+implementations, and the command does not invoke provider implementations or
+CLIs; normal CLI import
 still materializes the compatibility implementation views.
 
 ## Validate

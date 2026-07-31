@@ -199,10 +199,15 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         native_judges = set(judge_backend_action.choices) - {"cmd"}
         self.assertEqual(native_judges, set(sb.JUDGE_BACKENDS))
         self.assertEqual(native_judges, set(ac.surface_names("judge")))
-        self.assertLessEqual(
-            {registration.trace_dialect for registration in ac.BACKENDS.values()},
-            set(sb.TRACE_DIALECTS),
-        )
+        registered_traces = {
+            name: registration.trace.resolve()
+            for name, registration in ac.BACKENDS.items()
+            if registration.trace is not None
+        }
+        self.assertEqual(set(sb.TRACE_DIALECTS), {"generic", *registered_traces})
+        self.assertEqual(ac.trace_dialect_implementations(), registered_traces)
+        for name, dialect in registered_traces.items():
+            self.assertIs(sb.TRACE_DIALECTS[name], dialect)
         for name in ac.surface_names("answer"):
             self.assertIsInstance(
                 sb.AGENT_BACKENDS[name],
@@ -291,6 +296,8 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             self.assertNotIn("surfaces", row)
 
     def test_unified_registry_rejects_partial_surface_rows(self):
+        generic_trace = ac.ObjectRef(
+            "skill_benchmark", "GENERIC_TRACE_DIALECT")
         triggerless = ac.AgentCapabilities(
             answer_runner=False, autonomous_trigger=False,
             trigger_ablation=False, trace_artifacts=True, token_usage=False,
@@ -300,8 +307,8 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "trigger binding disagrees"):
             ac.BackendRegistration(
                 name="partial", capabilities=triggerless,
-                trace_dialect="partial",
                 answer_route="none",
+                trace=generic_trace,
                 trigger=ac.SurfaceBinding(
                     ac.ObjectRef("run_trigger_matrix", "StubAdapter")),
             )
@@ -316,7 +323,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "workspace builder"):
             ac.BackendRegistration(
                 name="partial", capabilities=answer_without_safety,
-                trace_dialect="partial", answer_route="native",
+                answer_route="native", trace=generic_trace,
                 answer_entrypoints=(native_entrypoint,),
                 answer=ac.SurfaceBinding(
                     ac.ObjectRef("skill_benchmark", "ClaudeBackend")),
@@ -325,7 +332,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "native answer binding"):
             ac.BackendRegistration(
                 name="agy", capabilities=answer_without_safety,
-                trace_dialect="agy", answer_route="native",
+                answer_route="native", trace=generic_trace,
                 answer_entrypoints=(native_entrypoint,),
                 workspace_builder=ac.ObjectRef(
                     "skill_benchmark", "build_skill_workspace"),
@@ -338,7 +345,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             ):
                 ac.BackendRegistration(
                     name="agy", capabilities=answer_without_safety,
-                    trace_dialect="agy", answer_route=route,
+                    answer_route=route, trace=generic_trace,
                     workspace_builder=ac.ObjectRef(
                         "skill_benchmark", "build_skill_workspace"),
                     failure_marker="[AGY FAILURE",
@@ -347,7 +354,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "run-subagent"):
             ac.BackendRegistration(
                 name="agy", capabilities=answer_without_safety,
-                trace_dialect="agy", answer_route="subagent",
+                answer_route="subagent", trace=generic_trace,
                 answer_entrypoints=(native_entrypoint,),
                 workspace_builder=ac.ObjectRef(
                     "skill_benchmark", "build_skill_workspace"),
@@ -357,12 +364,26 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one export, run, and import"):
             ac.BackendRegistration(
                 name="agy", capabilities=answer_without_safety,
-                trace_dialect="agy", answer_route="export_import",
+                answer_route="export_import", trace=generic_trace,
                 answer_entrypoints=(native_entrypoint,),
                 workspace_builder=ac.ObjectRef(
                     "skill_benchmark", "build_skill_workspace"),
                 failure_marker="[AGY FAILURE",
             )
+
+        for command, handler, phase in (
+            ("export-jetty", "export_jetty", "import"),
+            ("run-jetty", "run_jetty", "export"),
+            ("import-jetty-results", "import_jetty_results", "run"),
+        ):
+            with self.subTest(command=command, phase=phase), self.assertRaisesRegex(
+                ValueError, rf"must use the {phase!r} command prefix"
+            ):
+                ac.AnswerEntrypoint(
+                    command,
+                    ac.ObjectRef("skill_benchmark", handler),
+                    phase,  # type: ignore[arg-type]
+                )
 
         with self.assertRaisesRegex(ValueError, "must resolve handler 'run_agent'"):
             ac.AnswerEntrypoint(
@@ -376,7 +397,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             ):
                 ac.BackendRegistration(
                     name="agy", capabilities=answer_without_safety,
-                    trace_dialect="agy", answer_route="native",
+                    answer_route="native", trace=generic_trace,
                     answer_entrypoints=(native_entrypoint,),
                     answer=ac.SurfaceBinding(
                         ac.ObjectRef("skill_benchmark", "ClaudeBackend")),
@@ -385,22 +406,22 @@ class SharedOwnerIdentityTests(unittest.TestCase):
                     failure_marker=marker,  # type: ignore[arg-type]
                 )
 
-        with self.assertRaisesRegex(ValueError, "same stable identity"):
+        with self.assertRaisesRegex(ValueError, "trace binding disagrees"):
             ac.BackendRegistration(
                 name="alias", capabilities=triggerless,
-                trace_dialect="generic", answer_route="none",
+                answer_route="none",
             )
 
         with self.assertRaisesRegex(ValueError, "backend names"):
             ac.BackendRegistration(
                 name=" agy ", capabilities=triggerless,
-                trace_dialect=" agy ", answer_route="none",
+                answer_route="none", trace=generic_trace,
             )
 
         with self.assertRaisesRegex(ValueError, "unknown answer route"):
             ac.BackendRegistration(
                 name="agy", capabilities=triggerless,
-                trace_dialect="agy", answer_route="other",  # type: ignore[arg-type]
+                answer_route="other", trace=generic_trace,  # type: ignore[arg-type]
             )
 
     def test_registry_keys_come_from_unique_stable_backend_names(self):
@@ -414,12 +435,14 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         )
         row = ac.BackendRegistration(
             name="offline", capabilities=offline,
-            trace_dialect="offline", answer_route="none",
+            answer_route="none",
         )
         with self.assertRaisesRegex(ValueError, "duplicate backend registration 'offline'"):
             ac.backend_registry(row, row)
 
     def test_registry_rejects_wrong_implementation_identity_and_cli_collisions(self):
+        generic_trace = ac.ObjectRef(
+            "skill_benchmark", "GENERIC_TRACE_DIALECT")
         answer_capability = ac.AgentCapabilities(
             answer_runner=True, autonomous_trigger=False,
             trigger_ablation=False, trace_artifacts=True, token_usage=False,
@@ -428,7 +451,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         )
         wrong_answer = ac.BackendRegistration(
             name="agy", capabilities=answer_capability,
-            trace_dialect="agy", answer_route="native",
+            answer_route="native", trace=generic_trace,
             answer_entrypoints=(ac.AnswerEntrypoint(
                 "run-agent", ac.ObjectRef("skill_benchmark", "run_agent")),),
             answer=ac.SurfaceBinding(
@@ -445,7 +468,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
 
         conflicting_route = ac.BackendRegistration(
             name="other", capabilities=answer_capability,
-            trace_dialect="other", answer_route="native",
+            answer_route="native", trace=generic_trace,
             answer_entrypoints=(ac.AnswerEntrypoint(
                 "run-agent", ac.ObjectRef("other_module", "run_agent")),),
             answer=ac.SurfaceBinding(
@@ -467,13 +490,27 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             )
             return ac.BackendRegistration(
                 name=name, capabilities=capability,
-                trace_dialect=name, answer_route="none",
+                answer_route="none", trace=generic_trace,
                 trigger=ac.SurfaceBinding(
                     ac.ObjectRef("run_trigger_matrix", "StubAdapter"),
                     (ac.BackendCliOption(
                         (flag,), dest, "stub", "test"),),
                 ),
             )
+
+        bad_trace = ac.BackendRegistration(
+            name="bad-trace", capabilities=ac.AgentCapabilities(
+                answer_runner=False, autonomous_trigger=False,
+                trigger_ablation=False, trace_artifacts=True,
+                token_usage=False, dollar_cost="missing",
+                judge_backend=False, tool_replay=False,
+                live_smoke_env=None,
+            ),
+            answer_route="none",
+            trace=ac.ObjectRef("skill_benchmark", "ClaudeBackend"),
+        )
+        with self.assertRaisesRegex(TypeError, "trace binding did not resolve"):
+            ac.trace_dialect_implementations(ac.backend_registry(bad_trace))
 
         with self.assertRaisesRegex(RuntimeError, "identifies as 'stub'"):
             ac.surface_implementations(

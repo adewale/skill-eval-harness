@@ -166,8 +166,8 @@ BackendRegistration(
         token_usage=True, dollar_cost="trace_normalized",
         judge_backend=False, tool_replay=False, live_smoke_env=None,
     ),
-    trace_dialect="my-agent",
     answer_route="none",
+    trace=ObjectRef("skill_benchmark", "MY_AGENT_TRACE_DIALECT"),
     trigger=SurfaceBinding(ObjectRef("run_trigger_matrix", "MyAgentAdapter")),
 )
 ```
