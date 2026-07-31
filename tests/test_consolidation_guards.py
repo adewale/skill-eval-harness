@@ -281,7 +281,8 @@ class TimeoutConventionTests(unittest.TestCase):
     def test_native_invocation_helper_kills_process_groups_on_timeout(self):
         src = inspect.getsource(sb.invoke_argv_with_timeout)
         self.assertIn("start_new_session=True", src)
-        self.assertIn("os.killpg", src)
+        self.assertIn('getattr(os, "killpg"', src)
+        self.assertIn('getattr(signal, "SIGKILL"', src)
         self.assertIn("returncode=127", src)
         self.assertIn("invoke_argv_with_timeout", inspect.getsource(sb.run_argv_capture))
 

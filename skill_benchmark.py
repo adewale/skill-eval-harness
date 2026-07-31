@@ -2129,7 +2129,11 @@ def required_fields_present(text: str) -> bool:
     # REQUIRED_FRONTMATTER_FIELDS is the single owner of which fields are required;
     # this predicate iterates it rather than hardcoding name/description.
     data = parse_frontmatter(text)
-    return all(isinstance(data.get(f), str) and bool(data.get(f).strip()) for f in REQUIRED_FRONTMATTER_FIELDS)
+    for field in REQUIRED_FRONTMATTER_FIELDS:
+        value = data.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    return True
 
 
 def _line_starts(text: str) -> tuple[list[str], list[int]]:
@@ -2247,7 +2251,8 @@ def _locate_section(lines: list[str], mask: list[bool], heading: str, *, err_con
     h = heading.strip()
     want_level = (len(h) - len(h.lstrip("#"))) if h.startswith("#") else None
     want = h.lstrip("#").strip().lower()
-    start_i = level = None
+    start_i: int | None = None
+    level: int | None = None
     for i, ln in enumerate(lines):
         if mask[i]:
             continue
@@ -2255,7 +2260,7 @@ def _locate_section(lines: list[str], mask: list[bool], heading: str, *, err_con
         if m and m.group(2).strip().lower() == want and (want_level is None or len(m.group(1)) == want_level):
             start_i, level = i, len(m.group(1))
             break
-    if start_i is None:
+    if start_i is None or level is None:
         raise AblationError(f"section not found{err_context}: {heading!r}")
     end_i = len(lines)
     for j in range(start_i + 1, len(lines)):
@@ -2679,7 +2684,10 @@ def _resolve_component_ops(comp: dict[str, Any], main_file: Path, root_dir: Path
     elif mech == "patch":
         patch_file = _safe_under(repo_root, repo_root / tgt["patch"])
         spans = patch_delete_ops(text, patch_file.read_text(encoding="utf-8"))
-        _verify_hunks_match_class(text, spans, component_class(comp))
+        declared_class = component_class(comp)
+        if declared_class is None:
+            raise AblationError("patch component has no resolvable class")
+        _verify_hunks_match_class(text, spans, declared_class)
         ops[main_file] = spans
     elif mech == "reference":
         mode = tgt.get("remove", "both")
@@ -2707,7 +2715,7 @@ class ValidatedAblation:
     manifest: dict[str, Any]
     ablation: dict[str, Any]
     components: tuple[dict[str, Any], ...]
-    population: str
+    population: Population
 
     @classmethod
     def validate(cls, repo_root: Path, manifest: dict[str, Any], ablation: dict[str, Any]) -> ValidatedAblation:
@@ -2716,7 +2724,7 @@ class ValidatedAblation:
             raise AblationError(f"ablation {ablation.get('id')!r} declares no removal (instruction-simulated)")
         validate_ablation_removal(ablation, manifest)
         _reject_overlapping_skill_roots(repo_root, manifest)
-        population = derived_population(comps)   # runs the layer-cohesion gate
+        population = Population(derived_population(comps))   # runs the layer-cohesion gate
         return cls(repo_root=repo_root, manifest=manifest, ablation=ablation, components=tuple(comps), population=population)
 
 
@@ -2897,7 +2905,10 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
     skill_paths = manifest.get("skill_paths", [])
 
     def root_for(comp: dict[str, Any]) -> str:
-        return resolve_skill_root(comp, skill_paths)
+        root = resolve_skill_root(comp, skill_paths)
+        if root is None:
+            raise AblationError("ablation component has no resolvable skill_root")
+        return root
 
     dest = out_root / aid
     if dest.exists():
@@ -2982,11 +2993,15 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
     # warnings) are merged on top.
     prov = Provenance(
         id=aid,
-        mode="invalid_skill" if ablation.get("invalid_skill") else "materialized",
+        mode=(AblationMode.INVALID_SKILL if ablation.get("invalid_skill")
+              else AblationMode.MATERIALIZED),
         population=population,
         identity=TreeIdentity(canonical=parent_skill_hash, edited=skill_hash),
         components=tuple(
-            Component(cls=component_class(c), mechanism=c.get("mechanism"), skill_root=root_for(c), target=c.get("target", {}), removed_bytes=removed_by_component[i])
+            Component(cls=ComponentClass(component_class(c)),
+                      mechanism=Mechanism(c.get("mechanism")),
+                      skill_root=root_for(c), target=c.get("target", {}),
+                      removed_bytes=removed_by_component[i])
             for i, c in enumerate(comps)
         ),
     )
@@ -5489,10 +5504,12 @@ def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
         helper can continue changing its isolated home. Cleanup retries absorb
         the short interval between signal delivery and filesystem quiescence.
         """
-        if not hasattr(os, "killpg"):
+        killpg = getattr(os, "killpg", None)
+        sigkill = getattr(signal, "SIGKILL", None)
+        if not callable(killpg) or not isinstance(sigkill, int):
             return {"status": "unsupported"}
         try:
-            os.killpg(pgid, signal.SIGKILL)
+            killpg(pgid, sigkill)
         except ProcessLookupError:
             return {"status": "not_needed"}
         except OSError as exc:
@@ -5504,13 +5521,19 @@ def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
         """Observe POSIX leader exit without reaping it when the OS supports that."""
         if proc.returncode is not None:
             return True
-        waitid_parts = ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
-        if hasattr(os, "killpg") and all(hasattr(os, name) for name in waitid_parts):
+        waitid = getattr(os, "waitid", None)
+        p_pid = getattr(os, "P_PID", None)
+        wexited = getattr(os, "WEXITED", None)
+        wnohang = getattr(os, "WNOHANG", None)
+        wnowait = getattr(os, "WNOWAIT", None)
+        if (hasattr(os, "killpg") and callable(waitid)
+                and isinstance(p_pid, int)
+                and isinstance(wexited, int)
+                and isinstance(wnohang, int)
+                and isinstance(wnowait, int)):
             try:
-                status = os.waitid(
-                    os.P_PID, proc.pid,
-                    os.WEXITED | os.WNOHANG | os.WNOWAIT,
-                )
+                status = waitid(p_pid, proc.pid,
+                                wexited | wnohang | wnowait)
             except (ChildProcessError, OSError):
                 pass
             else:
@@ -6809,16 +6832,17 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
 def _pi_final_message(record: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(record, dict):
         return None
-    if isinstance(record.get("message"), dict):
-        return record["message"]
+    message = record.get("message")
+    if isinstance(message, dict):
+        return string_keyed_dict(message, "Pi final message")
     messages = record.get("messages")
     if isinstance(messages, list):
         for candidate in reversed(messages):
             if isinstance(candidate, dict) and candidate.get("role") == "assistant":
-                return candidate
+                return string_keyed_dict(candidate, "Pi assistant message")
         for candidate in reversed(messages):
             if isinstance(candidate, dict):
-                return candidate
+                return string_keyed_dict(candidate, "Pi fallback message")
     return None
 
 
@@ -7624,9 +7648,11 @@ def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeo
     stderr capping, elapsed time, and returncode shape; this function only adapts
     that dict contract into `InvocationResult`."""
     outcome = invoke_argv_with_timeout(argv, input_text=input_text, cwd=cwd, env=env, timeout=timeout)
+    if outcome.returncode is None or outcome.elapsed_ms is None:
+        raise RuntimeError("subprocess owner returned a non-process invocation outcome")
     return InvocationResult(stdout=outcome.stdout,
                             stderr=outcome.stderr[:4000],
-                            returncode=int(outcome.returncode if outcome.returncode is not None else 127),
+                            returncode=outcome.returncode,
                             elapsed_ms=outcome.elapsed_ms,
                             timed_out=outcome.timed_out,
                             adapter_metadata=dict(outcome.metadata))
@@ -11780,18 +11806,21 @@ def anthropic_grading_json(result: dict[str, Any]) -> dict[str, Any]:
     tool_calls = telemetry_domain.measurement_from_envelope_or_nonnegative(meta, "tool_calls")
     timing: dict[str, Any] = {}
     telemetry_status: dict[str, Any] = {}
-    if elapsed.availability == telemetry_domain.AVAILABLE:
-        timing["executor_duration_seconds"] = round(float(elapsed.value) / 1000, 3)
-        timing["total_duration_seconds"] = round(float(elapsed.value) / 1000, 3)
+    elapsed_value = elapsed.value
+    if elapsed.availability == telemetry_domain.AVAILABLE and elapsed_value is not None:
+        timing["executor_duration_seconds"] = round(float(elapsed_value) / 1000, 3)
+        timing["total_duration_seconds"] = round(float(elapsed_value) / 1000, 3)
     else:
         telemetry_status["timing"] = elapsed.to_dict()
-    if tokens.availability == telemetry_domain.AVAILABLE:
-        timing["total_tokens"] = int(tokens.value)
+    token_value = tokens.value
+    if tokens.availability == telemetry_domain.AVAILABLE and token_value is not None:
+        timing["total_tokens"] = int(token_value)
     else:
         telemetry_status["total_tokens"] = tokens.to_dict()
     execution_metrics: dict[str, Any] = {}
-    if tool_calls.availability == telemetry_domain.AVAILABLE:
-        execution_metrics["total_tool_calls"] = int(tool_calls.value)
+    tool_call_value = tool_calls.value
+    if tool_calls.availability == telemetry_domain.AVAILABLE and tool_call_value is not None:
+        execution_metrics["total_tool_calls"] = int(tool_call_value)
     else:
         telemetry_status["total_tool_calls"] = tool_calls.to_dict()
     total = result.get("combined_total", result.get("objective_total", 0))
@@ -11897,7 +11926,8 @@ def telemetry_for_result(result: dict[str, Any]) -> dict[str, bool]:
     events, _ = read_events_base(base) if events_exists else (None, None)
     has_skill_event = bool(events and any(e.get("type") == "skill_load" for e in events))
     has_command_event = bool(events and command_events(events))
-    envelope = metrics.get("telemetry") if isinstance(metrics.get("telemetry"), dict) else {}
+    raw_envelope = metrics.get("telemetry")
+    envelope = raw_envelope if isinstance(raw_envelope, dict) else {}
     measurements = envelope.get("measurements") if isinstance(envelope, dict) else {}
 
     def observed(key: str, fallback: bool) -> bool:
@@ -12711,7 +12741,7 @@ def build_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> pair_domain.PairConstruction:
-    def eligibility(row: dict[str, Any]) -> tuple[bool, str | None]:
+    def eligibility(row: Mapping[str, Any]) -> tuple[bool, str | None]:
         if not scorable_run(row):
             return False, "unscorable_arm"
         value = row.get(key)
@@ -12747,7 +12777,15 @@ def _reliability_counts(rows: list[dict[str, Any]]) -> tuple[int, int]:
     c = runs where every objective assertion passed. Identical predicate to
     build_reliability (:build_reliability) so the paired counts line up with the
     per-arm block above them."""
-    rates = [r.get("objective_pass_rate") for r in rows if r.get("objective_pass_rate") is not None]
+    rates: list[float] = []
+    for row in rows:
+        value = row.get("objective_pass_rate")
+        if value is None:
+            continue
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value)) or not 0 <= float(value) <= 1):
+            raise ValueError("objective_pass_rate must be a finite number in [0, 1]")
+        rates.append(float(value))
     return len(rates), sum(1 for x in rates if x >= 1.0 - 1e-12)
 
 
@@ -13379,11 +13417,14 @@ def cost_stats(values: list[float]) -> dict[str, Any]:
     clean = [float(v) for v in values if v is not None]
     if not clean:
         return {"sum": None, "mean": None, "median": None, "p90": None, "n": 0}
+    p90_value = p90(clean)
+    if p90_value is None:
+        raise AssertionError("non-empty cost observations must have a p90")
     return {
         "sum": round(sum(clean), 6),
         "mean": round(statistics.mean(clean), 6),
         "median": round(statistics.median(clean), 6),
-        "p90": round(p90(clean), 6),
+        "p90": round(p90_value, 6),
         "n": len(clean),
     }
 
@@ -13447,7 +13488,8 @@ def _money_aggregate_fields(measurements: list[telemetry_domain.Measurement[Any]
 def measurement_stats(measurements: list[telemetry_domain.Measurement[Any]]) -> dict[str, Any]:
     """Stats plus availability; a partial set has a known sum, never a total."""
     aggregate = telemetry_domain.aggregate_numeric(measurements)
-    values = [float(m.value) for m in measurements if m.availability == telemetry_domain.AVAILABLE]
+    values = [float(m.value) for m in measurements
+              if m.availability == telemetry_domain.AVAILABLE and m.value is not None]
     out = cost_stats(values)
     out["availability"] = aggregate.availability
     out["aggregate"] = aggregate.to_dict()
@@ -13455,7 +13497,10 @@ def measurement_stats(measurements: list[telemetry_domain.Measurement[Any]]) -> 
         for key in ("sum", "mean", "median", "p90"):
             out[key] = None
         if aggregate.availability == telemetry_domain.PARTIAL:
-            out["known_sum"] = float(aggregate.known_subtotal)
+            known_subtotal = aggregate.known_subtotal
+            if known_subtotal is None:
+                raise AssertionError("partial numeric aggregate requires a known subtotal")
+            out["known_sum"] = float(known_subtotal)
     return out
 
 
@@ -13474,7 +13519,10 @@ def money_measurement_stats(measurements: list[telemetry_domain.Measurement[Any]
         for key in ("sum", "mean", "median", "p90"):
             out[key] = None
         if aggregate.availability == telemetry_domain.PARTIAL:
-            out["known_sum"] = float(aggregate.known_subtotal)
+            known_subtotal = aggregate.known_subtotal
+            if known_subtotal is None:
+                raise AssertionError("partial money aggregate requires a known subtotal")
+            out["known_sum"] = float(known_subtotal)
     return out
 
 
@@ -13587,16 +13635,21 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
     run still cost money — while quality rates elsewhere keep excluding them.
     Coverage separates missing telemetry from zero spend."""
     rows = []
+    variants: set[str] = set()
     for result in results:
         run_number = result.get("run_number")
         if isinstance(run_number, bool) or not isinstance(run_number, int) or run_number < 1:
             raise ValueError("cost result row requires a positive integer run_number")
         if not isinstance(result.get("case_id"), str) or not result.get("case_id"):
             raise ValueError("cost result row requires a non-empty string case_id")
+        variant = result.get("variant")
+        if not isinstance(variant, str) or not variant:
+            raise ValueError("cost result row requires a non-empty string variant")
+        variants.add(variant)
         facts = bind_telemetry_pair_identity(
             result_cost_facts(result), case_id=result["case_id"], run_number=run_number,
-            variant=result["variant"], model=result.get("model"), population="answer")
-        rows.append({**facts, "case_id": result["case_id"], "variant": result["variant"],
+            variant=variant, model=result.get("model"), population="answer")
+        rows.append({**facts, "case_id": result["case_id"], "variant": variant,
                      "run_number": run_number, "model": result.get("model"),
                      "missing_output": result.get("missing_output"),
                      "execution_valid": result.get("execution_valid", True)})
@@ -13605,7 +13658,7 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
         "execution_errors": sum(1 for r in rows if not r.get("missing_output") and not r.get("execution_valid", True)),
     }
     by_variant: dict[str, Any] = {}
-    for variant in sorted({r["variant"] for r in rows}):
+    for variant in sorted(variants):
         vrows = [r for r in rows if r["variant"] == variant]
         by_variant[variant] = {
             "runs": len(vrows),
@@ -14144,16 +14197,19 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
     missing evidence is never presented as an empty diff."""
     profiles: dict[str, dict[str, Any]] = {}
 
-    def eligibility(row: dict[str, Any]) -> tuple[bool, str | None]:
+    def eligibility(row: Mapping[str, Any]) -> tuple[bool, str | None]:
         if not scorable_run(row):
             return False, "unscorable_arm"
         base = row.get("run_base")
-        events, _ = read_events_base(Path(base)) if base else (None, "missing run_base")
+        if not isinstance(base, str) or not base:
+            return False, "missing_trace_evidence"
+        base_path = Path(base)
+        events, _ = read_events_base(base_path)
         if not events:
             return False, "missing_trace_evidence"
-        if read_metrics_base(Path(base)).get("trace_observation_complete") is False:
+        if read_metrics_base(base_path).get("trace_observation_complete") is False:
             return False, "incomplete_trace_evidence"
-        profiles[str(base)] = _trajectory_profile(events)
+        profiles[base] = _trajectory_profile(events)
         return True, None
 
     construction = pair_domain.pairs_from_rows(results, population="answer", eligibility=eligibility)
@@ -15632,7 +15688,10 @@ def next_iteration_dir(root: Path) -> Path:
     existing = iteration_dirs(root)
     if not existing:
         return root / "iteration-1"
-    last = int(re.fullmatch(r"iteration-(\d+)", existing[-1].name).group(1))
+    match = re.fullmatch(r"iteration-(\d+)", existing[-1].name)
+    if match is None:
+        raise AssertionError("iteration_dirs returned a non-iteration directory")
+    last = int(match.group(1))
     return root / f"iteration-{last + 1}"
 
 
@@ -15666,7 +15725,7 @@ def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
                 self.send_response(400)
             self.end_headers()
 
-        def log_message(self, fmt, *log_args):   # quiet server
+        def log_message(self, format: str, *log_args: Any) -> None:   # quiet server
             return
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), ViewerHandler)
@@ -15979,7 +16038,13 @@ def append_history_report(history: Path, report_path: Path) -> Path:
     existing = load_history_reports(history)
     seq = 1
     if existing:
-        seq = max(int(re.fullmatch(r"run-(\d+)\.json", name).group(1)) for name, _ in existing) + 1
+        sequence_numbers = []
+        for name, _ in existing:
+            match = re.fullmatch(r"run-(\d+)\.json", name)
+            if match is None:
+                raise AssertionError("load_history_reports returned an invalid history name")
+            sequence_numbers.append(int(match.group(1)))
+        seq = max(sequence_numbers) + 1
     history.mkdir(parents=True, exist_ok=True)
     dest = history / f"run-{seq:03d}.json"
     dest.write_text(Path(report_path).read_text(encoding="utf-8"), encoding="utf-8")
@@ -16407,6 +16472,13 @@ def paired_token_overhead_report(
                 objective_delta = objective_comparison.value if objective_comparison.availability == telemetry_domain.COMPARABLE else None
                 lift_per_token = telemetry_domain.lift_per_1k_tokens(objective_comparison, token_delta)
                 lift_per_dollar = telemetry_domain.lift_per_dollar(objective_comparison, cost_delta)
+                cost_delta_value = cost_delta.value
+                if (cost_delta.availability == telemetry_domain.COMPARABLE
+                        and not isinstance(cost_delta_value, telemetry_domain.SignedMoney)):
+                    raise AssertionError("comparable cost delta requires SignedMoney")
+                cost_delta_is_usd = (
+                    isinstance(cost_delta_value, telemetry_domain.SignedMoney)
+                    and cost_delta_value.currency == "USD")
 
                 def scalar(measurement):
                     return measurement.value if measurement.availability == telemetry_domain.AVAILABLE else None
@@ -16444,15 +16516,15 @@ def paired_token_overhead_report(
                     "without_cost": without_facts["cost_measurement"].to_dict(),
                     "with_cost_usd": float(with_cost.amount) if isinstance(with_cost, telemetry_domain.Money) and with_cost.currency == "USD" else None,
                     "without_cost_usd": float(without_cost.amount) if isinstance(without_cost, telemetry_domain.Money) and without_cost.currency == "USD" else None,
-                    "cost_delta_usd": float(cost_delta.value.amount) if cost_delta.availability == telemetry_domain.COMPARABLE and cost_delta.value.currency == "USD" else None,
+                    "cost_delta_usd": float(cost_delta_value.amount) if cost_delta_is_usd else None,
                     "cost_delta_comparison": cost_delta.to_dict(),
                     # This legacy scalar is USD-only. Other currencies retain
                     # their typed basis below and must not masquerade as dollars.
-                    "objective_lift_per_dollar": lift_per_dollar.value if lift_per_dollar.availability == telemetry_domain.COMPARABLE and cost_delta.value.currency == "USD" else None,
+                    "objective_lift_per_dollar": lift_per_dollar.value if lift_per_dollar.availability == telemetry_domain.COMPARABLE and cost_delta_is_usd else None,
                     "objective_lift_per_cost_unit": lift_per_dollar.value if lift_per_dollar.availability == telemetry_domain.COMPARABLE else None,
                     "objective_lift_per_cost_unit_comparison": lift_per_dollar.to_dict(),
                     "objective_lift_per_dollar_comparison": (
-                        lift_per_dollar.to_dict() if lift_per_dollar.availability != telemetry_domain.COMPARABLE or cost_delta.value.currency == "USD"
+                        lift_per_dollar.to_dict() if lift_per_dollar.availability != telemetry_domain.COMPARABLE or cost_delta_is_usd
                         else telemetry_domain.Comparison.blocked("currency_not_usd", basis=lift_per_dollar.basis).to_dict()
                     ),
                 })
@@ -16464,8 +16536,14 @@ def paired_token_overhead_report(
     waste_measurements: list[telemetry_domain.Measurement[Any]] = []
     non_discriminating_pairs = 0
     for pair in pairs:
-        if pair.get("objective_delta") is None or not (
-            pair.get("objective_delta") <= 0
+        pair_objective_delta = pair.get("objective_delta")
+        if pair_objective_delta is None:
+            continue
+        if (isinstance(pair_objective_delta, bool)
+                or not isinstance(pair_objective_delta, (int, float))):
+            raise TypeError("paired objective_delta must be numeric or null")
+        if not (
+            pair_objective_delta <= 0
             or (pair.get("with_objective_pass_rate") == 1 and pair.get("without_objective_pass_rate") == 1)
         ):
             continue
