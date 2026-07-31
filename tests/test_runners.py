@@ -534,7 +534,20 @@ class D1_FailureMarkerOwnerTests(unittest.TestCase):
 
     def test_writer_constants_are_exactly_the_detector_markers(self):
         import ablation_model as am
-        self.assertEqual((am.CODEX_FAILURE, am.JETTY_FAILURE, am.CLAUDE_FAILURE, am.VIBE_FAILURE, am.TIMEOUT_FAILURE), am.RUNNER_FAILURE_MARKERS)
+        self.assertEqual(
+            am.RUNNER_FAILURE_MARKERS[:4],
+            (am.CODEX_FAILURE, am.JETTY_FAILURE, am.CLAUDE_FAILURE,
+             am.VIBE_FAILURE),
+        )
+        self.assertEqual(am.RUNNER_FAILURE_MARKERS[-1], am.TIMEOUT_FAILURE)
+        self.assertEqual(
+            set(am.RUNNER_FAILURE_MARKERS[:-1]),
+            set(am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values()),
+        )
+        self.assertEqual(
+            len(am.RUNNER_FAILURE_MARKERS[:-1]),
+            len(set(am.RUNNER_FAILURE_MARKERS[:-1])),
+        )
 
     def test_each_formatted_failure_body_is_non_executable(self):
         import ablation_model as am

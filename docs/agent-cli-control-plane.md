@@ -18,9 +18,9 @@ The shared abstraction is therefore **not** “send prompt, get text.” It is:
 | Process boundary | `InvocationRequest` / `InvocationResult` | Every native backend must declare prompt, model, workspace, timeout, argv/env/cwd behavior, stdout/stderr/returncode, and timeout state. |
 | Answer result | `Completed | TimedOut | SpawnFailed | ProviderFailed` (`RunnerOutcome` is the strict compatibility factory) | Provider-specific code returns one frozen semantic state with validated context; timeout/return code/answer/error cannot contradict. |
 | Run artifacts | `write_runner_outcome()` | One exhaustive adapter consumes the outcome union and produces `output.md`, `metadata.json`, `events.json`, `metrics.json`, and optional `trace.jsonl`, so failure markers, timeout return code, and missing telemetry cannot drift by provider. |
-| Capabilities | `agent_capabilities.AGENT_CAPABILITIES` | A row states which surfaces are real for each agent: answer runner, trigger adapter, judge backend, trace artifacts, usage/cost telemetry, tool replay, and live-smoke gate. |
+| Capabilities and registration | `agent_capabilities.BACKENDS` (`AGENT_CAPABILITIES` is a compatibility projection) | One complete row owns which surfaces are real for each agent plus its routes, implementations, workspace, trace, provider CLI options, failure policy, and live-smoke gate. |
 | Trigger adapter | `AgentAdapter.mount/invoke/detect` | Autonomous trigger evals mount the same canonical/materialized skill tree, run raw user trigger prompts, and detect activation without forced-load answer scaffolding. |
-| Judge path | `JUDGE_BACKENDS` registry or `--judge-cmd` | Native backends use provider-specific schema/final-answer channels where available; `--judge-cmd` remains the universal stdin→stdout JSON escape hatch. |
+| Judge path | Unified `agent_capabilities.BACKENDS` judge binding or `--judge-cmd` | Native backends use provider-specific schema/final-answer channels where available; `--judge-cmd` remains the universal stdin→stdout JSON escape hatch. `JUDGE_BACKENDS` is a compatibility projection. |
 
 This is intentionally a **control-plane abstraction**, not a lowest-common-denominator CLI wrapper. Prompt transport, tool controls, schema enforcement, config isolation, and telemetry differ per CLI and stay in thin provider adapters.
 
@@ -64,7 +64,7 @@ This is intentionally a **control-plane abstraction**, not a lowest-common-denom
 - Skill discovery is provider-specific: `.claude/skills`, `$CODEX_HOME/skills`, `.agents/skills`.
 - Telemetry coverage is provider-specific and must be reported, not normalized away.
 
-The rule for future CLIs is: implement the shared contracts, but do not pretend their control surface is identical. Add a capability row, a native answer backend if possible, a trigger adapter only after autonomous skill discovery is proven, and fake/offline conformance tests for prompt transport, config isolation, final answer extraction, telemetry, and failure semantics.
+The rule for future CLIs is: implement the shared contracts, but do not pretend their control surface is identical. Add one `agent_capabilities.BACKENDS` row, a native answer backend if possible, a trigger adapter only after autonomous skill discovery is proven, and fake/offline conformance tests for prompt transport, config isolation, final answer extraction, telemetry, and failure semantics.
 
 ## Typed trigger state pipeline
 

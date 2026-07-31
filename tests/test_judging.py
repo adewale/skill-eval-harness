@@ -451,10 +451,10 @@ class VerdictSchemaTests(unittest.TestCase):
             return {"stdout": '{"passed":true}', "stderr": "", "returncode": 0}
 
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(
-                sb.JUDGE_BACKENDS, {"broken": broken_backend}):
+                sb.JUDGE_BACKENDS, {"claude": broken_backend}):
             with self.assertRaisesRegex(TypeError, "JudgeInvocation"):
                 sb.run_one_judge_task(
-                    self._task(td), judge_backend="broken", judge_model="model")
+                    self._task(td), judge_backend="claude", judge_model="model")
 
     def test_native_codex_judge_uses_last_message_and_schema(self):
         with tempfile.TemporaryDirectory() as td:

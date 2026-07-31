@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:9241`, merged in `grade_case_variant:11415`).
+threshold, evidence}` (`load_judge_results:9295`, merged in `grade_case_variant:11470`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -168,6 +168,10 @@ Mistral support should mean first-class Vibe CLI support, not a raw chat-complet
       smoke-test environment documentation for Vibe.
 - [x] Add a registry/conformance guard that fails when a backend is partially registered (for
       example `run-agent` supports it but parity docs or capability rows do not).
+- [x] Replace the parallel capability, answer, trigger, judge, workspace, trace, smoke,
+      failure-policy, and provider-CLI registries with one validated `BACKENDS` row per backend
+      (issue #52 item 4). Keep the old maps as replacement-only compatibility projections and
+      expose the non-invoking `agent-capabilities` JSON view.
 Standing invariant (not a tickable task): `--judge-cmd` stays the escape hatch for arbitrary
 providers while first-class backends move through the native registry — the code documents it
 as "the universal escape hatch" and `judge` points unknown backends at it.

@@ -1,16 +1,18 @@
 # Agent parity matrix
 
-The harness supports several agent surfaces, but not every agent supports every surface. This table is the reader-facing copy of `agent_capabilities.AGENT_CAPABILITIES`; when an agent gains a surface, update the registry, this table, and the tests together.
+The harness supports several agent surfaces, but not every agent supports every surface. This table is the reader-facing copy of `agent_capabilities.BACKENDS`; `AGENT_CAPABILITIES`, native answer/judge dispatch, trigger adapters, workspace builders, smoke targets, failure markers, and provider-specific CLI options are compatibility projections of those rows. When an agent gains a surface, update its one registry row, this table, and its conformance fixtures.
 
-| Agent | Answer runs | Autonomous trigger | Trigger ablation | Trace artifacts | Token usage | Dollar cost | Judge backend | Tool replay | Live smoke |
-|---|---:|---:|---:|---:|---:|---|---:|---:|---|
-| `claude` | yes (`run-claude`, `run-agent --agent claude`) | yes (`skill-trigger-matrix --agent claude`) | yes | yes | yes | provider-reported | yes (`judge --judge-backend claude` / `--judge-model`) | yes through `run-subagent` | `RUN_TRIGGER_SMOKE` |
-| `codex` | yes (`run-codex`, `run-agent --agent codex`) | yes (`skill-trigger-matrix --agent codex`) | yes | yes | yes, when stream reports it | explicit `missing` unless a wrapper emits/estimates cost | yes (`judge --judge-backend codex`) | no native replay | `RUN_CODEX_TRIGGER_SMOKE` |
-| `pi` | no core answer runner | yes (`skill-pi-trigger-eval`, `skill-trigger-matrix --agent pi`) | yes | yes | yes, when stream reports it | stream-reported when available | no | no | `RUN_PI_TRIGGER_SMOKE` |
-| `jetty` | yes (`export-jetty` / `run-jetty` / `import-jetty-results`; answer-path ablations only) | no | no | imported | imported | imported | planned in Jetty TODO | no | `RUN_JETTY_SMOKE` (passed vs production 2026-07-17) |
-| `vibe` | yes (`run-agent --agent vibe`) | yes (`skill-trigger-matrix --agent vibe`) | yes | yes | no in current CLI output | explicit `missing` in current CLI output | yes (`judge --judge-backend vibe`) | no native replay | `RUN_VIBE_TRIGGER_SMOKE` |
-| `subagent` | yes (`run-subagent`) | no | no | yes | yes, when backend returns it | explicit `missing` unless backend emits cost | no | yes | n/a |
-| `stub` | no native answer runner; demo stub uses `run-codex --codex-cmd` | yes | yes | yes | not applicable | not applicable | no | no | n/a |
+Run `skill-benchmark agent-capabilities` for the machine-readable registry view.
+
+| Agent | Answer runs | Answer route | Autonomous trigger | Trigger ablation | Trace artifacts | Token usage | Dollar cost | Judge backend | Tool replay | Live smoke |
+|---|---:|---|---:|---:|---:|---:|---|---:|---:|---|
+| `claude` | yes (`run-claude`, `run-agent --agent claude`) | `native` | yes (`skill-trigger-matrix --agent claude`) | yes | yes | yes | `provider_reported` | yes (`judge --judge-backend claude` / `--judge-model`) | yes through `run-subagent` | `RUN_TRIGGER_SMOKE` |
+| `codex` | yes (`run-codex`, `run-agent --agent codex`) | `native` | yes (`skill-trigger-matrix --agent codex`) | yes | yes | yes, when stream reports it | `missing` unless a wrapper emits/estimates cost | yes (`judge --judge-backend codex`) | no native replay | `RUN_CODEX_TRIGGER_SMOKE` |
+| `pi` | no core answer runner | `none` | yes (`skill-pi-trigger-eval`, `skill-trigger-matrix --agent pi`) | yes | yes | yes, when stream reports it | `trace_normalized` from the stream when available | no | no | `RUN_PI_TRIGGER_SMOKE` |
+| `jetty` | yes (`export-jetty` / `run-jetty` / `import-jetty-results`; answer-path ablations only) | `export_import` | no | no | yes, imported | yes, imported | `provider_reported`, imported | no (planned in Jetty TODO) | no | `RUN_JETTY_SMOKE` |
+| `vibe` | yes (`run-agent --agent vibe`) | `native` | yes (`skill-trigger-matrix --agent vibe`) | yes | yes | no in current CLI output | `missing` in current CLI output | yes (`judge --judge-backend vibe`) | no native replay | `RUN_VIBE_TRIGGER_SMOKE` |
+| `subagent` | yes (`run-subagent`) | `subagent` | no | no | yes | yes, when backend returns it | `missing` unless backend emits cost | no | yes | n/a |
+| `stub` | no native answer runner; demo stub uses `run-codex --codex-cmd` | `none` | yes | yes | yes | no (not applicable) | `not_applicable` | no | no | n/a |
 
 ## What changed for Vibe
 

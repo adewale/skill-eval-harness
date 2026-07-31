@@ -38,9 +38,8 @@ Five adapters ship:
 
 To add another agent: subclass AgentAdapter, implement mount() (copy the
 canonical tree where that agent discovers skills) and invoke() (run the agent
-headless on the raw query, return its JSON event stream), then register it in
-ADAPTERS, agent_capabilities.AGENT_CAPABILITIES, and the explicit trace-dialect
-registry (choose the generic dialect deliberately when appropriate). detect()
+headless on the raw query, return its JSON event stream), then add one row to
+agent_capabilities.BACKENDS and its explicit trace-dialect semantics. detect()
 only needs overriding when load evidence is not a file path in the stream.
 
 Every number this emits is a RAW autonomous-trigger measurement (the same
@@ -57,6 +56,7 @@ import os
 import re
 import shlex
 import shutil
+import sys
 import tempfile
 import time
 from collections.abc import Iterable
@@ -64,8 +64,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+# Preserve one module identity under the documented direct-script entrypoint;
+# lazy trigger bindings resolve the canonical ``run_trigger_matrix`` name.
+if __name__ == "__main__":
+    sys.modules.setdefault("run_trigger_matrix", sys.modules[__name__])
+
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
-from agent_capabilities import AGENT_CAPABILITIES
+from agent_capabilities import (
+    AGENT_CAPABILITIES,
+    CODEX_TRIGGER_DEFAULT_CMD,
+    add_surface_cli_options,
+    binding_for,
+    surface_implementations,
+    surface_option_values,
+)
 from run_pi_trigger_eval import (
     cases_from_manifest,
     eval_rows_from_args,
@@ -128,7 +140,7 @@ from trigger_reporting import (
 )
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
-DEFAULT_CODEX_CMD = "codex exec --json --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules"
+DEFAULT_CODEX_CMD = CODEX_TRIGGER_DEFAULT_CMD
 CLAUDE_PORTABLE_AUTH_FILES = (".credentials.json",)
 SENSITIVE_WORKSPACE_FILES = (
     ".trigger-config/.credentials.json",
@@ -656,7 +668,9 @@ class StubAdapter(AgentAdapter):
         )
 
 
-ADAPTERS: dict[str, type[AgentAdapter]] = {"claude": ClaudeAdapter, "codex": CodexAdapter, "pi": PiAdapter, "vibe": VibeAdapter, "stub": StubAdapter}
+# Mutable compatibility view for tests that replace an existing adapter. Adding
+# an adapter requires an atomic agent_capabilities.BACKENDS row.
+ADAPTERS: dict[str, type[AgentAdapter]] = surface_implementations("trigger")
 
 
 def executable_identity(command: str) -> dict[str, Any]:
@@ -733,15 +747,26 @@ def trigger_protocol(
     }
 
 
-def adapter_instance(name: str, *, claude_bin: str = "claude", codex_cmd: str | None = None, vibe_cmd: str | None = None, max_turns: int = 6) -> AgentAdapter:
+def adapter_instance(
+    name: str, *, claude_bin: str = "claude", codex_cmd: str | None = None,
+    vibe_cmd: str | None = None, max_turns: int = 6,
+    backend_options: dict[str, Any] | None = None,
+) -> AgentAdapter:
+    values = {
+        "claude_bin": claude_bin,
+        "codex_cmd": codex_cmd or DEFAULT_CODEX_CMD,
+        "vibe_cmd": vibe_cmd or VIBE_DEFAULT_CMD,
+        "max_turns": max_turns,
+        **dict(backend_options or {}),
+    }
+    binding = binding_for(name, "trigger")
     adapter_cls = ADAPTERS[name]
-    if adapter_cls is ClaudeAdapter:
-        return ClaudeAdapter(claude_bin=claude_bin, max_turns=max_turns)
-    if adapter_cls is CodexAdapter:
-        return CodexAdapter(codex_cmd=codex_cmd or DEFAULT_CODEX_CMD)
-    if adapter_cls is VibeAdapter:
-        return VibeAdapter(vibe_cmd=vibe_cmd or VIBE_DEFAULT_CMD, max_turns=max_turns)
-    return adapter_cls()
+    registered_cls = binding.implementation.resolve()
+    # Preserve the established replacement seam: tests and integrations may
+    # substitute a zero-argument adapter. Provider CLI options describe only
+    # the implementation registered by the backend row.
+    options = binding.option_values(values) if adapter_cls is registered_cls else {}
+    return adapter_cls(**options)
 
 
 def matrix_capabilities() -> dict[str, Any]:
@@ -963,6 +988,7 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
                models: list[str | None] | None, runs_per_query: int, timeout: int, workers: int,
                claude_bin: str = "claude", codex_cmd: str | None = None,
                vibe_cmd: str | None = None, max_turns: int = 6,
+               backend_options: dict[str, Any] | None = None,
                trace_runs: Path | None = None, ablation: str | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     rows = validate_trigger_rows(rows, "trigger matrix rows")
@@ -999,7 +1025,11 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         if ablation and not cap.trigger_ablation:
             raise SystemExit(f"agent {name!r} does not support trigger ablations")
         capability_rows[name] = cap
-        adapter = adapter_instance(name, claude_bin=claude_bin, codex_cmd=codex_cmd, vibe_cmd=vibe_cmd, max_turns=max_turns)
+        adapter = adapter_instance(
+            name, claude_bin=claude_bin, codex_cmd=codex_cmd,
+            vibe_cmd=vibe_cmd, max_turns=max_turns,
+            backend_options=backend_options,
+        )
         if adapter.name != name:
             raise SystemExit(f"ADAPTERS[{name!r}] returned adapter with name {adapter.name!r}; set the adapter's name to {name!r}")
         adapters.append(adapter)
@@ -1101,14 +1131,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--timeout", type=int, default=240)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-turns", type=int, default=6, help="claude/vibe adapters: turns the model gets to load the skill (its observation window)")
-    ap.add_argument("--claude-bin", default="claude")
-    ap.add_argument("--codex-cmd", default=DEFAULT_CODEX_CMD,
-                    help="codex adapter command prefix; the raw query is appended as the final argv item")
-    ap.add_argument("--vibe-cmd", default=VIBE_DEFAULT_CMD,
-                    help="vibe adapter command prefix; the raw query is passed as the --prompt argument")
     ap.add_argument("--trace-runs", help="optional directory for per-run trace.jsonl/events.json/metrics.json artifacts for every selected agent")
     ap.add_argument("--ablation", help="materialize this discovery/trigger-population ablation id and trigger-test the altered skill")
     ap.add_argument("--out", required=True)
+    add_surface_cli_options(ap, "trigger")
     return ap
 
 
@@ -1123,8 +1149,8 @@ def main() -> int:
 
     report = run_matrix(manifest_path, rows, agents=args.agent or ["claude"], models=args.model,
                         runs_per_query=args.runs_per_query, timeout=args.timeout, workers=args.workers,
-                        claude_bin=args.claude_bin, codex_cmd=args.codex_cmd,
-                        vibe_cmd=args.vibe_cmd, max_turns=args.max_turns,
+                        max_turns=args.max_turns,
+                        backend_options=surface_option_values(args, "trigger"),
                         trace_runs=Path(args.trace_runs) if args.trace_runs else None,
                         ablation=args.ablation)
     write_json(Path(args.out), report)

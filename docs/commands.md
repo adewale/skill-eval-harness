@@ -9,6 +9,21 @@ the run-output contract are in the [README](../README.md#manifest-format), the a
 catalog is the [README's Assertions section](../README.md#assertions), and the reason
 grading never calls a model is [`architecture.md`](architecture.md).
 
+## Inspect agent capabilities
+
+```bash
+skill-benchmark agent-capabilities
+skill-benchmark agent-capabilities --out backend-registry.json
+```
+
+`agent-capabilities` renders the unified `agent_capabilities.BACKENDS` rows as
+JSON: capability and telemetry contracts, explicit answer route and executable
+command entrypoints, native answer/trigger/judge bindings, trace dialect, and
+live-smoke policy. Serialization does not dereference lazy handlers or trace
+implementations, and the command does not invoke provider implementations or
+CLIs; normal CLI import
+still materializes the compatibility implementation views.
+
 ## Validate
 
 ```bash
@@ -455,7 +470,7 @@ skill-trigger-matrix ../repo/evals/shared-benchmark.json \
   --out trigger-matrix.json
 ```
 
-For each (agent, model) cell this mounts the skill where that agent discovers skills autonomously (never forcing the load), runs the manifest's `kind: "trigger"` cases the requested number of times, and reports per-cell trigger rates split by should-fire / should-not-fire polarity. The `claude` adapter spawns headless Claude Code subagents and defaults to haiku, sonnet, and opus; `--agent codex`, `--agent pi`, `--agent vibe`, and the offline `--agent stub` are included. Codex keeps credential-bearing `CODEX_HOME` outside the model workdir and exposes only `$CODEX_HOME/skills` as an extra read root. The Vibe adapter mounts skills under `.agents/skills`, keeps `VIBE_HOME` outside the model workdir, runs `vibe --prompt "$QUERY" --output streaming`, and detects native `skill` tool calls by skill name with path-evidence fallback. Additional agents register through an `AgentAdapter` subclass, an `AGENT_CAPABILITIES` row, and an explicit trace-dialect entry (the generic dialect must be chosen deliberately rather than reached by fallback). The tuning loop that consumes these rates is [`tuning-skill-activation.md`](tuning-skill-activation.md); manual live smoke tests wrap the same path (`RUN_TRIGGER_SMOKE=1` for Claude, `RUN_CODEX_TRIGGER_SMOKE=1` for Codex, `RUN_PI_TRIGGER_SMOKE=1` for Pi, `RUN_VIBE_TRIGGER_SMOKE=1` for Vibe). For a cheaper auth/network/process check that invokes every supported live adapter/model without asserting trigger behavior, run `RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v`.
+For each (agent, model) cell this mounts the skill where that agent discovers skills autonomously (never forcing the load), runs the manifest's `kind: "trigger"` cases the requested number of times, and reports per-cell trigger rates split by should-fire / should-not-fire polarity. The `claude` adapter spawns headless Claude Code subagents and defaults to haiku, sonnet, and opus; `--agent codex`, `--agent pi`, `--agent vibe`, and the offline `--agent stub` are included. Codex keeps credential-bearing `CODEX_HOME` outside the model workdir and exposes only `$CODEX_HOME/skills` as an extra read root. The Vibe adapter mounts skills under `.agents/skills`, keeps `VIBE_HOME` outside the model workdir, runs `vibe --prompt "$QUERY" --output streaming`, and detects native `skill` tool calls by skill name with path-evidence fallback. Additional agents add their `AgentAdapter`, explicit trace-dialect semantics, and one complete `agent_capabilities.BACKENDS` row; `AGENT_CAPABILITIES` and `ADAPTERS` are projections rather than independent registration points. The tuning loop that consumes these rates is [`tuning-skill-activation.md`](tuning-skill-activation.md); manual live smoke tests wrap the same path (`RUN_TRIGGER_SMOKE=1` for Claude, `RUN_CODEX_TRIGGER_SMOKE=1` for Codex, `RUN_PI_TRIGGER_SMOKE=1` for Pi, `RUN_VIBE_TRIGGER_SMOKE=1` for Vibe). For a cheaper auth/network/process check that invokes every supported live adapter/model without asserting trigger behavior, run `RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v`.
 
 ## Pi trigger evals
 

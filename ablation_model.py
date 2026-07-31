@@ -22,8 +22,8 @@ model-visible payload -> run metadata -> grading row -> report):
 - `ResultSet` makes "scorable, grouped" the default access to graded results, so
   a report view cannot forget the infrastructure-failure predicate.
 
-This module is a leaf: it imports nothing from the harness, so the harness can
-adopt it without a cycle.
+This module depends only on contract and registry leaves, so the central harness
+can adopt it without a cycle.
 """
 from __future__ import annotations
 
@@ -35,8 +35,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
+from agent_capabilities import BACKENDS
 from json_contracts import freeze_json_value
 
 
@@ -62,15 +64,24 @@ def _require(d: dict[str, Any], key: str, types: type | tuple[type, ...], ctx: s
 # --------------------------------------------------------------------------- #
 
 # Synthetic-failure body prefixes a runner writes when it never produced a real
-# answer. These names are the SINGLE source: writers format their failure bodies
-# from them and execution_valid() detects them, so a renamed marker cannot silently
-# slip a crashed run past the scorable filter.
-CODEX_FAILURE = "[CODEX FAILURE"
-JETTY_FAILURE = "[JETTY FAILURE"
-CLAUDE_FAILURE = "[CLAUDE FAILURE"
-VIBE_FAILURE = "[VIBE FAILURE"
+# answer. Backend-to-marker ownership lives in the unified backend registry;
+# these aliases preserve the established runner-domain import surface.
+RUNNER_FAILURE_MARKER_BY_PROVIDER = MappingProxyType({
+    name: registration.failure_marker
+    for name, registration in BACKENDS.items()
+    if registration.failure_marker is not None
+})
+CODEX_FAILURE = RUNNER_FAILURE_MARKER_BY_PROVIDER["codex"]
+JETTY_FAILURE = RUNNER_FAILURE_MARKER_BY_PROVIDER["jetty"]
+CLAUDE_FAILURE = RUNNER_FAILURE_MARKER_BY_PROVIDER["claude"]
+VIBE_FAILURE = RUNNER_FAILURE_MARKER_BY_PROVIDER["vibe"]
 TIMEOUT_FAILURE = "[TIMEOUT"
-RUNNER_FAILURE_MARKERS = (CODEX_FAILURE, JETTY_FAILURE, CLAUDE_FAILURE, VIBE_FAILURE, TIMEOUT_FAILURE)
+_LEGACY_FAILURE_MARKER_ORDER = ("codex", "jetty", "claude", "vibe")
+RUNNER_FAILURE_MARKERS = tuple(dict.fromkeys(
+    [RUNNER_FAILURE_MARKER_BY_PROVIDER[name]
+     for name in _LEGACY_FAILURE_MARKER_ORDER]
+    + list(RUNNER_FAILURE_MARKER_BY_PROVIDER.values())
+)) + (TIMEOUT_FAILURE,)
 
 
 def metadata_lifecycle_error(metadata: dict[str, Any] | None) -> str | None:
@@ -125,19 +136,6 @@ def scorable_run(row: Mapping[str, Any]) -> bool:
     was not an infrastructure failure. Every report view filters through this."""
     return not row.get("missing_output") and row.get("execution_valid", True)
 
-
-# The failure marker each provider stamps at the head of a synthetic output.md.
-# Subagent reuses CLAUDE_FAILURE (its production backend IS Claude); a timeout
-# with a runner-side error string overrides this with TIMEOUT_FAILURE. The map is
-# the SINGLE place a provider is bound to its marker, so a new runner picks one
-# here rather than hand-spelling the literal in its output-writing code.
-RUNNER_FAILURE_MARKER_BY_PROVIDER = {
-    "codex": CODEX_FAILURE,
-    "claude": CLAUDE_FAILURE,
-    "subagent": CLAUDE_FAILURE,
-    "jetty": JETTY_FAILURE,
-    "vibe": VIBE_FAILURE,
-}
 
 # These runner-domain names are intentionally re-exported from this module for
 # backwards compatibility with the harness's established import surface.
