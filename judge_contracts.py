@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import telemetry
 from json_contracts import freeze_json_mapping
 
 JudgeUsageSource = Literal["provider_reported", "trace_normalized"]
@@ -24,14 +25,16 @@ def _finite_nonnegative(value: Any, label: str) -> int | float:
     return value
 
 
-def _validate_usage(value: Any, label: str) -> None:
+def _validate_usage(value: Any, label: str, key: str | None = None) -> None:
     if isinstance(value, Mapping):
-        for key, item in value.items():
-            if not isinstance(key, str):
+        for child_key, item in value.items():
+            if not isinstance(child_key, str):
                 raise TypeError(f"{label} object keys must be strings")
-            _validate_usage(item, f"{label}.{key}")
+            _validate_usage(item, f"{label}.{child_key}", child_key)
         return
     _finite_nonnegative(value, label)
+    if key is not None and key.casefold().endswith("tokens") and type(value) is not int:
+        raise ValueError(f"{label} must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -69,8 +72,9 @@ class JudgeInvocation:
             if not isinstance(self.usage, Mapping):
                 raise TypeError("judge usage must be a mapping or None")
             _validate_usage(self.usage, "judge usage")
-            object.__setattr__(
-                self, "usage", freeze_json_mapping(self.usage, "judge usage"))
+            frozen_usage = freeze_json_mapping(self.usage, "judge usage")
+            telemetry.canonical_usage_counts(frozen_usage)
+            object.__setattr__(self, "usage", frozen_usage)
 
     @property
     def succeeded(self) -> bool:

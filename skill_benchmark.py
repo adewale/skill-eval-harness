@@ -5682,18 +5682,9 @@ def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:
 
 USAGE_SOURCES = {"provider_reported", "trace_normalized", "estimated", "missing", "not_applicable"}
 COST_SOURCES = {"provider_reported", "trace_normalized", "price_table_estimated", "missing", "not_applicable"}
-# THE token-usage alias table. Every normalizer (metadata `normalize_usage`, the
-# trace-stream `usage_number`, and the Claude envelope parser) reads THIS table,
-# so the same provider payload can never be classified differently by two paths
-# (the drift that once made metrics.json and usage_normalized disagree).
-USAGE_ALIASES: dict[str, list[str]] = {
-    "input_tokens": ["input_tokens", "prompt_tokens", "input", "promptTokens", "inputTokens"],
-    "output_tokens": ["output_tokens", "completion_tokens", "output", "completionTokens", "outputTokens"],
-    "cache_read_tokens": ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cached_input_tokens", "cacheReadTokens"],
-    "cache_write_tokens": ["cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens", "cacheWriteTokens"],
-    "reasoning_tokens": ["reasoning_tokens", "thinking_tokens", "reasoningTokens"],
-    "total_tokens": ["total_tokens", "totalTokens", "total", "tokens"],
-}
+# Every normalizer reads the leaf telemetry domain's token-usage alias table, so
+# provider payloads cannot be classified differently by two paths.
+USAGE_ALIASES = telemetry_domain.USAGE_ALIASES
 COST_PART_ALIASES: dict[str, tuple[str, ...]] = {
     "input_cost": ("input_cost", "prompt_cost"),
     "output_cost": ("output_cost", "completion_cost"),
@@ -5719,23 +5710,7 @@ def normalize_usage(raw: Any, *, source: str = "provider_reported") -> dict[str,
     "missing"} — missing telemetry is never silently zero."""
     if source not in USAGE_SOURCES:
         raise ValueError(f"unknown usage source {source!r}; expected one of {sorted(USAGE_SOURCES)}")
-    out: dict[str, Any] = {}
-    if isinstance(raw, dict):
-        for key, aliases in USAGE_ALIASES.items():
-            observed: list[tuple[str, int]] = []
-            for alias in aliases:
-                if alias not in raw or raw.get(alias) is None:
-                    continue
-                value = raw[alias]
-                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                    raise ValueError(
-                        f"usage.{alias} must be a finite nonnegative integer token count")
-                observed.append((alias, value))
-            if observed:
-                values = {value for _, value in observed}
-                if len(values) != 1:
-                    raise ValueError(f"conflicting aliases for {key}: {dict(observed)}")
-                out[key] = observed[0][1]
+    out: dict[str, Any] = telemetry_domain.canonical_usage_counts(raw)
     if source == "not_applicable":
         return {"source": "not_applicable"}
     if ("total_tokens" not in out and "input_tokens" in out

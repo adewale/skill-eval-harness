@@ -59,8 +59,11 @@ class JudgeInvocationTests(unittest.TestCase):
             {"cost_usd": math.inf},
             {"usage": []},
             {"usage": {"input_tokens": True}},
+            {"usage": {"input_tokens": 1.5}},
+            {"usage": {"cache": {"read_tokens": 3.0}}},
             {"usage": {"input_tokens": -1}},
             {"usage": {"input_tokens": math.nan}},
+            {"usage": {"input_tokens": 2, "prompt_tokens": 3}},
             {"usage": {1: 2}},
         )
         for overrides in invalid:

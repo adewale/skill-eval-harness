@@ -35,6 +35,38 @@ PROVENANCE = {
 }
 CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
+USAGE_ALIASES: dict[str, tuple[str, ...]] = {
+    "input_tokens": ("input_tokens", "prompt_tokens", "input", "promptTokens", "inputTokens"),
+    "output_tokens": ("output_tokens", "completion_tokens", "output", "completionTokens", "outputTokens"),
+    "cache_read_tokens": ("cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cached_input_tokens", "cacheReadTokens"),
+    "cache_write_tokens": ("cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens", "cacheWriteTokens"),
+    "reasoning_tokens": ("reasoning_tokens", "thinking_tokens", "reasoningTokens"),
+    "total_tokens": ("total_tokens", "totalTokens", "total", "tokens"),
+}
+
+
+def canonical_usage_counts(raw: Any) -> dict[str, int]:
+    """Validate and collapse recognized raw token aliases without provenance."""
+    out: dict[str, int] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, aliases in USAGE_ALIASES.items():
+        observed: list[tuple[str, int]] = []
+        for alias in aliases:
+            if alias not in raw or raw.get(alias) is None:
+                continue
+            value = raw[alias]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"usage.{alias} must be a finite nonnegative integer token count")
+            observed.append((alias, value))
+        if observed:
+            values = {value for _, value in observed}
+            if len(values) != 1:
+                raise ValueError(f"conflicting aliases for {key}: {dict(observed)}")
+            out[key] = observed[0][1]
+    return out
+
 EVIDENCE_COMPLETE = "complete"
 EVIDENCE_INCOMPLETE = "incomplete"
 EVIDENCE_UNKNOWN = "unknown"
