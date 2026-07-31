@@ -38,6 +38,7 @@ class SupportedCliSmokeTests(unittest.TestCase):
         expected = {
             "claude": ("SMOKE_CLAUDE_MODEL", "haiku", "answer"),
             "codex": ("SMOKE_CODEX_MODEL", "gpt-5.4-mini", "answer"),
+            "gemini": ("SMOKE_GEMINI_MODEL", "gemini-2.5-flash", "answer"),
             "vibe": ("SMOKE_VIBE_MODEL", "devstral-small-latest", "answer"),
             "pi": ("SMOKE_PI_MODEL", "openai-codex/gpt-5.4-mini", "trigger"),
         }

@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import json
 import unittest
+from pathlib import Path
 
 from gemini_contracts import GeminiJsonResponse, GeminiStream
+
+FIXTURES = Path(__file__).parent / "fixtures" / "gemini"
 
 
 def event(kind: str, **values: object) -> str:
@@ -20,6 +23,15 @@ def stream(*records: str) -> str:
 
 
 class GeminiStreamContractTests(unittest.TestCase):
+    def test_upstream_conformance_fixture_is_accepted_without_invented_invariants(self):
+        parsed = GeminiStream.parse(
+            (FIXTURES / "tool-answer.stream.jsonl").read_text(encoding="utf-8"))
+
+        self.assertTrue(parsed.complete)
+        self.assertEqual(parsed.answer, "Final answer")
+        self.assertEqual(len(parsed.tool_calls), 1)
+        self.assertEqual(parsed.tool_calls[0].name, "read_file")
+
     def test_success_constructs_one_complete_answer_and_usage_observation(self):
         parsed = GeminiStream.parse(stream(
             event("init", session_id="session-1", model="gemini-2.5-flash"),
@@ -69,7 +81,10 @@ class GeminiStreamContractTests(unittest.TestCase):
             event("result", status="success", stats={
                 "total_tokens": 20, "input_tokens": 12, "output_tokens": 8,
                 "cached": 0, "input": 12, "duration_ms": 50,
-                "tool_calls": 1, "models": {},
+                # Gemini CLI's own nonInteractiveCli snapshot reports zero here
+                # despite emitting the complete tool lifecycle above. Treat the
+                # counter as telemetry, not an invented protocol invariant.
+                "tool_calls": 0, "models": {},
             }),
         ))
 
@@ -133,6 +148,19 @@ class GeminiStreamContractTests(unittest.TestCase):
 
 
 class GeminiJsonContractTests(unittest.TestCase):
+    def test_upstream_json_formatter_fixture_preserves_multi_model_usage(self):
+        parsed = GeminiJsonResponse.parse(
+            (FIXTURES / "judge.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(parsed.complete)
+        self.assertIsNone(parsed.resolved_model)
+        self.assertEqual(parsed.usage, {
+            "input_tokens": 45204,
+            "output_tokens": 931,
+            "total_tokens": 46376,
+            "cache_read_tokens": 10656,
+        })
+
     def test_json_response_preserves_final_answer_usage_and_model_resolution(self):
         parsed = GeminiJsonResponse.parse(json.dumps({
             "session_id": "session-1",

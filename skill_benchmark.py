@@ -106,6 +106,7 @@ from agent_capabilities import (
     BACKENDS,
     CODEX_ANSWER_DEFAULT_CMD,
     CODEX_JUDGE_DEFAULT_CMD,
+    GEMINI_DEFAULT_CMD,
     VIBE_DEFAULT_CMD,
     add_surface_cli_options,
     answer_entrypoint_implementations,
@@ -116,6 +117,7 @@ from agent_capabilities import (
     trace_dialect_implementations,
     workspace_builder_implementations,
 )
+from gemini_contracts import GeminiJsonResponse, GeminiStream
 from jetty_contracts import (
     JettyObservation,
     ProtocolInvalid,
@@ -157,6 +159,7 @@ from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 VALID_SPLITS = {"tune", "holdout", "holdback"}
 HARNESS_SEMANTIC_MODULES = (
     "ablation_model.py", "agent_capabilities.py", "experimental_pairs.py",
+    "gemini_contracts.py",
     "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "run_pi_trigger_eval.py",
     "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
     "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
@@ -2089,6 +2092,14 @@ CODEX_HOME_FILES = ("auth.json", "config.toml")
 
 VIBE_READ_ONLY_TOOLS = ("skill", "read_file", "grep")
 VIBE_NO_TOOLS = ("re:^$",)
+
+GEMINI_AUTH_FILES = ("oauth_creds.json", "gemini-credentials.json")
+GEMINI_AUTH_ENV = (
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+)
+GEMINI_READ_ONLY_TOOLS = (
+    "glob", "grep_search", "list_directory", "read_file", "read_many_files",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -7564,6 +7575,112 @@ def vibe_stream_flat_records(records: list[dict[str, Any]], *,
     return flat
 
 
+def _gemini_tool_flat_record(name: str, parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Map one official Gemini tool name into the harness trace vocabulary."""
+    values = dict(parameters)
+    path = str(
+        values.get("file_path") or values.get("path")
+        or values.get("dir_path") or values.get("directory_path")
+        or values.get("pattern") or values.get("name") or ""
+    )
+    if name == "run_shell_command":
+        return {"type": "command", "tool": name,
+                "command": str(values.get("command") or "")}
+    if name == "activate_skill":
+        return {"type": "skill_load", "name": name, "path": path}
+    if name in {"write_file", "replace"}:
+        return {"type": "file_write", "name": name, "path": path}
+    if name in GEMINI_READ_ONLY_TOOLS:
+        return {"type": "file_read", "name": name, "path": path}
+    return {"type": "tool_use", "tool": name, "input": values}
+
+
+def gemini_stream_flat_records(
+    records: list[dict[str, Any]], *, record_lines: list[int] | None = None,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten Gemini's paired tool events without discarding raw line refs."""
+    if record_lines is not None and len(record_lines) != len(records):
+        raise ValueError("record_lines must have one physical line per trace record")
+    flat: list[tuple[int, dict[str, Any]]] = []
+    open_calls: dict[str, tuple[int, dict[str, Any]]] = {}
+    for ordinal, record in enumerate(records, 1):
+        line = record_lines[ordinal - 1] if record_lines is not None else ordinal
+        kind = record.get("type")
+        if kind == "tool_use":
+            call_id = record.get("tool_id")
+            name = record.get("tool_name")
+            parameters = record.get("parameters")
+            if (not isinstance(call_id, str) or not call_id.strip()
+                    or not isinstance(name, str) or not name.strip()
+                    or not isinstance(parameters, Mapping)):
+                flat.append((line, _claude_protocol_error(
+                    "Gemini tool_use has an invalid id, name, or parameters")))
+                continue
+            spec = _gemini_tool_flat_record(name, parameters)
+            flat.append((line, {**spec, "status": "in_progress"}))
+            open_calls[call_id] = (line, spec)
+            continue
+        if kind == "tool_result":
+            call_id = record.get("tool_id")
+            matched = open_calls.pop(call_id, None) if isinstance(call_id, str) else None
+            if matched is None:
+                flat.append((line, _claude_protocol_error(
+                    "Gemini tool_result has no matching tool_use")))
+                continue
+            call_line, spec = matched
+            flat.append((line, {
+                **spec,
+                "status": "completed",
+                "output": stringify_trace_value(
+                    record.get("output") or record.get("error"))[:1000],
+                "is_error": record.get("status") == "error",
+                "_raw_call_line": call_line,
+                "_raw_result_line": line,
+            }))
+            continue
+        if kind == "message":
+            flat.append((line, {
+                "type": "message",
+                "role": record.get("role"),
+                "text": record.get("content"),
+                "timestamp": record.get("timestamp"),
+            }))
+            continue
+        flat.append((line, record))
+    for call_id, (line, _) in sorted(open_calls.items()):
+        flat.append((line, _claude_protocol_error(
+            f"Gemini tool_use call id {call_id!r} has no matching tool_result")))
+    return flat
+
+
+def _gemini_records_text(records: Iterable[Mapping[str, Any]]) -> str:
+    return "\n".join(json.dumps(dict(record), ensure_ascii=False)
+                     for record in records) + ("\n" if records else "")
+
+
+def _gemini_stream_semantics(
+    records: list[dict[str, Any]], pi_stream: PiStream | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    _ = pi_stream
+    parsed = GeminiStream.parse(_gemini_records_text(records))
+    failure = parsed.protocol_error or parsed.provider_error
+    return (dict(parsed.usage) if parsed.usage is not None and failure is None
+            else None), failure
+
+
+def _gemini_usage_and_cost_blocks(
+    raw_text: str, pi_stream: PiStream | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    _ = pi_stream
+    parsed = GeminiStream.parse(raw_text)
+    if not parsed.complete or parsed.usage is None:
+        return {"source": "missing"}, {"source": "missing"}
+    return (
+        normalize_usage(dict(parsed.usage), source="trace_normalized"),
+        {"source": "missing"},
+    )
+
+
 def _no_stream_semantics(records: list[dict[str, Any]], pi_stream: PiStream | None) -> tuple[dict[str, Any] | None, str | None]:
     """No terminal cumulative usage and no stream-level failure: per-record
     token accumulation applies."""
@@ -7626,6 +7743,13 @@ def _vibe_trace_protocol_error(
     return None
 
 
+def _gemini_trace_protocol_error(
+    records: list[dict[str, Any]], pi_stream: PiStream | None,
+) -> str | None:
+    _ = pi_stream
+    return GeminiStream.parse(_gemini_records_text(records)).protocol_error
+
+
 def _pi_trace_protocol_error(
     records: list[dict[str, Any]], pi_stream: PiStream | None,
 ) -> str | None:
@@ -7671,6 +7795,12 @@ PI_TRACE_DIALECT = TraceDialect(
     stream_semantics=_pi_stream_semantics,
     usage_and_cost=_pi_usage_and_cost_blocks,
     protocol_error=_pi_trace_protocol_error,
+)
+GEMINI_TRACE_DIALECT = TraceDialect(
+    flatten=gemini_stream_flat_records,
+    stream_semantics=_gemini_stream_semantics,
+    usage_and_cost=_gemini_usage_and_cost_blocks,
+    protocol_error=_gemini_trace_protocol_error,
 )
 
 # ``generic`` is the explicit source for unowned imported traces. Every backend
@@ -8719,6 +8849,292 @@ def codex_env_for_home(codex_home: Path) -> tuple[dict[str, str], dict[str, Any]
     return env, meta
 
 
+def seed_gemini_home(home_root: Path) -> dict[str, Any]:
+    """Seed only auth identity into a fresh Gemini CLI home root.
+
+    Gemini resolves user configuration below ``$GEMINI_CLI_HOME/.gemini``.
+    Skills, extensions, policies, MCP servers, hooks, memory, and history are
+    deliberately not copied. Environment credentials win over credential files.
+    """
+    target = home_root / ".gemini"
+    target.mkdir(parents=True, exist_ok=True)
+    source_root = Path(os.environ.get("GEMINI_CLI_HOME") or Path.home())
+    source = source_root / ".gemini"
+    environment_auth = [name for name in GEMINI_AUTH_ENV if os.environ.get(name)]
+    copied: list[str] = []
+    if not environment_auth:
+        for name in GEMINI_AUTH_FILES:
+            src = source / name
+            dst = target / name
+            if src.is_file() and src.resolve() != dst.resolve():
+                shutil.copy2(src, dst)
+                copied.append(name)
+
+    selected_type: str | None = None
+    settings_error: str | None = None
+    source_settings = source / "settings.json"
+    if source_settings.is_file():
+        try:
+            raw = strict_json_loads(source_settings.read_text(encoding="utf-8"))
+            security = raw.get("security") if isinstance(raw, dict) else None
+            auth = security.get("auth") if isinstance(security, dict) else None
+            candidate = auth.get("selectedType") if isinstance(auth, dict) else None
+            if isinstance(candidate, str) and candidate.strip():
+                selected_type = candidate
+                write_json(target / "settings.json", {
+                    "security": {"auth": {"selectedType": selected_type}},
+                })
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            settings_error = f"{type(exc).__name__}: {exc}"
+    return {
+        "gemini_home": str(home_root),
+        "gemini_auth_files_copied": copied,
+        "gemini_environment_auth": sorted(environment_auth),
+        "gemini_auth_type_copied": selected_type is not None,
+        **({"gemini_settings_warning": settings_error}
+           if settings_error is not None else {}),
+    }
+
+
+def gemini_env_for_home(home_root: Path) -> tuple[dict[str, str], dict[str, Any]]:
+    env = os.environ.copy()
+    seeded = seed_gemini_home(home_root)
+    ambient_system_prompt_removed = bool(env.pop("GEMINI_SYSTEM_MD", None))
+    # The harness owns sandbox selection; an inherited command/image choice can
+    # otherwise replace the semantics requested by the invocation argv.
+    inherited_sandbox_removed = bool(env.pop("GEMINI_SANDBOX", None))
+    env["GEMINI_CLI_HOME"] = seeded["gemini_home"]
+    env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
+    return env, {
+        **seeded,
+        "gemini_home": "<isolated GEMINI_CLI_HOME outside workdir>",
+        "gemini_home_outside_workdir": True,
+        "config_isolated": True,
+        "user_skills_isolated": True,
+        "user_extensions_isolated": True,
+        "user_mcp_isolated": True,
+        "user_hooks_isolated": True,
+        "user_context_isolated": True,
+        "ambient_system_prompt_removed": ambient_system_prompt_removed,
+        "ambient_sandbox_selection_removed": inherited_sandbox_removed,
+        "system_settings_inherited": bool(
+            env.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH")),
+    }
+
+
+def gemini_policy_text(*, allow_read_tools: bool) -> str:
+    rules = [
+        (
+            '[[rule]]\n'
+            'toolName = "*"\n'
+            'decision = "deny"\n'
+            'priority = 900\n'
+        ),
+    ]
+    if allow_read_tools:
+        names = ", ".join(json.dumps(name) for name in GEMINI_READ_ONLY_TOOLS)
+        rules.append(
+            '[[rule]]\n'
+            f'toolName = [{names}]\n'
+            'decision = "allow"\n'
+            'priority = 950\n'
+        )
+    return "\n".join(rules)
+
+
+def build_gemini_cli_argv(
+    gemini_cmd: str | None, *, prompt: str, output_format: str,
+    policy_path: Path, model: str | None,
+) -> list[str]:
+    if output_format not in {"json", "stream-json"}:
+        raise ValueError(f"unsupported Gemini output format {output_format!r}")
+    try:
+        argv = shlex.split(gemini_cmd or GEMINI_DEFAULT_CMD)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid --gemini-cmd: {exc}") from exc
+    if not argv:
+        argv = [GEMINI_DEFAULT_CMD]
+    owned = {
+        "--prompt", "-p", "--output-format", "--model", "-m", "--policy",
+        "--sandbox", "--skip-trust", "--yolo", "-y", "--approval-mode",
+        "--allowed-tools", "--exclude-tools",
+    }
+    collisions = sorted({argument for argument in argv if argument in owned})
+    if collisions:
+        raise ValueError(
+            "--gemini-cmd cannot override harness-owned flags: "
+            + ", ".join(collisions))
+    argv += ["--prompt", prompt, "--output-format", output_format]
+    if model:
+        argv += ["--model", model]
+    argv += ["--policy", str(policy_path), "--skip-trust", "--sandbox"]
+    return argv
+
+
+def redact_gemini_argv(argv: list[str]) -> list[str]:
+    redacted = list(argv)
+    for flag, replacement in (
+        ("--prompt", "<prompt>"),
+        ("--policy", "<isolated policy outside workdir>"),
+    ):
+        if flag in redacted:
+            index = redacted.index(flag)
+            if index + 1 < len(redacted):
+                redacted[index + 1] = replacement
+    return redacted
+
+
+def gemini_workspace_control_paths(workspace: Path) -> list[str]:
+    """Provider control files in an eval fixture are ambient configuration."""
+    controls: list[str] = []
+    for path in workspace.rglob("*"):
+        if path.name == ".gemini" or path.name.casefold() == "gemini.md":
+            controls.append(str(path.relative_to(workspace)))
+    return sorted(set(controls))
+
+
+def _cleanup_gemini_temp(path: Path) -> dict[str, Any]:
+    try:
+        shutil.rmtree(path)
+        return {"status": "removed"}
+    except Exception as exc:
+        shutil.rmtree(path, ignore_errors=True)
+        retained = path.exists()
+        code = errno.errorcode.get(
+            getattr(exc, "errno", None), type(exc).__name__)
+        return {
+            "status": "retained" if retained else "removed_after_fallback",
+            "warning": (
+                "isolated Gemini temporary-home cleanup could not fully remove "
+                f"its unique directory ({code}); it will not be reused"
+                if retained else
+                "isolated Gemini temporary-home cleanup required the final "
+                f"fallback ({code})"
+            ),
+        }
+
+
+def gemini_cli_invoke(
+    prompt: str, *, model: str | None = None,
+    gemini_cmd: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S,
+    cwd: str | Path | None = None, output_format: str = "stream-json",
+    allow_read_tools: bool = True,
+) -> dict[str, Any]:
+    """Invoke official Gemini CLI behind isolated config and typed protocols."""
+    invocation_root = Path(tempfile.mkdtemp(prefix="gemini-invoke-"))
+    cleanup_meta: dict[str, Any]
+    result: InvocationResult | None = None
+    argv: list[str] = []
+    env_meta: dict[str, Any] = {}
+    preflight_error: str | None = None
+    try:
+        workspace = Path(cwd) if cwd is not None else invocation_root / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        controls = gemini_workspace_control_paths(workspace)
+        if controls:
+            preflight_error = (
+                "Gemini workspace contains provider control files: "
+                + ", ".join(controls[:10]))
+        else:
+            env, env_meta = gemini_env_for_home(invocation_root / "home")
+            policy_path = invocation_root / "harness-policy.toml"
+            policy_path.write_text(
+                gemini_policy_text(allow_read_tools=allow_read_tools),
+                encoding="utf-8",
+            )
+            try:
+                argv = build_gemini_cli_argv(
+                    gemini_cmd, prompt=prompt, output_format=output_format,
+                    policy_path=policy_path, model=model,
+                )
+            except ValueError as exc:
+                preflight_error = str(exc)
+            if preflight_error is None:
+                result = run_argv_capture(
+                    argv, input_text="", cwd=workspace, env=env,
+                    timeout=timeout,
+                )
+    finally:
+        cleanup_meta = _cleanup_gemini_temp(invocation_root)
+
+    environment = {
+        **env_meta,
+        **(dict(result.adapter_metadata or {}) if result is not None else {}),
+        "tool_policy": (
+            "read-only allowlist" if allow_read_tools else "deny all tools"),
+        "sandbox_requested": True,
+        "admin_policy_may_override": True,
+        "workspace_provider_controls": "rejected",
+        "temporary_home_cleanup": cleanup_meta,
+        "command": (
+            " ".join(shlex.quote(arg) for arg in redact_gemini_argv(argv))
+            if argv else GEMINI_DEFAULT_CMD),
+        "cwd": "<isolated workspace>",
+    }
+    cleanup_warning = cleanup_meta.get("warning")
+    if preflight_error is not None:
+        return {
+            "answer": "", "stdout": "", "raw_response": "",
+            "trace_text": "", "stderr": preflight_error,
+            "returncode": 1, "timed_out": False, "elapsed_ms": 0,
+            "usage": None, "cost_usd": None, "model": model,
+            "protocol_error": preflight_error, "provider_error": None,
+            "metadata": {}, "environment": environment,
+        }
+    assert result is not None
+    stderr = result.stderr
+    if isinstance(cleanup_warning, str) and cleanup_warning:
+        stderr = _stderr_with_warning(stderr, cleanup_warning)
+    if output_format == "stream-json":
+        parsed_stream = GeminiStream.parse(result.stdout)
+        answer = parsed_stream.answer
+        usage = (dict(parsed_stream.usage)
+                 if parsed_stream.usage is not None else None)
+        protocol_error = parsed_stream.protocol_error
+        provider_error = parsed_stream.provider_error
+        resolved_model = parsed_stream.resolved_model or model
+        metadata = {
+            "session_id": parsed_stream.session_id,
+            "configured_model": parsed_stream.configured_model,
+            "resolved_model": resolved_model,
+            "reported_models": list(parsed_stream.models),
+            **({"provider_duration_ms": parsed_stream.duration_ms}
+               if parsed_stream.duration_ms is not None else {}),
+        }
+        trace_text = result.stdout
+    else:
+        parsed_json = GeminiJsonResponse.parse(result.stdout)
+        answer = parsed_json.response
+        usage = (dict(parsed_json.usage)
+                 if parsed_json.usage is not None else None)
+        protocol_error = parsed_json.protocol_error
+        provider_error = parsed_json.provider_error
+        resolved_model = parsed_json.resolved_model or model
+        metadata = {
+            "session_id": parsed_json.session_id,
+            "resolved_model": resolved_model,
+            "reported_models": list(parsed_json.models),
+        }
+        trace_text = ""
+    return {
+        "answer": answer,
+        "stdout": result.stdout,
+        "raw_response": result.stdout,
+        "trace_text": trace_text,
+        "stderr": stderr[:4000],
+        "returncode": result.returncode,
+        "timed_out": result.timed_out,
+        "elapsed_ms": result.elapsed_ms,
+        "usage": usage,
+        "cost_usd": None,
+        "model": resolved_model,
+        "protocol_error": protocol_error,
+        "provider_error": provider_error,
+        "metadata": metadata,
+        "environment": environment,
+    }
+
+
 def seed_vibe_home(vibe_home: Path) -> dict[str, Any]:
     """Create an isolated VIBE_HOME for native Vibe runs.
 
@@ -8998,6 +9414,49 @@ class ClaudeBackend(AgentBackend):
             error=result.get("parse_error"), trace_text=result.get("raw_response") or "",
             usage=result.get("usage"), cost_usd=result.get("cost_usd"), model=request.model,
             environment={"runner": "claude", "command": result.get("command") or "claude -p", "cwd": "<isolated workspace>"})
+
+
+class GeminiBackend(AgentBackend):
+    name = "gemini"
+
+    def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
+        result = gemini_cli_invoke(
+            request.prompt,
+            model=request.model,
+            gemini_cmd=str(options.get("gemini_cmd") or GEMINI_DEFAULT_CMD),
+            timeout=request.timeout_s,
+            cwd=request.workspace,
+            output_format="stream-json",
+            allow_read_tools=True,
+        )
+        returncode = cast(int, result.get("returncode"))
+        error = (
+            result.get("protocol_error") or result.get("provider_error")
+            if returncode == 0 and not result.get("timed_out") else None
+        )
+        raw_metadata = result.get("metadata")
+        metadata = (dict(raw_metadata)
+                    if isinstance(raw_metadata, Mapping) else {})
+        return RunnerOutcome(
+            provider="gemini",
+            answer=result.get("answer") or "",
+            returncode=returncode,
+            timed_out=bool(result.get("timed_out", False)),
+            timeout_s=request.timeout_s,
+            elapsed_ms=(result.get("elapsed_ms")
+                        if isinstance(result.get("elapsed_ms"), int) else None),
+            stderr=result.get("stderr", "") or "",
+            error=error,
+            usage=(result.get("usage")
+                   if isinstance(result.get("usage"), Mapping) else None),
+            cost_usd=None,
+            model=request.model or result.get("model"),
+            trace_text=result.get("trace_text") or "",
+            metadata_extra=metadata,
+            environment={
+                "runner": "gemini", **dict(result.get("environment") or {}),
+            },
+        )
 
 
 class VibeBackend(AgentBackend):
@@ -10593,6 +11052,43 @@ def codex_judge_invoke(prompt: str, *, judge_model: str | None, codex_cmd: str,
     )
 
 
+def gemini_judge_invoke(
+    prompt: str, *, judge_model: str | None, gemini_cmd: str,
+    explore_hint: str | None, **_: Any,
+) -> JudgeInvocation:
+    result = gemini_cli_invoke(
+        prompt, model=judge_model, gemini_cmd=gemini_cmd,
+        output_format="json", allow_read_tools=False, cwd=explore_hint,
+    )
+    process_returncode = cast(int, result.get("returncode"))
+    error = result.get("protocol_error") or result.get("provider_error")
+    effective_returncode = (
+        1 if process_returncode == 0 and isinstance(error, str) and error
+        else process_returncode
+    )
+    stderr = result.get("stderr", "") or ""
+    if effective_returncode != process_returncode and isinstance(error, str):
+        stderr = _stderr_with_warning(stderr, error)
+    raw_metadata = result.get("metadata")
+    metadata = (dict(raw_metadata)
+                if isinstance(raw_metadata, Mapping) else {})
+    environment = result.get("environment")
+    if isinstance(environment, Mapping):
+        metadata["environment"] = dict(environment)
+    return JudgeInvocation(
+        stdout=result.get("answer") or "",
+        stderr=stderr,
+        returncode=effective_returncode,
+        usage=(result.get("usage")
+               if isinstance(result.get("usage"), Mapping) else None),
+        cost_usd=None,
+        usage_source="provider_reported",
+        model_label=str(result.get("model") or judge_model or "gemini/default"),
+        raw_response=result.get("raw_response"),
+        metadata=metadata,
+    )
+
+
 def vibe_judge_invoke(prompt: str, *, judge_model: str | None, vibe_cmd: str,
                       explore_hint: str | None, **_: Any) -> JudgeInvocation:
     res = vibe_cli_invoke(prompt, model=judge_model, vibe_cmd=vibe_cmd, output="json",
@@ -10968,6 +11464,11 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         (dest / "stdout.txt").write_text(stdout, encoding="utf-8")
         if stderr:
             (dest / "stderr.txt").write_text(stderr, encoding="utf-8")
+        if invocation.raw_response is not None:
+            (dest / "provider-response.json").write_text(
+                invocation.raw_response, encoding="utf-8")
+        if invocation.metadata:
+            write_json(dest / "provider-metadata.json", dict(invocation.metadata))
         write_json(dest / "result.json", row)
     return row
 

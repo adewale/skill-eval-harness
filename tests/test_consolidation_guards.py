@@ -909,6 +909,8 @@ class TimeoutConventionTests(unittest.TestCase):
         self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["claude"], am.CLAUDE_FAILURE)
         self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["subagent"], am.CLAUDE_FAILURE)
         self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["vibe"], am.VIBE_FAILURE)
+        self.assertEqual(
+            am.RUNNER_FAILURE_MARKER_BY_PROVIDER["gemini"], "[GEMINI FAILURE")
         for marker in am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values():
             self.assertIn(marker, am.RUNNER_FAILURE_MARKERS)
 

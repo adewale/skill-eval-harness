@@ -38,6 +38,7 @@ CODEX_TRIGGER_DEFAULT_CMD = (
     "--ignore-user-config --ignore-rules"
 )
 VIBE_DEFAULT_CMD = "vibe"
+GEMINI_DEFAULT_CMD = "gemini"
 
 
 @dataclass(frozen=True)
@@ -468,6 +469,16 @@ _CODEX_JUDGE = SurfaceBinding(
     (_option("--codex-cmd", "codex_cmd", CODEX_JUDGE_DEFAULT_CMD,
              "argv-style Codex command prefix for --judge-backend codex; shell metacharacters are not interpreted"),),
 )
+_GEMINI_ANSWER = SurfaceBinding(
+    ObjectRef("skill_benchmark", "GeminiBackend"),
+    (_option("--gemini-cmd", "gemini_cmd", GEMINI_DEFAULT_CMD,
+             "argv-style Gemini CLI command prefix for --agent gemini answer runs; shell metacharacters are not interpreted"),),
+)
+_GEMINI_JUDGE = SurfaceBinding(
+    ObjectRef("skill_benchmark", "gemini_judge_invoke"),
+    (_option("--gemini-cmd", "gemini_cmd", GEMINI_DEFAULT_CMD,
+             "argv-style Gemini CLI command prefix for --judge-backend gemini; shell metacharacters are not interpreted"),),
+)
 _VIBE_ANSWER = SurfaceBinding(
     ObjectRef("skill_benchmark", "VibeBackend"),
     (_option("--vibe-cmd", "vibe_cmd", VIBE_DEFAULT_CMD,
@@ -593,6 +604,32 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
         workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
         smoke=SmokeTarget("codex", "SMOKE_CODEX_MODEL", "gpt-5.4-mini", "answer"),
         failure_marker="[CODEX FAILURE",
+    ),
+    BackendRegistration(
+        name="gemini",
+        capabilities=AgentCapabilities(
+            answer_runner=True, autonomous_trigger=False,
+            trigger_ablation=False, trace_artifacts=True, token_usage=True,
+            dollar_cost="missing", judge_backend=True, tool_replay=False,
+            live_smoke_env="RUN_GEMINI_SMOKE",
+            notes=(
+                "Official Gemini CLI answer and judge support uses isolated "
+                "GEMINI_CLI_HOME roots, deny-by-default policy files, and "
+                "strict JSON/stream-JSON contracts. Autonomous trigger is "
+                "disabled until a live headless activate_skill run proves "
+                "consent-free, noninteractive activation. Dollar cost remains "
+                "explicit missing because the CLI does not report it."
+            ),
+        ),
+        answer_route="native",
+        trace=ObjectRef("skill_benchmark", "GEMINI_TRACE_DIALECT"),
+        answer_entrypoints=(_RUN_AGENT,),
+        answer=_GEMINI_ANSWER,
+        judge=_GEMINI_JUDGE,
+        workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
+        smoke=SmokeTarget(
+            "gemini", "SMOKE_GEMINI_MODEL", "gemini-2.5-flash", "answer"),
+        failure_marker="[GEMINI FAILURE",
     ),
     BackendRegistration(
         name="pi",

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import telemetry
@@ -53,6 +53,8 @@ class JudgeInvocation:
     cost_usd: float | None = None
     usage_source: JudgeUsageSource = "provider_reported"
     model_label: str | None = None
+    raw_response: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
@@ -65,6 +67,12 @@ class JudgeInvocation:
         if self.model_label is not None and (
                 not isinstance(self.model_label, str) or not self.model_label.strip()):
             raise ValueError("judge model label must be None or a non-empty string")
+        if self.raw_response is not None and not isinstance(self.raw_response, str):
+            raise TypeError("judge raw_response must be text or None")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("judge metadata must be a mapping")
+        object.__setattr__(self, "metadata", freeze_json_mapping(
+            self.metadata, "judge metadata"))
         if self.cost_usd is not None:
             _finite_nonnegative(self.cost_usd, "judge cost_usd")
             object.__setattr__(self, "cost_usd", float(self.cost_usd))

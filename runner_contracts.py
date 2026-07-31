@@ -17,6 +17,7 @@ from json_contracts import freeze_json_mapping
 class Provider(str, Enum):
     CODEX = "codex"
     CLAUDE = "claude"
+    GEMINI = "gemini"
     VIBE = "vibe"
     SUBAGENT = "subagent"
     JETTY = "jetty"
