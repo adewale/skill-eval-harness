@@ -3,7 +3,7 @@
 
 This is intentionally an opt-in operational check, not a test-suite member. It
 creates a disposable one-answer/two-trigger case using the bundled demo skill,
-then exercises the native answer path for Claude, Codex, and Vibe plus Pi's
+then exercises the native answer path for Claude, Codex, Gemini, and Vibe plus Pi's
 native trigger path. It never reads credentials; each CLI retains its normal
 isolated-home/auth behavior through the harness.
 """

@@ -106,6 +106,47 @@ assembly. A nonzero exit remains a valid diagnostic invocation but cannot become
 observation. This changes no persisted judge-row fields; `judge_verdict.py` still re-establishes the
 boolean/scored/dimension/dynamic/consensus invariant at the storage boundary.
 
+## Gemini CLI provider boundary
+
+The Gemini integration reuses the existing typed process and answer/judge boundaries, while adding
+a provider-specific wire contract at the point where Gemini's JSON or JSONL leaves the subprocess.
+
+```text
+InvocationRequest
+  -> InvocationResult
+  -> GeminiStream | GeminiJsonResponse
+  -> Completed | ProviderFailed        (answer)
+  -> JudgeInvocation                    (judge)
+```
+
+- `InvocationRequest` remains suitable as the provider-neutral input contract: it fixes the prompt,
+  optional model, timeout, working directory, environment, and immutable provider context before
+  execution. The Gemini adapter, rather than callers, owns output-format, policy, trust, sandbox,
+  and prompt/model flags, so a raw command cannot weaken those controls.
+- `gemini_contracts.py` strictly parses duplicate-free, finite JSON into frozen provider values.
+  Stream success requires one `init`, one terminal successful `result`, a non-empty final assistant
+  message, paired tool start/result identifiers, and no provider error. Usage is numeric only when
+  Gemini supplies a valid token accounting object. A malformed exit-zero envelope therefore becomes
+  `ProviderFailed`, never a successful answer with guessed telemetry.
+- Gemini tool records are adapted through the shared `TraceDialect`; the adapter preserves lifecycle
+  identifiers and does not invent an equality between event count and Gemini's aggregate
+  `stats.tool_calls`. This is the right abstraction level for normalized evidence, but it does not
+  imply that every provider exposes identical counters.
+- The answer adapter constructs the closed `RunnerOutcome` union and the judge adapter constructs
+  `JudgeInvocation`. The latter retains immutable raw provider response and provider metadata
+  sidecars, which prevents provider dictionaries from leaking into verdict construction while still
+  keeping auditable wire evidence.
+- The existing trigger adapter abstraction is deliberately not used for Gemini yet. Gemini's
+  `activate_skill` is an interactive tool and the headless default policy denies it; without a live,
+  non-interactive activation proof, declaring trigger support would turn absence of evidence into a
+  false-negative measurement. The registry therefore advertises answer, judge, trace, and usage
+  support, but not trigger or cost support.
+
+The remaining compatibility seam is the internal dictionary returned by `gemini_cli_invoke`; it is
+not a public or persisted contract, and both consumers immediately construct the closed domain value
+for their path. A future common provider-invocation result could remove that local adaptation, but
+doing so is not required to make the Gemini wire, answer, judge, or persisted boundaries type-safe.
+
 ## Orthogonal run evidence and artifact commit
 
 `telemetry.ObservationEvidence` is the product of four independent states:

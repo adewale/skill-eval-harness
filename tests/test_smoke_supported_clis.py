@@ -150,7 +150,8 @@ class SupportedCliSmokeTests(unittest.TestCase):
     def test_failed_prepare_short_circuits_before_any_answer_call(self):
         with tempfile.TemporaryDirectory() as td:
             args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="claude",
-                                      claude_model="haiku", codex_model="unused", vibe_model="unused",
+                                      claude_model="haiku", codex_model="unused",
+                                      gemini_model="unused", vibe_model="unused",
                                       pi_model="unused", timeout=1)
             with mock.patch.object(smoke, "parse_args", return_value=args), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/claude"), \
@@ -182,7 +183,8 @@ class SupportedCliSmokeTests(unittest.TestCase):
     def test_registry_population_dispatches_pi_to_trigger_runner(self):
         with tempfile.TemporaryDirectory() as td:
             args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="pi",
-                                      claude_model="unused", codex_model="unused", vibe_model="unused",
+                                      claude_model="unused", codex_model="unused",
+                                      gemini_model="unused", vibe_model="unused",
                                       pi_model="model", timeout=1)
             with mock.patch.object(smoke, "parse_args", return_value=args), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/pi"), \

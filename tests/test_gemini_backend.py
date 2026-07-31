@@ -284,6 +284,27 @@ class GeminiAnswerBackendTests(unittest.TestCase):
         self.assertIn("provider control files", result["protocol_error"])
         self.assertEqual(result["stdout"], "")
 
+    def test_spawn_nonzero_and_timeout_failures_keep_process_state(self):
+        cases = (
+            ("missing-gemini-binary-for-contract-test", 30, 127, False),
+            (f"{sys.executable} -c 'raise SystemExit(9)'", 30, 9, False),
+            (f"{sys.executable} -c 'import time; time.sleep(5)'", 1, 124, True),
+        )
+        for command, timeout, returncode, timed_out in cases:
+            with self.subTest(command=command):
+                result = sb.gemini_cli_invoke(
+                    "prompt", gemini_cmd=command, timeout=timeout)
+                self.assertEqual(result["returncode"], returncode)
+                self.assertIs(result["timed_out"], timed_out)
+                outcome = sb.RunnerOutcome(
+                    provider="gemini", answer=result["answer"],
+                    returncode=result["returncode"],
+                    timed_out=result["timed_out"], timeout_s=timeout,
+                    elapsed_ms=result["elapsed_ms"], stderr=result["stderr"],
+                    trace_text=result["trace_text"],
+                )
+                self.assertNotIsInstance(outcome, rc.Completed)
+
 
 class GeminiJudgeBackendTests(unittest.TestCase):
     def _task(self, root: Path) -> dict[str, object]:
@@ -356,6 +377,37 @@ class GeminiJudgeBackendTests(unittest.TestCase):
         self.assertIsInstance(invocation, jc.JudgeInvocation)
         self.assertEqual(invocation.raw_response, _judge_envelope())
         self.assertEqual(invocation.metadata["session_id"], "session-judge")
+
+
+@unittest.skipUnless(
+    os.environ.get("RUN_GEMINI_SMOKE") == "1",
+    "token-backed smoke: set RUN_GEMINI_SMOKE=1 (needs Gemini CLI auth)",
+)
+class GeminiLiveSmokeTests(unittest.TestCase):
+    def test_run_agent_writes_one_execution_valid_gemini_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_eval_repo(root)
+            rows = sb.prepared_task_rows(
+                manifest, sb.validate_manifest(manifest), split="tune")
+            row = next(item for item in rows
+                       if item["variant"] == "without_skill")
+            tasks = root / "tasks.jsonl"
+            tasks.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            runs = root / "runs"
+            model = os.environ.get("SMOKE_GEMINI_MODEL", "gemini-2.5-flash")
+
+            sb.run_agent(argparse.Namespace(
+                agent="gemini", tasks=str(tasks), runs=str(runs), model=model,
+                gemini_cmd=os.environ.get("GEMINI_SMOKE_CMD", "gemini"),
+                timeout=int(os.environ.get("GEMINI_SMOKE_TIMEOUT", "120")),
+            ))
+
+            base = runs / row["run_dir"]
+            output = (base / "output.md").read_text(encoding="utf-8")
+            metadata = sb.read_metadata_base(base)
+            self.assertTrue(am.execution_valid(metadata, output), metadata)
+            self.assertEqual(metadata["provider"], "gemini")
 
 
 if __name__ == "__main__":

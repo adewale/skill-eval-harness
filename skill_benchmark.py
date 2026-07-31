@@ -4,7 +4,7 @@
 The grading and aggregation path intentionally does not call a model: it prepares
 paired tasks, grades saved outputs with deterministic assertions, emits judge
 tasks for subjective checks, and aggregates timing/token/cost/pass-rate data. The
-explicit runner and judge commands DO call a model — `run-agent --agent claude|codex|vibe`
+explicit runner and judge commands DO call a model — `run-agent --agent claude|codex|gemini|vibe`
 (compatibility wrappers `run-codex`/`run-claude`, plus `run-jetty`) to generate outputs,
 and `judge` (via `--judge-cmd`, or natively `--judge-model`/`--judge-backend`) to grade
 them. Everything from `grade`/`benchmark` onward is model-free and reproducible from saved artifacts.
@@ -19530,7 +19530,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--variant", action="append")
     p.add_argument("--judge-cmd", help="shell command that reads a judge prompt on stdin and emits JSON on stdout (any provider)")
     p.add_argument("--judge-backend", choices=sorted([*JUDGE_BACKENDS, "cmd"]), help="native judge backend; defaults to cmd when --judge-cmd is supplied, otherwise claude")
-    p.add_argument("--judge-model", help="judge model id for the selected native backend; with --judge-backend codex this is a Codex/OpenAI model; with vibe this is passed as VIBE_ACTIVE_MODEL")
+    p.add_argument("--judge-model", help="judge model id for the selected native backend; Gemini and Codex receive their native model flags, while Vibe receives VIBE_ACTIVE_MODEL")
     p.add_argument("--judge-runs", type=int, default=1, help="repeat each judge task and majority/median merge results")
     p.add_argument("--strict-judge-schema", action="store_true", help="deprecated compatibility flag (no-op): malformed judge verdicts always fail closed and retain schema_errors diagnostics")
     p.add_argument("--judge-trajectory", action="store_true", help="also give the judge the run's normalized trajectory (events/metrics) and a denylisted artifact inventory, not just the final output (G1)")

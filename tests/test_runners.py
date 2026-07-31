@@ -277,7 +277,7 @@ class SubagentRunnerTests(unittest.TestCase):
             self.assertFalse(metrics["operation_observation_complete"])
 
     def test_agent_backends_are_registered_workspace_builders(self):
-        for name in ("subagent", "codex", "claude", "vibe"):
+        for name in ("subagent", "codex", "claude", "gemini", "vibe"):
             self.assertIn(name, sb.WORKSPACE_BUILDERS)
 
 
@@ -1304,7 +1304,7 @@ class TraceDialectRegistryTests(unittest.TestCase):
         for source in ("generic", "stub", "subagent"):
             with self.subTest(source=source):
                 self.assertIs(sb.trace_dialect_for(source), sb.GENERIC_TRACE_DIALECT)
-        for source in ("codex", "JETTY", "vibe"):
+        for source in ("codex", "gemini", "JETTY", "vibe"):
             with self.subTest(source=source):
                 self.assertIsNot(
                     sb.trace_dialect_for(source), sb.GENERIC_TRACE_DIALECT)

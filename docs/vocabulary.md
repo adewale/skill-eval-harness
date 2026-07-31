@@ -112,7 +112,7 @@ Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger
 - `metrics.json` — tokens, command counts, tool calls, elapsed time, retries.
 - `environment.json` — runner, model, and sandbox details where available.
 
-The normalized shapes are an adapter boundary: Pi, Codex, and Jetty emit different raw events, so each shape gets fixture tests rather than an assumed common schema.
+The normalized shapes are an adapter boundary: Pi, Codex, Gemini, and Jetty emit different raw events, so each shape gets fixture tests rather than an assumed common schema.
 
 ## Runners and judges
 
@@ -120,9 +120,9 @@ The normalized shapes are an adapter boundary: Pi, Codex, and Jetty emit differe
 
 **Answer-runner outcome** — one frozen execution variant: completed, timed out, spawn failed, or provider failed. Return code, timeout, answer, and failure are not independent flags. A validated context carries the closed provider identity plus finite non-negative elapsed/usage/cost fields; the shared artifact writer consumes the union exhaustively.
 
-**Workspace isolation** — every arm of a case runs in a fresh isolated workspace built by one shared builder: `with_skill` gets the (real or ablated) skill tree mounted, `without_skill` gets no skill files at all, so the baseline cannot read the skill from disk. Credential-bearing runner homes (`CODEX_HOME`, `VIBE_HOME`) live outside the model's working directory. This is the CF.2 invariant: baseline isolation is enforced by construction and covered by a cross-runner test, because a baseline that can see the skill silently destroys lift.
+**Workspace isolation** — every arm of a case runs in a fresh isolated workspace built by one shared builder: `with_skill` gets the (real or ablated) skill tree mounted, `without_skill` gets no skill files at all, so the baseline cannot read the skill from disk. Credential-bearing runner homes (`CODEX_HOME`, `GEMINI_CLI_HOME`, `VIBE_HOME`) live outside the model's working directory. This is the CF.2 invariant: baseline isolation is enforced by construction and covered by a cross-runner test, because a baseline that can see the skill silently destroys lift.
 
-**Judge backend** — how a deferred qualitative assertion gets its verdict. `--judge-cmd` is the universal escape hatch (any shell command: prompt on stdin, JSON verdict on stdout); `--judge-backend claude|codex|vibe` selects a native adapter (with `--judge-model` picking the model; the native paths capture the judge's real dollar cost). Every verdict records its `judge_model`, and judge spend is its own ledger line in `cost_summary`, never folded into the model under test.
+**Judge backend** — how a deferred qualitative assertion gets its verdict. `--judge-cmd` is the universal escape hatch (any shell command: prompt on stdin, JSON verdict on stdout); `--judge-backend claude|codex|gemini|vibe` selects a native adapter (with `--judge-model` picking the model; usage/cost is captured when that provider reports it). Every verdict records its `judge_model`, and judge spend is its own ledger line in `cost_summary`, never folded into the model under test.
 
 **Judge task** — one deferred qualitative check on one run, keyed by `judge_task_id` (`case::variant::run-n::assertion`, with a model segment when the model axis is fanned). `grade --judge-tasks` can emit pending tasks to `judge-tasks.jsonl`; the `judge` command reconstructs the same tasks from the manifest and runs. Verdicts merge back by the same key, which is also how human labels pair with verdicts in `judge-alignment`.
 

@@ -151,10 +151,10 @@ in the codebase.
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:9139`), Claude (`run_claude:9307`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:9598`), Claude (`run_claude:9766`, capturing real
 per-run cost), Mistral Vibe (`run-agent --agent vibe`, using isolated `VIBE_HOME` outside the workdir), the in-process
-subagent runner (`run_subagent:11744`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:3914` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:12245`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:3925` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -186,7 +186,8 @@ segment on a multi-model run). `grade --judge-tasks` can serialize that queue, w
 reading the optional queue file. `judge_prompt` renders the case, expected behavior, rubric,
 and candidate output into a prompt — including the anchored dimensions or dynamic-rubric
 instruction for a graded assertion; `run_one_judge_task` pipes it to the `--judge-cmd` you
-supply or to a native `--judge-backend` (`claude`, `codex`, or `vibe`) plus `--judge-model`;
+supply or to a native `--judge-backend` (`claude`, `codex`, `gemini`, or `vibe`) plus
+`--judge-model`;
 both routes construct the frozen `judge_contracts.JudgeInvocation` boundary before any verdict
 parsing. It closes return code, output, immutable usage/cost telemetry, provenance, and model
 identity, so a newly registered backend cannot feed a dictionary-shaped partial contract into row
@@ -222,7 +223,7 @@ those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplica
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:759`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:762`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 ## What changes when you extend the tool
