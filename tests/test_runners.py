@@ -28,8 +28,10 @@ from helpers import (
     good_pr_manifest as _manifest,
 )
 from helpers import (
+    judge_task,
     make_eval_repo,
     stub_claude,
+    write_run,
 )
 from helpers import (
     write_demo_manifest as write_manifest,
@@ -1291,6 +1293,662 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(meta["usage_normalized"], {"source": "missing"})
             self.assertEqual(meta["cost_normalized"], {"source": "missing"})
             self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
+
+    def test_run_agent_dispatches_registered_agy_backend(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks, run_dir = self._one_with_skill_task(root)
+            fake_agy = root / "fake_agy.py"
+            fake_agy.write_text(
+                "import json, sys\n"
+                "assert '--print' in sys.argv\n"
+                "assert '--output-format' in sys.argv\n"
+                # Without these agy runs shell tools in its own scratch dir and
+                # never sees the mounted workspace at all.
+                "assert '--add-dir' in sys.argv\n"
+                "assert '--new-project' in sys.argv\n"
+                "assert sys.argv[sys.argv.index('--model') + 1] == 'gemini-test'\n"
+                "prompt = sys.argv[sys.argv.index('--print') + 1]\n"
+                "assert 'Task prompt:' in prompt\n"
+                "print(json.dumps({'event': 'step_update', 'step_update': {'state': 'DONE',"
+                " 'step_type': 'tool', 'tool_name': 'run_command', 'tool_info': {'name': 'run_command',"
+                " 'parameters': {'CommandLine': 'echo hi'}, 'output': 'hi'}}}))\n"
+                "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS',"
+                " 'response': 'token from agy', 'usage': {'input_tokens': 5, 'output_tokens': 7,"
+                " 'total_tokens': 12}}}))\n",
+                encoding="utf-8")
+            runs = root / "agy-runs"
+            sb.run_agent(argparse.Namespace(agent="agy", tasks=str(tasks), runs=str(runs), model="gemini-test",
+                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd="vibe",
+                                            agy_cmd=f"{sys.executable} {fake_agy}", timeout=30))
+            base = runs / run_dir
+            self.assertIn("token from agy", (base / "output.md").read_text(encoding="utf-8"))
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["provider"], "agy")
+            self.assertEqual(meta["model"], "gemini-test")
+            self.assertEqual(meta["usage_normalized"]["total_tokens"], 12)
+            # agy reports usage on its terminal event, not in the trace; the
+            # flat metrics must still carry it like the other provider-reported
+            # backends, or token comparisons silently read as unavailable.
+            self.assertEqual(json.loads((base / "metrics.json").read_text())["total_tokens"], 12)
+            # agy reports no dollar figure, so cost stays explicit missing
+            # rather than being silently inferred.
+            self.assertEqual(meta["cost_normalized"], {"source": "missing"})
+            env = json.loads((base / "environment.json").read_text(encoding="utf-8"))
+            self.assertFalse(env["config_isolated"], "agy offers no config-home override")
+            self.assertIn("--print '<prompt>'", env["command"])
+            self.assertNotIn("Task prompt:", env["command"])
+            # The command the model ran must survive into the graded trace, or
+            # every command_ran assertion silently fails.
+            self.assertEqual(json.loads((base / "metrics.json").read_text())["commands"], 1)
+
+
+AGY_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "agy"
+
+
+def agy_fixture(name: str) -> str:
+    """One checked-in agy protocol shape. Per agent-backend-interface-spec item
+    4 the degenerate shapes are fixtures too, not inline literals: the single
+    success fixture this set started as was why the whole degenerate space went
+    untested and had to be walked one review round at a time."""
+    return (AGY_FIXTURES / name).read_text(encoding="utf-8")
+
+
+class AgyStreamParsingTests(unittest.TestCase):
+    """Golden-fixture parsing for the agy backend — no CLI, no credentials, no
+    tokens. The fixtures are real `agy --output-format stream-json` output with
+    paths and conversation ids redacted, plus the degenerate shapes a healthy
+    CLI will not emit on demand."""
+
+    def setUp(self):
+        self.stdout = agy_fixture("stream-json-success.jsonl")
+        self.events = sb.parse_agy_events(self.stdout)
+
+    def test_final_answer_and_usage_come_from_the_result_event(self):
+        self.assertEqual(sb.agy_final_answer(self.events), "The current stable version is 2.11.2.")
+        self.assertEqual(sb.agy_usage(self.events),
+                         {"input_tokens": 13387, "output_tokens": 1052,
+                          "total_tokens": 14439, "cache_read_tokens": 24324,
+                          "thinking_tokens": 915})
+
+    def test_shell_steps_normalize_into_command_records(self):
+        # command_ran reads record['item']['type'] == 'command_execution', so a
+        # step_update left untranslated is an invisible command and every
+        # process assertion fails for a run that actually did the work.
+        records, errors = sb.parse_trace_jsonl_text(sb.agy_trace_text(self.events, self.stdout))
+        self.assertFalse(errors)
+        commands = [r["item"]["command"] for r in records
+                    if "item" in r and r["item"]["type"] == "command_execution"]
+        self.assertEqual(commands, ["scripts/jetpack version androidx.work:work-runtime STABLE"])
+        self.assertEqual(records[0]["item"]["aggregated_output"], "2.11.2\n")
+
+    def test_only_the_terminal_record_of_a_step_is_emitted(self):
+        # The ACTIVE and DONE records share step_index 4; emitting both would
+        # double every command a tool_count_le assertion counts.
+        records, _ = sb.parse_trace_jsonl_text(sb.agy_trace_text(self.events, self.stdout))
+        self.assertEqual([r["item"]["type"] for r in records if "item" in r],
+                         ["command_execution", "file_read"])
+        # plus one terminal usage record, which carries no item
+        self.assertEqual([r.get("type") for r in records if "item" not in r], ["result"])
+
+    def test_json_envelope_is_normalized_like_a_result_event(self):
+        # `--output-format json`, which the judge uses, emits one bare envelope
+        # rather than a stream; both reduce to the same answer/usage path.
+        events = sb.parse_agy_events(agy_fixture("json-envelope-success.json"), output="json")
+        self.assertEqual(sb.agy_final_answer(events), "4\n")
+        self.assertEqual(sb.agy_usage(events)["total_tokens"], 19640)
+
+        # And only that caller may be answered with an envelope. A stream-json
+        # request served one means the CLI ignored the format, and an envelope
+        # holds no step_update records — so a trigger run would read as a clean
+        # no-trigger and an answer run as zero tool activity.
+        events, errors = sb.parse_agy_stream(agy_fixture("json-envelope-success.json"))
+        self.assertTrue(errors)
+        self.assertIsNotNone(sb.agy_protocol_error(events, errors))
+
+    def test_prompt_is_redacted_from_the_recorded_command(self):
+        argv = sb.build_agy_cli_argv("agy", prompt="secret task prompt", cwd="/ws")
+        redacted = sb.redact_agy_prompt_arg(argv)
+        self.assertNotIn("secret task prompt", redacted)
+        self.assertIn("<prompt>", redacted)
+
+    def test_usage_survives_the_shared_stream_extractor(self):
+        # agy nests usage under its own `result` container, which
+        # raw_trace_value does not descend into, so the raw stream is
+        # identified as cumulative and then found to carry no usage at all.
+        raw_usage, _ = sb.stream_usage_and_cost(self.stdout, source="agy")
+        self.assertEqual(raw_usage.get("source"), "missing", "precondition: raw stream loses usage")
+
+        usage, _ = sb.stream_usage_and_cost(sb.agy_trace_text(self.events, self.stdout), source="agy")
+        self.assertEqual(usage["total_tokens"], 14439)
+        self.assertEqual(usage["source"], "trace_normalized")
+
+    def test_a_read_of_skill_md_counts_as_a_skill_invocation(self):
+        # The path must land in `path`, not only inside the serialized
+        # `arguments`: normalize_trace_record never inspects arguments, so the
+        # event would carry no input_summary and event_mentions_skill_file
+        # would report skill_invoked=False for a run that opened SKILL.md.
+        records, _ = sb.parse_trace_jsonl_text(sb.agy_trace_text(self.events, self.stdout))
+        events = [sb.normalize_trace_record(r, source="agy", index=i, line=i)
+                  for i, r in enumerate(records, 1)]
+        self.assertTrue(any(sb.event_mentions_skill_file(e) for e in events))
+        self.assertIn("SKILL.md", [e.get("input_summary") or "" for e in events][1])
+
+    def test_print_timeout_is_derived_from_the_invocation_timeout(self):
+        # agy enforces its own --print-timeout (default 5m) regardless of the
+        # harness budget, so a longer --timeout is silently truncated without
+        # this.
+        argv = sb.build_agy_cli_argv("agy", prompt="p", cwd="/ws", timeout=1800)
+        self.assertEqual(argv[argv.index("--print-timeout") + 1], "1800s")
+        self.assertNotIn("--print-timeout", sb.build_agy_cli_argv("agy", prompt="p", cwd="/ws"))
+
+    def test_reasoning_tokens_survive_normalization(self):
+        # agy reports thinking_tokens and the shared alias table already maps it
+        # onto reasoning_tokens, so filtering it out here would be the only
+        # reason the provider's own breakdown went unreported.
+        events = sb.parse_agy_events(json.dumps({"event": "result", "result": {
+            "status": "SUCCESS", "response": "x",
+            "usage": {"total_tokens": 3, "thinking_tokens": 4}}}))
+        self.assertEqual(sb.agy_usage(events)["thinking_tokens"], 4)
+        normalized = sb.normalize_usage(sb.agy_usage(events), source="trace_normalized")
+        self.assertEqual(normalized["reasoning_tokens"], 4)
+
+    def test_protocol_failures_are_named_rather_than_accepted(self):
+        # agy exits zero on a truncated or invalid stream, so a zero exit alone
+        # cannot separate "answered without the skill" from "the run broke".
+        for label, fixture in [
+            ("no terminal result", "stream-json-no-result.jsonl"),
+            ("unparsable line", "stream-json-bad-line.jsonl"),
+            ("failed status", "stream-json-failed-status.jsonl"),
+            ("non-string response", "stream-json-nonstring-response.jsonl"),
+            # Both of these carry a healthy terminal result, so only record
+            # validation separates them from a clean run. Left unvalidated the
+            # tool step vanishes and the run reads as a model that ran nothing,
+            # which is exactly what a negative trigger case wants to see.
+            ("unknown event type", "stream-json-unknown-event.jsonl"),
+            ("malformed tool step", "stream-json-malformed-step.jsonl"),
+        ]:
+            with self.subTest(stream=label):
+                events, errors = sb.parse_agy_stream(agy_fixture(fixture))
+                self.assertIsNotNone(sb.agy_protocol_error(events, errors), label)
+
+        events, errors = sb.parse_agy_stream(self.stdout)
+        self.assertEqual(errors, [])
+        self.assertIsNone(sb.agy_protocol_error(events, errors), "a healthy stream must not be flagged")
+        # A success that simply reports no usage is healthy, not a protocol
+        # error: absent telemetry is absent, not a broken observation.
+        no_usage, errors = sb.parse_agy_stream(agy_fixture("stream-json-no-usage.jsonl"))
+        self.assertIsNone(sb.agy_protocol_error(no_usage, errors))
+        self.assertIsNone(sb.agy_usage(no_usage))
+
+    def test_headless_auto_approval_is_paired_with_a_sandbox(self):
+        # Auto-approval is unavoidable headless (agy would block on a prompt),
+        # so it must not be granted bare: an untrusted manifest or skill would
+        # otherwise run arbitrary commands against the user's environment.
+        # codex uses --sandbox read-only and vibe a tool allowlist.
+        argv = sb.build_agy_cli_argv("agy", prompt="p", cwd="/ws")
+        self.assertIn("--sandbox", argv)
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertNotIn("--sandbox", sb.build_agy_cli_argv("agy", prompt="p", cwd="/ws", sandbox=False))
+
+    def test_a_degenerate_result_event_is_a_protocol_error(self):
+        # The captured object-response shape lives in a fixture; these are the
+        # hand-written micro-variants around it that a real CLI will not emit.
+        for label, result in [
+            ("status omitted", {"response": "ok"}),
+            ("numeric response", {"status": "SUCCESS", "response": 42}),
+        ]:
+            with self.subTest(result=label):
+                events, errors = sb.parse_agy_stream(json.dumps({"event": "result", "result": result}))
+                self.assertIsNotNone(sb.agy_protocol_error(events, errors), label)
+
+        events, errors = sb.parse_agy_stream(agy_fixture("stream-json-nonstring-response.jsonl"))
+        self.assertIsNotNone(sb.agy_protocol_error(events, errors))
+        # and it must not become candidate output that satisfies a text
+        # assertion — `str()` here manufactured a non-empty answer.
+        self.assertEqual(sb.agy_final_answer(events), "")
+
+        events, errors = sb.parse_agy_stream(json.dumps(
+            {"event": "result", "result": {"status": "SUCCESS", "response": "ok"}}))
+        self.assertIsNone(sb.agy_protocol_error(events, errors))
+        self.assertEqual(sb.agy_final_answer(events), "ok")
+
+    def test_a_failing_command_does_not_report_exit_code_zero(self):
+        # agy's tool_info is name/output/parameters only, and parameters is the
+        # tool INPUT, so no exit status exists even for a command that failed.
+        # Defaulting to 0 exported a false success for every such command.
+        tool = json.dumps({"event": "step_update", "step_update": {
+            "state": "DONE", "step_type": "tool", "tool_name": "run_command",
+            "tool_info": {"name": "run_command",
+                          "parameters": {"CommandLine": "false"}, "output": "boom"}}})
+        records, _ = sb.parse_trace_jsonl_text(sb.agy_trace_text(sb.parse_agy_events(tool), tool))
+        item = next(r["item"] for r in records if "item" in r)
+        self.assertNotIn("exit_code", item)
+        event = sb.normalize_trace_record(records[0], source="agy", index=1, line=1)
+        self.assertIsNone(event.get("exit_code"), "unknown must stay unknown, not become success")
+
+    def test_judge_enforces_the_verdict_schema_in_the_cli(self):
+        # Parity with codex_judge_invoke's --output-schema: let agy constrain
+        # the verdict rather than only rejecting a malformed one afterwards.
+        seen = {}
+
+        def fake_invoke(prompt, **kwargs):
+            seen.update(kwargs)
+            return {"answer": "{}", "stderr": "", "returncode": 0, "usage": None, "cost_usd": None}
+
+        schema = {"type": "object", "required": ["passed"]}
+        with mock.patch.object(sb, "agy_cli_invoke", side_effect=fake_invoke):
+            sb.agy_judge_invoke("prompt", judge_model=None, agy_cmd="agy",
+                                assertion_schema=schema, explore_hint=None)
+        self.assertEqual(json.loads(seen["json_schema"]), schema)
+
+    def test_judge_rejects_explore_hint(self):
+        with self.assertRaises(ValueError):
+            sb.agy_judge_invoke("prompt", judge_model=None, agy_cmd="agy",
+                                assertion_schema=None, explore_hint="/tmp/explore")
+
+    def test_a_protocol_failed_judge_reply_cannot_certify_a_verdict(self):
+        # agy exits zero on a stream it could not complete, and a syntactically
+        # valid verdict can ride one. Dropping the protocol error here persisted
+        # `passed: true` for a broken observation — a judge scoring a run it
+        # never really saw.
+        def fake_invoke(prompt, **kwargs):
+            return {"answer": json.dumps({"passed": True, "reasoning": "looks great"}),
+                    "provider_error": "agy terminal result reported status 'FAILED'",
+                    "stderr": "", "returncode": 0, "usage": None, "cost_usd": None}
+
+        with mock.patch.object(sb, "agy_cli_invoke", side_effect=fake_invoke):
+            res = sb.agy_judge_invoke("prompt", judge_model=None, agy_cmd="agy",
+                                      assertion_schema=None, explore_hint=None)
+        self.assertNotEqual(res["returncode"], 0, "a protocol failure must not report success")
+        self.assertIn("FAILED", res["stderr"], "the reason must survive into the judge transcript")
+
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "output.md"
+            out.write_text("candidate answer", encoding="utf-8")
+            with mock.patch.object(sb, "agy_cli_invoke", side_effect=fake_invoke):
+                row = sb.run_one_judge_task(judge_task(output_path=str(out)),
+                                            judge_backend="agy", judge_model=None)
+        self.assertFalse(row["passed"], "a protocol-failed judge reply was scored as a pass")
+
+    def test_import_trace_supports_agy_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            trace_file = base / "raw_agy.jsonl"
+            run_dir = base / "run"
+            run_dir.mkdir()
+            (run_dir / "output.md").write_text("sample answer", encoding="utf-8")
+            (run_dir / "metadata.json").write_text(json.dumps({"returncode": 0}), encoding="utf-8")
+            stream_lines = [
+                json.dumps({"event": "step_update", "step_update": {
+                    "state": "DONE", "step_type": "tool", "tool_name": "view_file",
+                    "tool_info": {"name": "view_file", "parameters": {"AbsolutePath": "/ws/a.txt"}, "output": "content"}}}),
+                json.dumps({"event": "result", "result": {"status": "SUCCESS", "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}})
+            ]
+            trace_file.write_text("\n".join(stream_lines), encoding="utf-8")
+            args = argparse.Namespace(trace=str(trace_file), run_dir=str(run_dir), source="agy",
+                                      out_events=None, out_metrics=None)
+            ret = sb.import_trace(args)
+            self.assertEqual(ret, 0)
+            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+            self.assertEqual(metrics["file_reads"], 1)
+            self.assertEqual(metrics["total_tokens"], 15)
+
+    def test_import_trace_rejects_invalid_agy_stream(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            trace_file = base / "bad_agy.jsonl"
+            run_dir = base / "run"
+            run_dir.mkdir()
+            (run_dir / "output.md").write_text("sample answer", encoding="utf-8")
+            (run_dir / "metadata.json").write_text(json.dumps({"returncode": 0}), encoding="utf-8")
+            stream_lines = [
+                json.dumps({"event": "step_update", "step_update": {
+                    "state": "DONE", "step_type": "tool", "tool_name": "view_file",
+                    "tool_info": {"name": "view_file", "parameters": {"AbsolutePath": "/ws/a.txt"}, "output": "content"}}}),
+            ]
+            trace_file.write_text("\n".join(stream_lines), encoding="utf-8")
+            args = argparse.Namespace(trace=str(trace_file), run_dir=str(run_dir), source="agy",
+                                      out_events=None, out_metrics=None)
+            ret = sb.import_trace(args)
+            self.assertEqual(ret, 0)
+            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+            metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertFalse(metrics["provider_response_complete"])
+            self.assertIn("provider_error", metadata)
+            self.assertEqual(metrics["usage_normalized"]["source"], "missing")
+
+    def test_write_tools_are_recorded_as_file_writes(self):
+        # Classified as a generic tool_call, a run that wrote files publishes
+        # file_writes: 0 next to complete trace evidence — a model that appears
+        # to have changed nothing. write_to_file is not hypothetical: a
+        # sandbox-escape probe on 1.1.8 used it in preference to the shell.
+        for tool, params in [("write_to_file", {"TargetFile": "/ws/out.txt"}),
+                             ("replace_file_content", {"TargetFile": "/ws/out.txt"}),
+                             ("multi_replace_file_content", {"TargetFile": "/ws/out.txt"}),
+                             ("notebook_edit", {"TargetFile": "/ws/nb.ipynb"})]:
+            with self.subTest(tool=tool):
+                self.assertEqual(sb.agy_tool_item_type(tool), "file_write")
+                stream = "\n".join([
+                    json.dumps({"event": "step_update", "step_update": {
+                        "state": "DONE", "step_type": "tool", "tool_name": tool,
+                        "tool_info": {"name": tool, "parameters": params}}}),
+                    json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "ok"}})])
+                events, _ = sb.parse_agy_stream(stream)
+                records, _ = sb.parse_trace_jsonl_text(sb.agy_trace_text(events, stream))
+                normalized = [sb.normalize_trace_record(r, source="agy", index=i, line=i)
+                              for i, r in enumerate(records, 1)]
+                self.assertIn("file_write", [e["type"] for e in normalized])
+                # The path must survive too, or the write is counted but unattributable.
+                self.assertIn("/ws/", " ".join(e.get("input_summary") or "" for e in normalized))
+
+        self.assertEqual(sb.agy_tool_item_type("view_file"), "file_read")
+        # Unclassified rather than guessed: an unverified read classification
+        # would both inflate file_reads and hide a write.
+        self.assertEqual(sb.agy_tool_item_type("sed_file"), "tool_call")
+
+    def test_a_json_envelope_with_a_raw_newline_still_parses(self):
+        # agy 1.1.8 puts an unescaped newline inside `response`
+        # (antigravity-cli#702), which is invalid strict JSON. Line-oriented
+        # strict parsing split one good envelope into two broken records, so an
+        # ordinary judge verdict with a trailing newline was reported as a
+        # provider failure -- a false failure, the mirror of a false pass.
+        raw = ('{"conversation_id":"c","status":"SUCCESS","response":"JSONTEST\n",'
+               '"duration_seconds":2.9,"usage":{"total_tokens":5}}')
+        events, errors = sb.parse_agy_stream(raw, output="json")
+        self.assertEqual(errors, [])
+        self.assertIsNone(sb.agy_protocol_error(events, errors))
+        self.assertEqual(sb.agy_final_answer(events), "JSONTEST\n")
+        self.assertEqual(sb.agy_usage(events)["total_tokens"], 5)
+
+        # Tolerance is scoped to control characters in an otherwise valid
+        # envelope; a genuinely truncated one must still fail closed.
+        broken, broken_errs = sb.parse_agy_stream('{"status":"SUCCESS","response":')
+        self.assertIsNotNone(sb.agy_protocol_error(broken, broken_errs))
+        # And the NDJSON path is untouched.
+        stream, stream_errs = sb.parse_agy_stream(agy_fixture("stream-json-success.jsonl"))
+        self.assertIsNone(sb.agy_protocol_error(stream, stream_errs))
+
+    def test_unsupported_tool_step_states_are_protocol_errors(self):
+        # agy_trace_text emits only exact `DONE` records, so any other spelling
+        # drops the tool while the run still ends in a successful result — the
+        # tool never happened as far as grading is concerned, and negative tool
+        # and process assertions pass on activity that did occur.
+        info = {"name": "run_command", "parameters": {"CommandLine": "jetpack version x"}}
+        for label, state in [("absent", None), ("non-string", 5),
+                             ("future state", "FINISHED"), ("wrong case", "done")]:
+            with self.subTest(state=label):
+                step = {"step_type": "tool", "tool_name": "run_command", "tool_info": info}
+                if state is not None:
+                    step["state"] = state
+                self.assertIsNotNone(
+                    sb.agy_record_error({"event": "step_update", "step_update": step}), label)
+
+        for state in ("DONE", "ACTIVE"):
+            with self.subTest(state=state):
+                self.assertIsNone(sb.agy_record_error({"event": "step_update", "step_update": {
+                    "state": state, "step_type": "tool", "tool_name": "run_command", "tool_info": info}}))
+
+    def test_file_operations_count_as_tool_calls(self):
+        # `file_read`/`file_write` are categories, not exemptions: a run that
+        # wrote a file could otherwise satisfy `expected_no_call` or
+        # `tool_count_le: 0` while plainly having invoked a tool.
+        for tool, params, category in [
+            ("write_to_file", {"TargetFile": "/ws/f.txt"}, "file_writes"),
+            ("view_file", {"AbsolutePath": "/ws/f.txt"}, "file_reads"),
+        ]:
+            with self.subTest(tool=tool):
+                stream = "\n".join([
+                    json.dumps({"event": "step_update", "step_update": {
+                        "state": "DONE", "step_type": "tool", "tool_name": tool,
+                        "tool_info": {"name": tool, "parameters": params, "output": "x"}}}),
+                    json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "ok"}})])
+                events, _ = sb.parse_agy_stream(stream)
+                records, _ = sb.parse_trace_jsonl_text(sb.agy_trace_text(events, stream))
+                _, metrics = sb.normalize_trace_records(records, source="agy")
+                self.assertEqual(metrics["tool_calls"], 1, f"{tool} was not counted as a tool call")
+                self.assertEqual(metrics[category], 1, f"{tool} lost its {category} category")
+
+    def test_the_resolved_model_labels_a_run_without_an_explicit_one(self):
+        # Without --model the harness has no model identity of its own, so
+        # metadata recorded model: null and the run dropped out of every
+        # by-model breakdown — even though agy names the model in its init
+        # event. grade_case_variant already falls back to the model the runner
+        # recorded, so this is that mechanism working, not a new convention.
+        events = sb.parse_agy_events(self.stdout)
+        self.assertEqual(sb.agy_init_model(events), "gemini-3.1-pro-low")
+        # An explicit request always wins, and the judge's bare json envelope
+        # carries no init event, so there is nothing to discover there.
+        self.assertIsNone(sb.agy_init_model(sb.parse_agy_events(agy_fixture("json-envelope-success.json"))))
+
+    def test_a_url_fetch_is_not_a_file_read(self):
+        # `read_url_content` reads a URL. Filed as a file_read it inflated
+        # file_reads and published the URL as an OTel file.path, so telemetry
+        # claimed a filesystem access that never happened.
+        self.assertEqual(sb.agy_tool_item_type("read_url_content"), "tool_call")
+        self.assertEqual(sb.agy_tool_item_type("view_file"), "file_read")
+        self.assertIn("read_url_content", sb.AGY_GENERIC_TOOLS)
+        self.assertNotIn("read_url_content", sb.AGY_READ_TOOLS)
+
+    def test_a_malformed_init_payload_is_a_protocol_error(self):
+        # init carries the resolved model and the advertised-tool inventory, so a
+        # null payload silently costs both — the model identity and the
+        # classification staleness signal — while the run scores as complete.
+        for label, record in [("null", {"event": "init", "init": None}),
+                              ("string", {"event": "init", "init": "ready"}),
+                              ("absent", {"event": "init"})]:
+            with self.subTest(payload=label):
+                self.assertIsNotNone(sb.agy_record_error(record), label)
+        self.assertIsNone(sb.agy_record_error({"event": "init", "init": {"model": "m"}}))
+
+        stream = "\n".join([json.dumps({"event": "init", "init": None}),
+                            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "ok"}})])
+        events, errors = sb.parse_agy_stream(stream)
+        self.assertIsNotNone(sb.agy_protocol_error(events, errors),
+                             "a good result must not paper over an unreadable init")
+
+    def test_non_completed_tool_events_do_not_fail_a_zero_budget(self):
+        # The metric counts completed calls; tool_count_le counted every event,
+        # so a run could report tool_calls=0 and still fail `tool_count_le: 0` —
+        # two numbers from one trace disagreeing about whether anything ran.
+        doc = {"schema_version": 2, "source": "agy", "events": [
+            {"index": 1, "type": "file_write", "status": "in_progress", "name": "write_to_file"},
+            {"index": 2, "type": "file_read", "status": "failed", "name": "view_file"}]}
+        metrics = {"schema_version": 2, "tool_calls": 0, "commands": 0, "file_reads": 0, "file_writes": 0}
+        with tempfile.TemporaryDirectory() as td:
+            base = write_run(Path(td) / "run", "done", metadata={"returncode": 0},
+                             metrics=metrics, events=doc)
+            result = sb.assertion_result({"name": "n", "type": "tool_count_le", "max": 0}, "done",
+                                         base / "output.md", run_base=base, manifest_dir=base)
+        self.assertTrue(result["passed"], f"metric says 0 tool calls but the budget failed: {result['evidence']}")
+
+    def test_contradictory_token_totals_are_not_a_measurement(self):
+        # Every field can be a valid integer while the block contradicts itself,
+        # and normalize_usage would then publish the false total — so a
+        # total_tokens_le budget could be satisfied by arithmetic that cannot be
+        # true.
+        def usage_for(block):
+            return sb.agy_usage(sb.parse_agy_events(json.dumps(
+                {"event": "result", "result": {"status": "SUCCESS", "response": "x", "usage": block}})))
+
+        self.assertIsNone(usage_for({"input_tokens": 100, "output_tokens": 100, "total_tokens": 1}),
+                          "a total below the parts it must contain is impossible")
+        # Only the impossible direction is rejected. agy 1.1.8 reports
+        # total == input + output exactly, and a larger total is legitimate if
+        # the provider adds components, so neither may be thrown away.
+        self.assertEqual(usage_for({"input_tokens": 13387, "output_tokens": 1052, "total_tokens": 14439}),
+                         {"input_tokens": 13387, "output_tokens": 1052, "total_tokens": 14439})
+        self.assertEqual(usage_for({"input_tokens": 10, "output_tokens": 5, "total_tokens": 40})["total_tokens"], 40)
+        self.assertEqual(usage_for({"input_tokens": 10, "output_tokens": 5}),
+                         {"input_tokens": 10, "output_tokens": 5})
+        self.assertEqual(
+            sb.normalize_usage(usage_for({"input_tokens": 100, "output_tokens": 100, "total_tokens": 1}),
+                               source="provider_reported"),
+            {"source": "missing"}, "a rejected block must report missing, not a partial figure")
+
+    def test_a_file_only_run_does_not_read_as_zero_tool_activity(self):
+        # The metric was corrected to count file operations while grading still
+        # built its own set from command/tool_call only, so a run whose sole act
+        # was a file write reported tool_calls=1 and simultaneously satisfied
+        # `tool_count_le: 0` and `expected_no_call` — while `tool_call tool:
+        # write_to_file` failed. One definition now feeds both.
+        stream = "\n".join([
+            json.dumps({"event": "step_update", "step_update": {
+                "state": "DONE", "step_type": "tool", "tool_name": "write_to_file",
+                "tool_info": {"name": "write_to_file", "parameters": {"TargetFile": "/ws/out.txt"}}}}),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "done"}})])
+        events, _ = sb.parse_agy_stream(stream)
+        records, _ = sb.parse_trace_jsonl_text(sb.agy_trace_text(events, stream))
+        doc, metrics = sb.normalize_trace_records(records, source="agy")
+        with tempfile.TemporaryDirectory() as td:
+            base = write_run(Path(td) / "run", "done", metadata={"returncode": 0},
+                             metrics=metrics, events=doc)
+            for assertion, expected in [
+                ({"name": "n", "type": "tool_count_le", "max": 0}, False),
+                ({"name": "n", "type": "tool_call", "expected_no_call": True}, False),
+                ({"name": "n", "type": "tool_call", "tool": "write_to_file"}, True),
+            ]:
+                with self.subTest(assertion=assertion["type"], expected=expected):
+                    result = sb.assertion_result(assertion, "done", base / "output.md",
+                                                 run_base=base, manifest_dir=base)
+                    self.assertEqual(result["passed"], expected, result["evidence"])
+
+    def test_tool_arguments_without_a_path_stay_matchable(self):
+        # A tool whose parameters carry no path — search_web {"query": ...} —
+        # normalized with an empty input_summary, so `tool_call` with a pattern
+        # could not match what the model actually did.
+        stream = "\n".join([
+            json.dumps({"event": "step_update", "step_update": {
+                "state": "DONE", "step_type": "tool", "tool_name": "search_web",
+                "tool_info": {"name": "search_web", "parameters": {"query": "needle"}}}}),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "done"}})])
+        events, _ = sb.parse_agy_stream(stream)
+        records, _ = sb.parse_trace_jsonl_text(sb.agy_trace_text(events, stream))
+        doc, metrics = sb.normalize_trace_records(records, source="agy")
+        event = doc["events"][0]
+        # Still a tool call, not a shell command: the arguments must not be read
+        # through the command lookup, or every non-shell tool inflates `commands`.
+        self.assertEqual(event["type"], "tool_call")
+        self.assertIn("needle", event.get("input_summary") or "")
+        self.assertEqual(metrics["commands"], 0)
+        with tempfile.TemporaryDirectory() as td:
+            base = write_run(Path(td) / "run", "done", metadata={"returncode": 0},
+                             metrics=metrics, events=doc)
+            result = sb.assertion_result(
+                {"name": "n", "type": "tool_call", "tool": "search_web", "pattern": "needle"},
+                "done", base / "output.md", run_base=base, manifest_dir=base)
+        self.assertTrue(result["passed"], result["evidence"])
+
+    def test_unknown_step_types_are_protocol_errors(self):
+        # Only `tool` steps are translated, so a renamed or added type would
+        # otherwise skip validation entirely and be dropped — tool activity
+        # scoring as zero while the run ends in a successful result.
+        info = {"name": "run_command", "parameters": {"CommandLine": "x"}}
+        for label, step_type in [("renamed", "tool_invocation"), ("added", "thinking"),
+                                 ("absent", None), ("non-string", 5)]:
+            with self.subTest(step_type=label):
+                step = {"state": "DONE", "tool_name": "run_command", "tool_info": info}
+                if step_type is not None:
+                    step["step_type"] = step_type
+                self.assertIsNotNone(
+                    sb.agy_record_error({"event": "step_update", "step_update": step}), label)
+
+        # Every step type agy 1.1.8 actually emits stays readable, including the
+        # literal `unknown` that agy itself uses.
+        for step_type in sorted(sb.AGY_STEP_TYPES):
+            with self.subTest(step_type=step_type):
+                step = {"state": "DONE", "step_type": step_type}
+                if step_type == "tool":
+                    step |= {"tool_name": "run_command", "tool_info": info}
+                self.assertIsNone(sb.agy_record_error({"event": "step_update", "step_update": step}))
+
+    def test_an_incomplete_terminal_shell_step_is_a_protocol_error(self):
+        # Type-checking only the fields that are present is not enough: an
+        # absent CommandLine normalizes to a COMPLETED command with empty text,
+        # and empty text matches no pattern, so command_not_ran and negative
+        # trigger cases pass on a record the harness could not read.
+        for label, step in [
+            ("no tool_info", {"state": "DONE", "step_type": "tool", "tool_name": "run_command"}),
+            ("no parameters", {"state": "DONE", "step_type": "tool", "tool_name": "run_command",
+                               "tool_info": {"name": "run_command"}}),
+            ("no CommandLine", {"state": "DONE", "step_type": "tool", "tool_name": "run_command",
+                                "tool_info": {"name": "run_command", "parameters": {"Cwd": "/ws"}}}),
+            ("blank CommandLine", {"state": "DONE", "step_type": "tool", "tool_name": "run_command",
+                                   "tool_info": {"name": "run_command", "parameters": {"CommandLine": "  "}}}),
+            ("unnamed tool", {"state": "DONE", "step_type": "tool",
+                              "tool_info": {"parameters": {"CommandLine": "x"}}}),
+        ]:
+            with self.subTest(step=label):
+                self.assertIsNotNone(
+                    sb.agy_record_error({"event": "step_update", "step_update": step}), label)
+
+        # A real DONE run_command always carries parameters.CommandLine, but
+        # `output` is legitimately absent for a command that failed (verified on
+        # agy 1.1.8), so requiring it would reject a healthy stream.
+        self.assertIsNone(sb.agy_record_error({"event": "step_update", "step_update": {
+            "state": "DONE", "step_type": "tool", "tool_name": "run_command",
+            "tool_info": {"name": "run_command", "parameters": {"CommandLine": "exit 7"}}}}))
+        # Only the terminal record reaches the trace, so a partial ACTIVE record
+        # is not a protocol violation.
+        self.assertIsNone(sb.agy_record_error({"event": "step_update", "step_update": {
+            "state": "ACTIVE", "step_type": "tool", "tool_name": "run_command"}}))
+
+    def test_the_event_vocabulary_is_closed(self):
+        # An unreadable record must not be silently dropped: the tool step it
+        # should have produced becomes zero activity, and a negative trigger or
+        # command_not_ran assertion then passes on a record nobody could parse.
+        for label, record in [
+            ("unknown event", {"event": "tool_invocation", "tool_invocation": {"x": 1}}),
+            ("non-dict step payload", {"event": "step_update", "step_update": "DONE"}),
+            ("non-dict result payload", {"event": "result", "result": "SUCCESS"}),
+            ("non-dict tool_info", {"event": "step_update", "step_update": {
+                "state": "DONE", "step_type": "tool", "tool_info": "ran it"}}),
+            ("non-dict parameters", {"event": "step_update", "step_update": {
+                "state": "DONE", "step_type": "tool", "tool_info": {"parameters": "x"}}}),
+            ("no discriminator", {"conversation_id": "c"}),
+        ]:
+            with self.subTest(record=label):
+                self.assertIsNotNone(sb.agy_record_error(record), label)
+
+        # The shapes agy really emits stay readable, including the bare
+        # `--output-format json` envelope, which carries no discriminator.
+        for label, record in [
+            ("init", {"event": "init", "init": {"model": "m"}}),
+            ("tool step", {"event": "step_update", "step_update": {
+                "state": "DONE", "step_type": "tool", "tool_name": "run_command",
+                "tool_info": {"name": "run_command", "parameters": {"CommandLine": "x"}}}}),
+            ("result", {"event": "result", "result": {"status": "SUCCESS", "response": "ok"}}),
+            ("json envelope", {"status": "SUCCESS", "response": "ok"}),
+        ]:
+            with self.subTest(record=label):
+                self.assertIsNone(sb.agy_record_error(record), label)
+
+    def test_impossible_token_counts_do_not_abort_the_batch(self):
+        # OutcomeContext rejects booleans and negative counts with a hard
+        # ValueError, so letting them through here killed the whole run-agent
+        # batch before any failure artifact was written. `isinstance(True, int)`
+        # is True, which is how a boolean passed a numeric filter.
+        for label, usage in [("boolean", {"total_tokens": True, "input_tokens": 5}),
+                             ("negative", {"total_tokens": -7, "input_tokens": 5}),
+                             ("infinite", {"total_tokens": float("inf"), "input_tokens": 5}),
+                             # Truncated to a plausible integer by normalize_usage,
+                             # turning garbage into a credible-looking count.
+                             ("fractional", {"total_tokens": 1.5, "input_tokens": 5}),
+                             # JSON integers are unbounded; the float conversion in
+                             # OutcomeContext raises OverflowError, so an unbounded
+                             # count aborts the batch unless it is rejected here.
+                             ("unbounded", {"total_tokens": 10 ** 400, "input_tokens": 5})]:
+            with self.subTest(usage=label):
+                events = sb.parse_agy_events(json.dumps({"event": "result", "result": {
+                    "status": "SUCCESS", "response": "ok", "usage": usage}}))
+                # The whole block goes, not just the bad field: a partial report
+                # would present provider garbage as a measurement.
+                self.assertIsNone(sb.agy_usage(events), label)
+
+        events = sb.parse_agy_events(json.dumps({"event": "result", "result": {
+            "status": "SUCCESS", "response": "ok",
+            "usage": {"total_tokens": 7, "input_tokens": 5}}}))
+        self.assertEqual(sb.agy_usage(events), {"input_tokens": 5, "total_tokens": 7})
 
 
 class TraceDialectRegistryTests(unittest.TestCase):

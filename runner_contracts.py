@@ -18,6 +18,7 @@ class Provider(str, Enum):
     CODEX = "codex"
     CLAUDE = "claude"
     VIBE = "vibe"
+    AGY = "agy"
     SUBAGENT = "subagent"
     JETTY = "jetty"
 

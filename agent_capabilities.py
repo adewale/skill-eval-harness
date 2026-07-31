@@ -38,6 +38,7 @@ CODEX_TRIGGER_DEFAULT_CMD = (
     "--ignore-user-config --ignore-rules"
 )
 VIBE_DEFAULT_CMD = "vibe"
+AGY_DEFAULT_CMD = "agy"
 
 
 @dataclass(frozen=True)
@@ -484,6 +485,21 @@ _VIBE_JUDGE = SurfaceBinding(
     (_option("--vibe-cmd", "vibe_cmd", VIBE_DEFAULT_CMD,
              "argv-style Vibe command prefix for --judge-backend vibe; shell metacharacters are not interpreted"),),
 )
+_AGY_ANSWER = SurfaceBinding(
+    ObjectRef("skill_benchmark", "AgyBackend"),
+    (_option("--agy-cmd", "agy_cmd", AGY_DEFAULT_CMD,
+             "argv-style Antigravity command prefix for --agent agy answer runs; shell metacharacters are not interpreted"),),
+)
+_AGY_TRIGGER = SurfaceBinding(
+    ObjectRef("run_trigger_matrix", "AgyAdapter"),
+    (_option("--agy-cmd", "agy_cmd", AGY_DEFAULT_CMD,
+             "Antigravity command prefix; the harness adds --print/--output-format/--add-dir/--new-project"),),
+)
+_AGY_JUDGE = SurfaceBinding(
+    ObjectRef("skill_benchmark", "agy_judge_invoke"),
+    (_option("--agy-cmd", "agy_cmd", AGY_DEFAULT_CMD,
+             "argv-style Antigravity command prefix for --judge-backend agy; shell metacharacters are not interpreted"),),
+)
 
 _RUN_AGENT = AnswerEntrypoint(
     "run-agent", ObjectRef("skill_benchmark", "run_agent"))
@@ -645,6 +661,25 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
         workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
         smoke=SmokeTarget("vibe", "SMOKE_VIBE_MODEL", "devstral-small-latest", "answer"),
         failure_marker="[VIBE FAILURE",
+    ),
+    BackendRegistration(
+        name="agy",
+        capabilities=AgentCapabilities(
+            answer_runner=True, autonomous_trigger=True, trigger_ablation=True,
+            trace_artifacts=True, token_usage=True, dollar_cost="missing",
+            judge_backend=True, tool_replay=False,
+            live_smoke_env="RUN_AGY_TRIGGER_SMOKE",
+            notes="Google Antigravity (`agy`) support uses --print with --output-format stream-json, Agent Skills discovery from .agents/skills, and --model for model selection. Shell tools run in the CLI's own scratch directory unless the workspace is attached, so every invocation passes --add-dir/--new-project. agy exposes no config-home override (no CODEX_HOME/VIBE_HOME equivalent), so runs record config_isolated=False and the user's own configuration influences a measurement; the eval requirement is filed upstream at https://github.com/google-antigravity/antigravity-cli/issues/155#issuecomment-5120099256. An agy run is also not contained: --sandbox restricts terminal operations only, --dangerously-skip-permissions auto-approves the sandbox-bypass prompt as well (antigravity-cli#36), and dropping that flag makes the CLI silently decline shell tools instead of failing safe. Runs therefore record sandbox_contains_run=False; prefer a disposable machine for untrusted skills. The terminal result event reports token usage but no dollar figure, so cost is explicit missing.",
+        ),
+        answer_route="native",
+        trace=ObjectRef("skill_benchmark", "AGY_TRACE_DIALECT"),
+        answer_entrypoints=(_RUN_AGENT,),
+        answer=_AGY_ANSWER,
+        trigger=_AGY_TRIGGER,
+        judge=_AGY_JUDGE,
+        workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
+        smoke=SmokeTarget("agy", "SMOKE_AGY_MODEL", "gemini-3.6-flash-low", "answer"),
+        failure_marker="[AGY FAILURE",
     ),
     BackendRegistration(
         name="subagent",

@@ -10,8 +10,9 @@ covered through its adapter contract and shared path-evidence detector.
 Live (manual): RUN_AGENT_INVOKE_SMOKE=1 runs one cheap invocation for every
 supported live trigger adapter/model to verify auth/network/process plumbing.
 RUN_TRIGGER_SMOKE=1 runs the fuller Claude trigger matrix across haiku, sonnet,
-and opus; RUN_CODEX_TRIGGER_SMOKE=1, RUN_PI_TRIGGER_SMOKE=1, and
-RUN_VIBE_TRIGGER_SMOKE=1 run the same trigger path for those adapters:
+and opus; RUN_CODEX_TRIGGER_SMOKE=1, RUN_PI_TRIGGER_SMOKE=1,
+RUN_VIBE_TRIGGER_SMOKE=1, and RUN_AGY_TRIGGER_SMOKE=1 run the same trigger
+path for those adapters:
 
     RUN_AGENT_INVOKE_SMOKE=1 python3 -m unittest tests.test_trigger_matrix.AgentInvokeSmokeTests -v
     RUN_TRIGGER_SMOKE=1 python3 -m unittest tests.test_trigger_matrix -v
@@ -29,6 +30,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from helpers import skill_markdown
+
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
 import skill_benchmark as sb
@@ -43,6 +46,13 @@ from trigger_contracts import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DEMO_MANIFEST = ROOT / "examples" / "demo-skill" / "evals" / "shared-benchmark.json"
+AGY_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "agy"
+
+
+def agy_fixture(name: str) -> str:
+    """One checked-in agy protocol shape, shared with the runner tests so the
+    trigger and answer paths are held against the same bytes."""
+    return (AGY_FIXTURES / name).read_text(encoding="utf-8")
 
 
 def demo_trigger_rows():
@@ -1079,6 +1089,7 @@ class AgentInvokeSmokeTests(unittest.TestCase):
                     claude_bin=os.environ.get("CLAUDE_INVOKE_SMOKE_BIN", "claude"),
                     codex_cmd=os.environ.get("CODEX_INVOKE_SMOKE_CMD", tm.DEFAULT_CODEX_CMD),
                     vibe_cmd=os.environ.get("VIBE_INVOKE_SMOKE_CMD", tm.VIBE_DEFAULT_CMD),
+                    agy_cmd=os.environ.get("AGY_INVOKE_SMOKE_CMD", tm.AGY_DEFAULT_CMD),
                     max_turns=int(os.environ.get("CLAUDE_INVOKE_SMOKE_MAX_TURNS", "1")),
                 )
                 models = _live_invoke_smoke_models(agent_name, adapter)
@@ -1143,6 +1154,7 @@ class AgentInvokeSmokeConfigTests(unittest.TestCase):
             "CODEX_INVOKE_SMOKE_MODEL": "",
             "PI_INVOKE_SMOKE_MODEL": "",
             "VIBE_INVOKE_SMOKE_MODEL": "",
+            "AGY_INVOKE_SMOKE_MODEL": "",
         }
         with mock.patch.dict(os.environ, clean_env, clear=False):
             for key in clean_env:
@@ -1152,11 +1164,12 @@ class AgentInvokeSmokeConfigTests(unittest.TestCase):
                 name: _live_invoke_smoke_models(name, tm.adapter_instance(name))
                 for name in agents
             }
-        self.assertEqual(agents, ["claude", "codex", "pi", "vibe"])
+        self.assertEqual(agents, ["claude", "codex", "pi", "vibe", "agy"])
         self.assertEqual(models["claude"], ["haiku", "sonnet", "opus"])
         self.assertEqual(models["codex"], [None])
         self.assertEqual(models["pi"], [None])
         self.assertEqual(models["vibe"], [None])
+        self.assertEqual(models["agy"], [None])
 
     def test_advertised_live_smoke_envs_are_consumed_by_tests(self):
         # Trigger smokes live here; the Jetty answer-path smoke has its own
@@ -1703,6 +1716,146 @@ class TriggerComparisonTests(unittest.TestCase):
         baseline["evidence_class"] = "answer"
         with self.assertRaises(SystemExit):
             sb.build_trigger_comparison(baseline, trigger_report(self._ablation_rows(), ablation="x", provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH))
+class AgyAdapterTests(unittest.TestCase):
+    """Offline checks for the agy adapter. No CLI, no credentials, no tokens."""
+
+    def test_skills_mount_where_agy_discovers_them(self):
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td) / "tree"
+            (tree / "demo").mkdir(parents=True)
+            (tree / "demo" / "SKILL.md").write_text(skill_markdown(), encoding="utf-8")
+            workspace = Path(td) / "ws"
+            workspace.mkdir()
+            copied = tm.AgyAdapter().mount(tree, workspace)
+            self.assertTrue(copied, "mount returned no detection needles")
+            self.assertTrue((workspace / ".agents" / "skills" / "demo" / "SKILL.md").exists(),
+                            "agy discovers Agent Skills from .agents/skills")
+
+    def test_invocation_attaches_the_workspace(self):
+        # Without --add-dir/--new-project agy runs shell tools in its own
+        # scratch directory, so a mounted skill is never reachable and every
+        # run looks like a no-trigger. Pin the flags, not just the behaviour.
+        argv = tm.build_agy_cli_argv(tm.AGY_DEFAULT_CMD, prompt="what version?",
+                                     cwd=Path("/tmp/ws"), output="stream-json", model=None)
+        self.assertIn("--add-dir", argv)
+        self.assertEqual(argv[argv.index("--add-dir") + 1], "/tmp/ws")
+        self.assertIn("--new-project", argv)
+        self.assertEqual(argv[argv.index("--print") + 1], "what version?")
+
+    def test_mounted_path_evidence_is_read_from_agy_tool_keys(self):
+        # agy names its tool inputs AbsolutePath/CommandLine rather than
+        # file_path/command. A detector that does not know those spellings sees
+        # no evidence for a run that really did load the skill, and the matrix
+        # reports 0% activation instead of a broken detector.
+        mounted = Path("/ws/.agents/skills/demo/SKILL.md")
+        stdout = "\n".join([
+            json.dumps({"event": "step_update", "step_update": {
+                "state": "DONE", "step_type": "tool", "tool_name": "view_file",
+                "tool_info": {"name": "view_file", "parameters": {"AbsolutePath": str(mounted)}}}}),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "done"}}),
+        ])
+        detection = tm.detect_trigger_detection(stdout, [mounted])
+        self.assertTrue(detection.triggered, "agy's AbsolutePath tool input carries the mounted skill path")
+
+    def _agy_adapter_returning(self, stdout):
+        class Fake(tm.AgyAdapter):
+            _run_argv = staticmethod(lambda *a, **k: InvocationOutcome.from_process(
+                stdout=stdout, stderr="", returncode=0, elapsed_ms=5))
+        return Fake()
+
+    def test_a_broken_stream_is_not_a_clean_no_trigger(self):
+        # agy exits zero on a truncated stream. Left alone, a negative case
+        # scores as a successful no-trigger and inflates the matrix, which is
+        # indistinguishable in the summary table from a real result.
+        for label, fixture in [("no terminal result", "stream-json-no-result.jsonl"),
+                               ("unparsable line", "stream-json-bad-line.jsonl"),
+                               ("failed status", "stream-json-failed-status.jsonl"),
+                               ("non-string response", "stream-json-nonstring-response.jsonl")]:
+            with self.subTest(stream=label), tempfile.TemporaryDirectory() as td:
+                outcome = self._agy_adapter_returning(agy_fixture(fixture)).invoke("q", None, Path(td), 10)
+                self.assertFalse(outcome.observation_complete, label)
+                self.assertTrue(outcome.provider_error, label)
+
+        with tempfile.TemporaryDirectory() as td:
+            healthy = self._agy_adapter_returning(
+                agy_fixture("stream-json-success.jsonl")).invoke("q", None, Path(td), 10)
+        self.assertTrue(healthy.observation_complete)
+        self.assertIsNone(healthy.provider_error)
+
+    def test_a_trigger_run_reports_tools_it_could_not_classify(self):
+        # The normalized stream this adapter hands back is what
+        # write_trace_artifacts feeds to normalize_trace_records, so a trigger
+        # run publishes the same tool_calls/file_reads/file_writes counts an
+        # answer run does. An unclassified tool skews them here identically, so
+        # the staleness of the classification must be just as visible on this
+        # path — it is the same helper and the same metadata fields.
+        stream = "\n".join([
+            json.dumps({"event": "init", "init": {"model": "m", "cwd": "/ws",
+                                                  "tools": ["run_command", "teleport_file"]}}),
+            json.dumps({"event": "step_update", "step_update": {
+                "state": "DONE", "step_type": "tool", "tool_name": "teleport_file",
+                "tool_info": {"name": "teleport_file", "parameters": {"TargetFile": "/ws/x"}}}}),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "ok"}})])
+        with tempfile.TemporaryDirectory() as td:
+            outcome = self._agy_adapter_returning(stream).invoke("q", None, Path(td), 10)
+        self.assertEqual(outcome.metadata.get("unclassified_tools_used"), ["teleport_file"])
+        self.assertEqual(outcome.metadata.get("unclassified_tools_advertised"), ["teleport_file"])
+        # A fully classified run carries no gap fields, so their presence means something.
+        with tempfile.TemporaryDirectory() as td:
+            clean = self._agy_adapter_returning(
+                agy_fixture("stream-json-success.jsonl")).invoke("q", None, Path(td), 10)
+        self.assertNotIn("unclassified_tools_used", clean.metadata)
+        self.assertNotIn("unclassified_tools_advertised", clean.metadata)
+
+    def test_a_trigger_run_records_the_model_agy_resolved(self):
+        # Without --model the row kept None and grouped under "default", losing
+        # the identity agy names in its init event. The grid stays keyed on the
+        # REQUESTED model — "no --model" is a real cell, and a spawn failure has
+        # no stream to resolve a model from — so the measured identity is
+        # recorded alongside rather than used to relabel the cell.
+        stream = agy_fixture("stream-json-success.jsonl")
+        with tempfile.TemporaryDirectory() as td:
+            outcome = self._agy_adapter_returning(stream).invoke("q", None, Path(td), 10)
+        self.assertEqual(outcome.metadata.get("resolved_model"), "gemini-3.1-pro-low")
+        self.assertEqual(outcome.metadata.get("model_source"), "provider_reported")
+
+        # An explicit request needs no discovery, so nothing is recorded.
+        with tempfile.TemporaryDirectory() as td:
+            explicit = self._agy_adapter_returning(stream).invoke("q", "gemini-explicit", Path(td), 10)
+        self.assertIsNone(explicit.metadata.get("resolved_model"))
+        self.assertIsNone(explicit.metadata.get("model_source"))
+
+    def test_matrix_timeout_reaches_agy_print_mode(self):
+        # agy applies its own five-minute --print-timeout regardless of the
+        # matrix budget, so a longer --timeout is cut short without this.
+        argv = tm.build_agy_cli_argv(tm.AGY_DEFAULT_CMD, prompt="q", cwd=Path("/ws"),
+                                     output="stream-json", model=None, timeout=900)
+        self.assertEqual(argv[argv.index("--print-timeout") + 1], "900s")
+
+    def test_bad_command_prefix_fails_without_spawning(self):
+        adapter = tm.AgyAdapter(agy_cmd='agy "unterminated')
+        with tempfile.TemporaryDirectory() as td:
+            outcome = adapter.invoke("q", None, Path(td), timeout=5)
+        self.assertEqual(outcome.returncode, 127)
+        self.assertFalse(outcome.metadata.get("config_isolated", True),
+                         "agy has no config-home override; runs must not claim isolation")
+
+
+@unittest.skipUnless(os.environ.get("RUN_AGY_TRIGGER_SMOKE") == "1",
+                     "manual smoke: set RUN_AGY_TRIGGER_SMOKE=1 (needs agy CLI + credentials, spends tokens)")
+class AgyMatrixSmokeTests(unittest.TestCase):
+    def test_agy_matrix_end_to_end(self):
+        runs = int(os.environ.get("AGY_TRIGGER_SMOKE_RUNS", "1"))
+        model = os.environ.get("AGY_TRIGGER_SMOKE_MODEL")
+        report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["agy"],
+                               models=[model] if model else [None], runs_per_query=runs,
+                               timeout=300, workers=1,
+                               agy_cmd=os.environ.get("AGY_TRIGGER_SMOKE_CMD", tm.AGY_DEFAULT_CMD))
+        tm.print_matrix(report["matrix"])
+        incomplete = [r for r in report["results"] if not r["observation_complete"]]
+        self.assertFalse(incomplete, f"broken runs (crash/timeout), not trigger signal: {incomplete}")
+        self.assertTrue(any(r["triggered"] for r in report["results"]),
+                        "no agy run loaded the skill — detection, auth, or mounting is broken")
 
 
 if __name__ == "__main__":

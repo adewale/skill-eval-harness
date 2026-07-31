@@ -26,10 +26,10 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 ## Core loop
 
 1. **Describe cases** in `evals/shared-benchmark.json`: prompt, split, fixture files, variants, assertions, and ablations.
-2. **Prepare tasks** with `skill-benchmark prepare`; generation rows omit `expected_behavior` and judge rubrics unless you explicitly request them.
-3. **Run tasks** with Claude, Codex, Mistral Vibe, Jetty, or any runner that writes the run-output contract; Pi support is currently trigger-focused plus workspace-specific smoke tooling.
-4. **Grade outputs** with deterministic assertions: string, regex, file, JSON field, and opt-in `script` oracles.
-5. **Inspect the report** for pass rates, flaky repeated runs, no-lift cases, saturated assertions, judge tasks, and trigger/no-trigger results.
+1. **Prepare tasks** with `skill-benchmark prepare`; generation rows omit `expected_behavior` and judge rubrics unless you explicitly request them.
+1. **Run tasks** with Claude, Codex, Mistral Vibe, Jetty, or any runner that writes the run-output contract; Pi support is currently trigger-focused plus workspace-specific smoke tooling.
+1. **Grade outputs** with deterministic assertions: string, regex, file, JSON field, and opt-in `script` oracles.
+1. **Inspect the report** for pass rates, flaky repeated runs, no-lift cases, saturated assertions, judge tasks, and trigger/no-trigger results.
 
 ## What the CLI owns
 
@@ -485,7 +485,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 |---|---|
 | `skill-benchmark run-codex` | Drive prepared rows through isolated `codex exec --json --output-last-message`; save trace, events, metrics, answer. |
 | `skill-benchmark run-claude` | Drive `claude -p --output-format stream-json`, capturing real per-run cost + token usage AND the full tool-use stream as the run's trace (`trace.jsonl`/`events.json`), so process assertions have evidence on Claude answer runs. |
-| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, or `--agent vibe`); compatibility wrappers delegate here. |
+| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, `--agent vibe`, or `--agent agy`); compatibility wrappers delegate here. |
 | `skill-benchmark run-subagent` | In-process backend seam: any provider via `--agent-cmd`, tool replay, multi-turn `turns`. |
 | `skill-benchmark import-trace` | Normalize a raw JSONL trace into `events.json`/`metrics.json` for process/efficiency checks. |
 
@@ -542,6 +542,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 - **Anthropic skill-creator**: use `grade --write-grading-files` and `export-anthropic` for compatible `grading.json`/`benchmark.json` shapes.
 - **Pi**: use `examples/adewale-workspace/run_pi_smoke.py` for the Adewale multi-repo smoke workflow and `skill-pi-trigger-eval` for autonomous trigger checks.
 - **Mistral Vibe**: use `run-agent --agent vibe`, `judge --judge-backend vibe`, and `skill-trigger-matrix --agent vibe`. The harness isolates `VIBE_HOME`, passes `--model` as `VIBE_ACTIVE_MODEL`, mounts trigger skills under `.agents/skills`, and requires `MISTRAL_API_KEY` (or a copied `.env` from the current `VIBE_HOME`, falling back to `~/.vibe/.env`) for live runs.
+- **Google Antigravity (Agy)**: use `run-agent --agent agy`, `judge --judge-backend agy`, and `skill-trigger-matrix --agent agy`. The harness drives `agy --print` with `--output-format stream-json`, mounts trigger skills under `.agents/skills`, always attaches the workspace with `--add-dir`/`--new-project`, and validates protocol completeness. Agy exposes no config-home override, so runs record `config_isolated=False`; its result event reports token usage but no dollar cost. See [docs/agent-parity.md](docs/agent-parity.md) for the sandbox and ambient-tool boundaries.
 - **Other runners**: use `prepare` JSONL as the import format and write results back to the run output contract.
 - **Jetty**: use `export-jetty`, `run-jetty`, and `import-jetty-results` for REST runbook-mode execution. Response shapes were validated against production `flows-api.jetty.io` on 2026-07-17 (captured fixtures in `tests/fixtures/jetty/`); re-verify anytime with the opt-in live smoke — `RUN_JETTY_SMOKE=1 JETTY_API_TOKEN=... JETTY_SMOKE_COLLECTION=<your-collection> python3 -m unittest discover tests -k smoke_jetty` (five real sandbox runs, never in default CI).
 
@@ -577,7 +578,7 @@ skill-eval-harness/
 ├── pyproject.toml
 ├── skill_benchmark.py          # the CLI, grading, reporting, and runner adapters
 ├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
-├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
+├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/agy/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance/task value objects
 ├── agent_capabilities.py       # unified backend surfaces, capabilities, CLI options, smoke, and failure policy
 ├── experimental_pairs.py       # exact pair identities and blocked-pair construction

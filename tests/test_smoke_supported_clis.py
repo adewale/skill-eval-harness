@@ -40,6 +40,7 @@ class SupportedCliSmokeTests(unittest.TestCase):
             "codex": ("SMOKE_CODEX_MODEL", "gpt-5.4-mini", "answer"),
             "vibe": ("SMOKE_VIBE_MODEL", "devstral-small-latest", "answer"),
             "pi": ("SMOKE_PI_MODEL", "openai-codex/gpt-5.4-mini", "trigger"),
+            "agy": ("SMOKE_AGY_MODEL", "gemini-3.6-flash-low", "answer"),
         }
         self.assertEqual(
             {name: (target.model_env, target.fallback_model, target.population)
@@ -150,7 +151,7 @@ class SupportedCliSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="claude",
                                       claude_model="haiku", codex_model="unused", vibe_model="unused",
-                                      pi_model="unused", timeout=1)
+                                      pi_model="unused", agy_model="unused", timeout=1)
             with mock.patch.object(smoke, "parse_args", return_value=args), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/claude"), \
                  mock.patch.object(smoke, "run", return_value=False) as run:
@@ -182,7 +183,7 @@ class SupportedCliSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="pi",
                                       claude_model="unused", codex_model="unused", vibe_model="unused",
-                                      pi_model="model", timeout=1)
+                                      pi_model="model", agy_model="model", timeout=1)
             with mock.patch.object(smoke, "parse_args", return_value=args), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/pi"), \
                  mock.patch.object(smoke, "run", return_value=True) as run, \

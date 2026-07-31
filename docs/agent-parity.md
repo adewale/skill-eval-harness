@@ -11,8 +11,57 @@ Run `skill-benchmark agent-capabilities` for the machine-readable registry view.
 | `pi` | no core answer runner | `none` | yes (`skill-pi-trigger-eval`, `skill-trigger-matrix --agent pi`) | yes | yes | yes, when stream reports it | `trace_normalized` from the stream when available | no | no | `RUN_PI_TRIGGER_SMOKE` |
 | `jetty` | yes (`export-jetty` / `run-jetty` / `import-jetty-results`; answer-path ablations only) | `export_import` | no | no | yes, imported | yes, imported | `provider_reported`, imported | no (planned in Jetty TODO) | no | `RUN_JETTY_SMOKE` |
 | `vibe` | yes (`run-agent --agent vibe`) | `native` | yes (`skill-trigger-matrix --agent vibe`) | yes | yes | no in current CLI output | `missing` in current CLI output | yes (`judge --judge-backend vibe`) | no native replay | `RUN_VIBE_TRIGGER_SMOKE` |
+| `agy` | yes (`run-agent --agent agy`) | `native` | yes (`skill-trigger-matrix --agent agy`) | yes | yes | yes, from the terminal result event | `missing` in current CLI output | yes (`judge --judge-backend agy`) | no native replay | `RUN_AGY_TRIGGER_SMOKE` |
 | `subagent` | yes (`run-subagent`) | `subagent` | no | no | yes | yes, when backend returns it | `missing` unless backend emits cost | no | yes | n/a |
 | `stub` | no native answer runner; demo stub uses `run-codex --codex-cmd` | `none` | yes | yes | yes | no (not applicable) | `not_applicable` | no | no | n/a |
+
+## What changed for Agy
+
+Google Antigravity (`agy`) is a native backend for the surfaces its headless
+mode exposes. `agy` 1.1.8 added `--output-format stream-json` explicitly for
+eval harnesses: a typed NDJSON stream with a closed `step_type` vocabulary.
+
+- `skill-benchmark run-agent --agent agy` runs prepared answer rows through
+  `agy --print "$PROMPT" --output-format stream-json` from an isolated workspace.
+
+- `skill-benchmark judge --judge-backend agy` runs native judges against the
+  plain `--output-format json` envelope and validates the final response against
+  the harness verdict schema.
+
+- `skill-trigger-matrix --agent agy` mounts skills under project
+  `.agents/skills` — the same location Vibe reads — runs raw trigger queries,
+  and detects loading through the shared mounted-path evidence detector.
+
+- **Every invocation passes `--add-dir <workspace> --new-project`.** agy runs its
+  shell tools in its own scratch directory (`~/.gemini/antigravity-cli/scratch`)
+  rather than the process working directory, so without attaching the workspace
+  a prepared task's relative commands run somewhere else and find nothing —
+  which reads as a model failure rather than a harness one.
+
+- **An agy run is neither isolated nor contained, and this is not closable at the
+  current CLI surface.** Two upstream gaps, both reproduced on agy 1.1.8:
+
+  - No config-home override exists (no `CODEX_HOME`/`CLAUDE_CONFIG_DIR`/`VIBE_HOME`
+    equivalent), so the user's own Antigravity configuration — settings, plugins,
+    MCP servers, user-level skills — is part of every measurement. Runs record
+    `config_isolated=False`. The eval requirement is filed upstream at
+    [antigravity-cli#155](https://github.com/google-antigravity/antigravity-cli/issues/155#issuecomment-5120099256).
+  - `--sandbox` restricts terminal operations only, and
+    `--dangerously-skip-permissions` auto-approves the sandbox-bypass prompt as
+    well ([antigravity-cli#36](https://github.com/google-antigravity/antigravity-cli/issues/36)).
+    A run asked to write outside its workspace did so via `write_to_file`, which
+    the sandbox never covered. Runs record `sandbox_contains_run=False`.
+
+  Dropping `--dangerously-skip-permissions` does not fail safe: agy then silently
+  declines shell tools and returns an empty answer, so no process assertion is
+  satisfiable. Treat an agy run as unsandboxed access to the invoking user's
+  environment, and prefer a disposable machine for untrusted skills.
+
+- The terminal `result` event reports token usage but no dollar figure, so cost
+  is explicit `missing` until the CLI exports it or the harness adds an estimator.
+
+Live smoke is gated by `RUN_AGY_TRIGGER_SMOKE=1`; token-backed smokes passed for
+agy 1.1.8 on macOS on 2026-07-29.
 
 ## What changed for Vibe
 

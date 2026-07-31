@@ -56,6 +56,23 @@ The point of the adapter work is not only feature parity. The refactor should ma
 11. **Enforce docs/registry drift tests.** `agent_capabilities.py`, `docs/agent-parity.md`, command help, and this spec should be checked together whenever a backend gains or loses a surface.
 12. **Prefer conformance tests over provider-specific assertions.** The same tests should run against every adapter that claims a capability: final-answer extraction, trace normalization, judge verdict parsing, transcript writing, trigger detection, ablation provenance, and failure semantics.
 
+### The fail-closed rule
+
+At a provider boundary, absent or unexpected data is a protocol error, never a default.
+
+This is the single rule behind items 4, 5, and 12, and it is worth stating separately because violating it is silent. A harness that raises is debuggable; a harness that substitutes a plausible value for a missing one simply reports a wrong number, and an eval's whole output is numbers. Adding the `agy` backend produced eight defects of exactly this shape, each of which passed its tests:
+
+- a shell step with no reported exit status exported `exit_code = 0`, so every failing command counted as a success;
+- a non-string `response` was coerced with `str()`, yielding non-empty output that can satisfy a text assertion;
+- a terminal result carrying no `status` was read as success, in the very check added to stop that;
+- a stream with no terminal result was recorded as a complete observation, so a truncated run scored as a clean no-trigger;
+- unparsable stream lines were discarded, so a dropped tool call read as a model that did nothing;
+- absent usage was at risk of being reported as zero rather than `missing`, which downstream cannot distinguish from a real measurement.
+
+Concretely, for every adapter: a response that cannot be parsed sets `provider_error` and writes a runner failure body rather than an empty answer; unknown values stay unknown rather than becoming zero or success; and telemetry that a provider did not report is labelled `missing`. Headless auto-approval is paired with a sandbox or a tool allowlist, never granted bare.
+
+The root cause of the eight was a fixture set, not a reviewer: `tests/fixtures/agy/` held one captured *successful* run, so the degenerate space was untested by construction. Item 4's fixture list is the countermeasure, and `tests/test_backend_conformance.py` runs these assertions across every backend claiming `answer_runner`, driven from `AGENT_CAPABILITIES` so a new adapter inherits them by registering.
+
 ## Current Claude features
 
 | Surface | Current Claude behavior |

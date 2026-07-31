@@ -10,7 +10,7 @@ runs every (agent, model, query) cell `--runs-per-query` times, and reports a
 per-cell trigger rate. You tune the skill description against that matrix; see
 docs/tuning-skill-activation.md for the loop.
 
-Five adapters ship:
+Six adapters ship:
 
 - `claude`  — Claude Code CLI subagents (`claude -p`), defaulting to the
               haiku / sonnet / opus aliases. The skill mounts as a project
@@ -27,6 +27,11 @@ Five adapters ship:
 - `vibe`    — Mistral Vibe CLI (`vibe --prompt ...`), with skills mounted under
               workspace `.agents/skills` and `VIBE_HOME` isolated outside the
               model workdir. Native `skill` tool calls are primary evidence.
+- `agy`     — Google Antigravity (`agy --print ...`), with skills mounted
+              under workspace `.agents/skills`. Its shell tools run in the
+              CLI's own scratch directory unless the workspace is attached, so
+              every invocation passes `--add-dir`/`--new-project`. agy offers
+              no config-home override, so runs record `config_isolated=False`.
 - `pi`      — the Pi coding agent, same mount/detect approach as
               run_pi_trigger_eval.py (which remains a compatibility wrapper
               for the Pi-only entry point).
@@ -61,6 +66,7 @@ import tempfile
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +77,7 @@ if __name__ == "__main__":
 
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 from agent_capabilities import (
+    AGY_DEFAULT_CMD,
     AGENT_CAPABILITIES,
     CODEX_TRIGGER_DEFAULT_CMD,
     add_surface_cli_options,
@@ -89,11 +96,17 @@ from run_pi_trigger_eval import (
     validate_trigger_rows,
 )
 from skill_benchmark import (
+    AGY_CONFIG_METADATA,
     VALID_SPLITS,
     VIBE_DEFAULT_CMD,
     VIBE_READ_ONLY_TOOLS,
     AblationError,
     PiStream,
+    agy_init_model,
+    agy_protocol_error,
+    agy_tool_classification_gap,
+    agy_trace_text,
+    build_agy_cli_argv,
     build_canonical_skill_tree,
     build_vibe_cli_argv,
     canonical_json_sha256,
@@ -106,6 +119,7 @@ from skill_benchmark import (
     materialize_trigger_ablation,
     mount_skill_tree,
     normalize_trace_records,
+    parse_agy_stream,
     parse_trace_jsonl_text,
     repo_root_for_manifest,
     safe_trace_label,
@@ -666,6 +680,83 @@ class StubAdapter(AgentAdapter):
             stdout="\n".join(lines) + "\n", stderr="", returncode=0,
             elapsed_ms=int((time.monotonic() - started) * 1000),
         )
+
+
+class AgyAdapter(AgentAdapter):
+    """Google Antigravity (`agy`) trigger adapter. agy discovers Agent Skills
+    from project `.agents/skills` — the same location Vibe reads — so the matrix
+    measures real autonomous loading rather than a forced-load answer prompt.
+
+    Unlike the Codex and Vibe adapters this one cannot isolate the agent's
+    config: agy exposes no CODEX_HOME/VIBE_HOME equivalent, so the user's own
+    ~/.gemini configuration is in play and every run records that.
+    """
+
+    name = "agy"
+    default_models: list[str | None] = [None]
+
+    def __init__(self, agy_cmd: str = AGY_DEFAULT_CMD) -> None:
+        self.agy_cmd = agy_cmd
+
+    def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
+        try:
+            # Passing cwd also emits --add-dir/--new-project, without which agy
+            # runs its shell tools in its own scratch directory and never sees
+            # the mounted skill at all (see build_agy_cli_argv).
+            # The timeout also becomes --print-timeout; agy otherwise applies
+            # its own five-minute default and cuts a longer matrix budget short.
+            argv = build_agy_cli_argv(self.agy_cmd, prompt=query, cwd=workspace,
+                                      output="stream-json", model=model, timeout=timeout)
+        except ValueError as exc:
+            return InvocationOutcome.from_process(
+                stdout="", stderr=str(exc), returncode=127, elapsed_ms=0,
+            ).with_metadata(AGY_CONFIG_METADATA)
+        result = validate_invoke_result(
+            self.name,
+            self._run_argv(argv, input_text="", cwd=workspace, timeout=timeout),
+        )
+        # Hand the shared pipeline a normalized stream rather than agy's own.
+        # Detection, telemetry, and the trace artifact all read this one string,
+        # and the generic parsers do not descend into agy's `result`/
+        # `step_update` containers: left raw, a successful run records usage as
+        # missing and every command/file/tool count as zero. The normalized
+        # shape keeps detection working (its `command`/`path` keys are the ones
+        # the detector already reads) and matches what the answer runner writes.
+        events, parse_errors = parse_agy_stream(result.stdout)
+        normalized = agy_trace_text(events, result.stdout)
+        # Because that normalized stream is what write_trace_artifacts hands to
+        # normalize_trace_records, a trigger run publishes the same
+        # tool_calls/file_reads/file_writes counts an answer run does — so an
+        # unclassified tool skews them here identically, and the staleness of the
+        # classification has to be just as visible. Same helper, same fields.
+        tool_gap = agy_tool_classification_gap(events)
+        metadata: dict[str, Any] = {**AGY_CONFIG_METADATA, **tool_gap}
+        # The matrix grid is (agent x REQUESTED model), and `--model` absent is a
+        # real cell meaning "whatever agy defaults to". So the resolved identity
+        # is recorded rather than used to relabel the cell: relabeling would
+        # scatter one cell's rows across several, and a spawn failure has no
+        # stream to resolve a model from, so its row would stay in the old cell
+        # regardless. This keeps the grid coherent and still records which model
+        # was actually measured, in the row and in the trace metadata.
+        resolved_model = agy_init_model(events)
+        if resolved_model and not model:
+            metadata["resolved_model"] = resolved_model
+            metadata["model_source"] = "provider_reported"
+        if tool_gap.get("unclassified_tools_used"):
+            print(f"agy: trigger run used unclassified tool(s) "
+                  f"{', '.join(tool_gap['unclassified_tools_used'])}; they count as generic tool "
+                  "calls, so file_reads/file_writes may under-report.", file=sys.stderr)
+        outcome = replace(result, stdout=normalized).with_metadata(metadata)
+        # agy exits zero on a truncated stream, so without this a broken run is
+        # recorded as a clean no-trigger observation and inflates the matrix.
+        # with_provider_error moves it to PROVIDER_FAILED, which is what
+        # observation_complete keys on — the same route the Pi adapter takes.
+        if outcome.observation_complete:
+            return outcome.with_provider_error(agy_protocol_error(events, parse_errors))
+        return outcome
+
+    def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
+        return self._mount_tree(tree_dir, workspace / ".agents" / "skills")
 
 
 # Mutable compatibility view for tests that replace an existing adapter. Adding
