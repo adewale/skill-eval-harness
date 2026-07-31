@@ -1754,7 +1754,7 @@ class AgyAdapterTests(unittest.TestCase):
                 "tool_info": {"name": "view_file", "parameters": {"AbsolutePath": str(mounted)}}}}),
             json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "done"}}),
         ])
-        detection = tm.detect_trigger_detection(stdout, [mounted])
+        detection = tm.detect_trigger_detection(stdout, [mounted], source="agy")
         self.assertTrue(detection.triggered, "agy's AbsolutePath tool input carries the mounted skill path")
 
     def _agy_adapter_returning(self, stdout):
@@ -1798,8 +1798,8 @@ class AgyAdapterTests(unittest.TestCase):
             json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "ok"}})])
         with tempfile.TemporaryDirectory() as td:
             outcome = self._agy_adapter_returning(stream).invoke("q", None, Path(td), 10)
-        self.assertEqual(outcome.metadata.get("unclassified_tools_used"), ["teleport_file"])
-        self.assertEqual(outcome.metadata.get("unclassified_tools_advertised"), ["teleport_file"])
+        self.assertEqual(outcome.metadata.get("unclassified_tools_used"), ("teleport_file",))
+        self.assertEqual(outcome.metadata.get("unclassified_tools_advertised"), ("teleport_file",))
         # A fully classified run carries no gap fields, so their presence means something.
         with tempfile.TemporaryDirectory() as td:
             clean = self._agy_adapter_returning(

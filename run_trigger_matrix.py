@@ -77,8 +77,8 @@ if __name__ == "__main__":
 
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
 from agent_capabilities import (
-    AGY_DEFAULT_CMD,
     AGENT_CAPABILITIES,
+    AGY_DEFAULT_CMD,
     CODEX_TRIGGER_DEFAULT_CMD,
     add_surface_cli_options,
     binding_for,

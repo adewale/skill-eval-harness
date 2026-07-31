@@ -160,7 +160,8 @@ class RunArtifacts:
         return self.metadata.get("usage_normalized") or {}
 
 
-def run_backend(backend: str, stdout: str, *, sidecar_text: str | None = None) -> RunArtifacts:
+def run_backend(backend: str, stdout: str, *, sidecar_text: str | None = None,
+                implementation: sb.AgentBackend | None = None) -> RunArtifacts:
     """Drive `run-agent` for one backend against a fake CLI emitting `stdout`."""
     profile = PROFILES[backend]
     with tempfile.TemporaryDirectory() as td:
@@ -175,8 +176,14 @@ def run_backend(backend: str, stdout: str, *, sidecar_text: str | None = None) -
         options = {name: None for name in BACKEND_CMD_OPTION.values()}
         options[BACKEND_CMD_OPTION[backend]] = str(cli)
         runs = root / "runs"
-        sb.run_agent(argparse.Namespace(agent=backend, tasks=str(tasks), runs=str(runs),
-                                        model=None, timeout=30, **options))
+        if implementation is None:
+            sb.run_agent(argparse.Namespace(
+                agent=backend, tasks=str(tasks), runs=str(runs),
+                model=None, timeout=30, **options))
+        else:
+            sb.run_agent_tasks(
+                rows, runs, implementation, model=None, timeout=30,
+                **{BACKEND_CMD_OPTION[implementation.name]: str(cli)})
         base = runs / rows[0]["run_dir"]
         return RunArtifacts(
             output=(base / "output.md").read_text(encoding="utf-8"),
@@ -214,7 +221,9 @@ class BackendRegistrationTests(unittest.TestCase):
         # assertion rejects it. Without this, the sweep could pass because
         # nothing exercises it.
         class FailOpenBackend(sb.AgentBackend):
-            name = "failopen"
+            # Reuse a fully declared row's workspace and CLI-option contract;
+            # only the provider parser is intentionally broken.
+            name = "agy"
 
             def invoke_answer(self, request, **options):
                 # Reports success no matter what the provider actually said —
@@ -224,30 +233,31 @@ class BackendRegistrationTests(unittest.TestCase):
                     timeout_s=request.timeout_s, elapsed_ms=1, stderr="",
                     trace_text="", model=None, environment={"runner": "agy"})
 
-        sb.AGENT_BACKENDS["failopen"] = FailOpenBackend()
-        PROFILES["failopen"] = PROFILES["agy"]
-        BACKEND_CMD_OPTION["failopen"] = "agy_cmd"
-        try:
-            run = run_backend("failopen", agy_fixture("stream-json-no-result.jsonl"))
-            with self.assertRaises(AssertionError):
-                assert_failed_closed(self, run, "failopen/truncated stream",
-                                     PROFILES["failopen"].healthy_answer)
-        finally:
-            sb.AGENT_BACKENDS.pop("failopen", None)
-            PROFILES.pop("failopen", None)
-            BACKEND_CMD_OPTION.pop("failopen", None)
+        run = run_backend(
+            "agy", agy_fixture("stream-json-no-result.jsonl"),
+            implementation=FailOpenBackend())
+        with self.assertRaises(AssertionError):
+            assert_failed_closed(
+                self, run, "failopen/truncated stream",
+                PROFILES["agy"].healthy_answer)
 
     def test_the_fail_open_backend_would_otherwise_have_been_registered(self):
         # And registering it without a profile trips the first test, so the
         # exemption route is closed too.
-        sb.AGENT_BACKENDS["failopen"] = sb.AgentBackend()
-        AGENT_CAPABILITIES["failopen"] = AGENT_CAPABILITIES["agy"]
-        try:
-            with self.assertRaises(AssertionError):
-                self.test_every_registered_answer_runner_has_a_profile()
-        finally:
-            sb.AGENT_BACKENDS.pop("failopen", None)
-            AGENT_CAPABILITIES.pop("failopen", None)
+        claimed = {
+            name for name, cap in {
+                **dict(AGENT_CAPABILITIES),
+                "failopen": AGENT_CAPABILITIES["agy"],
+            }.items()
+            if cap.answer_runner and name in {
+                **sb.AGENT_BACKENDS,
+                "failopen": sb.AgentBackend(),
+            }
+        }
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                claimed, set(PROFILES),
+                "a newly registered answer backend without a profile must fail")
 
 
 class FailClosedConformanceTests(unittest.TestCase):

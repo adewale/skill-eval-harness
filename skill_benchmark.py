@@ -4,7 +4,7 @@
 The grading and aggregation path intentionally does not call a model: it prepares
 paired tasks, grades saved outputs with deterministic assertions, emits judge
 tasks for subjective checks, and aggregates timing/token/cost/pass-rate data. The
-explicit runner and judge commands DO call a model — `run-agent --agent claude|codex|vibe`
+explicit runner and judge commands DO call a model — `run-agent --agent claude|codex|vibe|agy`
 (compatibility wrappers `run-codex`/`run-claude`, plus `run-jetty`) to generate outputs,
 and `judge` (via `--judge-cmd`, or natively `--judge-model`/`--judge-backend`) to grade
 them. Everything from `grade`/`benchmark` onward is model-free and reproducible from saved artifacts.
@@ -5457,18 +5457,6 @@ def command_text(event: dict[str, Any]) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
-# What counts as "the model called a tool", for the `tool_calls` metric AND for
-# the `tool_call`/`tool_count_le` assertions. One definition because two drifted:
-# the metric was corrected to include file operations while grading still built
-# its own set from `command`/`tool_call` only, so a run whose sole act was a file
-# write reported tool_calls=1 and simultaneously satisfied `tool_count_le: 0` and
-# `expected_no_call` -- while `tool_call tool: write_to_file` failed. A file read
-# or write is a tool call; `skill_load` is one too, and already counted under
-# `file_reads` as well, so an event contributing to both its category and the
-# tool total is the established shape here.
-TOOL_CALL_EVENT_TYPES = frozenset({"command", "tool_call", "file_read", "file_write", "skill_load"})
-
-
 def command_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Commands proven completed; failed/unknown/start events never satisfy execution."""
     return [e for e in events if e.get("type") == "command" and event_is_completed(e)]
@@ -5482,7 +5470,9 @@ def event_mentions_skill_file(event: dict[str, Any]) -> bool:
 
 
 # The step-shaped trajectory events: the completed actions a per-step judge
-# grades and the trajectory diff counts. Messages/metrics are context.
+# grades, the trajectory diff counts, and the tool metrics/assertions consume.
+# One definition prevents file operations from being counted in metrics while
+# remaining invisible to grading. Messages/metrics are context.
 TRAJECTORY_STEP_TYPES = {"command", "tool_call", "file_read", "file_write", "skill_load"}
 
 
@@ -6662,7 +6652,8 @@ def agy_stream_flat_records(records: list[dict[str, Any]], *,
             if step.get("step_type") == AGY_TOOL_STEP and step.get("state") == AGY_DONE_STATE:
                 info = step.get("tool_info") if isinstance(step.get("tool_info"), dict) else {}
                 name = str(step.get("tool_name") or info.get("name") or "")
-                params = info.get("parameters") if isinstance(info.get("parameters"), dict) else {}
+                raw_params = info.get("parameters")
+                params: dict[str, Any] = raw_params if isinstance(raw_params, dict) else {}
                 item_counter += 1
                 item: dict[str, Any] = {"id": f"item_{item_counter}", "status": "completed"}
                 if name in AGY_SHELL_TOOLS:
@@ -6975,6 +6966,7 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
     metrics: dict[str, Any] = {
         "schema_version": 2,
         "source": source,
+        "steps": counts["steps"],
         "tool_calls": counts["tool_calls"],
         "commands": counts["commands"],
         "file_reads": counts["file_reads"],
@@ -8404,7 +8396,13 @@ def parse_agy_stream(stdout: str, *, output: str = "stream-json") -> tuple[list[
             return [], [(f"agy returned a single {output!r} envelope instead of a stream; "
                          "the CLI ignored the requested output format")]
         return [{"event": "result", "result": envelope}], []
-    records, errors = parse_trace_jsonl_text(coerce_text(stdout))
+    try:
+        records, errors = parse_trace_jsonl_text(coerce_text(stdout))
+    except ValueError as exc:
+        # The shared strict parser raises for ambiguous/non-JSON numeric input.
+        # At a provider boundary that is a failed observation, not a reason to
+        # abort every remaining run in the batch.
+        return [], [str(exc)]
     events: list[dict[str, Any]] = []
     for index, record in enumerate(records, 1):
         problem = agy_record_error(record)
@@ -8662,7 +8660,8 @@ def agy_trace_text(events: list[dict[str, Any]], stdout: str) -> str:
             continue
         info = step.get("tool_info") if isinstance(step.get("tool_info"), dict) else {}
         name = str(step.get("tool_name") or info.get("name") or "")
-        params = info.get("parameters") if isinstance(info.get("parameters"), dict) else {}
+        raw_params = info.get("parameters")
+        params: dict[str, Any] = raw_params if isinstance(raw_params, dict) else {}
         item: dict[str, Any] = {"id": f"item_{len(records) + 1}", "status": "completed"}
         if name in AGY_SHELL_TOOLS:
             # No exit_code: agy's tool_info carries only name/output/parameters,
@@ -8720,7 +8719,7 @@ def agy_cli_invoke(prompt: str, *, model: str | None = None, agy_cmd: str | None
     # Staleness of the tool classification, measured against the CLI that just
     # ran rather than against a checked-in snapshot. Warned about rather than
     # fatal; see agy_tool_classification_gap.
-    tool_gap = agy_tool_classification_gap(events)
+    tool_gap: dict[str, Any] = agy_tool_classification_gap(events)
     # Prefer what was asked for; fall back to what agy says it used, and record
     # which, so a reader can tell a requested identity from a discovered one.
     resolved_model = model or agy_init_model(events)
@@ -8848,10 +8847,6 @@ class AgyBackend(AgentBackend):
             # --model still carries an identity the by-model axis can group on.
             model=result.get("model") or request.model,
             trace_text=result.get("trace_text") or "",
-            # agy reports usage on its terminal event rather than in the trace,
-            # so mirror it into the flat metrics the way the other
-            # provider-reported backends (claude, subagent) do.
-            metrics_extra={k: v for k, v in (result.get("usage") or {}).items() if isinstance(v, (int, float))},
             environment={"runner": "agy", **env})
 
 
@@ -10688,8 +10683,11 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
                 "vibe_cmd": vibe_cmd,
                 **dict(backend_options or {}),
             }
-            provider_options = binding_for(judge_backend, "judge").option_values(
-                available_options)
+            binding = binding_for(judge_backend, "judge")
+            provider_options = {
+                option.dest: option.default for option in binding.cli_options
+            }
+            provider_options.update(binding.option_values(available_options))
             invocation = JUDGE_BACKENDS[judge_backend](
                 prompt,
                 judge_model=judge_model,

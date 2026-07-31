@@ -1560,8 +1560,8 @@ class AgyStreamParsingTests(unittest.TestCase):
         with mock.patch.object(sb, "agy_cli_invoke", side_effect=fake_invoke):
             res = sb.agy_judge_invoke("prompt", judge_model=None, agy_cmd="agy",
                                       assertion_schema=None, explore_hint=None)
-        self.assertNotEqual(res["returncode"], 0, "a protocol failure must not report success")
-        self.assertIn("FAILED", res["stderr"], "the reason must survive into the judge transcript")
+        self.assertNotEqual(res.returncode, 0, "a protocol failure must not report success")
+        self.assertIn("FAILED", res.stderr, "the reason must survive into the judge transcript")
 
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "output.md"

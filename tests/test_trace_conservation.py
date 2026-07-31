@@ -492,15 +492,15 @@ class C4GradingAgreement(unittest.TestCase):
         # definition of a tool call back to what grading used to select, and the
         # law must fail on a file-only run. Without C4 this passed both C1 and
         # C2 and shipped.
-        original = sb.TOOL_CALL_EVENT_TYPES
-        sb.TOOL_CALL_EVENT_TYPES = frozenset({"command", "tool_call"})
+        original = sb.TRAJECTORY_STEP_TYPES
+        sb.TRAJECTORY_STEP_TYPES = frozenset({"command", "tool_call"})
         try:
             with self.assertRaises(AssertionError):
                 self.assert_grading_agrees(
                     agy_stream(tool_step(tool="write_to_file", params="path"), HEALTHY_RESULT),
                     "file write only")
         finally:
-            sb.TOOL_CALL_EVENT_TYPES = original
+            sb.TRAJECTORY_STEP_TYPES = original
         # And it holds again once restored, so the failure was the mutation.
         self.assert_grading_agrees(
             agy_stream(tool_step(tool="write_to_file", params="path"), HEALTHY_RESULT),
@@ -546,8 +546,8 @@ class C2AccountingTotality(unittest.TestCase):
             f"that invoked this tool")
         # And it counts toward the tool total, so the total cannot be dodged by
         # emitting a kind that only its own category counts.
-        self.assertGreaterEqual(
-            metrics["tool_calls"], 1, f"a completed {kind} event did not count as a tool call")
+        self.assertEqual(
+            metrics["steps"], 1, f"a completed {kind} event did not count as a step")
 
     def test_every_activity_kind_is_counted(self):
         for kind in sorted(TOOL_ACTIVITY_KINDS):
@@ -557,17 +557,17 @@ class C2AccountingTotality(unittest.TestCase):
     def test_an_uncounted_kind_is_caught(self):
         # The inheritance proof for C2: drop a kind from the one definition of
         # "a tool call" and the law must fail, so a kind that no metric sums
-        # cannot pass quietly. Mutating TOOL_CALL_EVENT_TYPES rather than a
+        # cannot pass quietly. Mutating TRAJECTORY_STEP_TYPES rather than a
         # helper keeps this pointed at the contract instead of at whichever
         # function currently implements it.
-        original = sb.TOOL_CALL_EVENT_TYPES
+        original = sb.TRAJECTORY_STEP_TYPES
         for kind in sorted(TOOL_ACTIVITY_KINDS):
-            sb.TOOL_CALL_EVENT_TYPES = frozenset(original - {kind})
+            sb.TRAJECTORY_STEP_TYPES = frozenset(original - {kind})
             try:
                 with self.subTest(dropped=kind), self.assertRaises(AssertionError):
                     self.assert_counted(kind)
             finally:
-                sb.TOOL_CALL_EVENT_TYPES = original
+                sb.TRAJECTORY_STEP_TYPES = original
         self.assert_counted(TraceEventKind.COMMAND.value)  # and restored
 
 

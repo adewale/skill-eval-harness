@@ -151,10 +151,10 @@ in the codebase.
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:8210`), Claude (`run_claude:8378`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:8964`), Claude (`run_claude:9132`, capturing real
 per-run cost), Mistral Vibe (`run-agent --agent vibe`, using isolated `VIBE_HOME` outside the workdir), the in-process
-subagent runner (`run_subagent:10815`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:3847` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:11609`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:3928` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -222,7 +222,7 @@ those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplica
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:692`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:693`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 ## What changes when you extend the tool
