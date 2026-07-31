@@ -136,34 +136,42 @@ gemini -p "$PROMPT" \
   --output-format stream-json \
   --skip-trust \
   --policy "$ISOLATED_POLICY" \
-  --sandbox
+  [--sandbox when auth transport is proven]
 ```
 
 Implemented choices:
 
 - Use prepared-row forced-load prompting for answer runs, just like Codex/Claude. The model sees workspace-relative skill paths and input files.
 - Parse the official event union into frozen `GeminiStream` values. Final answer text comes only from assistant deltas after the last completed tool lifecycle and before one terminal successful `result`; the trace is never used as a text fallback.
-- Normalize paired `tool_use`/`tool_result` into existing lifecycle events while validating Gemini protocol completeness separately from provider failure.
+- Normalize paired `tool_use`/`tool_result` into existing lifecycle events while validating Gemini protocol completeness separately from provider failure. Because `stream-json` omits `read_many_files`' processed-file list, its `include` globs never become file/skill-read evidence.
 - Normalize `stats` and per-model token usage into `usage_normalized`; absent stats stay `missing`, and cost is `missing` because the CLI has no cost field.
-- Use a fresh `GEMINI_CLI_HOME` outside the model workdir. Prefer environment auth; otherwise copy only `oauth_creds.json`, `gemini-credentials.json`, and `security.auth.selectedType`. Do not copy user skills, extensions, MCP configuration, hooks, context, policies, sessions, or history.
-- Reject workspace `.gemini` and `GEMINI.md` provider controls before process invocation. Load one harness policy that denies all tools and then allows only `glob`, `grep_search`, `list_directory`, `read_file`, and `read_many_files`. Request sandboxing and disclose that administrator-tier policy can override user-tier policy.
+- Use a fresh `GEMINI_CLI_HOME` outside the model workdir. A valid configured `security.auth.selectedType` wins; environment-selector precedence applies only when settings do not choose a type. Copy only credential material and supporting environment required by that one planned mode, force portable file storage when needed, disable interactive browser auth, and fail closed on invalid/nonportable plans. Explicit ADC is copied into the isolated home and rejected if its source is model-readable. The isolated user settings disable ordinary workspace/ancestor `.env` loading and request disabled provider usage statistics; early workspace trust stays unset so Gemini-specific ancestor env files are skipped before `--skip-trust` takes effect. Machine administrator settings may still override either user-tier request. Do not copy user skills, extensions, MCP configuration, hooks, context, policies, sessions, or history.
+- Reject workspace `.gemini`, `.agents`, `.geminiignore`, and `GEMINI.md` provider controls case-insensitively before process invocation. Accept exactly one caller-trusted executable token, strip ambient Gemini/sandbox/debug/endpoint/telemetry controls while preserving auth routing, then load one harness policy that denies all tools and allows only `glob`, `grep_search`, `list_directory`, `read_file`, and `read_many_files`.
+- Reject active `@path` references and leading slash commands before spawn because Gemini preprocesses them before the tool-policy and `stream-json` lifecycle. Bind prompt/model values with `--flag=value` so leading-dash data cannot be reinterpreted by the CLI parser.
+- Request sandboxing only when a supported engine is detected and the relevant container credential transport is proven; macOS seatbelt runs in the host credential context. Portable legacy OAuth files and explicit ADC can cross a container boundary; GCA/encrypted OAuth, keychain-only API-key auth, implicit ADC, and unproven metadata auth cannot. Artifacts disclose the decision and retain the policy/config/workspace isolation that still applies. Machine-owned administrator-tier settings and policy can still override user-tier auth/tool choices.
+- Probe and record the installed CLI version on every invocation. The live smoke requires version evidence; parser fixtures retain their pinned upstream commit and package snapshot.
 
 ### Gemini judge backend (implemented)
 
 A native Gemini judge uses:
 
 ```bash
-gemini -p "$JUDGE_PROMPT" --model "$MODEL" --output-format json \
-  --policy "$DENY_ALL_POLICY" --skip-trust --sandbox
+gemini -p "$JUDGE_PROMPT" --model "$MODEL" --output-format stream-json \
+  --policy "$DENY_ALL_POLICY" --skip-trust \
+  [--sandbox when auth transport is proven]
 ```
 
-`GeminiJsonResponse` validates the envelope and per-model token stats; only
-`response` reaches the canonical verdict parser. Gemini does not expose an
+`GeminiStream` validates the complete event lifecycle and per-model token stats; only
+the final assistant segment reaches the canonical verdict parser. The judge rejects
+any observed tool lifecycle and treats a nonzero aggregate tool counter as a secondary
+failure signal. Gemini does not expose an
 external verdict-schema flag, so `verdict_schema_for` remains the fail-closed
 gate. `JudgeInvocation` now has optional immutable `raw_response` and `metadata`
-fields, allowing Gemini's original envelope, session, resolved models, and
+fields, allowing Gemini's original raw stream, session, resolved models, and
 isolation disclosures to survive as transcript sidecars without making every
 judge backend return provider-shaped dictionaries.
+Gemini `--judge-explore` is rejected at both CLI and programmatic seams until a
+separately tested read-only policy exists.
 
 ### Gemini autonomous trigger
 
@@ -240,7 +248,7 @@ Vibe trigger measurement is implemented because it natively discovers Agent Skil
 
 ## Shared adapter interface
 
-The shared interface should split capability surfaces instead of making every backend implement a monolith.
+The shared interface should split capability surfaces instead of making every backend implement a monolith. The block below is the **target shape**, not the exact implemented dataclasses: today's `InvocationRequest` has only `prompt`, `workspace`, `model`, and `timeout_s`, while environment and provider options remain adapter-owned; today's `InvocationResult` also carries explicit process-state and UTF-8-validity fields but has not eliminated every provider-local dictionary seam.
 
 ### Core types
 

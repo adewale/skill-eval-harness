@@ -528,3 +528,119 @@ valid import path are useful declarations, but none is runtime validation.
 - Audit the model gap, not only current rows: construct a complete synthetic future backend and
   adversarial malformed rows, verify the negative tests fail when guards are removed, then rerun
   import-order, direct-entrypoint, CLI-collision, full-suite, and documentation-drift checks.
+
+## 2026-07-31 — A provider boundary includes every configuration authority
+
+**Problem:** The first Gemini adapter isolated `GEMINI_CLI_HOME` and appended a harness policy, but
+Gemini also accepts authority from command-option aliases, environment variables, workspace
+`.env` files, `.agents/skills`, sessions, extensions, additional directories, user policy, and
+administrator policy. Exact-token collision checks missed `--flag=value`, attached short aliases,
+and `--admin-policy`. Auth isolation independently combined “an auth-looking environment variable
+exists” with a copied `selectedType`, even though Gemini chooses a configured type before its
+environment selector. The result could be either weaker isolation or a home that could not
+authenticate.
+The audit also found that Gemini authenticates a second time inside container
+sandboxes. Legacy OAuth files and explicit ADC are portable, while GCA access tokens,
+encrypted FileKeychain state, keychain-only API keys, and implicit metadata auth are not; a sandbox flag
+can therefore make an otherwise valid auth plan fail. Free-form executable
+prefixes could reconstruct stripped environment controls or swallow appended
+policy flags, and invalid UTF-8 could fail before artifacts existed—or become a
+replacement character inside otherwise valid JSON.
+
+**Lesson:** A temporary home is only one tier of a CLI's control plane. Correct construction needs
+one closed invocation plan covering argv, environment, workspace, user state, machine state, auth,
+and the provider wire. Each tier must be either owned, rejected, isolated, or explicitly disclosed.
+
+**Implications for PR #62:**
+
+- Parse the official Gemini event union before deriving trigger evidence. Unknown, malformed,
+  duplicate, non-finite, dangling, or unterminated streams are protocol failures, not negative
+  trigger observations.
+- Treat `activate_skill` as a real provider tool lifecycle. A start without a successful result is
+  not activation; a failed result is not a completed tool call; consent denial is provider/process
+  evidence, not “the skill chose not to trigger.”
+- Keep search intent separate from file access. A `glob` or `grep_search` pattern containing
+  `SKILL.md` proves only a query. Gemini's `read_many_files.include` also proves only intent:
+  `stream-json` omits the processed-file list, so even a successful no-match glob cannot prove a
+  real skill-file read.
+- Do not advertise autonomous trigger support from discovery documentation alone. Require a live,
+  headless, consent-free positive and negative activation proof under the exact policy used by the
+  harness, and preserve “not measurable” until that gate passes.
+- Build auth as one sum-type decision using Gemini's documented precedence. Credential-support
+  variables such as `GOOGLE_API_KEY` or `GOOGLE_APPLICATION_CREDENTIALS` are not necessarily auth
+  selectors, a copied setting can outrank environment inference, and the current shared keychain
+  plus `GEMINI_FORCE_ENCRYPTED_FILE_STORAGE` and its file-storage sub-selector must travel together
+  when the selected auth mode needs them. Explicit ADC belongs in the isolated credential home,
+  never in the model-readable workspace (including through symlinks).
+- Preserve exact provider bytes or an explicit lossless encoding in future artifact contracts. The
+  current subprocess boundary retains an artifact-safe decoded representation plus a strict UTF-8
+  validity bit; invalid transport is never promoted, but the original invalid bytes are not claimed
+  as preserved. Record the upstream CLI commit/version used for fixtures, and ensure malformed
+  traces still produce durable failure artifacts so #62 can diagnose the activation barrier.
+- Keep provider errors, protocol errors, warnings, tool failures, and process exit as distinct
+  states. Optional wire fields must remain optional even when a stricter invented invariant would
+  make the parser look cleaner.
+- Distinguish a harness preflight rejection from a provider exit. If no process was created, PR #62
+  must persist a no-process observation rather than claiming a complete failed process.
+
+**Recommendations for current and future integrations:**
+
+- Add a provider-authority inventory to every adapter review: executable and aliases; environment;
+  local/ancestor files; workspace discovery; user home; system/admin policy; extensions/plugins;
+  sessions; additional roots; network endpoints; and telemetry export.
+- Audit configuration timing as well as precedence. For Gemini, env-file discovery occurs before
+  parsed `--skip-trust`; pre-setting trust therefore enabled an ancestor `.gemini/.env` even though
+  the isolated settings ignored ordinary `.env` files.
+- Replace permissive command-prefix assembly with a typed invocation-plan constructor. Prefer one
+  caller-trusted executable token; otherwise define an exact launcher grammar rather than an
+  interpreter blacklist. Normalize long `=`, negated, split, short, and attached spellings before
+  collision checks, then redact from that same plan so validation and artifact disclosure cannot
+  drift.
+- Define a closed auth plan per provider: selected mode, source, required credential material,
+  supporting environment, nested-sandbox transport, incompatibilities, and metadata provenance.
+  Never infer precedence from “any credential variable is present,” and never leave an explicit
+  credential path in the model workspace.
+- Disable provider usage statistics in the isolated user settings and label that as a requested
+  setting, not a proven effective value when machine administrator settings have higher precedence.
+- Treat aggregate counters and lifecycle evidence as independent unless the provider documents an
+  invariant. Gemini judging moved to `stream-json` so zero tools is checked from observed
+  lifecycles; its aggregate counter remains a secondary signal, not a substitute for the stream.
+- Give each provider tool a schema-specific trace adapter. Normalize lifecycle first, count only
+  successful completions, preserve failed attempts as errors, and test false-positive as well as
+  false-negative skill evidence.
+- Model resolved model identity as zero/one/many. Preserve requested/configured identity separately;
+  never collapse a fallback or multi-model run into a singular billed-model claim.
+- Use two JSON boundaries deliberately: trusted/imported inputs may reject malformed strict JSON
+  immediately, while provider failures must retain an artifact-safe representation with parse and
+  UTF-8 diagnostics plus an incomplete evidence state. A future raw-byte artifact should use an
+  explicit lossless encoding. Replacement decoding can silently turn malformed bytes into valid
+  JSON strings and must never certify the trace.
+- Make registry defaults construct programmatic invocations as well as argparse namespaces. Test
+  each surface through both the CLI and direct Python API so a backend is not accidentally usable
+  only from one route.
+- Require a common conformance pack for every integration: answer, judge, trigger (when claimed),
+  no-trigger, tool success/failure, warning/error, timeout/spawn/nonzero exit, missing telemetry,
+  malformed/unknown wire, auth precedence, config isolation, option collisions, multi-model
+  attribution, and durable failure artifacts.
+- Gate capability claims with meaningful opt-in smoke tests. A smoke must exercise the integration's
+  riskiest behavior (for Gemini, a real completed skill-file read under the harness policy) and
+  record the installed CLI version, not merely obtain a zero process exit.
+- Generate or guard provider inventories in documentation from the registry, and periodically
+  re-harvest official fixtures against a pinned upstream revision. Provider CLIs evolve too quickly
+  for copied prose and one-time schema assumptions to remain trustworthy unaided.
+- Continue migrating the residual provider invocation dictionaries to a shared closed result union.
+  The current typed answer, judge, trace, and artifact boundaries contain the risk, but eliminating
+  the local dictionary seam would let type checking enforce the same state model end to end.
+- Treat preprocessing as part of the provider wire. Gemini expands active `@path` references before
+  the model/tool-policy loop and does not expose that file ingestion as a `stream-json` tool event.
+  It also dispatches leading slash commands before normal prompting. The harness now rejects both
+  forms before spawn; PR #62 must apply the same rule or explicitly model preprocessing evidence.
+- Carry the explicit process-state discriminant into judge invocations too. The current answer and
+  trigger contracts distinguish timeout/spawn from real exits 124/127, while `JudgeInvocation`
+  still has only a numeric return code and is therefore not yet an equally suitable lifecycle type.
+- Prefer signal-specific telemetry provenance types. A single closed vocabulary is better than a
+  free string, but it can still admit nonsensical combinations such as price-table provenance for
+  elapsed time unless each signal constrains its own subset.
+- Make prompt transport an invocation-plan capability. Gemini and Vibe currently place prompts in
+  argv, which can expose content in local process listings and hit OS command-line size limits;
+  prefer stdin or a protected prompt file when a provider offers equivalent noninteractive semantics.

@@ -86,11 +86,13 @@ Completed | TimedOut | SpawnFailed | ProviderFailed
 ```
 
 `OutcomeContext` owns the closed provider enum, recursively freezes JSON-shaped context, and
-validates finite non-negative elapsed time, usage, and cost. `Completed` requires a non-empty final
-answer; raw trace bytes are never promoted to candidate output. Timeout return code 124 and spawn
-return code 127 remain reserved. `ProviderFailed` preserves the subprocess's actual exit code,
-including zero when the process succeeded but its provider envelope was malformed or lacked a final
-answer; provider-response failure is not encoded by inventing return code 1. `write_runner_outcome`
+validates finite non-negative elapsed time, usage, and cost. `Completed` requires a non-blank,
+strict-UTF-8 final answer; raw trace bytes are never promoted to candidate output. Return codes 124
+and 127 are conventional serialized codes for harness timeout and spawn failure, but a real spawned
+process may also exit with either code; the explicit `invocation_state` discriminant preserves that
+provenance. `ProviderFailed` preserves the subprocess's actual exit code, including zero when the
+process succeeded but its provider envelope was malformed or lacked a final answer;
+provider-response failure is not encoded by inventing return code 1. `write_runner_outcome`
 exhaustively adapts the union to artifacts; backends cannot repair or mutate status booleans while
 writing files. `RunnerOutcome` remains only as a strict compatibility factory that constructs one
 of the four variants.
@@ -119,10 +121,14 @@ InvocationRequest
   -> JudgeInvocation                    (judge)
 ```
 
-- `InvocationRequest` remains suitable as the provider-neutral input contract: it fixes the prompt,
-  optional model, timeout, working directory, environment, and immutable provider context before
-  execution. The Gemini adapter, rather than callers, owns output-format, policy, trust, sandbox,
-  and prompt/model flags, so a raw command cannot weaken those controls.
+- `InvocationRequest` is a validated minimal answer request: prompt, optional model, positive timeout,
+  and working directory. It does **not** freeze argv, environment, auth, or provider policy; those are
+  still adapter-owned plans assembled after request construction and remain the clearest abstraction
+  gap for a future typed `InvocationPlan`. The Gemini adapter accepts one caller-trusted executable
+  token and owns output-format,
+  policy, trust, conditional sandbox, workspace expansion, session, extension, and prompt/model
+  flags. Prefix launchers are rejected because they can reinterpret appended arguments; the chosen
+  executable itself remains an explicit operator authority recorded in artifacts.
 - `gemini_contracts.py` strictly parses duplicate-free, finite JSON into frozen provider values.
   Stream success requires one `init`, one terminal successful `result`, a non-empty final assistant
   message, paired tool start/result identifiers, and no provider error. Usage is numeric only when
@@ -131,11 +137,34 @@ InvocationRequest
 - Gemini tool records are adapted through the shared `TraceDialect`; the adapter preserves lifecycle
   identifiers and does not invent an equality between event count and Gemini's aggregate
   `stats.tool_calls`. This is the right abstraction level for normalized evidence, but it does not
-  imply that every provider exposes identical counters.
+  imply that every provider exposes identical counters. In particular, `read_many_files.include`
+  is request intent, and Gemini omits the processed-file list from `stream-json`, so it cannot prove
+  a skill read.
+- The isolated Gemini settings disable ordinary local `.env` discovery, while early workspace trust
+  remains unset so ancestor `.gemini/.env` files are skipped before `--skip-trust` takes effect.
+  Environment construction preserves only variables required by the selected auth plan while
+  removing inherited sandbox, system-prompt, extension, IDE, debug, endpoint, telemetry, and custom
+  system-settings controls. Explicit ADC is copied outside the model workspace; a model-readable ADC
+  source is rejected. Default machine administrator settings and policy may still exist, and artifacts
+  state that limitation instead of claiming they were isolated.
+- The planned auth mode also owns containment feasibility. Machine system settings may still override
+  user-tier auth fields, so artifacts disclose that limitation rather than claiming the planned mode
+  is necessarily the effective provider mode. Gemini's container hop cannot transport OAuth
+  GCA access tokens or decrypt host-bound FileKeychain state; legacy `oauth_creds.json` and
+  explicit ADC are portable, while implicit ADC is unproven there. The adapter requests the nested
+  sandbox only for a proven transport and otherwise records why it was disabled, while retaining
+  deny policy plus config/workspace isolation.
+- Runtime metadata records the installed CLI version and the pinned fixture contract revision, so
+  a future protocol drift failure can be attributed instead of guessed. Requested, configured,
+  and resolved model identities remain separate; zero/many reported models never become one.
 - The answer adapter constructs the closed `RunnerOutcome` union and the judge adapter constructs
   `JudgeInvocation`. The latter retains immutable raw provider response and provider metadata
   sidecars, which prevents provider dictionaries from leaking into verdict construction while still
-  keeping auditable wire evidence.
+  preserving provider evidence. Gemini judges use the lifecycle-bearing stream and reject any
+  observed tool lifecycle, with the independent aggregate counter as a secondary failure signal.
+  Active `@path` preprocessing and leading slash-command prompts are rejected before spawn, closing
+  the provider's pre-stream read/command channel. Administrator policy can still override user-tier
+  policy, so artifacts continue to disclose that separate limitation.
 - The existing trigger adapter abstraction is deliberately not used for Gemini yet. Gemini's
   `activate_skill` is an interactive tool and the headless default policy denies it; without a live,
   non-interactive activation proof, declaring trigger support would turn absence of evidence into a

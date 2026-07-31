@@ -99,12 +99,15 @@ skill-benchmark run-agent --agent gemini --tasks tasks.jsonl --runs ../repo/eval
 The Gemini backend invokes the official CLI in headless `stream-json` mode and
 accepts final text only from a complete typed stream. It creates a fresh
 `GEMINI_CLI_HOME` outside the task workspace, copies only minimal auth state,
-rejects workspace `.gemini`/`GEMINI.md` control files, requests sandboxing, and
+rejects workspace `.gemini`, `.agents`, `.geminiignore`, and `GEMINI.md`
+controls case-insensitively, requests sandboxing when the selected credentials
+can cross Gemini's nested sandbox boundary, and
 loads a deny-all policy with a higher-priority allowlist for the five read-only
-tools used by answer runs. Override the executable or wrapper with
-`--gemini-cmd`; harness-owned prompt/model/output/policy/sandbox flags cannot be
-embedded in that prefix. Token stats are normalized when the CLI returns them;
-missing token stats and unsupported dollar cost remain explicit `missing`.
+tools used by answer runs. `--gemini-cmd` accepts exactly one caller-trusted
+executable path; free-form launcher/prefix arguments are rejected. Artifacts
+record the sandbox/auth transport decision, installed `gemini --version`, and
+pinned wire-fixture revision. Token stats are normalized when the CLI returns
+them; missing token stats and unsupported dollar cost remain explicit `missing`.
 
 ## Run Claude tasks (with cost capture)
 
@@ -287,7 +290,7 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --out benchmark.json
 ```
 
-Native Claude uses `claude -p --output-format json --no-session-persistence`; tool-free judges add `--tools ""`, and every native Claude judge passes the harness verdict schema through `--json-schema`. Native Codex uses isolated `CODEX_HOME` outside the model workdir plus `codex exec --output-last-message <file> --output-schema <schema.json>` so verdict parsing reads the final assistant message rather than the event JSONL stream. Native Gemini uses isolated `GEMINI_CLI_HOME`, `--output-format json`, sandboxing, and a deny-all tool policy; only the envelope's validated `response` reaches verdict parsing, while the raw envelope and session/model metadata are saved as transcript sidecars. Native Vibe uses isolated `VIBE_HOME` outside the model workdir plus `vibe --prompt "$PROMPT" --output json` with tools disabled (`--enabled-tools re:^$`) and reads the final assistant message as the verdict JSON; `--judge-model` is passed through `VIBE_ACTIVE_MODEL`. Native judges run from an explicit working directory: a sanitized run-copy when tool exploration is enabled, otherwise a fresh empty temp directory so they cannot accidentally read the harness repo cwd. For Codex/OpenAI structured output, the harness adapts the canonical verdict schema into a strict provider schema (`additionalProperties:false`; optional fields become nullable) while still validating the returned verdict against the canonical schema. Gemini and Vibe do not expose provider-enforced schema here, so harness-side schema validation is the gate. A shell judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting. `--transcripts` saves the exact prompt, stdout, stderr, parsed result, and any provider response/metadata sidecars.
+Native Claude uses `claude -p --output-format json --no-session-persistence`; tool-free judges add `--tools ""`, and every native Claude judge passes the harness verdict schema through `--json-schema`. Native Codex uses isolated `CODEX_HOME` outside the model workdir plus `codex exec --output-last-message <file> --output-schema <schema.json>` so verdict parsing reads the final assistant message rather than the event JSONL stream. Native Gemini uses isolated `GEMINI_CLI_HOME`, `--output-format stream-json`, conditional nested sandboxing, and a deny-all tool policy; only the stream's final validated assistant segment reaches verdict parsing, while the raw lifecycle stream and session/model metadata are saved as transcript sidecars. It rejects observed tool lifecycles and nonzero aggregate tool counts. Native Vibe uses isolated `VIBE_HOME` outside the model workdir plus `vibe --prompt "$PROMPT" --output json` with tools disabled (`--enabled-tools re:^$`) and reads the final assistant message as the verdict JSON; `--judge-model` is passed through `VIBE_ACTIVE_MODEL`. Native judges run from an explicit working directory: a sanitized run-copy when tool exploration is enabled, otherwise a fresh empty temp directory so they cannot accidentally read the harness repo cwd. For Codex/OpenAI structured output, the harness adapts the canonical verdict schema into a strict provider schema (`additionalProperties:false`; optional fields become nullable) while still validating the returned verdict against the canonical schema. Gemini and Vibe do not expose provider-enforced schema here, so harness-side schema validation is the gate. A shell judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting. `--transcripts` saves the exact prompt, stdout, stderr, parsed result, and any provider response/metadata sidecars.
 
 ## Audit manifest quality
 

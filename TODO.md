@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:10683`, merged in `grade_case_variant:12900`).
+threshold, evidence}` (`load_judge_results:11619`, merged in `grade_case_variant:13880`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -133,7 +133,8 @@ shared backend protocols and conformance tests, not one-off grading or benchmark
       timeout. Materialize the same provider-neutral skill workspace used by other forced-load
       answer backends.
 - [x] Add a native Gemini judge backend (`judge --judge-backend gemini`) that returns the canonical
-      verdict JSON shape, stamps backend/model/usage metadata, and uses harness-side schema
+      verdict JSON shape, stamps backend/requested-resolved-model/CLI-version/usage metadata,
+      rejects unimplemented judge explore, and uses harness-side schema
       validation (`verdict_schema_for`, `--strict-judge-schema`) unless Gemini exposes a reliable
       provider-enforced schema hook.
 - [ ] Add a Gemini autonomous trigger adapter for `skill-trigger-matrix --agent gemini` only after a
@@ -144,7 +145,8 @@ shared backend protocols and conformance tests, not one-off grading or benchmark
       available, path-evidence fallback, and `RUN_GEMINI_TRIGGER_SMOKE` live-smoke coverage.
 - [x] Add Gemini offline conformance fixtures/tests: success, malformed JSON/schema failure, timeout,
       nonzero/spawn failure, usage-present, usage-missing, tool lifecycles, and judge verdict
-      parsing. Skill-activation evidence stays with the gated trigger item above.
+      parsing, plus auth/sandbox transport, workspace-control, invalid-byte, and version-provenance
+      guards. Skill-activation evidence stays with the gated trigger item above.
 
 ## Mistral Vibe
 

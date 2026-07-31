@@ -17,8 +17,8 @@ Related docs:
 | Token telemetry | Strong: provider envelope | Partial: JSONL usage events when emitted | Provider stats with per-model totals, when present | Missing in current CLI output | Missing stats remain unavailable, never numeric zero. |
 | Dollar cost | Strong: provider-reported `total_cost_usd` | Missing unless wrapper/estimator supplies it | Missing: no CLI cost field | Missing in current CLI output | Cost-per-signal is strongest for Claude and unavailable for Gemini/Vibe without an estimator. |
 | Prompt transport | stdin in print mode | stdin or prompt arg | prompt arg in headless mode | prompt arg required for reliable headless mode | Gemini/Vibe prompts appear in process argv; saved metadata is redacted, but OS-level argv exposure remains. |
-| Config isolation | Good; `--no-session-persistence`; `--bare` possible with API-key auth | Good; isolated `CODEX_HOME`, `--ephemeral`, ignore flags | Good for user state: isolated `GEMINI_CLI_HOME`, minimal auth copy, workspace controls rejected; admin settings can still override | Good; isolated `VIBE_HOME`, but programmatic runs write under it | Scratch homes are credential-bearing artifacts outside model-readable workdirs and are deleted after runs. |
-| Tool policy | Mature: `--tools`, `--allowedTools` | Sandbox/approval-policy oriented | Policy-tier oriented: deny-all plus read allowlist; sandbox requested | Allowlist/denylist oriented: `--enabled-tools`, `--disabled-tools` | Provider-specific policy adapters are required; one generic “read-only” flag would overclaim parity. |
+| Config isolation | Good; `--no-session-persistence`; `--bare` possible with API-key auth | Good; isolated `CODEX_HOME`, `--ephemeral`, ignore flags | Good for user state: isolated `GEMINI_CLI_HOME`, selected auth only, explicit ADC externalized, project controls rejected; admin settings can still override | Good; isolated `VIBE_HOME`, but programmatic runs write under it | Scratch homes are credential-bearing artifacts outside model-readable workdirs and are deleted after runs. |
+| Tool policy | Mature: `--tools`, `--allowedTools` | Sandbox/approval-policy oriented | Policy-tier oriented: deny-all plus read allowlist; nested sandbox depends on portable auth | Allowlist/denylist oriented: `--enabled-tools`, `--disabled-tools` | Provider-specific policy adapters are required; one generic “read-only” flag would overclaim parity. |
 | Skill discovery | `.claude/skills` plus `Skill` evidence | `$CODEX_HOME/skills` plus path evidence | Native Agent Skills, but `activate_skill` consent blocks a trigger claim until live-proven | `.agents/skills` / `.vibe/skills` plus `skill` evidence | Existence of a skill format is not evidence that autonomous headless activation works. |
 | Tool replay | Harness subagent path only | Not native in harness | Not native in harness | Not native in harness | Native CLI runs are measurement surfaces, not replayable deterministic tool-host runs. |
 | Live smoke reliability | Depends on quota/auth | Depends on Codex auth/model | Offline official fixtures pass; token-backed answer gate is `RUN_GEMINI_SMOKE`, not yet claimed as run | Passed with `MISTRAL_API_KEY` for Vibe 2.19.1 | Keep live proof distinct from fixture conformance and rerun after CLI/provider upgrades. |
@@ -37,6 +37,16 @@ answers/verdicts. The remaining limitations are control-plane limitations:
 - Harness policy files are user-tier. Administrator policy has higher
   precedence, so artifacts disclose the possible override instead of claiming
   an absolute no-tools boundary.
+- Gemini authenticates again inside container sandboxes. Environment API keys,
+  legacy `oauth_creds.json`, and explicit external ADC have a supported bridge;
+  GCA/encrypted OAuth, keychain-only API keys, implicit ADC, and metadata auth do not. Those runs retain the deny
+  policy and isolated config/workspace but explicitly record that the extra
+  provider sandbox was not requested.
+- `read_many_files` does not export its processed-file list in `stream-json`.
+  Its include patterns are never treated as skill-file read evidence.
+- `--gemini-cmd` accepts one caller-trusted executable path, not a shell-like
+  prefix. Runtime artifacts record `gemini --version` and the pinned fixture
+  revision.
 - Gemini has no provider verdict-schema flag or dollar-cost field. Verdict shape
   is harness-enforced; cost stays unavailable.
 - Headless prompt text is an argv argument. Saved command metadata redacts it,
