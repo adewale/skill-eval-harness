@@ -346,6 +346,19 @@ class ClosedRunnerOutcomeTests(unittest.TestCase):
             sb.run_argv_capture(
                 ["unused"], input_text="", cwd=Path.cwd(), timeout=1)
 
+    def test_spawned_reserved_exit_codes_remain_process_failures(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for returncode in (124, 127):
+                script = root / f"exit_{returncode}.py"
+                script.write_text(
+                    f"raise SystemExit({returncode})\n", encoding="utf-8")
+                with self.subTest(returncode=returncode):
+                    outcome = sb.invoke_argv_with_timeout(
+                        [sys.executable, str(script)], cwd=root, timeout=5)
+                    self.assertIs(outcome.state, sb.InvocationState.PROCESS_FAILED)
+                    self.assertFalse(outcome.timed_out)
+
     def test_pi_message_boundary_rejects_non_string_object_keys(self):
         with self.assertRaisesRegex(TypeError, "keys must be strings"):
             sb._pi_final_message({"message": {1: "not JSON"}})
@@ -392,6 +405,7 @@ class ClosedRunnerOutcomeTests(unittest.TestCase):
             {"provider": "codex", "cost_usd": float("inf")},
             {"provider": "codex", "usage": {"input_tokens": -1}},
             {"provider": "codex", "usage": {"input_tokens": "unknown"}},
+            {"provider": "codex", "trace_utf8_valid": "yes"},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises((TypeError, ValueError)):
                 rc.OutcomeContext(**kwargs)
@@ -422,6 +436,38 @@ class ClosedRunnerOutcomeTests(unittest.TestCase):
         context = rc.OutcomeContext(provider="codex")
         with self.assertRaises(TypeError):
             context.enriched(metadata=[])
+
+    def test_typed_outcomes_reject_non_utf8_artifact_text_and_cycles(self):
+        with self.assertRaisesRegex(ValueError, "surrogate"):
+            rc.RunnerOutcome(provider="claude", answer="\ud800", returncode=0)
+        cycle: dict[str, object] = {}
+        cycle["self"] = cycle
+        with self.assertRaisesRegex(ValueError, "cyclic"):
+            rc.OutcomeContext(provider="codex", metadata_extra=cycle)
+
+    def test_large_exact_integer_measurements_survive_artifact_writing(self):
+        huge = 10 ** 400
+        outcome = rc.RunnerOutcome(
+            provider="gemini", answer="ok", returncode=0,
+            elapsed_ms=42, usage={"input_tokens": huge,
+                                    "output_tokens": 1,
+                                    "total_tokens": huge + 1})
+        with tempfile.TemporaryDirectory() as td:
+            run = Path(td) / "run"
+            sb.write_runner_outcome(run, outcome)
+            metadata = json.loads(
+                (run / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["elapsed_ms"], 42)
+        self.assertEqual(metadata["usage_normalized"]["input_tokens"], huge)
+        with self.assertRaisesRegex(ValueError, "duration range"):
+            rc.OutcomeContext(provider="gemini", elapsed_ms=huge)
+
+    def test_excessive_json_nesting_is_a_stable_validation_failure(self):
+        value: object = 0
+        for _ in range(110):
+            value = [value]
+        with self.assertRaisesRegex(ValueError, "nesting depth"):
+            rc.OutcomeContext(provider="codex", environment={"value": value})
 
     def test_context_and_outcome_are_recursively_immutable(self):
         source = {"x": 1, "nested": {"value": 2}, "items": [{"value": 3}]}
@@ -1073,6 +1119,64 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertFalse(meta["provider_response_complete"])
             self.assertNotIn(trace, text)
             self.assertFalse(sb.execution_valid(sb.read_metadata_base(base), text))
+
+    def test_native_structured_adapters_reject_invalid_utf8_answer_channels(self):
+        claude_bytes = (
+            b'{"type":"result","result":"bad \\' + b'\xff'
+            + b'","is_error":false,"usage":{}}\n')
+        vibe_bytes = (
+            b'{"role":"assistant","content":"bad \\' + b'\xff' + b'"}\n')
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            scripts: dict[str, Path] = {}
+            for provider, payload in (
+                    ("claude", claude_bytes), ("vibe", vibe_bytes)):
+                script = root / f"invalid-{provider}.py"
+                script.write_text(
+                    f"#!{sys.executable}\nimport os\nos.write(1, {payload!r})\n",
+                    encoding="utf-8")
+                script.chmod(0o755)
+                scripts[provider] = script
+
+            requests = sb.InvocationRequest(
+                "prompt", root / "workspace", None, 30)
+            requests.workspace.mkdir()
+            outcomes = (
+                sb.ClaudeBackend().invoke_answer(
+                    requests, claude_bin=str(scripts["claude"])),
+                sb.VibeBackend().invoke_answer(
+                    requests, vibe_cmd=str(scripts["vibe"])),
+            )
+            for outcome in outcomes:
+                with self.subTest(provider=outcome.context.provider.value):
+                    run = root / f"run-{outcome.context.provider.value}"
+                    sb.write_runner_outcome(run, outcome)
+                    metrics = json.loads(
+                        (run / "metrics.json").read_text(encoding="utf-8"))
+                    self.assertIsInstance(outcome, rc.ProviderFailed)
+                    self.assertFalse(metrics["trace_observation_complete"])
+                    self.assertIn("not valid UTF-8", " ".join(
+                        metrics["trace_protocol_errors"]))
+
+    def test_codex_rejects_invalid_utf8_last_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            script = root / "invalid-codex.py"
+            script.write_text(
+                f"#!{sys.executable}\n"
+                "import os, pathlib, sys\n"
+                "target = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+                "target.write_bytes(b'bad \\xff')\n"
+                "os.write(1, b'{\"type\":\"thread.started\"}\\n')\n",
+                encoding="utf-8")
+            script.chmod(0o755)
+
+            outcome = sb.CodexBackend().invoke_answer(
+                sb.InvocationRequest("prompt", root / "workspace", None, 30),
+                codex_cmd=str(script))
+
+        self.assertIsInstance(outcome, rc.ProviderFailed)
+        self.assertIn("not valid UTF-8", outcome.reason or "")
 
     def test_write_runner_outcome_encodes_timeout_uniformly(self):
         # One timeout encoding for every provider: timed_out + returncode 124, a

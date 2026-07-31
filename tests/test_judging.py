@@ -425,7 +425,8 @@ class VerdictSchemaTests(unittest.TestCase):
         with mock.patch.object(sb, "gemini_cli_invoke", return_value={
                 **provider_result, "model": "gemini-2.5-flash",
                 "raw_response": '{"response":"{\\"passed\\":true}"}',
-                "metadata": {"session_id": "session-1"}}):
+                "metadata": {"session_id": "session-1",
+                             "provider_tool_calls": 0}}):
             gemini = sb.gemini_judge_invoke(
                 "prompt", judge_model="gemini-2.5-flash",
                 gemini_cmd="gemini", explore_hint=None)

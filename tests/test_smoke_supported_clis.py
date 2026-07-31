@@ -119,6 +119,24 @@ class SupportedCliSmokeTests(unittest.TestCase):
             self.assertFalse(smoke.assess_trigger_report(path, report))
             self.assertFalse(report["checks"][0]["passed"])
 
+    def test_gemini_live_smoke_requires_recorded_cli_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            environment = runs / "case" / "with_skill" / "run-1" / "environment.json"
+            environment.parent.mkdir(parents=True)
+            report = {"checks": []}
+            environment.write_text(json.dumps({
+                "gemini_cli_version_status": "unavailable",
+            }), encoding="utf-8")
+            self.assertFalse(smoke.assess_gemini_version_evidence(runs, report))
+            environment.write_text(json.dumps({
+                "gemini_cli_version_status": "reported",
+                "gemini_cli_version": "0.55.0-test",
+            }), encoding="utf-8")
+            report = {"checks": []}
+            self.assertTrue(smoke.assess_gemini_version_evidence(runs, report))
+            self.assertEqual(report["cli_versions"]["gemini"], ["0.55.0-test"])
+
     def test_trigger_assessment_rejects_a_persisted_pass_that_contradicts_provider_failure(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pi-trigger.json"

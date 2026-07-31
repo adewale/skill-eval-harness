@@ -640,9 +640,11 @@ class ClaudeDetectionTests(unittest.TestCase):
         stdout = json.dumps({"type": "result", "subtype": "error_max_turns"})
         for returncode, state in ((124, InvocationState.TIMED_OUT), (127, InvocationState.SPAWN_FAILED)):
             def fake_run(*args, _returncode=returncode, **kwargs):
-                return InvocationOutcome.from_process(
-                    stdout=stdout, stderr="failure", returncode=_returncode, elapsed_ms=3,
-                )
+                if _returncode == 124:
+                    return InvocationOutcome.from_timeout(
+                        stdout=stdout, stderr="failure", elapsed_ms=3)
+                return InvocationOutcome.spawn_failed(
+                    stdout=stdout, stderr="failure", elapsed_ms=3)
 
             with self.subTest(returncode=returncode), \
                  tempfile.TemporaryDirectory() as td, \

@@ -13,7 +13,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from json_contracts import freeze_json_mapping
+from json_contracts import (
+    freeze_json_mapping,
+    validate_json_text,
+    validate_json_value,
+)
 
 
 def _reject_constant(value: str) -> None:
@@ -30,16 +34,19 @@ def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _strict_json_loads(text: str) -> Any:
-    return json.loads(
+    value = json.loads(
         text,
         parse_constant=_reject_constant,
         object_pairs_hook=_object_without_duplicates,
     )
+    validate_json_value(value, "Gemini JSON")
+    return value
 
 
 def _nonempty_string(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a non-empty string")
+    validate_json_text(value, label)
     return value
 
 
@@ -55,6 +62,17 @@ def _error_text(value: Any, label: str) -> str:
     kind = _nonempty_string(value.get("type"), f"{label}.type")
     message = _nonempty_string(value.get("message"), f"{label}.message")
     return f"{kind}: {message}"
+
+
+def _terminal_warning(value: str) -> bool:
+    normalized = value.casefold()
+    return (
+        normalized in {
+            "maximum session turns exceeded",
+            "loop detected, stopping execution",
+        }
+        or normalized.startswith("agent execution stopped:")
+    )
 
 
 @dataclass(frozen=True)
@@ -75,9 +93,18 @@ class GeminiToolCall:
             raise ValueError("Gemini tool status must be success or error")
         if self.output is not None and not isinstance(self.output, str):
             raise TypeError("Gemini tool output must be text or None")
+        if self.output is not None:
+            validate_json_text(self.output, "Gemini tool output")
         if self.error is not None and (
                 not isinstance(self.error, str) or not self.error.strip()):
             raise ValueError("Gemini tool error must be non-empty text or None")
+        if self.error is not None:
+            validate_json_text(self.error, "Gemini tool error")
+        # The official ToolResultEvent makes ``error`` optional even for an
+        # error status, so absence is not an invalid state.  A success carrying
+        # an error object is contradictory to the emitter's lifecycle, though.
+        if self.status == "success" and self.error is not None:
+            raise ValueError("Gemini tool success cannot carry an error")
         object.__setattr__(
             self, "parameters",
             freeze_json_mapping(self.parameters, "Gemini tool parameters"),
@@ -132,7 +159,7 @@ def _parse_stream_stats(raw: Any) -> _StreamStats:
         models.append(model_name)
         for key, value in values.items():
             model_totals[key] += value
-    if models and model_totals != totals:
+    if model_totals != totals:
         raise ValueError(
             "Gemini result.stats totals must equal the per-model token totals")
     return _StreamStats(
@@ -160,25 +187,34 @@ class GeminiStream:
     usage: Mapping[str, Any] | None = None
     duration_ms: int | None = None
     tool_calls: tuple[GeminiToolCall, ...] = ()
+    reported_tool_calls: int | None = None
+    warnings: tuple[str, ...] = ()
     provider_error: str | None = None
     protocol_error: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.models, (tuple, list)):
+            raise TypeError("Gemini models must be a tuple or list")
         if self.session_id is not None:
             _nonempty_string(self.session_id, "Gemini session id")
         if self.configured_model is not None:
             _nonempty_string(self.configured_model, "Gemini configured model")
+        frozen_models = tuple(self.models)
         if any(not isinstance(model, str) or not model.strip()
-               for model in self.models):
+               for model in frozen_models):
             raise ValueError("Gemini model names must be non-empty strings")
+        for model in frozen_models:
+            validate_json_text(model, "Gemini model name")
         if not isinstance(self.answer, str):
             raise TypeError("Gemini answer must be text")
+        validate_json_text(self.answer, "Gemini answer")
         if self.usage is not None:
             object.__setattr__(self, "usage", freeze_json_mapping(
                 self.usage, "Gemini usage"))
         if self.duration_ms is not None:
             _nonnegative_int(self.duration_ms, "Gemini duration_ms")
-        if any(not isinstance(call, GeminiToolCall) for call in self.tool_calls):
+        frozen_calls = tuple(self.tool_calls)
+        if any(not isinstance(call, GeminiToolCall) for call in frozen_calls):
             raise TypeError("Gemini tool_calls must contain GeminiToolCall values")
         if self.provider_error is not None:
             _nonempty_string(self.provider_error, "Gemini provider error")
@@ -189,20 +225,30 @@ class GeminiStream:
             for index, record in enumerate(self.records, 1)
         )
         object.__setattr__(self, "records", frozen_records)
+        object.__setattr__(self, "models", frozen_models)
+        object.__setattr__(self, "tool_calls", frozen_calls)
+        if self.reported_tool_calls is not None:
+            _nonnegative_int(
+                self.reported_tool_calls, "Gemini reported tool_calls")
+        if not isinstance(self.warnings, (tuple, list)) or any(
+                not isinstance(warning, str) or not warning.strip()
+                for warning in self.warnings):
+            raise ValueError("Gemini stream warnings must be non-empty strings")
+        for warning in self.warnings:
+            validate_json_text(warning, "Gemini stream warning")
+        object.__setattr__(self, "warnings", tuple(self.warnings))
 
     @property
     def complete(self) -> bool:
         return (
             self.protocol_error is None
             and self.provider_error is None
-            and bool(self.answer)
+            and bool(self.answer.strip())
         )
 
     @property
     def resolved_model(self) -> str | None:
-        if len(self.models) == 1:
-            return self.models[0]
-        return self.configured_model
+        return self.models[0] if len(self.models) == 1 else None
 
     @classmethod
     def invalid(
@@ -228,7 +274,7 @@ class GeminiStream:
                 continue
             try:
                 value = _strict_json_loads(line)
-            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as exc:
                 return cls.invalid(
                     f"malformed JSONL at line {line_number}: {exc}",
                     records=tuple(materialized),
@@ -267,6 +313,7 @@ class GeminiStream:
         seen_call_ids: set[str] = set()
         answer_parts: list[str] = []
         error_events: list[str] = []
+        warning_events: list[str] = []
         provider_error: str | None = None
         stats: _StreamStats | None = None
         known = {"init", "message", "tool_use", "tool_result", "error", "result"}
@@ -331,9 +378,6 @@ class GeminiStream:
                     if record.get("error") is not None:
                         tool_error = _error_text(
                             record["error"], f"Gemini tool_result {index}.error")
-                    if status == "error" and tool_error is None:
-                        raise ValueError(
-                            f"Gemini tool_result {index} error status needs an error object")
                     if status == "success" and tool_error is not None:
                         raise ValueError(
                             f"Gemini tool_result {index} success contradicts its error object")
@@ -352,6 +396,8 @@ class GeminiStream:
                         record.get("message"), f"Gemini error {index}.message")
                     if severity == "error":
                         error_events.append(message)
+                    else:
+                        warning_events.append(message)
                 else:
                     status = record.get("status")
                     if status not in {"success", "error"}:
@@ -359,7 +405,12 @@ class GeminiStream:
                             "Gemini result.status must be success or error")
                     raw_error = record.get("error")
                     if status == "error":
-                        provider_error = _error_text(raw_error, "Gemini result.error")
+                        provider_error = (
+                            _error_text(raw_error, "Gemini result.error")
+                            if raw_error is not None else
+                            error_events[-1] if error_events else
+                            "Gemini result reported error status"
+                        )
                     elif raw_error is not None:
                         raise ValueError(
                             "Gemini result success contradicts its error object")
@@ -376,9 +427,15 @@ class GeminiStream:
                 f"dangling tool call {next(iter(open_calls))!r}", records=records,
                 session_id=session_id, configured_model=configured_model)
         if error_events and provider_error is None:
-            return cls.invalid(
-                "success plus error event: " + error_events[0], records=records,
-                session_id=session_id, configured_model=configured_model)
+            # The official max-turn path can emit a severity:error event and
+            # still close with result.status=success. That is a provider-level
+            # failure observation, not malformed wire protocol.
+            provider_error = error_events[-1]
+        terminal_warning = next((
+            warning for warning in reversed(warning_events)
+            if _terminal_warning(warning)), None)
+        if terminal_warning is not None and provider_error is None:
+            provider_error = terminal_warning
         answer = "".join(answer_parts).strip()
         if provider_error is None and not answer:
             return cls.invalid(
@@ -393,6 +450,8 @@ class GeminiStream:
             usage=dict(stats.usage) if stats is not None else None,
             duration_ms=stats.duration_ms if stats is not None else None,
             tool_calls=tuple(completed_calls),
+            reported_tool_calls=(stats.tool_calls if stats is not None else None),
+            warnings=tuple(warning_events),
             provider_error=provider_error,
         )
 
@@ -421,9 +480,11 @@ def _json_model_usage(raw: Any, label: str) -> dict[str, int]:
     }
 
 
-def _parse_json_usage(raw: Any) -> tuple[dict[str, int] | None, tuple[str, ...]]:
+def _parse_json_usage(
+    raw: Any,
+) -> tuple[dict[str, int] | None, tuple[str, ...], int | None]:
     if raw is None:
-        return None, ()
+        return None, (), None
     if not isinstance(raw, Mapping):
         raise ValueError("Gemini JSON stats must be an object")
     models = raw.get("models")
@@ -442,7 +503,15 @@ def _parse_json_usage(raw: Any) -> tuple[dict[str, int] | None, tuple[str, ...]]
         names.append(model_name)
         for key, value in usage.items():
             totals[key] += value
-    return (totals if names else None), tuple(names)
+    raw_tools = raw.get("tools")
+    tool_calls: int | None = None
+    if raw_tools is not None:
+        if not isinstance(raw_tools, Mapping):
+            raise ValueError("Gemini JSON stats.tools must be an object")
+        tool_calls = _nonnegative_int(
+            raw_tools.get("totalCalls"),
+            "Gemini JSON stats.tools.totalCalls")
+    return (totals if names else None), tuple(names), tool_calls
 
 
 @dataclass(frozen=True)
@@ -453,31 +522,52 @@ class GeminiJsonResponse:
     session_id: str | None = None
     models: tuple[str, ...] = ()
     usage: Mapping[str, Any] | None = None
+    tool_calls: int | None = None
+    warnings: tuple[str, ...] = ()
     provider_error: str | None = None
     protocol_error: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.models, (tuple, list)):
+            raise TypeError("Gemini JSON models must be a tuple or list")
         if not isinstance(self.response, str):
             raise TypeError("Gemini JSON response must be text")
+        validate_json_text(self.response, "Gemini JSON response")
         if self.session_id is not None:
             _nonempty_string(self.session_id, "Gemini JSON session id")
+        frozen_models = tuple(self.models)
+        if any(not isinstance(model, str) or not model.strip()
+               for model in frozen_models):
+            raise ValueError("Gemini JSON model names must be non-empty strings")
+        for model in frozen_models:
+            validate_json_text(model, "Gemini JSON model name")
         if self.usage is not None:
             object.__setattr__(self, "usage", freeze_json_mapping(
                 self.usage, "Gemini JSON usage"))
+        if self.tool_calls is not None:
+            _nonnegative_int(self.tool_calls, "Gemini JSON tool_calls")
+        if not isinstance(self.warnings, (tuple, list)) or any(
+                not isinstance(warning, str) or not warning.strip()
+                for warning in self.warnings):
+            raise ValueError("Gemini JSON warnings must be non-empty strings")
+        for warning in self.warnings:
+            validate_json_text(warning, "Gemini JSON warning")
+        object.__setattr__(self, "warnings", tuple(self.warnings))
         if self.provider_error is not None:
             _nonempty_string(self.provider_error, "Gemini JSON provider error")
         if self.protocol_error is not None:
             _nonempty_string(self.protocol_error, "Gemini JSON protocol error")
         object.__setattr__(self, "raw", freeze_json_mapping(
             self.raw, "Gemini JSON envelope"))
+        object.__setattr__(self, "models", frozen_models)
 
     @property
     def complete(self) -> bool:
         return (
             self.protocol_error is None
             and self.provider_error is None
-            and bool(self.response)
+            and bool(self.response.strip())
         )
 
     @property
@@ -490,7 +580,7 @@ class GeminiJsonResponse:
             raise TypeError("Gemini JSON output must be text")
         try:
             value = _strict_json_loads(raw_text)
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as exc:
             return cls(protocol_error=f"malformed Gemini JSON: {exc}")
         if not isinstance(value, Mapping):
             return cls(protocol_error="Gemini JSON output must be an object")
@@ -504,6 +594,17 @@ class GeminiJsonResponse:
                 _error_text(raw["error"], "Gemini JSON error")
                 if raw.get("error") is not None else None
             )
+            raw_warnings = raw.get("warnings", [])
+            if not isinstance(raw_warnings, list):
+                raise ValueError("Gemini JSON warnings must be an array")
+            warnings = tuple(
+                _nonempty_string(warning, "Gemini JSON warning")
+                for warning in raw_warnings)
+            terminal_warning = next((
+                warning for warning in warnings
+                if _terminal_warning(warning)), None)
+            if provider_error is None and terminal_warning is not None:
+                provider_error = terminal_warning
             response = raw.get("response")
             if provider_error is None:
                 response = _nonempty_string(
@@ -512,7 +613,7 @@ class GeminiJsonResponse:
                 response = ""
             elif not isinstance(response, str):
                 raise ValueError("Gemini JSON response must be a string when present")
-            usage, models = _parse_json_usage(raw.get("stats"))
+            usage, models, tool_calls = _parse_json_usage(raw.get("stats"))
         except (TypeError, ValueError) as exc:
             return cls(
                 session_id=session_id if isinstance(session_id, str) else None,
@@ -523,6 +624,8 @@ class GeminiJsonResponse:
             session_id=session_id,
             models=models,
             usage=usage,
+            tool_calls=tool_calls,
+            warnings=warnings,
             provider_error=provider_error,
             raw=raw,
         )

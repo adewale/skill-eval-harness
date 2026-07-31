@@ -11,7 +11,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, TypeAlias
 
-from json_contracts import freeze_json_mapping
+from json_contracts import freeze_json_mapping, validate_json_text
+from trigger_contracts import InvocationState
 
 
 class Provider(str, Enum):
@@ -24,8 +25,17 @@ class Provider(str, Enum):
 
 
 def _finite_nonnegative(value: Any, label: str, *, integer: bool = False) -> int | float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise ValueError(f"{label} must be finite and non-negative")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{label} must be finite and non-negative")
+    if not integer:
+        try:
+            converted = float(value)
+        except OverflowError as exc:
+            raise ValueError(f"{label} must be finite and non-negative") from exc
+        if not math.isfinite(converted):
+            raise ValueError(f"{label} must be finite and non-negative")
     if integer and (not isinstance(value, int) or isinstance(value, bool)):
         raise ValueError(f"{label} must be a non-negative integer")
     return value
@@ -63,6 +73,7 @@ class OutcomeContext:
     elapsed_ms: int | None = None
     stderr: str = ""
     trace_text: str = ""
+    trace_utf8_valid: bool = True
     usage: Mapping[str, Any] | None = None
     cost_usd: float | None = None
     metadata_extra: Mapping[str, Any] = field(default_factory=dict)
@@ -77,10 +88,18 @@ class OutcomeContext:
             raise ValueError(f"unknown runner provider {self.provider!r}") from exc
         if self.model is not None and (not isinstance(self.model, str) or not self.model.strip()):
             raise ValueError("runner model must be None or a non-empty string")
+        if self.model is not None:
+            validate_json_text(self.model, "runner model")
         if self.elapsed_ms is not None:
             _finite_nonnegative(self.elapsed_ms, "elapsed_ms", integer=True)
+            if self.elapsed_ms > 2**63 - 1:
+                raise ValueError("elapsed_ms exceeds the supported duration range")
         if not isinstance(self.stderr, str) or not isinstance(self.trace_text, str):
             raise TypeError("stderr and trace_text must be strings")
+        validate_json_text(self.stderr, "runner stderr")
+        validate_json_text(self.trace_text, "runner trace_text")
+        if not isinstance(self.trace_utf8_valid, bool):
+            raise TypeError("trace_utf8_valid must be boolean")
         if self.cost_usd is not None:
             _finite_nonnegative(self.cost_usd, "cost_usd")
         if self.usage is not None:
@@ -134,8 +153,9 @@ class Completed:
             raise ValueError("Completed returncode must be 0")
         if not isinstance(self.answer, str):
             raise TypeError("Completed answer must be a string")
-        if not self.answer:
-            raise ValueError("Completed answer cannot be empty")
+        validate_json_text(self.answer, "Completed answer")
+        if not self.answer.strip():
+            raise ValueError("Completed answer cannot be blank")
 
 
 @dataclass(frozen=True)
@@ -156,6 +176,8 @@ class TimedOut:
             raise ValueError("timeout_s must be a positive integer or None")
         if self.reason is not None and (not isinstance(self.reason, str) or not self.reason.strip()):
             raise ValueError("timeout reason must be non-empty or None")
+        if self.reason is not None:
+            validate_json_text(self.reason, "timeout reason")
 
 
 @dataclass(frozen=True)
@@ -173,6 +195,7 @@ class SpawnFailed:
             raise ValueError("SpawnFailed returncode must be 127")
         if not isinstance(self.reason, str) or not self.reason.strip():
             raise ValueError("SpawnFailed requires a reason")
+        validate_json_text(self.reason, "spawn failure reason")
 
 
 @dataclass(frozen=True)
@@ -187,14 +210,15 @@ class ProviderFailed:
             raise TypeError("ProviderFailed context must be OutcomeContext")
         if type(self.returncode) is not int:
             raise TypeError("ProviderFailed returncode must be an integer")
-        if self.returncode in {124, 127}:
-            raise ValueError("ProviderFailed requires an actual exited-process returncode")
         if self.reason is not None and (not isinstance(self.reason, str) or not self.reason.strip()):
             raise ValueError("provider failure reason must be non-empty or None")
+        if self.reason is not None:
+            validate_json_text(self.reason, "provider failure reason")
         if self.returncode == 0 and self.reason is None:
             raise ValueError("zero-exit provider failure requires a protocol reason")
         if not isinstance(self.answer, str):
             raise TypeError("provider failure answer must be a string")
+        validate_json_text(self.answer, "provider failure answer")
 
 
 AnswerOutcome: TypeAlias = Completed | TimedOut | SpawnFailed | ProviderFailed
@@ -222,12 +246,14 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
                   returncode: int | None = None, timed_out: bool = False,
                   elapsed_ms: int | None = None, stderr: str = "",
                   error: str | None = None, timeout_s: int | None = None,
-                  trace_text: str | None = None, usage: Mapping[str, Any] | None = None,
+                  trace_text: str | None = None, trace_utf8_valid: bool = True,
+                  usage: Mapping[str, Any] | None = None,
                   cost_usd: float | None = None, model: str | None = None,
                   metadata_extra: Mapping[str, Any] | None = None,
                   metrics_extra: Mapping[str, Any] | None = None,
                   environment: Mapping[str, Any] | None = None,
-                  diagnose_returncode: bool = True) -> AnswerOutcome:
+                  diagnose_returncode: bool = True,
+                  invocation_state: InvocationState | str | None = None) -> AnswerOutcome:
     """Strict compatibility factory for the historical constructor spelling."""
     if not isinstance(timed_out, bool):
         raise TypeError("timed_out must be boolean")
@@ -237,9 +263,22 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
         raise TypeError("answer must be a string or None")
     if error is not None and (not isinstance(error, str) or not error.strip()):
         raise ValueError("error must be a non-empty string or None")
+    try:
+        state = (InvocationState(invocation_state)
+                 if invocation_state is not None else None)
+    except ValueError as exc:
+        raise ValueError("invalid answer-runner invocation_state") from exc
+    if state in {InvocationState.PROVIDER_FAILED, InvocationState.HARNESS_FAILED}:
+        raise ValueError(
+            "answer-runner invocation_state must describe process provenance")
+    if timed_out and state not in {None, InvocationState.TIMED_OUT}:
+        raise ValueError("timed_out contradicts invocation_state")
+    if state is InvocationState.TIMED_OUT and not timed_out:
+        raise ValueError("timed-out invocation_state requires timed_out=True")
     context = OutcomeContext(
         provider=Provider(provider), model=model, elapsed_ms=elapsed_ms, stderr=stderr,
         trace_text="" if trace_text is None else trace_text,
+        trace_utf8_valid=trace_utf8_valid,
         usage=usage, cost_usd=cost_usd,
         metadata_extra={} if metadata_extra is None else metadata_extra,
         metrics_extra={} if metrics_extra is None else metrics_extra,
@@ -250,15 +289,19 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
             raise ValueError("timed-out outcome cannot carry a non-timeout returncode")
         return TimedOut(context, timeout_s=timeout_s, reason=error)
     code = 0 if returncode is None else returncode
-    if code == 124:
-        raise ValueError("returncode 124 requires timed_out=True")
-    if code == 127:
+    if state is InvocationState.SPAWN_FAILED:
+        if code != 127:
+            raise ValueError("spawn-failed invocation_state requires returncode 127")
         return SpawnFailed(context, reason=error or stderr or "process spawn failed")
+    if state is InvocationState.COMPLETE and code != 0:
+        raise ValueError("complete invocation_state requires returncode 0")
+    if state is InvocationState.PROCESS_FAILED and code == 0:
+        raise ValueError("process-failed invocation_state requires non-zero returncode")
     if code != 0 or error:
         return ProviderFailed(
             context, returncode=code, reason=error,
             answer="" if answer is None else answer)
-    if not answer:
+    if answer is None or not answer.strip():
         return ProviderFailed(context, returncode=0, reason="provider produced no final answer")
     return Completed(context, answer=answer)
 

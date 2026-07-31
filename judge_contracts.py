@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import telemetry
-from json_contracts import freeze_json_mapping
+from json_contracts import freeze_json_mapping, validate_json_text
 
 JudgeUsageSource = Literal["provider_reported", "trace_normalized"]
 JUDGE_USAGE_SOURCES = frozenset({"provider_reported", "trace_normalized"})
@@ -20,7 +20,8 @@ JUDGE_USAGE_SOURCES = frozenset({"provider_reported", "trace_normalized"})
 
 def _finite_nonnegative(value: Any, label: str) -> int | float:
     if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(float(value)) or value < 0):
+            or value < 0
+            or (isinstance(value, float) and not math.isfinite(value))):
         raise ValueError(f"{label} must be finite and non-negative")
     return value
 
@@ -59,6 +60,8 @@ class JudgeInvocation:
     def __post_init__(self) -> None:
         if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
             raise TypeError("judge stdout and stderr must be strings")
+        validate_json_text(self.stdout, "judge stdout")
+        validate_json_text(self.stderr, "judge stderr")
         if type(self.returncode) is not int:
             raise TypeError("judge returncode must be an integer")
         if self.usage_source not in JUDGE_USAGE_SOURCES:
@@ -67,15 +70,23 @@ class JudgeInvocation:
         if self.model_label is not None and (
                 not isinstance(self.model_label, str) or not self.model_label.strip()):
             raise ValueError("judge model label must be None or a non-empty string")
+        if self.model_label is not None:
+            validate_json_text(self.model_label, "judge model label")
         if self.raw_response is not None and not isinstance(self.raw_response, str):
             raise TypeError("judge raw_response must be text or None")
+        if self.raw_response is not None:
+            validate_json_text(self.raw_response, "judge raw_response")
         if not isinstance(self.metadata, Mapping):
             raise TypeError("judge metadata must be a mapping")
         object.__setattr__(self, "metadata", freeze_json_mapping(
             self.metadata, "judge metadata"))
         if self.cost_usd is not None:
             _finite_nonnegative(self.cost_usd, "judge cost_usd")
-            object.__setattr__(self, "cost_usd", float(self.cost_usd))
+            try:
+                object.__setattr__(self, "cost_usd", float(self.cost_usd))
+            except OverflowError as exc:
+                raise ValueError(
+                    "judge cost_usd must be finite and non-negative") from exc
         if self.usage is not None:
             if not isinstance(self.usage, Mapping):
                 raise TypeError("judge usage must be a mapping or None")
