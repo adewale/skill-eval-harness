@@ -26,6 +26,7 @@ from helpers import (
     write_demo_manifest as write_manifest,
 )
 
+import judge_contracts as jc
 import judge_verdict as jv
 import skill_benchmark as sb
 
@@ -403,6 +404,57 @@ class VerdictSchemaTests(unittest.TestCase):
         for r in rows:
             self.assertNotIn("schema_errors", r)   # clean verdict -> no new key -> byte-identical row
             self.assertTrue(r["passed"])
+
+    def test_native_judge_backends_return_typed_invocations(self):
+        assertion_schema = sb.verdict_schema_for(self.PLAIN)
+        provider_result = {
+            "answer": '{"passed":true}', "stderr": "", "returncode": 0,
+            "cost_usd": 0.02,
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        }
+        with mock.patch.object(sb, "claude_cli_invoke", return_value=provider_result):
+            claude = sb.claude_judge_invoke(
+                "prompt", judge_model="sonnet", claude_bin="claude",
+                assertion_schema=assertion_schema, extra_args=None,
+                explore_hint=None)
+        with mock.patch.object(sb, "codex_cli_invoke", return_value={
+                **provider_result, "model": "codex/gpt-mini"}):
+            codex = sb.codex_judge_invoke(
+                "prompt", judge_model="gpt-mini", codex_cmd="codex exec",
+                assertion_schema=assertion_schema, explore_hint=None)
+        with mock.patch.object(sb, "vibe_cli_invoke", return_value=provider_result):
+            vibe = sb.vibe_judge_invoke(
+                "prompt", judge_model="mistral", vibe_cmd="vibe",
+                explore_hint=None)
+
+        for backend, invocation in {
+                "claude": claude, "codex": codex, "vibe": vibe}.items():
+            with self.subTest(backend=backend):
+                self.assertIsInstance(invocation, jc.JudgeInvocation)
+                self.assertTrue(invocation.succeeded)
+
+    def test_shell_judge_uses_the_same_typed_boundary(self):
+        invocation = jc.JudgeInvocation(
+            stdout='{"passed":true}', stderr="", returncode=0,
+            model_label="opaque-shell-judge")
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+                sb, "shell_judge_invoke", return_value=invocation) as invoke:
+            row = sb.run_one_judge_task(
+                self._task(td), judge_cmd="unused", judge_model="opaque-shell-judge")
+
+        invoke.assert_called_once()
+        self.assertTrue(row["passed"])
+        self.assertEqual(row["judge_model"], "opaque-shell-judge")
+
+    def test_registry_rejects_an_untyped_judge_backend_result(self):
+        def broken_backend(prompt, **kwargs):
+            return {"stdout": '{"passed":true}', "stderr": "", "returncode": 0}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                sb.JUDGE_BACKENDS, {"broken": broken_backend}):
+            with self.assertRaisesRegex(TypeError, "JudgeInvocation"):
+                sb.run_one_judge_task(
+                    self._task(td), judge_backend="broken", judge_model="model")
 
     def test_native_codex_judge_uses_last_message_and_schema(self):
         with tempfile.TemporaryDirectory() as td:

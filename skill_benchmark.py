@@ -43,7 +43,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
-from typing import Any, NoReturn, Protocol
+from typing import Any, NoReturn, Protocol, cast
 
 import yaml
 from yaml.constructor import ConstructorError
@@ -100,6 +100,7 @@ from jetty_contracts import (
     lifecycle_from_record,
     lifecycle_from_status,
 )
+from judge_contracts import JudgeInvocation
 from judge_verdict import (
     BooleanVerdict,
     ConsensusVerdict,
@@ -134,7 +135,7 @@ from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 VALID_SPLITS = {"tune", "holdout", "holdback"}
 HARNESS_SEMANTIC_MODULES = (
     "ablation_model.py", "agent_capabilities.py", "experimental_pairs.py",
-    "jetty_contracts.py", "judge_verdict.py", "json_contracts.py", "run_pi_trigger_eval.py",
+    "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "run_pi_trigger_eval.py",
     "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
     "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
     "trigger_reporting.py",
@@ -5681,18 +5682,9 @@ def metric_number(metrics: dict[str, Any], *keys: str) -> float | None:
 
 USAGE_SOURCES = {"provider_reported", "trace_normalized", "estimated", "missing", "not_applicable"}
 COST_SOURCES = {"provider_reported", "trace_normalized", "price_table_estimated", "missing", "not_applicable"}
-# THE token-usage alias table. Every normalizer (metadata `normalize_usage`, the
-# trace-stream `usage_number`, and the Claude envelope parser) reads THIS table,
-# so the same provider payload can never be classified differently by two paths
-# (the drift that once made metrics.json and usage_normalized disagree).
-USAGE_ALIASES: dict[str, list[str]] = {
-    "input_tokens": ["input_tokens", "prompt_tokens", "input", "promptTokens", "inputTokens"],
-    "output_tokens": ["output_tokens", "completion_tokens", "output", "completionTokens", "outputTokens"],
-    "cache_read_tokens": ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cached_input_tokens", "cacheReadTokens"],
-    "cache_write_tokens": ["cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens", "cacheWriteTokens"],
-    "reasoning_tokens": ["reasoning_tokens", "thinking_tokens", "reasoningTokens"],
-    "total_tokens": ["total_tokens", "totalTokens", "total", "tokens"],
-}
+# Every normalizer reads the leaf telemetry domain's token-usage alias table, so
+# provider payloads cannot be classified differently by two paths.
+USAGE_ALIASES = telemetry_domain.USAGE_ALIASES
 COST_PART_ALIASES: dict[str, tuple[str, ...]] = {
     "input_cost": ("input_cost", "prompt_cost"),
     "output_cost": ("output_cost", "completion_cost"),
@@ -5718,23 +5710,7 @@ def normalize_usage(raw: Any, *, source: str = "provider_reported") -> dict[str,
     "missing"} — missing telemetry is never silently zero."""
     if source not in USAGE_SOURCES:
         raise ValueError(f"unknown usage source {source!r}; expected one of {sorted(USAGE_SOURCES)}")
-    out: dict[str, Any] = {}
-    if isinstance(raw, dict):
-        for key, aliases in USAGE_ALIASES.items():
-            observed: list[tuple[str, int]] = []
-            for alias in aliases:
-                if alias not in raw or raw.get(alias) is None:
-                    continue
-                value = raw[alias]
-                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                    raise ValueError(
-                        f"usage.{alias} must be a finite nonnegative integer token count")
-                observed.append((alias, value))
-            if observed:
-                values = {value for _, value in observed}
-                if len(values) != 1:
-                    raise ValueError(f"conflicting aliases for {key}: {dict(observed)}")
-                out[key] = observed[0][1]
+    out: dict[str, Any] = telemetry_domain.canonical_usage_counts(raw)
     if source == "not_applicable":
         return {"source": "not_applicable"}
     if ("total_tokens" not in out and "input_tokens" in out
@@ -9571,7 +9547,7 @@ def sanitized_run_copy(run_base: Path, dest: Path) -> Path | None:
 
 def claude_judge_invoke(prompt: str, *, judge_model: str | None, claude_bin: str,
                         assertion_schema: dict[str, Any], extra_args: list[str] | None,
-                        explore_hint: str | None, **_: Any) -> dict[str, Any]:
+                        explore_hint: str | None, **_: Any) -> JudgeInvocation:
     if not judge_model:
         raise ValueError("native Claude judge requires judge_model")
     claude_extra_args = list(extra_args or [])
@@ -9580,47 +9556,58 @@ def claude_judge_invoke(prompt: str, *, judge_model: str | None, claude_bin: str
     claude_extra_args += ["--json-schema", json.dumps(assertion_schema, separators=(",", ":"))]
     res = claude_cli_invoke(prompt, model=judge_model, claude_bin=claude_bin,
                             extra_args=claude_extra_args, cwd=explore_hint)
-    return {
-        "stdout": res.get("answer", ""),
-        "stderr": res.get("stderr", "") or "",
-        "returncode": res.get("returncode"),
-        "cost_usd": res.get("cost_usd"),
-        "usage": res.get("usage") if isinstance(res.get("usage"), dict) else None,
-        "usage_source": "provider_reported",
-        "judge_model_label": judge_model,
-    }
+    return JudgeInvocation(
+        stdout=res.get("answer", ""),
+        stderr=res.get("stderr", "") or "",
+        returncode=cast(int, res.get("returncode")),
+        cost_usd=res.get("cost_usd"),
+        usage=res.get("usage") if isinstance(res.get("usage"), dict) else None,
+        usage_source="provider_reported",
+        model_label=judge_model,
+    )
 
 
 def codex_judge_invoke(prompt: str, *, judge_model: str | None, codex_cmd: str,
                        assertion_schema: dict[str, Any], explore_hint: str | None,
-                       **_: Any) -> dict[str, Any]:
+                       **_: Any) -> JudgeInvocation:
     res = codex_cli_invoke(prompt, model=judge_model, codex_cmd=codex_cmd,
                            output_schema=assertion_schema, cwd=explore_hint)
     usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
-    return {
-        "stdout": res.get("answer") or "",
-        "stderr": res.get("stderr", "") or "",
-        "returncode": res.get("returncode"),
-        "cost_usd": res.get("cost_usd"),
-        "usage": usage,
-        "usage_source": "trace_normalized" if usage else "provider_reported",
-        "judge_model_label": str(res.get("model") or f"codex/{judge_model or 'default'}"),
-    }
+    return JudgeInvocation(
+        stdout=res.get("answer") or "",
+        stderr=res.get("stderr", "") or "",
+        returncode=cast(int, res.get("returncode")),
+        cost_usd=res.get("cost_usd"),
+        usage=usage,
+        usage_source="trace_normalized" if usage else "provider_reported",
+        model_label=str(res.get("model") or f"codex/{judge_model or 'default'}"),
+    )
 
 
 def vibe_judge_invoke(prompt: str, *, judge_model: str | None, vibe_cmd: str,
-                      explore_hint: str | None, **_: Any) -> dict[str, Any]:
+                      explore_hint: str | None, **_: Any) -> JudgeInvocation:
     res = vibe_cli_invoke(prompt, model=judge_model, vibe_cmd=vibe_cmd, output="json",
                           tools=VIBE_NO_TOOLS, cwd=explore_hint)
-    return {
-        "stdout": res.get("answer", ""),
-        "stderr": res.get("stderr", "") or "",
-        "returncode": res.get("returncode"),
-        "cost_usd": res.get("cost_usd"),
-        "usage": res.get("usage") if isinstance(res.get("usage"), dict) else None,
-        "usage_source": "provider_reported",
-        "judge_model_label": f"vibe/{judge_model or 'default'}",
-    }
+    return JudgeInvocation(
+        stdout=res.get("answer", ""),
+        stderr=res.get("stderr", "") or "",
+        returncode=cast(int, res.get("returncode")),
+        cost_usd=res.get("cost_usd"),
+        usage=res.get("usage") if isinstance(res.get("usage"), dict) else None,
+        usage_source="provider_reported",
+        model_label=f"vibe/{judge_model or 'default'}",
+    )
+
+
+def shell_judge_invoke(prompt: str, *, judge_cmd: str,
+                       model_label: str | None = None) -> JudgeInvocation:
+    """Adapt the universal stdin/stdout judge command to the native contract."""
+    proc = subprocess.run(
+        judge_cmd, shell=True, input=prompt, text=True,
+        capture_output=True, check=False)
+    return JudgeInvocation(
+        stdout=proc.stdout, stderr=proc.stderr or "", returncode=proc.returncode,
+        model_label=model_label)
 
 
 JUDGE_BACKENDS = {
@@ -9814,19 +9801,13 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     # `judge_cmd` remains the universal escape hatch; native Codex uses
     # --output-last-message/--output-schema so stdout JSONL is telemetry, not
     # the verdict stream.
-    cost_usd = None
-    judge_usage = None
-    usage_source = "provider_reported"
-    judge_model_label = judge_model
     assertion_schema = verdict_schema_for(task.get("assertion", {}))
     try:
         if judge_cmd:
-            proc = subprocess.run(
-                judge_cmd, shell=True, input=prompt, text=True, capture_output=True, check=False
-            )
-            stdout, stderr, returncode = proc.stdout, proc.stderr or "", proc.returncode
+            invocation = shell_judge_invoke(
+                prompt, judge_cmd=judge_cmd, model_label=judge_model)
         elif judge_backend in JUDGE_BACKENDS:
-            res = JUDGE_BACKENDS[judge_backend](
+            invocation = JUDGE_BACKENDS[judge_backend](
                 prompt,
                 judge_model=judge_model,
                 claude_bin=claude_bin,
@@ -9836,17 +9817,23 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
                 extra_args=extra_args,
                 explore_hint=explore_hint,
             )
-            stdout, stderr, returncode = res["stdout"], res["stderr"], res["returncode"]
-            cost_usd = res.get("cost_usd")
-            judge_usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
-            usage_source = str(res.get("usage_source") or usage_source)
-            judge_model_label = str(res.get("judge_model_label") or judge_model_label)
         else:
             raise ValueError(f"unknown native judge backend {judge_backend!r}; choose one of {', '.join(sorted(JUDGE_BACKENDS))} or use --judge-cmd")
+        if not isinstance(invocation, JudgeInvocation):
+            raise TypeError(
+                f"judge backend {judge_backend!r} must return JudgeInvocation, "
+                f"got {type(invocation).__name__}")
     finally:
         # The sanitized copy is scratch; the judge has already run against it.
         if explore_root is not None:
             shutil.rmtree(explore_root, ignore_errors=True)
+    stdout = invocation.stdout
+    stderr = invocation.stderr
+    returncode = invocation.returncode
+    cost_usd = invocation.cost_usd
+    judge_usage = dict(invocation.usage) if invocation.usage is not None else None
+    usage_source = invocation.usage_source
+    judge_model_label = invocation.model_label or judge_model
     parsed: dict[str, Any]
     parse_error = None
     try:

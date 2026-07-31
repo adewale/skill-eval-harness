@@ -95,6 +95,17 @@ exhaustively adapts the union to artifacts; backends cannot repair or mutate sta
 writing files. `RunnerOutcome` remains only as a strict compatibility factory that constructs one
 of the four variants.
 
+## Judge invocation results
+
+`judge_contracts.JudgeInvocation` is the immutable process boundary shared by native judge
+backends and `--judge-cmd`. It requires string output channels and an exact integer return code,
+validates finite non-negative cost and usage measurements, recursively freezes usage, and closes
+usage provenance plus model identity. `run_one_judge_task` rejects any registered backend that
+returns another shape before JSON extraction, schema checks, typed verdict construction, or row
+assembly. A nonzero exit remains a valid diagnostic invocation but cannot become a complete judge
+observation. This changes no persisted judge-row fields; `judge_verdict.py` still re-establishes the
+boolean/scored/dimension/dynamic/consensus invariant at the storage boundary.
+
 ## Orthogonal run evidence and artifact commit
 
 `telemetry.ObservationEvidence` is the product of four independent states:

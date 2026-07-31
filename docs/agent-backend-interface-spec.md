@@ -251,6 +251,16 @@ class InvocationResult:
     provider: str | None = None
     finish_reason: str | None = None
     adapter_metadata: dict[str, Any] = field(default_factory=dict)
+
+@dataclass(frozen=True)
+class JudgeInvocation:
+    stdout: str
+    stderr: str
+    returncode: int
+    usage: Mapping[str, Any] | None = None
+    cost_usd: float | None = None
+    usage_source: Literal["provider_reported", "trace_normalized"] = "provider_reported"
+    model_label: str | None = None
 ```
 
 ### Protocols
@@ -269,7 +279,7 @@ class AgentBackend(Protocol):
 class JudgeBackend(Protocol):
     # Verdict schema, tool policy, and exploration options belong here rather
     # than on answer-runner InvocationRequest.
-    def judge(self, task: JudgeTask, model: str | None, options: JudgeOptions) -> JudgeResult: ...
+    def judge(self, task: JudgeTask, model: str | None, options: JudgeOptions) -> JudgeInvocation: ...
 
 class TriggerBackend(Protocol):
     def mount_trigger_skill(self, tree_dir: Path, workspace: Path) -> list[Path]: ...
