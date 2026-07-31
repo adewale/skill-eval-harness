@@ -43,6 +43,17 @@ OTEL_PLAN = (ROOT / "docs" / "otel-support-plan.md").read_text(encoding="utf-8")
 PYPROJECT = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
 
+class _AnswerWithoutInvoke:
+    name = "codex"
+
+
+class _TriggerWithoutAdapterMethods:
+    name = "stub"
+
+
+_NON_CALLABLE_IMPLEMENTATION = object()
+
+
 class SharedOwnerIdentityTests(unittest.TestCase):
     """Every helper both a runner and the harness need must BE the harness's
     object. (Pattern established by test_audit_fixes' detect_trigger check.)"""
@@ -473,6 +484,79 @@ class SharedOwnerIdentityTests(unittest.TestCase):
                 ac.BACKENDS["codex"],
                 answer_entrypoints=(object(),),  # type: ignore[arg-type]
             )
+
+    def test_registry_declarations_are_deeply_immutable(self):
+        with self.assertRaisesRegex(TypeError, "command must be a tuple"):
+            ac.DedicatedSmokeTarget(
+                "agy", ["true"],  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(TypeError, "flags must be a tuple"):
+            ac.BackendCliOption(
+                ["--agy-cmd"], "agy_cmd", "agy", "test",  # type: ignore[arg-type]
+            )
+        option = ac.BackendCliOption(
+            ("--agy-cmd",), "agy_cmd", "agy", "test")
+        implementation = ac.ObjectRef(
+            "run_trigger_matrix", "StubAdapter")
+        with self.assertRaisesRegex(TypeError, "CLI options must be a tuple"):
+            ac.SurfaceBinding(
+                implementation, [option],  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(
+            TypeError, "extra parameters must be a tuple"
+        ):
+            ac.SurfaceBinding(
+                implementation, (), ["max_turns"],  # type: ignore[arg-type]
+            )
+
+    def test_materialized_registry_views_validate_runtime_contracts(self):
+        answer = replace(
+            ac.BACKENDS["codex"],
+            answer=ac.SurfaceBinding(
+                ac.ObjectRef(__name__, "_AnswerWithoutInvoke")),
+        )
+        with self.assertRaisesRegex(
+            TypeError, "answer implementation is missing callable methods"
+        ):
+            ac.surface_implementations(
+                "answer", instantiate=True,
+                registrations=ac.backend_registry(answer),
+            )
+
+        trigger = replace(
+            ac.BACKENDS["stub"],
+            trigger=ac.SurfaceBinding(
+                ac.ObjectRef(__name__, "_TriggerWithoutAdapterMethods")),
+        )
+        with self.assertRaisesRegex(
+            TypeError, "trigger implementation is missing callable methods"
+        ):
+            ac.surface_implementations(
+                "trigger", registrations=ac.backend_registry(trigger),
+            )
+
+        judge = replace(
+            ac.BACKENDS["codex"],
+            judge=ac.SurfaceBinding(
+                ac.ObjectRef(__name__, "_NON_CALLABLE_IMPLEMENTATION")),
+        )
+        with self.assertRaisesRegex(
+            TypeError, "judge implementation is not callable"
+        ):
+            ac.surface_implementations(
+                "judge", registrations=ac.backend_registry(judge),
+            )
+
+        workspace = replace(
+            ac.BACKENDS["codex"],
+            workspace_builder=ac.ObjectRef(
+                __name__, "_NON_CALLABLE_IMPLEMENTATION"),
+        )
+        with self.assertRaisesRegex(
+            TypeError, "workspace builder is not callable"
+        ):
+            ac.workspace_builder_implementations(
+                ac.backend_registry(workspace))
 
     def test_registry_rejects_wrong_implementation_identity_and_cli_collisions(self):
         generic_trace = ac.ObjectRef(

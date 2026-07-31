@@ -74,6 +74,8 @@ class DedicatedSmokeTarget:
         if (not isinstance(self.agent, str)
                 or BACKEND_NAME_RE.fullmatch(self.agent) is None):
             raise ValueError("dedicated smoke target needs a stable backend name")
+        if not isinstance(self.command, tuple):
+            raise TypeError("dedicated smoke target command must be a tuple")
         if (not self.command
                 or any(not isinstance(part, str) or not part.strip()
                        for part in self.command)):
@@ -167,7 +169,9 @@ class ObjectRef:
     attribute: str
 
     def __post_init__(self) -> None:
-        if not self.module.strip() or not self.attribute.strip():
+        if (not isinstance(self.module, str) or not self.module.strip()
+                or not isinstance(self.attribute, str)
+                or not self.attribute.strip()):
             raise ValueError("object references need non-empty module and attribute names")
 
     def resolve(self) -> Any:
@@ -187,12 +191,19 @@ class BackendCliOption:
     help: str
 
     def __post_init__(self) -> None:
-        if not self.flags or any(not flag.startswith("-") for flag in self.flags):
+        if not isinstance(self.flags, tuple):
+            raise TypeError("backend CLI option flags must be a tuple")
+        if (not self.flags
+                or any(not isinstance(flag, str) or not flag.startswith("-")
+                       for flag in self.flags)):
             raise ValueError("backend CLI options need at least one flag")
         if len(self.flags) != len(set(self.flags)):
             raise ValueError("backend CLI options cannot repeat a flag")
-        if not self.dest.strip() or not isinstance(self.default, str):
+        if (not isinstance(self.dest, str) or not self.dest.strip()
+                or not isinstance(self.default, str)):
             raise ValueError("backend CLI options need a destination and string default")
+        if not isinstance(self.help, str) or not self.help.strip():
+            raise ValueError("backend CLI options need non-empty help text")
 
 
 @dataclass(frozen=True)
@@ -206,6 +217,17 @@ class SurfaceBinding:
     def __post_init__(self) -> None:
         if not isinstance(self.implementation, ObjectRef):
             raise TypeError("surface bindings need a lazy object reference")
+        if not isinstance(self.cli_options, tuple):
+            raise TypeError("surface binding CLI options must be a tuple")
+        if any(not isinstance(option, BackendCliOption)
+               for option in self.cli_options):
+            raise TypeError("surface bindings need typed CLI options")
+        if not isinstance(self.extra_parameters, tuple):
+            raise TypeError("surface binding extra parameters must be a tuple")
+        if any(not isinstance(parameter, str) or not parameter.strip()
+               for parameter in self.extra_parameters):
+            raise ValueError(
+                "surface binding extra parameters must be non-empty strings")
         destinations = [option.dest for option in self.cli_options]
         if len(destinations) != len(set(destinations)):
             raise ValueError("surface binding repeats a CLI option destination")
@@ -640,14 +662,22 @@ def surface_implementations(
     surface: BackendSurface, *, instantiate: bool = False,
     registrations: Mapping[str, BackendRegistration] | None = None,
 ) -> dict[str, Any]:
-    """Materialize a compatibility view from the one declarative owner."""
+    """Materialize only implementations satisfying their runtime contract."""
     rows = BACKENDS if registrations is None else registrations
     implementations: dict[str, Any] = {}
+    required_methods = {
+        "answer": ("invoke_answer",),
+        "trigger": ("mount", "invoke", "detect"),
+        "judge": (),
+    }
     for name, registration in rows.items():
         binding = getattr(registration, surface)
         if binding is None:
             continue
         implementation = binding.implementation.resolve()
+        if not callable(implementation):
+            raise TypeError(
+                f"backend {name!r} {surface} implementation is not callable")
         projected = implementation() if instantiate else implementation
         if surface in {"answer", "trigger"}:
             actual_name = getattr(projected, "name", None)
@@ -655,7 +685,32 @@ def surface_implementations(
                 raise RuntimeError(
                     f"backend {name!r} {surface} implementation identifies as "
                     f"{actual_name!r}")
+        missing_methods = [
+            method for method in required_methods[surface]
+            if not callable(getattr(projected, method, None))
+        ]
+        if missing_methods:
+            raise TypeError(
+                f"backend {name!r} {surface} implementation is missing callable "
+                f"methods: {', '.join(missing_methods)}")
         implementations[name] = projected
+    return implementations
+
+
+def workspace_builder_implementations(
+    registrations: Mapping[str, BackendRegistration] | None = None,
+) -> dict[str, Any]:
+    """Resolve callable workspace builders before publishing their view."""
+    rows = BACKENDS if registrations is None else registrations
+    implementations: dict[str, Any] = {}
+    for name, registration in rows.items():
+        if registration.workspace_builder is None:
+            continue
+        implementation = registration.workspace_builder.resolve()
+        if not callable(implementation):
+            raise TypeError(
+                f"backend {name!r} workspace builder is not callable")
+        implementations[name] = implementation
     return implementations
 
 

@@ -113,6 +113,7 @@ from agent_capabilities import (
     surface_implementations,
     surface_option_values,
     trace_dialect_implementations,
+    workspace_builder_implementations,
 )
 from jetty_contracts import (
     JettyObservation,
@@ -7583,11 +7584,7 @@ def jetty_upload_workspace(pt: PreparedTask, ws: Path) -> None:
 # Compatibility view of the unified backend registry. ONE parameterized
 # invariant (tests/test_confidence_floor.py) proves the without_skill baseline
 # is skill-free by construction for every registered answer path.
-WORKSPACE_BUILDERS: dict[str, Any] = {
-    name: registration.workspace_builder.resolve()
-    for name, registration in BACKENDS.items()
-    if registration.workspace_builder is not None
-}
+WORKSPACE_BUILDERS: dict[str, Any] = workspace_builder_implementations()
 
 
 def register_workspace_builder(name: str, builder: Any) -> None:
