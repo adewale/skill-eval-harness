@@ -122,7 +122,7 @@ class JettySmokePayloadContractTests(unittest.TestCase):
 
                 def poll(self, *args, **kwargs):
                     return {
-                        "status": "completed",
+                        "status": "failed",
                         "trajectory_id": "failure-trajectory",
                         "storage_path": f"{args[0]}/{args[1]}/0000",
                     }

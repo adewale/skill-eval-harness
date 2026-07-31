@@ -29,6 +29,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -3860,7 +3861,7 @@ def validate_jetty_submission(
     trajectory_id = extract_trajectory_id(submission)
     if trajectory_id is None:
         raise RuntimeError(
-            f"Jetty submit response did not include trajectory_id: {submission}")
+            "Jetty submit response did not include trajectory_id")
     storage_paths: set[str] = set()
     for label, container in (
         ("submit", submission),
@@ -4012,6 +4013,10 @@ class JettyClient:
                 if exc.code == 404:
                     # The DB row can lag the submission by a few seconds;
                     # 404 while waiting means queued, not gone.
+                    last = {
+                        "status": "queued",
+                        "trajectory_id": trajectory_id,
+                    }
                     time.sleep(poll_interval_s)
                     continue
                 raise
@@ -4303,12 +4308,27 @@ class JettyJournalInUse(RuntimeError):
     """Another process currently owns a Jetty attempt journal."""
 
 
+def canonical_jetty_journal_path(journal_path: Path) -> Path:
+    """Return one filesystem identity for every spelling of a journal path."""
+    resolved = journal_path.resolve()
+    if resolved.exists():
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(
+                f"Jetty attempt journal must be a regular file: {journal_path}")
+        if info.st_nlink != 1:
+            raise ValueError(
+                f"Jetty attempt journal must not have hard-link aliases: "
+                f"{journal_path}")
+    return resolved
+
+
 class JettyAttemptJournalLock:
     """Cross-process exclusive ownership for one journal's submit lifecycle."""
 
     def __init__(self, journal_path: Path):
-        self.journal_path = journal_path
-        self.path = Path(str(journal_path) + ".lock")
+        self.journal_path = canonical_jetty_journal_path(journal_path)
+        self.path = Path(str(self.journal_path) + ".lock")
         self._fh: Any = None
 
     def acquire(self) -> None:
@@ -4316,9 +4336,24 @@ class JettyAttemptJournalLock:
             raise RuntimeError(
                 f"Jetty attempt journal lock is already held: {self.path}")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-        fh = os.fdopen(fd, "r+b")
+        if self.path.is_symlink():
+            raise ValueError(
+                f"Jetty attempt journal lock must not be a symlink: {self.path}")
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(self.path, flags, 0o600)
         try:
+            opened = os.fstat(fd)
+            named = os.stat(self.path, follow_symlinks=False)
+            if (not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink != 1
+                    or not os.path.samestat(opened, named)):
+                raise ValueError(
+                    f"Jetty attempt journal lock must be one regular file: "
+                    f"{self.path}")
+            fh = os.fdopen(fd, "r+b")
+            fd = -1
             fh.seek(0, os.SEEK_END)
             if fh.tell() == 0:
                 fh.write(b"\0")
@@ -4332,10 +4367,19 @@ class JettyAttemptJournalLock:
                 fcntl.flock(
                     fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (OSError, BlockingIOError) as exc:
-            fh.close()
+            if fd >= 0:
+                os.close(fd)
+            elif "fh" in locals():
+                fh.close()
             raise JettyJournalInUse(
                 f"Jetty attempt journal is already owned by another "
                 f"run-jetty process: {self.journal_path}") from exc
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            elif "fh" in locals():
+                fh.close()
+            raise
         self._fh = fh
 
     def release(self) -> None:
@@ -4366,21 +4410,23 @@ class JettyAttemptJournal:
     """Atomic local ownership record for paid Jetty attempt boundaries."""
 
     def __init__(self, path: Path):
-        self.path = path
-        if path.exists():
-            raw = strict_json_loads(path.read_text(encoding="utf-8"))
+        self.path = canonical_jetty_journal_path(path)
+        if self.path.exists():
+            raw = strict_json_loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
-                raise ValueError(f"Jetty attempt journal {path} must be an object")
+                raise ValueError(
+                    f"Jetty attempt journal {self.path} must be an object")
             self.data = raw
         else:
             self.data = {"schema_version": 1, "attempts": {}}
         self._validate()
 
-    def _validate(self) -> None:
-        if self.data.get("schema_version") != 1:
+    def _validate(self, data: dict[str, Any] | None = None) -> None:
+        checked = self.data if data is None else data
+        if checked.get("schema_version") != 1:
             raise ValueError(
                 f"unsupported Jetty attempt journal schema in {self.path}")
-        attempts = self.data.get("attempts")
+        attempts = checked.get("attempts")
         if not isinstance(attempts, dict):
             raise TypeError(f"Jetty attempt journal {self.path} needs attempts")
         for digest, raw_entry in attempts.items():
@@ -4403,12 +4449,12 @@ class JettyAttemptJournal:
         assert isinstance(attempts, dict)
         return attempts
 
-    def _persist(self) -> None:
-        self._validate()
+    def _persist(self, data: dict[str, Any]) -> None:
+        self._validate(data)
         _atomic_write_text(
             self.path,
             json.dumps(
-                self.data, indent=2, ensure_ascii=False, allow_nan=False,
+                data, indent=2, ensure_ascii=False, allow_nan=False,
             ) + "\n",
         )
 
@@ -4423,8 +4469,14 @@ class JettyAttemptJournal:
                 "identity": copy.deepcopy(identity),
                 "state": "prepared",
             }
-            self.attempts[digest] = current
-            self._persist()
+            candidate = copy.deepcopy(self.data)
+            candidate_attempts = candidate.get("attempts")
+            if not isinstance(candidate_attempts, dict):
+                raise TypeError(
+                    f"Jetty attempt journal {self.path} needs attempts")
+            candidate_attempts[digest] = current
+            self._persist(candidate)
+            self.data = candidate
         elif current.get("identity") != identity:
             raise RuntimeError(
                 "Jetty attempt journal identity conflict for task contract "
@@ -4440,7 +4492,9 @@ class JettyAttemptJournal:
     ) -> dict[str, Any]:
         if state not in JETTY_ATTEMPT_STATES:
             raise ValueError(f"invalid Jetty attempt state: {state}")
-        entry = self.attempts.get(digest)
+        candidate = copy.deepcopy(self.data)
+        attempts = candidate.get("attempts")
+        entry = attempts.get(digest) if isinstance(attempts, dict) else None
         if not isinstance(entry, dict):
             raise TypeError(f"Jetty attempt {digest} is not registered")
         current_state = entry.get("state")
@@ -4450,7 +4504,8 @@ class JettyAttemptJournal:
                 f"{current_state!r} -> {state!r}")
         entry.update(copy.deepcopy(values))
         entry["state"] = state
-        self._persist()
+        self._persist(candidate)
+        self.data = candidate
         return copy.deepcopy(entry)
 
     def mark_submission_unknown(
@@ -4472,7 +4527,9 @@ class JettyAttemptJournal:
         )
 
     def abandon_unknown(self, digest: str) -> dict[str, Any]:
-        entry = self.attempts.get(digest)
+        candidate = copy.deepcopy(self.data)
+        attempts = candidate.get("attempts")
+        entry = attempts.get(digest) if isinstance(attempts, dict) else None
         if not isinstance(entry, dict) or entry.get("state") not in {
             "submitting", "submission_unknown",
         }:
@@ -4489,17 +4546,32 @@ class JettyAttemptJournal:
             entry.pop(key, None)
         entry["abandoned_unknown_submissions"] = count + 1
         entry["state"] = "upload_completed"
-        self._persist()
+        self._persist(candidate)
+        self.data = candidate
         return copy.deepcopy(entry)
 
     def mark_result_committed(
         self, digest: str, record: dict[str, Any],
     ) -> dict[str, Any]:
+        entry = self.entry(digest)
+        if not isinstance(entry, dict) or entry.get("state") not in {
+            "artifacts_downloaded", "result_committed",
+        }:
+            raise RuntimeError(
+                f"Jetty attempt {digest} has no downloaded result to commit")
+        saved_record = entry.get("record")
+        if (not isinstance(saved_record, dict)
+                or entry.get("record_sha256")
+                != canonical_json_sha256(saved_record)
+                or saved_record != record):
+            raise RuntimeError(
+                f"Jetty attempt {digest} result does not match its downloaded "
+                "artifact checkpoint")
+        if entry.get("state") == "result_committed":
+            return entry
         return self.checkpoint(
             digest,
             "result_committed",
-            record=record,
-            record_sha256=canonical_json_sha256(record),
         )
 
 
@@ -4572,6 +4644,79 @@ def validated_jetty_resume_contract(
             "Jetty attempt journal identity conflict for resumed payload; "
             "refusing stale or mismatched receipt")
     return copy.deepcopy(stored_contract)
+
+
+def jetty_submission_receipt(
+    trajectory_id: str, storage_path: str | None,
+) -> dict[str, Any]:
+    """Persist only the reconciled submit fields required for resumption."""
+    return {
+        "trajectory_id": trajectory_id,
+        **({"storage_path": storage_path} if storage_path is not None else {}),
+    }
+
+
+def jetty_poll_receipt(
+    polled: dict[str, Any], *, trajectory_id: str,
+    require_trajectory_id: bool = True,
+) -> dict[str, Any]:
+    """Project a poll response onto its content-free causal receipt."""
+    lifecycle = lifecycle_from_record(polled)
+    observed_id = extract_trajectory_id(polled)
+    if (observed_id is not None and observed_id != trajectory_id
+            or require_trajectory_id and observed_id is None):
+        raise ValueError(
+            "poll trajectory_id conflicts with submission: "
+            f"{observed_id!r} != {trajectory_id!r}")
+    safe_lifecycle = lifecycle_from_status(
+        lifecycle.status,
+        error=(
+            "Jetty poll lifecycle was protocol-invalid"
+            if isinstance(lifecycle, ProtocolInvalid) else None
+        ),
+    )
+    receipt: dict[str, Any] = {
+        key: value for key, value in polled.items()
+        if key in {
+            "status", "state", "provider_status", "trajectory_id",
+            "storage_path", "elapsed_ms", "duration_ms", "input_tokens",
+            "output_tokens", "total_tokens", "cost", "cost_usd",
+            "total_tool_calls", "api_calls",
+        }
+        and isinstance(value, (str, int, float, bool))
+    }
+    receipt["trajectory_id"] = trajectory_id
+    receipt["status"] = safe_lifecycle.status
+    receipt["lifecycle"] = safe_lifecycle.to_dict()
+    return receipt
+
+
+def validated_jetty_saved_record(
+    entry: dict[str, Any],
+    *,
+    harness: dict[str, Any],
+    digest: str,
+    task_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate one downloaded/committed record before replay or publication."""
+    state = entry.get("state")
+    saved_record = entry.get("record")
+    if state not in {"artifacts_downloaded", "result_committed"}:
+        raise ValueError(
+            f"Jetty attempt {digest} state {state!r} has no durable result")
+    if not isinstance(saved_record, dict):
+        raise TypeError(
+            f"Jetty attempt {digest} has state {state} without a saved record")
+    if (entry.get("record_sha256") != canonical_json_sha256(saved_record)
+            or saved_record.get("harness") != harness
+            or saved_record.get("jetty_task_contract_sha256") != digest
+            or saved_record.get("jetty_task_contract") != task_contract
+            or saved_record.get("attempt_state")
+            not in {"artifacts_downloaded", "result_committed"}):
+        raise RuntimeError(
+            "Jetty committed result conflicts with its attempt identity; "
+            "refusing stale or corrupted receipt")
+    return copy.deepcopy(saved_record)
 
 
 def execute_jetty_payloads(
@@ -4700,22 +4845,12 @@ def execute_jetty_payloads(
                             "must not be resubmitted automatically; reconcile provider "
                             "state or rerun with --resubmit-unknown")
                 if attempt_state in {"artifacts_downloaded", "result_committed"}:
-                    saved_record = attempt_entry.get("record")
-                    if not isinstance(saved_record, dict):
-                        raise ValueError(
-                            f"Jetty attempt {actual_task_contract_sha256} has "
-                            f"state {attempt_state} without a saved record")
-                    saved_record_sha256 = attempt_entry.get("record_sha256")
-                    if (saved_record_sha256 != canonical_json_sha256(saved_record)
-                            or saved_record.get("harness") != harness
-                            or saved_record.get("jetty_task_contract_sha256")
-                            != actual_task_contract_sha256
-                            or saved_record.get("jetty_task_contract")
-                            != actual_task_contract):
-                        raise RuntimeError(
-                            "Jetty committed result conflicts with its attempt "
-                            "identity; refusing stale or corrupted receipt")
-                    yield copy.deepcopy(saved_record)
+                    yield validated_jetty_saved_record(
+                        attempt_entry,
+                        harness=harness,
+                        digest=actual_task_contract_sha256,
+                        task_contract=actual_task_contract,
+                    )
                     continue
             plan = row.get("upload_plan", {})
             bundle = plan.get("bundle") if isinstance(plan.get("bundle"), dict) else {}
@@ -4767,6 +4902,7 @@ def execute_jetty_payloads(
                                 actual_task_contract_sha256, exc)
                             attempt_state = "submission_unknown"
                     raise
+                inject("after_submit_response")
                 try:
                     trajectory_id, submitted_storage_path = validate_jetty_submission(
                         submission, collection=collection, task=task_name)
@@ -4780,6 +4916,8 @@ def execute_jetty_payloads(
                     raise JettySubmissionUnknown(
                         "Jetty returned an unusable submission acknowledgement; "
                         f"the provider may still have accepted the attempt: {exc}") from exc
+                submission = jetty_submission_receipt(
+                    trajectory_id, submitted_storage_path)
                 if journal is not None:
                     attempt_entry = journal.checkpoint(
                         actual_task_contract_sha256,
@@ -4821,7 +4959,17 @@ def execute_jetty_payloads(
                         timeout_s=timeout_s, poll_interval_s=poll_interval_s,
                     )
                 except JettyPollWaitExpired as exc:
-                    lifecycle = lifecycle_from_status("timeout")
+                    pending = string_keyed_dict(
+                        exc.last, "Jetty pending poll response")
+                    pending = jetty_poll_receipt(
+                        pending,
+                        trajectory_id=trajectory_id,
+                        require_trajectory_id=False,
+                    )
+                    lifecycle = lifecycle_from_record(pending)
+                    if lifecycle.terminal:
+                        raise RuntimeError(
+                            "local Jetty poll deadline carried a terminal state")
                     yield {
                         "harness": harness,
                         "status": lifecycle.status,
@@ -4841,7 +4989,7 @@ def execute_jetty_payloads(
                         },
                         "submitted_request": request,
                         "submission_response": submission,
-                        "trajectory": merged_jetty_trajectory(exc.last, {}),
+                        "trajectory": merged_jetty_trajectory(pending, {}),
                         "error": str(exc),
                         "artifacts": [],
                     }
@@ -4851,6 +4999,9 @@ def execute_jetty_payloads(
                 if not lifecycle.terminal:
                     raise RuntimeError(
                         "Jetty poll returned before observing a terminal state")
+                poll_record = jetty_poll_receipt(
+                    poll_record, trajectory_id=trajectory_id)
+                lifecycle = lifecycle_from_record(poll_record)
                 if journal is not None:
                     attempt_entry = journal.checkpoint(
                         actual_task_contract_sha256,
@@ -4896,6 +5047,7 @@ def execute_jetty_payloads(
                 "harness": harness,
                 "status": lifecycle.status,
                 "lifecycle": lifecycle.to_dict(),
+                "attempt_state": "artifacts_downloaded",
                 "trajectory_id": trajectory_id,
                 "jetty_task_contract_sha256": actual_task_contract_sha256,
                 "jetty_task_contract": actual_task_contract,
@@ -4925,6 +5077,8 @@ def execute_jetty_payloads(
         except Exception as exc:
             if journal is not None and actual_task_contract_sha256 is not None:
                 current = journal.entry(actual_task_contract_sha256)
+                if isinstance(current, dict):
+                    attempt_state = str(current.get("state", attempt_state))
                 if (isinstance(current, dict)
                         and current.get("state") == "submission_unknown"):
                     unknown_reason = current.get("submission_unknown_error")
@@ -4961,6 +5115,7 @@ def execute_jetty_payloads(
                 "harness": harness,
                 "status": lifecycle.status,
                 "lifecycle": lifecycle.to_dict(),
+                "attempt_state": attempt_state,
                 "trajectory_id": trajectory_id,
                 "jetty_task_contract_sha256": actual_task_contract_sha256,
                 "jetty_task_contract": actual_task_contract,
@@ -4979,6 +5134,70 @@ def execute_jetty_payloads(
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return [strict_json_loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def durable_jetty_result_slots(
+    payloads: list[dict[str, Any]], journal: JettyAttemptJournal,
+) -> list[dict[str, Any] | None]:
+    """Recover every durable result before replacing an existing JSONL file."""
+    slots: list[dict[str, Any] | None] = []
+    payload_digests: set[str] = set()
+    for row in payloads:
+        harness = row.get("harness")
+        digest = (
+            harness.get("jetty_task_contract_sha256")
+            if isinstance(harness, dict) else None
+        )
+        if not isinstance(digest, str):
+            slots.append(None)
+            continue
+        if digest in payload_digests:
+            raise ValueError(
+                f"duplicate Jetty payload task contract digest: {digest}")
+        payload_digests.add(digest)
+        entry = journal.entry(digest)
+        if (not isinstance(entry, dict)
+                or entry.get("state")
+                not in {"artifacts_downloaded", "result_committed"}):
+            slots.append(None)
+            continue
+        if not isinstance(harness, dict):
+            raise TypeError("Jetty durable result payload has no harness")
+        task_contract = validated_jetty_resume_contract(row, entry, digest)
+        request = row.get("jetty_request")
+        if not isinstance(request, dict):
+            raise TypeError("Jetty durable result payload has no request")
+        jetty = request.get("jetty")
+        if not isinstance(jetty, dict):
+            raise TypeError("Jetty durable result payload has no Jetty routing")
+        expected_identity = jetty_attempt_identity(
+            task_contract_sha256=digest,
+            task_contract=task_contract,
+            collection=str(jetty.get("collection", "")),
+            task=str(jetty.get("task", "")),
+            model=request.get("model"),
+        )
+        if entry.get("identity") != expected_identity:
+            raise RuntimeError(
+                "Jetty durable result conflicts with its attempt identity")
+        slots.append(validated_jetty_saved_record(
+            entry,
+            harness=harness,
+            digest=digest,
+            task_contract=task_contract,
+        ))
+    omitted_durable = sorted(
+        digest for digest, entry in journal.attempts.items()
+        if (digest not in payload_digests
+            and isinstance(entry, dict)
+            and entry.get("state")
+            in {"artifacts_downloaded", "result_committed"})
+    )
+    if omitted_durable:
+        raise RuntimeError(
+            "Jetty payload set omits previously durable result(s): "
+            + ", ".join(omitted_durable))
+    return slots
 
 
 def run_jetty(args: argparse.Namespace) -> int:
@@ -5004,48 +5223,63 @@ def run_jetty(args: argparse.Namespace) -> int:
     client = JettyClient(
         token, os.environ.get("JETTY_BASE_URL", JETTY_DEFAULT_BASE_URL))
     raw_journal = getattr(args, "journal", None)
-    journal_path = (
-        Path(raw_journal) if raw_journal
-        else Path(str(out) + ".attempts.json")
-    )
+    try:
+        journal_path = canonical_jetty_journal_path(
+            Path(raw_journal) if raw_journal
+            else Path(str(out) + ".attempts.json")
+        )
+    except (OSError, ValueError) as exc:
+        die(str(exc))
     protected_paths = {payloads_path.resolve()}
     if out.resolve() in protected_paths:
         die("Jetty result JSONL must not overwrite payload JSONL")
     protected_paths.add(out.resolve())
     if journal_path.resolve() in protected_paths:
         die("Jetty attempt journal must not overwrite payload or result JSONL")
-    lock = JettyAttemptJournalLock(journal_path)
+    try:
+        lock = JettyAttemptJournalLock(journal_path)
+    except (OSError, ValueError) as exc:
+        die(str(exc))
     if lock.path.resolve() in protected_paths:
         die(
             "Jetty attempt journal lock must not overwrite payload or "
             "result JSONL")
     try:
         lock.acquire()
-    except JettyJournalInUse as exc:
+    except (JettyJournalInUse, OSError, ValueError) as exc:
         die(str(exc))
     try:
         journal = JettyAttemptJournal(journal_path)
-        records: list[dict[str, Any]] = []
-        atomic_write_jsonl(out, records)
-        for record in execute_jetty_payloads(
+        result_slots = durable_jetty_result_slots(payloads, journal)
+        atomic_write_jsonl(
+            out, (record for record in result_slots if record is not None))
+        incomplete = False
+        for index, record in enumerate(execute_jetty_payloads(
             payloads,
             client=client,
             timeout_s=getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S),
             poll_interval_s=getattr(args, "poll_interval", 5),
             journal=journal,
             resubmit_unknown=getattr(args, "resubmit_unknown", False),
-        ):
-            records.append(record)
-            atomic_write_jsonl(out, records)
+        )):
+            result_slots[index] = record
+            atomic_write_jsonl(
+                out,
+                (item for item in result_slots if item is not None),
+            )
             digest = record.get("jetty_task_contract_sha256")
             entry = journal.entry(digest) if isinstance(digest, str) else None
             if isinstance(entry, dict) and entry.get("state") in {
                 "artifacts_downloaded", "result_committed",
             }:
                 journal.mark_result_committed(digest, record)
+            if record.get("attempt_state") not in {
+                "artifacts_downloaded", "result_committed",
+            }:
+                incomplete = True
     finally:
         lock.release()
-    return 0
+    return 1 if incomplete else 0
 
 
 def artifact_content(artifact: dict[str, Any]) -> Any:
@@ -5635,6 +5869,14 @@ def import_jetty_results(args: argparse.Namespace) -> int:
     seen_identities: set[tuple[str, str | None, str, int, str]] = set()
     seen_destinations: set[Path] = set()
     for record in records:
+        attempt_state = record.get("attempt_state")
+        if (attempt_state is not None
+                and attempt_state not in {
+                    "artifacts_downloaded", "result_committed",
+                }):
+            die(
+                "invalid Jetty result: attempt is not provider-terminal and "
+                f"durably downloaded ({attempt_state!r})")
         harness = record.get("harness")
         if not isinstance(harness, dict):
             die("invalid Jetty result: harness must be an object")

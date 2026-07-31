@@ -254,7 +254,13 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
 
         class Client:
             def submit(self, request):
-                return {"trajectory_id": "trajectory-1"}
+                return {
+                    "trajectory_id": "trajectory-1",
+                    "provider_debug": {
+                        "authorization": sentinel,
+                        "steps": {"inputs": {"token": sentinel}},
+                    },
+                }
 
             def poll(self, *args, **kwargs):
                 return {
@@ -293,12 +299,19 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
             def download_file(self, storage_path):
                 return b"answer"
 
-        record = next(iter(sb.execute_jetty_payloads(
-            [executable_payload()], client=Client())))
+        with tempfile.TemporaryDirectory() as td:
+            journal_path = Path(td) / "attempts.json"
+            record = next(iter(sb.execute_jetty_payloads(
+                [executable_payload()],
+                client=Client(),
+                journal=sb.JettyAttemptJournal(journal_path),
+            )))
 
-        self.assertEqual(record["status"], "completed")
-        self.assertNotIn(sentinel, json.dumps(record))
-        self.assertNotIn("inputs", record["trajectory"]["steps"]["run"])
+            self.assertEqual(record["status"], "completed")
+            self.assertNotIn(sentinel, json.dumps(record))
+            self.assertNotIn(
+                sentinel, journal_path.read_text(encoding="utf-8"))
+            self.assertNotIn("inputs", record["trajectory"]["steps"]["run"])
 
     def test_jetty_bundle_rejects_nonportable_or_escaping_members(self):
         invalid = [

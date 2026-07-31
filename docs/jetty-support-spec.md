@@ -301,8 +301,9 @@ Responsibilities:
    `workflow_id`). Only a documented 429 rejection returns to the automatically
    submit-ready state. Every other exception or unproven HTTP response becomes
    `submission_unknown`; a blind resubmit could double the sandbox spend.
-4. Require file output and take one exclusive OS lock for the journal before
-   loading it. Atomically persist the uploaded bundle receipt, then mark the
+4. Require file output, resolve all journal aliases to one canonical path, and
+   take one exclusive OS lock before loading it. Reject hard-linked journals
+   and symlinked/non-regular lock files. Atomically persist the uploaded bundle receipt, then mark the
    attempt as `submitting` before the non-idempotent POST. Persist the trajectory
    ID and response immediately after validating the acknowledgement. A restart
    with an acknowledged ID resumes it; a restart while the acknowledgement was
@@ -313,7 +314,8 @@ Responsibilities:
 5. Poll `/api/v1/db/trajectory/{collection}/{task}/{trajectory_id}` until
    terminal status, treating early 404s as queued (the DB row can lag the
    submission). A local polling deadline is not a provider terminal state: the
-   attempt remains acknowledged and a later invocation polls the same ID.
+   attempt remains acknowledged and a later invocation polls the same ID. Its
+   output remains nonterminal, exits nonzero, and cannot be imported or graded.
 6. On success, fetch the storage detail
    (`GET /api/v1/trajectory/{collection}/{task}/{trajectory_id}`), download
    every `results_files[]` artifact via `GET /api/v1/file/{path}`, and inline
@@ -321,14 +323,17 @@ Responsibilities:
    `content_b64`) so the import step stays local and network-free.
 7. Atomically checkpoint terminal status and downloaded artifacts, then
    atomically republish the complete ready prefix of the JSONL result and mark
-   each record committed. The empty prefix is published before work begins, so
-   an empty input cannot retain stale output. A restart rebuilds the result from
-   committed journal records without remote calls.
+   each record committed. Before the first replacement, reconstruct every
+   downloaded or committed result from the journal, so another interruption
+   cannot erase or truncate prior commits. An empty input still clears stale
+   output. A restart rebuilds results without remote calls.
 8. Retry bounded transient 429/5xx failures on the idempotent calls
    (upload, poll, fetch, download).
 
 The journal identity includes the full attested task contract and digest plus
-collection, task, and model. Jetty does not currently accept a server-side
+collection, task, and model. Submit and poll responses are projected onto the
+minimal validated receipt needed for resumption; provider debug, environment,
+input, and credential-bearing fields are never journaled. Jetty does not currently accept a server-side
 idempotency key on this route, so the harness reports the ambiguous-response
 window instead of claiming exactly-once execution; `--resubmit-unknown` may
 create a duplicate paid attempt. Atomic replacement is process-crash-safe on
