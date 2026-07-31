@@ -168,6 +168,10 @@ Mistral support should mean first-class Vibe CLI support, not a raw chat-complet
       smoke-test environment documentation for Vibe.
 - [x] Add a registry/conformance guard that fails when a backend is partially registered (for
       example `run-agent` supports it but parity docs or capability rows do not).
+- [x] Replace the parallel capability, answer, trigger, judge, workspace, trace, smoke,
+      failure-policy, and provider-CLI registries with one validated `BACKENDS` row per backend
+      (issue #52 item 4). Keep the old maps as replacement-only compatibility projections and
+      expose the non-invoking `agent-capabilities` JSON view.
 Standing invariant (not a tickable task): `--judge-cmd` stays the escape hatch for arbitrary
 providers while first-class backends move through the native registry — the code documents it
 as "the universal escape hatch" and `judge` points unknown backends at it.

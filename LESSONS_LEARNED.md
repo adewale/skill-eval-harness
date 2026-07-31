@@ -490,3 +490,41 @@ the semantics of `dict[str, Any]`, and an AST rule that bans one loop spelling o
   repeats the bug's assumption.
 - Treat source/AST guards as migration scaffolding for facts the language cannot express, not as
   the primary architecture. If a sum type and API ownership can encode the rule, use them.
+
+## 2026-07-31 — A registry is a constructor, not a bag of names
+
+**Problem:** Adding one backend used to require coordinated edits to capability, answer, trigger,
+judge, workspace, trace, smoke, failure-marker, and provider-CLI registries. The history of the
+Agy integration showed the predictable result: one commit added the broad wiring, later commits
+repaired individual surfaces, and reviewers had to rediscover which copies were authoritative.
+
+The first unified registry still had weaker versions of the same escape. A non-native route could
+exist without executable command ownership; a second export/import row could reuse Jetty commands;
+lazy references could resolve to objects with the wrong runtime shape; frozen rows could retain
+mutable lists; and Python annotations admitted `1` as a boolean plus open telemetry vocabularies.
+Direct script execution could also import a second copy of the defining module and split mutable
+compatibility state.
+
+**Lesson:** A registry becomes architecture only when constructing one complete row proves its
+declaration policy and materializing that row proves its executable contracts. A mapping that
+merely collects names centralizes lookup, not correctness. `frozen=True`, type annotations, and a
+valid import path are useful declarations, but none is runtime validation.
+
+**Rule:**
+- Give each backend row one stable identity and ownership of its answer route and commands,
+  answer/trigger/judge bindings, workspace, trace, smoke, failure policy, capability/telemetry
+  declarations, and provider CLI options. Adding a key to a derived dictionary is replacement,
+  not registration.
+- Validate in two stages. Construction closes routes, command ownership, nested tuple shapes,
+  exact booleans, and scalar vocabularies; materialization resolves lazy references and checks
+  answer, trigger, judge, workspace, and trace runtime shapes before publishing any view.
+- Treat deep immutability as a boundary property. A frozen dataclass that captures a list is still
+  mutable, and `bool` fields must reject integers even though `True == 1`.
+- Use lazy references to keep the registry acyclic, then preserve one canonical module identity
+  for direct-script and installed entrypoints so the same references cannot resolve into parallel
+  class and registry instances.
+- Keep compatibility maps only as explicit replacement seams for tests and integrations. Policy
+  projections stay immutable, and conformance tests fail if another registration point appears.
+- Audit the model gap, not only current rows: construct a complete synthetic future backend and
+  adversarial malformed rows, verify the negative tests fail when guards are removed, then rerun
+  import-order, direct-entrypoint, CLI-collision, full-suite, and documentation-drift checks.

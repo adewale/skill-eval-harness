@@ -71,7 +71,29 @@ project from the same row. Run `skill-benchmark agent-capabilities` to inspect
 that control plane as JSON. An explicit answer route distinguishes native dispatch
 from Jetty export/import and the dedicated subagent path. Implementation dispatch
 maps are mutable replacement views for compatibility; policy projections are
-immutable, and neither is an alternative registration point for new providers.
+deeply immutable, and neither is an alternative registration point for new providers.
+Construction validates the row's ownership, routes, closed scalar vocabularies,
+and nested declaration shapes. Lazy materialization then validates the resolved
+answer, trigger, judge, workspace, and trace runtime contracts before publishing
+their compatibility views.
+
+```mermaid
+flowchart LR
+    R["BACKENDS<br/>one complete row per backend"] --> C["Construction checks<br/>ownership, routes, immutable policy"]
+    C --> I["agent-capabilities JSON<br/>no provider invocation"]
+    C --> P["Immutable policy projections"]
+    C --> L["Validated lazy materialization"]
+    L --> A["Answer dispatch"]
+    L --> T["Trigger adapters"]
+    L --> J["Judge dispatch"]
+    L --> W["Workspace builders"]
+    L --> D["Trace dialects"]
+    A --> O["Existing runtime and artifact contracts"]
+    T --> O
+    J --> O
+    W --> O
+    D --> O
+```
 
 ## Four axes, one grid
 
