@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 from agent_capabilities import SMOKE_TARGETS
 from skill_benchmark import invoke_argv_with_timeout
 from telemetry import ObservationEvidence
-from trigger_contracts import TriggerObservation
+from trigger_contracts import CompleteTriggerResult, TriggerObservation
 
 DEFAULT_MODELS = {name: target.resolved_model(os.environ) for name, target in SMOKE_TARGETS.items()}
 ANSWER_AGENTS = tuple(name for name, target in SMOKE_TARGETS.items() if target.population == "answer")
@@ -161,7 +161,11 @@ def assess_trigger_report(path: Path, report: dict[str, Any], agent: str = "pi")
             observation.invocation.observation_complete and observation.invocation.returncode == 0
             for observation in observations
         )
-        expected = exact_fixture and all(observation.passed for observation in observations)
+        results = [observation.result for observation in observations]
+        expected = exact_fixture and all(
+            isinstance(result, CompleteTriggerResult) and result.passed
+            for result in results
+        )
         report["checks"].append({"label": f"{agent}:observation-contract", "passed": observed,
                                  "detail": "exactly one complete positive and one complete negative trigger observation"})
         report["checks"].append({"label": f"{agent}:demo-trigger-fixture", "passed": expected,

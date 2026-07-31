@@ -101,8 +101,9 @@ any selected adapter, including Codex or Vibe.
   for those; `cfdoctor` had to disclaim generic Cloudflare status questions.
 - **Models disagree** → the weakest model you support sets the bound. A description
   Opus routes correctly on cadence alone may need Haiku's keywords spelled out.
-- **`incomplete_observations` > 0** → those runs crashed or timed out. They count as
-  failures, never as "didn't trigger" — fix the runs before reading the rates.
+- **`incomplete_observations` > 0** → those runs crashed or timed out. The cell and
+  report are incomplete, so no quality rate is emitted — fix and rerun them before
+  interpreting the measurement.
 
 Trigger cases are cheap to run compared to answer-quality cases, so repetition is
 affordable: one run per cell is a coin flip, and this repo's own ablation study saw

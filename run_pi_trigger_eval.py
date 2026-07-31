@@ -58,6 +58,11 @@ from trigger_contracts import (
     validated_trigger_model,
     validated_trigger_protocol_limits,
 )
+from trigger_reporting import (
+    summarize_trigger_cohort,
+    trigger_cohort_as_dict,
+    trigger_cohort_exit_code,
+)
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -192,11 +197,12 @@ def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, 
     )
 
 
-def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int,
-              model: str | None, trace_dir: Path | None = None,
-              ablation: str | None = None,
-              identity: TriggerRepetitionIdentity | None = None,
-              protocol_sha256: str | None = None) -> dict[str, Any]:
+def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int,
+                  model: str | None, trace_dir: Path | None = None,
+                  ablation: str | None = None,
+                  identity: TriggerRepetitionIdentity | None = None,
+                  protocol_sha256: str | None = None) -> TriggerObservation:
+    """Keep the typed observation alive until report aggregation completes."""
     manifest = load_manifest(manifest_path)
     with tempfile.TemporaryDirectory(prefix="pi-trigger-") as td:
         config_dir = Path(td)
@@ -254,7 +260,19 @@ def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: in
         result = observation.as_row()
         if trace_dir is not None:
             write_trigger_trace_artifacts(trace_dir, invocation.stdout, result, stream)
-        return result
+        return observation
+
+
+def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int,
+              model: str | None, trace_dir: Path | None = None,
+              ablation: str | None = None,
+              identity: TriggerRepetitionIdentity | None = None,
+              protocol_sha256: str | None = None) -> dict[str, Any]:
+    """Compatibility wire adapter for one trigger result row."""
+    return observe_query(
+        manifest_path, query, should_trigger, timeout, model, trace_dir,
+        ablation, identity, protocol_sha256,
+    ).as_row()
 
 
 def trigger_query_from_case(case: dict[str, Any]) -> str:
@@ -388,7 +406,7 @@ def main() -> int:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     futures = []
-    results = []
+    observations: list[TriggerObservation] = []
     protocol = pi_trigger_protocol(
         timeout=timeout, runs_per_query=runs_per_query,
         workers=workers, model=args.model)
@@ -402,22 +420,23 @@ def main() -> int:
                     trace_dir = Path(args.trace_runs) / f"query-{i:03d}-{label}" / f"run-{run_number}"
                 identity = TriggerRepetitionIdentity(row["query_id"], run_number)
                 futures.append(ex.submit(
-                    run_query, manifest_path, row["query"], row["should_trigger"],
+                    observe_query, manifest_path, row["query"], row["should_trigger"],
                     timeout, args.model, trace_dir, args.ablation, identity,
                     protocol_sha256))
         for fut in as_completed(futures):
-            results.append(fut.result())
-    results.sort(key=lambda row: (str(row["query_id"]), int(row["run_number"])))
-    complete_results = [r for r in results if r["observation_complete"]]
-    passed = sum(1 for r in complete_results if r["pass"])
-    incomplete = len(results) - len(complete_results)
-    observed_pass_rate = passed / len(complete_results) if complete_results else None
-    tree_hashes = {r.get("skill_tree_hash") for r in results}
+            observations.append(fut.result())
+    observations.sort(key=lambda observation: (
+        str(observation.identity.query_id if observation.identity else ""),
+        int(observation.identity.run_number if observation.identity else 0),
+    ))
+    cohort = summarize_trigger_cohort(observations)
+    summary = trigger_cohort_as_dict(cohort)
+    tree_hashes = {observation.metadata.get("skill_tree_hash") for observation in observations}
     if len(tree_hashes) != 1 or not next(iter(tree_hashes), None):
         raise SystemExit("trigger rows did not retain one consistent skill_tree_hash")
     tree_hash = next(iter(tree_hashes))
     if args.ablation:
-        provenance_rows = [r.get("ablation") for r in results]
+        provenance_rows = [observation.metadata.get("ablation") for observation in observations]
         if (not all(isinstance(value, dict) for value in provenance_rows)
                 or len({json.dumps(value, sort_keys=True) for value in provenance_rows}) != 1):
             raise SystemExit("trigger rows did not retain one consistent ablation provenance")
@@ -448,16 +467,12 @@ def main() -> int:
              "query": row["query"], "should_trigger": row["should_trigger"]}
             for row in rows
         ],
-        "summary": {"total": len(results), "complete": len(complete_results),
-                    "incomplete": incomplete,
-                    "passed": passed, "failed": len(complete_results) - passed,
-                    "pass_rate": None if incomplete else observed_pass_rate,
-                    "observed_pass_rate": observed_pass_rate},
-        "results": results,
+        "summary": summary,
+        "results": [observation.as_row() for observation in observations],
     }
     write_json(Path(args.out), output)
     print(json.dumps(output["summary"], indent=2))
-    return 0
+    return trigger_cohort_exit_code(cohort)
 
 
 if __name__ == "__main__":

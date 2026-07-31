@@ -30,6 +30,8 @@ subprocess bytes
   -> PiStream (Pi only)
   -> TriggerDetection
   -> TriggerObservation
+  -> CompleteTriggerResult | IncompleteTriggerResult
+  -> CompleteTriggerCohort | IncompleteTriggerCohort | EmptyTriggerCohort
   -> persisted JSON row
 ```
 
@@ -40,8 +42,17 @@ subprocess bytes
   Failed streams cannot carry numeric usage or cost.
 - `TriggerDetection.triggered` is derived from typed evidence. Unknown lifecycle events are not
   evidence, and callers cannot independently set a trigger boolean.
-- `TriggerObservation.pass` is derived from invocation completeness, expected polarity, and
-  detection. Incomplete observations cannot carry measured usage or cost.
+- `TriggerObservation.result` is a sum type. Only `CompleteTriggerResult` carries `passed` and
+  `triggered`; `IncompleteTriggerResult` carries the failed invocation state instead. The
+  compatibility `passed` projection is therefore `bool | None`, not a total boolean.
+- `trigger_reporting.py` owns every raw trigger aggregate: overall report, matrix cell, polarity,
+  and per-query. Only `CompleteTriggerCohort` has `pass_rate` and `trigger_rate`; incomplete and
+  empty cohorts cannot serialize a numeric quality rate. Both trigger runners retain
+  `TriggerObservation` values until this aggregation is complete and serialize rows last.
+- Incomplete rows expose raw evidence separately but serialize measured `pass` and `triggered` as
+  null. Reports name observed/attempted coverage and incomplete reasons, terminal output names the
+  cohort `INCOMPLETE`, and the CLI exits nonzero.
+- Incomplete observations cannot carry measured usage or cost.
 - Persisted rows are parsed through `TriggerObservation.from_row` before live smoke trusts them.
 
 Recorded, sanitized Pi JSONL fixtures cover success, an exit-zero provider error, retry then
@@ -246,6 +257,10 @@ The suite uses four complementary proof styles:
 - sanitized provider-shaped fixtures at external protocol boundaries; and
 - integration tests that feed mismatched models/repetitions, duplicates, missing arms, malformed
   verdicts, incomplete traces, and completed-without-output Jetty records through real consumers.
+
+`ty check` also verifies parser narrowing and exhaustive handling of the trigger result and
+cohort sum types. `trigger_reporting.py` joins the repository's expanding typed boundary instead
+of relying on a source-shape guard or weakening diagnostics around legacy dictionaries.
 
 Live provider checks remain explicit `--live`; deterministic CI does not require credentials or
 network access.

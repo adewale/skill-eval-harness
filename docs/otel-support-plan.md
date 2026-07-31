@@ -102,7 +102,7 @@ without pretending the harness observed work that happened elsewhere.
 
 This is a commit-pinned snapshot, not a claim that mutable branch counts will
 remain current. The 2026-07-31 audit covered complete reachable history through
-`99da1f8`, every then-open PR (#47, #61, #62, #63, and #65), and every open issue
+`90c77e2`, every then-open PR (#47, #61, #62, and #65), and every open issue
 (#37, #48, #49, #52, and #64). The history repeatedly succeeds by stabilizing a
 typed owner before instrumenting its callers; cross-cutting changes are then
 rebased once after their prerequisites.
@@ -114,32 +114,29 @@ Current status and remaining order:
    roadmap; [#57](https://github.com/adewale/skill-eval-harness/pull/57), the
    fail-closed evidence/design boundary; and
    [#58](https://github.com/adewale/skill-eval-harness/pull/58), the Unicode-safe
-   comparison boundary, are on `main` through `99da1f8`. #58 closed
+   comparison boundary; and [#63](https://github.com/adewale/skill-eval-harness/pull/63),
+   this audited roadmap, are on `main` through `90c77e2`. #58 closed
    [#55](https://github.com/adewale/skill-eval-harness/issues/55).
-2. Land this audited roadmap in
-   [#63](https://github.com/adewale/skill-eval-harness/pull/63) so later runtime
-   rebases share the corrected artifact graph and OTel contracts.
-3. Rebase and land [#61](https://github.com/adewale/skill-eval-harness/pull/61).
-   #57 fixed incomplete denominators and nullable public rates, but #61 remains
+2. This change lands [#61](https://github.com/adewale/skill-eval-harness/pull/61),
    the typed complete/incomplete/empty cohort owner plus the explicit terminal
    output and nonzero-exit contract. It completes the user-visible/runtime work
    behind the already-closed
    [#54](https://github.com/adewale/skill-eval-harness/issues/54); it is not
    superseded by #57.
-4. Rebase and land [#65](https://github.com/adewale/skill-eval-harness/pull/65),
+3. Rebase and land [#65](https://github.com/adewale/skill-eval-harness/pull/65),
    the unified backend registry prompted by
    [#52 item 4](https://github.com/adewale/skill-eval-harness/issues/52). OTel
    conformance must enumerate that registry/capability model rather than only
    parser subcommands, so a new backend cannot miss answer, trigger, judge,
    workspace, trace, smoke, or privacy policy on one surface.
-5. Rebase and land [#47](https://github.com/adewale/skill-eval-harness/pull/47)
+4. Rebase and land [#47](https://github.com/adewale/skill-eval-harness/pull/47)
    after repairing its current Python 3.12 failure. Preserve its token-backed
    live Jetty evidence while adapting the old branch to the typed evidence and
    unified-registry owners.
-6. Complete the relevant [#64](https://github.com/adewale/skill-eval-harness/issues/64)
+5. Complete the relevant [#64](https://github.com/adewale/skill-eval-harness/issues/64)
    type-clean slices and [#52 item 5](https://github.com/adewale/skill-eval-harness/issues/52)
    typed judge-invocation result before instrumenting those central-CLI regions.
-7. Rebase and preferably split [#62](https://github.com/adewale/skill-eval-harness/pull/62)
+6. Rebase and preferably split [#62](https://github.com/adewale/skill-eval-harness/pull/62)
    over #65 and the typed judge boundary. Agy then joins answer, trigger, judge,
    telemetry, privacy, and conformance coverage by registry capability. If #62
    lands after an OTel slice, add Agy in a focused parity PR rather than weakening
