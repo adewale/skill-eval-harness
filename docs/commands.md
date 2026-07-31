@@ -501,6 +501,8 @@ Comparison then forms complete (agent, model, query-ID) cells and collapses ever
 
 Jetty support is optional and validated against production `flows-api.jetty.io` (live smoke first passed 2026-07-17; captured response fixtures live in `tests/fixtures/jetty/` — see [`jetty-support-spec.md`](jetty-support-spec.md)). The harness exports runbook-mode chat-completion payloads, Jetty executes them, and `import-jetty-results` copies `output.md`, artifacts, and metadata back into the normal run layout. `run-jetty` zips each task's upload plan (Jetty's sandbox upload flattens single files to basenames; a zip auto-extracts under `/app/assets/` with paths preserved), submits with a short `timeout_hint` so polling drives the wait, and downloads every `/app/results` artifact from trajectory storage before writing the run record. Provider status aliases parse into queued/running/succeeded/failed/timed-out/protocol-invalid states; unknown status and completed-without-`output.md` fail closed as protocol-invalid rather than ordinary model failures. Imports validate every record, destination, embedded answer design, model-visible task digest, and uploaded-file digest before committing the batch; one invalid record leaves all destination run directories untouched.
 
+Every live invocation atomically checkpoints `prepared`, upload completion, submission acknowledgement, terminal observation, artifact download, and result publication in an attempt journal. The default path is `<out>.attempts.json` (or `<payloads>.attempts.json` when writing results to stdout); `--journal PATH` selects another location. The identity contains the full attested task contract plus its digest, collection, task, and model, so a stale or mismatched receipt fails closed. Rerunning the same command resumes an acknowledged trajectory without another `POST /v1/chat/completions`, and a terminal receipt resumes download/import. A process or connection failure while the POST acknowledgement is pending becomes `submission_unknown`: it is visible in both the journal and result record and is not retried. After reconciling the provider manually, `--resubmit-unknown` explicitly abandons that unknown receipt and submits again. Jetty currently exposes no server-side idempotency key, so this override can duplicate a paid run; the harness deliberately does not claim exactly-once execution in that ambiguous window.
+
 ```bash
 # Export runbook-mode Jetty chat-completion payloads. No network calls.
 skill-benchmark export-jetty ../repo/evals/shared-benchmark.json \
@@ -529,6 +531,10 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
   --runs ../repo/eval-runs/jetty \
   --out jetty-benchmark.json
 ```
+
+Add `--journal jetty-attempts.json` when an explicit journal path is useful.
+Do not use `--resubmit-unknown` until you have checked whether Jetty accepted
+the ambiguous attempt.
 
 Defaults follow Jetty docs and `jettyio/jettyio-skills`: `claude-code`, `claude-sonnet-4-6`, `model_provider=anthropic`, and `snapshot=python312-uv`. The runbook is the system message. Runtime values go in `jetty.template_variables`; every model-visible file reference is a deterministic `/app/assets/...` path baked at export time. `jetty.file_paths` carries the one run-time value — the uploaded zip bundle's storage path from `POST /api/v1/sandbox/upload`. Use `JETTY_BASE_URL` to override `https://flows-api.jetty.io`.
 

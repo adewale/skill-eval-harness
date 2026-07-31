@@ -50,7 +50,7 @@ Current support is an adapter scaffold, not production-proven Jetty evidence. Th
 - [x] Persist Jetty trajectory IDs in run records as soon as submit returns them.
 - [x] Retry transient 429/5xx API failures with bounded backoff.
 - [ ] Support concurrency limits and rate-limit handling: bounded worker pool, `Retry-After` support, jittered backoff, and no unbounded in-flight submissions.
-- [ ] Add a resumable run ledger so an interrupted suite can resume submitted trajectory IDs instead of resubmitting tasks.
+- [x] Add a resumable run ledger so an interrupted suite can resume submitted trajectory IDs instead of resubmitting tasks; ambiguous submit responses fail closed until an explicit operator override.
 - [x] Support dry-run payload loading without submission.
 - [ ] Handle streaming Jetty responses when/if needed by the production API.
 

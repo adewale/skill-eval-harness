@@ -300,7 +300,12 @@ Responsibilities:
    id from `jetty_metadata` (`trajectory_id` on 200; on 202 the bare suffix of
    `workflow_id`). Submission is retried on 429 only — a 5xx can arrive after
    the workflow started, and a blind resubmit would double the sandbox spend.
-4. Persist the trajectory ID immediately.
+4. Atomically persist the uploaded bundle receipt, then mark the attempt as
+   `submitting` before the non-idempotent POST. Persist the trajectory ID and
+   response immediately after validating the acknowledgement. A restart with
+   an acknowledged ID resumes it; a restart while the acknowledgement was
+   pending becomes `submission_unknown` and cannot submit again without the
+   explicit `--resubmit-unknown` operator override.
 5. Poll `/api/v1/db/trajectory/{collection}/{task}/{trajectory_id}` until
    terminal status, treating early 404s as queued (the DB row can lag the
    submission).
@@ -309,9 +314,18 @@ Responsibilities:
    every `results_files[]` artifact via `GET /api/v1/file/{path}`, and inline
    them into the run record (text as `content`, binary as base64
    `content_b64`) so the import step stays local and network-free.
-7. Write one JSONL run record per task, including failures/timeouts.
+7. Atomically checkpoint terminal status and downloaded artifacts, then
+   atomically republish the complete ready prefix of the JSONL result and mark
+   each record committed. A restart rebuilds the result from committed journal
+   records without remote calls.
 8. Retry bounded transient 429/5xx failures on the idempotent calls
    (upload, poll, fetch, download).
+
+The journal identity includes the full attested task contract and digest plus
+collection, task, and model. Jetty does not currently accept a server-side
+idempotency key on this route, so the harness reports the ambiguous-response
+window instead of claiming exactly-once execution; `--resubmit-unknown` may
+create a duplicate paid attempt.
 
 ### `import-jetty-results`
 
