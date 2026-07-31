@@ -5504,10 +5504,12 @@ def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
         helper can continue changing its isolated home. Cleanup retries absorb
         the short interval between signal delivery and filesystem quiescence.
         """
-        if not hasattr(os, "killpg"):
+        killpg = getattr(os, "killpg", None)
+        sigkill = getattr(signal, "SIGKILL", None)
+        if not callable(killpg) or not isinstance(sigkill, int):
             return {"status": "unsupported"}
         try:
-            os.killpg(pgid, signal.SIGKILL)
+            killpg(pgid, sigkill)
         except ProcessLookupError:
             return {"status": "not_needed"}
         except OSError as exc:
@@ -14207,7 +14209,7 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
             return False, "missing_trace_evidence"
         if read_metrics_base(base_path).get("trace_observation_complete") is False:
             return False, "incomplete_trace_evidence"
-        profiles[str(base_path)] = _trajectory_profile(events)
+        profiles[base] = _trajectory_profile(events)
         return True, None
 
     construction = pair_domain.pairs_from_rows(results, population="answer", eligibility=eligibility)

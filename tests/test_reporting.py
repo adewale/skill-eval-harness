@@ -652,6 +652,16 @@ class TrajectoryDiffTests(unittest.TestCase):
             {"missing_trace_evidence": 1},
         )
 
+    def test_equivalent_string_run_bases_keep_pair_profiles_addressable(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._rows(
+                td, with_events=self._events(["ls"]),
+                without_events=self._events(["ls"]))
+            for row in rows:
+                row["run_base"] += "/"
+            diff = sb.build_trajectory_diff(rows)
+        self.assertEqual(diff["pairs_compared"], 1)
+
     def test_empty_events_are_missing_trace_evidence(self):
         empty = {"schema_version": 2, "source": "test", "events": []}
         with tempfile.TemporaryDirectory() as td:
