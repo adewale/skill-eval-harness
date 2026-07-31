@@ -486,6 +486,44 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             )
 
     def test_registry_declarations_are_deeply_immutable(self):
+        capabilities = ac.BACKENDS["codex"].capabilities
+        with self.assertRaisesRegex(TypeError, "boolean fields must be bool"):
+            replace(
+                capabilities,
+                answer_runner=1,  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(ValueError, "dollar cost"):
+            replace(
+                capabilities,
+                dollar_cost="bogus",  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(ValueError, "elapsed availability"):
+            replace(
+                capabilities,
+                elapsed_ms="bogus",  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(TypeError, "notes must be a string"):
+            replace(
+                capabilities,
+                notes=[],  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(ValueError, "live-smoke environment"):
+            replace(
+                capabilities,
+                live_smoke_env=[],  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(ValueError, "telemetry availability"):
+            ac.TelemetryCapability(
+                "bogus", reason="accepted",  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(ValueError, "needs provenance"):
+            ac.TelemetryCapability(
+                "available", provenance=["mutable"],  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(ValueError, "needs reason"):
+            ac.TelemetryCapability(
+                "unavailable", reason=["mutable"],  # type: ignore[arg-type]
+            )
         with self.assertRaisesRegex(TypeError, "command must be a tuple"):
             ac.DedicatedSmokeTarget(
                 "agy", ["true"],  # type: ignore[arg-type]

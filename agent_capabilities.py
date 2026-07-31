@@ -91,10 +91,18 @@ class TelemetryCapability:
     reason: str | None = None
 
     def __post_init__(self) -> None:
+        if (not isinstance(self.availability, str)
+                or self.availability not in {
+                    "available", "unavailable", "not_applicable",
+                }):
+            raise ValueError("telemetry availability must use the closed vocabulary")
         if self.availability == "available":
-            if not self.provenance or self.reason is not None:
+            if (not isinstance(self.provenance, str)
+                    or not self.provenance.strip()
+                    or self.reason is not None):
                 raise ValueError("available telemetry needs provenance and no reason")
-        elif not self.reason or self.provenance is not None:
+        elif (not isinstance(self.reason, str) or not self.reason.strip()
+              or self.provenance is not None):
             raise ValueError("unavailable/not-applicable telemetry needs reason only")
 
 
@@ -114,6 +122,33 @@ class AgentCapabilities:
     notes: str = ""
 
     def __post_init__(self) -> None:
+        boolean_fields = (
+            "answer_runner", "autonomous_trigger", "trigger_ablation",
+            "trace_artifacts", "token_usage", "judge_backend", "tool_replay",
+            "usage_not_applicable",
+        )
+        if any(type(getattr(self, field)) is not bool
+               for field in boolean_fields):
+            raise TypeError("agent capability boolean fields must be bool")
+        if (not isinstance(self.dollar_cost, str)
+                or self.dollar_cost not in {
+                    "provider_reported", "trace_normalized",
+                    "price_table_estimated", "missing", "not_applicable",
+                }):
+            raise ValueError("agent capability dollar cost must use the closed vocabulary")
+        if (not isinstance(self.elapsed_ms, str)
+                or self.elapsed_ms not in {
+                    "available", "unavailable", "not_applicable",
+                }):
+            raise ValueError(
+                "agent capability elapsed availability must use the closed vocabulary")
+        if (self.live_smoke_env is not None
+                and (not isinstance(self.live_smoke_env, str)
+                     or not self.live_smoke_env.strip())):
+            raise ValueError(
+                "agent capability live-smoke environment must be a non-empty string")
+        if not isinstance(self.notes, str):
+            raise TypeError("agent capability notes must be a string")
         if self.token_usage and self.usage_not_applicable:
             raise ValueError("reported token usage cannot also be not applicable")
 
