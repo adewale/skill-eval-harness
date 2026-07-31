@@ -21,7 +21,7 @@ Related docs:
 | Tool policy | Mature: `--tools`, `--allowedTools` | Sandbox/approval-policy oriented | Policy-tier oriented: deny-all plus read allowlist; nested sandbox depends on portable auth | Allowlist/denylist oriented: `--enabled-tools`, `--disabled-tools` | Provider-specific policy adapters are required; one generic “read-only” flag would overclaim parity. |
 | Skill discovery | `.claude/skills` plus `Skill` evidence | `$CODEX_HOME/skills` plus path evidence | Native Agent Skills, but `activate_skill` consent blocks a trigger claim until live-proven | `.agents/skills` / `.vibe/skills` plus `skill` evidence | Existence of a skill format is not evidence that autonomous headless activation works. |
 | Tool replay | Harness subagent path only | Not native in harness | Not native in harness | Not native in harness | Native CLI runs are measurement surfaces, not replayable deterministic tool-host runs. |
-| Live smoke reliability | Depends on quota/auth | Depends on Codex auth/model | Offline official fixtures pass; token-backed answer gate is `RUN_GEMINI_SMOKE`, not yet claimed as run | Passed with `MISTRAL_API_KEY` for Vibe 2.19.1 | Keep live proof distinct from fixture conformance and rerun after CLI/provider upgrades. |
+| Live smoke reliability | Depends on quota/auth | Depends on Codex auth/model | Pinned CLI `0.55.0-nightly.20260729.g3499c84f7` accepts the real harness command and fails closed without auth; the token-backed answer gate is `RUN_GEMINI_SMOKE` | Passed with `MISTRAL_API_KEY` for Vibe 2.19.1 | Keep executable, auth-boundary, token-backed answer, and trigger proof distinct; rerun the relevant layer after CLI/provider upgrades. |
 
 ## Gemini-specific trade-offs
 
@@ -52,7 +52,10 @@ answers/verdicts. The remaining limitations are control-plane limitations:
 - Headless prompt text is an argv argument. Saved command metadata redacts it,
   but the process list can expose it during execution.
 - Official fixtures establish parser conformance, not credentials/network/model
-  availability. `RUN_GEMINI_SMOKE=1` is the separate token-backed gate.
+  availability. A credential-free probe of the exact pinned CLI established
+  command compatibility, version capture, isolation/cleanup, and fail-closed
+  exit-41 handling. `RUN_GEMINI_SMOKE=1` remains the separate token-backed
+  answer gate.
 
 ## Vibe-only gaps and weaknesses
 

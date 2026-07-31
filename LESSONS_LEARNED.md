@@ -625,6 +625,10 @@ and the provider wire. Each tier must be either owned, rejected, isolated, or ex
 - Gate capability claims with meaningful opt-in smoke tests. A smoke must exercise the integration's
   riskiest behavior (for Gemini, a real completed skill-file read under the harness policy) and
   record the installed CLI version, not merely obtain a zero process exit.
+- Layer live evidence instead of treating “smoke tested” as a boolean: verify the installed
+  executable and flags, the unauthenticated/auth-failure boundary, a token-backed semantic answer,
+  and positive/negative autonomous activation separately. The first two can prove command and
+  failure-path compatibility without credentials; they cannot substitute for the latter two.
 - Generate or guard provider inventories in documentation from the registry, and periodically
   re-harvest official fixtures against a pinned upstream revision. Provider CLIs evolve too quickly
   for copied prose and one-time schema assumptions to remain trustworthy unaided.
