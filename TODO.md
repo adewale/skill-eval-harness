@@ -50,7 +50,7 @@ Current support is an adapter scaffold, not production-proven Jetty evidence. Th
 - [x] Persist Jetty trajectory IDs in run records as soon as submit returns them.
 - [x] Retry transient 429/5xx API failures with bounded backoff.
 - [ ] Support concurrency limits and rate-limit handling: bounded worker pool, `Retry-After` support, jittered backoff, and no unbounded in-flight submissions.
-- [ ] Add a resumable run ledger so an interrupted suite can resume submitted trajectory IDs instead of resubmitting tasks.
+- [x] Add a resumable run ledger so an interrupted suite can resume submitted trajectory IDs instead of resubmitting tasks; ambiguous submit responses fail closed until an explicit operator override.
 - [x] Support dry-run payload loading without submission.
 - [ ] Handle streaming Jetty responses when/if needed by the production API.
 
@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:9295`, merged in `grade_case_variant:11470`).
+threshold, evidence}` (`load_judge_results:10224`, merged in `grade_case_variant:12399`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the

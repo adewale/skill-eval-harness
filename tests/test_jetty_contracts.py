@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import jetty_contracts as jc
 import skill_benchmark as sb
@@ -253,7 +254,13 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
 
         class Client:
             def submit(self, request):
-                return {"trajectory_id": "trajectory-1"}
+                return {
+                    "trajectory_id": "trajectory-1",
+                    "provider_debug": {
+                        "authorization": sentinel,
+                        "steps": {"inputs": {"token": sentinel}},
+                    },
+                }
 
             def poll(self, *args, **kwargs):
                 return {
@@ -292,12 +299,19 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
             def download_file(self, storage_path):
                 return b"answer"
 
-        record = next(iter(sb.execute_jetty_payloads(
-            [executable_payload()], client=Client())))
+        with tempfile.TemporaryDirectory() as td:
+            journal_path = Path(td) / "attempts.json"
+            record = next(iter(sb.execute_jetty_payloads(
+                [executable_payload()],
+                client=Client(),
+                journal=sb.JettyAttemptJournal(journal_path),
+            )))
 
-        self.assertEqual(record["status"], "completed")
-        self.assertNotIn(sentinel, json.dumps(record))
-        self.assertNotIn("inputs", record["trajectory"]["steps"]["run"])
+            self.assertEqual(record["status"], "completed")
+            self.assertNotIn(sentinel, json.dumps(record))
+            self.assertNotIn(
+                sentinel, journal_path.read_text(encoding="utf-8"))
+            self.assertNotIn("inputs", record["trajectory"]["steps"]["run"])
 
     def test_jetty_bundle_rejects_nonportable_or_escaping_members(self):
         invalid = [
@@ -678,6 +692,31 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
         record = Client().poll("c", "task", "t", timeout_s=1, poll_interval_s=0)
         self.assertEqual(record["status"], "protocol_invalid")
         self.assertEqual(record["lifecycle"]["kind"], "protocol_invalid")
+
+    def test_poller_local_deadline_preserves_the_pending_provider_state(self):
+        class Client(sb.JettyClient):
+            def __init__(self):
+                pass
+
+            def _json_request(self, method, path, body=None):
+                return {
+                    "status": "running",
+                    "trajectory_id": "trajectory-1",
+                }
+
+        with (
+            mock.patch.object(sb.time, "time", side_effect=[0, 0, 2]),
+            mock.patch.object(sb.time, "sleep"),
+            self.assertRaises(sb.JettyPollWaitExpired) as caught,
+        ):
+            Client().poll(
+                "c", "task", "trajectory-1",
+                timeout_s=1, poll_interval_s=0,
+            )
+
+        self.assertEqual(caught.exception.last["status"], "running")
+        self.assertEqual(
+            caught.exception.last["provider_status"], "running")
 
 
 class JettyObservationTests(unittest.TestCase):
