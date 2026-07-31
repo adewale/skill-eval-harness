@@ -368,8 +368,8 @@ Qualitative assertion types:
 
 | Type | Behavior |
 |---|---|
-| `judge` | Deferred into `judge-tasks.jsonl`; merge results with `--judge-results`. |
-| `rubric` | Same deferred qualitative flow. |
+| `judge` | Deferred as a keyed judge task; `grade --judge-tasks` can serialize the queue, and `--judge-results` merges verdicts. |
+| `rubric` | Same deferred, keyed qualitative flow. |
 | `factuality` | Preset: a judge assertion carrying a canned anchored factuality rubric (threshold 4). `preset: "factuality"` on a judge assertion does the same. |
 
 A judge assertion may carry **anchored graded dimensions** (`graded_dimensions: [{name, scale: "1-5", rubric: "5 = …observable…; 1 = …"}]` — the judge returns `dimension_scores`, normalized to 0-1, passing at `threshold` ≥ 4 by default), a **dynamic rubric** (`dynamic_rubric: {instruction, minimum_criteria}` — the judge drafts case-specific criteria and must meet the minimum), or a **per-step trajectory rubric** (`per_step: true`, or `per_step: {min_met_fraction: f}`). A per-step judge grades EACH completed trajectory step — one criterion per step, named step-1..step-N in trajectory order, with the untruncated invocation and result records resolved separately from `trace.jsonl` beside the normalized summaries — and passes when at least `ceil(f × steps)` steps are judged sound (default: every step). It is trace-evidence-backed and fails closed like a process assertion: a run with no completed steps fails the assertion at grade time and no judge task (no model spend) is emitted. Stored verdicts carry a hash of the exact step payload and are re-queued if the trajectory, criterion names, or derived minimum changes. Per-step assertions are case-level only; turn assertions do not have independent trace artifacts. A case may set a reference floor (`reference_score` 0-1 or `reference_graded_score` 1-5); scoring below it flags `below-reference-floor`. Paired reports carry a sign-flip permutation `significance` block beside every lift, and a `graded` channel when graded scores exist.

@@ -3,7 +3,7 @@
 The harness is a pipeline. Each stage hands one well-defined object to the next: a manifest
 becomes task rows, task rows become files on disk, files on disk become graded result rows,
 and result rows become a report. Because the boundaries are explicit, you can swap the
-runner without touching grading, and grading never has to call a model.
+runner without touching grading, and the default grading path never has to call a model.
 
 This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md): what each object *is* in the code and what it hands downstream. The glossary defines the words; this page shows their shape. Symbols below point at `skill_benchmark.py` at the line where each abstraction is defined.
 
@@ -137,11 +137,16 @@ runs/<case_id>/<variant>/[run-<n>/]metadata.json     # optional
 runs/<case_id>/<variant>/[run-<n>/]trace.jsonl        # optional, raw
 runs/<case_id>/<variant>/[run-<n>/]events.json        # optional, normalized
 runs/<case_id>/<variant>/[run-<n>/]metrics.json       # optional, normalized
+runs/<case_id>/<variant>/[run-<n>/]artifact-commit.json # harness-written commit marker
 ```
 
 `discover_run_bases` and `read_output_base` read this layout. A runner that writes these
 files is a valid runner, whether it is Pi, Codex, Jetty, a subagent, or a person with a text
-editor. This boundary is the main extension seam in the codebase.
+editor. Harness-owned schema-v1 writers commit their required files and SHA-256 inventory by
+writing `artifact-commit.json` last; a missing or stale marker makes such a declared artifact
+set incomplete. Legacy or externally written runs that do not declare that contract version
+remain readable through the compatibility boundary. This boundary is the main extension seam
+in the codebase.
 
 ## Runner / adapter
 
@@ -159,7 +164,8 @@ Native answer backends return the frozen `Completed | TimedOut | SpawnFailed | P
 union from `runner_contracts.py`. `OutcomeContext` validates provider, telemetry, and elapsed-time
 fields; `write_runner_outcome` exhaustively writes the disk contract. A backend therefore cannot
 independently set timeout, return code, answer, and failure into a contradictory bag. The harness
-calls no model during grading; it reads what the runner left behind.
+calls no model during default grading; it reads what the runner left behind. The explicit
+`--allow-scripts` and `--embed-cmd` modes may invoke caller-supplied external oracle subprocesses.
 
 ## Trace normalization
 
@@ -175,8 +181,10 @@ inferring tool use from answer text is how false evidence gets in.
 
 Qualitative assertions defer. `collect_judge_tasks` gathers every `judge`/`rubric` assertion
 across runs and keys each by `judge_task_id` (`case::variant::run-n::assertion`, with a `model`
-segment on a multi-model run). `judge_prompt` renders the case, expected behavior, rubric, and
-candidate output into a prompt — including the anchored dimensions or dynamic-rubric
+segment on a multi-model run). `grade --judge-tasks` can serialize that queue, while the
+`judge` command reconstructs the same tasks from the manifest and run directory rather than
+reading the optional queue file. `judge_prompt` renders the case, expected behavior, rubric,
+and candidate output into a prompt — including the anchored dimensions or dynamic-rubric
 instruction for a graded assertion; `run_one_judge_task` pipes it to the `--judge-cmd` you
 supply or to a native `--judge-backend` (`claude`, `codex`, or `vibe`) plus `--judge-model`;
 `merge_repeated_judge_rows` majority-votes pass/fail and medians scores across repeats. The
@@ -185,7 +193,10 @@ boolean, scored, dimension-scored, dynamic-rubric, or consensus. Pass is derived
 payload; duplicate IDs and contradictory score/threshold/pass rows are rejected. The serialized
 row still carries `{judge_task_id, verdict_kind, passed, score, evidence}` — plus
 `dimension_scores`/`criteria` for a graded verdict and normalized `usage_normalized`/
-`cost_normalized` for judge spend — merged back at grade time.
+`cost_normalized` for judge spend — merged back whenever `grade` or `benchmark` receives
+`--judge-results`. Both task and result carry `judge_input_sha256`, binding the verdict to the
+exact rendered prompt, candidate output, and evidence. A stale or mismatched result is rejected
+or re-queued even when its `judge_task_id` still matches.
 
 ## Grade result row
 
@@ -193,11 +204,14 @@ row still carries `{judge_task_id, verdict_kind, passed, score, evidence}` — p
 efficiency, and qualitative counts, computes each pass rate, marks `missing_output` when a run
 never produced text, and carries the run `metadata`. Deferred judge assertions leave a task
 behind rather than a verdict. Grading reads from disk and calls no model, which is what makes
-a re-grade cheap and deterministic.
+a default re-grade cheap and deterministic; opt-in script and embedding oracles are the explicit
+external-process exceptions.
 
 ## Benchmark report
 
-`build_benchmark_report` turns result rows into the artifact you read. Before arithmetic,
+`build_benchmark_report` invokes the shared grader for each discovered run, then
+turns those in-memory result rows into the artifact you read. It does not consume the output
+of the `grade` command. Before arithmetic,
 `experimental_pairs.py` constructs exact `(case, model, repetition, population)` identities and
 requires one eligible arm of each kind. `build_paired_summary` computes per-case lift
 (`with_skill` minus `without_skill`, normalized gain, and a flag when the skill hurts) only from
