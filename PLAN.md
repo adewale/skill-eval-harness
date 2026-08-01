@@ -262,6 +262,24 @@ hand-constructed from the 1.1.8 vocabulary and labelled as such in the README,
 which also records the one guessed parameter name (`grep_search`'s `SearchPath`)
 for step 10 to replace.
 
+### Commit history: three commits do not pass on their own
+
+HEAD is green, but the branch is **not cleanly bisectable**. Measured by running
+the suite at each commit, not from memory:
+
+| Commit | Suite | Why |
+|---|---|---|
+| `83081aa` — step 2 | FAILED (9) | 7 failures are the deliberate red this step exists to produce. The other 2 are `test_type_coverage` drift gates that should have been closed in the same commit by registering `agy_contracts` in `pyproject.toml` and the docs. That part was an oversight. |
+| `bf340ae` — step 3 | FAILED (9) | Inherited the same 9. **This one matters**: the plan says step 3 "lands as its own PR, independent of agy", so it ought to be independently green. Anyone splitting it out for its own PR must rebase it ahead of step 2 first. |
+| `ece0644` — steps 6-7 | FAILED (1) | A broken markdown anchor in this file, caught by the doc-link gate and fixed in `ec72afd`. |
+
+Every other commit passes, and the tip passes with 1385 tests plus clean `ty`
+and `ruff`. The history was deliberately left as-is rather than rewritten, so
+this table is the warning that replaces a clean bisect.
+
+The red-test evidence review requirement 8 asks for does **not** depend on that
+red history — `docs/evidence/agy-red-tests.md` holds the full transcript.
+
 ### Handover: what is left, and exactly how to do it
 
 Everything sandbox-completable is done. **Steps 0-8 are finished and the branch
