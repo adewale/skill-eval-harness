@@ -104,6 +104,7 @@ from ablation_model import (
     scorable_run,
 )
 from agent_capabilities import (
+    AGY_DEFAULT_CMD,
     BACKENDS,
     CODEX_ANSWER_DEFAULT_CMD,
     CODEX_JUDGE_DEFAULT_CMD,
@@ -117,6 +118,15 @@ from agent_capabilities import (
     surface_option_values,
     trace_dialect_implementations,
     workspace_builder_implementations,
+)
+from agy_contracts import (
+    AgyFileRead,
+    AgyFileWrite,
+    AgyGenericCall,
+    AgySearch,
+    AgyShellCommand,
+    AgyStream,
+    AgyUsagePresent,
 )
 from artifact_contracts import (
     ARTIFACT_COMMIT_NAME,
@@ -7873,6 +7883,97 @@ def _gemini_usage_and_cost_blocks(
     )
 
 
+def _agy_records_text(records: Iterable[Mapping[str, Any]]) -> str:
+    return "\n".join(json.dumps(dict(record), ensure_ascii=False)
+                     for record in records) + ("\n" if records else "")
+
+
+def _agy_tool_flat_record(evidence: object) -> dict[str, Any]:
+    """Map one piece of agy tool evidence into the harness trace vocabulary.
+
+    A search normalizes to a plain ``tool_call`` with **no path**, matching the
+    rule the Gemini dialect already applies: a search pattern is a query, not
+    evidence that a matching path was opened.  Filing one as a ``file_read``
+    both inflates `file_reads` and, because trigger detection keys on a read of
+    the mounted `SKILL.md`, lets searching for a skill count as activating it.
+    """
+    if isinstance(evidence, AgyShellCommand):
+        return {"type": "command", "tool": "run_command",
+                "command": evidence.command}
+    if isinstance(evidence, AgyFileRead):
+        return {"type": "file_read", "name": "view_file", "path": evidence.path}
+    if isinstance(evidence, AgyFileWrite):
+        return {"type": "file_write", "name": "write_to_file",
+                "path": evidence.path}
+    if isinstance(evidence, AgySearch):
+        return {"type": "tool_call", "name": evidence.tool}
+    if isinstance(evidence, AgyGenericCall):
+        return {"type": "tool_call", "name": evidence.tool}
+    raise TypeError(f"unhandled agy tool evidence: {evidence!r}")
+
+
+def agy_stream_flat_records(
+    records: list[dict[str, Any]], *, record_lines: list[int] | None = None,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten agy's step lifecycle into completed-item records.
+
+    Only ``DONE`` tool steps become evidence.  A step that merely started is
+    dropped here and surfaces as an incomplete observation instead, so a tool
+    that never finished cannot be counted as one that did.
+    """
+    if record_lines is not None and len(record_lines) != len(records):
+        raise ValueError("record_lines must have one physical line per trace record")
+    parsed = AgyStream.parse(_agy_records_text(records))
+    flat: list[tuple[int, dict[str, Any]]] = []
+    if parsed.protocol_error is not None:
+        line = record_lines[0] if record_lines else 1
+        return [(line, _claude_protocol_error(parsed.protocol_error))]
+    for ordinal, evidence in enumerate(parsed.tools, 1):
+        line = (record_lines[min(ordinal, len(record_lines)) - 1]
+                if record_lines else ordinal)
+        spec = _agy_tool_flat_record(evidence)
+        # Only DONE steps reach here, so every record is already terminal.
+        flat.append((line, {**spec, "status": "completed",
+                            "_raw_call_line": line, "_raw_result_line": line}))
+    return flat
+
+
+def _agy_stream_semantics(
+    records: list[dict[str, Any]], pi_stream: PiStream | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    _ = pi_stream
+    parsed = AgyStream.parse(_agy_records_text(records))
+    failure = parsed.protocol_error or parsed.provider_error
+    usage = (dict(parsed.usage.counters)
+             if isinstance(parsed.usage, AgyUsagePresent) and failure is None
+             else None)
+    return usage, failure
+
+
+def _agy_usage_and_cost_blocks(
+    raw_text: str, pi_stream: PiStream | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    _ = pi_stream
+    parsed = AgyStream.parse(raw_text)
+    # Absent telemetry stays absent.  agy emits a full block of zeroed counters
+    # when a run never reached a model, and publishing that as a measurement is
+    # how a failed run comes to claim it spent nothing.
+    if not parsed.complete or not isinstance(parsed.usage, AgyUsagePresent):
+        return {"source": "missing"}, {"source": "missing"}
+    return (
+        normalize_usage(dict(parsed.usage.counters), source="provider_reported"),
+        # agy reports tokens but no dollar figure.
+        {"source": "missing"},
+    )
+
+
+def _agy_trace_protocol_error(
+    records: list[dict[str, Any]], pi_stream: PiStream | None,
+) -> str | None:
+    _ = pi_stream
+    return AgyStream.parse(_agy_records_text(records)).protocol_error
+
+
 def _no_stream_semantics(records: list[dict[str, Any]], pi_stream: PiStream | None) -> tuple[dict[str, Any] | None, str | None]:
     """No terminal cumulative usage and no stream-level failure: per-record
     token accumulation applies."""
@@ -7993,6 +8094,12 @@ GEMINI_TRACE_DIALECT = TraceDialect(
     stream_semantics=_gemini_stream_semantics,
     usage_and_cost=_gemini_usage_and_cost_blocks,
     protocol_error=_gemini_trace_protocol_error,
+)
+AGY_TRACE_DIALECT = TraceDialect(
+    flatten=agy_stream_flat_records,
+    stream_semantics=_agy_stream_semantics,
+    usage_and_cost=_agy_usage_and_cost_blocks,
+    protocol_error=_agy_trace_protocol_error,
 )
 
 # ``generic`` is the explicit source for unowned imported traces. Every backend
@@ -10153,6 +10260,228 @@ def vibe_skill_tool_evidence(stdout: str, skill_names: list[str]) -> list[str]:
     return evidence[:5]
 
 
+AGY_CONFIG_METADATA: dict[str, Any] = {
+    "config_isolated": False,
+    # State the exposure this adapter cannot close, rather than implying
+    # --sandbox covers it. See agy_cli_argv for why neither flag setting closes
+    # it, and the registry's isolation posture for the machine-readable form.
+    "config_isolation_warning": (
+        "agy exposes no config-home override (antigravity-cli#155), so the invoking user's "
+        "Antigravity configuration influences this measurement. --sandbox restricts terminal "
+        "operations only and does not contain the run: headless runs auto-approve every permission "
+        "request, including the sandbox-bypass prompt (antigravity-cli#36), and non-terminal tools "
+        "such as write_to_file are outside the sandbox entirely. Both were reproduced on agy 1.1.8, "
+        "where a run wrote outside its workspace. Treat an agy run as unsandboxed access to the "
+        "invoking user's environment, and run it only on a disposable host."
+    ),
+    "ambient_tools_auto_approved": True,
+    "sandbox_contains_run": False,
+    "disposable_host_required": True,
+    "config_isolation_upstream": (
+        "https://github.com/google-antigravity/antigravity-cli/issues/155#issuecomment-5120099256"
+    ),
+}
+
+# Flags the harness itself sets. A launcher prefix that re-supplied any of these
+# would be redundant at best; the boundary below refuses prefixes outright, so
+# this list exists to document the surface rather than to filter it.
+AGY_HARNESS_OWNED_FLAGS = (
+    "--print", "--output-format", "--add-dir", "--new-project", "--sandbox",
+    "--dangerously-skip-permissions", "--model", "--json-schema",
+    "--print-timeout", "--disable-slash-commands",
+)
+
+
+def agy_executable_token(agy_cmd: str | None) -> str:
+    """The one executable token an agy launcher may specify.
+
+    A shell-split launcher string is a hole in the measurement, not a
+    convenience. Measured on agy 1.1.9, the last occurrence of a repeated flag
+    wins, so harness-appended flags do survive a user-supplied prefix -- the
+    danger is flag *addition*. A prefix can introduce `--continue` or `-c`,
+    `--conversation`, `--agent`, `--mode`, `--effort` or `--project`, none of
+    which the harness sets. `--continue`/`-c` and `--conversation` would
+    silently seed the run with prior conversation state, which no downstream
+    check would catch: the run succeeds, the answer is contaminated, and the
+    measurement is quietly invalid.
+
+    Accepting exactly one token closes all of that by construction, including
+    the short aliases a denylist of long flag names would miss, and stays
+    correct when the next release adds another alias.
+    """
+    if agy_cmd is None:
+        return AGY_DEFAULT_CMD
+    if not isinstance(agy_cmd, str):
+        raise TypeError("--agy-cmd must be one executable string")
+    token = agy_cmd.strip()
+    if not token:
+        raise ValueError("--agy-cmd must not be empty")
+    validate_json_text(token, "agy executable")
+    if "\x00" in token:
+        raise ValueError("--agy-cmd executable cannot contain NUL")
+    if len(token.split()) > 1:
+        raise ValueError(
+            "--agy-cmd must be one executable token with no arguments; a "
+            "launcher prefix could add flags such as --continue/-c or "
+            "--conversation that would seed the run with prior conversation "
+            "state and silently invalidate the measurement")
+    if token.startswith("-"):
+        raise ValueError("--agy-cmd must be an executable, not a flag")
+    return token
+
+
+def agy_cli_argv(agy_cmd: str | None = None, *, prompt: str,
+                 cwd: Path | str | None = None, output: str = "stream-json",
+                 model: str | None = None, auto_approve: bool = True,
+                 json_schema: str | None = None, timeout: int | None = None,
+                 sandbox: bool = True,
+                 disable_slash_commands: bool = False) -> list[str]:
+    """argv for one headless agy run.
+
+    `--add-dir`/`--new-project` are not optional conveniences. agy executes its
+    shell tools in its own scratch directory (`~/.gemini/antigravity-cli/scratch`)
+    rather than the process cwd, so without attaching the workspace every
+    relative command in a prepared task runs somewhere else and silently finds
+    nothing -- which reads as a model failure rather than a harness one.
+
+    Every value is bound as its own argv element, so a dash-prefixed prompt,
+    model or schema is data rather than CLI structure.
+    """
+    if output not in {"json", "stream-json", "text"}:
+        raise ValueError(f"unsupported agy output format {output!r}")
+    argv = [agy_executable_token(agy_cmd)]
+    argv += ["--print", prompt, "--output-format", output]
+    if cwd is not None:
+        argv += ["--add-dir", str(cwd), "--new-project"]
+    if sandbox:
+        # Passed as defence in depth, NOT as containment. Two upstream facts,
+        # both reproduced against agy 1.1.8:
+        #
+        #   * `--sandbox` covers terminal restrictions only, so non-terminal
+        #     tools are outside it entirely -- a run asked to write outside its
+        #     workspace simply used `write_to_file` and succeeded.
+        #   * `--dangerously-skip-permissions` also auto-approves the
+        #     sandbox-bypass prompt itself, so even the shell path escapes:
+        #     https://github.com/google-antigravity/antigravity-cli/issues/36
+        #
+        # Dropping auto-approval does not fail safe either: without it agy
+        # silently declines the shell tool and returns an empty answer, so no
+        # process assertion is satisfiable. The flag stays because it is the
+        # tighter of the two available settings and becomes real containment if
+        # #36 is fixed; the exposure it does not close is recorded in
+        # AGY_CONFIG_METADATA and in the registry's isolation posture.
+        argv.append("--sandbox")
+    if auto_approve:
+        argv.append("--dangerously-skip-permissions")
+    if disable_slash_commands:
+        # 1.1.9's help describes this as disabling "slash command and skill
+        # expansion in print mode", which is exactly what a without-skill
+        # ablation arm must not have. Whether the with-skill arm also needs it
+        # depends on whether agy's discovery from .agents/skills is itself
+        # implemented as that expansion, which is unresolved; see PLAN.md.
+        argv.append("--disable-slash-commands")
+    if model:
+        argv += ["--model", model]
+    if json_schema:
+        argv += ["--json-schema", json_schema]
+    if timeout is not None:
+        # agy applies its own --print-timeout (default 5m) on top of whatever
+        # budget the caller enforces, so a harness --timeout above five minutes
+        # is silently truncated unless this is passed through.
+        argv += ["--print-timeout", f"{int(timeout)}s"]
+    return argv
+
+
+def redact_agy_prompt_arg(argv: list[str]) -> list[str]:
+    redacted = list(argv)
+    for idx, arg in enumerate(redacted[:-1]):
+        if arg in {"--print", "--prompt", "-p"}:
+            redacted[idx + 1] = "<prompt>"
+    return redacted
+
+
+def _agy_no_process_result(error: str, *, model: str | None) -> dict[str, Any]:
+    """A failure that happened before any process existed."""
+    return {
+        "answer": "", "provider_error": None, "protocol_error": error,
+        "stdout": "", "stderr": error, "returncode": 127, "timed_out": False,
+        "invocation_state": InvocationState.SPAWN_FAILED.value,
+        "elapsed_ms": None, "usage": None, "cost_usd": None, "model": model,
+        "trace_text": "", "trace_utf8_valid": True,
+        "environment": {**AGY_CONFIG_METADATA,
+                        "command_boundary": "not-constructed"},
+    }
+
+
+def agy_cli_invoke(prompt: str, *, model: str | None = None,
+                   agy_cmd: str | None = None,
+                   timeout: int = DEFAULT_RUNNER_TIMEOUT_S,
+                   cwd: str | Path | None = None, output: str = "stream-json",
+                   auto_approve: bool = True,
+                   json_schema: str | None = None) -> dict[str, Any]:
+    """Invoke agy headlessly behind the typed stream contract."""
+    if cwd is None:
+        with tempfile.TemporaryDirectory(prefix="agy-invoke-") as td:
+            return agy_cli_invoke(
+                prompt, model=model, agy_cmd=agy_cmd, timeout=timeout,
+                cwd=Path(td), output=output, auto_approve=auto_approve,
+                json_schema=json_schema)
+    workspace = Path(cwd)
+    try:
+        argv = agy_cli_argv(
+            agy_cmd, prompt=prompt, cwd=workspace, output=output, model=model,
+            auto_approve=auto_approve, json_schema=json_schema, timeout=timeout)
+    except (TypeError, ValueError) as exc:
+        # Invalid launch construction never became a process, so it is a spawn
+        # failure rather than a provider failure.
+        return _agy_no_process_result(
+            f"agy invocation setup failed before spawn: {exc}", model=model)
+    result = run_argv_capture(ProcessInvocationPlan.from_values(
+        argv, input_text="", cwd=workspace, timeout_s=timeout))
+    parsed = (AgyStream.parse(result.stdout, returncode=result.returncode,
+                              requested_model=model)
+              if result.stdout_utf8_valid
+              else AgyStream.invalid("agy stdout is not valid UTF-8"))
+    unclassified = parsed.unclassified_tools_advertised
+    if unclassified:
+        print(f"agy: CLI advertises {len(unclassified)} tool(s) this adapter does "
+              "not classify; re-capture tests/fixtures/agy/advertised-tools.json.",
+              file=sys.stderr)
+    return {
+        "answer": parsed.answer,
+        # D3: the structured provider error survives a nonzero exit. It is the
+        # only diagnosis an authentication failure produces.
+        "provider_error": parsed.provider_error,
+        "protocol_error": parsed.protocol_error,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "returncode": result.returncode,
+        "timed_out": result.timed_out,
+        "invocation_state": result.invocation_state.value,
+        "elapsed_ms": result.elapsed_ms,
+        # D2: absent telemetry stays absent rather than becoming a zero-valued
+        # provider-reported measurement.
+        "usage": (dict(parsed.usage.counters)
+                  if isinstance(parsed.usage, AgyUsagePresent) else None),
+        "cost_usd": None,
+        # Requested and reported model identities stay distinct: a run that
+        # reported no model is not labelled with the one that was asked for.
+        "model": parsed.model.resolved or model,
+        "model_reported": list(parsed.model.reported),
+        "trace_utf8_valid": result.stdout_utf8_valid,
+        # The raw stream is the trace: it is already the normalized
+        # dialect's input, so re-shaping it here would lose evidence.
+        "trace_text": result.stdout,
+        "environment": {
+            **AGY_CONFIG_METADATA, **dict(result.adapter_metadata or {}),
+            "command_boundary": "single-executable-token",
+            "unclassified_tools_advertised": list(unclassified),
+            "command": " ".join(
+                shlex.quote(a) for a in redact_agy_prompt_arg(argv)),
+            "cwd": "<workspace>"},
+    }
+
+
 def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | None = None,
                     timeout: int = DEFAULT_RUNNER_TIMEOUT_S, cwd: str | Path | None = None,
                     output: str = "streaming", tools: Iterable[str] | None = VIBE_READ_ONLY_TOOLS,
@@ -10323,6 +10652,59 @@ class GeminiBackend(AgentBackend):
             environment={
                 "runner": "gemini", **dict(result.get("environment") or {}),
             },
+        )
+
+
+class AgyBackend(AgentBackend):
+    name = "agy"
+
+    def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
+        result = agy_cli_invoke(
+            request.prompt,
+            model=request.model,
+            agy_cmd=str(options.get("agy_cmd") or AGY_DEFAULT_CMD),
+            timeout=request.timeout_s,
+            cwd=request.workspace,
+            output="stream-json",
+        )
+        returncode = cast(int, result.get("returncode"))
+        provider_error = result.get("provider_error")
+        protocol_error = result.get("protocol_error")
+        # A provider error is authoritative whatever the exit code. A protocol
+        # error only becomes the reported failure on a clean exit, because a
+        # nonzero exit already fails the run on its own and the protocol error
+        # would then be describing a stream that was cut short by the failure.
+        error = (
+            provider_error
+            if isinstance(provider_error, str) and provider_error
+            else protocol_error
+            if (returncode == 0 and not result.get("timed_out")
+                and isinstance(protocol_error, str) and protocol_error)
+            else None
+        )
+        raw_environment = result.get("environment")
+        environment = (dict(raw_environment)
+                       if isinstance(raw_environment, Mapping) else {})
+        return RunnerOutcome(
+            provider="agy",
+            answer=result.get("answer") or "",
+            returncode=returncode,
+            timed_out=bool(result.get("timed_out", False)),
+            invocation_state=result.get("invocation_state"),
+            timeout_s=request.timeout_s,
+            elapsed_ms=(result.get("elapsed_ms")
+                        if isinstance(result.get("elapsed_ms"), int) else None),
+            stderr=result.get("stderr", "") or "",
+            error=error,
+            usage=(result.get("usage")
+                   if isinstance(result.get("usage"), Mapping) else None),
+            cost_usd=None,
+            model=(result.get("model")
+                   if isinstance(result.get("model"), str) else None),
+            trace_text=result.get("trace_text") or "",
+            trace_utf8_valid=(result.get("trace_utf8_valid") is not False),
+            metadata_extra={},
+            environment={"runner": "agy", **environment},
         )
 
 
@@ -12000,6 +12382,67 @@ def codex_judge_invoke(prompt: str, *, judge_model: str | None, codex_cmd: str,
         usage=usage,
         usage_source="trace_normalized" if usage else "provider_reported",
         model_label=str(res.get("model") or f"codex/{judge_model or 'default'}"),
+    )
+
+
+def agy_judge_invoke(
+    prompt: str, *, judge_model: str | None, agy_cmd: str,
+    explore_hint: str | None = None, json_schema: str | None = None,
+    **_: Any,
+) -> JudgeInvocation:
+    """Run one agy judge under the lifecycle-bearing stream format.
+
+    The earlier adapter judged through `--output-format json`, whose envelope
+    agy 1.1.8 emits with raw control characters inside `response`. That forced a
+    permissive JSON parse with strictness disabled, which accepts invalid
+    JSON -- exactly the fail-open shape this harness refuses elsewhere.
+    `stream-json` carries the same verdict with a lifecycle around it, and
+    1.1.9's `--json-schema` help states the schema applies to the final result
+    under stream-json, so schema enforcement survives the switch. The permissive
+    parse is therefore deleted rather than preserved as a legacy dialect.
+    """
+    result = agy_cli_invoke(
+        prompt, model=judge_model, agy_cmd=agy_cmd,
+        output="stream-json", cwd=explore_hint, json_schema=json_schema,
+        # A judge reads and decides; it has no reason to run shell tools.
+        auto_approve=False,
+    )
+    returncode = cast(int, result.get("returncode"))
+    provider_error = result.get("provider_error")
+    protocol_error = result.get("protocol_error")
+    error = (
+        provider_error
+        if isinstance(provider_error, str) and provider_error
+        else protocol_error
+        if (returncode == 0 and isinstance(protocol_error, str)
+            and protocol_error)
+        else None
+    )
+    stderr = result.get("stderr", "") or ""
+    if isinstance(error, str):
+        stderr = _stderr_with_warning(stderr, error)
+    metadata: dict[str, Any] = {}
+    environment = result.get("environment")
+    if isinstance(environment, Mapping):
+        metadata["environment"] = dict(environment)
+    usage = result.get("usage")
+    return JudgeInvocation(
+        stdout=result.get("answer") or "",
+        stderr=stderr,
+        returncode=returncode,
+        invocation_state=_judge_invocation_state(
+            result, returncode=returncode, provider_error=error),
+        provider_error=error,
+        usage=usage if isinstance(usage, Mapping) else None,
+        cost_usd=None,
+        # agy reports its own counters. Absent telemetry has already been
+        # normalized to None above, so this label never describes a zero.
+        usage_source="provider_reported",
+        model_label=(
+            str(result["model"])
+            if isinstance(result.get("model"), str) and result.get("model")
+            else None),
+        metadata=metadata,
     )
 
 

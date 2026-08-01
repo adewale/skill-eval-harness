@@ -50,6 +50,7 @@ CODEX_TRIGGER_DEFAULT_CMD = (
 )
 VIBE_DEFAULT_CMD = "vibe"
 GEMINI_DEFAULT_CMD = "gemini"
+AGY_DEFAULT_CMD = "agy"
 
 
 @dataclass(frozen=True)
@@ -593,6 +594,16 @@ _GEMINI_JUDGE = SurfaceBinding(
     (_option("--gemini-cmd", "gemini_cmd", GEMINI_DEFAULT_CMD,
              "one literal Gemini CLI executable for --judge-backend gemini; spaces are path characters and no shell is used"),),
 )
+_AGY_ANSWER = SurfaceBinding(
+    ObjectRef("skill_benchmark", "AgyBackend"),
+    (_option("--agy-cmd", "agy_cmd", AGY_DEFAULT_CMD,
+             "one literal agy executable for --agent agy answer runs; a launcher prefix is refused because it could add --continue/-c or --conversation and seed the run with prior conversation state"),),
+)
+_AGY_JUDGE = SurfaceBinding(
+    ObjectRef("skill_benchmark", "agy_judge_invoke"),
+    (_option("--agy-cmd", "agy_cmd", AGY_DEFAULT_CMD,
+             "one literal agy executable for --judge-backend agy; a launcher prefix is refused for the same reason as the answer surface"),),
+)
 _VIBE_ANSWER = SurfaceBinding(
     ObjectRef("skill_benchmark", "VibeBackend"),
     (_option("--vibe-cmd", "vibe_cmd", VIBE_DEFAULT_CMD,
@@ -780,6 +791,61 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
         smoke=SmokeTarget(
             "gemini", "SMOKE_GEMINI_MODEL", "gemini-2.5-flash", "answer"),
         failure_marker="[GEMINI FAILURE",
+    ),
+    BackendRegistration(
+        name="agy",
+        capabilities=AgentCapabilities(
+            answer_runner=True, autonomous_trigger=False,
+            trigger_ablation=False, trace_artifacts=True, token_usage=True,
+            dollar_cost="missing", judge_backend=True, tool_replay=False,
+            usage_provenance="provider_reported",
+            elapsed_provenance="process_measured",
+            live_smoke_env="RUN_AGY_SMOKE",
+            isolation=IsolationPosture(
+                containment="uncontained_requires_disposable_host",
+                config_authority="ambient_user_config",
+                reason=(
+                    "agy exposes no config-home override "
+                    "(antigravity-cli#155), so the invoking user's "
+                    "configuration is in play, and --sandbox restricts "
+                    "terminal operations only while "
+                    "--dangerously-skip-permissions auto-approves the "
+                    "sandbox-bypass prompt itself (antigravity-cli#36). A run "
+                    "asked to write outside its workspace succeeded on 1.1.8."
+                ),
+            ),
+            notes=(
+                "Google Antigravity answer and judge support parses "
+                "stream-json through agy_contracts, where search tools are "
+                "disjoint from file reads, absent telemetry stays absent "
+                "rather than becoming a zero-token measurement, and the "
+                "provider error survives a nonzero exit. Autonomous trigger "
+                "and trigger ablation are withheld until one positive and one "
+                "negative activation are observed live, following the "
+                "precedent set for Gemini. Dollar cost remains explicit "
+                "missing because agy reports tokens but no cost. agy cannot "
+                "be contained at its CLI surface, so runs belong on a "
+                "disposable host."
+            ),
+        ),
+        answer_route="native",
+        trace=ObjectRef("skill_benchmark", "AGY_TRACE_DIALECT"),
+        answer_entrypoints=(_RUN_AGENT,),
+        answer=_AGY_ANSWER,
+        judge=_AGY_JUDGE,
+        workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
+        # Deliberately a dedicated smoke rather than a SmokeTarget. A
+        # SmokeTarget joins scripts/smoke_supported_clis.py, which sweeps every
+        # supported CLI in one run -- and agy cannot be contained, so sweeping
+        # it would invite an uncontained agent onto whatever machine ran the
+        # convenience script. Requiring its own opt-in keeps the disposable-host
+        # decision in front of the operator.
+        smoke=DedicatedSmokeTarget(
+            "agy",
+            ("python3", "-m", "unittest", "discover", "tests", "-k",
+             "smoke_agy", "-v"),
+        ),
+        failure_marker="[AGY FAILURE",
     ),
     BackendRegistration(
         name="pi",

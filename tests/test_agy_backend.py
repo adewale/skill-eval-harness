@@ -1,0 +1,277 @@
+"""Adapter laws for the Antigravity (`agy`) answer and judge surfaces.
+
+`tests/test_agy_contracts.py` holds the wire protocol laws.  This file covers
+what the adapter does with a parsed stream: how it builds argv, where it refuses
+to build one at all, and which facts survive into a typed outcome.
+"""
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import skill_benchmark as sb
+from invocation_contracts import InvocationResult
+from trigger_contracts import InvocationState
+
+FIXTURES = Path(__file__).parent / "fixtures" / "agy"
+
+
+def fixture(name: str) -> str:
+    return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def completed(stdout: str, *, returncode: int = 0) -> InvocationResult:
+    return InvocationResult(
+        stdout=stdout, stderr="", returncode=returncode, elapsed_ms=1200,
+        invocation_state=(InvocationState.COMPLETE if returncode == 0
+                          else InvocationState.PROCESS_FAILED),
+        stdout_utf8_valid=True, stderr_utf8_valid=True,
+    )
+
+
+class TheCommandBoundaryIsOneToken(unittest.TestCase):
+    """A launcher prefix cannot introduce flags the harness never sets."""
+
+    def test_the_default_is_the_bare_executable(self) -> None:
+        self.assertEqual(sb.agy_executable_token(None), "agy")
+
+    def test_a_plain_path_is_accepted(self) -> None:
+        self.assertEqual(sb.agy_executable_token("/opt/bin/agy"), "/opt/bin/agy")
+
+    def test_a_continue_prefix_is_rejected_rather_than_honoured(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            sb.agy_executable_token("agy --continue")
+        self.assertIn("--continue", str(caught.exception))
+
+    def test_every_conversation_seeding_flag_is_refused(self) -> None:
+        # The long names are what the plan called out; the short aliases are
+        # what a denylist of long names would have missed. agy 1.1.9 exposes
+        # -c for --continue and -p/--prompt for --print.
+        for prefix in ("agy --continue", "agy -c", "agy --conversation ABC",
+                       "agy --agent other", "agy --mode plan", "agy --effort high",
+                       "agy --project P", "agy -p hi", "agy --prompt hi",
+                       "agy -i", "agy --log-file /tmp/x"):
+            with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+                sb.agy_executable_token(prefix)
+
+    def test_a_bare_flag_is_not_an_executable(self) -> None:
+        with self.assertRaises(ValueError):
+            sb.agy_executable_token("--continue")
+
+    def test_empty_and_non_string_launchers_are_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            sb.agy_executable_token("   ")
+        with self.assertRaises(TypeError):
+            sb.agy_executable_token(["agy"])  # type: ignore[arg-type]
+
+    def test_an_invalid_launcher_never_becomes_a_process(self) -> None:
+        with mock.patch.object(sb, "run_argv_capture") as spawn:
+            result = sb.agy_cli_invoke(
+                "hi", agy_cmd="agy --continue", cwd="/tmp", timeout=5)
+        spawn.assert_not_called()
+        self.assertEqual(result["invocation_state"],
+                         InvocationState.SPAWN_FAILED.value)
+        self.assertIn("--continue", result["protocol_error"])
+        self.assertIsNone(result["usage"])
+
+
+class ValuesAreBoundAsValues(unittest.TestCase):
+    """Dash-prefixed data must reach the process as data, not as structure."""
+
+    def test_a_dash_prefixed_prompt_is_one_argv_element(self) -> None:
+        argv = sb.agy_cli_argv(prompt="--dangerously-skip-permissions",
+                               cwd="/tmp")
+        self.assertEqual(argv[argv.index("--print") + 1],
+                         "--dangerously-skip-permissions")
+
+    def test_a_dash_prefixed_model_is_one_argv_element(self) -> None:
+        argv = sb.agy_cli_argv(prompt="hi", model="--sandbox", cwd="/tmp")
+        self.assertEqual(argv[argv.index("--model") + 1], "--sandbox")
+
+    def test_a_dash_prefixed_schema_is_one_argv_element(self) -> None:
+        argv = sb.agy_cli_argv(prompt="hi", json_schema="--continue", cwd="/tmp")
+        self.assertEqual(argv[argv.index("--json-schema") + 1], "--continue")
+
+    def test_the_workspace_is_attached_to_the_run(self) -> None:
+        argv = sb.agy_cli_argv(prompt="hi", cwd="/work")
+        self.assertIn("--add-dir", argv)
+        self.assertEqual(argv[argv.index("--add-dir") + 1], "/work")
+        self.assertIn("--new-project", argv)
+
+    def test_the_harness_timeout_is_pushed_into_the_cli(self) -> None:
+        argv = sb.agy_cli_argv(prompt="hi", cwd="/work", timeout=900)
+        self.assertEqual(argv[argv.index("--print-timeout") + 1], "900s")
+
+    def test_slash_command_expansion_can_be_disabled(self) -> None:
+        self.assertNotIn("--disable-slash-commands",
+                         sb.agy_cli_argv(prompt="hi", cwd="/w"))
+        self.assertIn("--disable-slash-commands",
+                      sb.agy_cli_argv(prompt="hi", cwd="/w",
+                                      disable_slash_commands=True))
+
+    def test_the_prompt_is_redacted_from_recorded_commands(self) -> None:
+        argv = sb.agy_cli_argv(prompt="secret question", cwd="/w")
+        self.assertNotIn("secret question", sb.redact_agy_prompt_arg(argv))
+
+
+class TheAnswerPathReportsWhatHappened(unittest.TestCase):
+    def invoke(self, stdout: str, *, returncode: int = 0) -> dict:
+        with mock.patch.object(sb, "run_argv_capture",
+                               return_value=completed(stdout, returncode=returncode)):
+            return sb.agy_cli_invoke("hi", cwd="/tmp", timeout=30)
+
+    def test_a_successful_run_reports_answer_and_usage(self) -> None:
+        result = self.invoke(fixture("stream-json-success.jsonl"))
+        self.assertEqual(result["answer"], "The current stable version is 2.11.2.")
+        self.assertEqual(result["usage"]["total_tokens"], 14439)
+        self.assertEqual(result["model"], "gemini-3.1-pro-low")
+        self.assertIsNone(result["provider_error"])
+
+    def test_an_auth_failure_keeps_its_error_and_reports_no_usage(self) -> None:
+        result = self.invoke(fixture("stream-json-auth-failure.jsonl"),
+                             returncode=1)
+        self.assertEqual(result["provider_error"],
+                         "authentication failed or timed out")
+        self.assertIsNone(
+            result["usage"],
+            "a run that never reached a model must not publish token counters")
+
+    def test_an_auth_failure_is_a_provider_failure_outcome(self) -> None:
+        with mock.patch.object(
+                sb, "run_argv_capture",
+                return_value=completed(fixture("stream-json-auth-failure.jsonl"),
+                                       returncode=1)):
+            outcome = sb.AgyBackend().invoke_answer(
+                sb.InvocationRequest(prompt="hi", workspace=Path("/tmp"),
+                                     model=None, timeout_s=30))
+        self.assertEqual(outcome.reason, "authentication failed or timed out")
+        self.assertNotEqual(outcome.returncode, 0)
+
+    def test_a_run_that_reported_no_model_falls_back_to_the_request(self) -> None:
+        with mock.patch.object(
+                sb, "run_argv_capture",
+                return_value=completed(fixture("stream-json-auth-failure.jsonl"),
+                                       returncode=1)):
+            result = sb.agy_cli_invoke("hi", cwd="/tmp", timeout=30,
+                                       model="gemini-3.1-pro-high")
+        self.assertEqual(result["model_reported"], [],
+                         "the run reported no model of its own")
+        self.assertEqual(result["model"], "gemini-3.1-pro-high")
+
+    def test_two_reported_models_leave_the_identity_unresolved(self) -> None:
+        result = self.invoke(fixture("stream-json-multi-model.jsonl"))
+        self.assertEqual(result["model_reported"],
+                         ["gemini-3.1-pro-low", "gemini-3.1-pro-high"])
+        self.assertIsNone(result["model"],
+                          "two reported models cannot collapse to one")
+
+    def test_a_truncated_stream_is_not_a_completed_run(self) -> None:
+        result = self.invoke(fixture("stream-json-bad-line.jsonl"))
+        self.assertIsNotNone(result["protocol_error"])
+
+    def test_the_containment_exposure_is_recorded_on_every_run(self) -> None:
+        result = self.invoke(fixture("stream-json-success.jsonl"))
+        environment = result["environment"]
+        self.assertFalse(environment["config_isolated"])
+        self.assertFalse(environment["sandbox_contains_run"])
+        self.assertTrue(environment["disposable_host_required"])
+        self.assertEqual(environment["command_boundary"],
+                         "single-executable-token")
+
+
+class TheJudgePathUsesTheLifecycleFormat(unittest.TestCase):
+    def judge(self, stdout: str, *, returncode: int = 0):
+        with mock.patch.object(sb, "run_argv_capture",
+                               return_value=completed(stdout, returncode=returncode)):
+            return sb.agy_judge_invoke(
+                "verdict?", judge_model=None, agy_cmd="agy",
+                explore_hint="/tmp")
+
+    def test_the_judge_runs_under_stream_json_with_tools_unapproved(self) -> None:
+        with mock.patch.object(sb, "agy_cli_invoke") as invoke:
+            invoke.return_value = {
+                "answer": "{}", "provider_error": None, "protocol_error": None,
+                "stderr": "", "returncode": 0, "timed_out": False,
+                "invocation_state": "complete", "elapsed_ms": 5,
+                "usage": None, "model": None, "environment": {},
+            }
+            sb.agy_judge_invoke("verdict?", judge_model=None, agy_cmd="agy")
+        kwargs = invoke.call_args.kwargs
+        self.assertEqual(kwargs["output"], "stream-json")
+        self.assertFalse(
+            kwargs["auto_approve"],
+            "a judge reads and decides; it has no reason to auto-approve tools")
+
+    def test_a_judge_verdict_survives_the_stream_format(self) -> None:
+        invocation = self.judge(fixture("stream-json-success.jsonl"))
+        self.assertEqual(invocation.stdout,
+                         "The current stable version is 2.11.2.")
+        self.assertIsNone(invocation.provider_error)
+        self.assertEqual(invocation.usage["total_tokens"], 14439)
+
+    def test_a_judge_auth_failure_keeps_its_diagnosis(self) -> None:
+        invocation = self.judge(fixture("stream-json-auth-failure.jsonl"),
+                                returncode=1)
+        self.assertEqual(invocation.provider_error,
+                         "authentication failed or timed out")
+        self.assertIsNone(invocation.usage)
+
+    def test_no_permissive_json_parsing_survives_in_the_agy_path(self) -> None:
+        import re
+
+        source = Path(sb.__file__).read_text(encoding="utf-8")
+        permissive = re.findall(r"json\.loads\([^)]*strict\s*=\s*False", source)
+        self.assertEqual(
+            permissive, [],
+            "a JSON parser that accepts raw control characters is fail-open; "
+            "the agy judge uses stream-json precisely so this is unnecessary")
+
+    def test_the_agy_path_recovers_nothing_through_cast(self) -> None:
+        import inspect
+        for function in (sb.agy_cli_invoke, sb.agy_cli_argv,
+                         sb.agy_executable_token):
+            with self.subTest(function=function.__name__):
+                self.assertNotIn(
+                    "cast(", inspect.getsource(function),
+                    "cast()-based recovery hides a boundary that should be "
+                    "validated")
+
+
+class TheTraceDialectSeparatesSearchFromReads(unittest.TestCase):
+    def normalized(self, name: str) -> tuple[dict, dict]:
+        records, errors = sb.parse_trace_jsonl_text(fixture(name))
+        self.assertEqual(errors, [])
+        return sb.normalize_trace_records(records, source="agy")
+
+    def test_a_completed_read_is_counted_as_a_file_read(self) -> None:
+        events, metrics = self.normalized("stream-json-success.jsonl")
+        self.assertEqual(metrics["file_reads"], 1)
+        # The shared normalizer promotes a completed read of a SKILL.md into a
+        # skill_load event; that promotion is what trigger detection keys on,
+        # and it is exactly what a search must never reach.
+        loads = [event for event in events["events"]
+                 if event["type"] == "skill_load"]
+        self.assertEqual(len(loads), 1)
+        self.assertIn("SKILL.md", loads[0]["input_summary"])
+
+    def test_a_search_never_becomes_a_file_read(self) -> None:
+        events, metrics = self.normalized("stream-json-search-only.jsonl")
+        self.assertEqual(
+            [event for event in events["events"]
+             if event["type"] == "file_read"], [],
+            "grep_search and skill_search are discovery, not reads")
+        self.assertEqual(metrics.get("file_reads", 0), 0)
+
+    def test_a_search_carries_no_path_to_be_mistaken_for_evidence(self) -> None:
+        flat = sb._agy_tool_flat_record(sb.AgySearch(tool="grep_search"))
+        self.assertNotIn("path", flat)
+        self.assertEqual(flat["type"], "tool_call")
+
+    def test_the_registry_projects_the_agy_dialect(self) -> None:
+        self.assertIn("agy", sb.TRACE_DIALECTS)
+        self.assertIs(sb.TRACE_DIALECTS["agy"], sb.AGY_TRACE_DIALECT)
+
+
+if __name__ == "__main__":
+    unittest.main()

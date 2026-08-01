@@ -35,9 +35,9 @@ step.
 | 3 — containment posture | SANDBOX | **done — vocabulary needs maintainer sign-off** |
 | 4 — `agy_contracts.py` | SANDBOX | **done — all D1/D2/D3 tests green** |
 | 5 — narrowing proofs | SANDBOX | **done — mutation-verified** |
-| 6 — answer + judge adapters | SANDBOX | not started |
-| 7 — command boundary | SANDBOX | not started |
-| 8 — backend registration | SANDBOX | not started |
+| 6 — answer + judge adapters | SANDBOX | **done** |
+| 7 — command boundary | SANDBOX | **done** |
+| 8 — backend registration | SANDBOX | **partly done** — row + docs landed; conformance pack and conservation laws remain |
 | 9–13 | SHELL | **blocked in sandbox** — need an authenticated `agy` on a disposable host |
 
 ### Working environment
@@ -192,6 +192,33 @@ uv pip install --python .venv/bin/python -e ".[test]"
   fields are covered by the same drift gate as the old ones. Anyone adding a
   table to that file later needs to fix the scrape first.
 
+- **F10 (step 6) — the trace dialect forces the registry row to land with the
+  adapter, so part of step 8 is not separable.** `TRACE_DIALECTS` is projected
+  from `BACKENDS` via `trace_dialect_implementations()`, so `AGY_TRACE_DIALECT`
+  is unreachable — `normalize_trace_records(source="agy")` raises — until the
+  `BackendRegistration` row exists. The row, `Provider.AGY`, the surface
+  bindings and the parity/abstractions doc updates therefore landed with steps
+  6-7 rather than in step 8. **What remains of step 8 is the conformance pack
+  and the conservation laws**, both of which are genuinely separable.
+
+- **F11 (step 6) — agy must not join the all-CLIs smoke sweep.** A
+  `SmokeTarget` row is picked up by `scripts/smoke_supported_clis.py`, which
+  smoke-tests *every* supported CLI in one command. Giving agy one would invite
+  an uncontained agent onto whatever machine ran that convenience script, which
+  is exactly the hazard the containment posture exists to record. agy therefore
+  gets a **`DedicatedSmokeTarget`**, following jetty's precedent, backed by
+  `tests/test_smoke_agy.py` gated on `RUN_AGY_SMOKE=1`. That file also asserts
+  the backend is *still* declared uncontained, so relaxing the posture without
+  re-checking the containment findings fails a test.
+
+- **F12 (step 6) — the shared normalizer promotes a `SKILL.md` read to
+  `skill_load`, which is what makes the D1 fix matter end to end.** A completed
+  `view_file` of a mounted `SKILL.md` does not stay a `file_read`: the harness's
+  own normalizer turns it into a `skill_load` event, and that promotion is what
+  trigger detection keys on. Because a search now flattens to a `tool_call`
+  carrying no path, it can never reach that promotion. The D1 fix is therefore
+  load-bearing at the trace layer too, not only inside `agy_contracts`.
+
 - **F4 (step 1) — dash-prefixed prompt binding remains unproven.** `agy --print
   "--dangerously-skip-permissions" --output-format stream-json` reached the
   authentication stage rather than failing flag parsing, which is consistent
@@ -230,6 +257,64 @@ Both D2 and D3 are therefore confirmed against the current release, not inferred
 hand-constructed from the 1.1.8 vocabulary and labelled as such in the README,
 which also records the one guessed parameter name (`grep_search`'s `SearchPath`)
 for step 10 to replace.
+
+### Steps 6-7 result — measured 2026-08-01
+
+Answer and judge adapters live in `skill_benchmark.py`; the registry row and
+CLI wiring came with them (see F10). Gates: **1363 tests**, `ty
+--error-on-warning` clean, `ruff` clean. All three entrypoints run, and
+`--agent agy` / `--agy-cmd` appear in `run-agent --help`.
+
+`skill-benchmark agent-capabilities` now projects:
+
+```
+answer_runner: True          judge_backend: True
+autonomous_trigger: False    trigger_ablation: False
+usage_provenance: provider_reported    dollar_cost: missing
+isolation.containment: uncontained_requires_disposable_host
+```
+
+Step 6 specifics:
+
+- `AgyBackend` uses `ProcessInvocationPlan.from_values` and
+  `run_argv_capture(plan)`, and sets `invocation_state` and `trace_utf8_valid`,
+  which the reference `AgyBackend` did not.
+- **D3 fixed:** the provider error is read from the parsed stream whatever the
+  exit code. A protocol error still only becomes the reported failure on a clean
+  exit, so "zero exit is not proof of completion" survives.
+- Invalid launch construction returns `SPAWN_FAILED` **without spawning
+  anything**, asserted by a test that fails if `run_argv_capture` is called.
+- The judge runs under `stream-json` with `auto_approve=False`. There is no
+  permissive JSON parse anywhere in the agy path, and a test greps for
+  `json.loads(..., strict=False)` to keep it that way. No `cast()` appears in
+  the agy invocation path either.
+- `AGY_TRACE_DIALECT` reuses `agy_contracts`, so the trace normalizer and the
+  answer path cannot disagree about what a tool did. A search flattens to a
+  `tool_call` **with no `path` key at all**.
+
+Step 7 specifics:
+
+- `agy_executable_token` accepts exactly one token. Tested against eleven
+  rejected prefixes covering both the long flags the plan named and the short
+  aliases finding F2 turned up (`-c`, `-p`, `-i`, `--prompt`, `--log-file`).
+- Dash-prefixed prompt, model and schema values are each asserted to arrive as
+  their own argv element, so data cannot become CLI structure.
+- `--disable-slash-commands` is implemented and **off by default**, with the
+  open question recorded in code: 1.1.9's help calls it "slash command and skill
+  expansion in print mode", so a `without_skill` arm almost certainly needs it,
+  but whether the `with_skill` arm can tolerate it depends on whether agy's
+  `.agents/skills` discovery *is* that expansion. Unresolved until step 10.
+
+**Preprocessing inventory (review requirement 4).** What agy does to input
+before the model sees it, on 1.1.9:
+
+| Mechanism | Harness posture |
+|---|---|
+| slash-command and skill expansion in print mode | left on by default; `--disable-slash-commands` available, needed by the ablation arm |
+| `--add-dir` workspace attachment | always set — agy runs shell tools in its own scratch dir, so without it relative commands silently find nothing |
+| `--new-project` | always set, so a run does not join an existing project |
+| conversation resumption (`--continue`/`-c`, `--conversation`) | **impossible** — the launcher grammar refuses any prefix |
+| `--json-schema` on the final result | passed through for judges; enforcement unverified until step 10 |
 
 ### Step 5 result — measured 2026-08-01
 
@@ -849,7 +934,9 @@ locally produces a `ty` error (verify, then revert).
 
 ---
 
-### Step 6 — Port the answer and judge adapters [SANDBOX]
+### Step 6 — Port the answer and judge adapters [SANDBOX] — DONE
+
+> See [Step 6-7 result](#steps-67-result--measured-2026-08-01).
 
 Answer path — port `AgyBackend` from the reference branch, adapting to current
 `main`:
@@ -890,7 +977,9 @@ parsing anywhere in the agy path; suite green; `ty --error-on-warning` clean.
 
 ---
 
-### Step 7 — Close the command boundary [SANDBOX]
+### Step 7 — Close the command boundary [SANDBOX] — DONE
+
+> See [Step 6-7 result](#steps-67-result--measured-2026-08-01).
 
 Replace `shlex.split(agy_cmd or AGY_DEFAULT_CMD)` (reference branch
 `skill_benchmark.py:8200`).
