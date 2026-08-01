@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import telemetry
+from invocation_contracts import InvocationState, validate_invocation_lifecycle
 from json_contracts import freeze_json_mapping, validate_json_text
 
 JudgeUsageSource = Literal["provider_reported", "trace_normalized"]
@@ -50,6 +51,8 @@ class JudgeInvocation:
     stdout: str
     stderr: str
     returncode: int
+    invocation_state: InvocationState
+    provider_error: str | None = None
     usage: Mapping[str, Any] | None = None
     cost_usd: float | None = None
     usage_source: JudgeUsageSource = "provider_reported"
@@ -64,6 +67,10 @@ class JudgeInvocation:
         validate_json_text(self.stderr, "judge stderr")
         if type(self.returncode) is not int:
             raise TypeError("judge returncode must be an integer")
+        validate_invocation_lifecycle(
+            self.invocation_state, self.returncode, self.provider_error)
+        if self.provider_error is not None:
+            validate_json_text(self.provider_error, "judge provider_error")
         if self.usage_source not in JUDGE_USAGE_SOURCES:
             raise ValueError(
                 f"unknown judge usage source {self.usage_source!r}")
@@ -97,4 +104,4 @@ class JudgeInvocation:
 
     @property
     def succeeded(self) -> bool:
-        return self.returncode == 0
+        return self.invocation_state is InvocationState.COMPLETE

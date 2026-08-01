@@ -583,6 +583,7 @@ skill-eval-harness/
 ├── agent_capabilities.py       # unified backend surfaces, capabilities, CLI options, smoke, and failure policy
 ├── artifact_contracts.py       # closed persisted-artifact observations and integrity verification
 ├── experimental_pairs.py       # exact pair identities and blocked-pair construction
+├── grading_contracts.py        # closed assertion observations and immutable judge tasks
 ├── runner_contracts.py         # closed answer-runner outcome union
 ├── judge_verdict.py            # strict imported/stored judge verdict variants
 ├── jetty_contracts.py          # closed Jetty lifecycle and observation contract

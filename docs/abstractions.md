@@ -174,10 +174,10 @@ Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | Lo
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10439`), Claude (`run_claude:10625`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10449`), Claude (`run_claude:10635`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13171`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:3995` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13225`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4005` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -217,7 +217,9 @@ Qualitative assertions defer. `collect_judge_tasks` gathers every `judge`/`rubri
 across runs and keys each by `judge_task_id` (`case::variant::run-n::assertion`, with a `model`
 segment on a multi-model run). `grade --judge-tasks` can serialize that queue, while the
 `judge` command reconstructs the same tasks from the manifest and run directory rather than
-reading the optional queue file. `judge_prompt` renders the case, expected behavior, rubric,
+reading the optional queue file. Before queuing, `grading_contracts.JudgeTask` validates and freezes
+the case/model/variant/run identity, paths, assertion, conversation, and prompt/evidence
+fingerprints. `judge_prompt` renders the case, expected behavior, rubric,
 and candidate output into a prompt — including the anchored dimensions or dynamic-rubric
 instruction for a graded assertion; `run_one_judge_task` pipes it to the `--judge-cmd` you
 supply or to a native `--judge-backend` (`claude`, `codex`, `gemini`, or `vibe`) plus
@@ -245,6 +247,12 @@ behind rather than a verdict. Grading reads from disk and calls no model, which 
 a default re-grade cheap and deterministic; opt-in script and embedding oracles are the explicit
 external-process exceptions.
 
+Before aggregation, every objective and qualitative row becomes one
+`SatisfiedAssertion | FailedAssertion | UnavailableAssertion | SkippedAssertion`. Severity and
+oracle tier are closed enums, scores must be finite, and unavailable/skipped rows cannot enter a
+pass-rate denominator. The legacy dictionary rows are serialized only after typed aggregation, so
+`passed: null`, dependency skips, and observed failures no longer share an implicit falsy branch.
+
 ## Benchmark report
 
 `build_benchmark_report` invokes the shared grader for each discovered run, then
@@ -262,7 +270,7 @@ those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplica
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:785`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:795`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 The pairing key carries `CaseId`, `ModelId | None`, `RunNumber`, and the closed

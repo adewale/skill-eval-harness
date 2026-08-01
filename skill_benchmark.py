@@ -127,6 +127,16 @@ from artifact_contracts import (
     observe_artifact_set,
 )
 from gemini_contracts import GeminiJsonResponse, GeminiStream
+from grading_contracts import (
+    FailedAssertion,
+    JudgeTask,
+    OracleTier,
+    SatisfiedAssertion,
+    Severity,
+    SkippedAssertion,
+    UnavailableAssertion,
+    assertion_observation_from_row,
+)
 from invocation_contracts import (
     InvocationRequest,
     InvocationResult,
@@ -197,7 +207,7 @@ from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 VALID_SPLITS = frozenset(Split.values())
 HARNESS_SEMANTIC_MODULES = (
     "ablation_model.py", "agent_capabilities.py", "artifact_contracts.py", "experimental_pairs.py",
-    "gemini_contracts.py",
+    "gemini_contracts.py", "grading_contracts.py",
     "invocation_contracts.py", "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "manifest_contracts.py", "run_pi_trigger_eval.py",
     "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
     "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
@@ -245,8 +255,8 @@ EFFICIENCY_ASSERTIONS = {
 }
 OBJECTIVE_ASSERTIONS = TEXT_ASSERTIONS | PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS
 QUALITATIVE_ASSERTIONS = {"judge", "rubric", "factuality"}
-SEVERITIES = {"critical", "gate", "soft"}
-ORACLE_TIERS = {"strong", "demo", "live"}
+SEVERITIES = {item.value for item in Severity}
+ORACLE_TIERS = {item.value for item in OracleTier}
 ASSERTION_COMMON_FIELDS = {
     "type", "name", "description", "ci", "severity", "critical", "gate",
     "soft", "oracle", "variants", "only_variants", "except_variants",
@@ -11868,6 +11878,28 @@ def judge_artifact_inventory(run_base: Path) -> list[str]:
 JUDGE_EXPLORE_TOOLS = "Read,Grep,Glob,LS"
 
 
+def _judge_invocation_state(
+    raw: Mapping[str, Any], *, returncode: int,
+    provider_error: str | None = None,
+) -> InvocationState:
+    """Retain process provenance while classifying provider-response failure."""
+    if provider_error and returncode == 0:
+        return InvocationState.PROVIDER_FAILED
+    raw_state = raw.get("invocation_state")
+    if raw_state is not None:
+        try:
+            state = InvocationState(raw_state)
+        except ValueError as exc:
+            raise ValueError("judge backend returned an invalid invocation_state") from exc
+        if state is InvocationState.HARNESS_FAILED:
+            raise ValueError("judge backend harness failure cannot be a process record")
+        if state is InvocationState.PROVIDER_FAILED and returncode != 0:
+            return InvocationState.PROCESS_FAILED
+        return state
+    return (InvocationState.COMPLETE if returncode == 0
+            else InvocationState.PROCESS_FAILED)
+
+
 def sanitized_run_copy(run_base: Path, dest: Path) -> Path | None:
     """Safety-by-construction for the tool-using judge (G1 follow-on). Copies the
     run dir to `dest` with every oracle file removed — anything whose name carries a
@@ -11908,14 +11940,16 @@ def claude_judge_invoke(prompt: str, *, judge_model: str | None, claude_bin: str
                             extra_args=claude_extra_args, cwd=explore_hint)
     provider_error = res.get("provider_error")
     returncode = cast(int, res.get("returncode"))
-    if returncode == 0 and isinstance(provider_error, str):
-        returncode = 1
     return JudgeInvocation(
         stdout=res.get("answer", ""),
         stderr=(_stderr_with_warning(res.get("stderr", "") or "", provider_error)
                 if isinstance(provider_error, str)
                 else res.get("stderr", "") or ""),
         returncode=returncode,
+        invocation_state=_judge_invocation_state(
+            res, returncode=returncode,
+            provider_error=(provider_error if isinstance(provider_error, str) else None)),
+        provider_error=(provider_error if isinstance(provider_error, str) else None),
         cost_usd=res.get("cost_usd"),
         usage=res.get("usage") if isinstance(res.get("usage"), dict) else None,
         usage_source="provider_reported",
@@ -11929,10 +11963,16 @@ def codex_judge_invoke(prompt: str, *, judge_model: str | None, codex_cmd: str,
     res = codex_cli_invoke(prompt, model=judge_model, codex_cmd=codex_cmd,
                            output_schema=assertion_schema, cwd=explore_hint)
     usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
+    returncode = cast(int, res.get("returncode"))
+    provider_error = res.get("provider_error")
     return JudgeInvocation(
         stdout=res.get("answer") or "",
         stderr=res.get("stderr", "") or "",
-        returncode=cast(int, res.get("returncode")),
+        returncode=returncode,
+        invocation_state=_judge_invocation_state(
+            res, returncode=returncode,
+            provider_error=(provider_error if isinstance(provider_error, str) else None)),
+        provider_error=(provider_error if isinstance(provider_error, str) else None),
         cost_usd=res.get("cost_usd"),
         usage=usage,
         usage_source="trace_normalized" if usage else "provider_reported",
@@ -11979,10 +12019,6 @@ def gemini_judge_invoke(
         if process_returncode == 0 and tool_error is not None
         else None
     )
-    effective_returncode = (
-        1 if process_returncode == 0 and isinstance(error, str) and error
-        else process_returncode
-    )
     stderr = result.get("stderr", "") or ""
     if isinstance(error, str):
         stderr = _stderr_with_warning(stderr, error)
@@ -11993,7 +12029,11 @@ def gemini_judge_invoke(
     return JudgeInvocation(
         stdout=result.get("answer") or "",
         stderr=stderr,
-        returncode=effective_returncode,
+        returncode=process_returncode,
+        invocation_state=_judge_invocation_state(
+            result, returncode=process_returncode,
+            provider_error=error),
+        provider_error=error,
         usage=(result.get("usage")
                if isinstance(result.get("usage"), Mapping) else None),
         cost_usd=None,
@@ -12015,10 +12055,16 @@ def vibe_judge_invoke(prompt: str, *, judge_model: str | None, vibe_cmd: str,
                       explore_hint: str | None, **_: Any) -> JudgeInvocation:
     res = vibe_cli_invoke(prompt, model=judge_model, vibe_cmd=vibe_cmd, output="json",
                           tools=VIBE_NO_TOOLS, cwd=explore_hint)
+    returncode = cast(int, res.get("returncode"))
+    provider_error = res.get("provider_error")
     return JudgeInvocation(
         stdout=res.get("answer", ""),
         stderr=res.get("stderr", "") or "",
-        returncode=cast(int, res.get("returncode")),
+        returncode=returncode,
+        invocation_state=_judge_invocation_state(
+            res, returncode=returncode,
+            provider_error=(provider_error if isinstance(provider_error, str) else None)),
+        provider_error=(provider_error if isinstance(provider_error, str) else None),
         cost_usd=res.get("cost_usd"),
         usage=res.get("usage") if isinstance(res.get("usage"), dict) else None,
         usage_source="provider_reported",
@@ -12034,6 +12080,8 @@ def shell_judge_invoke(prompt: str, *, judge_cmd: str,
         capture_output=True, check=False)
     return JudgeInvocation(
         stdout=proc.stdout, stderr=proc.stderr or "", returncode=proc.returncode,
+        invocation_state=(InvocationState.COMPLETE if proc.returncode == 0
+                          else InvocationState.PROCESS_FAILED),
         model_label=model_label)
 
 
@@ -12266,6 +12314,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     stdout = invocation.stdout
     stderr = invocation.stderr
     returncode = invocation.returncode
+    invocation_complete = invocation.succeeded
     cost_usd = invocation.cost_usd
     judge_usage = dict(invocation.usage) if invocation.usage is not None else None
     usage_source = invocation.usage_source
@@ -12339,7 +12388,9 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
             plain_payload = ({**parsed, "threshold": threshold}
                              if parsed.get("score") is not None else parsed)
             passed = judge_verdict_passed(plain_payload)
-    evidence = parse_error or parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or "judge command completed"
+    evidence = (invocation.provider_error or parse_error
+                or parsed.get("evidence") or parsed.get("rationale")
+                or parsed.get("reasoning") or "judge command completed")
     row = {
         **graded_payload,
         **_judge_row_identity(task, judge_model=judge_model_label,
@@ -12354,10 +12405,13 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         "judge_evidence_mode": evidence_mode,
         **({"judge_context_sha256": context_sha256}
            if context_sha256 is not None else {}),
-        "judge_observation_complete": returncode == 0 and parse_error is None,
-        "availability": ("complete" if returncode == 0 and parse_error is None
+        "judge_observation_complete": invocation_complete and parse_error is None,
+        "invocation_state": invocation.invocation_state.value,
+        **({"provider_error": invocation.provider_error}
+           if invocation.provider_error is not None else {}),
+        "availability": ("complete" if invocation_complete and parse_error is None
                          else "partial"),
-        "passed": passed and returncode == 0 and parse_error is None,
+        "passed": passed and invocation_complete and parse_error is None,
         **({"score": score} if score is not None else {}),
         **({"threshold": threshold} if score is not None and "criteria" not in graded_payload else {}),
         "evidence": evidence,
@@ -14002,6 +14056,7 @@ def grade_case_variant(
                 judge_task, unit_text or "", run_base=unit_base,
                 steps=current_steps)
             judge_task["judge_input_sha256"] = current_input_fingerprint
+            judge_task = JudgeTask.from_row(judge_task).to_row()
             judged = judge_results.get(jid)
             if judged:
                 evidence_mode = judged.get("judge_evidence_mode")
@@ -14096,6 +14151,10 @@ def grade_case_variant(
                 break
         for r in objective + qualitative:
             r.pop("_dep_label", None)   # transient resolver key; never serialized
+    objective_observations = [assertion_observation_from_row(row) for row in objective]
+    qualitative_observations = [assertion_observation_from_row(row) for row in qualitative]
+    objective = [observation.to_row() for observation in objective_observations]
+    qualitative = [observation.to_row() for observation in qualitative_observations]
     for summary_row in turn_summaries:
         n = summary_row["turn"]
         all_rows_for_turn = [r for r in objective + qualitative
@@ -14112,46 +14171,62 @@ def grade_case_variant(
     # the graded `scored` bucket instead. A failing critical assertion is the
     # absorbing barrier: it VETOES the run — every rate collapses to 0.0 and the
     # graded score is withheld, so no mean can average the catastrophe away.
-    blocked_rows = [r for r in objective + qualitative
-                    if not r.get("skipped")
-                    and r.get("availability", "complete") != "complete"]
-    observed_rows = [r for r in objective + qualitative
-                     if r.get("availability", "complete") == "complete"]
-    gate_objective = [r for r in objective if r in observed_rows
-                      and r.get("severity") in {"gate", "critical"} and not r.get("skipped")]
-    soft_rows = [r for r in observed_rows if r.get("severity") == "soft" and not r.get("skipped")]
+    all_observations = objective_observations + qualitative_observations
+    blocked_rows = [observation for observation in all_observations
+                    if isinstance(observation, UnavailableAssertion)]
+    observed_rows = [observation for observation in all_observations
+                     if isinstance(observation, (SatisfiedAssertion, FailedAssertion))]
+    gate_objective = [observation for observation in objective_observations
+                      if observation in observed_rows
+                      and observation.severity.value in {"gate", "critical"}]
+    soft_rows = [observation for observation in observed_rows
+                 if observation.severity.value == "soft"]
     # G2: a SKIPPED dependent is excluded here, so a never-run critical dependent
     # cannot veto — the veto stays owned by the prerequisite's own severity.
-    critical_rows = [r for r in observed_rows if r.get("severity") == "critical" and not r.get("skipped")]
-    critical_failures = [r["name"] for r in critical_rows if not r["passed"]]
+    critical_rows = [observation for observation in observed_rows
+                     if observation.severity.value == "critical"]
+    critical_failures = [observation.name for observation in critical_rows
+                         if isinstance(observation, FailedAssertion)]
     vetoed = bool(critical_failures)
-    objective_passed = sum(1 for r in gate_objective if r["passed"])
+    objective_passed = sum(
+        1 for observation in gate_objective
+        if isinstance(observation, SatisfiedAssertion))
     objective_total = len(gate_objective)
-    process_rows = [r for r in gate_objective if r.get("type") in PROCESS_ASSERTIONS]
-    efficiency_rows = [r for r in gate_objective if r.get("type") in EFFICIENCY_ASSERTIONS]
-    process_passed = sum(1 for r in process_rows if r["passed"])
-    efficiency_passed = sum(1 for r in efficiency_rows if r["passed"])
+    process_rows = [observation for observation in gate_objective
+                    if observation.assertion_type in PROCESS_ASSERTIONS]
+    efficiency_rows = [observation for observation in gate_objective
+                       if observation.assertion_type in EFFICIENCY_ASSERTIONS]
+    process_passed = sum(
+        1 for observation in process_rows
+        if isinstance(observation, SatisfiedAssertion))
+    efficiency_passed = sum(
+        1 for observation in efficiency_rows
+        if isinstance(observation, SatisfiedAssertion))
     # Soft qualitative rows (the judge/rubric default) feed ONLY the graded
     # channel; the qualitative/combined pass rates are carried by gate and
     # critical qualitative rows, mirroring the objective split above. Declare
     # severity: "gate" on a judge assertion to keep it in the pass rate.
-    gate_qualitative = [r for r in qualitative if r in observed_rows
-                        and r.get("severity") in {"gate", "critical"} and not r.get("skipped")]
-    qualitative_passed = sum(1 for r in gate_qualitative if r["passed"])
+    gate_qualitative = [observation for observation in qualitative_observations
+                        if observation in observed_rows
+                        and observation.severity.value in {"gate", "critical"}]
+    qualitative_passed = sum(
+        1 for observation in gate_qualitative
+        if isinstance(observation, SatisfiedAssertion))
     qualitative_total = len(gate_qualitative)
     combined_passed = objective_passed + qualitative_passed
     combined_total = objective_total + qualitative_total
-    soft_scores = [r["score"] for r in soft_rows if isinstance(r.get("score"), (int, float))]
+    soft_scores = [observation.score for observation in soft_rows
+                   if observation.score is not None]
     graded_score = round(statistics.mean(soft_scores), 4) if soft_scores and not vetoed else None
     floor = reference_floor(case)
     below_floor: list[str] = []
     if floor is not None:
-        for r in soft_rows:
-            if isinstance(r.get("score"), (int, float)) and r["score"] < floor:
-                below_floor.append(str(r["name"]))
-            for dim, raw in (r.get("dimension_scores") or {}).items():
+        for observation in soft_rows:
+            if observation.score is not None and observation.score < floor:
+                below_floor.append(observation.name)
+            for dim, raw in (observation.extra.get("dimension_scores") or {}).items():
                 if isinstance(raw, (int, float)) and (raw - 1.0) / 4.0 < floor:
-                    below_floor.append(f"{r['name']}:{dim}")
+                    below_floor.append(f"{observation.name}:{dim}")
     result = {
         "case_id": case["id"],
         "split": case["split"],
@@ -14190,8 +14265,12 @@ def grade_case_variant(
         "critical_failures": critical_failures,
         "vetoed": vetoed,
         "soft_total": len(soft_rows),
-        "soft_passed": sum(1 for r in soft_rows if r["passed"]),
-        "skipped_total": sum(1 for r in objective + qualitative if r.get("skipped")),
+        "soft_passed": sum(
+            1 for observation in soft_rows
+            if isinstance(observation, SatisfiedAssertion)),
+        "skipped_total": sum(
+            1 for observation in all_observations
+            if isinstance(observation, SkippedAssertion)),
         "graded_score": graded_score,
         "below_reference_floor": below_floor,
         **({"turns": turn_summaries} if turn_specs else {}),
@@ -14200,9 +14279,9 @@ def grade_case_variant(
         "deferred_judge_tasks": len(judge_tasks),
         "grading_availability": "partial" if blocked_rows or judge_tasks else "complete",
         "blocked_assertions": [
-            {"name": row.get("name"), "type": row.get("type"),
-             "evidence": row.get("evidence")}
-            for row in blocked_rows
+            {"name": observation.name, "type": observation.assertion_type,
+             "evidence": observation.evidence}
+            for observation in blocked_rows
         ],
         "metadata": metadata,
     }

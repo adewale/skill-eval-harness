@@ -28,6 +28,61 @@ class InvocationState(str, Enum):
     HARNESS_FAILED = "harness_failed"
 
 
+def validate_invocation_lifecycle(
+    state: InvocationState,
+    returncode: int | None,
+    provider_error: str | None = None,
+    *,
+    allow_harness_failure: bool = False,
+    allow_nonzero_completion: bool = False,
+) -> None:
+    """Validate the shared process/provider lifecycle discriminant.
+
+    A provider failure is an exit-zero response/protocol failure.  A nonzero
+    exit remains a process failure even when provider diagnostics explain it.
+    """
+    if not isinstance(state, InvocationState):
+        raise TypeError("invocation state must be InvocationState")
+    if returncode is not None and type(returncode) is not int:
+        raise TypeError("invocation returncode must be an integer or None")
+    if provider_error is not None and (
+        not isinstance(provider_error, str) or not provider_error.strip()
+    ):
+        raise ValueError("provider_error must be a non-empty string")
+
+    if state is InvocationState.COMPLETE:
+        if returncode != 0 and not (
+            allow_nonzero_completion
+            and returncode is not None
+            and returncode != 0
+        ):
+            raise ValueError("complete invocation requires returncode 0")
+        if provider_error is not None:
+            raise ValueError("complete invocation cannot carry a provider error")
+    elif state is InvocationState.TIMED_OUT:
+        if returncode != 124:
+            raise ValueError("timed-out invocation requires returncode 124")
+        if provider_error is not None:
+            raise ValueError("timed-out invocation cannot carry a provider error")
+    elif state is InvocationState.SPAWN_FAILED:
+        if returncode != 127:
+            raise ValueError("spawn-failed invocation requires returncode 127")
+        if provider_error is not None:
+            raise ValueError("spawn-failed invocation cannot carry a provider error")
+    elif state is InvocationState.PROCESS_FAILED:
+        if returncode in {None, 0}:
+            raise ValueError("process-failed invocation requires nonzero returncode")
+    elif state is InvocationState.PROVIDER_FAILED:
+        if returncode != 0 or provider_error is None:
+            raise ValueError(
+                "provider-failed invocation requires returncode 0 and provider_error")
+    elif state is InvocationState.HARNESS_FAILED:
+        if not allow_harness_failure or returncode is not None:
+            raise ValueError("process invocation cannot represent harness failure")
+        if provider_error is not None:
+            raise ValueError("harness failure cannot carry a provider error")
+
+
 class TimeoutSeconds(int):
     """A positive provider invocation timeout."""
 
@@ -184,20 +239,18 @@ class InvocationResult:
             raise TypeError("invocation UTF-8 validity fields must be boolean")
         if not isinstance(self.timed_out, bool):
             raise TypeError("invocation timed_out must be boolean")
-        expected = {
-            InvocationState.COMPLETE: (0, False),
-            InvocationState.TIMED_OUT: (124, True),
-            InvocationState.SPAWN_FAILED: (127, False),
-        }
-        if self.invocation_state in expected:
-            code, timed_out = expected[self.invocation_state]
-            if self.returncode != code or self.timed_out is not timed_out:
-                raise ValueError("invocation state contradicts returncode/timed_out")
-        elif self.invocation_state is InvocationState.PROCESS_FAILED:
-            if self.returncode == 0 or self.timed_out:
-                raise ValueError("process failure requires nonzero exit without timeout")
-        else:
+        if self.invocation_state not in {
+            InvocationState.COMPLETE,
+            InvocationState.TIMED_OUT,
+            InvocationState.SPAWN_FAILED,
+            InvocationState.PROCESS_FAILED,
+        }:
             raise ValueError("InvocationResult requires a process-boundary state")
+        validate_invocation_lifecycle(self.invocation_state, self.returncode)
+        if self.timed_out is not (
+            self.invocation_state is InvocationState.TIMED_OUT
+        ):
+            raise ValueError("invocation state contradicts timed_out")
         if self.adapter_metadata is not None:
             frozen_metadata = freeze_json_mapping(
                 self.adapter_metadata, "invocation adapter metadata")

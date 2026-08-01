@@ -26,6 +26,14 @@ from experimental_pairs import (
     ExperimentalPairKey,
     ExperimentalPopulation,
 )
+from grading_contracts import (
+    AssertionObservation,
+    FailedAssertion,
+    JudgeTask,
+    SatisfiedAssertion,
+    SkippedAssertion,
+    UnavailableAssertion,
+)
 from invocation_contracts import (
     InvocationRequest,
     InvocationResult,
@@ -190,3 +198,26 @@ def event_log_observation_is_exhaustive(observation: EventLogObservation) -> Non
         _schema_version: int = observation.schema_version
     else:
         _assert_never(observation)
+
+
+def assertion_observation_is_exhaustive(
+    observation: AssertionObservation,
+) -> None:
+    if isinstance(observation, SatisfiedAssertion):
+        _satisfied: SatisfiedAssertion = observation
+    elif isinstance(observation, FailedAssertion):
+        _failed: FailedAssertion = observation
+    elif isinstance(observation, UnavailableAssertion):
+        _observed_passed: bool | None = observation.observed_passed
+    elif isinstance(observation, SkippedAssertion):
+        _skip_reason: str = observation.skip_reason
+    else:
+        _assert_never(observation)
+
+
+def judge_task_identity_is_precise(task: JudgeTask) -> None:
+    _case_id: CaseId = task.case_id
+    _variant: ExecutionVariant = task.variant
+    _run_number: RunNumber = task.run_number
+    _model: ModelId | None = task.model
+    _assertion: Mapping[str, object] = task.assertion

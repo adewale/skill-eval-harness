@@ -146,6 +146,8 @@ provider result -> Completed | TimedOut | SpawnFailed | ProviderFailed
 run evidence -> process × provider-response × trace × artifact-set state
 artifact set -> Legacy | MissingCommit | InvalidCommit | Incomplete | Complete
 event log -> Missing | Invalid | Loaded
+assertion result -> Satisfied | Failed | Unavailable | Skipped
+qualitative work -> JudgeTask
 judge process -> JudgeInvocation
 judge row -> Boolean | Scored | Dimension | Dynamic | Consensus verdict
 trace status -> Completed | InProgress | Failed | Unknown

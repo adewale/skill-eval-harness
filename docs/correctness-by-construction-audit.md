@@ -107,11 +107,14 @@ of the four variants.
 ## Judge invocation results
 
 `judge_contracts.JudgeInvocation` is the immutable process boundary shared by native judge
-backends and `--judge-cmd`. It requires string output channels and an exact integer return code,
+backends and `--judge-cmd`. It requires string output channels, an exact integer return code, and an
+explicit shared `InvocationState`,
 validates finite non-negative cost and usage measurements, recursively freezes usage, and closes
 usage provenance plus model identity. `run_one_judge_task` rejects any registered backend that
 returns another shape before JSON extraction, schema checks, typed verdict construction, or row
-assembly. A nonzero exit remains a valid diagnostic invocation but cannot become a complete judge
+assembly. Exit-zero provider-protocol failure retains return code zero with
+`InvocationState.PROVIDER_FAILED`; it cannot become a complete judge observation. A nonzero exit
+remains a valid diagnostic invocation but cannot become a complete judge
 observation. This changes no persisted judge-row fields; `judge_verdict.py` still re-establishes the
 boolean/scored/dimension/dynamic/consensus invariant at the storage boundary.
 
@@ -204,6 +207,27 @@ verify the marker and inventory before deriving `artifact_set_complete`; an inte
 missing or changed committed file, unsafe inventory path, or stale marker remains incomplete and
 unscorable. Later downstream artifacts such as `grading.json` do not alter the committed producer
 inventory.
+
+## Grading observations and judge tasks
+
+`grading_contracts.py` closes both sides of qualitative grading:
+
+```text
+assertion row -> Satisfied | Failed | Unavailable | Skipped
+judge work item -> JudgeTask(case, model, variant, run, paths, prompt, fingerprints)
+```
+
+- `passed: null` is unavailable evidence, not a behavioral failure. Dependency skips remain a
+  separate state even when an assertion had already produced an observed result before the
+  dependency fixed point resolved.
+- Severity and oracle tier are enums and scores are finite. Only satisfied/failed observations can
+  enter grading denominators; aggregation consumes the union and serializes dictionaries last.
+- `JudgeTask` validates the exact experimental identity, fingerprint syntax, and run paths before
+  the task is queued; `run_one_judge_task` recomputes the canonical input fingerprint against the
+  current output and trajectory before invocation. Assertion and conversation JSON are recursively frozen and
+  detached from their source rows, then deeply thawed only at serialization. A partially assembled
+  task cannot reach a judge backend.
+- `ty` checks exhaustive narrowing for the assertion union and precise judge-task identity fields.
 
 ## Imported judge verdicts
 

@@ -179,13 +179,14 @@ class PiStreamContractTests(unittest.TestCase):
         self.assertEqual(invocation.provider_error, "final provider failure")
         self.assertEqual(invocation.provider_payload.usage_normalized, {"source": "missing"})
 
-    def test_nonzero_process_with_terminal_provider_error_is_provider_failed(self):
+    def test_nonzero_process_with_terminal_provider_error_retains_process_failure(self):
         raw = (FIXTURES / "provider-error-exit-zero.jsonl").read_text(encoding="utf-8")
         invocation = pi_invocation_outcome(InvocationOutcome.from_process(
             stdout=raw, stderr="", returncode=1, elapsed_ms=1,
         ))
-        self.assertIs(invocation.state, InvocationState.PROVIDER_FAILED)
+        self.assertIs(invocation.state, InvocationState.PROCESS_FAILED)
         self.assertEqual(invocation.returncode, 1)
+        self.assertIn("invalid model", invocation.provider_error or "")
 
     def test_timeout_remains_a_timeout_when_its_partial_stream_has_no_terminal_event(self):
         process = InvocationOutcome.from_timeout(

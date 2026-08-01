@@ -89,7 +89,7 @@ class InvocationPlanContractTests(unittest.TestCase):
             stderr_utf8_valid=True,
         )
         self.assertFalse(completed.timed_out)
-        with self.assertRaisesRegex(ValueError, "contradicts"):
+        with self.assertRaisesRegex(ValueError, "requires returncode"):
             InvocationResult(
                 stdout="",
                 stderr="",
