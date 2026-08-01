@@ -37,7 +37,7 @@ step.
 | 5 — narrowing proofs | SANDBOX | **done — mutation-verified** |
 | 6 — answer + judge adapters | SANDBOX | **done** |
 | 7 — command boundary | SANDBOX | **done** |
-| 8 — backend registration | SANDBOX | **partly done** — row + docs landed; conformance pack and conservation laws remain |
+| 8 — backend registration | SANDBOX | **done** |
 | 9–13 | SHELL | **blocked in sandbox** — need an authenticated `agy` on a disposable host |
 
 ### Working environment
@@ -257,6 +257,42 @@ Both D2 and D3 are therefore confirmed against the current release, not inferred
 hand-constructed from the 1.1.8 vocabulary and labelled as such in the README,
 which also records the one guessed parameter name (`grep_search`'s `SearchPath`)
 for step 10 to replace.
+
+### Step 8 result — measured 2026-08-01
+
+Final sandbox state: **1385 tests pass**, `ty --error-on-warning` clean, `ruff`
+clean, all three entrypoints run. Up from 1286 on the base commit — 99 net new
+tests.
+
+The conformance pack now sweeps **five** backends (claude, codex, gemini, vibe,
+agy) over 18 degenerate streams. Its isolation assertions were reworked, not
+ported: the old `test_unattended_approval_is_paired_with_a_constraint` accepted
+agy's `--sandbox` as satisfying the pairing rule, which reported a containment
+property that a bypassable sandbox does not provide. It is replaced by three
+tests stated over the typed posture — a backend claiming containment must
+actually pass its constraint, an uncontained backend must repeat the exposure in
+every run's `environment.json`, and an uncontained backend must not advertise
+trigger. `test_declared_constraints_are_actually_passed` is kept as-is, since it
+is what stops the rule passing vacuously.
+
+All four conservation laws are in, each with its meta-test:
+
+| Law | Meta-test that proves it bites |
+|---|---|
+| C1 translation totality | a tool step under a renamed `step_type` must reject the stream, not vanish |
+| C2 accounting totality | dropping a kind from `TRAJECTORY_STEP_TYPES` must fail the law |
+| C3 classification totality | buckets must not overlap; search and file-read disjointness is asserted separately |
+| C4 grading agreement | narrowing the grading filter back to `command`/`tool_call` must fail on a file-only run |
+
+C1 required a **parser change**: a `step_update` carrying `tool_name`/`tool_info`
+under a non-`tool` `step_type` now raises rather than being skipped. Without it a
+renamed step type would conserve trivially by being invisible to both the adapter
+and the law.
+
+Docs updated: `CHANGELOG.md` (three entries), `README.md` (runner list plus a
+compatibility note leading with the disposable-host requirement),
+`docs/commands.md`, `docs/agent-parity.md`, `docs/abstractions.md`,
+`docs/typed-python.md`. `scripts/fix_doc_refs.py` reports no stale citations.
 
 ### Steps 6-7 result — measured 2026-08-01
 
@@ -1019,7 +1055,9 @@ preprocessing inventory is documented.
 
 ---
 
-### Step 8 — Register the backend, answer and judge only [SANDBOX]
+### Step 8 — Register the backend, answer and judge only [SANDBOX] — DONE
+
+> See [Step 8 result](#step-8-result--measured-2026-08-01).
 
 Add `Provider.AGY = "agy"` to `runner_contracts.py` and one complete
 `BackendRegistration` row in `agent_capabilities.py`:

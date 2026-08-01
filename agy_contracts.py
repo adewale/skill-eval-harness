@@ -539,6 +539,15 @@ class AgyStream:
                         raise ValueError(
                             f"agy step_update {index} has unknown state {state!r}")
                     if step_type != "tool":
+                        # A step that carries tool fields under a non-tool label
+                        # is claimed activity the translation has no home for.
+                        # Dropping it would be indistinguishable from a model
+                        # that did nothing, so fail closed instead: a renamed
+                        # step type must be understood before it is scored.
+                        if "tool_name" in step or "tool_info" in step:
+                            raise ValueError(
+                                f"agy step_update {index} carries tool fields "
+                                f"under step_type {step_type!r}")
                         continue
                     name = _nonempty_string(
                         step.get("tool_name"), f"agy step_update {index}.tool_name")
