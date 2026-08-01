@@ -311,6 +311,21 @@ pollute the shared repetition identity. `ExperimentalPair` is generic in its pay
 retains `Path` while pairing result rows retains their mapping interface; the shared constructor no
 longer erases every downstream payload to `Any`.
 
+When introducing or extending an abstraction, review the whole semantic path rather than only its
+constructor:
+
+1. name the untrusted boundary and the one owner that validates it;
+2. define stable value identity independently of Python object identity and treatment differences;
+3. keep process, provider, trace, judge, artifact, coverage, and telemetry facts on separate axes;
+4. make every refinement monotone, especially per-metric report coverage;
+5. serialize only at the artifact/UI edge, then re-validate on read; and
+6. prove the model twice: malformed/contradictory runtime cases plus `ty` narrowing and exhaustive
+   consumption.
+
+The compact owner inventory and extension rules are in [`typed-python.md`](typed-python.md). The
+failure models and adversarial proof styles are in
+[`correctness-by-construction-audit.md`](correctness-by-construction-audit.md).
+
 ## What changes when you extend the tool
 
 Two abstractions absorbed most of the roadmap, and they remain the seams to reach for next.

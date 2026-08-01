@@ -425,6 +425,13 @@ The suite uses four complementary proof styles:
 - integration tests that feed mismatched models/repetitions, duplicates, missing arms, malformed
   verdicts, incomplete traces, and completed-without-output Jetty records through real consumers.
 
+Cross-boundary reviews also check four composition properties that a local constructor cannot prove:
+
+- identity remains value-based after joins, persistence, and report grouping;
+- process/provider/judge/artifact owners preserve facts without synthesizing one another;
+- row-to-metric coverage refinement can only remove headline availability; and
+- telemetry observation neither grants nor loses grading eligibility.
+
 `ty check` also verifies parser narrowing and exhaustive handling of the trigger result and
 cohort sum types. `trigger_reporting.py` joins the repository's expanding typed boundary instead
 of relying on a source-shape guard or weakening diagnostics around legacy dictionaries.
@@ -441,6 +448,8 @@ legacy artifact never recorded. In particular:
   present; telemetry comparison remains blocked when its required basis is absent;
 - Jetty aliases and response shapes still need token-backed live validation before production claims;
 - `RunnerOutcome` is retained as a compatibility factory, so new code should construct the explicit
-  union variants directly; and
+  union variants directly;
+- `skill_benchmark.py` remains a shared orchestration monolith, so the conservative trigger identity
+  must invalidate on unrelated edits to that module until trigger ownership is extracted; and
 - provider payload dictionaries are preserved for diagnostics, but no downstream decision should
   bypass the typed adapter to read them directly.

@@ -44,6 +44,27 @@ materialization are owned by `agent_capabilities.py`. The broader engineering ex
 in [`abstractions.md`](abstractions.md), and the failure models and construction proofs remain in
 [`correctness-by-construction-audit.md`](correctness-by-construction-audit.md).
 
+## Coherence rules
+
+The rows above are one system, not independent typing projects. A new or changed boundary is
+coherent only when all of these remain true:
+
+- **Stable identity:** equality is derived from validated domain coordinates, never object identity,
+  mutable row position, or a treatment label that is allowed to differ across a pair.
+- **Single ownership:** process, provider, trace, judge, artifact, and coverage state each have one
+  constructor. A consumer may derive a decision from several owners but may not rewrite their facts.
+- **Monotone refinement:** moving from a row cohort to a metric cohort can remove availability, never
+  create it. Empty, partial, complete, and non-applicable populations stay distinct.
+- **Independent evidence:** grading eligibility does not erase telemetry, and observed telemetry does
+  not certify grading, lifecycle, trace, or artifact completeness.
+- **Exact persistence:** external rows are parsed once, schema scalars use exact JSON kinds, accepted
+  nested values are deeply frozen, and absent fields are not silently rewritten as explicit nulls.
+- **Narrow compatibility:** legacy shapes cross one named adapter that preserves meaningful `None`,
+  zero, and false values. The typed interior does not grow `Any` to accommodate the adapter.
+
+Review both sides of a seam. A constructor-only test does not prove aggregation is safe, and a
+consumer-only type check does not prove malformed wire data cannot construct the value.
+
 ## Drift prevention
 
 `tests/test_type_coverage.py` keeps three different inventories separate and requires:

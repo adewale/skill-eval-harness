@@ -68,7 +68,8 @@ live observability slice is in [`otel-support-plan.md`](otel-support-plan.md).
 ## Audits
 
 Point-in-time findings: [`repo-effectiveness-audit.md`](repo-effectiveness-audit.md) and
-[`correctness-by-construction-audit.md`](correctness-by-construction-audit.md).
+[`correctness-by-construction-audit.md`](correctness-by-construction-audit.md). Durable rules
+distilled from those audits and production runs live in [`LESSONS_LEARNED.md`](../LESSONS_LEARNED.md).
 
 ## Adding a user journey
 

@@ -49,10 +49,32 @@ Tests are organized by subject — put new tests where their subject lives: mani
 - Keep live model/API calls out of unit tests. Use mocked fixtures unless a test is explicitly documented as live/opt-in.
 - Do not claim ablation benefit from declared metadata alone. Claim it only after `ablation:<id>` rows have run and been benchmarked.
 
+## Stacked PRs
+
+Use a stack only when each layer has one reviewable responsibility. Each PR targets its immediate
+predecessor and must stand alone at its own tip: it compiles, passes the full deterministic
+validation suite, documents the behavior it introduces, and does not rely on a later PR for a fix.
+Put the parent PR and ordered stack in every description so reviewers can distinguish the current
+diff from the eventual combined tree.
+
+Before merging, preserve a backup ref if restacking rewrites commits. If a prerequisite was
+squash-merged, transplant the stack onto the exact merged tree instead of accepting duplicated
+parent commits in child diffs, then wait for every rewritten tip's checks.
+
+When GitHub recognizes the branches as a native stack, make every PR through the intended tip ready
+and green, then use the REST API's asynchronous stack merge on that highest PR and poll the returned
+UUID. GitHub merges all ancestors up to that PR into the base branch in order; the ordinary
+synchronous PR merge endpoint rejects recognized stacks. If the native endpoint is unavailable,
+fall back to merging base-to-top one PR at a time: retarget or rebase only the next child, inspect
+its diff, and wait for its checks before continuing. Do not delete an intermediate base until its
+child has the correct target.
+
 ## PR checklist
 
 - State what command or report shape changed.
 - Include the focused validation command and result.
+- For a stacked PR, name its parent and stack position; verify the full suite at this exact tip, not
+  only at the top of the stack.
 - Update README/docs when CLI flags, manifest fields, output layout, or safety behavior changes.
 - A new user-facing command or report block names the user journey it serves: either a walkthrough under `docs/` (the mold is in [`docs/README.md`](docs/README.md)) or an entry in `TODO.md`'s user-journeys backlog.
 - For Jetty work, keep the manifest/grading model as the source of truth and isolate network behavior behind tests/mocks.

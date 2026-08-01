@@ -2,6 +2,10 @@
 
 - 
 
+Parent PR / stack position (if stacked):
+
+-
+
 ## Validation
 
 Run the smallest command that proves the change:
@@ -10,6 +14,7 @@ Run the smallest command that proves the change:
 - [ ] `ty check --error-on-warning`
 - [ ] `python3 -m unittest discover tests -v`
 - [ ] Manifest/eval command, if changed: `skill-benchmark validate ...`
+- [ ] For a stacked PR, all checks pass at this exact tip and the diff does not rely on a later PR
 
 ## Eval / docs impact
 
