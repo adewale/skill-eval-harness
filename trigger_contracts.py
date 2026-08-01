@@ -15,20 +15,12 @@ from types import MappingProxyType
 from typing import Any, TypeAlias
 
 import telemetry as telemetry_domain
+from invocation_contracts import InvocationState
 from json_contracts import (
     freeze_json_mapping,
     strict_json_equal,
     validate_json_text,
 )
-
-
-class InvocationState(str, Enum):
-    COMPLETE = "complete"
-    TIMED_OUT = "timed_out"
-    SPAWN_FAILED = "spawn_failed"
-    PROCESS_FAILED = "process_failed"
-    PROVIDER_FAILED = "provider_failed"
-    HARNESS_FAILED = "harness_failed"
 
 
 class CompletionEvidence(str, Enum):

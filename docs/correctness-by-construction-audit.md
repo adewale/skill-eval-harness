@@ -122,6 +122,7 @@ a provider-specific wire contract at the point where Gemini's JSON or JSONL leav
 
 ```text
 InvocationRequest
+  -> ProcessInvocationPlan
   -> InvocationResult
   -> GeminiStream | GeminiJsonResponse
   -> Completed | ProviderFailed        (answer)
@@ -129,10 +130,10 @@ InvocationRequest
 ```
 
 - `InvocationRequest` is a validated minimal answer request: prompt, optional model, positive timeout,
-  and working directory. It does **not** freeze argv, environment, auth, or provider policy; those are
-  still adapter-owned plans assembled after request construction and remain the clearest abstraction
-  gap for a future typed `InvocationPlan`. The Gemini adapter accepts one caller-trusted executable
-  token and owns output-format,
+  and working directory. Provider adapters refine it into a frozen `ProcessInvocationPlan` containing
+  argv, stdin, cwd, timeout, and environment; the sole internal subprocess owner accepts that plan,
+  including version probes. Provider-specific auth and policy remain adapter-owned inputs to plan
+  construction. The Gemini adapter accepts one caller-trusted executable token and owns output-format,
   policy, trust, conditional sandbox, workspace expansion, session, extension, and prompt/model
   flags. Prefix launchers are rejected because they can reinterpret appended arguments; the chosen
   executable itself remains an explicit operator authority recorded in artifacts.

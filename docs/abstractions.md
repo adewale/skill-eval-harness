@@ -165,10 +165,10 @@ in the codebase.
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10528`), Claude (`run_claude:10709`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10485`), Claude (`run_claude:10671`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13249`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:4002` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13217`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4006` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -180,6 +180,16 @@ fields; `write_runner_outcome` exhaustively writes the disk contract. A backend 
 independently set timeout, return code, answer, and failure into a contradictory bag. The harness
 calls no model during default grading; it reads what the runner left behind. The explicit
 `--allow-scripts` and `--embed-cmd` modes may invoke caller-supplied external oracle subprocesses.
+
+Before a native provider subprocess starts, `invocation_contracts.py` constructs one
+`ProcessInvocationPlan`: immutable argv, stdin, working directory, environment, and a positive
+`TimeoutSeconds`. `run_argv_capture` accepts only that plan and returns the closed
+`InvocationResult` lifecycle. The answer backend receives the smaller `InvocationRequest`, whose
+model and timeout are also precise values. Provider adapters can choose wire formats, but they
+cannot omit or disagree about process inputs after the plan boundary. The same module owns the
+shared `InvocationState` vocabulary: `InvocationResult` admits only process-boundary states, while
+provider or harness failures remain semantic classifications and never rewrite the observed return
+code.
 
 ## Trace normalization
 
@@ -242,7 +252,7 @@ those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplica
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:792`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:796`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 The pairing key carries `CaseId`, `ModelId | None`, `RunNumber`, and the closed

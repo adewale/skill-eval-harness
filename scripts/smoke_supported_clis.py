@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agent_capabilities import SMOKE_TARGETS
-from skill_benchmark import invoke_argv_with_timeout
+from skill_benchmark import ProcessInvocationPlan, invoke_argv_with_timeout
 from telemetry import ObservationEvidence
 from trigger_contracts import CompleteTriggerResult, TriggerObservation
 
@@ -84,7 +84,8 @@ def make_smoke_repo(root: Path) -> Path:
 
 
 def run(command: list[str], *, cwd: Path, report: dict[str, Any], label: str) -> bool:
-    outcome = invoke_argv_with_timeout(command, cwd=cwd, timeout=300)
+    outcome = invoke_argv_with_timeout(ProcessInvocationPlan.from_values(
+        command, input_text="", cwd=cwd, timeout_s=300))
     entry: dict[str, Any] = {
         "label": label,
         "command": command,

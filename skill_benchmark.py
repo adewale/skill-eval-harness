@@ -118,6 +118,12 @@ from agent_capabilities import (
     workspace_builder_implementations,
 )
 from gemini_contracts import GeminiJsonResponse, GeminiStream
+from invocation_contracts import (
+    InvocationRequest,
+    InvocationResult,
+    InvocationState,
+    ProcessInvocationPlan,
+)
 from jetty_contracts import (
     JettyObservation,
     ProtocolInvalid,
@@ -125,7 +131,6 @@ from jetty_contracts import (
     lifecycle_from_status,
 )
 from json_contracts import (
-    freeze_json_mapping,
     validate_json_text,
     validate_json_value,
 )
@@ -161,7 +166,6 @@ from text_contracts import (
 from trace_contracts import EventState, event_is_completed, parse_event_state
 from trigger_contracts import (
     InvocationOutcome,
-    InvocationState,
     TraceEventKind,
     TriggerDetection,
     TriggerEvidenceKind,
@@ -174,7 +178,7 @@ VALID_SPLITS = frozenset(Split.values())
 HARNESS_SEMANTIC_MODULES = (
     "ablation_model.py", "agent_capabilities.py", "experimental_pairs.py",
     "gemini_contracts.py",
-    "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "manifest_contracts.py", "run_pi_trigger_eval.py",
+    "invocation_contracts.py", "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "manifest_contracts.py", "run_pi_trigger_eval.py",
     "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
     "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
     "trigger_reporting.py",
@@ -6530,13 +6534,20 @@ def mount_skill_tree(tree_dir: Path, skills_dir: Path) -> list[Path]:
     return copied
 
 
-def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
-                             env: dict[str, str] | None = None, timeout: int,
-                             input_text: str | None = None) -> InvocationOutcome:
+def invoke_argv_with_timeout(plan: ProcessInvocationPlan) -> InvocationOutcome:
     """Typed subprocess owner for every spawned runner/adapter process.
 
-    Completion state is classified once here. Consumers cannot independently
-    assemble contradictory returncode/timeout/completeness booleans."""
+    The owner accepts one fully validated plan, so internal callers cannot
+    bypass cwd, timeout, argv, environment, or stdin construction. Completion
+    state is classified once here; consumers cannot independently assemble
+    contradictory returncode/timeout/completeness booleans."""
+    if not isinstance(plan, ProcessInvocationPlan):
+        raise TypeError("invoke_argv_with_timeout requires a ProcessInvocationPlan")
+    argv = list(plan.argv)
+    cwd = plan.cwd
+    env = None if plan.environment is None else dict(plan.environment)
+    timeout = int(plan.timeout_s)
+    input_text = plan.input_text
     def _wire_text(value: Any) -> tuple[str, bool]:
         if value is None:
             return "", True
@@ -6725,9 +6736,14 @@ def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
                           env: dict[str, str] | None = None, timeout: int,
                           input_text: str | None = None) -> dict[str, Any]:
     """Legacy dictionary boundary for external callers; internal code uses the typed owner."""
-    return invoke_argv_with_timeout(
-        argv, cwd=cwd, env=env, timeout=timeout, input_text=input_text,
-    ).as_legacy_dict()
+    plan = ProcessInvocationPlan.from_values(
+        argv,
+        input_text=input_text,
+        cwd=Path.cwd() if cwd is None else cwd,
+        timeout_s=timeout,
+        environment=env,
+    )
+    return invoke_argv_with_timeout(plan).as_legacy_dict()
 
 
 def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:
@@ -8870,84 +8886,6 @@ def build_task_prompt(pt: PreparedTask, skill_paths: list[str] | None = None, in
     )
 
 
-@_dataclass(frozen=True)
-class InvocationRequest:
-    """Provider-neutral request handed to an agent backend.
-
-    The harness owns workspace construction and output writing. A backend owns
-    only the invocation wire format: argv/env/stdout parsing. Keeping that seam
-    small makes Claude/Codex parity testable without live model calls."""
-
-    prompt: str
-    workspace: Path
-    model: str | None
-    timeout_s: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.prompt, str):
-            raise TypeError("invocation prompt must be text")
-        validate_json_text(self.prompt, "invocation prompt")
-        if not isinstance(self.workspace, Path):
-            raise TypeError("invocation workspace must be a Path")
-        if self.model is not None and (
-                not isinstance(self.model, str) or not self.model.strip()):
-            raise ValueError("invocation model must be non-empty text or None")
-        if self.model is not None:
-            validate_json_text(self.model, "invocation model")
-        if (isinstance(self.timeout_s, bool)
-                or not isinstance(self.timeout_s, int)
-                or self.timeout_s <= 0):
-            raise ValueError("invocation timeout_s must be a positive integer")
-
-
-@_dataclass(frozen=True)
-class InvocationResult:
-    stdout: str
-    stderr: str
-    returncode: int
-    elapsed_ms: int
-    invocation_state: InvocationState
-    stdout_utf8_valid: bool
-    stderr_utf8_valid: bool
-    timed_out: bool = False
-    adapter_metadata: Mapping[str, Any] | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
-            raise TypeError("invocation stdout and stderr must be text")
-        validate_json_text(self.stdout, "invocation stdout")
-        validate_json_text(self.stderr, "invocation stderr")
-        if type(self.returncode) is not int:
-            raise TypeError("invocation returncode must be an integer")
-        if (isinstance(self.elapsed_ms, bool) or not isinstance(self.elapsed_ms, int)
-                or self.elapsed_ms < 0 or self.elapsed_ms > 2**63 - 1):
-            raise ValueError("invocation elapsed_ms must be a non-negative integer")
-        if not isinstance(self.invocation_state, InvocationState):
-            raise TypeError("invocation_state must be InvocationState")
-        if not isinstance(self.stdout_utf8_valid, bool) or not isinstance(
-                self.stderr_utf8_valid, bool):
-            raise TypeError("invocation UTF-8 validity fields must be boolean")
-        if not isinstance(self.timed_out, bool):
-            raise TypeError("invocation timed_out must be boolean")
-        expected = {
-            InvocationState.COMPLETE: (0, False),
-            InvocationState.TIMED_OUT: (124, True),
-            InvocationState.SPAWN_FAILED: (127, False),
-        }
-        if self.invocation_state in expected:
-            code, timed_out = expected[self.invocation_state]
-            if self.returncode != code or self.timed_out is not timed_out:
-                raise ValueError("invocation state contradicts returncode/timed_out")
-        elif self.invocation_state is InvocationState.PROCESS_FAILED:
-            if self.returncode == 0 or self.timed_out:
-                raise ValueError("process failure requires nonzero exit without timeout")
-        else:
-            raise ValueError("InvocationResult requires a process-boundary state")
-        if self.adapter_metadata is not None:
-            object.__setattr__(self, "adapter_metadata", freeze_json_mapping(
-                self.adapter_metadata, "invocation adapter metadata"))
-
-
 def coerce_text(value: Any) -> str:
     if value is None:
         return ""
@@ -8956,7 +8894,7 @@ def coerce_text(value: Any) -> str:
     return str(value)
 
 
-def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeout: int, env: dict[str, str] | None = None) -> InvocationResult:
+def run_argv_capture(plan: ProcessInvocationPlan) -> InvocationResult:
     """Native agent adapter wrapper over the one subprocess owner.
 
     Correctness-by-construction boundary: callers must choose an explicit cwd,
@@ -8964,7 +8902,9 @@ def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeo
     `run_argv_with_timeout` owns spawn failure, process-group timeout cleanup,
     stderr capping, elapsed time, and returncode shape; this function only adapts
     that dict contract into `InvocationResult`."""
-    outcome = invoke_argv_with_timeout(argv, input_text=input_text, cwd=cwd, env=env, timeout=timeout)
+    if not isinstance(plan, ProcessInvocationPlan):
+        raise TypeError("run_argv_capture requires a ProcessInvocationPlan")
+    outcome = invoke_argv_with_timeout(plan)
     if outcome.returncode is None or outcome.elapsed_ms is None:
         raise RuntimeError("subprocess owner returned a non-process invocation outcome")
     return InvocationResult(stdout=outcome.stdout,
@@ -9714,12 +9654,15 @@ def probe_gemini_cli_version(
         return {"gemini_cli_version_status": "unavailable",
                 "gemini_cli_version_error": "command prefix unavailable"}
     command_prefix = argv[:prompt_index]
-    outcome = invoke_argv_with_timeout(
-        [*command_prefix, "--version"], cwd=cwd, env=env,
-        timeout=max(1, min(timeout, 10)), input_text="",
-    )
-    stdout_utf8_valid = outcome.metadata.get("stdout_utf8_valid") is not False
-    stderr_utf8_valid = outcome.metadata.get("stderr_utf8_valid") is not False
+    outcome = run_argv_capture(ProcessInvocationPlan.from_values(
+        [*command_prefix, "--version"],
+        cwd=cwd,
+        environment=env,
+        timeout_s=max(1, min(timeout, 10)),
+        input_text="",
+    ))
+    stdout_utf8_valid = outcome.stdout_utf8_valid
+    stderr_utf8_valid = outcome.stderr_utf8_valid
     validity = {
         "gemini_cli_version_stdout_utf8_valid": stdout_utf8_valid,
         "gemini_cli_version_stderr_utf8_valid": stderr_utf8_valid,
@@ -9909,10 +9852,13 @@ def gemini_cli_invoke(
                 setup_phase = "provider invocation"
                 version_meta = probe_gemini_cli_version(
                     argv, cwd=workspace, env=env, timeout=timeout)
-                result = run_argv_capture(
-                    argv, input_text="", cwd=workspace, env=env,
-                    timeout=timeout,
-                )
+                result = run_argv_capture(ProcessInvocationPlan.from_values(
+                    argv,
+                    input_text="",
+                    cwd=workspace,
+                    environment=env,
+                    timeout_s=timeout,
+                ))
     except (OSError, RuntimeError) as exc:
         # Setup failures are closed no-process observations. Do not leak the
         # exception's credential/policy path text into durable artifacts.
@@ -10243,7 +10189,13 @@ def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | No
                     "model": model, "trace_text": "",
                     "invocation_state": InvocationState.SPAWN_FAILED.value,
                     "environment": env_meta}
-        result = run_argv_capture(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
+        result = run_argv_capture(ProcessInvocationPlan.from_values(
+            argv,
+            input_text="",
+            cwd=workspace,
+            environment=env,
+            timeout_s=timeout,
+        ))
     messages, parse_errors = (
         parse_vibe_messages_with_errors(result.stdout)
         if result.stdout_utf8_valid
@@ -10491,7 +10443,12 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
                 prov_extra["skill_tree_hash"] = attestation.mounted_skill_tree_hash
             prov_extra["fixture_tree_hash"] = attestation.fixture_tree_hash
             prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
-            outcome = backend.invoke_answer(InvocationRequest(prompt=prompt, workspace=ws, model=row_model, timeout_s=timeout), **options)
+            outcome = backend.invoke_answer(InvocationRequest.parse(
+                prompt=prompt,
+                workspace=ws,
+                model=row_model,
+                timeout_s=timeout,
+            ), **options)
         context = outcome_context(outcome)
         env = dict(context.environment or {})
         env.setdefault("runner", backend.name)
@@ -10647,7 +10604,12 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
         argv += list(extra_args)
 
     def invoke(cwd_path: Path | str) -> InvocationResult:
-        return run_argv_capture(argv, input_text=prompt, cwd=cwd_path, timeout=timeout)
+        return run_argv_capture(ProcessInvocationPlan.from_values(
+            argv,
+            input_text=prompt,
+            cwd=cwd_path,
+            timeout_s=timeout,
+        ))
 
     if cwd is None:
         with tempfile.TemporaryDirectory(prefix="claude-invoke-cwd-") as td:
@@ -10978,7 +10940,13 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
                 argv += ["--output-schema", str(schema_path)]
         if "-" not in argv:
             argv.append("-")
-        result = run_argv_capture(argv, input_text=prompt, cwd=invoke_cwd, env=env, timeout=timeout)
+        result = run_argv_capture(ProcessInvocationPlan.from_values(
+            argv,
+            input_text=prompt,
+            cwd=invoke_cwd,
+            environment=env,
+            timeout_s=timeout,
+        ))
         last_message_found = last_message.exists()
         last_message_utf8_valid = True
         if last_message_found:

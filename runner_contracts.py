@@ -11,8 +11,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, TypeAlias
 
+from invocation_contracts import InvocationState
 from json_contracts import freeze_json_mapping, validate_json_text
-from trigger_contracts import InvocationState
 
 
 class Provider(str, Enum):

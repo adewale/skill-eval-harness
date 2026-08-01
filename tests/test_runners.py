@@ -343,8 +343,9 @@ class ClosedRunnerOutcomeTests(unittest.TestCase):
         outcome = sb.InvocationOutcome.harness_failed("fixture setup failed")
         with mock.patch.object(sb, "invoke_argv_with_timeout", return_value=outcome), \
              self.assertRaisesRegex(RuntimeError, "non-process invocation"):
-            sb.run_argv_capture(
-                ["unused"], input_text="", cwd=Path.cwd(), timeout=1)
+            sb.run_argv_capture(sb.ProcessInvocationPlan.from_values(
+                ["unused"], input_text="", cwd=Path.cwd(), timeout_s=1
+            ))
 
     def test_spawned_reserved_exit_codes_remain_process_failures(self):
         with tempfile.TemporaryDirectory() as td:
@@ -355,7 +356,9 @@ class ClosedRunnerOutcomeTests(unittest.TestCase):
                     f"raise SystemExit({returncode})\n", encoding="utf-8")
                 with self.subTest(returncode=returncode):
                     outcome = sb.invoke_argv_with_timeout(
-                        [sys.executable, str(script)], cwd=root, timeout=5)
+                        sb.ProcessInvocationPlan.from_values(
+                            [sys.executable, str(script)], input_text="",
+                            cwd=root, timeout_s=5))
                     self.assertIs(outcome.state, sb.InvocationState.PROCESS_FAILED)
                     self.assertFalse(outcome.timed_out)
 
@@ -1076,7 +1079,10 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 "time.sleep(30)\n",
                 encoding="utf-8")
             started = time.monotonic()
-            outcome = sb.invoke_argv_with_timeout([sys.executable, str(parent)], cwd=root, timeout=1)
+            outcome = sb.invoke_argv_with_timeout(
+                sb.ProcessInvocationPlan.from_values(
+                    [sys.executable, str(parent)], input_text="",
+                    cwd=root, timeout_s=1))
             elapsed = time.monotonic() - started
             child_pid = int(pid_file.read_text(encoding="utf-8"))
             try:

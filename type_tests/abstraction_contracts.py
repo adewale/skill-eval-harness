@@ -6,6 +6,7 @@ current union can be narrowed exhaustively and that its public fields retain
 the intended precise types.
 """
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import NoReturn
 
@@ -16,6 +17,12 @@ from experimental_pairs import (
     ExperimentalPair,
     ExperimentalPairKey,
     ExperimentalPopulation,
+)
+from invocation_contracts import (
+    InvocationRequest,
+    InvocationResult,
+    ProcessInvocationPlan,
+    TimeoutSeconds,
 )
 from judge_verdict import (
     BooleanVerdict,
@@ -43,6 +50,7 @@ from runner_contracts import (
 from trigger_contracts import (
     CompleteTriggerResult,
     IncompleteTriggerResult,
+    InvocationState,
     TriggerResult,
 )
 from trigger_reporting import (
@@ -127,3 +135,15 @@ def experimental_pair_payload_type_is_preserved(
 ) -> None:
     assert_type(pair.with_skill.payload, Path)
     assert_type(pair.without_skill.payload, Path)
+
+
+def provider_invocation_types_are_precise(
+    request: InvocationRequest,
+    plan: ProcessInvocationPlan,
+    result: InvocationResult,
+) -> None:
+    _request_model: ModelId | None = request.model
+    _request_timeout: TimeoutSeconds = request.timeout_s
+    _argv: tuple[str, ...] = plan.argv
+    _environment: Mapping[str, str] | None = plan.environment
+    _state: InvocationState = result.invocation_state

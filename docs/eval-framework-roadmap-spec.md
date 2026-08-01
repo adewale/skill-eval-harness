@@ -17,7 +17,7 @@ One invariant governs every item: core grading stays local and deterministic and
 model, and the harness never picks a model for the user. Anything that needs a model lives
 behind an opt-in command or the external `--judge-cmd`. Two abstractions absorb most of the
 work, so the spec returns to them often: the assertion result shape in `assertion_result`
-(`skill_benchmark.py:11217`) and the fan-out in `prepared_task_rows` (`:1564`).
+(`skill_benchmark.py:11185`) and the fan-out in `prepared_task_rows` (`:1568`).
 
 ## Testing baseline
 
@@ -40,7 +40,7 @@ tests are where that claim is checked rather than trusted.
 
 The buckets below extend what the harness can measure. This floor decides whether the number it
 already prints can be believed. The harness reports one thing: lift, `with_skill` minus
-`without_skill` on the same case (`build_paired_summary` (`:15348`)). That number is believable only
+`without_skill` on the same case (`build_paired_summary` (`:15316`)). That number is believable only
 when three preconditions hold, each intended today, none enforced, and each restating a claim from
 `evals-are-not-tests.md`:
 
@@ -60,22 +60,22 @@ multi-model (2.1) feature built on unverified detectors only scales an unverifie
   hiding the quantity the tool exists to measure.
 - **Abstractions used or changed:** none in the engine. Adds
   `tests/fixtures/detectors/<detector_id>/should-fire.*` and `should-pass.*` that exercise
-  `assertion_result` (`:11217`) directly. That function has no direct unit test today, and its
+  `assertion_result` (`:11185`) directly. That function has no direct unit test today, and its
   `contains_any`, `excludes_any`, and `not_regex` branches go unexercised even though their types
-  are declared in the assertion registries (`TEXT_ASSERTIONS:185`).
+  are declared in the assertion registries (`TEXT_ASSERTIONS:189`).
 - **Design:** one table-driven test loads every pair and asserts the detector fires on `should-fire`
   and stays silent on `should-pass`. A `should-pass` twin is mandatory: it enforces the
   false-positive bar `authoring-evals.md` already sets for skill authors ("check both presence and
   absence"). Each `should-pass` set includes a case where the baseline echoes the prompt, because a
   detector that passes on echoed prompt text is a false oracle; this ties the fixtures to leakage
-  lint (`prompt_assertion_leakage_findings` (`:792`)). Every detector bug then becomes a permanent
+  lint (`prompt_assertion_leakage_findings` (`:796`)). Every detector bug then becomes a permanent
   fixture pair, and `test_command_assertions_match_command_inputs_not_outputs` is the first.
 - **Why it is the keystone:** the fixture pair is also the registration contract. It is what lets a
   harvested or third-party detector be trusted on entry, so it gates the exapted detector library
   (TODO, end of 2026), and it raises the oracle-strength ladder (1.7) so that "strong" means
   fixture-verified, not only deterministic.
 - **Testing:** the fixtures are the test. A meta-test asserts every name in `OBJECTIVE_ASSERTIONS`
-  (`:222`) has a fixture pair, so a new detector cannot land unverified.
+  (`:226`) has a fixture pair, so a new detector cannot land unverified.
 
 ### CF.2 — One cross-runner baseline-isolation invariant
 - **Goal:** prove the baseline is skill-free by construction, so a measured lift is the skill's
@@ -101,7 +101,7 @@ multi-model (2.1) feature built on unverified detectors only scales an unverifie
 ### CF.4 — A guard that the core grade path calls no model and no network
 - **Goal:** make the governing invariant — "core grading stays local and deterministic and never
   calls a model" — executable rather than aspirational.
-- **Abstractions used or changed:** none. A test-time guard around `grade_case_variant` (`:13904`).
+- **Abstractions used or changed:** none. A test-time guard around `grade_case_variant` (`:13872`).
 - **Design:** patch `urllib` and `subprocess` to raise, then grade a fixture covering every
   objective family (text, process, efficiency) and assert it completes. The sanctioned exceptions —
   `script` oracles and `judge` plumbing — are excluded from this path by design and keep their own
@@ -111,7 +111,7 @@ multi-model (2.1) feature built on unverified detectors only scales an unverifie
 
 ### Boundary
 The set stops here deliberately. Report-level correctness — whether the saturation, no-lift, flaky,
-and negative-delta flags (`build_benchmark_report` (`:16767`)) are computed right — sits a layer
+and negative-delta flags (`build_benchmark_report` (`:16735`)) are computed right — sits a layer
 above the raw measurement, where the golden-report tests the buckets already plan (1.2, 2.6) cover
 it. CF.1–CF.4 are the floor underneath that work: once they pass, a printed lift carries a checked
 measurement, and every feature in the buckets builds on a number that has been verified rather than
@@ -125,9 +125,9 @@ assumed.
 - **Goal:** ship graders authors reach for often, so they stop hand-rolling rubrics.
 - **Abstractions used or changed:** `tool_call` and `structured_output` are deterministic, so
   they become new types in `TEXT_ASSERTIONS` / `PROCESS_ASSERTIONS` and gain a branch in
-  `assertion_result`. `tool_call` reuses `command_events` (`:6397`) and the `command_order`
+  `assertion_result`. `tool_call` reuses `command_events` (`:6401`) and the `command_order`
   logic; `structured_output` extends `json_field_equals` with JSON-Schema validation.
-  `factuality` adds no core code: it is a named rubric that `judge_prompt` (`:11800`) renders
+  `factuality` adds no core code: it is a named rubric that `judge_prompt` (`:11768`) renders
   and still runs through `--judge-cmd`.
 - **Design:** a preset expands to either a deterministic objective assertion or a `judge`
   assertion with a canned rubric and threshold. No new execution path.
@@ -146,7 +146,7 @@ assumed.
 ### 1.3 Judge config slot and the "judge is not the model under test" guard
 - **Goal:** make an existing convention enforceable.
 - **Abstractions used or changed:** read an optional `judge` block in the manifest; add a check
-  in `audit_manifest_report` (`:19590`) comparing the declared judge model against `jetty.model`
+  in `audit_manifest_report` (`:19558`) comparing the declared judge model against `jetty.model`
   or the run metadata `model`.
 - **Design:** warn by default, error under `--strict-judge`.
 - **Testing:** unit tests for matching and differing model ids.
@@ -163,7 +163,7 @@ assumed.
 - **Status:** `docs/authoring-evals.md` shipped, alongside `architecture.md` and
   `abstractions.md`.
 - **Follow-on:** surface the guide's rules where they are checkable. Extend the messaging in
-  `prompt_assertion_leakage_findings` (`:792`) and `fixture_recommendations` (`:19283`) to point
+  `prompt_assertion_leakage_findings` (`:796`) and `fixture_recommendations` (`:19251`) to point
   at the relevant section.
 - **Testing:** assert the new hint strings appear for crafted manifests.
 
@@ -172,8 +172,8 @@ assumed.
   In `adewale/pythonbyexample` and `adewale/xampler` an example *is* an eval case: an input, an
   expected output, and a check that the output still matches. The harness has no equivalent of
   "this output equals this reference."
-- **Abstractions used or changed:** a new type in `TEXT_ASSERTIONS` (`:185`), implemented in
-  `assertion_result` (`:11217`). It reads `output.md` (or a named artifact), applies an optional
+- **Abstractions used or changed:** a new type in `TEXT_ASSERTIONS` (`:189`), implemented in
+  `assertion_result` (`:11185`). It reads `output.md` (or a named artifact), applies an optional
   normalization (trim, collapse whitespace, or a named normalizer), and compares to a reference
   file under the manifest dir. Evidence is a unified diff on mismatch.
 - **Design:** normalization is the whole game, so it is explicit and per-assertion, never
@@ -188,9 +188,9 @@ assumed.
   not name it.
 - **Abstractions used or changed:** an optional `oracle` tier on an assertion
   (`strong` / `demo` / `live`), defaulting by type (deterministic text/process are `strong`,
-  `script` is `demo` unless marked, judge/live are `live`). `build_benchmark_report` (`:16767`)
+  `script` is `demo` unless marked, judge/live are `live`). `build_benchmark_report` (`:16735`)
   reports, per case, the share of its pass rate carried by `strong` oracles;
-  `audit_manifest_report` (`:19590`) warns when a case passes only on weak ones. This extends
+  `audit_manifest_report` (`:19558`) warns when a case passes only on weak ones. This extends
   leakage lint (`:164`) from prompts to oracles.
 - **Strongest tier — the rendered-artifact oracle:** the top of the ladder is an oracle that
   builds or renders the artifact and inspects the result, not the source text.
@@ -205,8 +205,8 @@ assumed.
   splits "good poster" into seven `script` oracles, but each is forced all-or-nothing by the
   exit-code-only contract: a poster with six of seven drama carriers fails `drama_oracle` exactly
   like one with zero. That is the binary-saturation problem inside a single oracle.
-- **Abstractions used or changed:** extend `run_script_assertion` (`:11085`) and
-  `assertion_result` (`:11217`) to optionally parse a score from the oracle's stdout — a JSON line
+- **Abstractions used or changed:** extend `run_script_assertion` (`:11053`) and
+  `assertion_result` (`:11185`) to optionally parse a score from the oracle's stdout — a JSON line
   such as `{"score": 6, "max_score": 7}` (normalized to 0-1) — beside the existing
   `pass_exit_code`. The parsed score flows into the `score`/`severity` channel from 2.2, so a
   script oracle becomes a graded dimension while staying fully deterministic and model-free.
@@ -223,9 +223,9 @@ assumed.
   past it — either way, question it. This is the inverse of the saturation flag: saturation marks
   a case as too easy *now*; staleness marks a case that has never discriminated *over time*.
 - **Abstractions used or changed:** reads the cross-run history from 2.6. A `prune` report (or a
-  flag in `build_benchmark_report` (`:16767`)) marks a case a removal candidate when, across the
+  flag in `build_benchmark_report` (`:16735`)) marks a case a removal candidate when, across the
   last N runs, it never failed and never showed lift (`with_skill` == `without_skill` every time).
-  `audit_manifest_report` (`:19590`) lists the candidates; removal stays a human decision.
+  `audit_manifest_report` (`:19558`) lists the candidates; removal stays a human decision.
 - **Design:** the harness suggests, never deletes. A case may be kept deliberately as a
   regression guard even when stale; the report says so rather than acting.
 - **Depends on:** 2.6 (needs run history to judge "never failed over time").
@@ -239,12 +239,12 @@ assumed.
 ### 2.1 Multi-model fan-out (priority)
 - **Goal:** run the same cases across several models and compare lift per model. No surveyed
   framework does this; vitest-evals, eve, and viteval all push it onto the test runner.
-- **Abstractions used or changed:** `prepared_task_rows` (`:1564`) gains a `model` dimension
+- **Abstractions used or changed:** `prepared_task_rows` (`:1568`) gains a `model` dimension
   beside `variant` and `run_number`. Each row carries its target `model`, and `run_dir` gains a
   model segment (`<case>/<model>/<variant>/run-<n>`), kept backward-compatible when one model
   runs. Runners pass the row `model` through; per-run `model` already lands in `metadata.json`,
-  so grading needs no change. `build_benchmark_report` (`:16767`) groups `by_variant` within
-  `by_model`, and `build_paired_summary` (`:15348`) computes lift per (case, model).
+  so grading needs no change. `build_benchmark_report` (`:16735`) groups `by_variant` within
+  `by_model`, and `build_paired_summary` (`:15316`) computes lift per (case, model).
 - **Design:** model is a third axis, not a new variant. Variants stay orthogonal, giving a
   model-by-variant grid. CLI: `--models a,b,c` on `prepare`.
 - **Testing:** a fan-out test asserting row count equals cases × variants × runs × models with
@@ -261,7 +261,7 @@ assumed.
   no-regression floor. This spec ports those shapes into the harness rather than inventing new
   ones.
 - **Abstractions used or changed:**
-  - `assertion_result` (`:11217`) gains an optional `score` (0-1 or a normalized 1-5) and
+  - `assertion_result` (`:11185`) gains an optional `score` (0-1 or a normalized 1-5) and
     `severity` (`critical` / `gate` / `soft`), read from `critical`/`gate`/`soft`/`atLeast` on the
     assertion.
   - **`critical` (absorbing-barrier) tier — valley-dodging.** From the Jetty "valley-dodging"
@@ -276,13 +276,13 @@ assumed.
   - **Anchored `graded_dimensions`** as a `judge` assertion shape:
     `{name, scale: "1-5", rubric: "5 = …observable…; 1 = …observable…"}`. Anchors name what each
     score level looks like, so a judge scores against criteria, not a vibe. `judge_prompt`
-    (`:11800`) renders the dimensions; the result carries per-dimension scores in `evidence`.
+    (`:11768`) renders the dimensions; the result carries per-dimension scores in `evidence`.
   - **`dynamic_rubric`** as a second `judge` shape: `{instruction, minimum_criteria}`. The judge
     drafts 3-5 case-specific criteria before grading and must meet at least `minimum_criteria`.
-  - `grade_case_variant` (`:13904`) splits totals into critical, gated, and soft. A `critical`
+  - `grade_case_variant` (`:13872`) splits totals into critical, gated, and soft. A `critical`
     failure vetoes the case; a `gate` failure lowers the pass rate; a `soft` failure lowers
     neither and fills a `scored` bucket. A `--strict` flag promotes soft to gate.
-  - **Statistical lift** in `build_paired_summary` (`:15348`): alongside the raw delta, compute a
+  - **Statistical lift** in `build_paired_summary` (`:15316`): alongside the raw delta, compute a
     significance test over the per-case graded scores (paired bootstrap or sign-flip
     permutation, mirroring `score_delta.py`), so lift is tested, not eyeballed.
   - **Reference-anchor floor:** an optional `reference_score` / `reference_graded_score` on a
@@ -315,7 +315,7 @@ assumed.
 - **Goal:** deterministic re-runs that pay nothing for external dependencies, by recording tool
   inputs and outputs.
 - **Abstractions used or changed:** this lives in the runner, not core grading. Recording sits
-  beside `write_trace_artifacts` (`:8258`): a `tool-replay.json` keyed per tool, with
+  beside `write_trace_artifacts` (`:8274`): a `tool-replay.json` keyed per tool, with
   `sanitize` and `version`. Modes (`auto`, `record`, `off`, `strict`) come from an environment
   variable that `run_codex` and the Pi and subagent runners read.
 - **Design:** orthogonal to the disk re-grade the harness already does. Replay makes the agent
@@ -326,8 +326,8 @@ assumed.
 
 ### 2.4 OpenTelemetry GenAI normalization target
 - **Goal:** make the trace adapter boundary a standard rather than a bespoke schema.
-- **Abstractions used or changed:** `normalize_trace_record` (`:7315`) and
-  `normalize_trace_records` (`:7974`) keep their inputs but emit OTel GenAI semantic-key
+- **Abstractions used or changed:** `normalize_trace_record` (`:7331`) and
+  `normalize_trace_records` (`:7990`) keep their inputs but emit OTel GenAI semantic-key
   attributes; the `events.json` schema version bumps. Process and efficiency assertions read the
   new keys with backward-compatible fallbacks.
 - **Design:** additive schema. An old `events.json` still grades.
@@ -337,7 +337,7 @@ assumed.
 ### 2.5 Dataset abstraction
 - **Goal:** fan one case template over many rows instead of hand-authoring each case.
 - **Abstractions used or changed:** a new optional manifest construct (`datasets`, plus a case
-  `template` referencing a dataset id). `iter_cases` (`:599`) materializes template by row into
+  `template` referencing a dataset id). `iter_cases` (`:603`) materializes template by row into
   concrete cases before fan-out; `validate_manifest` validates rows and runs leakage lint per
   materialized case.
 - **Design:** materialization happens early, so prepare, grade, and report stay unchanged.
@@ -351,7 +351,7 @@ assumed.
 - **Goal:** watch lift, saturation, and token drift over time.
 - **Abstractions used or changed:** a consumer of `build_benchmark_report`. Add an append-only
   history store and a `trend` subcommand that diffs successive `benchmark.json` files, reusing
-  the `compare_results` (`:17949`) logic.
+  the `compare_results` (`:17917`) logic.
 - **Severity-weighted ranking (from the macro-evals notebook):** when surfacing recurring
   failures across runs, rank them by `prevalence × severity`, not raw count, so a rare but severe
   failure outranks a common trivial one. This is the floor-raising principle made quantitative;
@@ -377,8 +377,8 @@ assumed.
   it dispatches a subagent with a rubric whose "criteria [are] deliberately absent from
   generation rules."
 - **Abstractions used or changed:** mostly a discipline made first-class, not new machinery.
-  `prepared_task_rows` (`:1564`) already omits `review_rubric` from generation payloads unless
-  `--include-answer-key`; extend `validate_manifest` (`:1167`) to require that a `holdout`/
+  `prepared_task_rows` (`:1568`) already omits `review_rubric` from generation payloads unless
+  `--include-answer-key`; extend `validate_manifest` (`:1171`) to require that a `holdout`/
   `holdback` case's rubric stays out of the skill and public eval text, and pair it with the
   subagent judge from 2.7 and the graded scoring from 2.2. Track which rubrics were held out so
   the report can separate held-out scores from tune-visible ones.
@@ -390,7 +390,7 @@ assumed.
 ### 2.8 Interactive served report and richer artifacts
 - **Goal:** capture feedback in the browser and render image, PDF, and xlsx artifacts, beyond the
   static `render_viewer`.
-- **Abstractions used or changed:** extend `render_viewer` (`:18746`) with a `serve` mode and
+- **Abstractions used or changed:** extend `render_viewer` (`:18714`) with a `serve` mode and
   artifact encoders. Anthropic's `eval-viewer/generate_review.py` is the blueprint, including
   `feedback.json` persistence and a `--previous-workspace` diff.
 - **Testing:** unit-test the artifact embedding and categorization and the feedback round trip;
@@ -422,7 +422,7 @@ assumed.
 - **Goal:** evaluate conversational skills across a send/respond sequence.
 - **Abstractions changed (core contract):** a case gains an optional `turns` list. The
   run-output contract grows from one `output.md` to a turn-indexed transcript, so
-  `read_output_base` (`:6250`) and `discover_run_bases` learn the turn layout; runners drive the
+  `read_output_base` (`:6254`) and `discover_run_bases` learn the turn layout; runners drive the
   sequence; `grade_case_variant` grades per turn and aggregates.
 - **Design:** single-shot stays the default, so existing manifests are untouched.
 - **Testing:** a fixture multi-turn run asserting per-turn grading and aggregate, plus a
@@ -435,7 +435,7 @@ assumed.
   the model axis, plus a viewer panel.
 - **Slice-lift concentration (from the macro-evals notebook):** compute, per slice, where lift (or
   a failure) concentrates — `slice share ÷ overall share`, the macro-eval `lift` metric one level
-  up from per-case lift. `build_slice_summary` (`:15519`) already groups by domain/difficulty/
+  up from per-case lift. `build_slice_summary` (`:15487`) already groups by domain/difficulty/
   trigger/goal, so this is a ratio over groups it already forms, not new plumbing.
 - **Testing:** a report test over a two-model by two-variant fixture grid, plus a concentration
   test asserting a failure confined to one slice scores a high ratio there.
@@ -548,7 +548,7 @@ and upgrading to the new features should be something an agent can drive.
 
 ### Abstractions used or changed
 
-- `version` on the manifest (`validate_manifest:1167`) becomes meaningful: `validate` accepts both
+- `version` on the manifest (`validate_manifest:1171`) becomes meaningful: `validate` accepts both
   1 and 2, and warns (not errors) on a `version: 1` manifest once 2.2 has landed, pointing at
   `migrate`.
 - No grading abstraction changes for migration itself; it is a source-rewrite plus a guide.
