@@ -130,6 +130,10 @@ executable. `PreparedTaskDraft.validate()` / `PreparedTask.from_row()` construct
 repetition is positive, `run_dir` is safe and relative, and `without_skill` cannot carry skill
 paths. Every native runner and Jetty exporter requires the executable type.
 
+`CaseId`, `ModelId`, and `RunNumber` keep the run identity dimensions distinct from ordinary
+strings and integers. They serialize as the existing scalar values, while construction rejects an
+empty case/model or a boolean, zero, or negative repetition before that identity reaches pairing.
+
 The prepared rows also form a persisted `answer-design.json`: the exact expected
 case/model/repetition identities plus a digest of manifest inputs, referenced oracles, and
 variant instructions. Each produced run repeats the design, task, and instruction digests.
@@ -161,10 +165,10 @@ in the codebase.
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10525`), Claude (`run_claude:10706`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10528`), Claude (`run_claude:10709`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13246`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:3999` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13249`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4002` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -227,14 +231,26 @@ external-process exceptions.
 turns those in-memory result rows into the artifact you read. It does not consume the output
 of the `grade` command. Before arithmetic,
 `experimental_pairs.py` constructs exact `(case, model, repetition, population)` identities and
-requires one eligible arm of each kind. `build_paired_summary` computes per-case lift
+requires one eligible treatment and control arm from an explicit `ContrastSpec`. The default
+skill-presence contrast maps to the existing `with_skill`/`without_skill` wire rows.
+The stable identity of a comparison result is `(contrast_id, pair_key)`. Blocked rows and pairing
+diagnostics serialize that contrast ID, so two different comparisons over the same execution rows
+cannot collide or lose their causal question at a persistence boundary.
+`build_paired_summary` computes per-case lift
 (`with_skill` minus `without_skill`, normalized gain, and a flag when the skill hurts) only from
 those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplicate arms fail.
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:789`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:792`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
+
+The pairing key carries `CaseId`, `ModelId | None`, `RunNumber`, and the closed
+`ExperimentalPopulation` enum. The pair also carries a contrast whose canonical factor coordinates
+separate activation, skill set, and content revision; those differing treatment coordinates do not
+pollute the shared repetition identity. `ExperimentalPair` is generic in its payload, so pairing run paths
+retains `Path` while pairing result rows retains their mapping interface; the shared constructor no
+longer erases every downstream payload to `Any`.
 
 ## What changes when you extend the tool
 

@@ -126,9 +126,13 @@ dimension in the fan-out (`case × variant × model × run`), not a new kind of 
 report then groups `by_model` and computes lift per (case, model) — see `model_analysis`.
 
 Before any lift, reliability, cost delta, or token-overhead value is computed, result rows become
-`ExperimentalPairKey(case, model, repetition, population)` arms. Only a validated pair with exactly
-one `with_skill` and one `without_skill` arm can contribute. Missing/ineligible arms remain blocked
-diagnostics, and duplicate identities fail instead of overwriting an earlier row. Telemetry then
+`ExperimentalPairKey(case, model, repetition, population)` arms under an explicit binary
+`ContrastSpec`. Only a validated pair with exactly one declared treatment and control arm can
+contribute. The default contrast preserves `with_skill`/`without_skill`; its canonical factor
+coordinates keep activation, skill-set, and content-revision axes distinct for future contrasts.
+Missing/ineligible arms remain blocked
+diagnostics with their `contrast_id`; a comparison result is identified by `(contrast_id, pair_key)`,
+and duplicate identities fail instead of overwriting an earlier row. Telemetry then
 adds its stricter provenance/unit/billing-basis comparison.
 
 ## Typed trust boundaries

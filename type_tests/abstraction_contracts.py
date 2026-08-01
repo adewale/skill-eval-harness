@@ -6,9 +6,17 @@ current union can be narrowed exhaustively and that its public fields retain
 the intended precise types.
 """
 
+from pathlib import Path
 from typing import NoReturn
 
+from typing_extensions import assert_type
+
 from ablation_model import PreparedTask
+from experimental_pairs import (
+    ExperimentalPair,
+    ExperimentalPairKey,
+    ExperimentalPopulation,
+)
 from judge_verdict import (
     BooleanVerdict,
     ConsensusVerdict,
@@ -17,7 +25,14 @@ from judge_verdict import (
     JudgeVerdict,
     ScoredVerdict,
 )
-from manifest_contracts import CaseKind, ExecutionVariant, Split
+from manifest_contracts import (
+    CaseId,
+    CaseKind,
+    ExecutionVariant,
+    ModelId,
+    RunNumber,
+    Split,
+)
 from runner_contracts import (
     AnswerOutcome,
     Completed,
@@ -92,7 +107,23 @@ def judge_verdict_is_exhaustive(verdict: JudgeVerdict) -> None:
 
 
 def prepared_task_identity_is_precise(task: PreparedTask) -> None:
+    _case_id: CaseId = task.case_id
     _split: Split = task.split
     _kind: CaseKind = task.kind
     _variant: ExecutionVariant = task.variant_truth
+    _run_number: RunNumber = task.run_number
     _visible_variant: ExecutionVariant = task.model_facing_variant()
+
+
+def experimental_pair_identity_is_precise(key: ExperimentalPairKey) -> None:
+    _case_id: CaseId = key.case_id
+    _model: ModelId | None = key.model
+    _run_number: RunNumber = key.run_number
+    _population: ExperimentalPopulation = key.population
+
+
+def experimental_pair_payload_type_is_preserved(
+    pair: ExperimentalPair[Path],
+) -> None:
+    assert_type(pair.with_skill.payload, Path)
+    assert_type(pair.without_skill.payload, Path)

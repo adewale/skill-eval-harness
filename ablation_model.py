@@ -42,8 +42,10 @@ from agent_capabilities import BACKENDS
 from json_contracts import freeze_json_value
 from manifest_contracts import (
     ABLATION_VARIANT_PREFIX,
+    CaseId,
     CaseKind,
     ExecutionVariant,
+    RunNumber,
     Split,
     ablation_id_of,
     is_ablation_variant,
@@ -669,11 +671,11 @@ class PreparedTask:
     from_row() reconstructs the typed task on the far side of that boundary. The row
     dict is the only thing that crosses to disk — the type is the in-process owner."""
 
-    case_id: str
+    case_id: CaseId
     split: Split
     kind: CaseKind
     variant_truth: ExecutionVariant
-    run_number: int
+    run_number: RunNumber
     skill_name: str
     repo_root: str
     skill_paths: tuple[str, ...]
@@ -688,17 +690,16 @@ class PreparedTask:
     skill_root_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "case_id", CaseId.parse(self.case_id))
         object.__setattr__(self, "split", Split.parse(self.split))
         object.__setattr__(self, "kind", CaseKind.parse(self.kind))
         object.__setattr__(self, "variant_truth", ExecutionVariant.parse(self.variant_truth))
-        for label, value in (("case_id", self.case_id), ("kind", self.kind),
+        object.__setattr__(self, "run_number", RunNumber.parse(self.run_number))
+        for label, value in (("kind", self.kind),
                              ("skill_name", self.skill_name), ("repo_root", self.repo_root),
                              ("run_dir", self.run_dir)):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"PreparedTask.{label} must be non-empty")
-        if (isinstance(self.run_number, bool) or not isinstance(self.run_number, int)
-                or self.run_number < 1):
-            raise ValueError("PreparedTask.run_number must be a positive integer")
         if self.kind == "trigger":
             raise ValueError("PreparedTask is answer-population only; trigger cases use autonomous runners")
         run_path = Path(self.run_dir)
@@ -822,11 +823,11 @@ class PreparedTask:
             collections[key] = tuple(raw)
         ctx = "PreparedTask row"
         return cls(
-            case_id=_require(row, "case_id", str, ctx),
+            case_id=CaseId.parse(_require(row, "case_id", str, ctx)),
             split=Split.parse(_require(row, "split", str, ctx)),
             kind=CaseKind.parse(row.get("kind", "behavior")),
             variant_truth=ExecutionVariant.parse(row.get("variant")),
-            run_number=_require(row, "run_number", int, ctx),
+            run_number=RunNumber.parse(_require(row, "run_number", int, ctx)),
             skill_name=_require(row, "skill_name", str, ctx),
             repo_root=_require(row, "repo_root", str, ctx),
             skill_paths=collections["skill_paths"],

@@ -5,9 +5,12 @@ import ablation_model
 import skill_benchmark as sb
 from manifest_contracts import (
     ABLATION_VARIANT_PREFIX,
+    CaseId,
     CaseKind,
     CasePopulation,
     ExecutionVariant,
+    ModelId,
+    RunNumber,
     Split,
     ablation_id_of,
     is_ablation_variant,
@@ -15,6 +18,20 @@ from manifest_contracts import (
 
 
 class ManifestIdentityContractTests(unittest.TestCase):
+    def test_run_identity_scalars_are_validated_and_keep_wire_shape(self):
+        identity = {
+            "case_id": CaseId.parse("case-1"),
+            "model": ModelId.parse("model-a"),
+            "run_number": RunNumber.parse(2),
+        }
+        self.assertEqual(
+            json.dumps(identity),
+            '{"case_id": "case-1", "model": "model-a", "run_number": 2}',
+        )
+        for value in (0, -1, True, "1", None):
+            with self.subTest(run_number=value), self.assertRaises(ValueError):
+                RunNumber.parse(value)
+
     def test_split_is_closed_and_keeps_wire_shape(self):
         splits = [Split.parse(value) for value in Split.values()]
         self.assertEqual(splits, ["tune", "holdout", "holdback"])

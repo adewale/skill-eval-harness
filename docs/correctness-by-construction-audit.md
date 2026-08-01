@@ -60,11 +60,18 @@ success, and exhausted retries. Exhaustive finite-state and trigger truth tables
 
 ## Paired experimental identity
 
-`experimental_pairs.py` owns `ExperimentalPairKey(case_id, model, run_number, population)` and the
-only constructor for `ExperimentalPair`.
+`experimental_pairs.py` owns `ExperimentalPairKey(case_id, model, run_number, population)`, one
+explicit `ContrastSpec`, and the only constructor for `ExperimentalPair`.
 
-- A complete pair contains exactly one `with_skill` and one `without_skill` arm with the same key.
-- Missing arms and ineligible arms become explicit `BlockedExperimentalPair` values.
+- A complete pair contains exactly one treatment and one control arm from its declared contrast,
+  with the same key. The default contrast retains the existing `with_skill`/`without_skill` wire
+  shape and compatibility properties.
+- Each contrast binds both arms to canonical activation, skill-set, and content-revision factor
+  coordinates. Native discovery and component-composition work can therefore add declared binary
+  contrasts without pretending those dimensions are ordinary execution variants.
+- Missing arms and ineligible arms become explicit `BlockedExperimentalPair` values that retain the
+  `contrast_id`. Pairing diagnostics serialize the same ID; the durable comparison identity is
+  `(contrast_id, pair_key)`.
 - A duplicate arm for one identity raises before aggregation; it can no longer overwrite an earlier
   row in a dictionary.
 - Lift, graded lift, paired reliability, paired cost, token-overhead run discovery, slice/case

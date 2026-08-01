@@ -12,6 +12,57 @@ from enum import Enum
 ABLATION_VARIANT_PREFIX = "ablation:"
 
 
+class CaseId(str):
+    """A validated case identity used across planning, runs, and reports."""
+
+    def __new__(cls, value: str) -> CaseId:
+        if not isinstance(value, str):
+            raise TypeError("case id must be a string")
+        if not value.strip():
+            raise ValueError("case id must be a non-empty string")
+        return str.__new__(cls, value)
+
+    @classmethod
+    def parse(cls, value: object) -> CaseId:
+        if not isinstance(value, str):
+            raise ValueError("case id must be a string")
+        return cls(value)
+
+
+class ModelId(str):
+    """A non-empty model identity; absence remains represented by ``None``."""
+
+    def __new__(cls, value: str) -> ModelId:
+        if not isinstance(value, str):
+            raise TypeError("model id must be a string")
+        if not value.strip():
+            raise ValueError("model id must be a non-empty string")
+        return str.__new__(cls, value)
+
+    @classmethod
+    def parse(cls, value: object) -> ModelId:
+        if not isinstance(value, str):
+            raise ValueError("model id must be a string")
+        return cls(value)
+
+
+class RunNumber(int):
+    """A positive repetition identity (booleans are not integers here)."""
+
+    def __new__(cls, value: int) -> RunNumber:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("run number must be an integer")
+        if value < 1:
+            raise ValueError("run number must be positive")
+        return int.__new__(cls, value)
+
+    @classmethod
+    def parse(cls, value: object) -> RunNumber:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("run number must be an integer")
+        return cls(value)
+
+
 class Split(str):
     """One of the three closed evaluation phases."""
 

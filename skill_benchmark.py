@@ -142,6 +142,7 @@ from manifest_contracts import (
     CaseKind,
     CasePopulation,
     ExecutionVariant,
+    RunNumber,
     Split,
 )
 from text_contracts import (
@@ -179,6 +180,8 @@ HARNESS_SEMANTIC_MODULES = (
     "trigger_reporting.py",
 )
 DEFAULT_VARIANTS = list(DEFAULT_EXECUTION_VARIANTS)
+_ResultPair = pair_domain.ExperimentalPair[Mapping[str, Any]]
+_ResultPairConstruction = pair_domain.PairConstruction[Mapping[str, Any]]
 TEXT_ASSERTIONS = {
     "contains",
     "contains_any",
@@ -1690,7 +1693,7 @@ def prepared_task_rows(
                         split=case["split"],
                         kind=case.get("kind", "behavior"),
                         variant_truth=variant,
-                        run_number=run_number,
+                        run_number=RunNumber(run_number),
                         skill_name=manifest["skill_name"],
                         repo_root=str(repo_root),
                         skill_paths=tuple(skill_paths),
@@ -15226,7 +15229,7 @@ def build_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
     return {"by_case_variant": by_case_variant, "by_variant": by_variant_summary}
 
 
-def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> pair_domain.PairConstruction:
+def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> _ResultPairConstruction:
     def eligibility(row: Mapping[str, Any]) -> tuple[bool, str | None]:
         if not scorable_run(row):
             return False, "unscorable_arm"
@@ -15236,13 +15239,17 @@ def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> pair_d
         if key in {"objective_pass_rate", "combined_pass_rate", "graded_score"} and not 0 <= float(value) <= 1:
             return False, f"invalid_{key}"
         return True, None
-    return pair_domain.pairs_from_rows(results, population="answer", eligibility=eligibility)
+    return pair_domain.pairs_from_rows(
+        results,
+        population=pair_domain.ExperimentalPopulation.ANSWER,
+        eligibility=eligibility,
+    )
 
 
 def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pass_rate") -> tuple[list[float], list[float], list[dict[str, Any]]]:
     """Per-case rates computed only from validated repetition-level pairs."""
     construction = _metric_pair_construction(results, key)
-    grouped: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    grouped: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in construction.pairs:
         grouped[pair.key.case_id].append(pair)
     paired_with_rates: list[float] = []
@@ -15278,7 +15285,7 @@ def _reliability_counts(rows: list[dict[str, Any]]) -> tuple[int, int]:
 def paired_case_counts(results: list[dict[str, Any]]) -> list[tuple[str, tuple[int, int], tuple[int, int]]]:
     """Per-case success counts over the same validated repetition-level pairs."""
     construction = _metric_pair_construction(results, "objective_pass_rate")
-    grouped: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    grouped: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in construction.pairs:
         grouped[pair.key.case_id].append(pair)
     pairs: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
@@ -15319,7 +15326,7 @@ PAIR_HEADLINE_FIELDS = (
 
 
 def pairing_aware_block(block: dict[str, Any],
-                        construction: pair_domain.PairConstruction) -> dict[str, Any]:
+                        construction: _ResultPairConstruction) -> dict[str, Any]:
     """Make subset-only lift explicitly diagnostic when any identity is blocked."""
     out = dict(block)
     out["pairing"] = construction.diagnostics()
@@ -15446,7 +15453,7 @@ def paired_reliability_block(pairs: list[tuple[str, tuple[int, int], tuple[int, 
 
 
 def pairing_aware_reliability(block: dict[str, Any],
-                              construction: pair_domain.PairConstruction) -> dict[str, Any]:
+                              construction: _ResultPairConstruction) -> dict[str, Any]:
     out = dict(block)
     out["pairing"] = construction.diagnostics()
     if not construction.blocked:
@@ -15731,18 +15738,21 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             return True, None
 
         ablation_pairing = pair_domain.pairs_from_rows(
-            ablation_pair_rows, population="answer", eligibility=ablation_eligibility)
-        pairs_by_case_model: dict[tuple[str, str | None], list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+            ablation_pair_rows,
+            population=pair_domain.ExperimentalPopulation.ANSWER,
+            eligibility=ablation_eligibility,
+        )
+        pairs_by_case_model: dict[tuple[str, str | None], list[_ResultPair]] = collections.defaultdict(list)
         for pair in ablation_pairing.pairs:
             pairs_by_case_model[(pair.key.case_id, pair.key.model)].append(pair)
         entry["pairing"] = ablation_pairing.diagnostics()
 
-        def assertion_value(row: dict[str, Any], name: str) -> bool | None:
+        def assertion_value(row: Mapping[str, Any], name: str) -> bool | None:
             matches = [a.get("passed") for a in list(row.get("assertions", [])) + list(row.get("qualitative_assertions", []))
                        if a.get("name") == name]
             return matches[0] if len(matches) == 1 and isinstance(matches[0], bool) else None
 
-        def paired_assertion_rates(pairs: list[pair_domain.ExperimentalPair], name: str) -> tuple[float | None, float | None, int]:
+        def paired_assertion_rates(pairs: list[_ResultPair], name: str) -> tuple[float | None, float | None, int]:
             observations = []
             for pair in pairs:
                 left = assertion_value(pair.with_skill.payload, name)
@@ -15755,7 +15765,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                     sum(right for _, right in observations) / len(observations),
                     len(observations))
 
-        def paired_combined_deltas(pairs: list[pair_domain.ExperimentalPair]) -> list[float]:
+        def paired_combined_deltas(pairs: list[_ResultPair]) -> list[float]:
             deltas = []
             for pair in pairs:
                 left = pair.with_skill.payload.get("combined_pass_rate", pair.with_skill.payload.get("objective_pass_rate"))
@@ -15915,7 +15925,7 @@ def cost_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
-def _row_measurement(row: dict[str, Any], key: str):
+def _row_measurement(row: Mapping[str, Any], key: str):
     measurement = row.get(f"{key}_measurement")
     if isinstance(measurement, telemetry_domain.Measurement):
         return measurement
@@ -15925,7 +15935,7 @@ def _row_measurement(row: dict[str, Any], key: str):
     )
 
 
-def _cost_measurement(row: dict[str, Any]):
+def _cost_measurement(row: Mapping[str, Any]):
     measurement = row.get("cost_measurement")
     if isinstance(measurement, telemetry_domain.Measurement):
         return measurement
@@ -16155,8 +16165,10 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
     paired_cost_delta: dict[str, Any] = {}
     deltas_by_currency: dict[str, list[float]] = collections.defaultdict(list)
     all_cost_pairs_comparable = True
-    cost_pairing = pair_domain.pairs_from_rows(rows, population="answer")
-    complete_by_case: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    cost_pairing = pair_domain.pairs_from_rows(
+        rows, population=pair_domain.ExperimentalPopulation.ANSWER
+    )
+    complete_by_case: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     blocked_by_case: dict[str, list[str]] = collections.defaultdict(list)
     for pair in cost_pairing.pairs:
         complete_by_case[pair.key.case_id].append(pair)
@@ -16698,7 +16710,11 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
         profiles[base] = _trajectory_profile(events)
         return True, None
 
-    construction = pair_domain.pairs_from_rows(results, population="answer", eligibility=eligibility)
+    construction = pair_domain.pairs_from_rows(
+        results,
+        population=pair_domain.ExperimentalPopulation.ANSWER,
+        eligibility=eligibility,
+    )
     delta_keys = ("steps", "commands", "tool_calls", "file_reads", "file_writes")
     by_case: dict[str, dict[str, Any]] = {}
     for pair in construction.pairs:
@@ -18861,9 +18877,15 @@ def paired_run_bases(runs: Path, case_id: str, with_variant: str, without_varian
         bases: dict[tuple[int, str], Path] = {}
         for arm, discovered in (("with_skill", with_runs), ("without_skill", without_runs)):
             for run_number, base in discovered:
-                key = pair_domain.ExperimentalPairKey(case_id, model, run_number, "answer")
+                key = pair_domain.ExperimentalPairKey.parse(
+                    case_id,
+                    model,
+                    run_number,
+                    pair_domain.ExperimentalPopulation.ANSWER,
+                )
                 bases[(run_number, arm)] = base
-                arms.append(pair_domain.ExperimentalArm(key, arm, base))
+                arms.append(pair_domain.ExperimentalArm(
+                    key, pair_domain.ExperimentalArmId(arm), base))
         construction = pair_domain.construct_pairs(arms)
         for pair in construction.pairs:
             yield model, pair.key.run_number, pair.with_skill.payload, pair.without_skill.payload
@@ -19305,11 +19327,11 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
     for row in rows:
         intent.setdefault(row.get("case_id"), row.get("eval_intent", "capability"))
     pairing = pair_domain.pairs_from_rows(
-        rows, population="answer",
+        rows, population=pair_domain.ExperimentalPopulation.ANSWER,
         eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
     )
 
-    def combined_value(row: dict[str, Any]) -> float | None:
+    def combined_value(row: Mapping[str, Any]) -> float | None:
         value = row.get("combined_pass_rate")
         # Soft judges live in graded_score, not combined; the qualitative signal
         # this function looks for rides whichever channel the judge fed.
@@ -19320,7 +19342,7 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
         return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
                 and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
 
-    by_case: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    by_case: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in pairing.pairs:
         by_case[pair.key.case_id].append(pair)
     base_saturated, base_saturated_expected, qualitative_only = [], [], []

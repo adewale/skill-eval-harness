@@ -56,7 +56,7 @@ required-version = "==0.16.0"
 # These parsers intentionally normalize every malformed wire/schema value to
 # ValueError as part of their public validation contract.
 "ablation_model.py" = ["F401", "TRY004"]
-"experimental_pairs.py" = ["TRY004"]
+"experimental_pairs.py" = ["PYI034", "TRY004"]
 "gemini_contracts.py" = ["TRY004"]
 "judge_verdict.py" = ["TRY004"]
 "manifest_contracts.py" = ["PYI034", "TRY004"]
