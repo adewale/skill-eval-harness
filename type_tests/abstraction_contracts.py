@@ -56,6 +56,14 @@ from manifest_contracts import (
     RunNumber,
     Split,
 )
+from report_contracts import (
+    CompleteReportCohort,
+    EmptyReportCohort,
+    NotApplicableReportCohort,
+    PartialReportCohort,
+    ReportCohort,
+    UnitRate,
+)
 from runner_contracts import (
     AnswerOutcome,
     Completed,
@@ -221,3 +229,20 @@ def judge_task_identity_is_precise(task: JudgeTask) -> None:
     _run_number: RunNumber = task.run_number
     _model: ModelId | None = task.model
     _assertion: Mapping[str, object] = task.assertion
+
+
+def report_cohort_is_exhaustive(cohort: ReportCohort) -> None:
+    if isinstance(cohort, EmptyReportCohort):
+        _empty: EmptyReportCohort = cohort
+    elif isinstance(cohort, CompleteReportCohort):
+        _complete_rows: tuple[Mapping[str, object], ...] = cohort.rows
+    elif isinstance(cohort, PartialReportCohort):
+        _reason: str = cohort.reason
+    elif isinstance(cohort, NotApplicableReportCohort):
+        _attempted: int = cohort.attempted
+    else:
+        _assert_never(cohort)
+
+
+def report_rate_is_precise(rate: UnitRate) -> None:
+    _rate: float = rate

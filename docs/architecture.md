@@ -147,6 +147,7 @@ run evidence -> process × provider-response × trace × artifact-set state
 artifact set -> Legacy | MissingCommit | InvalidCommit | Incomplete | Complete
 event log -> Missing | Invalid | Loaded
 assertion result -> Satisfied | Failed | Unavailable | Skipped
+report coverage -> Empty | Complete | Partial
 qualitative work -> JudgeTask
 judge process -> JudgeInvocation
 judge row -> Boolean | Scored | Dimension | Dynamic | Consensus verdict

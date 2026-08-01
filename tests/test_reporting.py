@@ -267,6 +267,27 @@ class PerModelAnalysisTests(unittest.TestCase):
         self.assertEqual(domain["pairing"]["eligible_pairs"], 0)
         self.assertEqual(domain["pairing"]["blocked_pairs"], 2)
 
+    def test_partial_grading_cannot_publish_a_slice_headline(self):
+        row = {
+            "case_id": "c", "model": "m", "variant": "with_skill",
+            "run_number": 1, "domain": "docs", "missing_output": False,
+            "execution_valid": True, "grading_availability": "partial",
+            "objective_pass_rate": 1.0, "combined_pass_rate": 1.0,
+            "metadata": {},
+        }
+
+        block = sb.build_slice_summary(
+            [row], ["with_skill"])["domain"]["docs"]["with_skill"]
+
+        self.assertEqual(block["availability"], "partial")
+        self.assertEqual(block["attempted_runs"], 1)
+        self.assertEqual(block["runs"], 0)
+        self.assertEqual(block["blocked_runs"], 1)
+        self.assertIsNone(block["mean_objective_pass_rate"])
+        self.assertIsNone(block["mean_combined_pass_rate"])
+        self.assertEqual(block["observed_mean_objective_pass_rate"], 1.0)
+        self.assertEqual(block["observed_mean_combined_pass_rate"], 1.0)
+
     def test_no_model_axis_yields_empty_analysis(self):
         self.assertEqual(sb.model_analysis_from_paired({"absolute_delta": 0.5}), {})
 

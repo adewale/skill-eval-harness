@@ -40,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
@@ -58,6 +58,7 @@ from yaml.constructor import ConstructorError
 from yaml.resolver import BaseResolver
 
 import experimental_pairs as pair_domain
+import report_contracts as report_domain
 import telemetry as telemetry_domain
 from ablation_model import (
     CLAUDE_FAILURE,
@@ -166,9 +167,11 @@ from judge_verdict import (
 )
 from manifest_contracts import (
     DEFAULT_EXECUTION_VARIANTS,
+    CaseId,
     CaseKind,
     CasePopulation,
     ExecutionVariant,
+    ModelId,
     RunNumber,
     Split,
 )
@@ -209,7 +212,7 @@ HARNESS_SEMANTIC_MODULES = (
     "ablation_model.py", "agent_capabilities.py", "artifact_contracts.py", "experimental_pairs.py",
     "gemini_contracts.py", "grading_contracts.py",
     "invocation_contracts.py", "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "manifest_contracts.py", "run_pi_trigger_eval.py",
-    "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
+    "report_contracts.py", "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
     "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
     "trigger_reporting.py",
 )
@@ -14394,7 +14397,7 @@ def grade(args: argparse.Namespace) -> int:
                 fh.write(json.dumps(task, ensure_ascii=False) + "\n")
     return 0
 
-def stats(values: list[float]) -> dict[str, float | None]:
+def stats(values: Sequence[float]) -> dict[str, float | None]:
     clean = [float(v) for v in values if v is not None]
     if not clean:
         return {"mean": None, "stddev": None, "min": None, "max": None, "median": None, "n": 0}
@@ -15517,23 +15520,114 @@ def slice_lift_fields(paired: dict[str, Any], overall_lift: float | None) -> dic
     return fields
 
 
+def _report_attempt_identity(row: Mapping[str, Any]) -> str:
+    """Stable identity for one attempted answer-run report row."""
+    required = ("case_id", "variant", "run_number")
+    if any(row.get(key) is None for key in required):
+        raise ValueError("report row requires case_id, variant, and run_number identity")
+    case_id = CaseId.parse(row["case_id"])
+    model = (None if row.get("model") is None
+             else ModelId.parse(row["model"]))
+    variant = ExecutionVariant.parse(row["variant"])
+    run_number = RunNumber.parse(row["run_number"])
+    return canonical_json_sha256({
+        "case_id": str(case_id),
+        "model": None if model is None else str(model),
+        "variant": str(variant),
+        "run_number": int(run_number),
+        "population": "answer",
+    })
+
+
+_RATE_TOTAL_FIELDS = {
+    "objective_pass_rate": "objective_total",
+    "combined_pass_rate": "combined_total",
+    "process_pass_rate": "process_total",
+    "efficiency_pass_rate": "efficiency_total",
+}
+
+
+def _report_metric_applicable(row: Mapping[str, Any], key: str) -> bool:
+    """An explicit zero denominator is N/A; absence remains unknown coverage."""
+    total_key = _RATE_TOTAL_FIELDS[key]
+    if total_key not in row:
+        return True
+    total = row[total_key]
+    if type(total) is not int or total < 0:
+        raise ValueError(f"report {total_key} must be a non-negative integer")
+    if total == 0 and row.get(key) is not None:
+        raise ValueError(f"report {key} contradicts zero {total_key}")
+    return total != 0
+
+
+def _report_row_eligibility(row: Mapping[str, Any]) -> report_domain.Disposition:
+    if not scorable_run(row):
+        return False, "unscorable_attempt"
+    if row.get("grading_availability") != "complete":
+        return False, "grading_evidence_incomplete"
+    return True, None
+
+
+def _report_execution_eligibility(
+    row: Mapping[str, Any],
+) -> report_domain.Disposition:
+    return ((True, None) if scorable_run(row)
+            else (False, "unscorable_attempt"))
+
+
 def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> dict[str, Any]:
     out: dict[str, Any] = {"domain": {}, "difficulty": {}, "trigger_type": {}, "success_goals": {}}
     # Each slice routes through ResultSet so the scorable predicate is never
     # re-rolled inline; the value enumeration is over all rows (it lists which
     # slices exist), the scoring is over the scorable subset.
     def slice_stats(rs: ResultSet) -> dict[str, Any]:
-        attempted = len(rs)
-        s = rs.scorable()
-        blocked = attempted - len(s)
-        objective = s.mean_rate("objective_pass_rate")
-        combined = s.mean_rate("combined_pass_rate")
-        return {"attempted_runs": attempted, "runs": len(s), "blocked_runs": blocked,
-                "availability": "partial" if blocked else "complete",
-                "mean_objective_pass_rate": None if blocked else objective,
-                "mean_combined_pass_rate": None if blocked else combined,
-                "observed_mean_objective_pass_rate": objective,
-                "observed_mean_combined_pass_rate": combined}
+        cohort = report_domain.report_cohort(
+            rs.all,
+            identity=_report_attempt_identity,
+            eligibility=_report_row_eligibility,
+        )
+        diagnostic_cohort = report_domain.report_cohort(
+            rs.all,
+            identity=_report_attempt_identity,
+            eligibility=_report_execution_eligibility,
+        )
+        objective_cohort = report_domain.metric_cohort(
+            cohort, "objective_pass_rate",
+            applicability=lambda row: _report_metric_applicable(
+                row, "objective_pass_rate"))
+        combined_cohort = report_domain.metric_cohort(
+            cohort, "combined_pass_rate",
+            applicability=lambda row: _report_metric_applicable(
+                row, "combined_pass_rate"))
+        objective_values = report_domain.observed_rates(
+            objective_cohort, "objective_pass_rate")
+        combined_values = report_domain.observed_rates(
+            combined_cohort, "combined_pass_rate")
+        objective = statistics.mean(objective_values) if objective_values else None
+        combined = statistics.mean(combined_values) if combined_values else None
+        diagnostic_objective = report_domain.observed_rates(
+            report_domain.metric_cohort(
+                diagnostic_cohort, "objective_pass_rate",
+                applicability=lambda row: _report_metric_applicable(
+                    row, "objective_pass_rate")),
+            "objective_pass_rate")
+        diagnostic_combined = report_domain.observed_rates(
+            report_domain.metric_cohort(
+                diagnostic_cohort, "combined_pass_rate",
+                applicability=lambda row: _report_metric_applicable(
+                    row, "combined_pass_rate")),
+            "combined_pass_rate")
+        return {**report_domain.coverage_fields(cohort),
+                "mean_objective_pass_rate": report_domain.headline_value(
+                    objective_cohort, objective),
+                "mean_combined_pass_rate": report_domain.headline_value(
+                    combined_cohort, combined),
+                "observed_mean_objective_pass_rate": (
+                    statistics.mean(diagnostic_objective)
+                    if diagnostic_objective else None),
+                "observed_mean_combined_pass_rate": (
+                    statistics.mean(diagnostic_combined)
+                    if diagnostic_combined else None)}
 
     everything = ResultSet(results)
     overall_lift = (build_paired_summary(results) or {}).get("absolute_delta")
@@ -16346,19 +16440,44 @@ def qualitative_by_visibility(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    scorable_rows = [row for row in ResultSet(rows).scorable().all
-                     if row.get("grading_availability") == "complete"]
-    blocked_runs = len(rows) - len(scorable_rows)
-    objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
-    combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
-    process_rates = [r["process_pass_rate"] for r in scorable_rows if r.get("process_pass_rate") is not None]
-    efficiency_rates = [r["efficiency_pass_rate"] for r in scorable_rows if r.get("efficiency_pass_rate") is not None]
+    cohort = report_domain.report_cohort(
+        rows,
+        identity=_report_attempt_identity,
+        eligibility=_report_row_eligibility,
+    )
+    execution_cohort = report_domain.report_cohort(
+        rows,
+        identity=_report_attempt_identity,
+        eligibility=_report_execution_eligibility,
+    )
+    execution_rows = [
+        thaw_json_value(row, "report row")
+        for row in report_domain.observed_rows(execution_cohort)
+    ]
+    metric_cohorts = {
+        key: report_domain.metric_cohort(
+            cohort, key,
+            applicability=lambda row, metric=key: _report_metric_applicable(
+                row, metric))
+        for key in (
+            "objective_pass_rate", "combined_pass_rate",
+            "process_pass_rate", "efficiency_pass_rate",
+        )
+    }
+    objective_rates = list(report_domain.observed_rates(
+        metric_cohorts["objective_pass_rate"], "objective_pass_rate"))
+    combined_rates = list(report_domain.observed_rates(
+        metric_cohorts["combined_pass_rate"], "combined_pass_rate"))
+    process_rates = list(report_domain.observed_rates(
+        metric_cohorts["process_pass_rate"], "process_pass_rate"))
+    efficiency_rates = list(report_domain.observed_rates(
+        metric_cohorts["efficiency_pass_rate"], "efficiency_pass_rate"))
     # Timing/token/command central tendencies describe SCORABLE runs, matching
     # the pass-rate block above — a timed-out run's full duration must not drag
     # the mean (the failure count is disclosed separately as execution_errors).
-    facts = [result_cost_facts(r) for r in scorable_rows]
+    facts = [result_cost_facts(r) for r in execution_rows]
     command_measurements = []
-    for row in scorable_rows:
+    for row in execution_rows:
         merged = dict(row.get("metadata", {}) or {})
         merged.update(read_metrics_base(Path(row.get("run_base", ""))))
         command_measurements.append(telemetry_domain.measurement_from_envelope_or_nonnegative(merged, "commands"))
@@ -16368,7 +16487,7 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     cost_total = _money_aggregate_fields(cost_measurements)
     elapsed = [m.value for m in elapsed_measurements if m.availability == telemetry_domain.AVAILABLE]
     tokens = [m.value for m in token_measurements if m.availability == telemetry_domain.AVAILABLE]
-    observed_rates = {
+    diagnostic_rate_fields = {
         "mean_objective_pass_rate": statistics.mean(objective_rates) if objective_rates else None,
         "mean_combined_pass_rate": statistics.mean(combined_rates) if combined_rates else None,
         "mean_process_pass_rate": statistics.mean(process_rates) if process_rates else None,
@@ -16378,14 +16497,32 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "process_pass_rate": stats(process_rates),
         "efficiency_pass_rate": stats(efficiency_rates),
     }
+    field_metric = {
+        "mean_objective_pass_rate": "objective_pass_rate",
+        "objective_pass_rate": "objective_pass_rate",
+        "mean_combined_pass_rate": "combined_pass_rate",
+        "combined_pass_rate": "combined_pass_rate",
+        "mean_process_pass_rate": "process_pass_rate",
+        "process_pass_rate": "process_pass_rate",
+        "mean_efficiency_pass_rate": "efficiency_pass_rate",
+        "efficiency_pass_rate": "efficiency_pass_rate",
+    }
+    published_rate_fields = {
+        field: report_domain.headline_value(
+            metric_cohorts[field_metric[field]], value)
+        for field, value in diagnostic_rate_fields.items()
+    }
     out = {
         "cases": len({r["case_id"] for r in rows}),
-        "runs": len(rows),
-        "scorable_runs": len(scorable_rows),
-        "blocked_runs": blocked_runs,
+        "runs": report_domain.attempted_count(cohort),
+        "scorable_runs": len(execution_rows),
+        "blocked_runs": report_domain.blocked_count(cohort),
         "missing_outputs": sum(1 for r in rows if r["missing_output"]),
         "execution_errors": sum(1 for r in rows if not r["missing_output"] and not r.get("execution_valid", True)),
-        **observed_rates,
+        **published_rate_fields,
+        "metric_availability": {
+            key: metric.state.value for key, metric in metric_cohorts.items()
+        },
         "elapsed_ms": measurement_stats(elapsed_measurements),
         "total_tokens": measurement_stats(token_measurements),
         "command_count": measurement_stats(command_measurements),
@@ -16401,14 +16538,24 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
         "median_total_tokens": statistics.median(tokens) if tokens else None,
     }
-    if blocked_runs:
-        out["availability"] = "partial"
-        out["reason"] = "unscorable_or_incompletely_graded_attempts"
-        for key, value in observed_rates.items():
-            out[f"observed_{key}"] = value
+    if isinstance(cohort, report_domain.PartialReportCohort):
+        out["availability"] = cohort.state.value
+        out["reason"] = cohort.reason
+        for key, value in diagnostic_rate_fields.items():
+            if isinstance(
+                metric_cohorts[field_metric[key]],
+                report_domain.PartialReportCohort,
+            ):
+                out[f"observed_{key}"] = value
             out[key] = None
     else:
-        out["availability"] = "complete"
+        out["availability"] = cohort.state.value
+        for key, value in diagnostic_rate_fields.items():
+            if isinstance(
+                metric_cohorts[field_metric[key]],
+                report_domain.PartialReportCohort,
+            ):
+                out[f"observed_{key}"] = value
     return out
 
 

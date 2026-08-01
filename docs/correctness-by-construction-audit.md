@@ -366,6 +366,28 @@ raw output string
   replaces runtime parsing: manifest dictionaries and external embedding/script values remain
   untrusted wire data.
 
+## Report coverage cohorts
+
+Variant and slice summaries consume one closed report population:
+
+```text
+attempted rows + stable identity + eligibility -> Empty | Complete | Partial | NotApplicable
+row cohort + metric key/applicability -> metric-specific cohort
+observed numeric rate -> UnitRate(0 <= value <= 1)
+```
+
+- Empty populations remain distinct from fully observed non-empty populations.
+- Attempts that exist but have no applicable denominator remain distinct from empty and blocked
+  populations.
+- A partial population owns the attempted, observed, and blocked counts plus its reason. Its
+  observed means remain diagnostics while headline means are unavailable.
+- Every row is classified once from the attempted sequence, carries a stable run identity, is
+  recursively frozen, and cannot repeat that identity. No membership rule depends on object `id()`.
+- Each rate gets its own refined cohort. A complete row set with one absent rate is metric-partial,
+  never permission to average only the surviving values.
+- Rate validation rejects bool, NaN, infinity, and out-of-range values before aggregation.
+- `ty` checks exhaustive narrowing across all four coverage states.
+
 ## Ablation provenance vocabulary
 
 Answer-population ablation confirmation uses the same exact case/model/repetition pairs, requires
