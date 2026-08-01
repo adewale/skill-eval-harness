@@ -936,7 +936,7 @@ locally produces a `ty` error (verify, then revert).
 
 ### Step 6 — Port the answer and judge adapters [SANDBOX] — DONE
 
-> See [Step 6-7 result](#steps-67-result--measured-2026-08-01).
+> See [Step 6-7 result](#steps-6-7-result--measured-2026-08-01).
 
 Answer path — port `AgyBackend` from the reference branch, adapting to current
 `main`:
@@ -979,7 +979,7 @@ parsing anywhere in the agy path; suite green; `ty --error-on-warning` clean.
 
 ### Step 7 — Close the command boundary [SANDBOX] — DONE
 
-> See [Step 6-7 result](#steps-67-result--measured-2026-08-01).
+> See [Step 6-7 result](#steps-6-7-result--measured-2026-08-01).
 
 Replace `shlex.split(agy_cmd or AGY_DEFAULT_CMD)` (reference branch
 `skill_benchmark.py:8200`).
