@@ -45,9 +45,9 @@ py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "a
 pythonpath = ["."]
 
 [tool.ty.src]
-# Every project-owned top-level module is checked automatically. Type-only
-# contract assertions pin the precision and exhaustiveness of closed domains.
-include = ["*.py", "type_tests/*.py"]
+# Production modules, executable tooling, and shipped examples are checked
+# automatically. Type-only assertions pin closed-domain precision/exhaustiveness.
+include = ["*.py", "scripts/**/*.py", "examples/**/*.py", "type_tests/*.py"]
 
 [tool.ruff]
 required-version = "==0.16.0"

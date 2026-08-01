@@ -209,14 +209,28 @@ from trigger_contracts import (
 from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 
 VALID_SPLITS = frozenset(Split.values())
-HARNESS_SEMANTIC_MODULES = (
-    "ablation_model.py", "agent_capabilities.py", "artifact_contracts.py", "cli_contracts.py", "experimental_pairs.py",
-    "gemini_contracts.py", "grading_contracts.py",
-    "invocation_contracts.py", "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "manifest_contracts.py", "run_pi_trigger_eval.py",
-    "report_contracts.py", "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
-    "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
+TRIGGER_HARNESS_IDENTITY_VERSION = 2
+# Conservative at module granularity: skill_benchmark.py still combines trigger
+# and non-trigger orchestration, so every edit to that monolith invalidates the
+# trigger identity until its owners are extracted.
+TRIGGER_IDENTITY_MODULES = (
+    "ablation_model.py",
+    "agent_capabilities.py",
+    "experimental_pairs.py",
+    "invocation_contracts.py",
+    "json_contracts.py",
+    "manifest_contracts.py",
+    "run_pi_trigger_eval.py",
+    "run_trigger_matrix.py",
+    "skill_benchmark.py",
+    "telemetry.py",
+    "trace_contracts.py",
+    "trigger_contracts.py",
     "trigger_reporting.py",
 )
+# Compatibility names for code that inspected earlier trigger identity owners.
+TRIGGER_SEMANTIC_MODULES = TRIGGER_IDENTITY_MODULES
+HARNESS_SEMANTIC_MODULES = TRIGGER_IDENTITY_MODULES
 DEFAULT_VARIANTS = list(DEFAULT_EXECUTION_VARIANTS)
 _ResultPair = pair_domain.ExperimentalPair[Mapping[str, Any]]
 _ResultPairConstruction = pair_domain.PairConstruction[Mapping[str, Any]]
@@ -2965,14 +2979,17 @@ def trigger_harness_identity() -> dict[str, Any]:
     """Identity of every local module that can change trigger evidence semantics."""
     module_dir = Path(__file__).resolve().parent
     modules: dict[str, str] = {}
-    for name in HARNESS_SEMANTIC_MODULES:
+    for name in TRIGGER_IDENTITY_MODULES:
         path = module_dir / name
         try:
             content = path.read_bytes()
         except OSError as exc:
             raise RuntimeError(f"cannot identify trigger dependency {name}: {exc}") from exc
         modules[name] = "sha256:" + hashlib.sha256(content).hexdigest()
-    payload = {"schema_version": 1, "modules": modules}
+    payload = {
+        "schema_version": TRIGGER_HARNESS_IDENTITY_VERSION,
+        "modules": modules,
+    }
     return {**payload, "identity_sha256": canonical_json_sha256(payload)}
 
 
@@ -2981,13 +2998,15 @@ def validate_trigger_harness_identity(identity: Any, label: str) -> dict[str, An
     if not isinstance(identity, dict):
         raise TypeError(f"{label} harness_identity must be an object")
     payload = {key: value for key, value in identity.items() if key != "identity_sha256"}
-    if (identity.get("schema_version") != 1
+    if (type(identity.get("schema_version")) is not int
+            or identity.get("schema_version") != TRIGGER_HARNESS_IDENTITY_VERSION
             or canonical_json_sha256(payload) != identity.get("identity_sha256")):
         raise ValueError(f"{label} harness_identity does not match its identity_sha256")
     modules = identity.get("modules")
-    if not isinstance(modules, dict) or set(modules) != set(HARNESS_SEMANTIC_MODULES):
+    if not isinstance(modules, dict) or set(modules) != set(TRIGGER_IDENTITY_MODULES):
         raise ValueError(
-            f"{label} harness_identity must identify exactly {list(HARNESS_SEMANTIC_MODULES)}")
+            f"{label} harness_identity must identify exactly "
+            f"{list(TRIGGER_IDENTITY_MODULES)}")
     if any(not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
            for digest in modules.values()):
         raise ValueError(f"{label} harness_identity contains an invalid module digest")

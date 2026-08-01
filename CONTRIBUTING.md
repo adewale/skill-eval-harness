@@ -23,18 +23,21 @@ Run these before opening a PR:
 
 ```sh
 pip install -e ".[test]"
-python3 -m py_compile *.py examples/adewale-workspace/*.py
-ty check
+python3 -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
+ty check --error-on-warning
 python3 -m unittest discover tests -v
 ```
 
 (`pytest tests/` also works — `pyproject.toml` carries the pythonpath config — but CI runs `unittest discover`, so keep tests compatible with both.)
 
-`ty check` automatically covers every project-owned top-level Python module plus
-the static contracts under `type_tests/`. A new top-level boundary module enters
-the gate without another registry edit. Keep those contracts precise and do not
-hide diagnostics behind broad rule exclusions, file exclusions, blanket ignores,
-or unsafe casts.
+`ty check` automatically covers every packaged top-level Python module, repository script,
+shipped example, and the static contracts under `type_tests/`. A new runtime boundary module
+enters the gate without another registry edit. `tests/test_type_coverage.py` also requires it to
+enter packaging, semantic identity, and the abstraction docs. Runtime tests are intentionally
+outside the type-check source set because many are negative tests that pass forbidden values to
+prove runtime rejection; they remain linted, compiled, and executed. Keep production contracts
+precise and do not hide diagnostics behind broad rule exclusions, file exclusions, blanket
+ignores, or unsafe casts. See [`docs/typed-python.md`](docs/typed-python.md).
 
 Tests are organized by subject — put new tests where their subject lives: manifest validation/hygiene in `tests/test_manifest.py`, grading in `tests/test_grading.py`, typed domain invariants in the corresponding `tests/test_*_contracts.py`, judge plumbing in `tests/test_judging.py`, report views in `tests/test_reporting.py`, statistics in `tests/test_stats.py`, runner adapters in `tests/test_runners.py`, ablations in `tests/test_ablations.py`, cost telemetry in `tests/test_cost_telemetry.py`, and the CLI/report grab-bag in `tests/test_skill_benchmark.py`. Build fixtures through `tests/helpers.py` (`make_eval_repo`, `write_run`, `result_row`, `stub_claude`) instead of hand-rolling repo/manifest/run-dir scaffolding — the suite once carried ~25 drifting copies of the same builder. If you add a CLI subcommand or assertion type, `tests/test_consolidation_guards.py` will fail until the README documents it; if you move code that docs cite by line, `tests/test_doc_refs.py` tells you the correct numbers and `python3 scripts/fix_doc_refs.py` rewrites them in place; if you add or move a doc and leave a relative link dangling, `tests/test_doc_links.py` fails. The confidence floor (detector fixtures under `tests/fixtures/detectors/`, baseline isolation, idempotence, the no-model/no-network guard) lives in `tests/test_confidence_floor.py` — a new objective assertion type must ship its should-fire/should-pass fixture pair, and a new runner must register its workspace builder.
 

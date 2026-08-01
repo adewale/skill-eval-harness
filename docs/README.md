@@ -46,6 +46,9 @@ Pi, Jetty, subagent, and stub support), [`agent-cli-control-plane.md`](agent-cli
 [`agent-cli-tradeoffs.md`](agent-cli-tradeoffs.md) (Claude/Codex/Gemini/Vibe trade-offs and
 what their gaps mean for reports).
 
+The typed implementation boundary map and extension rules live in
+[`typed-python.md`](typed-python.md).
+
 ## Reference
 
 [`commands.md`](commands.md) is the full per-command reference (flags, examples, output shapes);

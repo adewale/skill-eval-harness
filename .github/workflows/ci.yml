@@ -28,13 +28,13 @@ jobs:
         run: python -m pip install -e ".[test]"
 
       - name: Compile Python files
-        run: python -m py_compile *.py examples/adewale-workspace/*.py
+        run: python -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
 
       - name: Run Ruff
         run: ruff check .
 
       - name: Run ty
-        run: ty check
+        run: ty check --error-on-warning --output-format github
 
       - name: Run unit tests
         run: python -m unittest discover tests -v
@@ -61,7 +61,7 @@ jobs:
         run: python -m pip install -e ".[test]"
 
       - name: Run ty
-        run: ty check
+        run: ty check --error-on-warning --output-format github
 
       - name: Run text-contract tests
         run: python -m unittest discover -s tests -p "test_text_contracts.py" -v

@@ -359,12 +359,19 @@ raw output string
   the same human-text view, including minimum-length and non-vacuity decisions. Protocol and
   machine-identity checks (`golden_output` by default, structured JSON, scripts, command text, tool
   names, and paths) remain exact; graded script scores still cross a finite 0-1 numeric boundary.
-- The project's `ty` gate automatically includes every project-owned top-level Python module,
-  including `text_contracts.py` and `skill_benchmark.py`, plus explicit static contract assertions
-  under `type_tests/`. Constructors, closed unions, return types, and exhaustive consumers are
-  therefore checked without a per-module registration step. That gate complements rather than
-  replaces runtime parsing: manifest dictionaries and external embedding/script values remain
-  untrusted wire data.
+- The project's `ty` gate automatically includes every packaged top-level Python module,
+  repository script, shipped example, and explicit static contract assertion under `type_tests/`.
+  Constructors, closed unions, return types, and exhaustive consumers are therefore checked without
+  a per-module registration step, and warnings fail CI. Runtime tests remain executable negative
+  proofs: many deliberately pass malformed values that production types forbid. The gate
+  complements rather than replaces runtime parsing; manifest dictionaries and external
+  embedding/script values remain untrusted wire data. The complete inventory and extension rule
+  are in [`typed-python.md`](typed-python.md).
+- Packaging inventory, `ty` source coverage, and the versioned trigger-semantic module inventory
+  are separate contracts. A standalone report-only module is excluded from trigger identity, while
+  a declared trigger dependency changes `harness_identity` and blocks causal reuse. The inventory is
+  deliberately conservative at module granularity: because `skill_benchmark.py` still owns both
+  trigger and non-trigger orchestration, any edit to that monolith invalidates trigger evidence.
 - The command line crosses the same kind of boundary. `argparse.Namespace` becomes a frozen
   `ValidatedLegacyCLIInvocation`; commands form a closed enum, paths and domain identities are projected to their
   typed values, numeric limits reject booleans and non-finite/out-of-range values, and dispatch

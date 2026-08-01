@@ -118,6 +118,13 @@ migrate. Keep the old environment for rollback; regenerate stale prepared tasks 
 reports after correcting rejected rows. Do not edit digests, availability, or repetition ids merely
 to make old artifacts pass the new constructors.
 
+Trigger `harness_identity` is now schema version 2 and names a conservative audited module-level
+inventory instead of every packaged module. Version-1 trigger reports must be regenerated before a
+new causal comparison; this deliberate incompatibility refuses to guess equivalence with the old
+overbroad set. Standalone report, judge, CLI, and unsupported-provider modules are excluded, but
+`skill_benchmark.py` remains a monolith shared by trigger and non-trigger orchestration. Any edit to
+that file still invalidates trigger identity until those owners are extracted into separate modules.
+
 #### Prepared task and result identities
 
 Every comparative observation needs one exact identity:
