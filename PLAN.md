@@ -30,7 +30,7 @@ step.
 | Step | Where | Status |
 |---|---|---|
 | 0 — working branch | SANDBOX | **done** |
-| 1 — wire fixtures | SANDBOX | not started |
+| 1 — wire fixtures | SANDBOX | **done** |
 | 2 — failing protocol tests | SANDBOX | not started |
 | 3 — containment posture | SANDBOX | not started |
 | 4 — `agy_contracts.py` | SANDBOX | not started |
@@ -87,6 +87,54 @@ uv pip install --python .venv/bin/python -e ".[test]"
   was written against, so every claim in the Background section about what
   `main` requires is current and no re-survey is needed.
 
+- **F1 (step 1) — `agy` 1.1.9 installs and runs in a sandbox.** The official
+  installer works in a network-restricted container, verifies a sha512 against
+  its manifest, and yields `agy --version` = `1.1.9`. Two consequences: the
+  unauthenticated captures the plan assigns to step 1 are genuinely
+  sandbox-completable, and **parts of steps 9 and 11 that need only an
+  unauthenticated CLI can also be done in a sandbox** — only the token-backed
+  and containment-probe work truly needs a disposable host with credentials.
+
+  Install it somewhere disposable; the installer appends a `PATH` export to
+  `~/.bashrc`, `~/.zshrc` and `~/.profile` unless pointed at a custom dir:
+
+  ```sh
+  curl -fsSL https://antigravity.google/cli/install.sh -o install.sh
+  bash install.sh --dir "$SCRATCH/bin"
+  ```
+
+- **F2 (step 1) — the 1.1.9 flag surface is wider than the plan recorded, and
+  step 7's rejection list is incomplete.** `agy --help` on 1.1.9 confirms every
+  flag the plan names, and additionally shows **short aliases and a `--print`
+  alias the plan never mentions**:
+
+  | flag | meaning |
+  |---|---|
+  | `-c` | short alias for `--continue` |
+  | `-i` | short alias for `--prompt-interactive` |
+  | `-p` | short alias for `--print` |
+  | `--prompt` | alias for `--print` |
+  | `--log-file` | override CLI log file path |
+
+  Step 7 as written rejects `--continue` and `--conversation` by name. That is
+  not sufficient: `-c` contaminates a run with prior conversation state exactly
+  as `--continue` does, and `--prompt`/`-p` can inject a second prompt. **A
+  denylist of long flag names is the wrong shape here** — step 7 should accept
+  one literal executable token (or an explicit allowlist), which rejects all of
+  these by construction and stays correct when 1.1.10 adds another alias.
+
+- **F3 (step 1) — last-flag-wins re-confirmed on 1.1.9.** `agy --output-format
+  text --print hi --output-format stream-json` emitted stream-json. Harness-
+  appended flags still survive a user-supplied launcher prefix, so the residual
+  risk really is flag *addition*, as step 7 states.
+
+- **F4 (step 1) — dash-prefixed prompt binding remains unproven.** `agy --print
+  "--dangerously-skip-permissions" --output-format stream-json` reached the
+  authentication stage rather than failing flag parsing, which is consistent
+  with the value being bound as a prompt — but authentication fails before
+  execution, so this is still not proof. Unchanged from the plan's original
+  assessment; step 10 must re-check it with credentials.
+
 ### Step 0 result — measured 2026-08-01
 
 Branch reset to `upstream/main` `2297000`. All three gates green on that base
@@ -101,6 +149,23 @@ before any agy work:
 The 1286 figure matches the plan's expectation exactly. Note that several tests
 print lines beginning `FAIL:` to stdout while exercising failure paths; these are
 captured output, not test failures. Trust the trailing `OK`.
+
+### Step 1 result — measured 2026-08-01
+
+Thirteen files now live in `tests/fixtures/agy/`: the nine ported from `32a3c11`,
+the three the plan asks for, and a provenance `README.md` in the format
+`tests/fixtures/gemini/README.md` uses.
+
+`stream-json-auth-failure.jsonl` is a **verbatim real capture on `agy` 1.1.9**,
+byte-identical to the captured stdout, taken with no credentials present. It
+reproduces the payload the plan predicted from 1.1.8 exactly — every token
+counter `0`, `"error":"authentication failed or timed out"`, process exit **1**.
+Both D2 and D3 are therefore confirmed against the current release, not inferred.
+
+`stream-json-search-only.jsonl` and `stream-json-multi-model.jsonl` are
+hand-constructed from the 1.1.8 vocabulary and labelled as such in the README,
+which also records the one guessed parameter name (`grep_search`'s `SearchPath`)
+for step 10 to replace.
 
 ---
 
@@ -413,7 +478,11 @@ reports a spurious unresolved-import diagnostic.
 
 ---
 
-### Step 1 — Capture wire fixtures, including the unauthenticated shape [SANDBOX]
+### Step 1 — Capture wire fixtures, including the unauthenticated shape [SANDBOX] — DONE
+
+> See [Step 1 result](#step-1-result--measured-2026-08-01). The auth-failure
+> fixture is a verbatim 1.1.9 capture; D2 and D3 are confirmed against the
+> current release.
 
 Port the nine existing fixtures from the reference branch:
 
@@ -631,6 +700,12 @@ Replace `shlex.split(agy_cmd or AGY_DEFAULT_CMD)` (reference branch
 Accept **one literal executable token** — a path or bare command name, no
 arguments. If a richer form is genuinely needed, define a small typed launcher
 grammar with an allowlist of permitted prefix flags.
+
+> **Finding F2 applies here.** 1.1.9 also exposes `-c` (alias for `--continue`),
+> `-i`, `-p`, `--prompt` (alias for `--print`) and `--log-file`. Rejecting a
+> denylist of long names would let `-c` through and silently contaminate a run.
+> Take the literal-token or allowlist route, which closes all of them at once
+> and does not rot when the next release adds an alias.
 
 The concrete harm is not flag *overriding* — measurement shows last-flag-wins,
 so harness-appended flags survive a prefix. It is flag *addition*: a prefix can
