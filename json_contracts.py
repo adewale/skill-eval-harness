@@ -35,6 +35,35 @@ def validate_json_value(value: Any, label: str) -> None:
     _validate_json_value(value, label, depth=0, ancestors=set())
 
 
+def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise json.JSONDecodeError(f"duplicate object key: {key!r}", "", 0)
+        result[key] = value
+    return result
+
+
+def strict_json_loads(value: str | bytes | bytearray) -> Any:
+    """Parse strict, persistable JSON without last-key-wins shadowing."""
+    def reject_constant(constant: str) -> Any:
+        raise json.JSONDecodeError(
+            f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
+
+    try:
+        parsed = json.loads(
+            value,
+            object_pairs_hook=unique_json_object,
+            parse_constant=reject_constant,
+        )
+        validate_json_value(parsed, "strict JSON")
+        return parsed
+    except json.JSONDecodeError:
+        raise
+    except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+        raise json.JSONDecodeError(str(exc), "", 0) from exc
+
+
 def _validate_json_value(
     value: Any, label: str, *, depth: int, ancestors: set[int],
 ) -> None:
@@ -123,6 +152,22 @@ def freeze_json_mapping(
     if not isinstance(frozen, Mapping):  # pragma: no cover - established above
         raise TypeError(f"{label} must be a mapping")
     return frozen
+
+
+def thaw_json_value(value: Any, label: str = "frozen JSON value") -> Any:
+    """Return a detached mutable JSON wire shape from a validated frozen value."""
+    validate_json_value(value, label)
+    if isinstance(value, Mapping):
+        return {
+            key: thaw_json_value(item, f"{label}.{key}")
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            thaw_json_value(item, f"{label}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    return value
 
 
 def strict_json_equal(left: Any, right: Any) -> bool:

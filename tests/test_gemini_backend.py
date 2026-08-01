@@ -1603,7 +1603,10 @@ class GeminiJudgeBackendTests(unittest.TestCase):
                 "prompt", judge_model="gemini-judge", gemini_cmd="gemini",
                 explore_hint=None)
 
-        self.assertNotEqual(invocation.returncode, 0)
+        self.assertEqual(invocation.returncode, 0)
+        self.assertIs(
+            invocation.invocation_state, sb.InvocationState.PROVIDER_FAILED)
+        self.assertFalse(invocation.succeeded)
         self.assertIn("observed 1 tool lifecycle", invocation.stderr)
 
     def test_programmatic_judge_materializes_registry_default_command(self):

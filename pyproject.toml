@@ -39,34 +39,15 @@ skill-pi-trigger-eval = "run_pi_trigger_eval:main"
 skill-trigger-matrix = "run_trigger_matrix:main"
 
 [tool.setuptools]
-py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model", "agent_capabilities", "telemetry", "trigger_contracts", "trigger_reporting", "trace_contracts", "runner_contracts", "judge_contracts", "judge_verdict", "experimental_pairs", "jetty_contracts", "gemini_contracts", "json_contracts", "text_contracts"]
+py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model", "agent_capabilities", "artifact_contracts", "cli_contracts", "telemetry", "trigger_contracts", "trigger_reporting", "trace_contracts", "runner_contracts", "judge_contracts", "judge_verdict", "experimental_pairs", "jetty_contracts", "gemini_contracts", "grading_contracts", "invocation_contracts", "json_contracts", "manifest_contracts", "report_contracts", "text_contracts"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 
 [tool.ty.src]
-# Project-owned source gate for the central CLI and its type-clean contract,
-# registry, runner, telemetry, and observability seams.
-include = [
-  "agent_capabilities.py",
-  "ablation_model.py",
-  "experimental_pairs.py",
-  "gemini_contracts.py",
-  "jetty_contracts.py",
-  "judge_contracts.py",
-  "judge_verdict.py",
-  "json_contracts.py",
-  "run_pi_trigger_eval.py",
-  "run_trigger_matrix.py",
-  "runner_contracts.py",
-  "skill_benchmark.py",
-  "telemetry.py",
-  "trace_contracts.py",
-  "text_contracts.py",
-  "observability.py",
-  "trigger_contracts.py",
-  "trigger_reporting.py",
-]
+# Production modules, executable tooling, and shipped examples are checked
+# automatically. Type-only assertions pin closed-domain precision/exhaustiveness.
+include = ["*.py", "scripts/**/*.py", "examples/**/*.py", "type_tests/*.py"]
 
 [tool.ruff]
 required-version = "==0.16.0"
@@ -75,9 +56,13 @@ required-version = "==0.16.0"
 # These parsers intentionally normalize every malformed wire/schema value to
 # ValueError as part of their public validation contract.
 "ablation_model.py" = ["F401", "TRY004"]
-"experimental_pairs.py" = ["TRY004"]
+"experimental_pairs.py" = ["PYI034", "TRY004"]
 "gemini_contracts.py" = ["TRY004"]
+"grading_contracts.py" = ["PYI034", "TRY004"]
 "judge_verdict.py" = ["TRY004"]
+"invocation_contracts.py" = ["PYI034", "TRY004"]
+"manifest_contracts.py" = ["PYI034", "TRY004"]
+"report_contracts.py" = ["PYI034", "TRY004"]
 "runner_contracts.py" = ["TRY004"]
 "telemetry.py" = ["TRY004"]
 # Runner boundaries must report arbitrary provider/CLI failures as evaluation

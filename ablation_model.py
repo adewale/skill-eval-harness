@@ -40,6 +40,16 @@ from typing import Any
 
 from agent_capabilities import BACKENDS
 from json_contracts import freeze_json_value
+from manifest_contracts import (
+    ABLATION_VARIANT_PREFIX,
+    CaseId,
+    CaseKind,
+    ExecutionVariant,
+    RunNumber,
+    Split,
+    ablation_id_of,
+    is_ablation_variant,
+)
 
 
 def _require(d: dict[str, Any], key: str, types: type | tuple[type, ...], ctx: str) -> Any:
@@ -192,22 +202,6 @@ class EvidenceClass(str, Enum):
     @property
     def is_confirmation(self) -> bool:
         return self is EvidenceClass.CONFIRMED_CAUSAL
-
-
-# The `ablation:<id>` variant-name encoding. These two helpers are the ONLY
-# reading of that prefix — every consumer (variant instructions, prepared rows,
-# cost ledgers, audits) routes through them instead of re-spelling
-# `variant.split(":", 1)[1]` inline (~14 copies before this owner existed).
-ABLATION_VARIANT_PREFIX = "ablation:"
-
-
-def is_ablation_variant(variant: Any) -> bool:
-    return str(variant).startswith(ABLATION_VARIANT_PREFIX)
-
-
-def ablation_id_of(variant: Any) -> str | None:
-    """The <id> of an `ablation:<id>` variant name, else None."""
-    return str(variant).split(":", 1)[1] if is_ablation_variant(variant) else None
 
 
 # The evidence label a whole autonomous-trigger REPORT carries. Per-row
@@ -677,11 +671,11 @@ class PreparedTask:
     from_row() reconstructs the typed task on the far side of that boundary. The row
     dict is the only thing that crosses to disk — the type is the in-process owner."""
 
-    case_id: str
-    split: str
-    kind: str
-    variant_truth: str
-    run_number: int
+    case_id: CaseId
+    split: Split
+    kind: CaseKind
+    variant_truth: ExecutionVariant
+    run_number: RunNumber
     skill_name: str
     repo_root: str
     skill_paths: tuple[str, ...]
@@ -696,22 +690,18 @@ class PreparedTask:
     skill_root_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for label, value in (("case_id", self.case_id), ("kind", self.kind),
+        object.__setattr__(self, "case_id", CaseId.parse(self.case_id))
+        object.__setattr__(self, "split", Split.parse(self.split))
+        object.__setattr__(self, "kind", CaseKind.parse(self.kind))
+        object.__setattr__(self, "variant_truth", ExecutionVariant.parse(self.variant_truth))
+        object.__setattr__(self, "run_number", RunNumber.parse(self.run_number))
+        for label, value in (("kind", self.kind),
                              ("skill_name", self.skill_name), ("repo_root", self.repo_root),
                              ("run_dir", self.run_dir)):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"PreparedTask.{label} must be non-empty")
-        if self.split not in {"tune", "holdout", "holdback"}:
-            raise ValueError("PreparedTask.split must be tune, holdout, or holdback")
-        if (isinstance(self.run_number, bool) or not isinstance(self.run_number, int)
-                or self.run_number < 1):
-            raise ValueError("PreparedTask.run_number must be a positive integer")
         if self.kind == "trigger":
             raise ValueError("PreparedTask is answer-population only; trigger cases use autonomous runners")
-        if not isinstance(self.variant_truth, str) or not self.variant_truth:
-            raise ValueError("PreparedTask.variant must be non-empty")
-        if self.variant_truth not in {"with_skill", "without_skill", "old_skill"} and not is_ablation_variant(self.variant_truth):
-            raise ValueError("PreparedTask.variant is not a supported execution arm")
         run_path = Path(self.run_dir)
         if run_path.is_absolute() or run_path == Path(".") or ".." in run_path.parts:
             raise ValueError("PreparedTask.run_dir must be a safe non-root relative path")
@@ -778,10 +768,10 @@ class PreparedTask:
         return self._experiment_arm().blind
 
     # --- model-facing surface (blinded) ---
-    def model_facing_variant(self) -> str:
+    def model_facing_variant(self) -> ExecutionVariant:
         """The variant the model may see: with_skill for a blind (materialized) arm,
         otherwise the true variant (instruction-simulated tells the model what to do)."""
-        return self._experiment_arm().model_visible_variant()
+        return ExecutionVariant.parse(self._experiment_arm().model_visible_variant())
 
     def upload_token(self) -> str:
         """Opaque, deterministic token for any ablation (path hygiene): a
@@ -833,11 +823,11 @@ class PreparedTask:
             collections[key] = tuple(raw)
         ctx = "PreparedTask row"
         return cls(
-            case_id=_require(row, "case_id", str, ctx),
-            split=_require(row, "split", str, ctx),
-            kind=row.get("kind", "behavior"),
-            variant_truth=str(row.get("variant")),
-            run_number=_require(row, "run_number", int, ctx),
+            case_id=CaseId.parse(_require(row, "case_id", str, ctx)),
+            split=Split.parse(_require(row, "split", str, ctx)),
+            kind=CaseKind.parse(row.get("kind", "behavior")),
+            variant_truth=ExecutionVariant.parse(row.get("variant")),
+            run_number=RunNumber.parse(_require(row, "run_number", int, ctx)),
             skill_name=_require(row, "skill_name", str, ctx),
             repo_root=_require(row, "repo_root", str, ctx),
             skill_paths=collections["skill_paths"],

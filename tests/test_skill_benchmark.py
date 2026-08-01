@@ -29,7 +29,8 @@ class SkillBenchmarkTests(unittest.TestCase):
     def test_central_cli_remains_in_the_project_ty_gate(self):
         project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         ty_sources = project.split("[tool.ty.src]", 1)[1].split("\n[", 1)[0]
-        self.assertIn('"skill_benchmark.py"', ty_sources)
+        self.assertIn('"*.py"', ty_sources)
+        self.assertIn('"type_tests/*.py"', ty_sources)
         self.assertNotIn("check_ty_regressions", project)
 
     def test_infra_failure_excluded_from_every_report_view(self):

@@ -16,6 +16,13 @@ tasks, autonomous-trigger work, and static checks. Commands can run on different
 days apart, and several commands call the same grading owner directly rather than
 consume another command's report.
 
+Every `skill-benchmark` entrypoint crosses one typed boundary before entering this graph.
+`argparse.Namespace` is parsed into a frozen `ValidatedLegacyCLIInvocation`: the command is a closed
+`CLICommand`, paths are `Path` values, and split, variant, model, and numeric domains are
+validated once. Dispatch then proves that every parser command has exactly one handler owner.
+Established handlers still receive a freshly thawed Namespace through one explicit compatibility
+adapter; typed projections migrate handler by handler rather than being silently discarded.
+
 ```mermaid
 flowchart LR
     M[Manifest\nshared-benchmark.json] --> V[validate]
@@ -126,9 +133,13 @@ dimension in the fan-out (`case × variant × model × run`), not a new kind of 
 report then groups `by_model` and computes lift per (case, model) — see `model_analysis`.
 
 Before any lift, reliability, cost delta, or token-overhead value is computed, result rows become
-`ExperimentalPairKey(case, model, repetition, population)` arms. Only a validated pair with exactly
-one `with_skill` and one `without_skill` arm can contribute. Missing/ineligible arms remain blocked
-diagnostics, and duplicate identities fail instead of overwriting an earlier row. Telemetry then
+`ExperimentalPairKey(case, model, repetition, population)` arms under an explicit binary
+`ContrastSpec`. Only a validated pair with exactly one declared treatment and control arm can
+contribute. The default contrast preserves `with_skill`/`without_skill`; its canonical factor
+coordinates keep activation, skill-set, and content-revision axes distinct for future contrasts.
+Missing/ineligible arms remain blocked
+diagnostics with their `contrast_id`; a comparison result is identified by `(contrast_id, pair_key)`,
+and duplicate identities fail instead of overwriting an earlier row. Telemetry then
 adds its stricter provenance/unit/billing-basis comparison.
 
 ## Typed trust boundaries
@@ -140,6 +151,11 @@ the interior. Each external boundary has one parser and a closed value:
 prepared row -> PreparedTaskDraft -> PreparedTask
 provider result -> Completed | TimedOut | SpawnFailed | ProviderFailed
 run evidence -> process × provider-response × trace × artifact-set state
+artifact set -> Legacy | MissingCommit | InvalidCommit | Incomplete | Complete
+event log -> Missing | Invalid | Loaded
+assertion result -> Satisfied | Failed | Unavailable | Skipped
+report coverage -> Empty | Complete | Partial
+qualitative work -> JudgeTask
 judge process -> JudgeInvocation
 judge row -> Boolean | Scored | Dimension | Dynamic | Consensus verdict
 trace status -> Completed | InProgress | Failed | Unknown

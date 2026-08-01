@@ -40,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
@@ -58,6 +58,7 @@ from yaml.constructor import ConstructorError
 from yaml.resolver import BaseResolver
 
 import experimental_pairs as pair_domain
+import report_contracts as report_domain
 import telemetry as telemetry_domain
 from ablation_model import (
     CLAUDE_FAILURE,
@@ -117,7 +118,33 @@ from agent_capabilities import (
     trace_dialect_implementations,
     workspace_builder_implementations,
 )
+from artifact_contracts import (
+    ARTIFACT_COMMIT_NAME,
+    ARTIFACT_CONTRACT_VERSION,
+    ARTIFACT_REQUIRED_FILES,
+    CompleteArtifactSet,
+    LegacyArtifactSet,
+    artifact_commit_valid,
+    observe_artifact_set,
+)
+from cli_contracts import CLICommand, CLIInvocation
 from gemini_contracts import GeminiJsonResponse, GeminiStream
+from grading_contracts import (
+    FailedAssertion,
+    JudgeTask,
+    OracleTier,
+    SatisfiedAssertion,
+    Severity,
+    SkippedAssertion,
+    UnavailableAssertion,
+    assertion_observation_from_row,
+)
+from invocation_contracts import (
+    InvocationRequest,
+    InvocationResult,
+    InvocationState,
+    ProcessInvocationPlan,
+)
 from jetty_contracts import (
     JettyObservation,
     ProtocolInvalid,
@@ -125,7 +152,9 @@ from jetty_contracts import (
     lifecycle_from_status,
 )
 from json_contracts import (
-    freeze_json_mapping,
+    strict_json_loads,
+    thaw_json_value,
+    unique_json_object,
     validate_json_text,
     validate_json_value,
 )
@@ -136,6 +165,16 @@ from judge_verdict import (
     validated_result_row,
     verdict_fields,
     verdict_from_dict,
+)
+from manifest_contracts import (
+    DEFAULT_EXECUTION_VARIANTS,
+    CaseId,
+    CaseKind,
+    CasePopulation,
+    ExecutionVariant,
+    ModelId,
+    RunNumber,
+    Split,
 )
 from text_contracts import (
     ComparisonProfile,
@@ -150,10 +189,17 @@ from text_contracts import (
     comparison_note,
     parse_human_text_assertion,
 )
-from trace_contracts import EventState, event_is_completed, parse_event_state
+from trace_contracts import (
+    EventLogObservation,
+    EventState,
+    InvalidEventLog,
+    MissingEventLog,
+    event_is_completed,
+    parse_event_log,
+    parse_event_state,
+)
 from trigger_contracts import (
     InvocationOutcome,
-    InvocationState,
     TraceEventKind,
     TriggerDetection,
     TriggerEvidenceKind,
@@ -162,16 +208,32 @@ from trigger_contracts import (
 )
 from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 
-VALID_SPLITS = {"tune", "holdout", "holdback"}
-HARNESS_SEMANTIC_MODULES = (
-    "ablation_model.py", "agent_capabilities.py", "experimental_pairs.py",
-    "gemini_contracts.py",
-    "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "run_pi_trigger_eval.py",
-    "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
-    "telemetry.py", "trace_contracts.py", "trigger_contracts.py",
+VALID_SPLITS = frozenset(Split.values())
+TRIGGER_HARNESS_IDENTITY_VERSION = 2
+# Conservative at module granularity: skill_benchmark.py still combines trigger
+# and non-trigger orchestration, so every edit to that monolith invalidates the
+# trigger identity until its owners are extracted.
+TRIGGER_IDENTITY_MODULES = (
+    "ablation_model.py",
+    "agent_capabilities.py",
+    "experimental_pairs.py",
+    "invocation_contracts.py",
+    "json_contracts.py",
+    "manifest_contracts.py",
+    "run_pi_trigger_eval.py",
+    "run_trigger_matrix.py",
+    "skill_benchmark.py",
+    "telemetry.py",
+    "trace_contracts.py",
+    "trigger_contracts.py",
     "trigger_reporting.py",
 )
-DEFAULT_VARIANTS = ["with_skill", "without_skill"]
+# Compatibility names for code that inspected earlier trigger identity owners.
+TRIGGER_SEMANTIC_MODULES = TRIGGER_IDENTITY_MODULES
+HARNESS_SEMANTIC_MODULES = TRIGGER_IDENTITY_MODULES
+DEFAULT_VARIANTS = list(DEFAULT_EXECUTION_VARIANTS)
+_ResultPair = pair_domain.ExperimentalPair[Mapping[str, Any]]
+_ResultPairConstruction = pair_domain.PairConstruction[Mapping[str, Any]]
 TEXT_ASSERTIONS = {
     "contains",
     "contains_any",
@@ -211,8 +273,8 @@ EFFICIENCY_ASSERTIONS = {
 }
 OBJECTIVE_ASSERTIONS = TEXT_ASSERTIONS | PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS
 QUALITATIVE_ASSERTIONS = {"judge", "rubric", "factuality"}
-SEVERITIES = {"critical", "gate", "soft"}
-ORACLE_TIERS = {"strong", "demo", "live"}
+SEVERITIES = {item.value for item in Severity}
+ORACLE_TIERS = {item.value for item in OracleTier}
 ASSERTION_COMMON_FIELDS = {
     "type", "name", "description", "ci", "severity", "critical", "gate",
     "soft", "oracle", "variants", "only_variants", "except_variants",
@@ -338,37 +400,6 @@ def oracle_tier(assertion: dict[str, Any]) -> str:
 def die(msg: str) -> NoReturn:
     print(f"FAIL: {msg}", file=sys.stderr)
     raise SystemExit(1)
-
-
-def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise json.JSONDecodeError(f"duplicate object key: {key!r}", "", 0)
-        result[key] = value
-    return result
-
-
-def strict_json_loads(value: str | bytes | bytearray) -> Any:
-    """Parse JSON without allowing last-key-wins shadowing."""
-    def reject_constant(constant: str) -> Any:
-        raise json.JSONDecodeError(
-            f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
-
-    try:
-        parsed = json.loads(
-            value, object_pairs_hook=_unique_json_object,
-            parse_constant=reject_constant)
-        reject_nonfinite_numbers(parsed)
-        validate_json_value(parsed, "strict JSON")
-        return parsed
-    except json.JSONDecodeError:
-        raise
-    except (OverflowError, RecursionError, TypeError, ValueError) as exc:
-        # Keep one stable exception surface for every syntactic, resource, and
-        # strict-persistability rejection so legacy callers cannot accidentally
-        # turn a new validation rule into an uncaught traceback.
-        raise json.JSONDecodeError(str(exc), "", 0) from exc
 
 
 def reject_nonfinite_numbers(value: Any, *, location: str = "$") -> None:
@@ -598,7 +629,11 @@ def is_trigger_case(case: dict[str, Any]) -> bool:
     output is a raw_autonomous_trigger_measurement — a different population from
     answer runs. Every grading path (benchmark, grade, judge) must exclude them
     through THIS predicate so the boundary cannot drift per-command."""
-    return case.get("kind") == "trigger"
+    try:
+        kind = CaseKind.parse(case.get("kind", "behavior"))
+    except ValueError:
+        return False
+    return kind.population is CasePopulation.TRIGGER
 
 
 def is_judge_only_case(case: dict[str, Any]) -> bool:
@@ -1216,10 +1251,14 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         if cid in seen:
             die(f"duplicate case id: {cid}")
         seen.add(cid)
+        try:
+            case_kind = CaseKind.parse(case.get("kind", "behavior"))
+        except ValueError:
+            die(f"{cid}: kind must be a non-empty string")
         split = case.get("split")
         if split not in VALID_SPLITS:
             die(f"{cid}: split must be one of {sorted(VALID_SPLITS)}")
-        trigger_case = is_trigger_case(case)
+        trigger_case = case_kind.population is CasePopulation.TRIGGER
         if trigger_case:
             if not isinstance(case.get("should_trigger"), bool):
                 die(f"{cid}: trigger cases require an explicit boolean should_trigger")
@@ -1411,15 +1450,21 @@ def variant_instruction(variant: str, manifest: dict[str, Any], repo_root: Path 
     return f"Run variant {variant}."
 
 
-def task_variants(manifest: dict[str, Any], *, include_old_skill: bool = False, include_ablations: bool = False) -> list[str]:
-    variants = list(manifest.get("variants", DEFAULT_VARIANTS))
+def task_variants(manifest: dict[str, Any], *, include_old_skill: bool = False, include_ablations: bool = False) -> list[ExecutionVariant]:
+    variants = [
+        ExecutionVariant.parse(value)
+        for value in manifest.get("variants", DEFAULT_VARIANTS)
+    ]
     if include_old_skill:
         old_paths = manifest.get("old_skill_paths") or []
         if not old_paths:
             die("--include-old-skill requires manifest.old_skill_paths to be populated")
-        variants.append("old_skill")
+        variants.append(ExecutionVariant("old_skill"))
     if include_ablations:
-        variants.extend(f"ablation:{a['id']}" for a in manifest.get("ablations", []))
+        variants.extend(
+            ExecutionVariant.ablation(ablation["id"])
+            for ablation in manifest.get("ablations", [])
+        )
     return variants
 
 
@@ -1669,7 +1714,7 @@ def prepared_task_rows(
                         split=case["split"],
                         kind=case.get("kind", "behavior"),
                         variant_truth=variant,
-                        run_number=run_number,
+                        run_number=RunNumber(run_number),
                         skill_name=manifest["skill_name"],
                         repo_root=str(repo_root),
                         skill_paths=tuple(skill_paths),
@@ -2934,14 +2979,17 @@ def trigger_harness_identity() -> dict[str, Any]:
     """Identity of every local module that can change trigger evidence semantics."""
     module_dir = Path(__file__).resolve().parent
     modules: dict[str, str] = {}
-    for name in HARNESS_SEMANTIC_MODULES:
+    for name in TRIGGER_IDENTITY_MODULES:
         path = module_dir / name
         try:
             content = path.read_bytes()
         except OSError as exc:
             raise RuntimeError(f"cannot identify trigger dependency {name}: {exc}") from exc
         modules[name] = "sha256:" + hashlib.sha256(content).hexdigest()
-    payload = {"schema_version": 1, "modules": modules}
+    payload = {
+        "schema_version": TRIGGER_HARNESS_IDENTITY_VERSION,
+        "modules": modules,
+    }
     return {**payload, "identity_sha256": canonical_json_sha256(payload)}
 
 
@@ -2950,13 +2998,15 @@ def validate_trigger_harness_identity(identity: Any, label: str) -> dict[str, An
     if not isinstance(identity, dict):
         raise TypeError(f"{label} harness_identity must be an object")
     payload = {key: value for key, value in identity.items() if key != "identity_sha256"}
-    if (identity.get("schema_version") != 1
+    if (type(identity.get("schema_version")) is not int
+            or identity.get("schema_version") != TRIGGER_HARNESS_IDENTITY_VERSION
             or canonical_json_sha256(payload) != identity.get("identity_sha256")):
         raise ValueError(f"{label} harness_identity does not match its identity_sha256")
     modules = identity.get("modules")
-    if not isinstance(modules, dict) or set(modules) != set(HARNESS_SEMANTIC_MODULES):
+    if not isinstance(modules, dict) or set(modules) != set(TRIGGER_IDENTITY_MODULES):
         raise ValueError(
-            f"{label} harness_identity must identify exactly {list(HARNESS_SEMANTIC_MODULES)}")
+            f"{label} harness_identity must identify exactly "
+            f"{list(TRIGGER_IDENTITY_MODULES)}")
     if any(not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
            for digest in modules.values()):
         raise ValueError(f"{label} harness_identity contains an invalid module digest")
@@ -6242,13 +6292,14 @@ def read_output(runs: Path, case_id: str, variant: str) -> tuple[str | None, Pat
 
 
 def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str, Any]:
-    marker_present = (base / ARTIFACT_COMMIT_NAME).exists()
-    contract_declared = data.get("artifact_contract_version") == ARTIFACT_CONTRACT_VERSION
-    if not marker_present and not contract_declared:
+    declared_version = data.get("artifact_contract_version")
+    observation = observe_artifact_set(
+        base, declared_contract_version=declared_version)
+    if isinstance(observation, LegacyArtifactSet):
         error = metadata_lifecycle_error(data)
         return ({**data, "metadata_error": error, "metadata_artifact_valid": False}
                 if error else data)
-    committed = marker_present and contract_declared and artifact_commit_valid(base)
+    committed = isinstance(observation, CompleteArtifactSet)
     current = telemetry_domain.ObservationEvidence.from_run(data)
     evidence = telemetry_domain.ObservationEvidence(
         current.process, current.provider_response, current.trace,
@@ -6256,6 +6307,9 @@ def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str
     )
     enriched = dict(data)
     enriched["artifact_set_complete"] = committed
+    enriched["artifact_set_state"] = observation.state.value
+    if not committed:
+        enriched["artifact_set_error"] = observation.reason
     enriched["observation_evidence"] = evidence.to_dict()
     envelope = enriched.get("telemetry")
     if isinstance(envelope, dict):
@@ -6289,26 +6343,28 @@ def read_json_dict_or_list(path: Path) -> Any:
         return {"_error": f"invalid JSON in {path.name}: {exc}"}
 
 
+def read_event_log_base(base: Path) -> EventLogObservation:
+    path = base / "events.json"
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return MissingEventLog()
+    except OSError as exc:
+        return InvalidEventLog(f"could not read events.json: {exc}")
+    try:
+        raw = strict_json_loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return InvalidEventLog(f"invalid JSON in events.json: {exc}")
+    return parse_event_log(raw)
+
+
 def read_events_base(base: Path) -> tuple[list[dict[str, Any]] | None, str | None]:
-    data = read_json_dict_or_list(base / "events.json")
-    if data is None:
-        return None, "missing events.json"
-    if isinstance(data, dict) and data.get("_error"):
-        return None, str(data["_error"])
-    version = data.get("schema_version") if isinstance(data, dict) else None
-    if version not in {None, 1, 2}:
-        return None, f"unsupported events.json schema_version {version!r}"
-    events = data.get("events") if isinstance(data, dict) else data
-    if not isinstance(events, list) or not all(isinstance(e, dict) for e in events):
-        return None, "events.json must contain an events list"
-    if version in {None, 1}:
-        events = [
-            ({**event, "status": EventState.COMPLETED.value,
-              "state_source": "legacy_assumed_completed"}
-             if event.get("status") is None else event)
-            for event in events
-        ]
-    return events, None
+    observation = read_event_log_base(base)
+    if isinstance(observation, MissingEventLog):
+        return None, observation.reason
+    if isinstance(observation, InvalidEventLog):
+        return None, observation.reason
+    return [thaw_json_value(event, "event log entry") for event in observation.events], None
 
 
 def read_metrics_base(base: Path) -> dict[str, Any]:
@@ -6506,13 +6562,20 @@ def mount_skill_tree(tree_dir: Path, skills_dir: Path) -> list[Path]:
     return copied
 
 
-def invoke_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
-                             env: dict[str, str] | None = None, timeout: int,
-                             input_text: str | None = None) -> InvocationOutcome:
+def invoke_argv_with_timeout(plan: ProcessInvocationPlan) -> InvocationOutcome:
     """Typed subprocess owner for every spawned runner/adapter process.
 
-    Completion state is classified once here. Consumers cannot independently
-    assemble contradictory returncode/timeout/completeness booleans."""
+    The owner accepts one fully validated plan, so internal callers cannot
+    bypass cwd, timeout, argv, environment, or stdin construction. Completion
+    state is classified once here; consumers cannot independently assemble
+    contradictory returncode/timeout/completeness booleans."""
+    if not isinstance(plan, ProcessInvocationPlan):
+        raise TypeError("invoke_argv_with_timeout requires a ProcessInvocationPlan")
+    argv = list(plan.argv)
+    cwd = plan.cwd
+    env = None if plan.environment is None else dict(plan.environment)
+    timeout = int(plan.timeout_s)
+    input_text = plan.input_text
     def _wire_text(value: Any) -> tuple[str, bool]:
         if value is None:
             return "", True
@@ -6701,9 +6764,14 @@ def run_argv_with_timeout(argv: list[str], *, cwd: Path | str | None = None,
                           env: dict[str, str] | None = None, timeout: int,
                           input_text: str | None = None) -> dict[str, Any]:
     """Legacy dictionary boundary for external callers; internal code uses the typed owner."""
-    return invoke_argv_with_timeout(
-        argv, cwd=cwd, env=env, timeout=timeout, input_text=input_text,
-    ).as_legacy_dict()
+    plan = ProcessInvocationPlan.from_values(
+        argv,
+        input_text=input_text,
+        cwd=Path.cwd() if cwd is None else cwd,
+        timeout_s=timeout,
+        environment=env,
+    )
+    return invoke_argv_with_timeout(plan).as_legacy_dict()
 
 
 def regex_hit(pattern: str, text: str, ci: bool = True) -> bool:
@@ -8465,11 +8533,6 @@ def final_answer_from_events(events: dict[str, Any]) -> str:
     return ""
 
 
-ARTIFACT_COMMIT_NAME = "artifact-commit.json"
-ARTIFACT_CONTRACT_VERSION = 1
-ARTIFACT_REQUIRED_FILES = ("output.md", "events.json", "metrics.json", "metadata.json")
-
-
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -8493,42 +8556,6 @@ def write_artifact_commit(run_dir: Path) -> None:
         "required_files": list(ARTIFACT_REQUIRED_FILES),
         "inventory_sha256": inventory,
     })
-
-
-def artifact_commit_valid(run_dir: Path) -> bool:
-    path = run_dir / ARTIFACT_COMMIT_NAME
-    try:
-        raw = strict_json_loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(raw, dict) or raw.get("schema_version") != ARTIFACT_CONTRACT_VERSION:
-        return False
-    required = raw.get("required_files")
-    inventory = raw.get("inventory_sha256")
-    if required != list(ARTIFACT_REQUIRED_FILES) or not isinstance(inventory, dict):
-        return False
-    if any(not isinstance(name, str) or not isinstance(digest, str)
-           or Path(name).is_absolute() or ".." in Path(name).parts
-           for name, digest in inventory.items()):
-        return False
-    if any(name not in inventory for name in ARTIFACT_REQUIRED_FILES):
-        return False
-    try:
-        actual_files = {
-            candidate.relative_to(run_dir).as_posix()
-            for candidate in run_dir.rglob("*")
-            if candidate.name != ARTIFACT_COMMIT_NAME and candidate.is_file()
-            and not candidate.is_symlink()
-        }
-        if actual_files != set(inventory):
-            return False
-        if any(candidate.is_symlink() for candidate in run_dir.rglob("*")):
-            return False
-        return all(
-            (run_dir / name).is_file() and _file_sha256(run_dir / name) == digest
-            for name, digest in inventory.items())
-    except OSError:
-        return False
 
 
 def _install_staged_run(run_dir: Path, staged: Path) -> None:
@@ -8846,84 +8873,6 @@ def build_task_prompt(pt: PreparedTask, skill_paths: list[str] | None = None, in
     )
 
 
-@_dataclass(frozen=True)
-class InvocationRequest:
-    """Provider-neutral request handed to an agent backend.
-
-    The harness owns workspace construction and output writing. A backend owns
-    only the invocation wire format: argv/env/stdout parsing. Keeping that seam
-    small makes Claude/Codex parity testable without live model calls."""
-
-    prompt: str
-    workspace: Path
-    model: str | None
-    timeout_s: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.prompt, str):
-            raise TypeError("invocation prompt must be text")
-        validate_json_text(self.prompt, "invocation prompt")
-        if not isinstance(self.workspace, Path):
-            raise TypeError("invocation workspace must be a Path")
-        if self.model is not None and (
-                not isinstance(self.model, str) or not self.model.strip()):
-            raise ValueError("invocation model must be non-empty text or None")
-        if self.model is not None:
-            validate_json_text(self.model, "invocation model")
-        if (isinstance(self.timeout_s, bool)
-                or not isinstance(self.timeout_s, int)
-                or self.timeout_s <= 0):
-            raise ValueError("invocation timeout_s must be a positive integer")
-
-
-@_dataclass(frozen=True)
-class InvocationResult:
-    stdout: str
-    stderr: str
-    returncode: int
-    elapsed_ms: int
-    invocation_state: InvocationState
-    stdout_utf8_valid: bool
-    stderr_utf8_valid: bool
-    timed_out: bool = False
-    adapter_metadata: Mapping[str, Any] | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
-            raise TypeError("invocation stdout and stderr must be text")
-        validate_json_text(self.stdout, "invocation stdout")
-        validate_json_text(self.stderr, "invocation stderr")
-        if type(self.returncode) is not int:
-            raise TypeError("invocation returncode must be an integer")
-        if (isinstance(self.elapsed_ms, bool) or not isinstance(self.elapsed_ms, int)
-                or self.elapsed_ms < 0 or self.elapsed_ms > 2**63 - 1):
-            raise ValueError("invocation elapsed_ms must be a non-negative integer")
-        if not isinstance(self.invocation_state, InvocationState):
-            raise TypeError("invocation_state must be InvocationState")
-        if not isinstance(self.stdout_utf8_valid, bool) or not isinstance(
-                self.stderr_utf8_valid, bool):
-            raise TypeError("invocation UTF-8 validity fields must be boolean")
-        if not isinstance(self.timed_out, bool):
-            raise TypeError("invocation timed_out must be boolean")
-        expected = {
-            InvocationState.COMPLETE: (0, False),
-            InvocationState.TIMED_OUT: (124, True),
-            InvocationState.SPAWN_FAILED: (127, False),
-        }
-        if self.invocation_state in expected:
-            code, timed_out = expected[self.invocation_state]
-            if self.returncode != code or self.timed_out is not timed_out:
-                raise ValueError("invocation state contradicts returncode/timed_out")
-        elif self.invocation_state is InvocationState.PROCESS_FAILED:
-            if self.returncode == 0 or self.timed_out:
-                raise ValueError("process failure requires nonzero exit without timeout")
-        else:
-            raise ValueError("InvocationResult requires a process-boundary state")
-        if self.adapter_metadata is not None:
-            object.__setattr__(self, "adapter_metadata", freeze_json_mapping(
-                self.adapter_metadata, "invocation adapter metadata"))
-
-
 def coerce_text(value: Any) -> str:
     if value is None:
         return ""
@@ -8932,7 +8881,7 @@ def coerce_text(value: Any) -> str:
     return str(value)
 
 
-def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeout: int, env: dict[str, str] | None = None) -> InvocationResult:
+def run_argv_capture(plan: ProcessInvocationPlan) -> InvocationResult:
     """Native agent adapter wrapper over the one subprocess owner.
 
     Correctness-by-construction boundary: callers must choose an explicit cwd,
@@ -8940,7 +8889,9 @@ def run_argv_capture(argv: list[str], *, input_text: str, cwd: Path | str, timeo
     `run_argv_with_timeout` owns spawn failure, process-group timeout cleanup,
     stderr capping, elapsed time, and returncode shape; this function only adapts
     that dict contract into `InvocationResult`."""
-    outcome = invoke_argv_with_timeout(argv, input_text=input_text, cwd=cwd, env=env, timeout=timeout)
+    if not isinstance(plan, ProcessInvocationPlan):
+        raise TypeError("run_argv_capture requires a ProcessInvocationPlan")
+    outcome = invoke_argv_with_timeout(plan)
     if outcome.returncode is None or outcome.elapsed_ms is None:
         raise RuntimeError("subprocess owner returned a non-process invocation outcome")
     return InvocationResult(stdout=outcome.stdout,
@@ -9690,12 +9641,15 @@ def probe_gemini_cli_version(
         return {"gemini_cli_version_status": "unavailable",
                 "gemini_cli_version_error": "command prefix unavailable"}
     command_prefix = argv[:prompt_index]
-    outcome = invoke_argv_with_timeout(
-        [*command_prefix, "--version"], cwd=cwd, env=env,
-        timeout=max(1, min(timeout, 10)), input_text="",
-    )
-    stdout_utf8_valid = outcome.metadata.get("stdout_utf8_valid") is not False
-    stderr_utf8_valid = outcome.metadata.get("stderr_utf8_valid") is not False
+    outcome = run_argv_capture(ProcessInvocationPlan.from_values(
+        [*command_prefix, "--version"],
+        cwd=cwd,
+        environment=env,
+        timeout_s=max(1, min(timeout, 10)),
+        input_text="",
+    ))
+    stdout_utf8_valid = outcome.stdout_utf8_valid
+    stderr_utf8_valid = outcome.stderr_utf8_valid
     validity = {
         "gemini_cli_version_stdout_utf8_valid": stdout_utf8_valid,
         "gemini_cli_version_stderr_utf8_valid": stderr_utf8_valid,
@@ -9885,10 +9839,13 @@ def gemini_cli_invoke(
                 setup_phase = "provider invocation"
                 version_meta = probe_gemini_cli_version(
                     argv, cwd=workspace, env=env, timeout=timeout)
-                result = run_argv_capture(
-                    argv, input_text="", cwd=workspace, env=env,
-                    timeout=timeout,
-                )
+                result = run_argv_capture(ProcessInvocationPlan.from_values(
+                    argv,
+                    input_text="",
+                    cwd=workspace,
+                    environment=env,
+                    timeout_s=timeout,
+                ))
     except (OSError, RuntimeError) as exc:
         # Setup failures are closed no-process observations. Do not leak the
         # exception's credential/policy path text into durable artifacts.
@@ -10219,7 +10176,13 @@ def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | No
                     "model": model, "trace_text": "",
                     "invocation_state": InvocationState.SPAWN_FAILED.value,
                     "environment": env_meta}
-        result = run_argv_capture(argv, input_text="", cwd=workspace, env=env, timeout=timeout)
+        result = run_argv_capture(ProcessInvocationPlan.from_values(
+            argv,
+            input_text="",
+            cwd=workspace,
+            environment=env,
+            timeout_s=timeout,
+        ))
     messages, parse_errors = (
         parse_vibe_messages_with_errors(result.stdout)
         if result.stdout_utf8_valid
@@ -10467,7 +10430,12 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
                 prov_extra["skill_tree_hash"] = attestation.mounted_skill_tree_hash
             prov_extra["fixture_tree_hash"] = attestation.fixture_tree_hash
             prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
-            outcome = backend.invoke_answer(InvocationRequest(prompt=prompt, workspace=ws, model=row_model, timeout_s=timeout), **options)
+            outcome = backend.invoke_answer(InvocationRequest.parse(
+                prompt=prompt,
+                workspace=ws,
+                model=row_model,
+                timeout_s=timeout,
+            ), **options)
         context = outcome_context(outcome)
         env = dict(context.environment or {})
         env.setdefault("runner", backend.name)
@@ -10623,7 +10591,12 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
         argv += list(extra_args)
 
     def invoke(cwd_path: Path | str) -> InvocationResult:
-        return run_argv_capture(argv, input_text=prompt, cwd=cwd_path, timeout=timeout)
+        return run_argv_capture(ProcessInvocationPlan.from_values(
+            argv,
+            input_text=prompt,
+            cwd=cwd_path,
+            timeout_s=timeout,
+        ))
 
     if cwd is None:
         with tempfile.TemporaryDirectory(prefix="claude-invoke-cwd-") as td:
@@ -10954,7 +10927,13 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
                 argv += ["--output-schema", str(schema_path)]
         if "-" not in argv:
             argv.append("-")
-        result = run_argv_capture(argv, input_text=prompt, cwd=invoke_cwd, env=env, timeout=timeout)
+        result = run_argv_capture(ProcessInvocationPlan.from_values(
+            argv,
+            input_text=prompt,
+            cwd=invoke_cwd,
+            environment=env,
+            timeout_s=timeout,
+        ))
         last_message_found = last_message.exists()
         last_message_utf8_valid = True
         if last_message_found:
@@ -11648,7 +11627,7 @@ def extract_json_object(text: str) -> dict[str, Any]:
             f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
 
     decoder = json.JSONDecoder(
-        object_pairs_hook=_unique_json_object,
+        object_pairs_hook=unique_json_object,
         parse_constant=reject_constant)
     found: list[dict[str, Any]] = []
     i = 0
@@ -11922,6 +11901,28 @@ def judge_artifact_inventory(run_base: Path) -> list[str]:
 JUDGE_EXPLORE_TOOLS = "Read,Grep,Glob,LS"
 
 
+def _judge_invocation_state(
+    raw: Mapping[str, Any], *, returncode: int,
+    provider_error: str | None = None,
+) -> InvocationState:
+    """Retain process provenance while classifying provider-response failure."""
+    if provider_error and returncode == 0:
+        return InvocationState.PROVIDER_FAILED
+    raw_state = raw.get("invocation_state")
+    if raw_state is not None:
+        try:
+            state = InvocationState(raw_state)
+        except ValueError as exc:
+            raise ValueError("judge backend returned an invalid invocation_state") from exc
+        if state is InvocationState.HARNESS_FAILED:
+            raise ValueError("judge backend harness failure cannot be a process record")
+        if state is InvocationState.PROVIDER_FAILED and returncode != 0:
+            return InvocationState.PROCESS_FAILED
+        return state
+    return (InvocationState.COMPLETE if returncode == 0
+            else InvocationState.PROCESS_FAILED)
+
+
 def sanitized_run_copy(run_base: Path, dest: Path) -> Path | None:
     """Safety-by-construction for the tool-using judge (G1 follow-on). Copies the
     run dir to `dest` with every oracle file removed — anything whose name carries a
@@ -11962,14 +11963,16 @@ def claude_judge_invoke(prompt: str, *, judge_model: str | None, claude_bin: str
                             extra_args=claude_extra_args, cwd=explore_hint)
     provider_error = res.get("provider_error")
     returncode = cast(int, res.get("returncode"))
-    if returncode == 0 and isinstance(provider_error, str):
-        returncode = 1
     return JudgeInvocation(
         stdout=res.get("answer", ""),
         stderr=(_stderr_with_warning(res.get("stderr", "") or "", provider_error)
                 if isinstance(provider_error, str)
                 else res.get("stderr", "") or ""),
         returncode=returncode,
+        invocation_state=_judge_invocation_state(
+            res, returncode=returncode,
+            provider_error=(provider_error if isinstance(provider_error, str) else None)),
+        provider_error=(provider_error if isinstance(provider_error, str) else None),
         cost_usd=res.get("cost_usd"),
         usage=res.get("usage") if isinstance(res.get("usage"), dict) else None,
         usage_source="provider_reported",
@@ -11983,10 +11986,16 @@ def codex_judge_invoke(prompt: str, *, judge_model: str | None, codex_cmd: str,
     res = codex_cli_invoke(prompt, model=judge_model, codex_cmd=codex_cmd,
                            output_schema=assertion_schema, cwd=explore_hint)
     usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
+    returncode = cast(int, res.get("returncode"))
+    provider_error = res.get("provider_error")
     return JudgeInvocation(
         stdout=res.get("answer") or "",
         stderr=res.get("stderr", "") or "",
-        returncode=cast(int, res.get("returncode")),
+        returncode=returncode,
+        invocation_state=_judge_invocation_state(
+            res, returncode=returncode,
+            provider_error=(provider_error if isinstance(provider_error, str) else None)),
+        provider_error=(provider_error if isinstance(provider_error, str) else None),
         cost_usd=res.get("cost_usd"),
         usage=usage,
         usage_source="trace_normalized" if usage else "provider_reported",
@@ -12033,10 +12042,6 @@ def gemini_judge_invoke(
         if process_returncode == 0 and tool_error is not None
         else None
     )
-    effective_returncode = (
-        1 if process_returncode == 0 and isinstance(error, str) and error
-        else process_returncode
-    )
     stderr = result.get("stderr", "") or ""
     if isinstance(error, str):
         stderr = _stderr_with_warning(stderr, error)
@@ -12047,7 +12052,11 @@ def gemini_judge_invoke(
     return JudgeInvocation(
         stdout=result.get("answer") or "",
         stderr=stderr,
-        returncode=effective_returncode,
+        returncode=process_returncode,
+        invocation_state=_judge_invocation_state(
+            result, returncode=process_returncode,
+            provider_error=error),
+        provider_error=error,
         usage=(result.get("usage")
                if isinstance(result.get("usage"), Mapping) else None),
         cost_usd=None,
@@ -12069,10 +12078,16 @@ def vibe_judge_invoke(prompt: str, *, judge_model: str | None, vibe_cmd: str,
                       explore_hint: str | None, **_: Any) -> JudgeInvocation:
     res = vibe_cli_invoke(prompt, model=judge_model, vibe_cmd=vibe_cmd, output="json",
                           tools=VIBE_NO_TOOLS, cwd=explore_hint)
+    returncode = cast(int, res.get("returncode"))
+    provider_error = res.get("provider_error")
     return JudgeInvocation(
         stdout=res.get("answer", ""),
         stderr=res.get("stderr", "") or "",
-        returncode=cast(int, res.get("returncode")),
+        returncode=returncode,
+        invocation_state=_judge_invocation_state(
+            res, returncode=returncode,
+            provider_error=(provider_error if isinstance(provider_error, str) else None)),
+        provider_error=(provider_error if isinstance(provider_error, str) else None),
         cost_usd=res.get("cost_usd"),
         usage=res.get("usage") if isinstance(res.get("usage"), dict) else None,
         usage_source="provider_reported",
@@ -12088,6 +12103,8 @@ def shell_judge_invoke(prompt: str, *, judge_cmd: str,
         capture_output=True, check=False)
     return JudgeInvocation(
         stdout=proc.stdout, stderr=proc.stderr or "", returncode=proc.returncode,
+        invocation_state=(InvocationState.COMPLETE if proc.returncode == 0
+                          else InvocationState.PROCESS_FAILED),
         model_label=model_label)
 
 
@@ -12320,6 +12337,7 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     stdout = invocation.stdout
     stderr = invocation.stderr
     returncode = invocation.returncode
+    invocation_complete = invocation.succeeded
     cost_usd = invocation.cost_usd
     judge_usage = dict(invocation.usage) if invocation.usage is not None else None
     usage_source = invocation.usage_source
@@ -12393,7 +12411,9 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
             plain_payload = ({**parsed, "threshold": threshold}
                              if parsed.get("score") is not None else parsed)
             passed = judge_verdict_passed(plain_payload)
-    evidence = parse_error or parsed.get("evidence") or parsed.get("rationale") or parsed.get("reasoning") or "judge command completed"
+    evidence = (invocation.provider_error or parse_error
+                or parsed.get("evidence") or parsed.get("rationale")
+                or parsed.get("reasoning") or "judge command completed")
     row = {
         **graded_payload,
         **_judge_row_identity(task, judge_model=judge_model_label,
@@ -12408,10 +12428,13 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         "judge_evidence_mode": evidence_mode,
         **({"judge_context_sha256": context_sha256}
            if context_sha256 is not None else {}),
-        "judge_observation_complete": returncode == 0 and parse_error is None,
-        "availability": ("complete" if returncode == 0 and parse_error is None
+        "judge_observation_complete": invocation_complete and parse_error is None,
+        "invocation_state": invocation.invocation_state.value,
+        **({"provider_error": invocation.provider_error}
+           if invocation.provider_error is not None else {}),
+        "availability": ("complete" if invocation_complete and parse_error is None
                          else "partial"),
-        "passed": passed and returncode == 0 and parse_error is None,
+        "passed": passed and invocation_complete and parse_error is None,
         **({"score": score} if score is not None else {}),
         **({"threshold": threshold} if score is not None and "criteria" not in graded_payload else {}),
         "evidence": evidence,
@@ -14056,6 +14079,7 @@ def grade_case_variant(
                 judge_task, unit_text or "", run_base=unit_base,
                 steps=current_steps)
             judge_task["judge_input_sha256"] = current_input_fingerprint
+            judge_task = JudgeTask.from_row(judge_task).to_row()
             judged = judge_results.get(jid)
             if judged:
                 evidence_mode = judged.get("judge_evidence_mode")
@@ -14150,6 +14174,10 @@ def grade_case_variant(
                 break
         for r in objective + qualitative:
             r.pop("_dep_label", None)   # transient resolver key; never serialized
+    objective_observations = [assertion_observation_from_row(row) for row in objective]
+    qualitative_observations = [assertion_observation_from_row(row) for row in qualitative]
+    objective = [observation.to_row() for observation in objective_observations]
+    qualitative = [observation.to_row() for observation in qualitative_observations]
     for summary_row in turn_summaries:
         n = summary_row["turn"]
         all_rows_for_turn = [r for r in objective + qualitative
@@ -14166,46 +14194,62 @@ def grade_case_variant(
     # the graded `scored` bucket instead. A failing critical assertion is the
     # absorbing barrier: it VETOES the run — every rate collapses to 0.0 and the
     # graded score is withheld, so no mean can average the catastrophe away.
-    blocked_rows = [r for r in objective + qualitative
-                    if not r.get("skipped")
-                    and r.get("availability", "complete") != "complete"]
-    observed_rows = [r for r in objective + qualitative
-                     if r.get("availability", "complete") == "complete"]
-    gate_objective = [r for r in objective if r in observed_rows
-                      and r.get("severity") in {"gate", "critical"} and not r.get("skipped")]
-    soft_rows = [r for r in observed_rows if r.get("severity") == "soft" and not r.get("skipped")]
+    all_observations = objective_observations + qualitative_observations
+    blocked_rows = [observation for observation in all_observations
+                    if isinstance(observation, UnavailableAssertion)]
+    observed_rows = [observation for observation in all_observations
+                     if isinstance(observation, (SatisfiedAssertion, FailedAssertion))]
+    gate_objective = [observation for observation in objective_observations
+                      if observation in observed_rows
+                      and observation.severity.value in {"gate", "critical"}]
+    soft_rows = [observation for observation in observed_rows
+                 if observation.severity.value == "soft"]
     # G2: a SKIPPED dependent is excluded here, so a never-run critical dependent
     # cannot veto — the veto stays owned by the prerequisite's own severity.
-    critical_rows = [r for r in observed_rows if r.get("severity") == "critical" and not r.get("skipped")]
-    critical_failures = [r["name"] for r in critical_rows if not r["passed"]]
+    critical_rows = [observation for observation in observed_rows
+                     if observation.severity.value == "critical"]
+    critical_failures = [observation.name for observation in critical_rows
+                         if isinstance(observation, FailedAssertion)]
     vetoed = bool(critical_failures)
-    objective_passed = sum(1 for r in gate_objective if r["passed"])
+    objective_passed = sum(
+        1 for observation in gate_objective
+        if isinstance(observation, SatisfiedAssertion))
     objective_total = len(gate_objective)
-    process_rows = [r for r in gate_objective if r.get("type") in PROCESS_ASSERTIONS]
-    efficiency_rows = [r for r in gate_objective if r.get("type") in EFFICIENCY_ASSERTIONS]
-    process_passed = sum(1 for r in process_rows if r["passed"])
-    efficiency_passed = sum(1 for r in efficiency_rows if r["passed"])
+    process_rows = [observation for observation in gate_objective
+                    if observation.assertion_type in PROCESS_ASSERTIONS]
+    efficiency_rows = [observation for observation in gate_objective
+                       if observation.assertion_type in EFFICIENCY_ASSERTIONS]
+    process_passed = sum(
+        1 for observation in process_rows
+        if isinstance(observation, SatisfiedAssertion))
+    efficiency_passed = sum(
+        1 for observation in efficiency_rows
+        if isinstance(observation, SatisfiedAssertion))
     # Soft qualitative rows (the judge/rubric default) feed ONLY the graded
     # channel; the qualitative/combined pass rates are carried by gate and
     # critical qualitative rows, mirroring the objective split above. Declare
     # severity: "gate" on a judge assertion to keep it in the pass rate.
-    gate_qualitative = [r for r in qualitative if r in observed_rows
-                        and r.get("severity") in {"gate", "critical"} and not r.get("skipped")]
-    qualitative_passed = sum(1 for r in gate_qualitative if r["passed"])
+    gate_qualitative = [observation for observation in qualitative_observations
+                        if observation in observed_rows
+                        and observation.severity.value in {"gate", "critical"}]
+    qualitative_passed = sum(
+        1 for observation in gate_qualitative
+        if isinstance(observation, SatisfiedAssertion))
     qualitative_total = len(gate_qualitative)
     combined_passed = objective_passed + qualitative_passed
     combined_total = objective_total + qualitative_total
-    soft_scores = [r["score"] for r in soft_rows if isinstance(r.get("score"), (int, float))]
+    soft_scores = [observation.score for observation in soft_rows
+                   if observation.score is not None]
     graded_score = round(statistics.mean(soft_scores), 4) if soft_scores and not vetoed else None
     floor = reference_floor(case)
     below_floor: list[str] = []
     if floor is not None:
-        for r in soft_rows:
-            if isinstance(r.get("score"), (int, float)) and r["score"] < floor:
-                below_floor.append(str(r["name"]))
-            for dim, raw in (r.get("dimension_scores") or {}).items():
+        for observation in soft_rows:
+            if observation.score is not None and observation.score < floor:
+                below_floor.append(observation.name)
+            for dim, raw in (observation.extra.get("dimension_scores") or {}).items():
                 if isinstance(raw, (int, float)) and (raw - 1.0) / 4.0 < floor:
-                    below_floor.append(f"{r['name']}:{dim}")
+                    below_floor.append(f"{observation.name}:{dim}")
     result = {
         "case_id": case["id"],
         "split": case["split"],
@@ -14244,8 +14288,12 @@ def grade_case_variant(
         "critical_failures": critical_failures,
         "vetoed": vetoed,
         "soft_total": len(soft_rows),
-        "soft_passed": sum(1 for r in soft_rows if r["passed"]),
-        "skipped_total": sum(1 for r in objective + qualitative if r.get("skipped")),
+        "soft_passed": sum(
+            1 for observation in soft_rows
+            if isinstance(observation, SatisfiedAssertion)),
+        "skipped_total": sum(
+            1 for observation in all_observations
+            if isinstance(observation, SkippedAssertion)),
         "graded_score": graded_score,
         "below_reference_floor": below_floor,
         **({"turns": turn_summaries} if turn_specs else {}),
@@ -14254,9 +14302,9 @@ def grade_case_variant(
         "deferred_judge_tasks": len(judge_tasks),
         "grading_availability": "partial" if blocked_rows or judge_tasks else "complete",
         "blocked_assertions": [
-            {"name": row.get("name"), "type": row.get("type"),
-             "evidence": row.get("evidence")}
-            for row in blocked_rows
+            {"name": observation.name, "type": observation.assertion_type,
+             "evidence": observation.evidence}
+            for observation in blocked_rows
         ],
         "metadata": metadata,
     }
@@ -14369,7 +14417,7 @@ def grade(args: argparse.Namespace) -> int:
                 fh.write(json.dumps(task, ensure_ascii=False) + "\n")
     return 0
 
-def stats(values: list[float]) -> dict[str, float | None]:
+def stats(values: Sequence[float]) -> dict[str, float | None]:
     clean = [float(v) for v in values if v is not None]
     if not clean:
         return {"mean": None, "stddev": None, "min": None, "max": None, "median": None, "n": 0}
@@ -15205,7 +15253,7 @@ def build_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
     return {"by_case_variant": by_case_variant, "by_variant": by_variant_summary}
 
 
-def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> pair_domain.PairConstruction:
+def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> _ResultPairConstruction:
     def eligibility(row: Mapping[str, Any]) -> tuple[bool, str | None]:
         if not scorable_run(row):
             return False, "unscorable_arm"
@@ -15215,13 +15263,17 @@ def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> pair_d
         if key in {"objective_pass_rate", "combined_pass_rate", "graded_score"} and not 0 <= float(value) <= 1:
             return False, f"invalid_{key}"
         return True, None
-    return pair_domain.pairs_from_rows(results, population="answer", eligibility=eligibility)
+    return pair_domain.pairs_from_rows(
+        results,
+        population=pair_domain.ExperimentalPopulation.ANSWER,
+        eligibility=eligibility,
+    )
 
 
 def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pass_rate") -> tuple[list[float], list[float], list[dict[str, Any]]]:
     """Per-case rates computed only from validated repetition-level pairs."""
     construction = _metric_pair_construction(results, key)
-    grouped: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    grouped: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in construction.pairs:
         grouped[pair.key.case_id].append(pair)
     paired_with_rates: list[float] = []
@@ -15257,7 +15309,7 @@ def _reliability_counts(rows: list[dict[str, Any]]) -> tuple[int, int]:
 def paired_case_counts(results: list[dict[str, Any]]) -> list[tuple[str, tuple[int, int], tuple[int, int]]]:
     """Per-case success counts over the same validated repetition-level pairs."""
     construction = _metric_pair_construction(results, "objective_pass_rate")
-    grouped: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    grouped: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in construction.pairs:
         grouped[pair.key.case_id].append(pair)
     pairs: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
@@ -15298,7 +15350,7 @@ PAIR_HEADLINE_FIELDS = (
 
 
 def pairing_aware_block(block: dict[str, Any],
-                        construction: pair_domain.PairConstruction) -> dict[str, Any]:
+                        construction: _ResultPairConstruction) -> dict[str, Any]:
     """Make subset-only lift explicitly diagnostic when any identity is blocked."""
     out = dict(block)
     out["pairing"] = construction.diagnostics()
@@ -15425,7 +15477,7 @@ def paired_reliability_block(pairs: list[tuple[str, tuple[int, int], tuple[int, 
 
 
 def pairing_aware_reliability(block: dict[str, Any],
-                              construction: pair_domain.PairConstruction) -> dict[str, Any]:
+                              construction: _ResultPairConstruction) -> dict[str, Any]:
     out = dict(block)
     out["pairing"] = construction.diagnostics()
     if not construction.blocked:
@@ -15488,23 +15540,114 @@ def slice_lift_fields(paired: dict[str, Any], overall_lift: float | None) -> dic
     return fields
 
 
+def _report_attempt_identity(row: Mapping[str, Any]) -> str:
+    """Stable identity for one attempted answer-run report row."""
+    required = ("case_id", "variant", "run_number")
+    if any(row.get(key) is None for key in required):
+        raise ValueError("report row requires case_id, variant, and run_number identity")
+    case_id = CaseId.parse(row["case_id"])
+    model = (None if row.get("model") is None
+             else ModelId.parse(row["model"]))
+    variant = ExecutionVariant.parse(row["variant"])
+    run_number = RunNumber.parse(row["run_number"])
+    return canonical_json_sha256({
+        "case_id": str(case_id),
+        "model": None if model is None else str(model),
+        "variant": str(variant),
+        "run_number": int(run_number),
+        "population": "answer",
+    })
+
+
+_RATE_TOTAL_FIELDS = {
+    "objective_pass_rate": "objective_total",
+    "combined_pass_rate": "combined_total",
+    "process_pass_rate": "process_total",
+    "efficiency_pass_rate": "efficiency_total",
+}
+
+
+def _report_metric_applicable(row: Mapping[str, Any], key: str) -> bool:
+    """An explicit zero denominator is N/A; absence remains unknown coverage."""
+    total_key = _RATE_TOTAL_FIELDS[key]
+    if total_key not in row:
+        return True
+    total = row[total_key]
+    if type(total) is not int or total < 0:
+        raise ValueError(f"report {total_key} must be a non-negative integer")
+    if total == 0 and row.get(key) is not None:
+        raise ValueError(f"report {key} contradicts zero {total_key}")
+    return total != 0
+
+
+def _report_row_eligibility(row: Mapping[str, Any]) -> report_domain.Disposition:
+    if not scorable_run(row):
+        return False, "unscorable_attempt"
+    if row.get("grading_availability") != "complete":
+        return False, "grading_evidence_incomplete"
+    return True, None
+
+
+def _report_execution_eligibility(
+    row: Mapping[str, Any],
+) -> report_domain.Disposition:
+    return ((True, None) if scorable_run(row)
+            else (False, "unscorable_attempt"))
+
+
 def build_slice_summary(results: list[dict[str, Any]], variants: list[str]) -> dict[str, Any]:
     out: dict[str, Any] = {"domain": {}, "difficulty": {}, "trigger_type": {}, "success_goals": {}}
     # Each slice routes through ResultSet so the scorable predicate is never
     # re-rolled inline; the value enumeration is over all rows (it lists which
     # slices exist), the scoring is over the scorable subset.
     def slice_stats(rs: ResultSet) -> dict[str, Any]:
-        attempted = len(rs)
-        s = rs.scorable()
-        blocked = attempted - len(s)
-        objective = s.mean_rate("objective_pass_rate")
-        combined = s.mean_rate("combined_pass_rate")
-        return {"attempted_runs": attempted, "runs": len(s), "blocked_runs": blocked,
-                "availability": "partial" if blocked else "complete",
-                "mean_objective_pass_rate": None if blocked else objective,
-                "mean_combined_pass_rate": None if blocked else combined,
-                "observed_mean_objective_pass_rate": objective,
-                "observed_mean_combined_pass_rate": combined}
+        cohort = report_domain.report_cohort(
+            rs.all,
+            identity=_report_attempt_identity,
+            eligibility=_report_row_eligibility,
+        )
+        diagnostic_cohort = report_domain.report_cohort(
+            rs.all,
+            identity=_report_attempt_identity,
+            eligibility=_report_execution_eligibility,
+        )
+        objective_cohort = report_domain.metric_cohort(
+            cohort, "objective_pass_rate",
+            applicability=lambda row: _report_metric_applicable(
+                row, "objective_pass_rate"))
+        combined_cohort = report_domain.metric_cohort(
+            cohort, "combined_pass_rate",
+            applicability=lambda row: _report_metric_applicable(
+                row, "combined_pass_rate"))
+        objective_values = report_domain.observed_rates(
+            objective_cohort, "objective_pass_rate")
+        combined_values = report_domain.observed_rates(
+            combined_cohort, "combined_pass_rate")
+        objective = statistics.mean(objective_values) if objective_values else None
+        combined = statistics.mean(combined_values) if combined_values else None
+        diagnostic_objective = report_domain.observed_rates(
+            report_domain.metric_cohort(
+                diagnostic_cohort, "objective_pass_rate",
+                applicability=lambda row: _report_metric_applicable(
+                    row, "objective_pass_rate")),
+            "objective_pass_rate")
+        diagnostic_combined = report_domain.observed_rates(
+            report_domain.metric_cohort(
+                diagnostic_cohort, "combined_pass_rate",
+                applicability=lambda row: _report_metric_applicable(
+                    row, "combined_pass_rate")),
+            "combined_pass_rate")
+        return {**report_domain.coverage_fields(cohort),
+                "mean_objective_pass_rate": report_domain.headline_value(
+                    objective_cohort, objective),
+                "mean_combined_pass_rate": report_domain.headline_value(
+                    combined_cohort, combined),
+                "observed_mean_objective_pass_rate": (
+                    statistics.mean(diagnostic_objective)
+                    if diagnostic_objective else None),
+                "observed_mean_combined_pass_rate": (
+                    statistics.mean(diagnostic_combined)
+                    if diagnostic_combined else None)}
 
     everything = ResultSet(results)
     overall_lift = (build_paired_summary(results) or {}).get("absolute_delta")
@@ -15710,18 +15853,21 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             return True, None
 
         ablation_pairing = pair_domain.pairs_from_rows(
-            ablation_pair_rows, population="answer", eligibility=ablation_eligibility)
-        pairs_by_case_model: dict[tuple[str, str | None], list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+            ablation_pair_rows,
+            population=pair_domain.ExperimentalPopulation.ANSWER,
+            eligibility=ablation_eligibility,
+        )
+        pairs_by_case_model: dict[tuple[str, str | None], list[_ResultPair]] = collections.defaultdict(list)
         for pair in ablation_pairing.pairs:
             pairs_by_case_model[(pair.key.case_id, pair.key.model)].append(pair)
         entry["pairing"] = ablation_pairing.diagnostics()
 
-        def assertion_value(row: dict[str, Any], name: str) -> bool | None:
+        def assertion_value(row: Mapping[str, Any], name: str) -> bool | None:
             matches = [a.get("passed") for a in list(row.get("assertions", [])) + list(row.get("qualitative_assertions", []))
                        if a.get("name") == name]
             return matches[0] if len(matches) == 1 and isinstance(matches[0], bool) else None
 
-        def paired_assertion_rates(pairs: list[pair_domain.ExperimentalPair], name: str) -> tuple[float | None, float | None, int]:
+        def paired_assertion_rates(pairs: list[_ResultPair], name: str) -> tuple[float | None, float | None, int]:
             observations = []
             for pair in pairs:
                 left = assertion_value(pair.with_skill.payload, name)
@@ -15734,7 +15880,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                     sum(right for _, right in observations) / len(observations),
                     len(observations))
 
-        def paired_combined_deltas(pairs: list[pair_domain.ExperimentalPair]) -> list[float]:
+        def paired_combined_deltas(pairs: list[_ResultPair]) -> list[float]:
             deltas = []
             for pair in pairs:
                 left = pair.with_skill.payload.get("combined_pass_rate", pair.with_skill.payload.get("objective_pass_rate"))
@@ -15894,7 +16040,7 @@ def cost_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
-def _row_measurement(row: dict[str, Any], key: str):
+def _row_measurement(row: Mapping[str, Any], key: str):
     measurement = row.get(f"{key}_measurement")
     if isinstance(measurement, telemetry_domain.Measurement):
         return measurement
@@ -15904,7 +16050,7 @@ def _row_measurement(row: dict[str, Any], key: str):
     )
 
 
-def _cost_measurement(row: dict[str, Any]):
+def _cost_measurement(row: Mapping[str, Any]):
     measurement = row.get("cost_measurement")
     if isinstance(measurement, telemetry_domain.Measurement):
         return measurement
@@ -16134,8 +16280,10 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
     paired_cost_delta: dict[str, Any] = {}
     deltas_by_currency: dict[str, list[float]] = collections.defaultdict(list)
     all_cost_pairs_comparable = True
-    cost_pairing = pair_domain.pairs_from_rows(rows, population="answer")
-    complete_by_case: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    cost_pairing = pair_domain.pairs_from_rows(
+        rows, population=pair_domain.ExperimentalPopulation.ANSWER
+    )
+    complete_by_case: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     blocked_by_case: dict[str, list[str]] = collections.defaultdict(list)
     for pair in cost_pairing.pairs:
         complete_by_case[pair.key.case_id].append(pair)
@@ -16312,19 +16460,44 @@ def qualitative_by_visibility(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    scorable_rows = [row for row in ResultSet(rows).scorable().all
-                     if row.get("grading_availability") == "complete"]
-    blocked_runs = len(rows) - len(scorable_rows)
-    objective_rates = [r["objective_pass_rate"] for r in scorable_rows if r["objective_pass_rate"] is not None]
-    combined_rates = [r["combined_pass_rate"] for r in scorable_rows if r.get("combined_pass_rate") is not None]
-    process_rates = [r["process_pass_rate"] for r in scorable_rows if r.get("process_pass_rate") is not None]
-    efficiency_rates = [r["efficiency_pass_rate"] for r in scorable_rows if r.get("efficiency_pass_rate") is not None]
+    cohort = report_domain.report_cohort(
+        rows,
+        identity=_report_attempt_identity,
+        eligibility=_report_row_eligibility,
+    )
+    execution_cohort = report_domain.report_cohort(
+        rows,
+        identity=_report_attempt_identity,
+        eligibility=_report_execution_eligibility,
+    )
+    execution_rows = [
+        thaw_json_value(row, "report row")
+        for row in report_domain.observed_rows(execution_cohort)
+    ]
+    metric_cohorts = {
+        key: report_domain.metric_cohort(
+            cohort, key,
+            applicability=lambda row, metric=key: _report_metric_applicable(
+                row, metric))
+        for key in (
+            "objective_pass_rate", "combined_pass_rate",
+            "process_pass_rate", "efficiency_pass_rate",
+        )
+    }
+    objective_rates = list(report_domain.observed_rates(
+        metric_cohorts["objective_pass_rate"], "objective_pass_rate"))
+    combined_rates = list(report_domain.observed_rates(
+        metric_cohorts["combined_pass_rate"], "combined_pass_rate"))
+    process_rates = list(report_domain.observed_rates(
+        metric_cohorts["process_pass_rate"], "process_pass_rate"))
+    efficiency_rates = list(report_domain.observed_rates(
+        metric_cohorts["efficiency_pass_rate"], "efficiency_pass_rate"))
     # Timing/token/command central tendencies describe SCORABLE runs, matching
     # the pass-rate block above — a timed-out run's full duration must not drag
     # the mean (the failure count is disclosed separately as execution_errors).
-    facts = [result_cost_facts(r) for r in scorable_rows]
+    facts = [result_cost_facts(r) for r in execution_rows]
     command_measurements = []
-    for row in scorable_rows:
+    for row in execution_rows:
         merged = dict(row.get("metadata", {}) or {})
         merged.update(read_metrics_base(Path(row.get("run_base", ""))))
         command_measurements.append(telemetry_domain.measurement_from_envelope_or_nonnegative(merged, "commands"))
@@ -16334,7 +16507,7 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
     cost_total = _money_aggregate_fields(cost_measurements)
     elapsed = [m.value for m in elapsed_measurements if m.availability == telemetry_domain.AVAILABLE]
     tokens = [m.value for m in token_measurements if m.availability == telemetry_domain.AVAILABLE]
-    observed_rates = {
+    diagnostic_rate_fields = {
         "mean_objective_pass_rate": statistics.mean(objective_rates) if objective_rates else None,
         "mean_combined_pass_rate": statistics.mean(combined_rates) if combined_rates else None,
         "mean_process_pass_rate": statistics.mean(process_rates) if process_rates else None,
@@ -16344,14 +16517,32 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "process_pass_rate": stats(process_rates),
         "efficiency_pass_rate": stats(efficiency_rates),
     }
+    field_metric = {
+        "mean_objective_pass_rate": "objective_pass_rate",
+        "objective_pass_rate": "objective_pass_rate",
+        "mean_combined_pass_rate": "combined_pass_rate",
+        "combined_pass_rate": "combined_pass_rate",
+        "mean_process_pass_rate": "process_pass_rate",
+        "process_pass_rate": "process_pass_rate",
+        "mean_efficiency_pass_rate": "efficiency_pass_rate",
+        "efficiency_pass_rate": "efficiency_pass_rate",
+    }
+    published_rate_fields = {
+        field: report_domain.headline_value(
+            metric_cohorts[field_metric[field]], value)
+        for field, value in diagnostic_rate_fields.items()
+    }
     out = {
         "cases": len({r["case_id"] for r in rows}),
-        "runs": len(rows),
-        "scorable_runs": len(scorable_rows),
-        "blocked_runs": blocked_runs,
+        "runs": report_domain.attempted_count(cohort),
+        "scorable_runs": len(execution_rows),
+        "blocked_runs": report_domain.blocked_count(cohort),
         "missing_outputs": sum(1 for r in rows if r["missing_output"]),
         "execution_errors": sum(1 for r in rows if not r["missing_output"] and not r.get("execution_valid", True)),
-        **observed_rates,
+        **published_rate_fields,
+        "metric_availability": {
+            key: metric.state.value for key, metric in metric_cohorts.items()
+        },
         "elapsed_ms": measurement_stats(elapsed_measurements),
         "total_tokens": measurement_stats(token_measurements),
         "command_count": measurement_stats(command_measurements),
@@ -16367,14 +16558,24 @@ def variant_summary_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "median_elapsed_ms": statistics.median(elapsed) if elapsed else None,
         "median_total_tokens": statistics.median(tokens) if tokens else None,
     }
-    if blocked_runs:
-        out["availability"] = "partial"
-        out["reason"] = "unscorable_or_incompletely_graded_attempts"
-        for key, value in observed_rates.items():
-            out[f"observed_{key}"] = value
+    if isinstance(cohort, report_domain.PartialReportCohort):
+        out["availability"] = cohort.state.value
+        out["reason"] = cohort.reason
+        for key, value in diagnostic_rate_fields.items():
+            if isinstance(
+                metric_cohorts[field_metric[key]],
+                report_domain.PartialReportCohort,
+            ):
+                out[f"observed_{key}"] = value
             out[key] = None
     else:
-        out["availability"] = "complete"
+        out["availability"] = cohort.state.value
+        for key, value in diagnostic_rate_fields.items():
+            if isinstance(
+                metric_cohorts[field_metric[key]],
+                report_domain.PartialReportCohort,
+            ):
+                out[f"observed_{key}"] = value
     return out
 
 
@@ -16677,7 +16878,11 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
         profiles[base] = _trajectory_profile(events)
         return True, None
 
-    construction = pair_domain.pairs_from_rows(results, population="answer", eligibility=eligibility)
+    construction = pair_domain.pairs_from_rows(
+        results,
+        population=pair_domain.ExperimentalPopulation.ANSWER,
+        eligibility=eligibility,
+    )
     delta_keys = ("steps", "commands", "tool_calls", "file_reads", "file_writes")
     by_case: dict[str, dict[str, Any]] = {}
     for pair in construction.pairs:
@@ -18840,9 +19045,15 @@ def paired_run_bases(runs: Path, case_id: str, with_variant: str, without_varian
         bases: dict[tuple[int, str], Path] = {}
         for arm, discovered in (("with_skill", with_runs), ("without_skill", without_runs)):
             for run_number, base in discovered:
-                key = pair_domain.ExperimentalPairKey(case_id, model, run_number, "answer")
+                key = pair_domain.ExperimentalPairKey.parse(
+                    case_id,
+                    model,
+                    run_number,
+                    pair_domain.ExperimentalPopulation.ANSWER,
+                )
                 bases[(run_number, arm)] = base
-                arms.append(pair_domain.ExperimentalArm(key, arm, base))
+                arms.append(pair_domain.ExperimentalArm(
+                    key, pair_domain.ExperimentalArmId(arm), base))
         construction = pair_domain.construct_pairs(arms)
         for pair in construction.pairs:
             yield model, pair.key.run_number, pair.with_skill.payload, pair.without_skill.payload
@@ -19284,11 +19495,11 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
     for row in rows:
         intent.setdefault(row.get("case_id"), row.get("eval_intent", "capability"))
     pairing = pair_domain.pairs_from_rows(
-        rows, population="answer",
+        rows, population=pair_domain.ExperimentalPopulation.ANSWER,
         eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
     )
 
-    def combined_value(row: dict[str, Any]) -> float | None:
+    def combined_value(row: Mapping[str, Any]) -> float | None:
         value = row.get("combined_pass_rate")
         # Soft judges live in graded_score, not combined; the qualitative signal
         # this function looks for rides whichever channel the judge fed.
@@ -19299,7 +19510,7 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
         return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
                 and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
 
-    by_case: dict[str, list[pair_domain.ExperimentalPair]] = collections.defaultdict(list)
+    by_case: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in pairing.pairs:
         by_case[pair.key.case_id].append(pair)
     base_saturated, base_saturated_expected, qualitative_only = [], [], []
@@ -20730,85 +20941,93 @@ def _stderr_with_warning(stderr: str, warning: str, *, limit: int = 4000) -> str
     return f"{prefix}\n{warning}" if prefix else warning
 
 
+def validate_cli_command(args: argparse.Namespace) -> int:
+    manifest_path = Path(args.manifest)
+    manifest = validate_manifest(
+        manifest_path, allow_missing_holdback=not args.strict_holdback)
+    leakage = prompt_assertion_leakage_findings(
+        manifest, manifest_path, min_chars=args.leakage_min_chars)
+    for finding in leakage:
+        print(
+            f"WARN {finding['case_id']}: assertion {finding['assertion']!r} "
+            f"value {finding['value']!r} appears in prompt "
+            "(leakage; case may saturate)",
+            file=sys.stderr,
+        )
+    if leakage and args.strict_leakage:
+        die(f"prompt/assertion leakage found in {len(leakage)} assertion value(s)")
+    if getattr(args, "check_ablations", False):
+        failures = check_ablations_dry_run(manifest_path, manifest)
+        if failures:
+            die(f"{failures} ablation(s) failed --check-ablations")
+    if manifest.get("version") == 1:
+        print(
+            "note: version-1 manifest grades with behavior-preserving defaults; "
+            "`skill-benchmark migrate --check` shows the version-2 upgrade "
+            "(severity + oracle tiers stamped, judgment calls listed)",
+            file=sys.stderr,
+        )
+    print(
+        f"OK: {manifest['skill_name']} — {len(iter_cases(manifest))} cases, "
+        f"{len(manifest.get('ablations', []))} ablations")
+    return 0
+
+
 def main() -> int:
     parser = build_arg_parser()
-    args = parser.parse_args()
-    if args.cmd == "agent-capabilities":
-        return agent_capabilities_command(args)
-    answer_handler = answer_entrypoint_implementations().get(args.cmd)
+    raw_args = parser.parse_args()
+    try:
+        invocation = CLIInvocation.from_namespace(raw_args)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
+    # Established handlers still consume Namespace. This is the single named
+    # compatibility edge; new handlers can instead accept the typed invocation.
+    args = invocation.to_legacy_namespace()
+    builtin_handlers: dict[CLICommand, Callable[[argparse.Namespace], int]] = {
+        CLICommand.AGENT_CAPABILITIES: agent_capabilities_command,
+        CLICommand.VALIDATE: validate_cli_command,
+        CLICommand.PREPARE: prepare,
+        CLICommand.IMPORT_TRACE: import_trace,
+        CLICommand.GRADE: grade,
+        CLICommand.JUDGE: judge_command,
+        CLICommand.BENCHMARK: benchmark,
+        CLICommand.REPORT: report_command,
+        CLICommand.COMPARE_JUDGES: compare_judges,
+        CLICommand.JUDGE_ALIGNMENT: judge_alignment_command,
+        CLICommand.ERROR_ANALYSIS: error_analysis_command,
+        CLICommand.CONTAMINATION: contamination_command,
+        CLICommand.JUDGE_ROBUSTNESS: judge_robustness_command,
+        CLICommand.EXPORT_ANTHROPIC: export_anthropic,
+        CLICommand.COMPARE_TASKS: compare_tasks,
+        CLICommand.COMPARE_RESULTS: compare_results,
+        CLICommand.TRIGGER_COMPARE: trigger_compare,
+        CLICommand.MIGRATE: migrate_command,
+        CLICommand.MIGRATE_TELEMETRY: migrate_telemetry_command,
+        CLICommand.COST_SUMMARY: cost_summary_command,
+        CLICommand.TREND: trend,
+        CLICommand.SUGGEST_CASES: suggest_cases,
+        CLICommand.RENDER_VIEWER: render_viewer,
+        CLICommand.PROFILE_SKILL: profile_skill,
+        CLICommand.TOKEN_OVERHEAD: token_overhead,
+        CLICommand.AUDIT_MANIFEST: audit_manifest,
+        CLICommand.AGGREGATE: aggregate,
+        CLICommand.SUITE_RUN: suite_run,
+        CLICommand.MATERIALIZE_ABLATIONS: materialize_ablations,
+    }
+    answer_handlers = answer_entrypoint_implementations()
+    registered_commands = {CLICommand(name) for name in answer_handlers}
+    overlap = registered_commands & set(builtin_handlers)
+    if overlap:
+        raise RuntimeError(
+            f"CLI commands have multiple owners: {sorted(item.value for item in overlap)}")
+    missing = set(CLICommand) - registered_commands - set(builtin_handlers)
+    if missing:
+        raise RuntimeError(
+            f"CLI commands have no handler: {sorted(item.value for item in missing)}")
+    answer_handler = answer_handlers.get(invocation.command.value)
     if answer_handler is not None:
         return answer_handler(args)
-    if args.cmd == "validate":
-        manifest_path = Path(args.manifest)
-        manifest = validate_manifest(manifest_path, allow_missing_holdback=not args.strict_holdback)
-        leakage = prompt_assertion_leakage_findings(manifest, manifest_path, min_chars=args.leakage_min_chars)
-        for finding in leakage:
-            print(f"WARN {finding['case_id']}: assertion {finding['assertion']!r} value {finding['value']!r} appears in prompt (leakage; case may saturate)", file=sys.stderr)
-        if leakage and args.strict_leakage:
-            die(f"prompt/assertion leakage found in {len(leakage)} assertion value(s)")
-        if getattr(args, "check_ablations", False):
-            failures = check_ablations_dry_run(manifest_path, manifest)
-            if failures:
-                die(f"{failures} ablation(s) failed --check-ablations")
-        if manifest.get("version") == 1:
-            print("note: version-1 manifest grades with behavior-preserving defaults; `skill-benchmark migrate --check` shows the version-2 upgrade (severity + oracle tiers stamped, judgment calls listed)", file=sys.stderr)
-        print(f"OK: {manifest['skill_name']} — {len(iter_cases(manifest))} cases, {len(manifest.get('ablations', []))} ablations")
-        return 0
-    if args.cmd == "prepare":
-        return prepare(args)
-    if args.cmd == "import-trace":
-        return import_trace(args)
-    if args.cmd == "grade":
-        return grade(args)
-    if args.cmd == "judge":
-        return judge_command(args)
-    if args.cmd == "benchmark":
-        return benchmark(args)
-    if args.cmd == "report":
-        return report_command(args)
-    if args.cmd == "compare-judges":
-        return compare_judges(args)
-    if args.cmd == "judge-alignment":
-        return judge_alignment_command(args)
-    if args.cmd == "error-analysis":
-        return error_analysis_command(args)
-    if args.cmd == "contamination":
-        return contamination_command(args)
-    if args.cmd == "judge-robustness":
-        return judge_robustness_command(args)
-    if args.cmd == "export-anthropic":
-        return export_anthropic(args)
-    if args.cmd == "compare-tasks":
-        return compare_tasks(args)
-    if args.cmd == "compare-results":
-        return compare_results(args)
-    if args.cmd == "trigger-compare":
-        return trigger_compare(args)
-    if args.cmd == "migrate":
-        return migrate_command(args)
-    if args.cmd == "migrate-telemetry":
-        return migrate_telemetry_command(args)
-    if args.cmd == "cost-summary":
-        return cost_summary_command(args)
-    if args.cmd == "trend":
-        return trend(args)
-    if args.cmd == "suggest-cases":
-        return suggest_cases(args)
-    if args.cmd == "render-viewer":
-        return render_viewer(args)
-    if args.cmd == "profile-skill":
-        return profile_skill(args)
-    if args.cmd == "token-overhead":
-        return token_overhead(args)
-    if args.cmd == "audit-manifest":
-        return audit_manifest(args)
-    if args.cmd == "aggregate":
-        return aggregate(args)
-    if args.cmd == "suite-run":
-        return suite_run(args)
-    if args.cmd == "materialize-ablations":
-        return materialize_ablations(args)
-    return 1
+    return builtin_handlers[invocation.command](args)
 
 
 if __name__ == "__main__":

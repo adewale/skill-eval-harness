@@ -15,20 +15,12 @@ from types import MappingProxyType
 from typing import Any, TypeAlias
 
 import telemetry as telemetry_domain
+from invocation_contracts import InvocationState, validate_invocation_lifecycle
 from json_contracts import (
     freeze_json_mapping,
     strict_json_equal,
     validate_json_text,
 )
-
-
-class InvocationState(str, Enum):
-    COMPLETE = "complete"
-    TIMED_OUT = "timed_out"
-    SPAWN_FAILED = "spawn_failed"
-    PROCESS_FAILED = "process_failed"
-    PROVIDER_FAILED = "provider_failed"
-    HARNESS_FAILED = "harness_failed"
 
 
 class CompletionEvidence(str, Enum):
@@ -91,22 +83,17 @@ class InvocationOutcome:
             elif (self.returncode is None
                   or self.completion_evidence is not CompletionEvidence.AGENT_WINDOW_EXHAUSTED):
                 raise ValueError("non-zero completion requires a spawned process and explicit agent-window evidence")
-            if self.provider_error is not None:
-                raise ValueError("a complete invocation cannot carry a provider error")
         elif self.completion_evidence is not None:
             raise ValueError("only complete invocations can carry completion evidence")
 
-        if self.state is InvocationState.TIMED_OUT and self.returncode != 124:
-            raise ValueError("timed-out invocation must use returncode 124")
-        if self.state is InvocationState.SPAWN_FAILED and self.returncode != 127:
-            raise ValueError("spawn failure must use returncode 127")
-        if self.state is InvocationState.PROCESS_FAILED and self.returncode in {None, 0}:
-            raise ValueError("process failure requires a non-zero returncode")
-        if self.state is InvocationState.PROVIDER_FAILED:
-            if self.returncode is None or self.provider_error is None:
-                raise ValueError("provider failure requires a spawned process and provider_error")
-        elif self.provider_error is not None:
-            raise ValueError("provider_error requires PROVIDER_FAILED state")
+        validate_invocation_lifecycle(
+            self.state,
+            self.returncode,
+            self.provider_error,
+            allow_harness_failure=True,
+            allow_nonzero_completion=(
+                self.completion_evidence is CompletionEvidence.AGENT_WINDOW_EXHAUSTED),
+        )
         if self.state is InvocationState.HARNESS_FAILED:
             if self.returncode is not None or self.elapsed_ms is not None:
                 raise ValueError("harness failure has no process returncode or measured elapsed time")
@@ -234,9 +221,13 @@ class InvocationOutcome:
                 raise ValueError(f"{agent}.invoke cannot be complete and provider-failed")
             if timed_out:
                 raise ValueError(f"{agent}.invoke cannot be both timed out and provider-failed")
-            if invocation_state not in {None, InvocationState.PROVIDER_FAILED}:
+            provider_state = (
+                InvocationState.PROVIDER_FAILED
+                if returncode == 0 else InvocationState.PROCESS_FAILED
+            )
+            if invocation_state not in {None, provider_state}:
                 raise ValueError(f"{agent}.invoke provider failure contradicts invocation_state")
-            return cls(stdout, stderr, returncode, elapsed_ms, InvocationState.PROVIDER_FAILED,
+            return cls(stdout, stderr, returncode, elapsed_ms, provider_state,
                        provider_error=provider_error, metadata=metadata)
         if timed_out:
             if complete or returncode != 124:
@@ -294,7 +285,11 @@ class InvocationOutcome:
     def with_provider_error(self, error: str | None, *, payload: Any = None) -> InvocationOutcome:
         if not error or self.state in {InvocationState.TIMED_OUT, InvocationState.SPAWN_FAILED, InvocationState.HARNESS_FAILED}:
             return replace(self, provider_payload=payload if payload is not None else self.provider_payload)
-        return replace(self, state=InvocationState.PROVIDER_FAILED,
+        state = (
+            InvocationState.PROVIDER_FAILED
+            if self.returncode == 0 else InvocationState.PROCESS_FAILED
+        )
+        return replace(self, state=state,
                        completion_evidence=None, provider_error=error.strip(),
                        provider_payload=payload if payload is not None else self.provider_payload)
 

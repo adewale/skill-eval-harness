@@ -11,10 +11,11 @@ This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md
 
 | Abstraction | Defined by | What it hands downstream |
 |---|---|---|
+| CLI invocation | `cli_contracts.ValidatedLegacyCLIInvocation` | One validated command, typed projections, and the explicit legacy-handler adapter. |
 | Manifest | `validate_manifest` | The full test definition for one skill. |
 | Case | `iter_cases` | One scenario with a prompt and graders. |
-| Variant | `task_variants` | The arm a case runs under; the lift axis. |
-| Split | `VALID_SPLITS` | Which cases are visible during iteration. |
+| Variant | `manifest_contracts.ExecutionVariant` / `task_variants` | The arm a case runs under; the lift axis. |
+| Split | `manifest_contracts.Split` | Which cases are visible during iteration. |
 | Assertion | `assertion_result` | A single pass/fail check over one run. |
 | Prepared task row | `prepared_task_rows` | A runner-neutral unit of work. |
 | Run-output contract | `discover_run_bases` | The files a runner leaves on disk. |
@@ -23,6 +24,21 @@ This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md
 | Judge plumbing | `collect_judge_tasks` | Qualitative checks, deferred to a model you supply. |
 | Grade result row | `grade_case_variant` | One scored row per case/variant/run. |
 | Benchmark report | `build_benchmark_report` | Aggregates, lift, and flags. |
+
+## CLI invocation
+
+`argparse` owns syntax and help text, but its namespace is untrusted wire data. Immediately after
+parsing, `CLIInvocation.from_namespace` validates the closed `CLICommand` vocabulary, converts path
+arguments to `Path`, parses split, execution-variant, and model identities, and rejects non-finite
+or command-invalid numeric limits. Its raw argument bag is recursively frozen. Established handlers
+do not yet consume the typed projections: they cross the single named `to_legacy_namespace`
+adapter, while new or migrated handlers can accept the typed value. This is migration scaffolding,
+not a claim that `ty` already checks every handler's options.
+
+The parser choices and `CLICommand` must be the same set. At dispatch, built-in handlers and
+backend-projected answer entrypoints must form a disjoint, complete partition of that set. Adding a
+command therefore requires an explicit parser spelling, enum member, handler owner, documentation,
+and tests; an unknown or multiply owned command cannot fall through a string-based `if` chain.
 
 ## Manifest
 
@@ -51,6 +67,11 @@ case, so the variant axis is where skill effect becomes measurable. `variant_ins
 writes the per-arm instruction; the baseline must run from a workspace that cannot read the
 skill files, or the comparison means nothing.
 
+In process, every arm is an `ExecutionVariant`: a validated `str` subtype that closes the base
+vocabulary and owns the `ablation:<id>` encoding. It retains the existing JSON/path spelling, so
+the type strengthens the boundary without changing persisted artifacts. `task_variants` returns
+these typed values instead of unchecked strings.
+
 ## Split
 
 `tune`, `holdout`, and `holdback` label the intended evaluation phase. Tune cases are for
@@ -58,6 +79,11 @@ iteration; holdout is intended for end-of-round scoring; holdback is intended to
 skill/docs/eval descriptions until after scoring. The harness filters and reports these labels but
 does not provide access control—repositories and CI must keep private material private. `prepare` refuses to emit a hidden case with no
 `prompt_ref` unless you pass `--allow-missing-prompts` for dry-run planning.
+
+`Split` is the corresponding closed `str` subtype. `CaseKind` remains intentionally extensible
+for descriptive labels, but it owns the only structural classification the runners need:
+`answer` versus `trigger`. `PreparedTask.from_row` parses all three identity values at the wire
+boundary, and the executable task carries their precise types thereafter.
 
 ## Assertion
 
@@ -120,6 +146,10 @@ executable. `PreparedTaskDraft.validate()` / `PreparedTask.from_row()` construct
 repetition is positive, `run_dir` is safe and relative, and `without_skill` cannot carry skill
 paths. Every native runner and Jetty exporter requires the executable type.
 
+`CaseId`, `ModelId`, and `RunNumber` keep the run identity dimensions distinct from ordinary
+strings and integers. They serialize as the existing scalar values, while construction rejects an
+empty case/model or a boolean, zero, or negative repetition before that identity reaches pairing.
+
 The prepared rows also form a persisted `answer-design.json`: the exact expected
 case/model/repetition identities plus a digest of manifest inputs, referenced oracles, and
 variant instructions. Each produced run repeats the design, task, and instruction digests.
@@ -148,13 +178,22 @@ set incomplete. Legacy or externally written runs that do not declare that contr
 remain readable through the compatibility boundary. This boundary is the main extension seam
 in the codebase.
 
+`artifact_contracts.observe_artifact_set` reads that seam into exactly one frozen value:
+`LegacyArtifactSet | MissingArtifactCommit | InvalidArtifactCommit | IncompleteArtifactSet |
+CompleteArtifactSet`. A malformed marker and a valid marker whose files were interrupted or
+tampered with are therefore different states. Existing dictionary readers retain
+`artifact_set_complete` as a compatibility projection and expose the reasoned state alongside it.
+Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | LoadedEventLog`;
+`read_events_base` is only the legacy tuple adapter. Strict JSON parsing lives in
+`json_contracts.py`, so every disk reader shares duplicate-key and non-finite-number rejection.
+
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10504`), Claude (`run_claude:10685`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10472`), Claude (`run_claude:10658`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13225`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:3978` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13248`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4028` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -167,15 +206,30 @@ independently set timeout, return code, answer, and failure into a contradictory
 calls no model during default grading; it reads what the runner left behind. The explicit
 `--allow-scripts` and `--embed-cmd` modes may invoke caller-supplied external oracle subprocesses.
 
+Before a native provider subprocess starts, `invocation_contracts.py` constructs one
+`ProcessInvocationPlan`: immutable argv, stdin, working directory, environment, and a positive
+`TimeoutSeconds`. `run_argv_capture` accepts only that plan and returns the closed
+`InvocationResult` lifecycle. The answer backend receives the smaller `InvocationRequest`, whose
+model and timeout are also precise values. Provider adapters can choose wire formats, but they
+cannot omit or disagree about process inputs after the plan boundary. The same module owns the
+shared `InvocationState` vocabulary: `InvocationResult` admits only process-boundary states, while
+provider or harness failures remain semantic classifications and never rewrite the observed return
+code.
+
 ## Trace normalization
 
 Runners disagree on event shape. Codex emits `command_execution` and `turn.completed`; Pi
 emits `message_end` usage aliases; Jetty emits trajectory records. `normalize_trace_record`
 and `normalize_trace_records` collapse these into one schema-versioned `events.json` plus
-`metrics.json`, tagged with the source. `trace_contracts.EventState` first classifies each event as
+`metrics.json`, tagged with the source. Loading `events.json` first constructs the closed event-log
+observation above. `trace_contracts.EventState` then classifies each event as
 completed, in-progress, failed, or unknown; only completed operations contribute command/tool/file
 counts. Process and efficiency assertions read the normalized form, never the raw prose, because
 inferring tool use from answer text is how false evidence gets in.
+
+Autonomous trigger execution crosses the parallel `trigger_contracts.py` boundary: process state,
+completion evidence, detection evidence, and the final observation are closed values before
+`trigger_reporting.py` constructs a complete, incomplete, or empty cohort.
 
 ## Judge plumbing
 
@@ -183,7 +237,9 @@ Qualitative assertions defer. `collect_judge_tasks` gathers every `judge`/`rubri
 across runs and keys each by `judge_task_id` (`case::variant::run-n::assertion`, with a `model`
 segment on a multi-model run). `grade --judge-tasks` can serialize that queue, while the
 `judge` command reconstructs the same tasks from the manifest and run directory rather than
-reading the optional queue file. `judge_prompt` renders the case, expected behavior, rubric,
+reading the optional queue file. Before queuing, `grading_contracts.JudgeTask` validates and freezes
+the case/model/variant/run identity, paths, assertion, conversation, and prompt/evidence
+fingerprints. `judge_prompt` renders the case, expected behavior, rubric,
 and candidate output into a prompt — including the anchored dimensions or dynamic-rubric
 instruction for a graded assertion; `run_one_judge_task` pipes it to the `--judge-cmd` you
 supply or to a native `--judge-backend` (`claude`, `codex`, `gemini`, or `vibe`) plus
@@ -211,20 +267,64 @@ behind rather than a verdict. Grading reads from disk and calls no model, which 
 a default re-grade cheap and deterministic; opt-in script and embedding oracles are the explicit
 external-process exceptions.
 
+Before aggregation, every objective and qualitative row becomes one
+`SatisfiedAssertion | FailedAssertion | UnavailableAssertion | SkippedAssertion`. Severity and
+oracle tier are closed enums, scores must be finite, and unavailable/skipped rows cannot enter a
+pass-rate denominator. The legacy dictionary rows are serialized only after typed aggregation, so
+`passed: null`, dependency skips, and observed failures no longer share an implicit falsy branch.
+
 ## Benchmark report
 
 `build_benchmark_report` invokes the shared grader for each discovered run, then
 turns those in-memory result rows into the artifact you read. It does not consume the output
 of the `grade` command. Before arithmetic,
 `experimental_pairs.py` constructs exact `(case, model, repetition, population)` identities and
-requires one eligible arm of each kind. `build_paired_summary` computes per-case lift
+requires one eligible treatment and control arm from an explicit `ContrastSpec`. The default
+skill-presence contrast maps to the existing `with_skill`/`without_skill` wire rows.
+The stable identity of a comparison result is `(contrast_id, pair_key)`. Blocked rows and pairing
+diagnostics serialize that contrast ID, so two different comparisons over the same execution rows
+cannot collide or lose their causal question at a persistence boundary.
+`build_paired_summary` computes per-case lift
 (`with_skill` minus `without_skill`, normalized gain, and a flag when the skill hurts) only from
 those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplicate arms fail.
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:778`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:813`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
+
+`report_contracts.report_cohort` classifies each attempted reporting population as
+`EmptyReportCohort | CompleteReportCohort | PartialReportCohort |
+NotApplicableReportCohort` from one stable-identity attempt sequence before computing variant and
+slice headlines. `metric_cohort` then refines that same population per rate: row completeness can
+never authorize a survivor-only metric mean. Partial cohorts expose observed diagnostics but
+withhold headline means; empty and non-applicable populations remain distinct. `UnitRate` rejects
+booleans, non-finite numbers, and values
+outside `[0, 1]` before `statistics` can aggregate them. Attempted, observed, and blocked counts are
+derived from the same deeply frozen attempt dispositions, preventing consumers from assembling
+inconsistent coverage or relying on Python object identity.
+
+The pairing key carries `CaseId`, `ModelId | None`, `RunNumber`, and the closed
+`ExperimentalPopulation` enum. The pair also carries a contrast whose canonical factor coordinates
+separate activation, skill set, and content revision; those differing treatment coordinates do not
+pollute the shared repetition identity. `ExperimentalPair` is generic in its payload, so pairing run paths
+retains `Path` while pairing result rows retains their mapping interface; the shared constructor no
+longer erases every downstream payload to `Any`.
+
+When introducing or extending an abstraction, review the whole semantic path rather than only its
+constructor:
+
+1. name the untrusted boundary and the one owner that validates it;
+2. define stable value identity independently of Python object identity and treatment differences;
+3. keep process, provider, trace, judge, artifact, coverage, and telemetry facts on separate axes;
+4. make every refinement monotone, especially per-metric report coverage;
+5. serialize only at the artifact/UI edge, then re-validate on read; and
+6. prove the model twice: malformed/contradictory runtime cases plus `ty` narrowing and exhaustive
+   consumption.
+
+The compact owner inventory and extension rules are in [`typed-python.md`](typed-python.md). The
+failure models and adversarial proof styles are in
+[`correctness-by-construction-audit.md`](correctness-by-construction-audit.md).
 
 ## What changes when you extend the tool
 

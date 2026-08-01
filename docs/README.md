@@ -46,6 +46,9 @@ Pi, Jetty, subagent, and stub support), [`agent-cli-control-plane.md`](agent-cli
 [`agent-cli-tradeoffs.md`](agent-cli-tradeoffs.md) (Claude/Codex/Gemini/Vibe trade-offs and
 what their gaps mean for reports).
 
+The typed implementation boundary map and extension rules live in
+[`typed-python.md`](typed-python.md).
+
 ## Reference
 
 [`commands.md`](commands.md) is the full per-command reference (flags, examples, output shapes);
@@ -65,7 +68,8 @@ live observability slice is in [`otel-support-plan.md`](otel-support-plan.md).
 ## Audits
 
 Point-in-time findings: [`repo-effectiveness-audit.md`](repo-effectiveness-audit.md) and
-[`correctness-by-construction-audit.md`](correctness-by-construction-audit.md).
+[`correctness-by-construction-audit.md`](correctness-by-construction-audit.md). Durable rules
+distilled from those audits and production runs live in [`LESSONS_LEARNED.md`](../LESSONS_LEARNED.md).
 
 ## Adding a user journey
 

@@ -156,7 +156,9 @@ class TriggerRowBoundaryTests(unittest.TestCase):
     def test_pi_trigger_runner_invokes_pi_from_isolated_workspace(self):
         seen = {}
 
-        def fake_run(argv, *, cwd, env, timeout):
+        def fake_run(plan):
+            argv, cwd = list(plan.argv), plan.cwd
+            env, timeout = dict(plan.environment or {}), int(plan.timeout_s)
             seen.update({"argv": argv, "cwd": str(cwd), "config_dir": env["PI_CODING_AGENT_DIR"], "timeout": timeout})
             return InvocationOutcome.from_process(
                 stdout=json.dumps({"type": "agent_end", "messages": [{"stopReason": "stop"}]}) + "\n",
@@ -305,7 +307,8 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         self.assertEqual(result.provider_error, "provider rejected model")
 
     def test_pi_matrix_detection_and_telemetry_share_one_parsed_stream(self):
-        def successful_pi(*args, cwd, **kwargs):
+        def successful_pi(plan):
+            cwd = plan.cwd
             skill = Path(cwd) / ".pi-config" / "skills" / "demo" / "SKILL.md"
             assistant = {"role": "assistant", "stopReason": "stop",
                          "usage": {"input": 4, "output": 1, "totalTokens": 5}}
@@ -663,7 +666,8 @@ class ClaudeDetectionTests(unittest.TestCase):
     def test_claude_invoke_seeds_portable_auth_into_isolated_config(self):
         seen = {}
 
-        def fake_run(argv, *, cwd, env, timeout):
+        def fake_run(plan):
+            env = dict(plan.environment or {})
             config_dir = Path(env["CLAUDE_CONFIG_DIR"])
             seen["config_dir"] = config_dir
             seen["credentials"] = (config_dir / ".credentials.json").read_text(encoding="utf-8")
@@ -686,7 +690,8 @@ class ClaudeDetectionTests(unittest.TestCase):
     def test_claude_invoke_preserves_nonportable_oauth_config(self):
         seen = {}
 
-        def fake_run(argv, *, cwd, env, timeout):
+        def fake_run(plan):
+            env = dict(plan.environment or {})
             seen["config_dir"] = env.get("CLAUDE_CONFIG_DIR")
             return {"stdout": json.dumps({"type": "result", "subtype": "success"}) + "\n",
                     "stderr": "", "returncode": 0, "timed_out": False,
@@ -773,7 +778,9 @@ class CodexAdapterTests(unittest.TestCase):
     def test_codex_invoke_appends_raw_query_model_and_external_skill_dir(self):
         seen = {}
 
-        def fake_run(argv, *, cwd, env, timeout):
+        def fake_run(plan):
+            argv, cwd = list(plan.argv), plan.cwd
+            env, timeout = dict(plan.environment or {}), int(plan.timeout_s)
             seen.update({"argv": argv, "cwd": cwd, "env": env, "timeout": timeout})
             return {"stdout": '{"type":"turn.completed"}\n', "stderr": "", "returncode": 0, "timed_out": False,
                     "elapsed_ms": 1, "observation_complete": True}
@@ -796,7 +803,9 @@ class CodexAdapterTests(unittest.TestCase):
     def test_codex_invoke_seeds_auth_without_copying_user_skills(self):
         seen = {}
 
-        def fake_run(argv, *, cwd, env, timeout):
+        def fake_run(plan):
+            cwd = plan.cwd
+            env = dict(plan.environment or {})
             codex_home = Path(env["CODEX_HOME"])
             seen["auth"] = (codex_home / "auth.json").read_text(encoding="utf-8")
             seen["config"] = (codex_home / "config.toml").read_text(encoding="utf-8")
@@ -1013,7 +1022,10 @@ class VibeAdapterTests(unittest.TestCase):
     def test_vibe_invoke_uses_isolated_home_model_env_and_prompt_arg(self):
         seen = {}
 
-        def fake_run(argv, *, cwd, env, timeout, input_text=None):
+        def fake_run(plan):
+            argv, cwd = list(plan.argv), plan.cwd
+            env, timeout = dict(plan.environment or {}), int(plan.timeout_s)
+            input_text = plan.input_text
             seen.update({"argv": argv, "cwd": cwd, "env": env, "timeout": timeout, "input_text": input_text})
             seen["vibe_home_inside_workdir"] = Path(env["VIBE_HOME"]).is_relative_to(Path(cwd))
             seen["workspace_vibe_env_present"] = (Path(cwd) / ".vibe-home" / ".env").exists()

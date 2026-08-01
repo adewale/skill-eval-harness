@@ -166,6 +166,7 @@ skill-benchmark --help
 | `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work and the roadmap/cost build-out. |
 | `docs/architecture.md` | How the pipeline fits together: the stages, the runner boundary, the model/variant/run fan-out, and the invariants that keep grading honest. |
 | `docs/abstractions.md` | What each core object is: manifest, prepared task, run-output contract, assertion result, `ResultSet`. |
+| `docs/typed-python.md` | Which Python surfaces `ty` checks, the boundary inventory, and the drift rules for new modules. |
 | `docs/authoring-evals.md` | Opinionated workflow/quickstart for writing a new eval suite, including severity and graded assertions. |
 | `docs/tuning-skill-activation.md` | The activation-tuning loop: trigger cases in both polarities, the (agent, model) trigger-rate matrix, how to read under/over-trigger, and the adapter seam for adding agents. |
 | `docs/is-my-skill-worth-its-tokens.md` | Keep/trim/cut walkthrough: static footprint (`profile-skill`) vs. runtime lift-per-token and lift-per-dollar (`token-overhead`, `cost-summary`). |
@@ -552,8 +553,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, validation commands, a
 
 ```bash
 pip install -e ".[test]"
-python3 -m py_compile *.py examples/adewale-workspace/*.py
-ty check
+python3 -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
+ty check --error-on-warning
 python3 -m unittest discover tests -v
 ```
 
@@ -581,11 +582,15 @@ skill-eval-harness/
 ├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance/task value objects
 ├── agent_capabilities.py       # unified backend surfaces, capabilities, CLI options, smoke, and failure policy
+├── artifact_contracts.py       # closed persisted-artifact observations and integrity verification
+├── cli_contracts.py            # validated command, path, model, variant, and numeric CLI values
 ├── experimental_pairs.py       # exact pair identities and blocked-pair construction
+├── grading_contracts.py        # closed assertion observations and immutable judge tasks
+├── report_contracts.py         # empty/complete/partial report coverage cohorts and rates
 ├── runner_contracts.py         # closed answer-runner outcome union
 ├── judge_verdict.py            # strict imported/stored judge verdict variants
 ├── jetty_contracts.py          # closed Jetty lifecycle and observation contract
-├── trace_contracts.py          # normalized event lifecycle contract
+├── trace_contracts.py          # normalized event-log and event lifecycle contracts
 ├── trigger_contracts.py        # autonomous-trigger invocation/detection/observation contract
 ├── telemetry.py                # schema-v3 availability/provenance/comparison domain
 ├── docs/                       # architecture, abstractions, vocabulary, specs, guides (see the map above)
@@ -604,12 +609,12 @@ skill-eval-harness/
 
 ```bash
 pip install -e ".[test]"
-python3 -m py_compile *.py examples/adewale-workspace/*.py
-ty check
+python3 -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
+ty check --error-on-warning
 python3 -m unittest discover tests -v
 ```
 
-The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), human-text construction and matching (`test_text_contracts.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics and pair identity (`test_stats.py`, `test_experimental_pairs.py`), runner/Jetty adapters and lifecycle contracts (`test_runners.py`, `test_jetty_contracts.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus three executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), and relative-link resolution across the docs (`test_doc_links.py`). Shared fixture builders live in `tests/helpers.py`.
+The test suite is organized by subject: manifest validation and eval hygiene (`test_manifest.py`), grading (`test_grading.py`), human-text construction and matching (`test_text_contracts.py`), judge plumbing (`test_judging.py`), report views (`test_reporting.py`), closed-form statistics and pair identity (`test_stats.py`, `test_experimental_pairs.py`), runner/Jetty adapters and lifecycle contracts (`test_runners.py`, `test_jetty_contracts.py`), the ablation experiment end to end (`test_ablations.py`), cost telemetry (`test_cost_telemetry.py`), the confidence floor and detector fixtures (`test_confidence_floor.py`), the trigger matrix (`test_trigger_matrix.py`), plus four executable drift guards: doc code references (`test_doc_refs.py`), shared-owner/doc-sync consolidation guards (`test_consolidation_guards.py`), relative-link resolution across the docs (`test_doc_links.py`), and Python type/package/semantic coverage (`test_type_coverage.py`). Shared fixture builders live in `tests/helpers.py`.
 
 ## Source checked
 

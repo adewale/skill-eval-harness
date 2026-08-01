@@ -40,7 +40,7 @@ class ComparisonTextConstructionTests(unittest.TestCase):
         packaged = project.split("[tool.setuptools]", 1)[1].split("\n[", 1)[0]
         ty_sources = project.split("[tool.ty.src]", 1)[1].split("\n[", 1)[0]
         self.assertIn('"text_contracts"', packaged)
-        self.assertIn('"text_contracts.py"', ty_sources)
+        self.assertIn('"*.py"', ty_sources)
         self.assertIn('"regex==2026.7.19"', project)
 
     def test_rendered_v1_removes_issue_55_character_and_records_it(self):

@@ -60,11 +60,18 @@ success, and exhausted retries. Exhaustive finite-state and trigger truth tables
 
 ## Paired experimental identity
 
-`experimental_pairs.py` owns `ExperimentalPairKey(case_id, model, run_number, population)` and the
-only constructor for `ExperimentalPair`.
+`experimental_pairs.py` owns `ExperimentalPairKey(case_id, model, run_number, population)`, one
+explicit `ContrastSpec`, and the only constructor for `ExperimentalPair`.
 
-- A complete pair contains exactly one `with_skill` and one `without_skill` arm with the same key.
-- Missing arms and ineligible arms become explicit `BlockedExperimentalPair` values.
+- A complete pair contains exactly one treatment and one control arm from its declared contrast,
+  with the same key. The default contrast retains the existing `with_skill`/`without_skill` wire
+  shape and compatibility properties.
+- Each contrast binds both arms to canonical activation, skill-set, and content-revision factor
+  coordinates. Native discovery and component-composition work can therefore add declared binary
+  contrasts without pretending those dimensions are ordinary execution variants.
+- Missing arms and ineligible arms become explicit `BlockedExperimentalPair` values that retain the
+  `contrast_id`. Pairing diagnostics serialize the same ID; the durable comparison identity is
+  `(contrast_id, pair_key)`.
 - A duplicate arm for one identity raises before aggregation; it can no longer overwrite an earlier
   row in a dictionary.
 - Lift, graded lift, paired reliability, paired cost, token-overhead run discovery, slice/case
@@ -100,11 +107,14 @@ of the four variants.
 ## Judge invocation results
 
 `judge_contracts.JudgeInvocation` is the immutable process boundary shared by native judge
-backends and `--judge-cmd`. It requires string output channels and an exact integer return code,
+backends and `--judge-cmd`. It requires string output channels, an exact integer return code, and an
+explicit shared `InvocationState`,
 validates finite non-negative cost and usage measurements, recursively freezes usage, and closes
 usage provenance plus model identity. `run_one_judge_task` rejects any registered backend that
 returns another shape before JSON extraction, schema checks, typed verdict construction, or row
-assembly. A nonzero exit remains a valid diagnostic invocation but cannot become a complete judge
+assembly. Exit-zero provider-protocol failure retains return code zero with
+`InvocationState.PROVIDER_FAILED`; it cannot become a complete judge observation. A nonzero exit
+remains a valid diagnostic invocation but cannot become a complete judge
 observation. This changes no persisted judge-row fields; `judge_verdict.py` still re-establishes the
 boolean/scored/dimension/dynamic/consensus invariant at the storage boundary.
 
@@ -115,6 +125,7 @@ a provider-specific wire contract at the point where Gemini's JSON or JSONL leav
 
 ```text
 InvocationRequest
+  -> ProcessInvocationPlan
   -> InvocationResult
   -> GeminiStream | GeminiJsonResponse
   -> Completed | ProviderFailed        (answer)
@@ -122,10 +133,10 @@ InvocationRequest
 ```
 
 - `InvocationRequest` is a validated minimal answer request: prompt, optional model, positive timeout,
-  and working directory. It does **not** freeze argv, environment, auth, or provider policy; those are
-  still adapter-owned plans assembled after request construction and remain the clearest abstraction
-  gap for a future typed `InvocationPlan`. The Gemini adapter accepts one caller-trusted executable
-  token and owns output-format,
+  and working directory. Provider adapters refine it into a frozen `ProcessInvocationPlan` containing
+  argv, stdin, cwd, timeout, and environment; the sole internal subprocess owner accepts that plan,
+  including version probes. Provider-specific auth and policy remain adapter-owned inputs to plan
+  construction. The Gemini adapter accepts one caller-trusted executable token and owns output-format,
   policy, trust, conditional sandbox, workspace expansion, session, extension, and prompt/model
   flags. Prefix launchers are rejected because they can reinterpret appended arguments; the chosen
   executable itself remains an explicit operator authority recorded in artifacts.
@@ -197,6 +208,27 @@ missing or changed committed file, unsafe inventory path, or stale marker remain
 unscorable. Later downstream artifacts such as `grading.json` do not alter the committed producer
 inventory.
 
+## Grading observations and judge tasks
+
+`grading_contracts.py` closes both sides of qualitative grading:
+
+```text
+assertion row -> Satisfied | Failed | Unavailable | Skipped
+judge work item -> JudgeTask(case, model, variant, run, paths, prompt, fingerprints)
+```
+
+- `passed: null` is unavailable evidence, not a behavioral failure. Dependency skips remain a
+  separate state even when an assertion had already produced an observed result before the
+  dependency fixed point resolved.
+- Severity and oracle tier are enums and scores are finite. Only satisfied/failed observations can
+  enter grading denominators; aggregation consumes the union and serializes dictionaries last.
+- `JudgeTask` validates the exact experimental identity, fingerprint syntax, and run paths before
+  the task is queued; `run_one_judge_task` recomputes the canonical input fingerprint against the
+  current output and trajectory before invocation. Assertion and conversation JSON are recursively frozen and
+  detached from their source rows, then deeply thawed only at serialization. A partially assembled
+  task cannot reach a judge backend.
+- `ty` checks exhaustive narrowing for the assertion union and precise judge-task identity fields.
+
 ## Imported judge verdicts
 
 `judge_verdict.py` parses judge rows into one of:
@@ -248,6 +280,24 @@ a protocol error and cannot receive return code zero.
 
 Dry-run payload generation is planning, not a Jetty execution lifecycle. Non-executable submitted
 payloads are protocol-invalid rather than ordinary provider failures.
+
+## Persisted run artifacts
+
+Persisted run evidence crosses a typed disk boundary before event semantics are inspected:
+
+```text
+artifact-commit.json -> Legacy | MissingCommit | InvalidCommit | Incomplete | Complete
+events.json -> Missing | Invalid | Loaded
+```
+
+- `artifact_contracts.py` verifies the declared schema, required-file inventory, paths, symbolic
+  links, and SHA-256 digests. It preserves malformed marker data separately from a well-formed but
+  partial or stale artifact set.
+- `trace_contracts.parse_event_log` validates the event-log envelope and performs the explicit v1
+  compatibility adaptation. A JSON `null` document is invalid rather than being mistaken for a
+  missing file.
+- `artifact_commit_valid` and `read_events_base` remain compatibility projections; integrity and
+  grading code can consume the closed observations without interpreting booleans or error tuples.
 
 ## Normalized trace-event lifecycle
 
@@ -309,11 +359,47 @@ raw output string
   the same human-text view, including minimum-length and non-vacuity decisions. Protocol and
   machine-identity checks (`golden_output` by default, structured JSON, scripts, command text, tool
   names, and paths) remain exact; graded script scores still cross a finite 0-1 numeric boundary.
-- The project's focused `ty` gate includes `text_contracts.py`, so this module's constructors,
-  closed assertion union, and return types are statically checked without suppressions. That gate
-  complements rather than replaces runtime parsing: manifest dictionaries and external
-  embedding/script values remain untrusted wire data, while the legacy `skill_benchmark.py`
-  integration is not yet in ty's configured source set.
+- The project's `ty` gate automatically includes every packaged top-level Python module,
+  repository script, shipped example, and explicit static contract assertion under `type_tests/`.
+  Constructors, closed unions, return types, and exhaustive consumers are therefore checked without
+  a per-module registration step, and warnings fail CI. Runtime tests remain executable negative
+  proofs: many deliberately pass malformed values that production types forbid. The gate
+  complements rather than replaces runtime parsing; manifest dictionaries and external
+  embedding/script values remain untrusted wire data. The complete inventory and extension rule
+  are in [`typed-python.md`](typed-python.md).
+- Packaging inventory, `ty` source coverage, and the versioned trigger-semantic module inventory
+  are separate contracts. A standalone report-only module is excluded from trigger identity, while
+  a declared trigger dependency changes `harness_identity` and blocks causal reuse. The inventory is
+  deliberately conservative at module granularity: because `skill_benchmark.py` still owns both
+  trigger and non-trigger orchestration, any edit to that monolith invalidates trigger evidence.
+- The command line crosses the same kind of boundary. `argparse.Namespace` becomes a frozen
+  `ValidatedLegacyCLIInvocation`; commands form a closed enum, paths and domain identities are projected to their
+  typed values, numeric limits reject booleans and non-finite/out-of-range values, and dispatch
+  requires exactly one owner for every command. Existing handlers still cross one explicitly named
+  legacy Namespace adapter; these projections are a migration seam until each handler accepts its
+  command-specific typed options.
+
+## Report coverage cohorts
+
+Variant and slice summaries consume one closed report population:
+
+```text
+attempted rows + stable identity + eligibility -> Empty | Complete | Partial | NotApplicable
+row cohort + metric key/applicability -> metric-specific cohort
+observed numeric rate -> UnitRate(0 <= value <= 1)
+```
+
+- Empty populations remain distinct from fully observed non-empty populations.
+- Attempts that exist but have no applicable denominator remain distinct from empty and blocked
+  populations.
+- A partial population owns the attempted, observed, and blocked counts plus its reason. Its
+  observed means remain diagnostics while headline means are unavailable.
+- Every row is classified once from the attempted sequence, carries a stable run identity, is
+  recursively frozen, and cannot repeat that identity. No membership rule depends on object `id()`.
+- Each rate gets its own refined cohort. A complete row set with one absent rate is metric-partial,
+  never permission to average only the surviving values.
+- Rate validation rejects bool, NaN, infinity, and out-of-range values before aggregation.
+- `ty` checks exhaustive narrowing across all four coverage states.
 
 ## Ablation provenance vocabulary
 
@@ -339,6 +425,13 @@ The suite uses four complementary proof styles:
 - integration tests that feed mismatched models/repetitions, duplicates, missing arms, malformed
   verdicts, incomplete traces, and completed-without-output Jetty records through real consumers.
 
+Cross-boundary reviews also check four composition properties that a local constructor cannot prove:
+
+- identity remains value-based after joins, persistence, and report grouping;
+- process/provider/judge/artifact owners preserve facts without synthesizing one another;
+- row-to-metric coverage refinement can only remove headline availability; and
+- telemetry observation neither grants nor loses grading eligibility.
+
 `ty check` also verifies parser narrowing and exhaustive handling of the trigger result and
 cohort sum types. `trigger_reporting.py` joins the repository's expanding typed boundary instead
 of relying on a source-shape guard or weakening diagnostics around legacy dictionaries.
@@ -355,6 +448,8 @@ legacy artifact never recorded. In particular:
   present; telemetry comparison remains blocked when its required basis is absent;
 - Jetty aliases and response shapes still need token-backed live validation before production claims;
 - `RunnerOutcome` is retained as a compatibility factory, so new code should construct the explicit
-  union variants directly; and
+  union variants directly;
+- `skill_benchmark.py` remains a shared orchestration monolith, so the conservative trigger identity
+  must invalidate on unrelated edits to that module until trigger ownership is extracted; and
 - provider payload dictionaries are preserved for diagnostics, but no downstream decision should
   bypass the typed adapter to read them directly.

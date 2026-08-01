@@ -648,3 +648,64 @@ and the provider wire. Each tier must be either owned, rejected, isolated, or ex
 - Make prompt transport an invocation-plan capability. Gemini and Vibe currently place prompts in
   argv, which can expose content in local process listings and hit OS command-line size limits;
   prefer stdin or a protected prompt file when a provider offers equivalent noninteractive semantics.
+
+## 2026-08-01 — Typed islands are coherent only when their proofs compose
+
+**Problem:** Each layer of the typed-boundary stack could be locally valid while adjacent layers
+still disagreed about meaning. Early revisions paired rows by Python object identity, represented a
+zero-exit provider failure as a fabricated process exit, allowed a metric to average the survivors
+of an otherwise complete cohort, and coupled telemetry availability to grading eligibility. Frozen
+containers and warning-free annotations did not make those cross-boundary claims true.
+
+**Lesson:** A type is useful evidence only when stable value identity, lifecycle ownership,
+coverage refinement, and serialization semantics survive all the way to the decision that consumes
+it. `ty` can prove that consumers handle the model we expose; it cannot repair a model whose owner
+or distinctions are wrong.
+
+**Rule:**
+- Give comparisons stable value identities. Pair by explicit case/model/repetition/population and
+  canonical contrast coordinates; never use object identity or treatment labels as repetition
+  identity.
+- Give each fact one owner. Process creation and exit, provider completion, trace evidence, judge
+  verdict, artifact durability, and report coverage are separate axes; one axis cannot fabricate or
+  upgrade another.
+- Preserve wire distinctions exactly. Schema versions are JSON integers, not booleans or integral
+  floats; absent and present-with-`null` are different when the schema says so; recursively freeze
+  accepted payloads before publishing them.
+- Make coverage refinement monotone. A complete row cohort can become partial for a specific
+  metric, but filtering or a later projection cannot resurrect an unavailable headline. Telemetry
+  remains independently observable even when a row is not grade-eligible.
+- Keep compatibility at one named seam. Preserve meaningful legacy values such as inherited stdin
+  (`None`) and explicit numeric zero rather than normalizing them through truthiness.
+- Pair static proofs with runtime model-gap tests. Narrowing and exhaustiveness belong in `ty`;
+  malformed wires, semantic contradictions, persistence round trips, and reversion failures belong
+  in executable tests.
+
+## 2026-08-01 — Every PR in a stack is a release candidate
+
+**Problem:** A green top-of-stack branch can hide a broken intermediate tip, a description that
+depends on code introduced later, or a child diff whose base changed after its parent merged. Those
+failures make the advertised review boundary fictional even when the final combined tree is sound.
+
+**Lesson:** A stacked PR is a sequence of independently reviewable and independently green changes,
+not one large change split into GitHub pages. Merge order and base movement are part of the change's
+correctness protocol.
+
+**Rule:**
+- Make each PR target its immediate predecessor and state its parent, scope, risk, and standalone
+  validation. No layer may require a later PR to compile, test, or explain its public behavior.
+- Test every intermediate tip with the full deterministic suite. Audit both directions: lower
+  layers for contracts leaked upward, and upper layers for duplicated ownership or weakened
+  semantics.
+- Before restacking, preserve a backup ref. If a prerequisite was squash-merged, transplant the
+  stack onto the exact merged tree, inspect every resulting diff, and rerun every tip's checks.
+- When GitHub recognizes a native stack, mark every included PR ready and green, then request the
+  asynchronous merge on the highest intended tip and poll its UUID. GitHub merges every ancestor up
+  to that tip into the base branch; the ordinary synchronous merge endpoint is not valid for a
+  recognized stack.
+- If the native stack endpoint is unavailable, merge strictly from the base upward: after each
+  parent, retarget or rebase only the next child, inspect the diff, and wait for its checks. Do not
+  delete an intermediate base before its child has the correct target.
+- Treat inventories according to meaning: packaging, static-analysis coverage, and causal identity
+  are different sets. A stack-wide guard should enforce their relationship, not collapse them into
+  filesystem equality.

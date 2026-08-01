@@ -94,6 +94,7 @@ from skill_benchmark import (
     VIBE_READ_ONLY_TOOLS,
     AblationError,
     PiStream,
+    ProcessInvocationPlan,
     build_canonical_skill_tree,
     build_vibe_cli_argv,
     canonical_json_sha256,
@@ -429,7 +430,9 @@ class ClaudeAdapter(AgentAdapter):
             env["CLAUDE_CONFIG_DIR"] = str(config_dir)
             config_isolated = True
         result = validate_invoke_result(
-            self.name, self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
+            self.name, self._run_argv(ProcessInvocationPlan.from_values(
+                argv, input_text="", cwd=workspace, timeout_s=timeout,
+                environment=env))
         )
         metadata: dict[str, Any] = {"config_isolated": config_isolated}
         if not config_isolated:
@@ -528,7 +531,9 @@ class CodexAdapter(AgentAdapter):
         env, meta = codex_env_for_home(codex_home)
         try:
             result = validate_invoke_result(
-                self.name, self._run_argv(argv, cwd=workspace, env=env, timeout=timeout)
+                self.name, self._run_argv(ProcessInvocationPlan.from_values(
+                    argv, input_text="", cwd=workspace, timeout_s=timeout,
+                    environment=env))
             )
         finally:
             shutil.rmtree(codex_home, ignore_errors=True)
@@ -569,7 +574,9 @@ class PiAdapter(AgentAdapter):
         env["PI_CODING_AGENT_DIR"] = str(workspace / ".pi-config")
         return pi_invocation_outcome(validate_invoke_result(
             self.name,
-            self._run_argv(pi_argv(query, model), cwd=workspace, env=env, timeout=timeout),
+            self._run_argv(ProcessInvocationPlan.from_values(
+                pi_argv(query, model), input_text="", cwd=workspace,
+                timeout_s=timeout, environment=env)),
         )).with_metadata(config_isolated=True)
 
 
@@ -617,7 +624,9 @@ class VibeAdapter(AgentAdapter):
                 )
             result = validate_invoke_result(
                 self.name,
-                self._run_argv(argv, input_text="", cwd=workspace, env=env, timeout=timeout),
+                self._run_argv(ProcessInvocationPlan.from_values(
+                    argv, input_text="", cwd=workspace, timeout_s=timeout,
+                    environment=env)),
             )
             if result.observation_complete:
                 result = result.with_provider_error(

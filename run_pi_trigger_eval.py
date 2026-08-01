@@ -27,6 +27,7 @@ from skill_benchmark import (
     VALID_SPLITS,
     AblationError,
     PiStream,
+    ProcessInvocationPlan,
     build_canonical_skill_tree,
     canonical_json_sha256,
     canonical_trigger_query,
@@ -223,7 +224,13 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(config_dir)
         invocation = pi_invocation_outcome(
-            invoke_argv_with_timeout(pi_argv(query, model), cwd=config_dir, env=env, timeout=timeout)
+            invoke_argv_with_timeout(ProcessInvocationPlan.from_values(
+                pi_argv(query, model),
+                input_text="",
+                cwd=config_dir,
+                timeout_s=timeout,
+                environment=env,
+            ))
         )
         stream = invocation.provider_payload
         if not isinstance(stream, PiStream):

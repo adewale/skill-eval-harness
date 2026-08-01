@@ -1,9 +1,12 @@
 """Closed lifecycle states for normalized trace events."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal, TypeAlias
+
+from json_contracts import freeze_json_mapping
 
 
 class EventState(str, Enum):
@@ -25,6 +28,79 @@ class ParsedEventState:
     state: EventState
     source: EventStateSource
     raw: str | None = None
+
+
+class EventLogState(str, Enum):
+    MISSING = "missing"
+    INVALID = "invalid"
+    LOADED = "loaded"
+
+
+@dataclass(frozen=True)
+class MissingEventLog:
+    reason: str = "missing events.json"
+    state: Literal[EventLogState.MISSING] = field(
+        default=EventLogState.MISSING, init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError("missing event log reason must be non-empty")
+
+
+@dataclass(frozen=True)
+class InvalidEventLog:
+    reason: str
+    state: Literal[EventLogState.INVALID] = field(
+        default=EventLogState.INVALID, init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError("invalid event log reason must be non-empty")
+
+
+@dataclass(frozen=True)
+class LoadedEventLog:
+    events: tuple[Mapping[str, Any], ...]
+    schema_version: Literal[1, 2]
+    state: Literal[EventLogState.LOADED] = field(
+        default=EventLogState.LOADED, init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version not in {1, 2}:
+            raise ValueError("loaded event log schema_version must be exactly 1 or 2")
+        if not isinstance(self.events, tuple) or not all(
+            isinstance(event, Mapping) for event in self.events
+        ):
+            raise TypeError("loaded event log events must be a tuple of mappings")
+        object.__setattr__(self, "events", tuple(
+            freeze_json_mapping(event, f"events[{index}]")
+            for index, event in enumerate(self.events)
+        ))
+
+
+EventLogObservation: TypeAlias = MissingEventLog | InvalidEventLog | LoadedEventLog
+
+
+def parse_event_log(raw: Any) -> InvalidEventLog | LoadedEventLog:
+    """Parse a loaded JSON value into one normalized event-log observation."""
+    version_present = isinstance(raw, dict) and "schema_version" in raw
+    version = raw["schema_version"] if version_present else None
+    if version_present and (type(version) is not int or version not in {1, 2}):
+        return InvalidEventLog(f"unsupported events.json schema_version {version!r}")
+    events = raw.get("events") if isinstance(raw, dict) else raw
+    if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
+        return InvalidEventLog("events.json must contain an events list")
+    resolved_version: Literal[1, 2] = 2 if type(version) is int and version == 2 else 1
+    if resolved_version == 1:
+        events = [
+            ({
+                **event,
+                "status": EventState.COMPLETED.value,
+                "state_source": EventStateSource.LEGACY_ASSUMED_COMPLETED.value,
+            } if event.get("status") is None else event)
+            for event in events
+        ]
+    return LoadedEventLog(tuple(events), resolved_version)
 
 
 _COMPLETED = {"completed", "complete", "succeeded", "success", "done", "finished"}

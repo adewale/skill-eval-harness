@@ -445,6 +445,7 @@ class VerdictSchemaTests(unittest.TestCase):
     def test_shell_judge_uses_the_same_typed_boundary(self):
         invocation = jc.JudgeInvocation(
             stdout='{"passed":true}', stderr="", returncode=0,
+            invocation_state=sb.InvocationState.COMPLETE,
             model_label="opaque-shell-judge")
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
                 sb, "shell_judge_invoke", return_value=invocation) as invoke:
@@ -454,6 +455,25 @@ class VerdictSchemaTests(unittest.TestCase):
         invoke.assert_called_once()
         self.assertTrue(row["passed"])
         self.assertEqual(row["judge_model"], "opaque-shell-judge")
+        self.assertEqual(row["invocation_state"], "complete")
+
+    def test_provider_failure_state_and_evidence_survive_result_projection(self):
+        invocation = jc.JudgeInvocation(
+            stdout="", stderr="protocol diagnostics", returncode=0,
+            invocation_state=sb.InvocationState.PROVIDER_FAILED,
+            provider_error="provider envelope was malformed",
+            model_label="opaque-shell-judge")
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+                sb, "shell_judge_invoke", return_value=invocation):
+            row = sb.run_one_judge_task(
+                self._task(td), judge_cmd="unused",
+                judge_model="opaque-shell-judge")
+
+        self.assertFalse(row["passed"])
+        self.assertFalse(row["judge_observation_complete"])
+        self.assertEqual(row["invocation_state"], "provider_failed")
+        self.assertEqual(row["provider_error"], "provider envelope was malformed")
+        self.assertEqual(row["evidence"], "provider envelope was malformed")
 
     def test_registry_rejects_an_untyped_judge_backend_result(self):
         def broken_backend(prompt, **kwargs):
