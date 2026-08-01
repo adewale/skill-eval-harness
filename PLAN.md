@@ -31,7 +31,7 @@ step.
 |---|---|---|
 | 0 — working branch | SANDBOX | **done** |
 | 1 — wire fixtures | SANDBOX | **done** |
-| 2 — failing protocol tests | SANDBOX | not started |
+| 2 — failing protocol tests | SANDBOX | **done (red, as intended)** |
 | 3 — containment posture | SANDBOX | not started |
 | 4 — `agy_contracts.py` | SANDBOX | not started |
 | 5 — narrowing proofs | SANDBOX | not started |
@@ -128,6 +128,35 @@ uv pip install --python .venv/bin/python -e ".[test]"
   appended flags still survive a user-supplied launcher prefix, so the residual
   risk really is flag *addition*, as step 7 states.
 
+- **F5 (step 2) — the conservation laws cannot land in step 2; they move to
+  step 8.** Step 2 asks to port `tests/test_trace_conservation.py` (575 lines on
+  the reference branch) alongside the D1/D2/D3 tests. That file does **not**
+  exist on `upstream/main` — it is reference-branch-only — and its C1–C3 laws
+  assert over the agy adapter's translation inside `skill_benchmark.py`, plus
+  C4 asserts over the grading filter. None of that exists until steps 6 and 8.
+  Porting it in step 2 would produce import and attribute errors, which step 2's
+  own goal condition forbids.
+
+  Step 2 therefore covers the parser-level protocol laws only (the D1/D2/D3
+  tests, which need nothing but `agy_contracts`). **The conservation-law port,
+  including the C4 law the plan singles out, is a step 8 deliverable** and is
+  listed there.
+
+- **F6 (step 2) — a stub with legacy semantics is more useful than an empty
+  one.** `agy_contracts.py` was created in step 2 with its *final* public
+  surface but internals that deliberately reproduce the reference branch's D1,
+  D2 and D3 behaviour. The red output is therefore a demonstration that the
+  three defects are real and reachable, not merely that a function is missing —
+  which is what review requirement 8 asks for. The most legible line of it:
+  a completed `grep_search` produced
+
+  ```
+  AgyFileRead(path='/WORKSPACE/.agents/skills/demo/SKILL.md')
+  ```
+
+  structurally identical to a genuine `view_file` activation. Step 4 replaces
+  the internals and keeps the surface.
+
 - **F4 (step 1) — dash-prefixed prompt binding remains unproven.** `agy --print
   "--dangerously-skip-permissions" --output-format stream-json` reached the
   authentication stage rather than failing flag parsing, which is consistent
@@ -166,6 +195,26 @@ Both D2 and D3 are therefore confirmed against the current release, not inferred
 hand-constructed from the 1.1.8 vocabulary and labelled as such in the README,
 which also records the one guessed parameter name (`grep_search`'s `SearchPath`)
 for step 10 to replace.
+
+### Step 2 result — measured 2026-08-01
+
+`tests/test_agy_contracts.py` holds 16 tests: 7 fail against the step-2 stub and
+9 pass. The 9 that pass are deliberate controls — they assert that the guards do
+not over-fire (real telemetry is still reported, a genuine `view_file` of the
+mounted `SKILL.md` still counts as activation), so a step-4 implementation
+cannot turn the red green by simply refusing everything.
+
+The full red transcript is committed at `docs/evidence/agy-red-tests.md`.
+Failures by defect:
+
+| Defect | Failing tests |
+|---|---|
+| D1 — search recorded as activation | 4 |
+| D2 — absent telemetry reported as zero | 2 |
+| D3 — provider error dropped on nonzero exit | 1 |
+
+**This commit is deliberately red.** Step 4 turns it green; the red state is
+kept in history because review requirement 8 asks for red-test evidence.
 
 ---
 
@@ -523,7 +572,11 @@ capture with its `agy --version` recorded.
 
 ---
 
-### Step 2 — Write failing protocol tests first [SANDBOX]
+### Step 2 — Write failing protocol tests first [SANDBOX] — DONE (red, as intended)
+
+> See [Step 2 result](#step-2-result--measured-2026-08-01). Note **finding F5**:
+> the conservation-law port called for below cannot happen here and has moved to
+> step 8.
 
 Before any parser exists, write the tests that encode the three defects. They
 must **fail** against a stub.
@@ -536,10 +589,14 @@ must **fail** against a stub.
 - **D3:** the same fixture at returncode 1 preserves
   `"authentication failed or timed out"` as the provider error.
 
-Also port the mutation-tested conservation laws from
+~~Also port the mutation-tested conservation laws from
 `tests/test_trace_conservation.py` (575 lines on the reference branch). The C4
 law — a metric cannot report `tool_calls=1` while the grading filter claims no
-tools ran — caught real defects and should survive.
+tools ran — caught real defects and should survive.~~
+
+**Moved to step 8 — see finding F5.** Those laws assert over the adapter and the
+grading filter, neither of which exists until steps 6 and 8, so porting them
+here would fail with import errors rather than for the intended reason.
 
 **Goal condition:** the new tests exist, fail for the intended reason (not an
 import or attribute error), and each failure message names the invariant it
@@ -754,6 +811,15 @@ elapsed_provenance="process_measured",
 This mirrors `main`'s own `gemini` row, which withholds trigger support pending
 a live headless activation run. Following that precedent is what makes this PR
 landable now.
+
+**Port the conservation laws here** (moved from step 2 by finding F5):
+`tests/test_trace_conservation.py`, 575 lines on the reference branch. It does
+not exist on `upstream/main`, so it arrives whole. The C4 law — a metric cannot
+report `tool_calls=1` while the grading filter claims no tools ran — caught real
+defects and must survive. Its C2 vocabulary law is also what keeps
+`unclassified_tools_advertised` honest against `advertised-tools.json`, and its
+bucket-overlap law is now a direct check on the D1 fix, since
+`AGY_FILE_READ_TOOLS` and `AGY_SEARCH_TOOLS` must not intersect.
 
 Port the conformance pack (`tests/test_backend_conformance.py`, 349 lines on the
 reference branch), with two changes:
