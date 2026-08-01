@@ -582,6 +582,7 @@ skill-eval-harness/
 ├── ablation_model.py           # typed ablation/provenance/task value objects
 ├── agent_capabilities.py       # unified backend surfaces, capabilities, CLI options, smoke, and failure policy
 ├── artifact_contracts.py       # closed persisted-artifact observations and integrity verification
+├── cli_contracts.py            # validated command, path, model, variant, and numeric CLI values
 ├── experimental_pairs.py       # exact pair identities and blocked-pair construction
 ├── grading_contracts.py        # closed assertion observations and immutable judge tasks
 ├── report_contracts.py         # empty/complete/partial report coverage cohorts and rates

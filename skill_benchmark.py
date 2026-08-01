@@ -127,6 +127,7 @@ from artifact_contracts import (
     artifact_commit_valid,
     observe_artifact_set,
 )
+from cli_contracts import CLICommand, CLIInvocation
 from gemini_contracts import GeminiJsonResponse, GeminiStream
 from grading_contracts import (
     FailedAssertion,
@@ -209,7 +210,7 @@ from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 
 VALID_SPLITS = frozenset(Split.values())
 HARNESS_SEMANTIC_MODULES = (
-    "ablation_model.py", "agent_capabilities.py", "artifact_contracts.py", "experimental_pairs.py",
+    "ablation_model.py", "agent_capabilities.py", "artifact_contracts.py", "cli_contracts.py", "experimental_pairs.py",
     "gemini_contracts.py", "grading_contracts.py",
     "invocation_contracts.py", "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "manifest_contracts.py", "run_pi_trigger_eval.py",
     "report_contracts.py", "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
@@ -20921,85 +20922,93 @@ def _stderr_with_warning(stderr: str, warning: str, *, limit: int = 4000) -> str
     return f"{prefix}\n{warning}" if prefix else warning
 
 
+def validate_cli_command(args: argparse.Namespace) -> int:
+    manifest_path = Path(args.manifest)
+    manifest = validate_manifest(
+        manifest_path, allow_missing_holdback=not args.strict_holdback)
+    leakage = prompt_assertion_leakage_findings(
+        manifest, manifest_path, min_chars=args.leakage_min_chars)
+    for finding in leakage:
+        print(
+            f"WARN {finding['case_id']}: assertion {finding['assertion']!r} "
+            f"value {finding['value']!r} appears in prompt "
+            "(leakage; case may saturate)",
+            file=sys.stderr,
+        )
+    if leakage and args.strict_leakage:
+        die(f"prompt/assertion leakage found in {len(leakage)} assertion value(s)")
+    if getattr(args, "check_ablations", False):
+        failures = check_ablations_dry_run(manifest_path, manifest)
+        if failures:
+            die(f"{failures} ablation(s) failed --check-ablations")
+    if manifest.get("version") == 1:
+        print(
+            "note: version-1 manifest grades with behavior-preserving defaults; "
+            "`skill-benchmark migrate --check` shows the version-2 upgrade "
+            "(severity + oracle tiers stamped, judgment calls listed)",
+            file=sys.stderr,
+        )
+    print(
+        f"OK: {manifest['skill_name']} — {len(iter_cases(manifest))} cases, "
+        f"{len(manifest.get('ablations', []))} ablations")
+    return 0
+
+
 def main() -> int:
     parser = build_arg_parser()
-    args = parser.parse_args()
-    if args.cmd == "agent-capabilities":
-        return agent_capabilities_command(args)
-    answer_handler = answer_entrypoint_implementations().get(args.cmd)
+    raw_args = parser.parse_args()
+    try:
+        invocation = CLIInvocation.from_namespace(raw_args)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
+    # Established handlers still consume Namespace. This is the single named
+    # compatibility edge; new handlers can instead accept the typed invocation.
+    args = invocation.to_legacy_namespace()
+    builtin_handlers: dict[CLICommand, Callable[[argparse.Namespace], int]] = {
+        CLICommand.AGENT_CAPABILITIES: agent_capabilities_command,
+        CLICommand.VALIDATE: validate_cli_command,
+        CLICommand.PREPARE: prepare,
+        CLICommand.IMPORT_TRACE: import_trace,
+        CLICommand.GRADE: grade,
+        CLICommand.JUDGE: judge_command,
+        CLICommand.BENCHMARK: benchmark,
+        CLICommand.REPORT: report_command,
+        CLICommand.COMPARE_JUDGES: compare_judges,
+        CLICommand.JUDGE_ALIGNMENT: judge_alignment_command,
+        CLICommand.ERROR_ANALYSIS: error_analysis_command,
+        CLICommand.CONTAMINATION: contamination_command,
+        CLICommand.JUDGE_ROBUSTNESS: judge_robustness_command,
+        CLICommand.EXPORT_ANTHROPIC: export_anthropic,
+        CLICommand.COMPARE_TASKS: compare_tasks,
+        CLICommand.COMPARE_RESULTS: compare_results,
+        CLICommand.TRIGGER_COMPARE: trigger_compare,
+        CLICommand.MIGRATE: migrate_command,
+        CLICommand.MIGRATE_TELEMETRY: migrate_telemetry_command,
+        CLICommand.COST_SUMMARY: cost_summary_command,
+        CLICommand.TREND: trend,
+        CLICommand.SUGGEST_CASES: suggest_cases,
+        CLICommand.RENDER_VIEWER: render_viewer,
+        CLICommand.PROFILE_SKILL: profile_skill,
+        CLICommand.TOKEN_OVERHEAD: token_overhead,
+        CLICommand.AUDIT_MANIFEST: audit_manifest,
+        CLICommand.AGGREGATE: aggregate,
+        CLICommand.SUITE_RUN: suite_run,
+        CLICommand.MATERIALIZE_ABLATIONS: materialize_ablations,
+    }
+    answer_handlers = answer_entrypoint_implementations()
+    registered_commands = {CLICommand(name) for name in answer_handlers}
+    overlap = registered_commands & set(builtin_handlers)
+    if overlap:
+        raise RuntimeError(
+            f"CLI commands have multiple owners: {sorted(item.value for item in overlap)}")
+    missing = set(CLICommand) - registered_commands - set(builtin_handlers)
+    if missing:
+        raise RuntimeError(
+            f"CLI commands have no handler: {sorted(item.value for item in missing)}")
+    answer_handler = answer_handlers.get(invocation.command.value)
     if answer_handler is not None:
         return answer_handler(args)
-    if args.cmd == "validate":
-        manifest_path = Path(args.manifest)
-        manifest = validate_manifest(manifest_path, allow_missing_holdback=not args.strict_holdback)
-        leakage = prompt_assertion_leakage_findings(manifest, manifest_path, min_chars=args.leakage_min_chars)
-        for finding in leakage:
-            print(f"WARN {finding['case_id']}: assertion {finding['assertion']!r} value {finding['value']!r} appears in prompt (leakage; case may saturate)", file=sys.stderr)
-        if leakage and args.strict_leakage:
-            die(f"prompt/assertion leakage found in {len(leakage)} assertion value(s)")
-        if getattr(args, "check_ablations", False):
-            failures = check_ablations_dry_run(manifest_path, manifest)
-            if failures:
-                die(f"{failures} ablation(s) failed --check-ablations")
-        if manifest.get("version") == 1:
-            print("note: version-1 manifest grades with behavior-preserving defaults; `skill-benchmark migrate --check` shows the version-2 upgrade (severity + oracle tiers stamped, judgment calls listed)", file=sys.stderr)
-        print(f"OK: {manifest['skill_name']} — {len(iter_cases(manifest))} cases, {len(manifest.get('ablations', []))} ablations")
-        return 0
-    if args.cmd == "prepare":
-        return prepare(args)
-    if args.cmd == "import-trace":
-        return import_trace(args)
-    if args.cmd == "grade":
-        return grade(args)
-    if args.cmd == "judge":
-        return judge_command(args)
-    if args.cmd == "benchmark":
-        return benchmark(args)
-    if args.cmd == "report":
-        return report_command(args)
-    if args.cmd == "compare-judges":
-        return compare_judges(args)
-    if args.cmd == "judge-alignment":
-        return judge_alignment_command(args)
-    if args.cmd == "error-analysis":
-        return error_analysis_command(args)
-    if args.cmd == "contamination":
-        return contamination_command(args)
-    if args.cmd == "judge-robustness":
-        return judge_robustness_command(args)
-    if args.cmd == "export-anthropic":
-        return export_anthropic(args)
-    if args.cmd == "compare-tasks":
-        return compare_tasks(args)
-    if args.cmd == "compare-results":
-        return compare_results(args)
-    if args.cmd == "trigger-compare":
-        return trigger_compare(args)
-    if args.cmd == "migrate":
-        return migrate_command(args)
-    if args.cmd == "migrate-telemetry":
-        return migrate_telemetry_command(args)
-    if args.cmd == "cost-summary":
-        return cost_summary_command(args)
-    if args.cmd == "trend":
-        return trend(args)
-    if args.cmd == "suggest-cases":
-        return suggest_cases(args)
-    if args.cmd == "render-viewer":
-        return render_viewer(args)
-    if args.cmd == "profile-skill":
-        return profile_skill(args)
-    if args.cmd == "token-overhead":
-        return token_overhead(args)
-    if args.cmd == "audit-manifest":
-        return audit_manifest(args)
-    if args.cmd == "aggregate":
-        return aggregate(args)
-    if args.cmd == "suite-run":
-        return suite_run(args)
-    if args.cmd == "materialize-ablations":
-        return materialize_ablations(args)
-    return 1
+    return builtin_handlers[invocation.command](args)
 
 
 if __name__ == "__main__":

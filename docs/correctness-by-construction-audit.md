@@ -365,6 +365,12 @@ raw output string
   therefore checked without a per-module registration step. That gate complements rather than
   replaces runtime parsing: manifest dictionaries and external embedding/script values remain
   untrusted wire data.
+- The command line crosses the same kind of boundary. `argparse.Namespace` becomes a frozen
+  `ValidatedLegacyCLIInvocation`; commands form a closed enum, paths and domain identities are projected to their
+  typed values, numeric limits reject booleans and non-finite/out-of-range values, and dispatch
+  requires exactly one owner for every command. Existing handlers still cross one explicitly named
+  legacy Namespace adapter; these projections are a migration seam until each handler accepts its
+  command-specific typed options.
 
 ## Report coverage cohorts
 

@@ -6,6 +6,7 @@ current union can be narrowed exhaustively and that its public fields retain
 the intended precise types.
 """
 
+from argparse import Namespace
 from collections.abc import Mapping
 from pathlib import Path
 from typing import NoReturn
@@ -21,6 +22,7 @@ from artifact_contracts import (
     LegacyArtifactSet,
     MissingArtifactCommit,
 )
+from cli_contracts import CLICommand, CLIInvocation
 from experimental_pairs import (
     ExperimentalPair,
     ExperimentalPairKey,
@@ -246,3 +248,14 @@ def report_cohort_is_exhaustive(cohort: ReportCohort) -> None:
 
 def report_rate_is_precise(rate: UnitRate) -> None:
     _rate: float = rate
+
+
+def cli_invocation_types_are_precise(invocation: CLIInvocation) -> None:
+    _command: CLICommand = invocation.command
+    _paths: Mapping[str, Path | tuple[Path, ...]] = invocation.paths
+    _split: Split | None = invocation.split
+    _variants: tuple[ExecutionVariant, ...] = invocation.variants
+    _model: ModelId | None = invocation.model
+    _models: tuple[ModelId, ...] = invocation.models
+    _judge_models: tuple[ModelId, ...] = invocation.judge_models
+    _namespace: Namespace = invocation.to_legacy_namespace()

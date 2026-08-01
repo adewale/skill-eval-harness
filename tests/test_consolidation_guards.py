@@ -277,6 +277,8 @@ class SharedOwnerIdentityTests(unittest.TestCase):
 
     def test_main_dispatches_registered_answer_entrypoints(self):
         handler = mock.Mock(return_value=23)
+        answer_entrypoints = ac.answer_entrypoint_implementations()
+        answer_entrypoints["run-agent"] = handler
         argv = [
             "skill_benchmark.py", "run-agent", "--agent", "codex",
             "--tasks", "tasks.jsonl", "--runs", "runs",
@@ -284,7 +286,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         with (
             mock.patch.object(
                 sb, "answer_entrypoint_implementations",
-                return_value={"run-agent": handler},
+                return_value=answer_entrypoints,
             ),
             mock.patch.object(sys, "argv", argv),
         ):

@@ -11,6 +11,7 @@ This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md
 
 | Abstraction | Defined by | What it hands downstream |
 |---|---|---|
+| CLI invocation | `cli_contracts.ValidatedLegacyCLIInvocation` | One validated command, typed projections, and the explicit legacy-handler adapter. |
 | Manifest | `validate_manifest` | The full test definition for one skill. |
 | Case | `iter_cases` | One scenario with a prompt and graders. |
 | Variant | `manifest_contracts.ExecutionVariant` / `task_variants` | The arm a case runs under; the lift axis. |
@@ -23,6 +24,21 @@ This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md
 | Judge plumbing | `collect_judge_tasks` | Qualitative checks, deferred to a model you supply. |
 | Grade result row | `grade_case_variant` | One scored row per case/variant/run. |
 | Benchmark report | `build_benchmark_report` | Aggregates, lift, and flags. |
+
+## CLI invocation
+
+`argparse` owns syntax and help text, but its namespace is untrusted wire data. Immediately after
+parsing, `CLIInvocation.from_namespace` validates the closed `CLICommand` vocabulary, converts path
+arguments to `Path`, parses split, execution-variant, and model identities, and rejects non-finite
+or command-invalid numeric limits. Its raw argument bag is recursively frozen. Established handlers
+do not yet consume the typed projections: they cross the single named `to_legacy_namespace`
+adapter, while new or migrated handlers can accept the typed value. This is migration scaffolding,
+not a claim that `ty` already checks every handler's options.
+
+The parser choices and `CLICommand` must be the same set. At dispatch, built-in handlers and
+backend-projected answer entrypoints must form a disjoint, complete partition of that set. Adding a
+command therefore requires an explicit parser spelling, enum member, handler owner, documentation,
+and tests; an unknown or multiply owned command cannot fall through a string-based `if` chain.
 
 ## Manifest
 
@@ -174,10 +190,10 @@ Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | Lo
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10452`), Claude (`run_claude:10638`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10453`), Claude (`run_claude:10639`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13228`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:4008` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13229`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4009` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -270,7 +286,7 @@ those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplica
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:798`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:799`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 `report_contracts.report_cohort` classifies each attempted reporting population as

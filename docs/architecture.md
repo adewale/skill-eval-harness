@@ -16,6 +16,13 @@ tasks, autonomous-trigger work, and static checks. Commands can run on different
 days apart, and several commands call the same grading owner directly rather than
 consume another command's report.
 
+Every `skill-benchmark` entrypoint crosses one typed boundary before entering this graph.
+`argparse.Namespace` is parsed into a frozen `ValidatedLegacyCLIInvocation`: the command is a closed
+`CLICommand`, paths are `Path` values, and split, variant, model, and numeric domains are
+validated once. Dispatch then proves that every parser command has exactly one handler owner.
+Established handlers still receive a freshly thawed Namespace through one explicit compatibility
+adapter; typed projections migrate handler by handler rather than being silently discarded.
+
 ```mermaid
 flowchart LR
     M[Manifest\nshared-benchmark.json] --> V[validate]

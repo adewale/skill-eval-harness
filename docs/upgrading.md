@@ -95,6 +95,29 @@ set is incomplete.
 
 ### Inputs that may need repair
 
+#### Typed boundary tightening
+
+The 0.6 runtime parses prepared tasks, pair identities, artifact/event logs, judge tasks, report
+attempts, and CLI input into immutable domain values before semantic use. This is intentionally
+stricter at programmatic and persisted boundaries:
+
+- schema versions must be exact JSON integers; `true`, `1.0`, and `"1"` are invalid;
+- nested assertion, conversation, event, and compatibility argument data is detached from its
+  source and recursively frozen;
+- report attempts require a unique stable case/model/variant/repetition identity, and each rate has
+  its own availability cohort; a complete row count no longer permits a survivor-only metric mean;
+- judge process completion, provider-response failure, and verdict parsing remain distinct, so an
+  exit-zero protocol failure keeps return code zero but cannot become a complete observation; and
+- CLI values are validated before dispatch. Existing handlers still receive the same Namespace
+  shape through the named legacy adapter, and meaningful zero values such as `--limit 0` and
+  `--max-references 0` remain valid.
+
+Custom Python adapters should build `ProcessInvocationPlan` and use `run_argv_capture(plan)`.
+Code that supplied parallel argv/cwd/environment/timeout arguments to that internal helper must
+migrate. Keep the old environment for rollback; regenerate stale prepared tasks and benchmark
+reports after correcting rejected rows. Do not edit digests, availability, or repetition ids merely
+to make old artifacts pass the new constructors.
+
 #### Prepared task and result identities
 
 Every comparative observation needs one exact identity:
