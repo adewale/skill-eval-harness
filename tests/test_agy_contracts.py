@@ -178,5 +178,111 @@ class ModelIdentityUncertainty(unittest.TestCase):
         self.assertEqual(stream.model.requested, "gemini-3.1-pro-high")
 
 
+class MalformedStreamsFailClosed(unittest.TestCase):
+    """Every wire fixture that is not a clean run becomes an explicit failure."""
+
+    def assert_incomplete(self, stream: AgyStream) -> None:
+        self.assertFalse(stream.complete)
+        self.assertTrue(stream.protocol_error or stream.provider_error)
+
+    def test_truncated_line_is_a_protocol_error(self) -> None:
+        stream = AgyStream.parse(fixture("stream-json-bad-line.jsonl"))
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertIn("line 2", str(stream.protocol_error))
+        self.assert_incomplete(stream)
+
+    def test_a_truncated_stream_is_not_a_clean_negative_observation(self) -> None:
+        stream = AgyStream.parse(fixture("stream-json-bad-line.jsonl"))
+        self.assertIsInstance(
+            observe_skill_activation(stream, MOUNTED_SKILL),
+            AgySkillObservationUnavailable,
+            "a stream that did not parse cannot prove the skill went unread")
+
+    def test_failed_status_becomes_a_provider_error(self) -> None:
+        stream = AgyStream.parse(fixture("stream-json-failed-status.jsonl"))
+        self.assertIsNotNone(stream.provider_error)
+        self.assert_incomplete(stream)
+
+    def test_malformed_step_payload_is_rejected(self) -> None:
+        stream = AgyStream.parse(fixture("stream-json-malformed-step.jsonl"))
+        self.assertIsNotNone(stream.protocol_error)
+
+    def test_missing_result_event_is_rejected(self) -> None:
+        stream = AgyStream.parse(fixture("stream-json-no-result.jsonl"))
+        self.assertEqual(stream.protocol_error, "missing terminal result event")
+        self.assert_incomplete(stream)
+
+    def test_nonstring_response_is_rejected(self) -> None:
+        stream = AgyStream.parse(fixture("stream-json-nonstring-response.jsonl"))
+        self.assertIsNotNone(stream.protocol_error)
+
+    def test_unknown_event_is_rejected_rather_than_ignored(self) -> None:
+        stream = AgyStream.parse(fixture("stream-json-unknown-event.jsonl"))
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertIn("tool_invocation", str(stream.protocol_error))
+
+    def test_empty_stream_is_rejected(self) -> None:
+        self.assertEqual(AgyStream.parse("").protocol_error,
+                         "agy stream is empty")
+
+    def test_duplicate_object_keys_are_rejected(self) -> None:
+        line = ('{"event":"result","event":"init","result":{"status":"SUCCESS",'
+                '"response":"hi"}}')
+        self.assertIsNotNone(AgyStream.parse(line).protocol_error)
+
+    def test_non_finite_constants_are_rejected(self) -> None:
+        line = ('{"event":"result","result":{"status":"SUCCESS","response":"hi",'
+                '"duration_seconds":NaN}}')
+        self.assertIsNotNone(AgyStream.parse(line).protocol_error)
+
+    def test_a_started_tool_is_not_evidence(self) -> None:
+        stream = AgyStream.parse(fixture("stream-json-success.jsonl"))
+        self.assertIn("run_command", stream.incomplete_tools,
+                      "an ACTIVE tool step must be recorded as incomplete")
+        self.assertEqual(
+            [item for item in stream.tools
+             if isinstance(item, AgySearch)], [],
+            "the success fixture has no search tools")
+
+    def test_contradictory_token_accounting_is_invalid(self) -> None:
+        line = ('{"event":"result","result":{"status":"SUCCESS","response":"hi",'
+                '"usage":{"input_tokens":10,"output_tokens":10,'
+                '"total_tokens":5}}}')
+        self.assertIsInstance(AgyStream.parse(line).usage, AgyUsageInvalid)
+
+
+class ToolPartitionIsTotalAndDisjoint(unittest.TestCase):
+    """No advertised tool may fall into a bucket by accident."""
+
+    def test_the_five_buckets_do_not_overlap(self) -> None:
+        import agy_contracts as agy
+        buckets = {
+            "shell": set(agy.AGY_SHELL_TOOLS),
+            "file_read": set(agy.AGY_FILE_READ_TOOLS),
+            "search": set(agy.AGY_SEARCH_TOOLS),
+            "write": set(agy.AGY_WRITE_TOOLS),
+            "generic": set(agy.AGY_GENERIC_TOOLS),
+        }
+        for left, left_tools in buckets.items():
+            for right, right_tools in buckets.items():
+                if left < right:
+                    self.assertEqual(
+                        left_tools & right_tools, set(),
+                        f"{left} and {right} classify the same tool")
+
+    def test_every_advertised_tool_is_classified(self) -> None:
+        import json as _json
+
+        import agy_contracts as agy
+        advertised = _json.loads(
+            (FIXTURES / "advertised-tools.json").read_text(encoding="utf-8"))
+        unclassified = sorted(
+            set(advertised["tools"]) - agy.AGY_CLASSIFIED_TOOLS)
+        self.assertEqual(
+            unclassified, [],
+            "a tool agy advertises has no explicit classification, so it would "
+            "silently default to a generic call")
+
+
 if __name__ == "__main__":
     unittest.main()

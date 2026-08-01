@@ -33,7 +33,7 @@ step.
 | 1 — wire fixtures | SANDBOX | **done** |
 | 2 — failing protocol tests | SANDBOX | **done (red, as intended)** |
 | 3 — containment posture | SANDBOX | **done — vocabulary needs maintainer sign-off** |
-| 4 — `agy_contracts.py` | SANDBOX | not started |
+| 4 — `agy_contracts.py` | SANDBOX | **done — all D1/D2/D3 tests green** |
 | 5 — narrowing proofs | SANDBOX | not started |
 | 6 — answer + judge adapters | SANDBOX | not started |
 | 7 — command boundary | SANDBOX | not started |
@@ -230,6 +230,41 @@ Both D2 and D3 are therefore confirmed against the current release, not inferred
 hand-constructed from the 1.1.8 vocabulary and labelled as such in the README,
 which also records the one guessed parameter name (`grep_search`'s `SearchPath`)
 for step 10 to replace.
+
+### Step 4 result — measured 2026-08-01
+
+`agy_contracts.py` (≈640 lines) replaces the step-2 stub's internals; the public
+surface is unchanged, so the 16 step-2 tests went green without being edited.
+Gates: **1330 tests pass**, `ty --error-on-warning` clean, `ruff` clean. The
+branch is fully green for the first time.
+
+How each defect is closed *by construction* rather than by a check:
+
+- **D1.** `AGY_FILE_READ_TOOLS` and `AGY_SEARCH_TOOLS` are disjoint tuples, and
+  `AgySearch` **has no path field at all** — there is nothing for a caller to
+  mistake for read evidence. Activation requires an `AgyFileRead` whose path
+  equals the mounted `SKILL.md` exactly.
+- **D2.** `parse_agy_usage` returns `AgyUsagePresent` / `AgyUsageAbsent` /
+  `AgyUsageInvalid`, and `AgyUsagePresent.__post_init__` *refuses to construct*
+  from an all-zero counter block. A zero-valued measurement is unrepresentable.
+- **D3.** `returncode` is accepted by `AgyStream.parse` but never gates the
+  provider error. Truncation is still reported independently as a protocol
+  error, so "zero exit is not proof of completion" survives.
+
+Beyond the three defects, `observe_skill_activation` now returns
+`AgySkillObservationUnavailable` for a truncated stream, an incomplete tool
+step, a search-only run, or a provider error — closing review requirement 5's
+list. A `view_file` with no usable path parameter degrades to a generic call and
+marks the observation incomplete rather than becoming a read of nowhere.
+
+The tool partition is total: `test_every_advertised_tool_is_classified` checks
+all **59** tools in `advertised-tools.json` against the five buckets and finds
+none unclassified. Verified non-vacuous by mutation — removing `view_file` from
+the vocabulary makes it fail.
+
+Registered in all three drift gates: `pyproject.toml` `py-modules`, a
+`per-file-ignores` entry matching `gemini_contracts.py`'s, and a boundary
+inventory row in `docs/typed-python.md`.
 
 ### Step 3 result — measured 2026-08-01
 
@@ -713,7 +748,11 @@ its own PR, independent of agy.
 
 ---
 
-### Step 4 — Create `agy_contracts.py` [SANDBOX]
+### Step 4 — Create `agy_contracts.py` [SANDBOX] — DONE
+
+> See [Step 4 result](#step-4-result--measured-2026-08-01). One open question
+> below is deliberately left open: `skill_search` is still classified as a
+> search, pending the real capture in step 10.
 
 Move all agy wire parsing out of `skill_benchmark.py` into a new
 `agy_contracts.py`, modelled directly on `gemini_contracts.py`.
