@@ -38,7 +38,11 @@ step.
 | 6 — answer + judge adapters | SANDBOX | **done** |
 | 7 — command boundary | SANDBOX | **done** |
 | 8 — backend registration | SANDBOX | **done** |
-| 9–13 | SHELL | **blocked in sandbox** — need an authenticated `agy` on a disposable host |
+| 9 — re-verify containment on 1.1.9 | SHELL | **partly done** — upstream issues re-checked from the sandbox; live probes still need a disposable host |
+| 10 — real 1.1.9 traces | SHELL | **blocked** — needs an authenticated `agy` |
+| 11 — layered live proof | SHELL | **layers 1-2 done**, layers 3-5 blocked |
+| 12 — trigger support | SHELL | **blocked** — needs authenticated `agy` on a disposable host |
+| 13 — PR presentation | SANDBOX/SHELL | draft table below; live rows outstanding |
 
 ### Working environment
 
@@ -257,6 +261,112 @@ Both D2 and D3 are therefore confirmed against the current release, not inferred
 hand-constructed from the 1.1.8 vocabulary and labelled as such in the README,
 which also records the one guessed parameter name (`grep_search`'s `SearchPath`)
 for step 10 to replace.
+
+### Handover: what is left, and exactly how to do it
+
+Everything sandbox-completable is done. **Steps 0-8 are finished and the branch
+is green**, which is the first PR the plan describes. What remains needs an
+authenticated `agy` on a disposable host, in this order:
+
+1. **Finish step 9** — on a disposable host, ask a run to write outside its
+   workspace and record whether `write_to_file` still succeeds on 1.1.9; then
+   run with `--sandbox` but *without* `--dangerously-skip-permissions` and
+   record whether the shell tool is silently declined. If either has changed,
+   the registry row's `IsolationPosture` in `agent_capabilities.py` is the one
+   place to update, and `tests/test_backend_conformance.py` will tell you if the
+   run artifacts stop agreeing with it.
+2. **Step 10** — capture four real fixtures and answer the three open questions
+   below. The fixture README already flags exactly which hand-made assumption
+   each capture replaces.
+3. **Step 11 layers 3-5** — `RUN_AGY_SMOKE=1 python3 -m unittest discover tests
+   -k smoke_agy -v` covers layers 3 and 4 as written.
+4. **Step 12** — trigger support. Note that flipping `autonomous_trigger=True`
+   will now **fail at import** unless the containment posture changes or an
+   operator opt-in env var is set on the posture. That is deliberate: the
+   registry refuses to advertise unattended runs on an uncontained backend. Two
+   tests also assert no shipped backend uses that escape hatch, so waiving it is
+   a visible decision.
+
+**Open questions still unanswered** (all deferred to step 10, all recorded in
+code comments where they bite):
+
+| Question | Where it bites | Current provisional answer |
+|---|---|---|
+| Does `skill_search` deserve its own evidence category, distinct from generic search and from a file read? | `AGY_SEARCH_TOOLS` in `agy_contracts.py` | treated as search |
+| Does `--json-schema` actually constrain the stream-json final result? | `agy_judge_invoke` | assumed yes; if not, fall back to a *named, versioned* legacy dialect — never call it strict JSON |
+| Does the `with_skill` arm need `--disable-slash-commands`, or is agy's `.agents/skills` discovery implemented *as* that expansion? | `agy_cli_argv(disable_slash_commands=...)` | flag implemented, default off |
+| Is a dash-prefixed prompt bound as a value with credentials present? | `agy_cli_argv` | consistent with yes, unproven (F4) |
+
+**One thing needs a human, not a host:** finding F7 — the containment vocabulary
+was implemented without the maintainer sign-off the plan asks for. Renaming a
+member touches only `agent_capabilities.py`, `docs/agent-parity.md`,
+`tests/test_isolation_posture.py` and `tests/test_consolidation_guards.py`.
+
+### Draft acceptance table (step 13)
+
+Requirement 8 asks for a closed statement rather than hedging. This is the table
+as it stands; the three blank rows are the honest gaps, not unknown risk.
+
+| Claim | Status | Evidence |
+|---|---|---|
+| Tested `agy` version | **1.1.9** | `agy --version`, captured in a sandbox |
+| Answer runs | **supported** | `--agent agy`; 1385 tests green |
+| Judge runs | **supported** | `--judge-backend agy`, stream-json + `--json-schema` |
+| Autonomous trigger | **deliberately unavailable** | no live activation observation; registry also forbids it while uncontained |
+| Trigger ablation | **deliberately unavailable** | same |
+| Tool replay | **not applicable** | agy exposes no replay seam |
+| Dollar cost | **explicitly missing** | agy reports tokens, no cost figure |
+| Token usage | **provider-reported when a model ran** | all-zero blocks normalize to absent |
+| Containment | **uncontained; disposable host required** | antigravity-cli#36 and #155 both still open as of 2026-08-01 |
+| Search ≠ activation (D1) | **fixed by construction** | disjoint partitions; `AgySearch` has no path field |
+| Absent telemetry ≠ zero (D2) | **fixed by construction** | `AgyUsagePresent` refuses all-zero counters |
+| Provider error survives nonzero exit (D3) | **fixed** | verbatim 1.1.9 auth-failure capture asserted |
+| Red-test evidence | **recorded** | `docs/evidence/agy-red-tests.md`, 7 failures against the stub |
+| Token-backed answer semantics | **outstanding** | needs credentials (step 11 layer 3) |
+| Token-backed judge semantics | **outstanding** | needs credentials (step 11 layer 4) |
+| Containment behaviour under production flags | **outstanding** | needs a disposable host (step 9) |
+
+### Step 9 partial result — measured 2026-08-01
+
+The upstream half of step 9 needed only a browser, so it was done here. **Both
+issues are still open**, checked 2026-08-01:
+
+| Issue | Title | State |
+|---|---|---|
+| `google-antigravity/antigravity-cli#36` | "Agent can bypass sandbox when combining `--sandbox` with `--dangerously-skip-permissions`" | **open**, reported 2026-05-20, no fix |
+| `google-antigravity/antigravity-cli#155` | "Add equivalent to `GEMINI_CLI_HOME` env variable" | **open**, no milestone or linked branch |
+
+So neither relaxation the plan hoped for has happened: `--sandbox` is still not
+real containment, and there is still no config-home override. **The
+`uncontained_requires_disposable_host` posture and the disposable-host
+requirement stand as declared, and are not merely inherited from 1.1.8.**
+Issue #36 also notes this is a *regression* from Gemini CLI, where the
+equivalent flag combination kept the sandbox effective.
+
+What still needs a disposable host: reproducing the write-outside-workspace
+probe on 1.1.9, and confirming that dropping `--dangerously-skip-permissions`
+still causes agy to silently decline the shell tool. Both need a model to
+actually run.
+
+### Step 11 layers 1-2 result — measured 2026-08-01
+
+Requirement 6 asks for each layer to be recorded separately. Two are done.
+
+**Layer 1 — installed executable and accepted flags.** `agy --version` →
+`1.1.9`. `agy --help` confirms every flag the adapter depends on
+(`--print`, `--output-format`, `--add-dir`, `--new-project`, `--sandbox`,
+`--dangerously-skip-permissions`, `--model`, `--print-timeout`, `--json-schema`,
+`--disable-slash-commands`) and revealed five the plan had not recorded — see
+finding F2.
+
+**Layer 2 — unauthenticated / auth-failure behaviour.** Captured verbatim; the
+fixture is byte-identical to the captured stdout and its command is recorded in
+`tests/fixtures/agy/README.md`. The harness now reports usage as **missing** and
+preserves `"authentication failed or timed out"`, both asserted by tests.
+
+Layers 3 (token-backed answer), 4 (token-backed judge) and 5 (containment under
+production flags) need credentials. `tests/test_smoke_agy.py` is written and
+waiting for them behind `RUN_AGY_SMOKE=1`.
 
 ### Step 8 result — measured 2026-08-01
 
