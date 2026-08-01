@@ -34,7 +34,7 @@ step.
 | 2 — failing protocol tests | SANDBOX | **done (red, as intended)** |
 | 3 — containment posture | SANDBOX | **done — vocabulary needs maintainer sign-off** |
 | 4 — `agy_contracts.py` | SANDBOX | **done — all D1/D2/D3 tests green** |
-| 5 — narrowing proofs | SANDBOX | not started |
+| 5 — narrowing proofs | SANDBOX | **done — mutation-verified** |
 | 6 — answer + judge adapters | SANDBOX | not started |
 | 7 — command boundary | SANDBOX | not started |
 | 8 — backend registration | SANDBOX | not started |
@@ -230,6 +230,31 @@ Both D2 and D3 are therefore confirmed against the current release, not inferred
 hand-constructed from the 1.1.8 vocabulary and labelled as such in the README,
 which also records the one guessed parameter name (`grep_search`'s `SearchPath`)
 for step 10 to replace.
+
+### Step 5 result — measured 2026-08-01
+
+`type_tests/abstraction_contracts.py` gains five proofs: exhaustive narrowing
+for the usage three-state, the tool-evidence union and the skill-observation
+union, plus precision proofs for `AgyModelIdentity` and `AgyStream`'s public
+fields.
+
+Mutation-verified as the plan requires. Deleting the `AgySearch` branch from the
+tool-evidence proof produces:
+
+```
+error[invalid-argument-type]: Argument to function `_assert_never` is incorrect
+    Expected `Never`, found `AgySearch & ~AgyFileRead & ~AgyShellCommand
+                             & ~AgyFileWrite & ~AgyGenericCall`
+```
+
+which names the missing member exactly. Reverted; gates re-verified clean.
+
+Note the `AgyStream.parse` event union is proved indirectly rather than by an
+`isinstance` chain: events are validated against `AGY_EVENT_TYPES` at parse time
+and never surface as separate dataclasses, so the runtime malformed-input tests
+in `tests/test_agy_contracts.py` are what hold that vocabulary closed. The
+plan's requirement of "a runtime malformed-input test **and** a static narrowing
+or precision proof" is met for every union that has a static form.
 
 ### Step 4 result — measured 2026-08-01
 
@@ -803,7 +828,9 @@ passes; no agy wire parsing remains in `skill_benchmark.py`.
 
 ---
 
-### Step 5 — Add static narrowing proofs [SANDBOX]
+### Step 5 — Add static narrowing proofs [SANDBOX] — DONE
+
+> See [Step 5 result](#step-5-result--measured-2026-08-01).
 
 `type_tests/abstraction_contracts.py` proves every closed union narrows
 exhaustively and public fields keep precise types. It is `ty`-checked but never
