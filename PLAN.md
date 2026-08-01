@@ -32,7 +32,7 @@ step.
 | 0 — working branch | SANDBOX | **done** |
 | 1 — wire fixtures | SANDBOX | **done** |
 | 2 — failing protocol tests | SANDBOX | **done (red, as intended)** |
-| 3 — containment posture | SANDBOX | not started |
+| 3 — containment posture | SANDBOX | **done — vocabulary needs maintainer sign-off** |
 | 4 — `agy_contracts.py` | SANDBOX | not started |
 | 5 — narrowing proofs | SANDBOX | not started |
 | 6 — answer + judge adapters | SANDBOX | not started |
@@ -157,6 +157,41 @@ uv pip install --python .venv/bin/python -e ".[test]"
   structurally identical to a genuine `view_file` activation. Step 4 replaces
   the internals and keeps the surface.
 
+- **F7 (step 3) — the containment vocabulary is implemented but unagreed.** The
+  plan says the vocabulary "should be settled with the maintainer before
+  implementation, since it is a change to a shared abstraction they own", and
+  suggests proposing it on PR #62 first. That was not possible from a sandbox
+  with no GitHub API access, so **the vocabulary as implemented is a proposal
+  expressed in code, not an agreed design.** It deliberately keeps the plan's
+  own suggested names (`contained`, `config_isolated_only`,
+  `uncontained_requires_disposable_host`) so the diff reads as the plan's
+  sketch made concrete. Renaming any member is a mechanical change confined to
+  `agent_capabilities.py`, the parity doc, and two test files. **Get sign-off
+  before this lands.**
+
+- **F8 (step 3) — a declared posture and a runtime observation are different
+  things, and `claude` shows the gap.** The `claude` trigger adapter sets
+  `config_isolated=False` at runtime whenever OAuth/keychain auth turns out not
+  to be file-seedable, and records a warning saying personal config may have
+  influenced the measurement. So `claude`'s honest posture is
+  `isolated_home_conditional`: the override exists but cannot always be applied.
+
+  That value exists in the vocabulary purely because of this case, and it is
+  worth flagging to the maintainer: the registry now says what a backend can do,
+  while the per-run metadata says what actually happened. They can disagree
+  legitimately, and nothing yet reconciles them. A follow-up worth considering
+  (out of scope here) is a check that a run whose observed `config_isolated` is
+  `False` cannot come from a row declaring `isolated_home_enforced`.
+
+- **F9 (step 3) — the parity doc-sync test assumed the file held exactly one
+  table.** `test_parity_doc_matches_registry_policy` scrapes every line starting
+  with `|`, treats line 0 as the header and everything from line 2 as rows. A
+  second markdown table anywhere in `docs/agent-parity.md` breaks it. Containment
+  was therefore added as two **columns of the existing matrix** rather than as a
+  separate table, and the test now asserts both against the registry — so the new
+  fields are covered by the same drift gate as the old ones. Anyone adding a
+  table to that file later needs to fix the scrape first.
+
 - **F4 (step 1) — dash-prefixed prompt binding remains unproven.** `agy --print
   "--dangerously-skip-permissions" --output-format stream-json` reached the
   authentication stage rather than failing flag parsing, which is consistent
@@ -195,6 +230,41 @@ Both D2 and D3 are therefore confirmed against the current release, not inferred
 hand-constructed from the 1.1.8 vocabulary and labelled as such in the README,
 which also records the one guessed parameter name (`grep_search`'s `SearchPath`)
 for step 10 to replace.
+
+### Step 3 result — measured 2026-08-01
+
+`agent_capabilities.IsolationPosture` is a required field on every
+`AgentCapabilities` row. Two closed vocabularies, both settled by the code but
+**not yet by the maintainer** (see finding F7):
+
+- `Containment` — `contained`, `config_isolated_only`,
+  `uncontained_requires_disposable_host`
+- `ConfigAuthority` — `isolated_home_enforced`, `isolated_home_conditional`,
+  `ambient_user_config`, `not_applicable`
+
+Four rules are enforced at construction, three of them beyond what the plan
+asked for:
+
+1. **The rule the plan asked for.** A backend whose containment is
+   `uncontained_requires_disposable_host` cannot advertise `autonomous_trigger`
+   or `trigger_ablation` without an explicit operator opt-in env var.
+2. A backend reading the invoking user's configuration cannot call itself
+   `contained` — otherwise agy's exact posture would be expressible as
+   "contained", defeating the point.
+3. `config_isolated_only` requires a config home that can actually be isolated.
+4. A trigger opt-in may only be attached to an uncontained backend, so it cannot
+   be sprinkled on rows where it implies a risk that is not there.
+
+All eight existing backends are back-filled, each with a mandatory one-sentence
+reason, and `docs/agent-parity.md` gained `Containment` and `Config authority`
+columns. Gates: **1316 tests** (up from 1286), `ty --error-on-warning` clean,
+`ruff` clean. The only failures are the nine expected ones — seven intentionally
+red D1/D2/D3 tests plus two `test_type_coverage` gates that step 4 closes by
+registering `agy_contracts`.
+
+`tests/test_isolation_posture.py` adds 14 tests, including one asserting that
+**no shipped backend uses the opt-in escape hatch** — so a future row cannot
+quietly waive containment without that test failing.
 
 ### Step 2 result — measured 2026-08-01
 
@@ -605,7 +675,12 @@ PR description.
 
 ---
 
-### Step 3 — Add a typed isolation/containment posture to the registry [SANDBOX]
+### Step 3 — Add a typed isolation/containment posture to the registry [SANDBOX] — DONE
+
+> See [Step 3 result](#step-3-result--measured-2026-08-01). **Findings F7 and F8
+> matter to the maintainer**: the vocabulary is a proposal expressed in code
+> rather than an agreed design, and declared posture can diverge from a run's
+> observed `config_isolated`.
 
 This is upstream work in `agent_capabilities.py`, not agy-specific, and is a
 prerequisite for registering agy honestly. Boolean capability flags cannot

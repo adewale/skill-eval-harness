@@ -4,16 +4,48 @@ The harness supports several agent surfaces, but not every agent supports every 
 
 Run `skill-benchmark agent-capabilities` for the machine-readable registry view.
 
-| Agent | Answer runs | Answer route | Autonomous trigger | Trigger ablation | Trace artifacts | Token usage | Dollar cost | Judge backend | Tool replay | Live smoke |
-|---|---:|---|---:|---:|---:|---:|---|---:|---:|---|
-| `claude` | yes (`run-claude`, `run-agent --agent claude`) | `native` | yes (`skill-trigger-matrix --agent claude`) | yes | yes | yes | `provider_reported` | yes (`judge --judge-backend claude` / `--judge-model`) | yes through `run-subagent` | `RUN_TRIGGER_SMOKE` |
-| `codex` | yes (`run-codex`, `run-agent --agent codex`) | `native` | yes (`skill-trigger-matrix --agent codex`) | yes | yes | yes, when stream reports it | `missing` unless a wrapper emits/estimates cost | yes (`judge --judge-backend codex`) | no native replay | `RUN_CODEX_TRIGGER_SMOKE` |
-| `gemini` | yes (`run-agent --agent gemini`) | `native` | no (headless `activate_skill` consent gate not live-proven) | no | yes | yes, when JSON stats report it | `missing` (CLI has no cost field) | yes (`judge --judge-backend gemini`) | no native replay | `RUN_GEMINI_SMOKE` |
-| `pi` | no core answer runner | `none` | yes (`skill-pi-trigger-eval`, `skill-trigger-matrix --agent pi`) | yes | yes | yes, when stream reports it | `trace_normalized` from the stream when available | no | no | `RUN_PI_TRIGGER_SMOKE` |
-| `jetty` | yes (`export-jetty` / `run-jetty` / `import-jetty-results`; answer-path ablations only) | `export_import` | no | no | yes, imported | yes, imported | `provider_reported`, imported | no (planned in Jetty TODO) | no | `RUN_JETTY_SMOKE` |
-| `vibe` | yes (`run-agent --agent vibe`) | `native` | yes (`skill-trigger-matrix --agent vibe`) | yes | yes | no in current CLI output | `missing` in current CLI output | yes (`judge --judge-backend vibe`) | no native replay | `RUN_VIBE_TRIGGER_SMOKE` |
-| `subagent` | yes (`run-subagent`) | `subagent` | no | no | yes | yes, when backend returns it | `missing` unless backend emits cost | no | yes | n/a |
-| `stub` | no native answer runner; demo stub uses `run-codex --codex-cmd` | `none` | yes | yes | yes | no (not applicable) | `not_applicable` | no | no | n/a |
+| Agent | Answer runs | Answer route | Autonomous trigger | Trigger ablation | Trace artifacts | Token usage | Dollar cost | Judge backend | Tool replay | Live smoke | Containment | Config authority |
+|---|---:|---|---:|---:|---:|---:|---|---:|---:|---|---|---|
+| `claude` | yes (`run-claude`, `run-agent --agent claude`) | `native` | yes (`skill-trigger-matrix --agent claude`) | yes | yes | yes | `provider_reported` | yes (`judge --judge-backend claude` / `--judge-model`) | yes through `run-subagent` | `RUN_TRIGGER_SMOKE` | `contained` | `isolated_home_conditional` |
+| `codex` | yes (`run-codex`, `run-agent --agent codex`) | `native` | yes (`skill-trigger-matrix --agent codex`) | yes | yes | yes, when stream reports it | `missing` unless a wrapper emits/estimates cost | yes (`judge --judge-backend codex`) | no native replay | `RUN_CODEX_TRIGGER_SMOKE` | `contained` | `isolated_home_enforced` |
+| `gemini` | yes (`run-agent --agent gemini`) | `native` | no (headless `activate_skill` consent gate not live-proven) | no | yes | yes, when JSON stats report it | `missing` (CLI has no cost field) | yes (`judge --judge-backend gemini`) | no native replay | `RUN_GEMINI_SMOKE` | `contained` | `isolated_home_enforced` |
+| `pi` | no core answer runner | `none` | yes (`skill-pi-trigger-eval`, `skill-trigger-matrix --agent pi`) | yes | yes | yes, when stream reports it | `trace_normalized` from the stream when available | no | no | `RUN_PI_TRIGGER_SMOKE` | `config_isolated_only` | `isolated_home_enforced` |
+| `jetty` | yes (`export-jetty` / `run-jetty` / `import-jetty-results`; answer-path ablations only) | `export_import` | no | no | yes, imported | yes, imported | `provider_reported`, imported | no (planned in Jetty TODO) | no | `RUN_JETTY_SMOKE` | `contained` | `not_applicable` |
+| `vibe` | yes (`run-agent --agent vibe`) | `native` | yes (`skill-trigger-matrix --agent vibe`) | yes | yes | no in current CLI output | `missing` in current CLI output | yes (`judge --judge-backend vibe`) | no native replay | `RUN_VIBE_TRIGGER_SMOKE` | `contained` | `isolated_home_enforced` |
+| `subagent` | yes (`run-subagent`) | `subagent` | no | no | yes | yes, when backend returns it | `missing` unless backend emits cost | no | yes | n/a | `config_isolated_only` | `isolated_home_conditional` |
+| `stub` | no native answer runner; demo stub uses `run-codex --codex-cmd` | `none` | yes | yes | yes | no (not applicable) | `not_applicable` | no | no | n/a | `contained` | `not_applicable` |
+
+## Containment posture
+
+Capability booleans cannot express conditional safety such as "works only on a
+disposable host", so containment is a separate typed field on every registry row
+(`agent_capabilities.IsolationPosture`). Two closed vocabularies:
+
+- **Containment** — `contained` (the harness constrains what the run can reach,
+  by sandbox or tool allowlist), `config_isolated_only` (configuration is
+  isolated but tool reach is not separately constrained), or
+  `uncontained_requires_disposable_host` (neither holds).
+- **Config authority** — `isolated_home_enforced`, `isolated_home_conditional`
+  (an override exists but cannot always be applied), `ambient_user_config` (the
+  invoking user's configuration is in play), or `not_applicable` (no local
+  provider configuration exists).
+
+Every posture carries a mandatory one-sentence reason, and three combinations are
+rejected at construction: a backend reading the invoking user's configuration
+cannot call itself `contained`; `config_isolated_only` requires a config home
+that can actually be isolated; and a trigger opt-in may only be attached to an
+uncontained backend.
+
+The rule this exists to enforce: **a backend whose containment is
+`uncontained_requires_disposable_host` cannot advertise `autonomous_trigger` or
+`trigger_ablation`** unless an operator sets an explicit opt-in environment
+variable named in the posture. Unattended trigger runs against a
+harness-assembled workspace are only safe on a host nobody minds losing, and
+that is an operator's decision rather than something a registry row inherits by
+default. No shipped backend uses the opt-in.
+
+Each row's posture is the `Containment` and `Config authority` columns of the
+matrix above, and the stated reason lives on the registry row itself.
 
 ## What changed for Gemini CLI
 
