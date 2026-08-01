@@ -162,13 +162,22 @@ set incomplete. Legacy or externally written runs that do not declare that contr
 remain readable through the compatibility boundary. This boundary is the main extension seam
 in the codebase.
 
+`artifact_contracts.observe_artifact_set` reads that seam into exactly one frozen value:
+`LegacyArtifactSet | MissingArtifactCommit | InvalidArtifactCommit | IncompleteArtifactSet |
+CompleteArtifactSet`. A malformed marker and a valid marker whose files were interrupted or
+tampered with are therefore different states. Existing dictionary readers retain
+`artifact_set_complete` as a compatibility projection and expose the reasoned state alongside it.
+Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | LoadedEventLog`;
+`read_events_base` is only the legacy tuple adapter. Strict JSON parsing lives in
+`json_contracts.py`, so every disk reader shares duplicate-key and non-finite-number rejection.
+
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10485`), Claude (`run_claude:10671`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10439`), Claude (`run_claude:10625`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13217`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:4006` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13171`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:3995` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -196,7 +205,8 @@ code.
 Runners disagree on event shape. Codex emits `command_execution` and `turn.completed`; Pi
 emits `message_end` usage aliases; Jetty emits trajectory records. `normalize_trace_record`
 and `normalize_trace_records` collapse these into one schema-versioned `events.json` plus
-`metrics.json`, tagged with the source. `trace_contracts.EventState` first classifies each event as
+`metrics.json`, tagged with the source. Loading `events.json` first constructs the closed event-log
+observation above. `trace_contracts.EventState` then classifies each event as
 completed, in-progress, failed, or unknown; only completed operations contribute command/tool/file
 counts. Process and efficiency assertions read the normalized form, never the raw prose, because
 inferring tool use from answer text is how false evidence gets in.
@@ -252,7 +262,7 @@ those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplica
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:796`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:785`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 The pairing key carries `CaseId`, `ModelId | None`, `RunNumber`, and the closed

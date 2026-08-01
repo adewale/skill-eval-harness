@@ -144,6 +144,8 @@ the interior. Each external boundary has one parser and a closed value:
 prepared row -> PreparedTaskDraft -> PreparedTask
 provider result -> Completed | TimedOut | SpawnFailed | ProviderFailed
 run evidence -> process × provider-response × trace × artifact-set state
+artifact set -> Legacy | MissingCommit | InvalidCommit | Incomplete | Complete
+event log -> Missing | Invalid | Loaded
 judge process -> JudgeInvocation
 judge row -> Boolean | Scored | Dimension | Dynamic | Consensus verdict
 trace status -> Completed | InProgress | Failed | Unknown

@@ -13,6 +13,14 @@ from typing import NoReturn
 from typing_extensions import assert_type
 
 from ablation_model import PreparedTask
+from artifact_contracts import (
+    ArtifactSetObservation,
+    CompleteArtifactSet,
+    IncompleteArtifactSet,
+    InvalidArtifactCommit,
+    LegacyArtifactSet,
+    MissingArtifactCommit,
+)
 from experimental_pairs import (
     ExperimentalPair,
     ExperimentalPairKey,
@@ -46,6 +54,12 @@ from runner_contracts import (
     ProviderFailed,
     SpawnFailed,
     TimedOut,
+)
+from trace_contracts import (
+    EventLogObservation,
+    InvalidEventLog,
+    LoadedEventLog,
+    MissingEventLog,
 )
 from trigger_contracts import (
     CompleteTriggerResult,
@@ -147,3 +161,32 @@ def provider_invocation_types_are_precise(
     _argv: tuple[str, ...] = plan.argv
     _environment: Mapping[str, str] | None = plan.environment
     _state: InvocationState = result.invocation_state
+
+
+def artifact_set_observation_is_exhaustive(
+    observation: ArtifactSetObservation,
+) -> None:
+    if isinstance(observation, LegacyArtifactSet):
+        _legacy: LegacyArtifactSet = observation
+    elif isinstance(observation, MissingArtifactCommit):
+        _missing_reason: str = observation.reason
+    elif isinstance(observation, InvalidArtifactCommit):
+        _invalid_reason: str = observation.reason
+    elif isinstance(observation, IncompleteArtifactSet):
+        _incomplete_reason: str = observation.reason
+    elif isinstance(observation, CompleteArtifactSet):
+        _inventory: Mapping[str, str] = observation.inventory_sha256
+    else:
+        _assert_never(observation)
+
+
+def event_log_observation_is_exhaustive(observation: EventLogObservation) -> None:
+    if isinstance(observation, MissingEventLog):
+        _missing_reason: str = observation.reason
+    elif isinstance(observation, InvalidEventLog):
+        _invalid_reason: str = observation.reason
+    elif isinstance(observation, LoadedEventLog):
+        _events: tuple[Mapping[str, object], ...] = observation.events
+        _schema_version: int = observation.schema_version
+    else:
+        _assert_never(observation)

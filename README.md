@@ -581,11 +581,12 @@ skill-eval-harness/
 ├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance/task value objects
 ├── agent_capabilities.py       # unified backend surfaces, capabilities, CLI options, smoke, and failure policy
+├── artifact_contracts.py       # closed persisted-artifact observations and integrity verification
 ├── experimental_pairs.py       # exact pair identities and blocked-pair construction
 ├── runner_contracts.py         # closed answer-runner outcome union
 ├── judge_verdict.py            # strict imported/stored judge verdict variants
 ├── jetty_contracts.py          # closed Jetty lifecycle and observation contract
-├── trace_contracts.py          # normalized event lifecycle contract
+├── trace_contracts.py          # normalized event-log and event lifecycle contracts
 ├── trigger_contracts.py        # autonomous-trigger invocation/detection/observation contract
 ├── telemetry.py                # schema-v3 availability/provenance/comparison domain
 ├── docs/                       # architecture, abstractions, vocabulary, specs, guides (see the map above)

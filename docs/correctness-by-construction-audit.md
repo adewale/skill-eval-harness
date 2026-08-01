@@ -257,6 +257,24 @@ a protocol error and cannot receive return code zero.
 Dry-run payload generation is planning, not a Jetty execution lifecycle. Non-executable submitted
 payloads are protocol-invalid rather than ordinary provider failures.
 
+## Persisted run artifacts
+
+Persisted run evidence crosses a typed disk boundary before event semantics are inspected:
+
+```text
+artifact-commit.json -> Legacy | MissingCommit | InvalidCommit | Incomplete | Complete
+events.json -> Missing | Invalid | Loaded
+```
+
+- `artifact_contracts.py` verifies the declared schema, required-file inventory, paths, symbolic
+  links, and SHA-256 digests. It preserves malformed marker data separately from a well-formed but
+  partial or stale artifact set.
+- `trace_contracts.parse_event_log` validates the event-log envelope and performs the explicit v1
+  compatibility adaptation. A JSON `null` document is invalid rather than being mistaken for a
+  missing file.
+- `artifact_commit_valid` and `read_events_base` remain compatibility projections; integrity and
+  grading code can consume the closed observations without interpreting booleans or error tuples.
+
 ## Normalized trace-event lifecycle
 
 `trace_contracts.py` owns `EventState`:

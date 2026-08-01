@@ -117,6 +117,15 @@ from agent_capabilities import (
     trace_dialect_implementations,
     workspace_builder_implementations,
 )
+from artifact_contracts import (
+    ARTIFACT_COMMIT_NAME,
+    ARTIFACT_CONTRACT_VERSION,
+    ARTIFACT_REQUIRED_FILES,
+    CompleteArtifactSet,
+    LegacyArtifactSet,
+    artifact_commit_valid,
+    observe_artifact_set,
+)
 from gemini_contracts import GeminiJsonResponse, GeminiStream
 from invocation_contracts import (
     InvocationRequest,
@@ -131,6 +140,9 @@ from jetty_contracts import (
     lifecycle_from_status,
 )
 from json_contracts import (
+    strict_json_loads,
+    thaw_json_value,
+    unique_json_object,
     validate_json_text,
     validate_json_value,
 )
@@ -163,7 +175,15 @@ from text_contracts import (
     comparison_note,
     parse_human_text_assertion,
 )
-from trace_contracts import EventState, event_is_completed, parse_event_state
+from trace_contracts import (
+    EventLogObservation,
+    EventState,
+    InvalidEventLog,
+    MissingEventLog,
+    event_is_completed,
+    parse_event_log,
+    parse_event_state,
+)
 from trigger_contracts import (
     InvocationOutcome,
     TraceEventKind,
@@ -176,7 +196,7 @@ from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 
 VALID_SPLITS = frozenset(Split.values())
 HARNESS_SEMANTIC_MODULES = (
-    "ablation_model.py", "agent_capabilities.py", "experimental_pairs.py",
+    "ablation_model.py", "agent_capabilities.py", "artifact_contracts.py", "experimental_pairs.py",
     "gemini_contracts.py",
     "invocation_contracts.py", "jetty_contracts.py", "judge_contracts.py", "judge_verdict.py", "json_contracts.py", "manifest_contracts.py", "run_pi_trigger_eval.py",
     "run_trigger_matrix.py", "runner_contracts.py", "skill_benchmark.py",
@@ -352,37 +372,6 @@ def oracle_tier(assertion: dict[str, Any]) -> str:
 def die(msg: str) -> NoReturn:
     print(f"FAIL: {msg}", file=sys.stderr)
     raise SystemExit(1)
-
-
-def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise json.JSONDecodeError(f"duplicate object key: {key!r}", "", 0)
-        result[key] = value
-    return result
-
-
-def strict_json_loads(value: str | bytes | bytearray) -> Any:
-    """Parse JSON without allowing last-key-wins shadowing."""
-    def reject_constant(constant: str) -> Any:
-        raise json.JSONDecodeError(
-            f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
-
-    try:
-        parsed = json.loads(
-            value, object_pairs_hook=_unique_json_object,
-            parse_constant=reject_constant)
-        reject_nonfinite_numbers(parsed)
-        validate_json_value(parsed, "strict JSON")
-        return parsed
-    except json.JSONDecodeError:
-        raise
-    except (OverflowError, RecursionError, TypeError, ValueError) as exc:
-        # Keep one stable exception surface for every syntactic, resource, and
-        # strict-persistability rejection so legacy callers cannot accidentally
-        # turn a new validation rule into an uncaught traceback.
-        raise json.JSONDecodeError(str(exc), "", 0) from exc
 
 
 def reject_nonfinite_numbers(value: Any, *, location: str = "$") -> None:
@@ -6270,13 +6259,14 @@ def read_output(runs: Path, case_id: str, variant: str) -> tuple[str | None, Pat
 
 
 def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str, Any]:
-    marker_present = (base / ARTIFACT_COMMIT_NAME).exists()
-    contract_declared = data.get("artifact_contract_version") == ARTIFACT_CONTRACT_VERSION
-    if not marker_present and not contract_declared:
+    declared_version = data.get("artifact_contract_version")
+    observation = observe_artifact_set(
+        base, declared_contract_version=declared_version)
+    if isinstance(observation, LegacyArtifactSet):
         error = metadata_lifecycle_error(data)
         return ({**data, "metadata_error": error, "metadata_artifact_valid": False}
                 if error else data)
-    committed = marker_present and contract_declared and artifact_commit_valid(base)
+    committed = isinstance(observation, CompleteArtifactSet)
     current = telemetry_domain.ObservationEvidence.from_run(data)
     evidence = telemetry_domain.ObservationEvidence(
         current.process, current.provider_response, current.trace,
@@ -6284,6 +6274,9 @@ def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str
     )
     enriched = dict(data)
     enriched["artifact_set_complete"] = committed
+    enriched["artifact_set_state"] = observation.state.value
+    if not committed:
+        enriched["artifact_set_error"] = observation.reason
     enriched["observation_evidence"] = evidence.to_dict()
     envelope = enriched.get("telemetry")
     if isinstance(envelope, dict):
@@ -6317,26 +6310,28 @@ def read_json_dict_or_list(path: Path) -> Any:
         return {"_error": f"invalid JSON in {path.name}: {exc}"}
 
 
+def read_event_log_base(base: Path) -> EventLogObservation:
+    path = base / "events.json"
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return MissingEventLog()
+    except OSError as exc:
+        return InvalidEventLog(f"could not read events.json: {exc}")
+    try:
+        raw = strict_json_loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return InvalidEventLog(f"invalid JSON in events.json: {exc}")
+    return parse_event_log(raw)
+
+
 def read_events_base(base: Path) -> tuple[list[dict[str, Any]] | None, str | None]:
-    data = read_json_dict_or_list(base / "events.json")
-    if data is None:
-        return None, "missing events.json"
-    if isinstance(data, dict) and data.get("_error"):
-        return None, str(data["_error"])
-    version = data.get("schema_version") if isinstance(data, dict) else None
-    if version not in {None, 1, 2}:
-        return None, f"unsupported events.json schema_version {version!r}"
-    events = data.get("events") if isinstance(data, dict) else data
-    if not isinstance(events, list) or not all(isinstance(e, dict) for e in events):
-        return None, "events.json must contain an events list"
-    if version in {None, 1}:
-        events = [
-            ({**event, "status": EventState.COMPLETED.value,
-              "state_source": "legacy_assumed_completed"}
-             if event.get("status") is None else event)
-            for event in events
-        ]
-    return events, None
+    observation = read_event_log_base(base)
+    if isinstance(observation, MissingEventLog):
+        return None, observation.reason
+    if isinstance(observation, InvalidEventLog):
+        return None, observation.reason
+    return [thaw_json_value(event, "event log entry") for event in observation.events], None
 
 
 def read_metrics_base(base: Path) -> dict[str, Any]:
@@ -8505,11 +8500,6 @@ def final_answer_from_events(events: dict[str, Any]) -> str:
     return ""
 
 
-ARTIFACT_COMMIT_NAME = "artifact-commit.json"
-ARTIFACT_CONTRACT_VERSION = 1
-ARTIFACT_REQUIRED_FILES = ("output.md", "events.json", "metrics.json", "metadata.json")
-
-
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -8533,42 +8523,6 @@ def write_artifact_commit(run_dir: Path) -> None:
         "required_files": list(ARTIFACT_REQUIRED_FILES),
         "inventory_sha256": inventory,
     })
-
-
-def artifact_commit_valid(run_dir: Path) -> bool:
-    path = run_dir / ARTIFACT_COMMIT_NAME
-    try:
-        raw = strict_json_loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(raw, dict) or raw.get("schema_version") != ARTIFACT_CONTRACT_VERSION:
-        return False
-    required = raw.get("required_files")
-    inventory = raw.get("inventory_sha256")
-    if required != list(ARTIFACT_REQUIRED_FILES) or not isinstance(inventory, dict):
-        return False
-    if any(not isinstance(name, str) or not isinstance(digest, str)
-           or Path(name).is_absolute() or ".." in Path(name).parts
-           for name, digest in inventory.items()):
-        return False
-    if any(name not in inventory for name in ARTIFACT_REQUIRED_FILES):
-        return False
-    try:
-        actual_files = {
-            candidate.relative_to(run_dir).as_posix()
-            for candidate in run_dir.rglob("*")
-            if candidate.name != ARTIFACT_COMMIT_NAME and candidate.is_file()
-            and not candidate.is_symlink()
-        }
-        if actual_files != set(inventory):
-            return False
-        if any(candidate.is_symlink() for candidate in run_dir.rglob("*")):
-            return False
-        return all(
-            (run_dir / name).is_file() and _file_sha256(run_dir / name) == digest
-            for name, digest in inventory.items())
-    except OSError:
-        return False
 
 
 def _install_staged_run(run_dir: Path, staged: Path) -> None:
@@ -11640,7 +11594,7 @@ def extract_json_object(text: str) -> dict[str, Any]:
             f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
 
     decoder = json.JSONDecoder(
-        object_pairs_hook=_unique_json_object,
+        object_pairs_hook=unique_json_object,
         parse_constant=reject_constant)
     found: list[dict[str, Any]] = []
     i = 0
