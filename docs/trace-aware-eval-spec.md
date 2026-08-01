@@ -2,7 +2,7 @@
 
 Status: v0.4.1 implementation note, with later follow-on items now shipped (see below). The shipped slice covers three things: trace artifacts, trace-backed assertions, and runner adapters. Concretely, the harness can import traces, run Codex JSONL tasks, normalize observed Pi/Codex shapes plus documented/mocked Jetty trajectory shapes, write Pi smoke and Pi trigger trace artifacts, scope assertions by variant, and report process/efficiency evidence alongside outcome scores. This plan uses the subset of ideas from OpenAI's `eval-skills` article, SkillsBench, and Anthropic's `skill-creator` that fit the existing harness model.
 
-> **Superseded in part by [`eval-framework-roadmap-spec.md`](eval-framework-roadmap-spec.md) (implemented).** Several items once listed here as follow-on work have since shipped: OpenTelemetry GenAI normalization (`events.json`/`metrics.json` are now `schema_version: 2` with `gen_ai.*` attributes; version-1 files still grade), the in-process subagent runner with record/replay tool I/O, output-side contamination lint, and the viewer's serve mode with `feedback.json` capture. The Phase checkboxes below are reconciled; live Jetty token validation and OpenCode/Gemini adapters remain open.
+> **Superseded in part by [`eval-framework-roadmap-spec.md`](eval-framework-roadmap-spec.md) (implemented).** Several items once listed here as follow-on work have since shipped: OpenTelemetry GenAI normalization (`events.json`/`metrics.json` are now `schema_version: 2` with `gen_ai.*` attributes; version-1 files still grade), the in-process subagent runner with record/replay tool I/O, output-side contamination lint, the viewer's serve mode with `feedback.json` capture, and the official Gemini CLI JSON/stream-JSON adapter. The Phase checkboxes below are reconciled; live Jetty token validation and an OpenCode adapter remain open.
 
 ## Design principle
 
@@ -274,7 +274,9 @@ skill-benchmark import-trace \
   --run-dir eval-runs/latest/case/with_skill/run-1
 ```
 
-`import-trace` currently accepts `claude`, `codex`, `generic`, `jetty`, and `pi` source dialects. Runner-specific adapters can still add richer normalization as their event streams stabilize.
+`import-trace` currently accepts `claude`, `codex`, `gemini`, `generic`, `jetty`, `pi`, and
+`vibe` source dialects. Runner-specific adapters can still add richer normalization as their event
+streams stabilize.
 
 ### `run-codex`
 
@@ -299,7 +301,7 @@ Current behavior:
 
 - **Pi smoke and trigger evals** use stream events for skill-load evidence and now write normalized `trace.jsonl`, `events.json`, and `metrics.json` artifacts where enabled. Pi smoke runs execute from isolated temporary workspaces so `without_skill` cannot discover source-repo skill files by grep/find/read.
 - **Jetty** imports trajectories and metadata into `trace.jsonl`, `events.json`, and `metrics.json` using documented/mocked trajectory shapes; live token validation is still needed for production response shape drift.
-- **OpenCode/Gemini CLI** can be added later if they provide stable machine-readable event streams.
+- **Gemini CLI** uses its official JSON/stream-JSON formats for answer, judge, usage, and trace evidence. **OpenCode** remains a future adapter candidate if it provides a stable machine-readable event stream.
 
 ## Report additions
 
@@ -420,7 +422,8 @@ This adopts the SkillsBench lesson that focused 2–3-module skills often outper
 - [x] Normalize mocked/documented Jetty trajectories into trace artifacts during `import-jetty-results`.
 - [x] Normalize Pi smoke and Pi trigger stream events where available.
 - [ ] Validate live Jetty trajectory shapes with `JETTY_API_TOKEN` before treating Jetty process evidence as production-grade.
-- [ ] Add OpenCode/Gemini adapters only when they expose stable machine-readable traces.
+- [x] Add the Gemini adapter against its official JSON/stream-JSON contracts.
+- [ ] Add an OpenCode adapter only when it exposes a stable machine-readable trace.
 
 ## Acceptance criteria for the shipped trace slice
 
@@ -431,7 +434,7 @@ The shipped slice includes:
 - tests that efficiency assertions fail when required metrics are missing;
 - tests that existing manifests without trace fields still validate and benchmark;
 - tests for variant-scoped process assertions;
-- tests for Pi, Codex, Jetty, and Pi-trigger trace artifact paths;
+- tests for Pi, Codex, Gemini, Jetty, and Pi-trigger trace artifact paths;
 - README updates documenting artifacts, assertion types, runner commands, and the isolated Pi smoke workspace;
 - no live runner/API dependency in unit tests;
 - no answer-key fields in executor payloads.

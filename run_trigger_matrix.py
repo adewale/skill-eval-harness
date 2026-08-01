@@ -608,8 +608,8 @@ class VibeAdapter(AgentAdapter):
                                            tools=VIBE_READ_ONLY_TOOLS, auto_approve=True,
                                            max_turns=self.max_turns)
             except ValueError as exc:
-                return InvocationOutcome.from_process(
-                    stdout="", stderr=str(exc), returncode=127, elapsed_ms=0,
+                return InvocationOutcome.spawn_failed(
+                    stderr=str(exc), elapsed_ms=0,
                 ).with_metadata(
                     config_isolated=True,
                     vibe_env_file_copied=bool(env_meta.get("vibe_env_file_copied", False)),
@@ -944,6 +944,8 @@ def observe_cell_query(
                 environment={"runner": adapter.name, "model": model, "trigger_eval": True},
                 write_metadata=True,
                 pi_stream=artifact_pi_stream,
+                process_observation_complete=(
+                    redacted_invocation.process_observation_complete),
             )
         except Exception as exc:
             trace_error = f"{type(exc).__name__}: {exc}"

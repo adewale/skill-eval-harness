@@ -1,0 +1,7 @@
+{"type":"init","timestamp":"2026-07-31T09:00:00.000Z","session_id":"fixture-session","model":"fixture-model"}
+{"type":"message","timestamp":"2026-07-31T09:00:00.001Z","role":"user","content":"Stream test"}
+{"type":"message","timestamp":"2026-07-31T09:00:00.002Z","role":"assistant","content":"Thinking...","delta":true}
+{"type":"tool_use","timestamp":"2026-07-31T09:00:00.003Z","tool_name":"read_file","tool_id":"tool-1","parameters":{"file_path":"fixture.txt"}}
+{"type":"tool_result","timestamp":"2026-07-31T09:00:00.004Z","tool_id":"tool-1","status":"success","output":"fixture contents"}
+{"type":"message","timestamp":"2026-07-31T09:00:00.005Z","role":"assistant","content":"Final answer","delta":true}
+{"type":"result","timestamp":"2026-07-31T09:00:00.006Z","status":"success","stats":{"total_tokens":0,"input_tokens":0,"output_tokens":0,"cached":0,"input":0,"duration_ms":25,"tool_calls":0,"models":{}}}

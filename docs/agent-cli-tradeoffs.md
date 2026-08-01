@@ -1,6 +1,6 @@
-# Claude, Codex, and Vibe CLI trade-offs
+# Claude, Codex, Gemini, and Vibe CLI trade-offs
 
-The harness can run Claude Code, Codex CLI, and Mistral Vibe through one evaluation contract, but the CLIs are not equivalent. This doc names the practical trade-offs and what they mean for harness behavior, reporting, and future work.
+The harness can run Claude Code, Codex CLI, Gemini CLI, and Mistral Vibe through one evaluation contract, but the CLIs are not equivalent. This doc names the practical trade-offs and what they mean for harness behavior, reporting, and future work.
 
 Related docs:
 
@@ -10,18 +10,52 @@ Related docs:
 
 ## Summary
 
-| Dimension | Claude Code | Codex CLI | Mistral Vibe | What it means for us |
-|---|---|---|---|---|
-| Final answer | Strong: JSON result envelope | Strong: `--output-last-message` sidecar | Adequate: last assistant `LLMMessage.content` | Vibe answer extraction works, but is less explicit than Claude/Codex. Keep parser tests and live smoke. |
-| Judge schema | Strong: `--json-schema` | Strong: `--output-schema` | Harness-only validation | Vibe judge verdicts need stricter retry/fail-closed handling because the provider is not constrained. |
-| Token telemetry | Strong: provider envelope | Partial: JSONL usage events when emitted | Missing in current CLI output | Vibe cannot participate in token-efficiency comparisons yet. Report explicit missing, never zero. |
-| Dollar cost | Strong: provider-reported `total_cost_usd` | Missing unless wrapper/estimator supplies it | Missing in current CLI output | Cost-per-signal is strongest for Claude, partial for Codex, absent for Vibe. |
-| Prompt transport | stdin in print mode | stdin or prompt arg | prompt arg required for reliable headless mode | Vibe prompts appear in process argv; we redact saved metadata but cannot remove OS-level argv exposure. |
-| Config isolation | Good; `--no-session-persistence`; `--bare` possible with API-key auth | Good; isolated `CODEX_HOME` outside the model workdir, `--ephemeral`, `--ignore-user-config`, `--ignore-rules` | Good; isolated `VIBE_HOME` outside the model workdir, but programmatic runs still write logs/session data under it | Scratch homes are credential-bearing artifacts; they must stay outside model-readable workdirs and be deleted after runs. |
-| Tool policy | Mature: `--tools`, `--allowedTools` | Sandbox/approval-policy oriented | Allowlist/denylist oriented: `--enabled-tools`, `--disabled-tools` | We need provider-specific tool-policy adapters, not one generic “read-only tools” flag. |
-| Skill discovery | `.claude/skills` plus `Skill` tool evidence | `$CODEX_HOME/skills` exposed as a skills-only extra read root; path evidence | `.agents/skills` / `.vibe/skills` plus `skill` tool evidence | Vibe is strong for autonomous Agent Skills measurement. This is the reason to support Vibe instead of raw Mistral API. |
-| Tool replay | Available through harness subagent path, not native CLI | Not native in harness | Not native in harness | Native CLI runs are measurement surfaces, not replayable deterministic tool-host runs. |
-| Live smoke reliability | Blocked by Claude quota/auth when unavailable | Depends on Codex auth/model | Passed with `MISTRAL_API_KEY` for Vibe 2.19.1 | Vibe is live-proven for the current CLI, but should be re-smoked after CLI/provider upgrades. |
+| Dimension | Claude Code | Codex CLI | Gemini CLI | Mistral Vibe | What it means for us |
+|---|---|---|---|---|---|
+| Final answer | Strong: JSON result envelope | Strong: `--output-last-message` sidecar | Strong after strict lifecycle validation: final assistant segment / JSON `response` | Adequate: last assistant `LLMMessage.content` | Every stream-like provider needs a tested terminal-answer rule; raw trace bytes are never answer text. |
+| Judge schema | Strong: `--json-schema` | Strong: `--output-schema` | Harness-only validation after a strict JSON envelope | Harness-only validation | Gemini/Vibe verdicts fail closed in the harness because the provider is not schema-constrained. |
+| Token telemetry | Strong: provider envelope | Partial: JSONL usage events when emitted | Provider stats with per-model totals, when present | Missing in current CLI output | Missing stats remain unavailable, never numeric zero. |
+| Dollar cost | Strong: provider-reported `total_cost_usd` | Missing unless wrapper/estimator supplies it | Missing: no CLI cost field | Missing in current CLI output | Cost-per-signal is strongest for Claude and unavailable for Gemini/Vibe without an estimator. |
+| Prompt transport | stdin in print mode | stdin or prompt arg | prompt arg in headless mode | prompt arg required for reliable headless mode | Gemini/Vibe prompts appear in process argv; saved metadata is redacted, but OS-level argv exposure remains. |
+| Config isolation | Good; `--no-session-persistence`; `--bare` possible with API-key auth | Good; isolated `CODEX_HOME`, `--ephemeral`, ignore flags | Good for user state: isolated `GEMINI_CLI_HOME`, selected auth only, explicit ADC externalized, project controls rejected; admin settings can still override | Good; isolated `VIBE_HOME`, but programmatic runs write under it | Scratch homes are credential-bearing artifacts outside model-readable workdirs and are deleted after runs. |
+| Tool policy | Mature: `--tools`, `--allowedTools` | Sandbox/approval-policy oriented | Policy-tier oriented: deny-all plus read allowlist; nested sandbox depends on portable auth | Allowlist/denylist oriented: `--enabled-tools`, `--disabled-tools` | Provider-specific policy adapters are required; one generic “read-only” flag would overclaim parity. |
+| Skill discovery | `.claude/skills` plus `Skill` evidence | `$CODEX_HOME/skills` plus path evidence | Native Agent Skills, but `activate_skill` consent blocks a trigger claim until live-proven | `.agents/skills` / `.vibe/skills` plus `skill` evidence | Existence of a skill format is not evidence that autonomous headless activation works. |
+| Tool replay | Harness subagent path only | Not native in harness | Not native in harness | Not native in harness | Native CLI runs are measurement surfaces, not replayable deterministic tool-host runs. |
+| Live smoke reliability | Depends on quota/auth | Depends on Codex auth/model | Pinned CLI `0.55.0-nightly.20260729.g3499c84f7` accepts the real harness command and fails closed without auth; the token-backed answer gate is `RUN_GEMINI_SMOKE` | Passed with `MISTRAL_API_KEY` for Vibe 2.19.1 | Keep executable, auth-boundary, token-backed answer, and trigger proof distinct; rerun the relevant layer after CLI/provider upgrades. |
+
+## Gemini-specific trade-offs
+
+Gemini's official output protocols are stronger than an unstructured message
+stream: they expose a closed event union, a terminal result, and per-model token
+statistics. `GeminiStream` and `GeminiJsonResponse` make malformed, missing,
+contradictory, or provider-error terminals unrepresentable as successful
+answers/verdicts. The remaining limitations are control-plane limitations:
+
+- `activate_skill` normally requires consent. The harness therefore supports
+  forced-load answer runs and native judges, but truthfully reports no Gemini
+  autonomous-trigger surface.
+- Harness policy files are user-tier. Administrator policy has higher
+  precedence, so artifacts disclose the possible override instead of claiming
+  an absolute no-tools boundary.
+- Gemini authenticates again inside container sandboxes. Environment API keys,
+  legacy `oauth_creds.json`, and explicit external ADC have a supported bridge;
+  GCA/encrypted OAuth, keychain-only API keys, implicit ADC, and metadata auth do not. Those runs retain the deny
+  policy and isolated config/workspace but explicitly record that the extra
+  provider sandbox was not requested.
+- `read_many_files` does not export its processed-file list in `stream-json`.
+  Its include patterns are never treated as skill-file read evidence.
+- `--gemini-cmd` accepts one caller-trusted executable path, not a shell-like
+  prefix. Runtime artifacts record `gemini --version` and the pinned fixture
+  revision.
+- Gemini has no provider verdict-schema flag or dollar-cost field. Verdict shape
+  is harness-enforced; cost stays unavailable.
+- Headless prompt text is an argv argument. Saved command metadata redacts it,
+  but the process list can expose it during execution.
+- Official fixtures establish parser conformance, not credentials/network/model
+  availability. A credential-free probe of the exact pinned CLI established
+  command compatibility, version capture, isolation/cleanup, and fail-closed
+  exit-41 handling. `RUN_GEMINI_SMOKE=1` remains the separate token-backed
+  answer gate.
 
 ## Vibe-only gaps and weaknesses
 
@@ -53,7 +87,7 @@ Harness behavior:
 
 Implication:
 
-- Vibe judge results are usable, but less constrained than Claude/Codex results.
+- Vibe judge results are usable, but less constrained than Claude/Codex results; Gemini has the same harness-only verdict-schema limitation.
 - Strict schema mode should fail closed on malformed Vibe verdicts.
 - A future improvement is a Vibe judge retry loop that re-prompts with parse/schema errors, or an upstream Vibe schema flag.
 
@@ -144,7 +178,7 @@ It is not yet first-class for:
 
 1. **Quality/trigger rows:** Vibe rows are meaningful if execution is valid and live smoke passes.
 2. **Token/cost summaries:** Treat Vibe as missing telemetry, not free execution.
-3. **Judge disagreements:** If Vibe disagrees with Claude/Codex, inspect the raw transcript first; schema adherence is harness-enforced after generation, not provider-enforced during generation.
+3. **Judge disagreements:** If Vibe or Gemini disagrees with Claude/Codex, inspect the raw provider transcript first; schema adherence is harness-enforced after generation, not provider-enforced during generation.
 4. **Official eval claims:** State which agent backends were exercised and which telemetry fields were missing.
 5. **Budget decisions:** Do not use Vibe runs to decide cost-per-signal until usage/cost telemetry or a documented estimator exists.
 

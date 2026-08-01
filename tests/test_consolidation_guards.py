@@ -175,6 +175,19 @@ class SharedOwnerIdentityTests(unittest.TestCase):
                 else:
                     self.assertIsNotNone(signal.reason)
 
+    def test_available_capability_signals_require_explicit_provenance(self):
+        common = {
+            "answer_runner": False, "autonomous_trigger": False,
+            "trigger_ablation": False, "trace_artifacts": False,
+            "dollar_cost": "missing", "judge_backend": False,
+            "tool_replay": False, "live_smoke_env": None,
+        }
+        with self.assertRaisesRegex(ValueError, "usage_provenance"):
+            ac.AgentCapabilities(
+                **common, token_usage=True, elapsed_ms="unavailable")
+        with self.assertRaisesRegex(ValueError, "elapsed_provenance"):
+            ac.AgentCapabilities(**common, token_usage=False)
+
     def test_offline_stub_contract_marks_model_telemetry_not_applicable(self):
         signals = ac.AGENT_CAPABILITIES["stub"].telemetry_contract()
         self.assertEqual(signals["usage"].availability, "not_applicable")
@@ -315,6 +328,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             trigger_ablation=False, trace_artifacts=True, token_usage=False,
             dollar_cost="missing", judge_backend=False, tool_replay=False,
             live_smoke_env=None,
+            elapsed_provenance="process_measured",
         )
         with self.assertRaisesRegex(ValueError, "trigger binding disagrees"):
             ac.BackendRegistration(
@@ -329,6 +343,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             trigger_ablation=False, trace_artifacts=True, token_usage=False,
             dollar_cost="missing", judge_backend=False, tool_replay=False,
             live_smoke_env=None,
+            elapsed_provenance="process_measured",
         )
         native_entrypoint = ac.AnswerEntrypoint(
             "run-agent", ac.ObjectRef("skill_benchmark", "run_agent"))
@@ -444,6 +459,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             dollar_cost="not_applicable", judge_backend=False,
             tool_replay=False, live_smoke_env=None,
             usage_not_applicable=True,
+            elapsed_provenance="process_measured",
         )
         row = ac.BackendRegistration(
             name="offline", capabilities=offline,
@@ -604,6 +620,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             trigger_ablation=False, trace_artifacts=True, token_usage=False,
             dollar_cost="missing", judge_backend=False, tool_replay=False,
             live_smoke_env=None,
+            elapsed_provenance="process_measured",
         )
         wrong_answer = ac.BackendRegistration(
             name="agy", capabilities=answer_capability,
@@ -643,6 +660,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
                 token_usage=False, dollar_cost="not_applicable",
                 judge_backend=False, tool_replay=False,
                 live_smoke_env=None, usage_not_applicable=True,
+                elapsed_provenance="process_measured",
             )
             return ac.BackendRegistration(
                 name=name, capabilities=capability,
@@ -661,6 +679,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
                 token_usage=False, dollar_cost="missing",
                 judge_backend=False, tool_replay=False,
                 live_smoke_env=None,
+                elapsed_provenance="process_measured",
             ),
             answer_route="none",
             trace=ac.ObjectRef("skill_benchmark", "ClaudeBackend"),
@@ -864,6 +883,21 @@ else:
             expected_smoke = registration.capabilities.live_smoke_env
             self.assertEqual(row[9], f"`{expected_smoke}`" if expected_smoke else "n/a")
 
+    def test_backend_abstraction_docs_name_every_shipped_answer_runner(self):
+        abstractions = (
+            ROOT / "docs" / "abstractions.md").read_text(encoding="utf-8")
+        runner_section = abstractions.split(
+            "## Runner / adapter", 1)[1].split("## Trace normalization", 1)[0]
+        for name, registration in ac.BACKENDS.items():
+            if registration.capabilities.answer_runner:
+                self.assertIn(name, runner_section.casefold(), name)
+
+        trace_spec = (
+            ROOT / "docs" / "trace-aware-eval-spec.md").read_text(
+                encoding="utf-8")
+        self.assertNotIn("OpenCode/Gemini CLI", trace_spec)
+        self.assertNotIn("Add OpenCode/Gemini adapters", trace_spec)
+
 
 class TimeoutConventionTests(unittest.TestCase):
     """One timeout encoding: timed_out=True (the flag execution_valid keys on)
@@ -909,6 +943,8 @@ class TimeoutConventionTests(unittest.TestCase):
         self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["claude"], am.CLAUDE_FAILURE)
         self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["subagent"], am.CLAUDE_FAILURE)
         self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["vibe"], am.VIBE_FAILURE)
+        self.assertEqual(
+            am.RUNNER_FAILURE_MARKER_BY_PROVIDER["gemini"], "[GEMINI FAILURE")
         for marker in am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values():
             self.assertIn(marker, am.RUNNER_FAILURE_MARKERS)
 
@@ -958,7 +994,7 @@ class TimeoutConventionTests(unittest.TestCase):
         self.assertIn("start_new_session=True", src)
         self.assertIn('getattr(os, "killpg"', src)
         self.assertIn('getattr(signal, "SIGKILL"', src)
-        self.assertIn("returncode=127", src)
+        self.assertIn("InvocationOutcome.spawn_failed", src)
         self.assertIn("invoke_argv_with_timeout", inspect.getsource(sb.run_argv_capture))
 
     def test_run_argv_with_timeout_converts_spawn_failure_to_failed_observation(self):

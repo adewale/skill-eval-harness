@@ -40,10 +40,10 @@ and the three docs below apply a lens to those terms rather than redefine them:
 [`evals-are-not-tests.md`](evals-are-not-tests.md) (how to read the number a term names). When
 a definition changes, change it in the glossary and let the lenses follow. Standing apart from
 the glossary: [`architecture.md`](architecture.md) (how the pipeline fits together, a flow not a
-definition), [`agent-parity.md`](agent-parity.md) (which surfaces Codex, Claude, Vibe, Pi,
-Jetty, subagent, and stub support), [`agent-cli-control-plane.md`](agent-cli-control-plane.md)
+definition), [`agent-parity.md`](agent-parity.md) (which surfaces Codex, Claude, Gemini, Vibe,
+Pi, Jetty, subagent, and stub support), [`agent-cli-control-plane.md`](agent-cli-control-plane.md)
 (the shared process/config/tool/schema control plane for native CLIs), and
-[`agent-cli-tradeoffs.md`](agent-cli-tradeoffs.md) (Claude/Codex/Vibe trade-offs and
+[`agent-cli-tradeoffs.md`](agent-cli-tradeoffs.md) (Claude/Codex/Gemini/Vibe trade-offs and
 what their gaps mean for reports).
 
 ## Reference

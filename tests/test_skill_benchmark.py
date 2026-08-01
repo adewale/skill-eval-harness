@@ -725,6 +725,39 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertEqual(arm["runs"], 0)
             self.assertEqual(arm["blocked_runs"], 1)
 
+    def test_import_trace_preserves_explicit_process_state_and_rejects_invalid_utf8(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run = root / "run"
+            run.mkdir()
+            (run / "metadata.json").write_text(json.dumps({
+                "returncode": 127,
+                "process_observation_complete": True,
+            }), encoding="utf-8")
+            trace = root / "trace.jsonl"
+            trace.write_text('{"type":"event","status":"completed"}\n',
+                             encoding="utf-8")
+            sb.import_trace(SimpleNamespace(
+                source="generic", trace=str(trace), run_dir=str(run),
+                out_events=None, out_metrics=None))
+            metrics = json.loads(
+                (run / "metrics.json").read_text(encoding="utf-8"))
+            self.assertTrue(metrics["process_observation_complete"])
+
+            invalid_run = root / "invalid-run"
+            invalid_trace = root / "invalid.jsonl"
+            invalid_trace.write_bytes(
+                b'{"type":"message","content":"\xff"}\n')
+            sb.import_trace(SimpleNamespace(
+                source="generic", trace=str(invalid_trace),
+                run_dir=str(invalid_run), out_events=None, out_metrics=None))
+            invalid_metrics = json.loads(
+                (invalid_run / "metrics.json").read_text(encoding="utf-8"))
+            self.assertFalse(invalid_metrics["trace_observation_complete"])
+            self.assertIn(
+                "trace transport is not valid UTF-8",
+                invalid_metrics["trace_protocol_errors"])
+
     def test_variant_scoped_process_assertions_do_not_penalize_other_variants(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

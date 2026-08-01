@@ -8,11 +8,26 @@ Run `skill-benchmark agent-capabilities` for the machine-readable registry view.
 |---|---:|---|---:|---:|---:|---:|---|---:|---:|---|
 | `claude` | yes (`run-claude`, `run-agent --agent claude`) | `native` | yes (`skill-trigger-matrix --agent claude`) | yes | yes | yes | `provider_reported` | yes (`judge --judge-backend claude` / `--judge-model`) | yes through `run-subagent` | `RUN_TRIGGER_SMOKE` |
 | `codex` | yes (`run-codex`, `run-agent --agent codex`) | `native` | yes (`skill-trigger-matrix --agent codex`) | yes | yes | yes, when stream reports it | `missing` unless a wrapper emits/estimates cost | yes (`judge --judge-backend codex`) | no native replay | `RUN_CODEX_TRIGGER_SMOKE` |
+| `gemini` | yes (`run-agent --agent gemini`) | `native` | no (headless `activate_skill` consent gate not live-proven) | no | yes | yes, when JSON stats report it | `missing` (CLI has no cost field) | yes (`judge --judge-backend gemini`) | no native replay | `RUN_GEMINI_SMOKE` |
 | `pi` | no core answer runner | `none` | yes (`skill-pi-trigger-eval`, `skill-trigger-matrix --agent pi`) | yes | yes | yes, when stream reports it | `trace_normalized` from the stream when available | no | no | `RUN_PI_TRIGGER_SMOKE` |
 | `jetty` | yes (`export-jetty` / `run-jetty` / `import-jetty-results`; answer-path ablations only) | `export_import` | no | no | yes, imported | yes, imported | `provider_reported`, imported | no (planned in Jetty TODO) | no | `RUN_JETTY_SMOKE` |
 | `vibe` | yes (`run-agent --agent vibe`) | `native` | yes (`skill-trigger-matrix --agent vibe`) | yes | yes | no in current CLI output | `missing` in current CLI output | yes (`judge --judge-backend vibe`) | no native replay | `RUN_VIBE_TRIGGER_SMOKE` |
 | `subagent` | yes (`run-subagent`) | `subagent` | no | no | yes | yes, when backend returns it | `missing` unless backend emits cost | no | yes | n/a |
 | `stub` | no native answer runner; demo stub uses `run-codex --codex-cmd` | `none` | yes | yes | yes | no (not applicable) | `not_applicable` | no | no | n/a |
+
+## What changed for Gemini CLI
+
+Gemini is a first-class native answer and judge backend, with its unproven surface kept out of the registry:
+
+- `skill-benchmark run-agent --agent gemini` runs `gemini --prompt "$PROMPT" --output-format stream-json`, takes final answer text only from a schema-valid terminal stream, and retains the raw stream for trace normalization.
+- `skill-benchmark judge --judge-backend gemini` uses `--output-format stream-json`, parses only the final validated assistant segment as verdict JSON, and preserves the raw lifecycle stream plus provider metadata in judge transcripts.
+- Every invocation uses a fresh `GEMINI_CLI_HOME` outside the model workdir. A valid configured `security.auth.selectedType` wins before environment selection; the harness copies only credential material and supporting environment required by that one planned auth mode, forces portable file storage when needed, suppresses interactive browser auth, and fails closed on invalid settings or nonportable credentials. User skills, extensions, MCP configuration, hooks, context, policies, history, and sessions are not copied.
+- A user-tier TOML policy denies every tool, then answer runs allow only `glob`, `grep_search`, `list_directory`, `read_file`, and `read_many_files`; judges keep the deny-all rule and reject any observed tool lifecycle or nonzero aggregate tool counter. The harness requests sandboxing only when a supported engine exists and the chosen credentials have a proven transport, and records disabled reasons plus the administrator settings/policy override risk.
+- Workspace `.gemini`, `.agents`, `.geminiignore`, and `GEMINI.md` controls are rejected case-insensitively before invocation so an eval fixture cannot silently replace the harness control plane. Usage is normalized from `stats` when present; absent usage and unsupported dollar cost remain explicit `missing` rather than zero.
+- `--gemini-cmd` is one caller-trusted executable token. Every run probes and records `gemini --version`; the live smoke requires that evidence, while offline fixtures name their exact upstream commit/package snapshot.
+- Autonomous trigger remains `false`. Current Gemini skills activate through `activate_skill`, whose headless consent behavior has not been proven safe and noninteractive in a token-backed run. No adapter or trigger claim is published until that gate passes.
+
+Offline tests mirror the official Gemini CLI stream/JSON conformance shapes. The opt-in token-backed answer smoke is `RUN_GEMINI_SMOKE=1`; it is not part of default CI. Gemini judge explore remains rejected until a separately proven read-only implementation exists.
 
 ## What changed for Vibe
 

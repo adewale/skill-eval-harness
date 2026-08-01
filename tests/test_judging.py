@@ -422,13 +422,22 @@ class VerdictSchemaTests(unittest.TestCase):
             codex = sb.codex_judge_invoke(
                 "prompt", judge_model="gpt-mini", codex_cmd="codex exec",
                 assertion_schema=assertion_schema, explore_hint=None)
+        with mock.patch.object(sb, "gemini_cli_invoke", return_value={
+                **provider_result, "model": "gemini-2.5-flash",
+                "raw_response": '{"response":"{\\"passed\\":true}"}',
+                "metadata": {"session_id": "session-1",
+                             "provider_tool_calls": 0}}):
+            gemini = sb.gemini_judge_invoke(
+                "prompt", judge_model="gemini-2.5-flash",
+                gemini_cmd="gemini", explore_hint=None)
         with mock.patch.object(sb, "vibe_cli_invoke", return_value=provider_result):
             vibe = sb.vibe_judge_invoke(
                 "prompt", judge_model="mistral", vibe_cmd="vibe",
                 explore_hint=None)
 
         for backend, invocation in {
-                "claude": claude, "codex": codex, "vibe": vibe}.items():
+                "claude": claude, "codex": codex,
+                "gemini": gemini, "vibe": vibe}.items():
             with self.subTest(backend=backend):
                 self.assertIsInstance(invocation, jc.JudgeInvocation)
                 self.assertTrue(invocation.succeeded)

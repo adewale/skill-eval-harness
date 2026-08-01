@@ -3,7 +3,7 @@
 
 This is intentionally an opt-in operational check, not a test-suite member. It
 creates a disposable one-answer/two-trigger case using the bundled demo skill,
-then exercises the native answer path for Claude, Codex, and Vibe plus Pi's
+then exercises the native answer path for Claude, Codex, Gemini, and Vibe plus Pi's
 native trigger path. It never reads credentials; each CLI retains its normal
 isolated-home/auth behavior through the harness.
 """
@@ -143,6 +143,37 @@ def assess_answer_benchmark(path: Path, agent: str, report: dict[str, Any]) -> b
         return False
 
 
+def assess_gemini_version_evidence(
+    runs: Path, report: dict[str, Any],
+) -> bool:
+    """Require live Gemini runs to retain the installed CLI version."""
+    environments = sorted(runs.rglob("environment.json"))
+    versions: list[str] = []
+    valid = bool(environments)
+    for path in environments:
+        try:
+            environment = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, json.JSONDecodeError):
+            valid = False
+            continue
+        version = environment.get("gemini_cli_version")
+        if (environment.get("gemini_cli_version_status") != "reported"
+                or not isinstance(version, str) or not version.strip()):
+            valid = False
+            continue
+        versions.append(version.strip())
+    unique = sorted(set(versions))
+    report.setdefault("cli_versions", {})["gemini"] = unique
+    report["checks"].append({
+        "label": "gemini:cli-version-provenance",
+        "passed": valid,
+        "detail": (
+            ", ".join(unique) if valid
+            else "every Gemini run must report `gemini --version`"),
+    })
+    return valid
+
+
 def assess_trigger_report(path: Path, report: dict[str, Any], agent: str = "pi") -> bool:
     try:
         trigger = json.loads(path.read_text(encoding="utf-8"))
@@ -257,6 +288,8 @@ def main() -> int:
         all_ok &= answered
         if not answered:
             continue
+        if agent == "gemini":
+            all_ok &= assess_gemini_version_evidence(runs, report)
         benchmarked = run([python, harness, "benchmark", str(manifest), "--runs", str(runs), "--split", "tune", "--out", str(benchmark)],
                           cwd=work, report=report, label=f"{agent}:benchmark")
         all_ok &= benchmarked

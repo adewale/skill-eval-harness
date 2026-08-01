@@ -38,6 +38,7 @@ class SupportedCliSmokeTests(unittest.TestCase):
         expected = {
             "claude": ("SMOKE_CLAUDE_MODEL", "haiku", "answer"),
             "codex": ("SMOKE_CODEX_MODEL", "gpt-5.4-mini", "answer"),
+            "gemini": ("SMOKE_GEMINI_MODEL", "gemini-2.5-flash", "answer"),
             "vibe": ("SMOKE_VIBE_MODEL", "devstral-small-latest", "answer"),
             "pi": ("SMOKE_PI_MODEL", "openai-codex/gpt-5.4-mini", "trigger"),
         }
@@ -118,6 +119,24 @@ class SupportedCliSmokeTests(unittest.TestCase):
             self.assertFalse(smoke.assess_trigger_report(path, report))
             self.assertFalse(report["checks"][0]["passed"])
 
+    def test_gemini_live_smoke_requires_recorded_cli_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            environment = runs / "case" / "with_skill" / "run-1" / "environment.json"
+            environment.parent.mkdir(parents=True)
+            report = {"checks": []}
+            environment.write_text(json.dumps({
+                "gemini_cli_version_status": "unavailable",
+            }), encoding="utf-8")
+            self.assertFalse(smoke.assess_gemini_version_evidence(runs, report))
+            environment.write_text(json.dumps({
+                "gemini_cli_version_status": "reported",
+                "gemini_cli_version": "0.55.0-test",
+            }), encoding="utf-8")
+            report = {"checks": []}
+            self.assertTrue(smoke.assess_gemini_version_evidence(runs, report))
+            self.assertEqual(report["cli_versions"]["gemini"], ["0.55.0-test"])
+
     def test_trigger_assessment_rejects_a_persisted_pass_that_contradicts_provider_failure(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pi-trigger.json"
@@ -149,7 +168,8 @@ class SupportedCliSmokeTests(unittest.TestCase):
     def test_failed_prepare_short_circuits_before_any_answer_call(self):
         with tempfile.TemporaryDirectory() as td:
             args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="claude",
-                                      claude_model="haiku", codex_model="unused", vibe_model="unused",
+                                      claude_model="haiku", codex_model="unused",
+                                      gemini_model="unused", vibe_model="unused",
                                       pi_model="unused", timeout=1)
             with mock.patch.object(smoke, "parse_args", return_value=args), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/claude"), \
@@ -181,7 +201,8 @@ class SupportedCliSmokeTests(unittest.TestCase):
     def test_registry_population_dispatches_pi_to_trigger_runner(self):
         with tempfile.TemporaryDirectory() as td:
             args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="pi",
-                                      claude_model="unused", codex_model="unused", vibe_model="unused",
+                                      claude_model="unused", codex_model="unused",
+                                      gemini_model="unused", vibe_model="unused",
                                       pi_model="model", timeout=1)
             with mock.patch.object(smoke, "parse_args", return_value=args), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/pi"), \

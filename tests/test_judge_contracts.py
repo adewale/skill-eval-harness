@@ -73,6 +73,19 @@ class JudgeInvocationTests(unittest.TestCase):
                 values.update(overrides)
                 jc.JudgeInvocation(**values)
 
+        with self.assertRaises(ValueError):
+            jc.JudgeInvocation(
+                stdout="", stderr="", returncode=0, cost_usd=10 ** 400)
+
+    def test_large_integer_usage_is_exact_and_surrogates_are_rejected(self):
+        huge = 10 ** 400
+        invocation = jc.JudgeInvocation(
+            stdout="{}", stderr="", returncode=0,
+            usage={"input_tokens": huge})
+        self.assertEqual(invocation.usage["input_tokens"], huge)
+        with self.assertRaisesRegex(ValueError, "surrogate"):
+            jc.JudgeInvocation(stdout="\ud800", stderr="", returncode=0)
+
 
 if __name__ == "__main__":
     unittest.main()

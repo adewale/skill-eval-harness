@@ -289,7 +289,7 @@ telemetry helpers.
 | Property-based tests | Parser never crashes on arbitrary JSON; encode/decode round-trips; unavailable rows do not change a known subtotal; ratios cannot exist with invalid denominators. |
 | Exhaustive tests | Enumerate availability × provenance × compatibility × denominator sign × scorable state. |
 | Mathematical properties | Compatible exact-money aggregation is permutation-invariant, associative, and commutative; incompatible buckets cannot aggregate. |
-| Contract fixtures | Redacted Claude/Codex/Pi/Jetty/judge streams cover zero, absent, malformed, cumulative, and schema-drift cases without live CI. |
+| Contract fixtures | Redacted Claude/Codex/Gemini/Pi/Jetty/Vibe/judge streams cover zero, absent, malformed, cumulative, and schema-drift cases without live CI. |
 | CLI E2E/smoke | Local fake-runner workflows exercise every producer and changed consumer against real files. |
 | Documentation-code sync | Command/backend/signal registries must agree with the canonical contract and command docs. |
 | Mutation-style gap analysis | Nightly targeted mutations remove guards, alter `> 0`, swap arms, ignore basis/currency, or coerce unavailable to zero. |

@@ -22,6 +22,10 @@ CostSupport = Literal[
     "provider_reported", "trace_normalized", "price_table_estimated",
     "missing", "not_applicable",
 ]
+TelemetryProvenance = Literal[
+    "provider_reported", "trace_normalized", "process_measured",
+    "price_table_estimated",
+]
 Availability = Literal["available", "unavailable", "not_applicable"]
 SmokePopulation = Literal["answer", "trigger"]
 BackendSurface = Literal["answer", "trigger", "judge"]
@@ -38,6 +42,7 @@ CODEX_TRIGGER_DEFAULT_CMD = (
     "--ignore-user-config --ignore-rules"
 )
 VIBE_DEFAULT_CMD = "vibe"
+GEMINI_DEFAULT_CMD = "gemini"
 
 
 @dataclass(frozen=True)
@@ -87,7 +92,7 @@ class TelemetryCapability:
     """Declared evidence contract for one runner signal."""
 
     availability: Availability
-    provenance: str | None = None
+    provenance: TelemetryProvenance | None = None
     reason: str | None = None
 
     def __post_init__(self) -> None:
@@ -98,7 +103,9 @@ class TelemetryCapability:
             raise ValueError("telemetry availability must use the closed vocabulary")
         if self.availability == "available":
             if (not isinstance(self.provenance, str)
-                    or not self.provenance.strip()
+                    or self.provenance not in {
+                    "provider_reported", "trace_normalized",
+                    "process_measured", "price_table_estimated"}
                     or self.reason is not None):
                 raise ValueError("available telemetry needs provenance and no reason")
         elif (not isinstance(self.reason, str) or not self.reason.strip()
@@ -118,6 +125,8 @@ class AgentCapabilities:
     tool_replay: bool
     live_smoke_env: str | None
     elapsed_ms: Availability = "available"
+    usage_provenance: TelemetryProvenance | None = None
+    elapsed_provenance: TelemetryProvenance | None = None
     usage_not_applicable: bool = False
     notes: str = ""
 
@@ -142,6 +151,19 @@ class AgentCapabilities:
                 }):
             raise ValueError(
                 "agent capability elapsed availability must use the closed vocabulary")
+        for label, available, value in (
+                ("usage_provenance", self.token_usage,
+                 self.usage_provenance),
+                ("elapsed_provenance", self.elapsed_ms == "available",
+                 self.elapsed_provenance)):
+            if available and value not in {
+                    "provider_reported", "trace_normalized",
+                    "process_measured", "price_table_estimated"}:
+                raise ValueError(
+                    f"agent capability {label} must use the closed vocabulary")
+            if not available and value is not None:
+                raise ValueError(
+                    f"agent capability {label} must be absent when unavailable")
         if (self.live_smoke_env is not None
                 and (not isinstance(self.live_smoke_env, str)
                      or not self.live_smoke_env.strip())):
@@ -163,7 +185,7 @@ class AgentCapabilities:
             )
         )
         usage = (
-            TelemetryCapability("available", provenance="provider_reported")
+            TelemetryCapability("available", provenance=self.usage_provenance)
             if self.token_usage
             else TelemetryCapability("not_applicable", reason="offline_runner")
             if self.usage_not_applicable
@@ -173,7 +195,7 @@ class AgentCapabilities:
             "usage": usage,
             "cost": cost,
             "elapsed_ms": (
-                TelemetryCapability("available", provenance="trace_normalized")
+                TelemetryCapability("available", provenance=self.elapsed_provenance)
                 if self.elapsed_ms == "available"
                 else TelemetryCapability(
                     self.elapsed_ms,
@@ -270,9 +292,19 @@ class SurfaceBinding:
             raise ValueError("surface binding repeats an extra parameter")
 
     def option_values(self, values: Mapping[str, Any]) -> dict[str, Any]:
-        names = (*[option.dest for option in self.cli_options], *self.extra_parameters)
-        return {name: values[name] for name in names
-                if name in values and values[name] is not None}
+        projected = {
+            option.dest: (
+                values[option.dest]
+                if option.dest in values and values[option.dest] is not None
+                else option.default
+            )
+            for option in self.cli_options
+        }
+        projected.update({
+            name: values[name] for name in self.extra_parameters
+            if name in values and values[name] is not None
+        })
+        return projected
 
 
 @dataclass(frozen=True)
@@ -468,6 +500,16 @@ _CODEX_JUDGE = SurfaceBinding(
     (_option("--codex-cmd", "codex_cmd", CODEX_JUDGE_DEFAULT_CMD,
              "argv-style Codex command prefix for --judge-backend codex; shell metacharacters are not interpreted"),),
 )
+_GEMINI_ANSWER = SurfaceBinding(
+    ObjectRef("skill_benchmark", "GeminiBackend"),
+    (_option("--gemini-cmd", "gemini_cmd", GEMINI_DEFAULT_CMD,
+             "one literal Gemini CLI executable for --agent gemini answer runs; spaces are path characters and no shell is used"),),
+)
+_GEMINI_JUDGE = SurfaceBinding(
+    ObjectRef("skill_benchmark", "gemini_judge_invoke"),
+    (_option("--gemini-cmd", "gemini_cmd", GEMINI_DEFAULT_CMD,
+             "one literal Gemini CLI executable for --judge-backend gemini; spaces are path characters and no shell is used"),),
+)
 _VIBE_ANSWER = SurfaceBinding(
     ObjectRef("skill_benchmark", "VibeBackend"),
     (_option("--vibe-cmd", "vibe_cmd", VIBE_DEFAULT_CMD,
@@ -562,6 +604,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             answer_runner=True, autonomous_trigger=True, trigger_ablation=True,
             trace_artifacts=True, token_usage=True,
             dollar_cost="provider_reported", judge_backend=True,
+            usage_provenance="provider_reported",
+            elapsed_provenance="process_measured",
             tool_replay=True, live_smoke_env="RUN_TRIGGER_SMOKE",
             notes="run-claude drives stream-json so answer runs keep the full tool-use stream as trace evidence and capture the Claude CLI cost envelope; trigger matrix detects Skill tool-use plus path evidence.",
         ),
@@ -580,6 +624,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
         capabilities=AgentCapabilities(
             answer_runner=True, autonomous_trigger=True, trigger_ablation=True,
             trace_artifacts=True, token_usage=True, dollar_cost="missing",
+            usage_provenance="trace_normalized",
+            elapsed_provenance="process_measured",
             judge_backend=True, tool_replay=False,
             live_smoke_env="RUN_CODEX_TRIGGER_SMOKE",
             notes="Codex answer/trigger support uses codex exec JSONL; native judging uses codex exec --output-last-message/--output-schema. Dollar cost remains explicit missing unless the stream reports cost or a wrapper estimates it.",
@@ -595,11 +641,41 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
         failure_marker="[CODEX FAILURE",
     ),
     BackendRegistration(
+        name="gemini",
+        capabilities=AgentCapabilities(
+            answer_runner=True, autonomous_trigger=False,
+            trigger_ablation=False, trace_artifacts=True, token_usage=True,
+            dollar_cost="missing", judge_backend=True, tool_replay=False,
+            usage_provenance="provider_reported",
+            elapsed_provenance="process_measured",
+            live_smoke_env="RUN_GEMINI_SMOKE",
+            notes=(
+                "Official Gemini CLI answer and judge support uses isolated "
+                "GEMINI_CLI_HOME roots, deny-by-default policy files, and "
+                "strict JSON/stream-JSON contracts. Autonomous trigger is "
+                "disabled until a live headless activate_skill run proves "
+                "consent-free, noninteractive activation. Dollar cost remains "
+                "explicit missing because the CLI does not report it."
+            ),
+        ),
+        answer_route="native",
+        trace=ObjectRef("skill_benchmark", "GEMINI_TRACE_DIALECT"),
+        answer_entrypoints=(_RUN_AGENT,),
+        answer=_GEMINI_ANSWER,
+        judge=_GEMINI_JUDGE,
+        workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
+        smoke=SmokeTarget(
+            "gemini", "SMOKE_GEMINI_MODEL", "gemini-2.5-flash", "answer"),
+        failure_marker="[GEMINI FAILURE",
+    ),
+    BackendRegistration(
         name="pi",
         capabilities=AgentCapabilities(
             answer_runner=False, autonomous_trigger=True, trigger_ablation=True,
             trace_artifacts=True, token_usage=True,
             dollar_cost="trace_normalized", judge_backend=False,
+            usage_provenance="trace_normalized",
+            elapsed_provenance="process_measured",
             tool_replay=False, live_smoke_env="RUN_PI_TRIGGER_SMOKE",
             notes="Pi trigger support is shared by skill-pi-trigger-eval and skill-trigger-matrix; cost is parsed when the JSON stream reports it.",
         ),
@@ -614,6 +690,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             answer_runner=True, autonomous_trigger=False, trigger_ablation=False,
             trace_artifacts=True, token_usage=True,
             dollar_cost="provider_reported", judge_backend=False,
+            usage_provenance="provider_reported",
+            elapsed_provenance="provider_reported",
             tool_replay=False, live_smoke_env="RUN_JETTY_SMOKE",
             notes="Jetty supports answer-path export/run/import; autonomous trigger and judge export/import remain separate Jetty TODOs.",
         ),
@@ -633,6 +711,7 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             answer_runner=True, autonomous_trigger=True, trigger_ablation=True,
             trace_artifacts=True, token_usage=False, dollar_cost="missing",
             judge_backend=True, tool_replay=False,
+            elapsed_provenance="process_measured",
             live_smoke_env="RUN_VIBE_TRIGGER_SMOKE",
             notes="Mistral Vibe support uses isolated VIBE_HOME, programmatic JSON/streaming output, Agent Skills discovery from .agents/skills, and VIBE_ACTIVE_MODEL for model selection. Current Vibe JSON/streaming output does not export usage/cost telemetry, so both are explicit missing unless a future CLI adds fields.",
         ),
@@ -652,6 +731,8 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             answer_runner=True, autonomous_trigger=False, trigger_ablation=False,
             trace_artifacts=True, token_usage=True, dollar_cost="missing",
             judge_backend=False, tool_replay=True, live_smoke_env=None,
+            usage_provenance="provider_reported",
+            elapsed_provenance="process_measured",
             notes="Generic in-process/shell seam for answer runs and tool replay; not an autonomous discovery adapter.",
         ),
         answer_route="subagent",
@@ -668,6 +749,7 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             dollar_cost="not_applicable", judge_backend=False,
             tool_replay=False, live_smoke_env=None,
             usage_not_applicable=True,
+            elapsed_provenance="process_measured",
             notes="Offline deterministic demo/CI adapter; never spends model tokens.",
         ),
         answer_route="none",

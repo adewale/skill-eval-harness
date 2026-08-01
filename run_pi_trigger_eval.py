@@ -52,6 +52,7 @@ from skill_benchmark import (
 )
 from trigger_contracts import (
     InvocationOutcome,
+    InvocationState,
     TriggerExpectation,
     TriggerObservation,
     TriggerRepetitionIdentity,
@@ -181,6 +182,16 @@ def pi_argv(query: str, model: str | None = None) -> list[str]:
 
 def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, Any],
                                   pi_stream: PiStream | None = None) -> None:
+    try:
+        invocation_state = InvocationState(result.get("invocation_state"))
+    except (TypeError, ValueError):
+        process_complete = None
+    else:
+        process_complete = invocation_state in {
+            InvocationState.COMPLETE,
+            InvocationState.PROCESS_FAILED,
+            InvocationState.PROVIDER_FAILED,
+        }
     write_trace_artifacts(
         run_dir,
         stdout,
@@ -194,6 +205,7 @@ def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, 
         environment={"runner": "pi", "mode": "json", "trigger_eval": True},
         write_metadata=True,
         pi_stream=pi_stream,
+        process_observation_complete=process_complete,
     )
 
 

@@ -26,8 +26,8 @@ class InvocationOutcomeInvariantTests(unittest.TestCase):
         cases = [
             (0, InvocationState.COMPLETE, True, False),
             (1, InvocationState.PROCESS_FAILED, False, False),
-            (124, InvocationState.TIMED_OUT, False, True),
-            (127, InvocationState.SPAWN_FAILED, False, False),
+            (124, InvocationState.PROCESS_FAILED, False, False),
+            (127, InvocationState.PROCESS_FAILED, False, False),
         ]
         for returncode, state, complete, timed_out in cases:
             with self.subTest(returncode=returncode):
@@ -38,18 +38,24 @@ class InvocationOutcomeInvariantTests(unittest.TestCase):
                 self.assertIs(outcome.observation_complete, complete)
                 self.assertIs(outcome.timed_out, timed_out)
 
+        self.assertIs(
+            InvocationOutcome.from_timeout(
+                stdout="", stderr="timeout", elapsed_ms=1).state,
+            InvocationState.TIMED_OUT,
+        )
+        self.assertIs(
+            InvocationOutcome.spawn_failed(
+                stderr="missing", elapsed_ms=1).state,
+            InvocationState.SPAWN_FAILED,
+        )
+
     def test_direct_constructor_rejects_every_contradictory_state(self):
         invalid = [
             {"returncode": 1, "state": InvocationState.COMPLETE},
-            {"returncode": 124, "state": InvocationState.COMPLETE,
-                 "completion_evidence": CompletionEvidence.AGENT_WINDOW_EXHAUSTED},
-            {"returncode": 127, "state": InvocationState.COMPLETE,
-                 "completion_evidence": CompletionEvidence.AGENT_WINDOW_EXHAUSTED},
             {"returncode": 0, "state": InvocationState.TIMED_OUT},
             {"returncode": 1, "state": InvocationState.SPAWN_FAILED},
             {"returncode": 0, "state": InvocationState.PROCESS_FAILED},
             {"returncode": 0, "state": InvocationState.PROVIDER_FAILED},
-            {"returncode": 124, "state": InvocationState.PROVIDER_FAILED, "provider_error": "error"},
             {"returncode": 0, "state": InvocationState.HARNESS_FAILED},
         ]
         for fields in invalid:
@@ -67,13 +73,15 @@ class InvocationOutcomeInvariantTests(unittest.TestCase):
         self.assertIs(complete.completion_evidence, CompletionEvidence.AGENT_WINDOW_EXHAUSTED)
         with self.assertRaises(ValueError):
             InvocationOutcome.from_process(stdout="", stderr="", returncode=0, elapsed_ms=0).as_agent_window_complete()
-        for reserved_code in (124, 127):
-            with self.subTest(reserved_code=reserved_code), self.assertRaises(ValueError):
-                InvocationOutcome.from_legacy_dict("fake", {
-                    "stdout": "", "stderr": "", "returncode": reserved_code,
+        for ordinary_exit_code in (124, 127):
+            with self.subTest(ordinary_exit_code=ordinary_exit_code):
+                completed = InvocationOutcome.from_legacy_dict("fake", {
+                    "stdout": "", "stderr": "", "returncode": ordinary_exit_code,
                     "timed_out": False, "elapsed_ms": 1, "observation_complete": True,
                     "completion_evidence": "agent_window_exhausted",
+                    "invocation_state": "complete",
                 }, allow_nonzero_complete=True)
+                self.assertIs(completed.state, InvocationState.COMPLETE)
 
     def test_legacy_boundary_rejects_truthy_strings_and_state_contradictions(self):
         base = {
@@ -84,12 +92,16 @@ class InvocationOutcomeInvariantTests(unittest.TestCase):
             {**base, "timed_out": "false"},
             {**base, "observation_complete": "false"},
             {**base, "elapsed_ms": None},
-            {**base, "returncode": 124, "timed_out": False, "observation_complete": False},
             {**base, "observation_complete": False},
         ]
         for row in invalid:
             with self.subTest(row=row), self.assertRaises((TypeError, ValueError)):
                 InvocationOutcome.from_legacy_dict("fake", row)
+        exited_124 = InvocationOutcome.from_legacy_dict("fake", {
+            **base, "returncode": 124, "timed_out": False,
+            "observation_complete": False,
+        })
+        self.assertIs(exited_124.state, InvocationState.PROCESS_FAILED)
 
     def test_harness_failure_preserves_unmeasured_elapsed_time_as_unavailable(self):
         outcome = InvocationOutcome.harness_failed("fixture setup failed")
@@ -176,8 +188,8 @@ class PiStreamContractTests(unittest.TestCase):
         self.assertEqual(invocation.returncode, 1)
 
     def test_timeout_remains_a_timeout_when_its_partial_stream_has_no_terminal_event(self):
-        process = InvocationOutcome.from_process(
-            stdout='{"type":"agent_start"}\n', stderr="timeout", returncode=124, elapsed_ms=1,
+        process = InvocationOutcome.from_timeout(
+            stdout='{"type":"agent_start"}\n', stderr="timeout", elapsed_ms=1,
         )
         invocation = pi_invocation_outcome(process)
         self.assertIs(invocation.state, InvocationState.TIMED_OUT)
@@ -343,6 +355,30 @@ class TriggerObservationTruthTableTests(unittest.TestCase):
                 self.assertIs(restored.invocation.completion_evidence, CompletionEvidence.AGENT_WINDOW_EXHAUSTED)
                 self.assertIs(restored.detection.evidence[0].kind, kind)
                 self.assertTrue(restored.passed)
+
+    def test_process_provenance_round_trips_independently_of_exit_code(self):
+        invocations = (
+            InvocationOutcome.spawn_failed(stderr="missing", elapsed_ms=1),
+            InvocationOutcome.from_process(
+                stdout="", stderr="exit 127", returncode=127, elapsed_ms=1),
+            InvocationOutcome.from_timeout(
+                stdout="", stderr="timeout", elapsed_ms=1),
+            InvocationOutcome.from_process(
+                stdout="", stderr="exit 124", returncode=124, elapsed_ms=1),
+        )
+        for invocation in invocations:
+            with self.subTest(state=invocation.state, code=invocation.returncode):
+                original = TriggerObservation(
+                    agent="stub", model=None, query="q",
+                    expectation=TriggerExpectation.DO_NOT_TRIGGER,
+                    invocation=invocation, detection=TriggerDetection.absent(),
+                    usage={"source": "missing"}, cost={"source": "missing"},
+                )
+                row = json.loads(json.dumps(original.as_row()))
+                restored = TriggerObservation.from_row(row)
+                self.assertIs(restored.invocation.state, invocation.state)
+                self.assertEqual(restored.invocation.returncode,
+                                 invocation.returncode)
 
     def test_repetition_identity_round_trips_and_is_part_of_observation_identity(self):
         base = self._observation(usage={"source": "missing"}, cost={"source": "missing"})

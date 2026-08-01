@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:10224`, merged in `grade_case_variant:12399`).
+threshold, evidence}` (`load_judge_results:11619`, merged in `grade_case_variant:13880`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -121,27 +121,32 @@ threshold, evidence}` (`load_judge_results:10224`, merged in `grade_case_variant
 # Agent backend parity follow-ups
 
 Design and acceptance criteria live in [`docs/agent-backend-interface-spec.md`](docs/agent-backend-interface-spec.md).
-Claude and Codex are the first native `run-agent`/judge backends; the next parity targets are
-Gemini CLI and Mistral Vibe. Keep the invariant from the v0.5.0 work: new providers implement
+Claude, Codex, Gemini, and Vibe are native `run-agent`/judge backends. Keep the invariant
+from the v0.5.0 work: new providers implement
 shared backend protocols and conformance tests, not one-off grading or benchmark paths.
 
 ## Gemini CLI
 
-- [ ] Add a native Gemini answer backend (`run-agent --agent gemini`) with isolated cwd/config,
+- [x] Add a native Gemini answer backend (`run-agent --agent gemini`) with isolated cwd/config,
       `InvocationRequest`/`InvocationResult` plumbing, answer extraction from Gemini's JSON or
       stream JSON mode, provider telemetry normalization, and failure artifacts on spawn/nonzero/
-      timeout. Mount skills under the Gemini/Agent Skills discovery locations described in the
-      backend spec.
-- [ ] Add a native Gemini judge backend (`judge --judge-backend gemini`) that returns the canonical
-      verdict JSON shape, stamps backend/model/usage metadata, and uses harness-side schema
+      timeout. Materialize the same provider-neutral skill workspace used by other forced-load
+      answer backends.
+- [x] Add a native Gemini judge backend (`judge --judge-backend gemini`) that returns the canonical
+      verdict JSON shape, stamps backend/requested-resolved-model/CLI-version/usage metadata,
+      rejects unimplemented judge explore, and uses harness-side schema
       validation (`verdict_schema_for`, `--strict-judge-schema`) unless Gemini exposes a reliable
       provider-enforced schema hook.
-- [ ] Add a Gemini autonomous trigger adapter for `skill-trigger-matrix --agent gemini`: fresh
+- [ ] Add a Gemini autonomous trigger adapter for `skill-trigger-matrix --agent gemini` only after a
+      token-backed run proves `activate_skill` can be allowed safely in headless mode without
+      enabling unrelated tools. Until then the registry must keep `autonomous_trigger=false` and
+      expose no trigger binding. Once proven: use a fresh
       config/home per run, skill mounting, activation evidence from Gemini skill/tool events when
       available, path-evidence fallback, and `RUN_GEMINI_TRIGGER_SMOKE` live-smoke coverage.
-- [ ] Add Gemini offline conformance fixtures: success, malformed JSON/schema failure, timeout,
-      nonzero/spawn failure, usage-present, usage-missing, tool/skill-activation traces, and judge
-      verdict parsing.
+- [x] Add Gemini offline conformance fixtures/tests: success, malformed JSON/schema failure, timeout,
+      nonzero/spawn failure, usage-present, usage-missing, tool lifecycles, and judge verdict
+      parsing, plus auth/sandbox transport, workspace-control, invalid-byte, and version-provenance
+      guards. Skill-activation evidence stays with the gated trigger item above.
 
 ## Mistral Vibe
 
@@ -212,7 +217,8 @@ Every item below slots around these, not over them.
 These are tests of the harness, not a new eval suite; sequence them before the buckets.
 
 - [x] CF.1 Detector meta-fixtures (keystone) — paired should-fire/should-pass per detector (`tests/fixtures/detectors/`, meta-test = registration contract)
-- [x] CF.2 One cross-runner baseline-isolation invariant (`WORKSPACE_BUILDERS` registry: codex/claude/jetty/subagent + pi smoke)
+- [x] CF.2 One cross-runner baseline-isolation invariant (`WORKSPACE_BUILDERS` registry:
+      Claude/Codex/Gemini/Vibe/Jetty/subagent + Pi smoke)
 - [x] CF.3 Re-grade idempotence (byte-identical report modulo `generated_at`)
 - [x] CF.4 Guard: no model / no network in the core grade path (subprocess+urllib patched to raise)
 

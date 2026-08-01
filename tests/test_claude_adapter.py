@@ -337,7 +337,9 @@ class RunClaudeAdapterTests(unittest.TestCase):
             base = runs / run_dir
             text = (base / "output.md").read_text()
             meta = json.loads((base / "metadata.json").read_text())
-            self.assertEqual(meta["returncode"], 1)
+            self.assertEqual(meta["returncode"], 0)
+            self.assertTrue(meta["process_observation_complete"])
+            self.assertFalse(meta["provider_response_complete"])
             self.assertTrue(text.lstrip().startswith(sb.CLAUDE_FAILURE))
             self.assertFalse(sb.execution_valid(meta, text))
 

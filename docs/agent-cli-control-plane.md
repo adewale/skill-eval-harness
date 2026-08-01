@@ -1,6 +1,6 @@
 # Agent CLI control plane
 
-Claude Code, Codex CLI, and Mistral Vibe do not share one wire protocol. The harness treats them as three different control planes that can be adapted into one evaluation contract.
+Claude Code, Codex CLI, Gemini CLI, and Mistral Vibe do not share one wire protocol. The harness treats them as four different control planes that can be adapted into one evaluation contract.
 
 The shared abstraction is therefore **not** “send prompt, get text.” It is:
 
@@ -26,17 +26,17 @@ This is intentionally a **control-plane abstraction**, not a lowest-common-denom
 
 ## Provider control surfaces
 
-| Concern | Claude Code | Codex CLI | Mistral Vibe |
-|---|---|---|---|
-| Noninteractive prompt | `claude -p`, prompt on stdin | `codex exec -`, prompt on stdin; prompt arg also supported | `vibe --prompt "$PROMPT"`; headless stdin prompt mode is unreliable without a tty |
-| Final answer channel | JSON result envelope (`result`) | `--output-last-message <file>`; JSONL is trace, not final-answer source | final assistant `LLMMessage.content` from `--output json` / `--output streaming` |
-| Trace channel | `--output-format stream-json` for trigger runs; JSON envelope for answer/judge | `--json` JSONL events | `--output streaming` newline-delimited `LLMMessage` JSON, or `--output json` message list |
-| Schema channel | `--json-schema` for native Claude judges; harness still validates | `--output-schema <schema.json>` for native Codex judges; harness adapts optional fields to strict provider schema and still validates canonical schema | no provider-enforced schema in current CLI; harness validates parsed final assistant JSON |
-| Config isolation | temp workspace; `--no-session-persistence`; optional portable config copy; `--bare` is a future stricter option when API-key auth is available | isolated `CODEX_HOME` outside the model workdir; copy only auth/config files; `--ignore-user-config --ignore-rules`; `--ephemeral` | isolated `VIBE_HOME` outside the model workdir; copy only `.env` when `MISTRAL_API_KEY` is absent; never copy user skills/config |
-| Skill discovery for trigger evals | project `.claude/skills`; primary evidence is `Skill` tool use, path evidence fallback | `$CODEX_HOME/skills` exposed as a skills-only extra read root; path evidence from JSONL commands/messages | project `.agents/skills`; primary evidence is native `skill` tool call, path evidence fallback |
-| Tool/read policy | `--allowedTools` for trigger/explore, `--tools ""` for tool-free native judges | `--sandbox read-only`, approvals/config/rules flags; no native replay in harness | `--enabled-tools skill/read_file/grep` for answer/trigger, `--enabled-tools re:^$` for no-tools judge |
-| Usage/cost | provider-reported Claude envelope includes token usage and dollar cost | usage parsed when JSONL emits it; dollar cost currently explicit `missing` unless a wrapper/estimator supplies it | current JSON/streaming output does not export usage/cost, so both are explicit `missing` |
-| Session persistence | disabled for native answer/judge via `--no-session-persistence` | disabled with `--ephemeral` | isolated `VIBE_HOME` keeps session/log bleed out of the user's home; programmatic runs still write under the isolated home |
+| Concern | Claude Code | Codex CLI | Gemini CLI | Mistral Vibe |
+|---|---|---|---|---|
+| Noninteractive prompt | `claude -p`, prompt on stdin | `codex exec -`, prompt on stdin; prompt arg also supported | `gemini --prompt "$PROMPT"` | `vibe --prompt "$PROMPT"`; headless stdin prompt mode is unreliable without a tty |
+| Final answer channel | JSON result envelope (`result`) | `--output-last-message <file>`; JSONL is trace, not final-answer source | final assistant segment in a complete `stream-json` lifecycle for answers and judges | final assistant `LLMMessage.content` from `--output json` / `--output streaming` |
+| Trace channel | `--output-format stream-json` for trigger runs; JSON envelope for answer/judge | `--json` JSONL events | `--output-format stream-json` typed `init`/message/tool/error/result events | `--output streaming` newline-delimited `LLMMessage` JSON, or `--output json` message list |
+| Schema channel | `--json-schema` for native Claude judges; harness still validates | `--output-schema <schema.json>` for native Codex judges; harness adapts optional fields to strict provider schema and still validates canonical schema | no provider verdict-schema flag; strict envelope parser then harness verdict validation | no provider-enforced schema in current CLI; harness validates parsed final assistant JSON |
+| Config isolation | temp workspace; `--no-session-persistence`; optional portable config copy; `--bare` is a future stricter option when API-key auth is available | isolated `CODEX_HOME` outside the model workdir; copy only auth/config files; `--ignore-user-config --ignore-rules`; `--ephemeral` | isolated `GEMINI_CLI_HOME` outside the model workdir; one auth plan; explicit ADC copied out of the workspace; `.gemini`/`.agents`/`.geminiignore`/`GEMINI.md` rejected | isolated `VIBE_HOME` outside the model workdir; copy only `.env` when `MISTRAL_API_KEY` is absent; never copy user skills/config |
+| Skill discovery for trigger evals | project `.claude/skills`; primary evidence is `Skill` tool use, path evidence fallback | `$CODEX_HOME/skills` exposed as a skills-only extra read root; path evidence from JSONL commands/messages | native Agent Skills exist, but autonomous trigger is unadvertised until headless `activate_skill` consent is live-proven | project `.agents/skills`; primary evidence is native `skill` tool call, path evidence fallback |
+| Tool/read policy | `--allowedTools` for trigger/explore, `--tools ""` for tool-free native judges | `--sandbox read-only`, approvals/config/rules flags; no native replay in harness | user-tier TOML deny-all plus answer read allowlist/judge no-tools; nested sandbox only when auth is portable; admin override disclosed | `--enabled-tools skill/read_file/grep` for answer/trigger, `--enabled-tools re:^$` for no-tools judge |
+| Usage/cost | provider-reported Claude envelope includes token usage and dollar cost | usage parsed when JSONL emits it; dollar cost currently explicit `missing` unless a wrapper/estimator supplies it | per-model JSON stats normalize to usage; no CLI cost field, so cost is explicit `missing` | current JSON/streaming output does not export usage/cost, so both are explicit `missing` |
+| Session persistence | disabled for native answer/judge via `--no-session-persistence` | disabled with `--ephemeral` | fresh isolated home prevents session/history reuse | isolated `VIBE_HOME` keeps session/log bleed out of the user's home; programmatic runs still write under the isolated home |
 
 ## What we missed and corrected
 
@@ -46,6 +46,13 @@ This is intentionally a **control-plane abstraction**, not a lowest-common-denom
 - **Credential placement:** isolated homes must not be children of the model-readable workdir. Vibe `.env` and Codex `auth.json`/`config.toml` now live in scratch homes outside the workdir; trigger rows expose only the mounted skill tree, not credential-bearing files.
 - **Codex isolation:** `--ignore-user-config` is not the same as isolating the home directory. The harness now sets isolated `CODEX_HOME` for answer, judge, and trigger paths and copies only portable auth/config files, never user skills/plugins.
 - **Claude judge controls:** Claude exposes a native schema channel and no-tools mode. Native Claude judges now pass `--json-schema`; tool-free judges pass `--tools ""`, while `--judge-explore` continues to use a sanitized run copy with read-only tools.
+- **Gemini answer extraction:** `stream-json` is trajectory evidence, not answer text. `GeminiStream` validates the complete lifecycle and exposes only the final assistant segment after the last tool result; unknown, malformed, contradictory, dangling, or unterminated streams cannot become candidate answers.
+- **Gemini telemetry independence:** Gemini's own conformance snapshot can emit one complete tool lifecycle while `stats.tool_calls` is zero. Event lifecycle and telemetry schema are validated independently; the harness does not invent an undocumented equality between them.
+- **Gemini read evidence:** `read_many_files.include` is a glob request, and `stream-json` omits the tool's processed-file list. It therefore counts as a completed tool/read operation but never as proof that a named skill file was opened.
+- **Gemini auth/sandbox coupling:** Gemini authenticates again inside container sandboxes. Legacy portable `oauth_creds.json` and explicit ADC can bridge that hop; GCA access tokens, encrypted FileKeychain state, keychain-only API keys, implicit metadata auth, and quota-project overrides cannot. `GOOGLE_CLOUD_PROJECT_ID` is canonicalized to the container-forwarded `GOOGLE_CLOUD_PROJECT`; conflicting aliases fail closed. Explicit ADC is copied outside the model workspace. The harness conditionally requests the nested sandbox and records the exact transport or disabled reason.
+- **Gemini executable authority:** `--gemini-cmd` is exactly one caller-trusted executable. Shell/env/interpreter prefixes could swallow owned flags, so prefix arguments are not a supported abstraction.
+- **Gemini provenance:** each invocation records `gemini --version` and the pinned fixture revision; live smoke requires version evidence.
+- **Gemini trigger gate:** Agent Skills support alone does not prove autonomous headless activation. Because `activate_skill` normally asks for consent and headless policy resolution can deny it, the registry reports no Gemini trigger surface until a safe, consent-free live run proves otherwise.
 - **Capability precision:** A boolean “supports usage” is too coarse unless it distinguishes actual exported telemetry from internal stats. The docs and registry now state the current CLI-exported truth.
 
 ## What the abstraction hides well
@@ -59,9 +66,9 @@ This is intentionally a **control-plane abstraction**, not a lowest-common-denom
 ## What remains intentionally provider-specific
 
 - Prompt transport (`stdin`, argv prompt, or sidecar file) is provider-specific.
-- Tool policy is provider-specific: Claude tools, Codex sandbox/approval policy, Vibe tool allowlists.
-- Schema enforcement is provider-specific: Claude and Codex expose schema flags; Vibe does not.
-- Skill discovery is provider-specific: `.claude/skills`, `$CODEX_HOME/skills`, `.agents/skills`.
+- Tool policy is provider-specific: Claude tools, Codex sandbox/approval policy, Gemini policy tiers, Vibe tool allowlists.
+- Schema enforcement is provider-specific: Claude and Codex expose schema flags; Gemini and Vibe rely on strict harness-side verdict validation.
+- Skill discovery is provider-specific: `.claude/skills`, `$CODEX_HOME/skills`, Gemini Agent Skills with a consent gate, `.agents/skills`.
 - Telemetry coverage is provider-specific and must be reported, not normalized away.
 
 The rule for future CLIs is: implement the shared contracts, but do not pretend their control surface is identical. Add one `agent_capabilities.BACKENDS` row, a native answer backend if possible, a trigger adapter only after autonomous skill discovery is proven, and fake/offline conformance tests for prompt transport, config isolation, final answer extraction, telemetry, and failure semantics.
@@ -86,7 +93,7 @@ artifacts only and are parsed back through the same contract before the live smo
 [`scripts/smoke_supported_clis.py`](../scripts/smoke_supported_clis.py) is the
 explicitly opt-in, lowest-cost integration smoke. It builds a disposable one-answer
 paired eval from the bundled demo skill, then runs the native answer path for Claude,
-Codex, and Vibe plus Pi's native trigger path (one positive and one negative trigger
+Codex, Gemini, and Vibe plus Pi's native trigger path (one positive and one negative trigger
 query). Each invocation creates a unique `attempt-*` child for task rows and artifacts, then
 writes the top-level `smoke.json` with that artifact path; it never deletes or reuses a
 caller-owned directory.
@@ -98,9 +105,9 @@ caller-owned directory.
 ```
 
 `--live` is required because this spends provider budget. Defaults are intentionally
-small (`haiku`, `gpt-5.4-mini`, `devstral-small-latest`, and Pi's
+small (`haiku`, `gpt-5.4-mini`, `gemini-2.5-flash`, `devstral-small-latest`, and Pi's
 `openai-codex/gpt-5.4-mini`); override any model with
-`--claude-model`, `--codex-model`, `--vibe-model`, or `--pi-model` (or the matching
+`--claude-model`, `--codex-model`, `--gemini-model`, `--vibe-model`, or `--pi-model` (or the matching
 `SMOKE_*_MODEL` environment variable). These targets live in the capability registry; a blank
 environment override falls back to the registered model instead of producing an empty model ID.
 Pi's Codex-backed default requires Pi's OpenAI Codex authentication. Jetty is an API/import surface, not a local

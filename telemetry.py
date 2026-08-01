@@ -29,10 +29,12 @@ BLOCKED = "blocked"
 PROVENANCE = {
     "provider_reported",
     "trace_normalized",
+    "process_measured",
     "price_table_estimated",
     "estimated",
     "legacy_unverified",
 }
+MAX_ELAPSED_MS = 2**63 - 1
 CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
 USAGE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -607,7 +609,8 @@ def measurement_from_usage_block(block: Any, key: str, *, legacy_value: Any = No
             return Measurement.not_applicable("not_applicable", basis=basis)
         if source is not None:
             raw = block.get(key)
-            if (isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw))
+            if (isinstance(raw, bool) or not isinstance(raw, (int, float))
+                    or (isinstance(raw, float) and not math.isfinite(raw))
                     or raw < 0 or (isinstance(raw, float) and not raw.is_integer())):
                 return Measurement.unavailable(f"missing_{key}", basis=basis)
             provenance = str(source)
@@ -616,23 +619,23 @@ def measurement_from_usage_block(block: Any, key: str, *, legacy_value: Any = No
             return Measurement.available(int(raw), provenance=provenance, basis=basis)
     if legacy_value is not None:
         if (isinstance(legacy_value, bool) or not isinstance(legacy_value, (int, float))
-                or not math.isfinite(float(legacy_value)) or legacy_value < 0
+                or (isinstance(legacy_value, float) and not math.isfinite(legacy_value))
+                or legacy_value < 0
                 or (isinstance(legacy_value, float) and not legacy_value.is_integer())):
             return Measurement.unavailable(f"invalid_legacy_{key}", basis=basis)
         return Measurement.available(int(legacy_value), provenance="legacy_unverified", basis=basis)
     return Measurement.unavailable("missing", basis=basis)
 
 
-def measurement_from_nonnegative(value: Any, *, provenance: str = "runner_measured",
+def measurement_from_nonnegative(value: Any, *, provenance: str = "process_measured",
                                   unavailable_reason: str = "missing", basis: Mapping[str, Any] | None = None) -> Measurement[int]:
     """Build a local counter/duration measurement with no truthiness fallback."""
-    # Harness-measured values have their own explicit provenance on the v3 wire;
-    # map them to trace_normalized internally until all callers expose a richer enum.
-    normalized_provenance = "trace_normalized" if provenance == "runner_measured" else provenance
-    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value))
-            or value < 0 or (isinstance(value, float) and not value.is_integer())):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or (isinstance(value, float) and not math.isfinite(value))
+            or value < 0 or value > MAX_ELAPSED_MS
+            or (isinstance(value, float) and not value.is_integer())):
         return Measurement.unavailable(unavailable_reason, basis=basis)
-    return Measurement.available(int(value), provenance=normalized_provenance, basis=basis)
+    return Measurement.available(int(value), provenance=provenance, basis=basis)
 
 
 def basis_from_run(raw: Mapping[str, Any] | None, *, source: str | None = None,

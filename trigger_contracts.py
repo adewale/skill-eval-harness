@@ -15,7 +15,11 @@ from types import MappingProxyType
 from typing import Any, TypeAlias
 
 import telemetry as telemetry_domain
-from json_contracts import freeze_json_mapping, strict_json_equal
+from json_contracts import (
+    freeze_json_mapping,
+    strict_json_equal,
+    validate_json_text,
+)
 
 
 class InvocationState(str, Enum):
@@ -35,6 +39,7 @@ class CompletionEvidence(str, Enum):
 _INVOCATION_RESERVED_METADATA = {
     "stdout", "stderr", "returncode", "timed_out", "elapsed_ms",
     "observation_complete", "provider_error", "completion_evidence",
+    "invocation_state",
 }
 
 
@@ -60,10 +65,14 @@ class InvocationOutcome:
     def __post_init__(self) -> None:
         if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
             raise TypeError("invocation stdout and stderr must be strings")
+        validate_json_text(self.stdout, "invocation stdout")
+        validate_json_text(self.stderr, "invocation stderr")
         if self.elapsed_ms is not None and (
-            isinstance(self.elapsed_ms, bool) or not isinstance(self.elapsed_ms, int) or self.elapsed_ms < 0
+            isinstance(self.elapsed_ms, bool) or not isinstance(self.elapsed_ms, int)
+            or self.elapsed_ms < 0 or self.elapsed_ms > 2**63 - 1
         ):
-            raise ValueError("invocation elapsed_ms must be a non-negative integer or None")
+            raise ValueError(
+                "invocation elapsed_ms must be a supported non-negative integer or None")
         if self.returncode is not None and (isinstance(self.returncode, bool) or not isinstance(self.returncode, int)):
             raise TypeError("invocation returncode must be an integer or None")
         if not isinstance(self.state, InvocationState):
@@ -72,14 +81,16 @@ class InvocationOutcome:
             raise TypeError("completion_evidence must be CompletionEvidence or None")
         if self.provider_error is not None and (not isinstance(self.provider_error, str) or not self.provider_error.strip()):
             raise ValueError("provider_error must be a non-empty string")
+        if self.provider_error is not None:
+            validate_json_text(self.provider_error, "invocation provider_error")
 
         if self.state is InvocationState.COMPLETE:
             if self.returncode == 0:
                 if self.completion_evidence not in {None, CompletionEvidence.NORMAL_EXIT}:
                     raise ValueError("zero-exit completion cannot claim an exhausted agent window")
-            elif (self.returncode in {None, 124, 127}
+            elif (self.returncode is None
                   or self.completion_evidence is not CompletionEvidence.AGENT_WINDOW_EXHAUSTED):
-                raise ValueError("non-zero completion requires a spawned non-timeout code and explicit agent-window evidence")
+                raise ValueError("non-zero completion requires a spawned process and explicit agent-window evidence")
             if self.provider_error is not None:
                 raise ValueError("a complete invocation cannot carry a provider error")
         elif self.completion_evidence is not None:
@@ -89,11 +100,11 @@ class InvocationOutcome:
             raise ValueError("timed-out invocation must use returncode 124")
         if self.state is InvocationState.SPAWN_FAILED and self.returncode != 127:
             raise ValueError("spawn failure must use returncode 127")
-        if self.state is InvocationState.PROCESS_FAILED and self.returncode in {None, 0, 124, 127}:
-            raise ValueError("process failure requires a non-zero non-timeout returncode")
+        if self.state is InvocationState.PROCESS_FAILED and self.returncode in {None, 0}:
+            raise ValueError("process failure requires a non-zero returncode")
         if self.state is InvocationState.PROVIDER_FAILED:
-            if self.returncode is None or self.returncode in {124, 127} or self.provider_error is None:
-                raise ValueError("provider failure requires a non-timeout spawned process and provider_error")
+            if self.returncode is None or self.provider_error is None:
+                raise ValueError("provider failure requires a spawned process and provider_error")
         elif self.provider_error is not None:
             raise ValueError("provider_error requires PROVIDER_FAILED state")
         if self.state is InvocationState.HARNESS_FAILED:
@@ -116,6 +127,15 @@ class InvocationOutcome:
     def timed_out(self) -> bool:
         return self.state is InvocationState.TIMED_OUT
 
+    @property
+    def process_observation_complete(self) -> bool:
+        """Whether a provider process was spawned and reached an exit."""
+        return self.state in {
+            InvocationState.COMPLETE,
+            InvocationState.PROCESS_FAILED,
+            InvocationState.PROVIDER_FAILED,
+        }
+
     @classmethod
     def from_process(cls, *, stdout: str, stderr: str, returncode: int,
                      elapsed_ms: int,
@@ -123,17 +143,28 @@ class InvocationOutcome:
         if returncode == 0:
             state = InvocationState.COMPLETE
             evidence = CompletionEvidence.NORMAL_EXIT
-        elif returncode == 124:
-            state = InvocationState.TIMED_OUT
-            evidence = None
-        elif returncode == 127:
-            state = InvocationState.SPAWN_FAILED
-            evidence = None
         else:
             state = InvocationState.PROCESS_FAILED
             evidence = None
         return cls(stdout, stderr, returncode, elapsed_ms, state, evidence,
                    metadata={} if metadata is None else metadata)
+
+    @classmethod
+    def from_timeout(cls, *, stdout: str, stderr: str, elapsed_ms: int,
+                     metadata: Mapping[str, Any] | None = None) -> InvocationOutcome:
+        return cls(
+            stdout, stderr, 124, elapsed_ms, InvocationState.TIMED_OUT,
+            metadata={} if metadata is None else metadata,
+        )
+
+    @classmethod
+    def spawn_failed(cls, *, stderr: str, elapsed_ms: int,
+                     stdout: str = "",
+                     metadata: Mapping[str, Any] | None = None) -> InvocationOutcome:
+        return cls(
+            stdout, stderr, 127, elapsed_ms, InvocationState.SPAWN_FAILED,
+            metadata={} if metadata is None else metadata,
+        )
 
     @classmethod
     def harness_failed(cls, message: str, *,
@@ -173,6 +204,14 @@ class InvocationOutcome:
             raise TypeError(f"{agent}.invoke timed_out and observation_complete must be booleans")
 
         provider_error = raw.get("provider_error")
+        raw_invocation_state = raw.get("invocation_state")
+        try:
+            invocation_state = (
+                InvocationState(raw_invocation_state)
+                if raw_invocation_state is not None else None
+            )
+        except ValueError as exc:
+            raise ValueError(f"{agent}.invoke has invalid invocation_state") from exc
         raw_completion_evidence = raw.get("completion_evidence")
         try:
             completion_evidence = (
@@ -183,7 +222,8 @@ class InvocationOutcome:
             raise ValueError(f"{agent}.invoke has invalid completion_evidence") from exc
         metadata = {
             key: value for key, value in raw.items()
-            if key not in required | {"provider_error", "completion_evidence"}
+            if key not in required | {
+                "provider_error", "completion_evidence", "invocation_state"}
         }
         if provider_error is not None:
             if not isinstance(provider_error, str) or not provider_error.strip():
@@ -194,14 +234,21 @@ class InvocationOutcome:
                 raise ValueError(f"{agent}.invoke cannot be complete and provider-failed")
             if timed_out:
                 raise ValueError(f"{agent}.invoke cannot be both timed out and provider-failed")
+            if invocation_state not in {None, InvocationState.PROVIDER_FAILED}:
+                raise ValueError(f"{agent}.invoke provider failure contradicts invocation_state")
             return cls(stdout, stderr, returncode, elapsed_ms, InvocationState.PROVIDER_FAILED,
                        provider_error=provider_error, metadata=metadata)
         if timed_out:
             if complete or returncode != 124:
                 raise ValueError(f"{agent}.invoke timeout requires returncode 124 and an incomplete observation")
-            return cls.from_process(stdout=stdout, stderr=stderr, returncode=returncode,
-                                    elapsed_ms=elapsed_ms).with_metadata(metadata)
+            if invocation_state not in {None, InvocationState.TIMED_OUT}:
+                raise ValueError(f"{agent}.invoke timeout contradicts invocation_state")
+            return cls.from_timeout(
+                stdout=stdout, stderr=stderr, elapsed_ms=elapsed_ms,
+                metadata=metadata)
         if complete:
+            if invocation_state not in {None, InvocationState.COMPLETE}:
+                raise ValueError(f"{agent}.invoke completion contradicts invocation_state")
             if returncode == 0:
                 if completion_evidence not in {None, CompletionEvidence.NORMAL_EXIT}:
                     raise ValueError(f"{agent}.invoke zero-exit completion has invalid evidence")
@@ -212,10 +259,16 @@ class InvocationOutcome:
                 raise ValueError(f"{agent}.invoke non-zero completion needs explicit agent-window evidence")
             return cls(stdout, stderr, returncode, elapsed_ms, InvocationState.COMPLETE,
                        completion_evidence, metadata=metadata)
-        if returncode == 124:
-            raise ValueError(f"{agent}.invoke returncode 124 must set timed_out true")
         if returncode == 0:
             raise ValueError(f"{agent}.invoke zero exit cannot be incomplete without a provider error")
+        if invocation_state is InvocationState.SPAWN_FAILED:
+            if returncode != 127:
+                raise ValueError(f"{agent}.invoke spawn failure requires returncode 127")
+            return cls.spawn_failed(
+                stdout=stdout, stderr=stderr, elapsed_ms=elapsed_ms,
+                metadata=metadata)
+        if invocation_state not in {None, InvocationState.PROCESS_FAILED}:
+            raise ValueError(f"{agent}.invoke process failure contradicts invocation_state")
         return cls.from_process(stdout=stdout, stderr=stderr, returncode=returncode,
                                 elapsed_ms=elapsed_ms).with_metadata(metadata)
 
@@ -260,6 +313,7 @@ class InvocationOutcome:
             "timed_out": self.timed_out,
             "elapsed_ms": self.elapsed_ms,
             "observation_complete": self.observation_complete,
+            "invocation_state": self.state.value,
             "completion_evidence": self.completion_evidence.value if self.completion_evidence else None,
         }
         if self.provider_error is not None:
@@ -310,6 +364,7 @@ class TriggerEvidence:
             raise TypeError("trigger evidence kind must be TriggerEvidenceKind")
         if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("trigger evidence text must be non-empty")
+        validate_json_text(self.text, "trigger evidence text")
 
 
 @dataclass(frozen=True)
@@ -342,7 +397,7 @@ _COST_SOURCES = {"provider_reported", "trace_normalized", "price_table_estimated
 _TRIGGER_RESERVED_METADATA = {
     "population", "agent", "provider", "model", "query", "should_trigger",
     "triggered", "pass", "observation_complete", "returncode", "timed_out",
-    "elapsed_ms", "completion_evidence", "evidence", "evidence_typed",
+    "elapsed_ms", "completion_evidence", "invocation_state", "evidence", "evidence_typed",
     "usage_normalized", "cost_normalized", "stderr", "provider_error",
     "query_id", "run_number", "invocation_metadata", "observation_metadata",
     "measurement_status", "trigger_evidence_observed",
@@ -375,6 +430,7 @@ def validated_trigger_model(value: Any, label: str = "model") -> str | None:
         return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be None or a non-empty string")
+    validate_json_text(value, label)
     return value
 
 
@@ -433,7 +489,12 @@ def _cost_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
         if key not in block:
             continue
         value = block[key]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+        try:
+            finite = math.isfinite(float(value))
+        except (OverflowError, TypeError, ValueError):
+            finite = False
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not finite or value < 0):
             raise ValueError(f"cost telemetry {key} must be finite and non-negative")
     currency = block.get("currency", "USD")
     if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
@@ -494,6 +555,7 @@ class TriggerRepetitionIdentity:
     def __post_init__(self) -> None:
         if not isinstance(self.query_id, str) or not self.query_id.strip():
             raise ValueError("trigger query_id must be a non-empty string")
+        validate_json_text(self.query_id, "trigger query_id")
         if (isinstance(self.run_number, bool) or not isinstance(self.run_number, int)
                 or self.run_number < 1):
             raise ValueError("trigger run_number must be a positive integer")
@@ -528,10 +590,14 @@ class TriggerObservation:
     def __post_init__(self) -> None:
         if not isinstance(self.agent, str) or not self.agent.strip():
             raise ValueError("trigger observation agent must be non-empty")
+        validate_json_text(self.agent, "trigger observation agent")
         if self.model is not None and (not isinstance(self.model, str) or not self.model.strip()):
             raise ValueError("trigger observation model must be None or non-empty")
+        if self.model is not None:
+            validate_json_text(self.model, "trigger observation model")
         if not isinstance(self.query, str) or not self.query.strip():
             raise ValueError("trigger observation query must be non-empty")
+        validate_json_text(self.query, "trigger observation query")
         if not isinstance(self.expectation, TriggerExpectation):
             raise TypeError("trigger observation expectation must be TriggerExpectation")
         if not isinstance(self.invocation, InvocationOutcome):
@@ -598,6 +664,7 @@ class TriggerObservation:
                 self.invocation.completion_evidence.value
                 if self.invocation.completion_evidence else None
             ),
+            "invocation_state": self.invocation.state.value,
             "evidence": self.detection.legacy_evidence,
             "evidence_typed": [
                 {"kind": item.kind.value, "text": item.text}
@@ -694,6 +761,7 @@ class TriggerObservation:
             "elapsed_ms": raw.get("elapsed_ms"),
             "observation_complete": raw.get("observation_complete"),
             "completion_evidence": raw.get("completion_evidence"),
+            "invocation_state": raw.get("invocation_state"),
             **({"provider_error": raw["provider_error"]} if "provider_error" in raw else {}),
         }
         if (raw.get("returncode") is None and raw.get("elapsed_ms") is None

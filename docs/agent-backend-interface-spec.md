@@ -1,8 +1,8 @@
 # Agent backend interface and parity spec
 
-Status: draft design record for `spec/agent-backend-parity`.
+Status: implementation record for `spec/agent-backend-parity`.
 
-This spec captures the current Claude-specific surfaces, the work required to make Codex reach parity, and the adapter shape needed to add Gemini CLI, Mistral Vibe, and future coding agents without adding one-off command paths for every feature.
+This spec captures the shared adapter shape now used by Claude, Codex, Gemini CLI, and Mistral Vibe, the capability gaps each registry row reports explicitly, and the requirements for adding future coding agents without one-off command paths.
 
 ## Problem
 
@@ -10,7 +10,7 @@ The harness already treats saved run directories as the stable grading contract,
 
 - `run-claude` and `run-codex` are compatibility wrappers around a shared native `run-agent` path.
 - `skill-trigger-matrix` has its own `AgentAdapter` family for autonomous skill activation.
-- `judge` has native Claude and Codex backends plus an untyped shell `--judge-cmd` escape hatch for every other provider.
+- `judge` has native Claude, Codex, Gemini, and Vibe backends plus an untyped shell `--judge-cmd` escape hatch for every other provider.
 - Tool replay exists through `run-subagent`, not through every native CLI runner.
 
 Those implementation families remain intentionally separate, but their registration is now unified. `agent_capabilities.BACKENDS` is the declarative owner of answer route and executable answer entrypoints, native answer/trigger/judge bindings, workspace-builder, lazy trace-dialect implementation, capability, smoke, failure-marker, and provider CLI-option bindings. `AGENT_BACKENDS`, `JUDGE_BACKENDS`, `run_trigger_matrix.ADAPTERS`, `TRACE_DIALECTS`, `WORKSPACE_BUILDERS`, `AGENT_CAPABILITIES`, and `SMOKE_TARGETS` are derived compatibility views. Existing entries in the mutable implementation dispatch maps can still be replaced temporarily by tests and integrations; policy projections are deeply immutable. Adding a backend requires one complete registry row rather than adding unrelated keys piecemeal.
@@ -28,7 +28,7 @@ This split is deliberate. Type annotations and a frozen outer dataclass do not v
 
 1. Inventory the features currently built for Claude.
 2. State the Codex parity gap and how the newer Codex CLI flags reduce it.
-3. Sketch first-class support for Gemini CLI and Mistral Vibe.
+3. Record the first-class Gemini CLI and Mistral Vibe implementations and their honest capability gaps.
 4. Define a shared adapter interface that can support arbitrary agents across answer runs, trigger measurement, judging, trace normalization, cost telemetry, and tool replay.
 5. Keep the existing run-output contract stable: `output.md`, `metadata.json`, `events.json`, `metrics.json`, optional turn directories, and benchmark/judge result JSONL formats.
 
@@ -122,40 +122,56 @@ External facts from Gemini CLI docs/README:
 - Output modes: `--output-format text|json|stream-json`.
 - JSON output includes a final `response` and `stats`; stream JSON includes events such as `init`, `message`, `tool_use`, `tool_result`, `error`, and `result` with aggregated statistics and per-model token usage.
 - Model selection: `--model` / `-m`.
-- Workspace controls include `--include-directories`, `--sandbox`, `--skip-trust`, `--approval-mode`, `--extensions`, and MCP controls.
+- Workspace controls include `--include-directories`, `--sandbox`, `--skip-trust`, extensions, policies, and MCP settings.
 - Gemini CLI supports Agent Skills based on the open standard. Discovery tiers include extension skills, user skills under `~/.gemini/skills` or `~/.agents/skills`, and workspace skills under `.gemini/skills` or `.agents/skills`. Activation uses an `activate_skill` tool and asks for consent.
 - `GEMINI.md` files provide persistent context, but they are not equivalent to on-demand skill activation.
 
-### Gemini answer runner
+### Gemini answer runner (implemented)
 
-Implement `GeminiBackend.invoke_answer` with:
+`GeminiBackend.invoke_answer` uses:
 
 ```bash
 gemini -p "$PROMPT" \
   --model "$MODEL" \
   --output-format stream-json \
   --skip-trust \
-  --approval-mode=yolo \
-  --sandbox \
-  --include-directories "$WORKSPACE"
+  --policy "$ISOLATED_POLICY" \
+  [--sandbox when auth transport is proven]
 ```
 
-Adapter choices:
+Implemented choices:
 
 - Use prepared-row forced-load prompting for answer runs, just like Codex/Claude. The model sees workspace-relative skill paths and input files.
-- Write final answer from the stream `result`/final assistant message into `output.md`; fall back to JSON `response` if using `--output-format json`.
-- Normalize `tool_use`/`tool_result` into existing events.
-- Normalize `stats`/result usage into `usage_normalized`; cost is `missing` unless Gemini reports cost or we add table estimation.
+- Parse the official event union into frozen `GeminiStream` values. Final answer text comes only from assistant deltas after the last completed tool lifecycle and before one terminal successful `result`; the trace is never used as a text fallback.
+- Normalize paired `tool_use`/`tool_result` into existing lifecycle events while validating Gemini protocol completeness separately from provider failure. Because `stream-json` omits `read_many_files`' processed-file list, its `include` globs never become file/skill-read evidence.
+- Normalize `stats` and per-model token usage into `usage_normalized`; absent stats stay `missing`, and cost is `missing` because the CLI has no cost field.
+- Use a fresh `GEMINI_CLI_HOME` outside the model workdir. A valid configured `security.auth.selectedType` wins; environment-selector precedence applies only when settings do not choose a type. Copy only credential material and supporting environment required by that one planned mode, force portable file storage when needed, disable interactive browser auth, and fail closed on invalid/nonportable plans. Explicit ADC is copied into the isolated home and rejected if its source is model-readable. The isolated user settings disable ordinary workspace/ancestor `.env` loading and request disabled provider usage statistics; early workspace trust stays unset so Gemini-specific ancestor env files are skipped before `--skip-trust` takes effect. Machine administrator settings may still override either user-tier request. Do not copy user skills, extensions, MCP configuration, hooks, context, policies, sessions, or history.
+- Reject workspace `.gemini`, `.agents`, `.geminiignore`, and `GEMINI.md` provider controls case-insensitively before process invocation. Accept exactly one caller-trusted executable token, strip ambient Gemini/sandbox/debug/endpoint/telemetry controls while preserving auth routing, then load one harness policy that denies all tools and allows only `glob`, `grep_search`, `list_directory`, `read_file`, and `read_many_files`.
+- Reject active `@path` references and leading slash commands before spawn because Gemini preprocesses them before the tool-policy and `stream-json` lifecycle. Bind prompt/model values with `--flag=value` so leading-dash data cannot be reinterpreted by the CLI parser.
+- Request sandboxing only when a supported engine is detected and the relevant container credential transport is proven; macOS seatbelt runs in the host credential context. Portable legacy OAuth files and explicit ADC can cross a container boundary; GCA/encrypted OAuth, keychain-only API-key auth, implicit ADC, and unproven metadata auth cannot. Artifacts disclose the decision and retain the policy/config/workspace isolation that still applies. Machine-owned administrator-tier settings and policy can still override user-tier auth/tool choices.
+- Probe and record the installed CLI version on every invocation. The live smoke requires version evidence; parser fixtures retain their pinned upstream commit and package snapshot.
 
-### Gemini judge backend
+### Gemini judge backend (implemented)
 
-A native Gemini judge can use:
+A native Gemini judge uses:
 
 ```bash
-gemini -p "$JUDGE_PROMPT" --model "$MODEL" --output-format json --approval-mode=plan --sandbox
+gemini -p "$JUDGE_PROMPT" --model "$MODEL" --output-format stream-json \
+  --policy "$DENY_ALL_POLICY" --skip-trust \
+  [--sandbox when auth transport is proven]
 ```
 
-Then parse `response` as the verdict JSON. If Gemini does not enforce an external JSON schema, keep enforcement in the harness exactly as today (`verdict_schema_for` always fails malformed verdicts closed; the old `--strict-judge-schema` flag is a deprecated no-op). If Gemini adds schema-constrained output, wire it through the same native judge schema path as Codex.
+`GeminiStream` validates the complete event lifecycle and per-model token stats; only
+the final assistant segment reaches the canonical verdict parser. The judge rejects
+any observed tool lifecycle and treats a nonzero aggregate tool counter as a secondary
+failure signal. Gemini does not expose an
+external verdict-schema flag, so `verdict_schema_for` remains the fail-closed
+gate. `JudgeInvocation` now has optional immutable `raw_response` and `metadata`
+fields, allowing Gemini's original raw stream, session, resolved models, and
+isolation disclosures to survive as transcript sidecars without making every
+judge backend return provider-shaped dictionaries.
+Gemini `--judge-explore` is rejected at both CLI and programmatic seams until a
+separately tested read-only policy exists.
 
 ### Gemini autonomous trigger
 
@@ -163,15 +179,16 @@ Gemini is a strong candidate for real trigger measurement because it has native 
 
 - Mount the materialized skill tree under workspace `.agents/skills/<skill-name>` or `.gemini/skills/<skill-name>`.
 - Run the raw trigger query with no forced-load instruction.
-- Enable noninteractive activation by using `--approval-mode=yolo` or a documented consent-bypass suitable for test sandboxes. If activation consent cannot be automated safely, report `autonomous_trigger=false` until an explicit noninteractive activation mode is validated.
+- Prove a narrow policy rule can allow `activate_skill` noninteractively without enabling unrelated write/shell/network tools. Do not use an allow-all or YOLO mode as the proof.
 - Detect activation from stream events: `activate_skill` tool call, skill path access, or Gemini-specific skill activation event if present.
 - Keep path-evidence fallback, but label primary Gemini evidence separately from fallback file reads.
 
 ### Gemini risks/open questions
 
-- Activation consent may block headless trigger runs; live smoke must prove the exact flags.
-- Skill discovery precedence must be isolated from user/global skills by controlling `HOME`/settings or using a temp config dir if supported.
-- `GEMINI.md` context should not be used as a substitute for skill activation in trigger evals because it is always loaded, not on-demand.
+- Activation consent currently blocks the trigger capability claim; `autonomous_trigger=false` and no trigger binding is registered until a token-backed proof passes.
+- User-tier policy cannot overrule administrator-tier policy. Invocation artifacts disclose this rather than claiming a stronger sandbox boundary than Gemini provides.
+- `GEMINI.md` context is rejected, not used as a substitute for skill activation, because it is always loaded rather than on-demand.
+- The official conformance snapshot can emit a completed tool event while its `tool_calls` telemetry counter is zero. Lifecycle validity and telemetry shape are therefore independent invariants.
 
 ## Mistral Vibe support plan
 
@@ -231,7 +248,7 @@ Vibe trigger measurement is implemented because it natively discovers Agent Skil
 
 ## Shared adapter interface
 
-The shared interface should split capability surfaces instead of making every backend implement a monolith.
+The shared interface should split capability surfaces instead of making every backend implement a monolith. The block below is the **target shape**, not the exact implemented dataclasses: today's `InvocationRequest` has only `prompt`, `workspace`, `model`, and `timeout_s`, while environment and provider options remain adapter-owned; today's `InvocationResult` also carries explicit process-state and UTF-8-validity fields but has not eliminated every provider-local dictionary seam.
 
 ### Core types
 
@@ -346,9 +363,9 @@ Live smoke tests remain opt-in by env var, one per adapter:
 
 - `RUN_TRIGGER_SMOKE` for Claude.
 - `RUN_CODEX_TRIGGER_SMOKE` for Codex.
-- Add `RUN_GEMINI_TRIGGER_SMOKE` for Gemini.
-- Add `RUN_VIBE_TRIGGER_SMOKE` for Mistral Vibe.
-- Add a generic `RUN_AGENT_INVOKE_SMOKE` row for cheap auth/process checks.
+- `RUN_GEMINI_SMOKE` for Gemini's native answer path; add a distinct trigger smoke only when the activation gate passes.
+- `RUN_VIBE_TRIGGER_SMOKE` for Mistral Vibe.
+- `RUN_AGENT_INVOKE_SMOKE` for cheap auth/process checks across autonomous adapters.
 
 ## Phased implementation plan
 
@@ -361,11 +378,10 @@ Live smoke tests remain opt-in by env var, one per adapter:
    - Parses optional JSONL telemetry when present.
    - Capability row now advertises native judge support.
 3. **Shared judge backend CLI** — initial implementation done.
-   - `--judge-backend claude|codex|vibe|cmd` selects the backend.
+   - `--judge-backend claude|codex|gemini|vibe|cmd` selects the backend.
    - `--judge-cmd` remains `backend=cmd` for arbitrary providers.
-4. **Gemini adapter**
-   - Answer runner and judge first (`--output-format json|stream-json`).
-   - Trigger adapter after headless Agent Skills activation is proven.
+4. **Gemini adapter** — answer runner and judge implemented with strict official wire contracts and isolated CLI state.
+   - Trigger adapter remains gated on proven headless Agent Skills activation.
 5. **Mistral Vibe adapter** — implemented with local/fake contracts and token-backed smoke evidence for Vibe 2.19.1.
    - Answer runner and judge use `--output json|streaming` and isolated `VIBE_HOME`.
    - Trigger adapter mounts `.agents/skills` and detects native `skill` tool calls with path fallback.
@@ -378,5 +394,5 @@ Live smoke tests remain opt-in by env var, one per adapter:
 - The harness can list every registered agent and its surfaces from one registry.
 - Claude behavior remains byte-compatible at the run-output/report level.
 - Codex supports native judging without a handwritten shell wrapper.
-- Gemini has a documented adapter plan; Vibe has implemented native answer, judge, and trigger surfaces tied to its published CLI.
+- Gemini has native answer and judge surfaces with an explicitly gated trigger claim; Vibe has native answer, judge, and trigger surfaces tied to its published CLI.
 - A new agent can be added by implementing protocols plus conformance tests, without editing grading, benchmarking, ablation, or trigger core logic.
