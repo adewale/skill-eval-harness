@@ -12,6 +12,12 @@ release. Where a fixture is still pinned to 1.1.8 it is because refreshing it
 needs an authenticated CLI, which is out of reach in a sandbox; PLAN.md step 10
 refreshes them on a host with credentials.
 
+`advertised-tools.json` is the one fixture with a standing re-capture
+obligation: every agy release that adds or renames a tool needs it refreshed
+alongside the vocabulary in `agy_contracts.py`, because an unclassified tool
+fails the stream rather than defaulting to a generic call. The procedure is
+`docs/agent-parity.md`, "Maintaining the agy tool vocabulary".
+
 | Fixture | `agy` version | Origin | Command |
 |---|---|---|---|
 | `advertised-tools.json` | 1.1.8 | real capture (2026-07-29) | tool list from the `init` event of a real `agy --output-format stream-json` run |

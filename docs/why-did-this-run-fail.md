@@ -223,6 +223,7 @@ as a quality miss. A timed-out run cost money but proves nothing about quality.
 | `evidence: "none matched: [...]"` but `output.md` is clearly *right* | Assertion too narrow, failing equivalent good behavior | The eval is wrong — broaden the assertion (the calibration lesson) |
 | Category `missing-output` / `execution-error`, or `metadata.json` shows `timed_out: true` / `returncode: 124` | Not measured, ≠ measured-and-failed | Check termination first; re-run; keep it out of the pass-rate denominator |
 | `without_skill` (or an ablation) row failing its cited assertion, `returncode: 0` | Baseline / materialized regression working as designed | No action — this is the lift the skill buys, made visible |
+| agy case erroring with `invoked unclassified tool` | An agy release added or renamed a tool the adapter does not classify; the case is not measured | Absorb the new vocabulary — [`agent-parity.md`](agent-parity.md#maintaining-the-agy-tool-vocabulary); re-run afterwards |
 
 The viewer is the same three layers, rendered. `render-viewer --benchmark "$S/bench.json"
 --runs "$S/runs" --out "$S/review.html"` writes a static HTML review over the run dir —

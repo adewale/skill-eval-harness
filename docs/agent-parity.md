@@ -48,6 +48,78 @@ default. No shipped backend uses the opt-in.
 Each row's posture is the `Containment` and `Config authority` columns of the
 matrix above, and the stated reason lives on the registry row itself.
 
+## Maintaining the agy tool vocabulary
+
+`agy_contracts.py` classifies every agy tool name into one of five buckets —
+shell, file read, search, write, or generic. The partition is closed: a name in
+none of them fails the stream with a protocol error, the same way an unknown
+event type or step state does. This section is the procedure for absorbing an
+agy release that adds or renames a tool.
+
+Failing closed is a deliberate trade. The alternative — defaulting an unknown
+name to a generic call — costs nothing visible, which is the problem: if the new
+tool is really a read or a write, the run still reports as complete while
+`file_reads` or `file_writes` under-counts it, and `observe_skill_activation`
+returns a confident "did not trigger" for a run that may have opened the skill
+through the renamed tool. Losing the cases that touch a new tool is recoverable.
+Publishing a measurement derived from evidence the adapter could not classify is
+not.
+
+### How you find out
+
+Two signals, and the first one arrives before anything fails:
+
+- **Every agy run** prints unclassified *advertised* names to stderr, read from
+  the `init` event's tool list. This fires whether or not the run invoked them,
+  so the first run after an upgrade names the complete new vocabulary.
+- **A run that invokes one** fails with a protocol error naming the tool and the
+  buckets. The `init` tool list survives that failure, so the stderr warning
+  still lists the full set — the fix is one pass, not one failed run per name.
+
+The failure is per case, not per batch: `AgyBackend.invoke_answer` returns the
+protocol error in its outcome rather than raising, so cases that do not touch
+the new tool grade normally.
+
+### The procedure
+
+1. Run any agy case once and read the stderr warning for the full set of
+   unclassified names.
+2. For each name, establish what the tool actually does — see below.
+3. Add it to the matching tuple in `agy_contracts.py`.
+4. Re-capture `tests/fixtures/agy/advertised-tools.json` from a real `init`
+   event, and update its `agy_version` and `captured` fields.
+5. Run the suite. `test_every_advertised_tool_is_classified` diffs the captured
+   list against `AGY_CLASSIFIED_TOOLS`, so a name you missed fails rather than
+   waiting for a run to hit it.
+
+### Choosing a bucket
+
+Step 2 is the only part that needs judgment, and it is the part no test can
+check: the suite verifies that a name *is* classified, never that it is
+classified correctly. Three ways to get it wrong, all silent:
+
+- A write filed as generic — `file_writes` under-counts. This is the defect the
+  closed partition exists to prevent, re-created by hand.
+- A read filed as generic — `file_reads` under-counts, and skill activation
+  reports a clean negative.
+- A search filed as a read — a search counts as activation, inflating the
+  trigger matrix.
+
+One case does fail safe. If a tool is classified as a read or a write but
+`_read_path` does not recognize its path parameter, the tool is recorded as
+incomplete and `observe_skill_activation` returns an explicitly unavailable
+observation. A misspelled parameter degrades to "unknown"; a wrong bucket does
+not.
+
+So classify from an observed stream — invoke the tool once and read its
+`tool_info.parameters` — rather than inferring from the name. Where that is not
+possible, the generic bucket with a comment recording what is unresolved is the
+honest choice, and the file already carries two: `sed_file` is generic because
+whether it edits in place or only prints was never established, and
+`skill_search` sits in search until a capture settles whether it carries more
+signal than a generic grep. An unverified classification is worse than an
+explicitly conservative one.
+
 ## What changed for Gemini CLI
 
 Gemini is a first-class native answer and judge backend, with its unproven surface kept out of the registry:

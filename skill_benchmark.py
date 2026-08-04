@@ -7901,9 +7901,15 @@ def _agy_tool_flat_record(evidence: object) -> dict[str, Any]:
         return {"type": "command", "tool": "run_command",
                 "command": evidence.command}
     if isinstance(evidence, AgyFileRead):
-        return {"type": "file_read", "name": "view_file", "path": evidence.path}
+        return {"type": "file_read", "name": evidence.tool,
+                "path": evidence.path}
     if isinstance(evidence, AgyFileWrite):
-        return {"type": "file_write", "name": "write_to_file",
+        # The tool that ran, not the partition it belongs to. agy has four
+        # write tools; naming them all `write_to_file` published a tool
+        # identity the run never emitted, and made a `required_calls`
+        # assertion for the real tool miss while one for `write_to_file`
+        # spuriously matched.
+        return {"type": "file_write", "name": evidence.tool,
                 "path": evidence.path}
     if isinstance(evidence, AgySearch):
         return {"type": "tool_call", "name": evidence.tool}
@@ -7928,9 +7934,13 @@ def agy_stream_flat_records(
     if parsed.protocol_error is not None:
         line = record_lines[0] if record_lines else 1
         return [(line, _claude_protocol_error(parsed.protocol_error))]
-    for ordinal, evidence in enumerate(parsed.tools, 1):
-        line = (record_lines[min(ordinal, len(record_lines)) - 1]
-                if record_lines else ordinal)
+    # Evidence is a filtered view of the stream, so its position in `tools` is
+    # not its position in `records`: indexing `record_lines` by the former gave
+    # the first tool the line of the init record. The parser reports which
+    # record each piece of evidence came from; that is what resolves to a line.
+    for record_index, evidence in zip(parsed.tool_records, parsed.tools,
+                                      strict=True):
+        line = record_lines[record_index - 1] if record_lines else record_index
         spec = _agy_tool_flat_record(evidence)
         # Only DONE steps reach here, so every record is already terminal.
         flat.append((line, {**spec, "status": "completed",
@@ -10274,6 +10284,10 @@ AGY_CONFIG_METADATA: dict[str, Any] = {
         "where a run wrote outside its workspace. Treat an agy run as unsandboxed access to the "
         "invoking user's environment, and run it only on a disposable host."
     ),
+    # Auto-approval is a property of one invocation, not of the CLI: answer
+    # runs pass it and judge runs do not. `agy_cli_invoke` overrides this with
+    # what it actually passed, so an isolation audit reads the flag the run
+    # was launched with rather than a global default.
     "ambient_tools_auto_approved": True,
     "sandbox_contains_run": False,
     "disposable_host_required": True,
@@ -10400,7 +10414,8 @@ def redact_agy_prompt_arg(argv: list[str]) -> list[str]:
     return redacted
 
 
-def _agy_no_process_result(error: str, *, model: str | None) -> dict[str, Any]:
+def _agy_no_process_result(error: str, *, model: str | None,
+                           auto_approve: bool) -> dict[str, Any]:
     """A failure that happened before any process existed."""
     return {
         "answer": "", "provider_error": None, "protocol_error": error,
@@ -10409,6 +10424,7 @@ def _agy_no_process_result(error: str, *, model: str | None) -> dict[str, Any]:
         "elapsed_ms": None, "usage": None, "cost_usd": None, "model": model,
         "trace_text": "", "trace_utf8_valid": True,
         "environment": {**AGY_CONFIG_METADATA,
+                        "ambient_tools_auto_approved": auto_approve,
                         "command_boundary": "not-constructed"},
     }
 
@@ -10435,7 +10451,8 @@ def agy_cli_invoke(prompt: str, *, model: str | None = None,
         # Invalid launch construction never became a process, so it is a spawn
         # failure rather than a provider failure.
         return _agy_no_process_result(
-            f"agy invocation setup failed before spawn: {exc}", model=model)
+            f"agy invocation setup failed before spawn: {exc}", model=model,
+            auto_approve=auto_approve)
     result = run_argv_capture(ProcessInvocationPlan.from_values(
         argv, input_text="", cwd=workspace, timeout_s=timeout))
     parsed = (AgyStream.parse(result.stdout, returncode=result.returncode,
@@ -10444,8 +10461,14 @@ def agy_cli_invoke(prompt: str, *, model: str | None = None,
               else AgyStream.invalid("agy stdout is not valid UTF-8"))
     unclassified = parsed.unclassified_tools_advertised
     if unclassified:
-        print(f"agy: CLI advertises {len(unclassified)} tool(s) this adapter does "
-              "not classify; re-capture tests/fixtures/agy/advertised-tools.json.",
+        # Names the complete set, ahead of the failure. A run that actually
+        # invokes one of these fails closed in agy_contracts, so this warning
+        # is what lets an upgrade be absorbed in one pass instead of being
+        # discovered one failed run at a time.
+        print(f"agy: CLI advertises {len(unclassified)} tool(s) this adapter "
+              f"does not classify ({', '.join(unclassified)}); a run that "
+              "invokes one will fail closed. Classify them in agy_contracts.py "
+              "and re-capture tests/fixtures/agy/advertised-tools.json.",
               file=sys.stderr)
     return {
         "answer": parsed.answer,
@@ -10474,6 +10497,7 @@ def agy_cli_invoke(prompt: str, *, model: str | None = None,
         "trace_text": result.stdout,
         "environment": {
             **AGY_CONFIG_METADATA, **dict(result.adapter_metadata or {}),
+            "ambient_tools_auto_approved": auto_approve,
             "command_boundary": "single-executable-token",
             "unclassified_tools_advertised": list(unclassified),
             "command": " ".join(
@@ -12387,7 +12411,7 @@ def codex_judge_invoke(prompt: str, *, judge_model: str | None, codex_cmd: str,
 
 def agy_judge_invoke(
     prompt: str, *, judge_model: str | None, agy_cmd: str,
-    explore_hint: str | None = None, json_schema: str | None = None,
+    assertion_schema: dict[str, Any], explore_hint: str | None = None,
     **_: Any,
 ) -> JudgeInvocation:
     """Run one agy judge under the lifecycle-bearing stream format.
@@ -12400,10 +12424,16 @@ def agy_judge_invoke(
     1.1.9's `--json-schema` help states the schema applies to the final result
     under stream-json, so schema enforcement survives the switch. The permissive
     parse is therefore deleted rather than preserved as a legacy dialect.
+
+    The verdict schema is named `assertion_schema` because that is the keyword
+    the judge registry dispatches with; naming the parameter after the agy flag
+    it becomes let every call bind it to `**_` instead, so the constraint this
+    docstring describes was never actually sent.
     """
     result = agy_cli_invoke(
         prompt, model=judge_model, agy_cmd=agy_cmd,
-        output="stream-json", cwd=explore_hint, json_schema=json_schema,
+        output="stream-json", cwd=explore_hint,
+        json_schema=json.dumps(assertion_schema, separators=(",", ":")),
         # A judge reads and decides; it has no reason to run shell tools.
         auto_approve=False,
     )

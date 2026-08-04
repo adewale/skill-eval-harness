@@ -39,6 +39,11 @@ from json_contracts import (
 # Each is deliberately closed: a value a future release adds fails loudly on the
 # next run rather than being dropped and mis-scored, and the fix is to add the
 # name here once its payload is understood.
+#
+# docs/agent-parity.md "Maintaining the agy tool vocabulary" is the procedure for
+# absorbing a release that adds or renames a tool, including how to choose a
+# bucket -- the one step no test can check, because the suite verifies that a
+# name is classified and never that it is classified correctly.
 # ---------------------------------------------------------------------------
 
 AGY_EVENT_TYPES = frozenset({"init", "step_update", "result"})
@@ -73,7 +78,8 @@ AGY_WRITE_TOOLS = ("write_to_file", "replace_file_content",
 # Genuinely neither shell, read, search, nor write.  Listed explicitly so a tool
 # agy advertises cannot default into this bucket without someone deciding it
 # belongs here -- a write landing here silently is how `file_writes: 0` was
-# reported for runs that wrote files.
+# reported for runs that wrote files.  `_tool_evidence` enforces that: a name in
+# none of the five buckets fails the stream rather than landing here.
 #
 # `sed_file` sits here under protest: agy advertises it, but whether it edits in
 # place or only prints could not be established, and an unverified read
@@ -274,12 +280,20 @@ class AgyModelIdentity:
 
 @dataclass(frozen=True)
 class AgyFileRead:
-    """A completed open of one specific file."""
+    """A completed open of one specific file.
+
+    Carries the tool that did the opening, not just the partition it belongs
+    to.  Collapsing every read onto one canonical name would make a
+    `tool_call` assertion for the tool that actually ran miss it, and would
+    publish a tool identity the run never emitted.
+    """
 
     path: str
+    tool: str
 
     def __post_init__(self) -> None:
         _nonempty_string(self.path, "agy file read path")
+        _nonempty_string(self.tool, "agy file read tool name")
 
 
 @dataclass(frozen=True)
@@ -307,10 +321,19 @@ class AgyShellCommand:
 
 @dataclass(frozen=True)
 class AgyFileWrite:
+    """A completed modification of one specific file.
+
+    `tool` is load-bearing for the same reason as on `AgyFileRead`: agy has
+    four write tools, and naming them all `write_to_file` downstream both
+    corrupts trace identity and silently redirects `required_calls`.
+    """
+
     path: str
+    tool: str
 
     def __post_init__(self) -> None:
         _nonempty_string(self.path, "agy file write path")
+        _nonempty_string(self.tool, "agy file write tool name")
 
 
 @dataclass(frozen=True)
@@ -403,6 +426,11 @@ class AgyStream:
     answer: str = ""
     usage: AgyUsage = AgyUsageAbsent("stream not parsed")
     tools: tuple[AgyToolEvidence, ...] = ()
+    # The 1-based index of the record each entry in `tools` came from, so a
+    # caller can resolve evidence back to its source line.  Evidence is a
+    # filtered view of the stream -- init records and non-tool steps produce
+    # none -- so its position in `tools` is not its position in `records`.
+    tool_records: tuple[int, ...] = ()
     advertised_tools: tuple[str, ...] = ()
     incomplete_tools: tuple[str, ...] = ()
     status: str | None = None
@@ -420,6 +448,9 @@ class AgyStream:
                              ("protocol error", self.protocol_error)):
             if value is not None:
                 _nonempty_string(value, f"agy {label}")
+        if len(self.tool_records) != len(self.tools):
+            raise ValueError(
+                "agy tool evidence must carry one source record index each")
         object.__setattr__(self, "records", tuple(
             freeze_json_mapping(record, f"agy stream record {index}")
             for index, record in enumerate(self.records, 1)))
@@ -442,9 +473,19 @@ class AgyStream:
     def invalid(cls, message: str, *,
                 records: tuple[Mapping[str, Any], ...] = (),
                 conversation_id: str | None = None,
-                provider_error: str | None = None) -> AgyStream:
+                provider_error: str | None = None,
+                advertised_tools: tuple[str, ...] = ()) -> AgyStream:
+        """A stream that did not parse, keeping what was established first.
+
+        `advertised_tools` survives deliberately.  An unclassified tool is the
+        one failure whose fix is a vocabulary update, and the `init` event
+        naming *every* tool the CLI offers is what turns that into a single
+        pass instead of one failed run per new name -- so it must not be
+        discarded by the failure it diagnoses.
+        """
         return cls(records=records, conversation_id=conversation_id,
                    usage=AgyUsageAbsent("stream did not parse"),
+                   advertised_tools=advertised_tools,
                    provider_error=provider_error, protocol_error=message)
 
     @classmethod
@@ -493,6 +534,7 @@ class AgyStream:
         provider_error: str | None = None
         raw_usage: Any = None
         tools: list[AgyToolEvidence] = []
+        tool_records: list[int] = []
         incomplete: list[str] = []
         saw_result = False
 
@@ -502,7 +544,17 @@ class AgyStream:
                 if not isinstance(event, str) or event not in AGY_EVENT_TYPES:
                     return cls.invalid(
                         f"unknown event {event!r} at record {index}",
-                        records=records, conversation_id=conversation_id)
+                        records=records, conversation_id=conversation_id,
+                        advertised_tools=tuple(advertised))
+                if saw_result:
+                    # The result is terminal by definition.  Anything after it
+                    # is a second run's output concatenated onto this one, or a
+                    # protocol this adapter does not understand; either way the
+                    # stream no longer describes one observation.  Accepting it
+                    # let a later result overwrite the answer and usage of the
+                    # one that actually terminated the run.
+                    raise ValueError(
+                        f"agy record {index} follows the terminal result event")
                 raw_conversation = record.get("conversation_id")
                 if isinstance(raw_conversation, str) and raw_conversation:
                     conversation_id = raw_conversation
@@ -568,17 +620,20 @@ class AgyStream:
                             f"agy step_update {index} parameters must be an object")
                     tools.append(_tool_evidence(
                         name, params if isinstance(params, Mapping) else {},
-                        incomplete))
+                        incomplete, index))
+                    tool_records.append(index)
                 else:
                     saw_result = True
                     result = record.get("result")
                     if not isinstance(result, Mapping):
                         raise ValueError(
                             f"agy result {index} must carry an object")
-                    raw_status = result.get("status")
-                    if raw_status is not None:
-                        status = _nonempty_string(
-                            raw_status, f"agy result {index}.status")
+                    # Required, not optional.  The status check below is the
+                    # only thing that turns a failed run into a provider error,
+                    # so a result missing it -- or a release that renames it --
+                    # would silently score every failure as a success.
+                    status = _nonempty_string(
+                        result.get("status"), f"agy result {index}.status")
                     response = result.get("response")
                     if response is not None:
                         if not isinstance(response, str):
@@ -594,7 +649,8 @@ class AgyStream:
         except (TypeError, ValueError) as exc:
             return cls.invalid(str(exc), records=records,
                                conversation_id=conversation_id,
-                               provider_error=provider_error)
+                               provider_error=provider_error,
+                               advertised_tools=tuple(advertised))
 
         identity = AgyModelIdentity(requested=requested_model,
                                     configured=configured_model,
@@ -606,6 +662,12 @@ class AgyStream:
             protocol_error = f"malformed JSONL at line {truncated_at}"
         elif not saw_result:
             protocol_error = "missing terminal result event"
+        elif isinstance(usage, AgyUsageInvalid):
+            # Telemetry that contradicts itself is malformed provider evidence,
+            # not absent provider evidence.  Collapsing it to "missing" made a
+            # run that reported impossible counters indistinguishable from one
+            # that reported none, and left its answer scoreable.
+            protocol_error = f"agy reported unusable telemetry: {usage.reason}"
         # A non-success status is the provider's own verdict, not a parse
         # failure, so it becomes a provider error when one is not already
         # present rather than masquerading as a protocol error.
@@ -620,6 +682,7 @@ class AgyStream:
             answer=answer,
             usage=usage,
             tools=tuple(tools),
+            tool_records=tuple(tool_records),
             advertised_tools=tuple(advertised),
             incomplete_tools=tuple(incomplete),
             status=status,
@@ -629,12 +692,28 @@ class AgyStream:
 
 
 def _tool_evidence(name: str, params: Mapping[str, Any],
-                   incomplete: list[str]) -> AgyToolEvidence:
+                   incomplete: list[str], index: int) -> AgyToolEvidence:
     """One completed tool step as evidence of its own kind.
 
     A search never becomes a read, and a read whose path is missing becomes an
     unclassified call rather than a read of nowhere.
+
+    A name in none of the five buckets **fails the stream**, exactly as an
+    unknown event type or step state does.  Defaulting it to a generic call is
+    not the conservative choice it looks like: if the tool was really a read or
+    a write, the run stays complete while `file_reads`/`file_writes` under-count
+    it, and `observe_skill_activation` reports a confident "did not trigger"
+    for a run that may have opened the skill through the renamed tool.  Losing
+    the runs that touch a new tool is recoverable; publishing a measurement
+    derived from evidence this module could not classify is not.
     """
+    if name not in AGY_CLASSIFIED_TOOLS:
+        raise ValueError(
+            f"agy step_update {index} invoked unclassified tool {name!r}. "
+            "Add it to one of AGY_SHELL_TOOLS, AGY_FILE_READ_TOOLS, "
+            "AGY_SEARCH_TOOLS, AGY_WRITE_TOOLS or AGY_GENERIC_TOOLS in "
+            "agy_contracts.py once its behaviour is known, and re-capture "
+            "tests/fixtures/agy/advertised-tools.json")
     if name in AGY_SEARCH_TOOLS:
         return AgySearch(tool=name)
     if name in AGY_FILE_READ_TOOLS:
@@ -642,13 +721,13 @@ def _tool_evidence(name: str, params: Mapping[str, Any],
         if not path:
             incomplete.append(name)
             return AgyGenericCall(tool=name)
-        return AgyFileRead(path=path)
+        return AgyFileRead(path=path, tool=name)
     if name in AGY_WRITE_TOOLS:
         path = _read_path(params)
         if not path:
             incomplete.append(name)
             return AgyGenericCall(tool=name)
-        return AgyFileWrite(path=path)
+        return AgyFileWrite(path=path, tool=name)
     if name in AGY_SHELL_TOOLS:
         command = params.get("CommandLine")
         if not isinstance(command, str) or not command.strip():

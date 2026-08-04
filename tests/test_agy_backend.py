@@ -6,6 +6,7 @@ to build one at all, and which facts survive into a typed outcome.
 """
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -180,15 +181,22 @@ class TheAnswerPathReportsWhatHappened(unittest.TestCase):
                          "single-executable-token")
 
 
+VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {"passed": {"type": "boolean"}},
+    "required": ["passed"],
+}
+
+
 class TheJudgePathUsesTheLifecycleFormat(unittest.TestCase):
     def judge(self, stdout: str, *, returncode: int = 0):
         with mock.patch.object(sb, "run_argv_capture",
                                return_value=completed(stdout, returncode=returncode)):
             return sb.agy_judge_invoke(
                 "verdict?", judge_model=None, agy_cmd="agy",
-                explore_hint="/tmp")
+                assertion_schema=VERDICT_SCHEMA, explore_hint="/tmp")
 
-    def test_the_judge_runs_under_stream_json_with_tools_unapproved(self) -> None:
+    def invoke_kwargs(self) -> dict:
         with mock.patch.object(sb, "agy_cli_invoke") as invoke:
             invoke.return_value = {
                 "answer": "{}", "provider_error": None, "protocol_error": None,
@@ -196,12 +204,49 @@ class TheJudgePathUsesTheLifecycleFormat(unittest.TestCase):
                 "invocation_state": "complete", "elapsed_ms": 5,
                 "usage": None, "model": None, "environment": {},
             }
-            sb.agy_judge_invoke("verdict?", judge_model=None, agy_cmd="agy")
-        kwargs = invoke.call_args.kwargs
+            sb.agy_judge_invoke("verdict?", judge_model=None, agy_cmd="agy",
+                                assertion_schema=VERDICT_SCHEMA)
+        return invoke.call_args.kwargs
+
+    def test_the_judge_runs_under_stream_json_with_tools_unapproved(self) -> None:
+        kwargs = self.invoke_kwargs()
         self.assertEqual(kwargs["output"], "stream-json")
         self.assertFalse(
             kwargs["auto_approve"],
             "a judge reads and decides; it has no reason to auto-approve tools")
+
+    def test_the_verdict_schema_reaches_the_cli(self) -> None:
+        # The registry dispatches every judge with `assertion_schema=`. A
+        # parameter named after the agy flag instead absorbed it into `**_`,
+        # so `--json-schema` was silently dropped from every judge run while
+        # the docs advertised it as applied.
+        self.assertEqual(
+            json.loads(self.invoke_kwargs()["json_schema"]), VERDICT_SCHEMA,
+            "the judge's declared verdict schema never reached agy")
+
+    def test_the_schema_is_bound_as_one_argv_value(self) -> None:
+        kwargs = self.invoke_kwargs()
+        argv = sb.agy_cli_argv("agy", prompt="verdict?", cwd="/tmp",
+                               json_schema=kwargs["json_schema"])
+        self.assertEqual(argv[argv.index("--json-schema") + 1],
+                         kwargs["json_schema"])
+
+    def test_the_judge_records_the_approval_it_was_launched_with(self) -> None:
+        with mock.patch.object(sb, "run_argv_capture",
+                               return_value=completed("", returncode=0)):
+            result = sb.agy_cli_invoke("verdict?", agy_cmd="agy", cwd="/tmp",
+                                       auto_approve=False)
+        self.assertFalse(
+            result["environment"]["ambient_tools_auto_approved"],
+            "an isolation audit must read the flag the run was launched "
+            "with, not a module-level default")
+
+    def test_an_answer_run_still_records_auto_approval(self) -> None:
+        with mock.patch.object(sb, "run_argv_capture",
+                               return_value=completed("", returncode=0)):
+            result = sb.agy_cli_invoke("answer?", agy_cmd="agy", cwd="/tmp",
+                                       auto_approve=True)
+        self.assertTrue(result["environment"]["ambient_tools_auto_approved"])
 
     def test_a_judge_verdict_survives_the_stream_format(self) -> None:
         invocation = self.judge(fixture("stream-json-success.jsonl"))
@@ -267,6 +312,61 @@ class TheTraceDialectSeparatesSearchFromReads(unittest.TestCase):
         flat = sb._agy_tool_flat_record(sb.AgySearch(tool="grep_search"))
         self.assertNotIn("path", flat)
         self.assertEqual(flat["type"], "tool_call")
+
+    def test_each_write_tool_keeps_its_own_name(self) -> None:
+        # `tool_call.required_calls` matches exact tool names, so collapsing
+        # four write tools onto `write_to_file` made an assertion for the tool
+        # that ran miss while one for a tool that did not ran matched.
+        from agy_contracts import AGY_WRITE_TOOLS
+        for tool in AGY_WRITE_TOOLS:
+            with self.subTest(tool=tool):
+                flat = sb._agy_tool_flat_record(
+                    sb.AgyFileWrite(path="/w/f.py", tool=tool))
+                self.assertEqual(flat["name"], tool)
+                self.assertEqual(flat["type"], "file_write")
+
+    def test_a_write_normalizes_under_its_real_name(self) -> None:
+        stream = (
+            '{"event":"init","init":{"model":"m"}}\n'
+            '{"event":"step_update","step_update":{"state":"DONE",'
+            '"step_type":"tool","tool_name":"replace_file_content",'
+            '"tool_info":{"parameters":{"TargetFile":"/w/f.py"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        records, errors = sb.parse_trace_jsonl_text(stream)
+        self.assertEqual(errors, [])
+        events, metrics = sb.normalize_trace_records(records, source="agy")
+        names = [event["name"] for event in events["events"]
+                 if event.get("type") == "file_write"]
+        self.assertEqual(names, ["replace_file_content"])
+        self.assertEqual(metrics["file_writes"], 1)
+
+    def test_tool_events_cite_the_line_they_came_from(self) -> None:
+        # Evidence is a filtered view of the stream: init records and non-tool
+        # steps produce none. Indexing the line table by position in the
+        # evidence list gave the first tool the init record's line.
+        text = fixture("stream-json-success.jsonl")
+        records, errors, lines = sb.parse_trace_jsonl_text_with_lines(text)
+        self.assertEqual(errors, [])
+        flat = sb.agy_stream_flat_records(records, record_lines=lines)
+        physical = {
+            record["name"] if record.get("name") else record["tool"]: line
+            for line, record in flat}
+        self.assertEqual(
+            physical, {"run_command": 5, "view_file": 6},
+            "each tool event must cite the physical line of the record that "
+            "produced it")
+
+    def test_line_refs_hold_when_tools_open_the_stream(self) -> None:
+        text = (
+            '{"event":"step_update","step_update":{"state":"DONE",'
+            '"step_type":"tool","tool_name":"view_file","tool_info":'
+            '{"parameters":{"AbsolutePath":"/w/a.md"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        records, _, lines = sb.parse_trace_jsonl_text_with_lines(text)
+        flat = sb.agy_stream_flat_records(records, record_lines=lines)
+        self.assertEqual([line for line, _ in flat], [1])
 
     def test_the_registry_projects_the_agy_dialect(self) -> None:
         self.assertIn("agy", sb.TRACE_DIALECTS)

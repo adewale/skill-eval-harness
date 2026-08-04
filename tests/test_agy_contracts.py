@@ -250,6 +250,63 @@ class MalformedStreamsFailClosed(unittest.TestCase):
                 '"total_tokens":5}}}')
         self.assertIsInstance(AgyStream.parse(line).usage, AgyUsageInvalid)
 
+    def test_contradictory_token_accounting_is_not_absent_telemetry(self) -> None:
+        line = ('{"event":"result","result":{"status":"SUCCESS","response":"hi",'
+                '"usage":{"input_tokens":10,"output_tokens":10,'
+                '"total_tokens":5}}}')
+        stream = AgyStream.parse(line)
+        self.assertIsNotNone(
+            stream.protocol_error,
+            "telemetry that contradicts itself is malformed provider "
+            "evidence; reporting it as ordinary missing usage makes the two "
+            "indistinguishable and leaves the answer scoreable")
+        self.assertFalse(stream.complete)
+
+
+class TheResultEventIsTerminalAndComplete(unittest.TestCase):
+    """One result, carrying a status, ends the stream."""
+
+    SUCCESS = ('{"event":"result","result":{"status":"SUCCESS",'
+               '"response":"ok","usage":{"input_tokens":5,"output_tokens":5,'
+               '"total_tokens":10}}}')
+
+    def test_a_result_without_a_status_is_rejected(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"result","result":{"response":"ok"}}')
+        self.assertIsNotNone(
+            stream.protocol_error,
+            "the status check is the only thing that turns a failed run into "
+            "a provider error, so an optional status would score every "
+            "failure whose status field went missing as a success")
+        self.assertFalse(stream.complete)
+
+    def test_a_second_result_cannot_overwrite_the_first(self) -> None:
+        failed = ('{"event":"result","result":{"status":"FAILED",'
+                  '"error":"boom"}}')
+        stream = AgyStream.parse(failed + "\n" + self.SUCCESS)
+        self.assertIsNotNone(
+            stream.protocol_error,
+            "two results are two observations concatenated; merging them "
+            "field-by-field let a later success overwrite the answer and "
+            "usage of the result that actually terminated the run")
+
+    def test_no_evidence_is_collected_after_the_result(self) -> None:
+        trailing = ('{"event":"step_update","step_update":{"state":"DONE",'
+                    '"step_type":"tool","tool_name":"run_command","tool_info":'
+                    '{"parameters":{"CommandLine":"echo late"}}}}')
+        stream = AgyStream.parse(self.SUCCESS + "\n" + trailing)
+        self.assertIsNotNone(
+            stream.protocol_error,
+            "a tool step after the terminal result is activity the stream "
+            "cannot account for")
+        self.assertFalse(stream.complete)
+
+    def test_a_well_formed_single_result_still_parses(self) -> None:
+        stream = AgyStream.parse(self.SUCCESS)
+        self.assertIsNone(stream.protocol_error)
+        self.assertTrue(stream.complete)
+        self.assertEqual(stream.answer, "ok")
+
 
 class ToolPartitionIsTotalAndDisjoint(unittest.TestCase):
     """No advertised tool may fall into a bucket by accident."""
@@ -269,6 +326,61 @@ class ToolPartitionIsTotalAndDisjoint(unittest.TestCase):
                     self.assertEqual(
                         left_tools & right_tools, set(),
                         f"{left} and {right} classify the same tool")
+
+    def test_an_unclassified_tool_fails_the_stream(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"init","init":{"model":"m"}}\n'
+            '{"event":"step_update","step_update":{"state":"DONE",'
+            '"step_type":"tool","tool_name":"edit_file_v2","tool_info":'
+            '{"parameters":{"TargetFile":"/w/f.py"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}')
+        self.assertIsNotNone(
+            stream.protocol_error,
+            "a tool in none of the five buckets must fail the stream: if it "
+            "is a read or a write, defaulting it to a generic call leaves the "
+            "run complete while its file counters silently under-report")
+        self.assertFalse(stream.complete)
+
+    def test_the_failure_names_the_tool_and_the_fix(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"step_update","step_update":{"state":"DONE",'
+            '"step_type":"tool","tool_name":"edit_file_v2","tool_info":'
+            '{"parameters":{"TargetFile":"/w/f.py"}}}}')
+        error = stream.protocol_error or ""
+        self.assertIn("edit_file_v2", error)
+        self.assertIn("agy_contracts.py", error,
+                      "the failure must say where the vocabulary is updated, "
+                      "so absorbing an agy release is a lookup and not an "
+                      "investigation")
+
+    def test_the_advertised_vocabulary_survives_the_failure(self) -> None:
+        # The init event names every tool the CLI offers, which is what makes
+        # absorbing an agy release a single pass. Dropping it on the failing
+        # stream would leave the operator rediscovering the new vocabulary one
+        # failed run at a time.
+        stream = AgyStream.parse(
+            '{"event":"init","init":{"model":"m","tools":'
+            '["view_file","edit_file_v2","grep_files"]}}\n'
+            '{"event":"step_update","step_update":{"state":"DONE",'
+            '"step_type":"tool","tool_name":"edit_file_v2","tool_info":'
+            '{"parameters":{"TargetFile":"/w/f.py"}}}}')
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertEqual(stream.unclassified_tools_advertised,
+                         ("edit_file_v2", "grep_files"))
+
+    def test_an_explicitly_generic_tool_still_parses(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"step_update","step_update":{"state":"DONE",'
+            '"step_type":"tool","tool_name":"search_web","tool_info":'
+            '{"parameters":{"Query":"agy release notes"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}')
+        self.assertIsNone(
+            stream.protocol_error,
+            "failing closed applies to unclassified names only; a tool "
+            "deliberately filed as generic is a decision already made")
+        self.assertTrue(stream.complete)
 
     def test_every_advertised_tool_is_classified(self) -> None:
         import json as _json

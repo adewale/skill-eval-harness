@@ -96,6 +96,10 @@ Closed statement of what this PR does and does not claim.
 | Containment                                  | **uncontained; disposable host required** | antigravity-cli #36 and #155 both open as of 2026-08-01                        |
 | Search ≠ activation                          | **fixed by construction**                 | disjoint partitions; `AgySearch` carries no path field                         |
 | Absent telemetry ≠ zero                      | **fixed by construction**                 | `AgyUsagePresent` refuses all-zero counters                                    |
+| Contradictory telemetry ≠ absent             | **fails closed**                          | `AgyUsageInvalid` becomes a protocol error, not a missing usage block          |
+| Unknown tool vocabulary                      | **fails closed**                          | an unclassified invoked tool fails the stream and names the fix                |
+| Terminal result                              | **unique, final, status-bearing**         | a second result, a trailing record, or a missing `status` is refused           |
+| Tool identity                                | **preserved**                             | each event keeps its real tool name and cites its own source line              |
 | Provider error survives nonzero exit         | **fixed**                                 | verbatim 1.1.9 auth-failure capture asserted                                   |
 | Red-test evidence                            | **recorded**                              | `docs/evidence/agy-red-tests.md`, 7 failures against the stub                  |
 | Token-backed answer semantics                | **outstanding**                           | needs credentials                                                              |
