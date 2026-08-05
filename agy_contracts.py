@@ -776,14 +776,39 @@ class AgyStream:
                         # held open so an observation can be marked incomplete,
                         # never translated into evidence.  The normal lifecycle
                         # is ACTIVE then DONE for one step_index, so this is a
-                        # pending entry rather than a permanent one: recording
-                        # it permanently made every run that used any tool at
-                        # all look like it had left one unfinished.
+                        # pending entry rather than a permanent one.  Multiple
+                        # ACTIVE updates for the same step identity must preserve
+                        # prior nonempty claims and reject contradictory values.
+                        existing = open_steps.get(step_id)
+                        new_cmd = _started_command(params)
+                        new_path = _read_path(params)
+                        if existing is not None:
+                            if existing.tool != name:
+                                raise ValueError(
+                                    f"agy step_update {index} updates step started "
+                                    f"as {existing.tool!r} under the name {name!r}")
+                            if (existing.command and new_cmd
+                                    and existing.command != new_cmd):
+                                raise ValueError(
+                                    f"agy step_update {index} changes step command "
+                                    f"from {existing.command!r} to {new_cmd!r}")
+                            if (existing.path and new_path
+                                    and existing.path != new_path):
+                                raise ValueError(
+                                    f"agy step_update {index} changes step path "
+                                    f"from {existing.path!r} to {new_path!r}")
+                            cmd = existing.command if existing.command else new_cmd
+                            path = existing.path if existing.path else new_path
+                            rec_idx = existing.record
+                        else:
+                            cmd = new_cmd
+                            path = new_path
+                            rec_idx = index
                         open_steps[step_id] = AgyStartedTool(
-                            tool=name, record=index,
+                            tool=name, record=rec_idx,
                             partition=_tool_partition(name, index),
-                            command=_started_command(params),
-                            path=_read_path(params))
+                            command=cmd,
+                            path=path)
                         continue
                     if step_id in closed_steps:
                         # One lifecycle is one tool call.  A second DONE found

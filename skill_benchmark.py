@@ -120,6 +120,7 @@ from agent_capabilities import (
     workspace_builder_implementations,
 )
 from agy_contracts import (
+    AGY_SEARCH_TOOLS,
     AgyFileRead,
     AgyFileWrite,
     AgyGenericCall,
@@ -7077,6 +7078,10 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
 
     if atype == "skill_invoked":
         expected = bool(assertion.get("expected", True))
+        if metrics.get("skill_invoked") is None and events is not None and not any(
+                event_is_completed(e) and (e.get("type") == "skill_load" or event_mentions_skill_file(e))
+                for e in events):
+            return None, f"skill invocation evidence is unavailable ({event_error or 'search-only or inconclusive trace'})"
         has_metric = isinstance(metrics.get("skill_invoked"), bool)
         invoked = bool(metrics.get("skill_invoked")) if has_metric else False
         evidence: list[str] = []
@@ -7191,11 +7196,19 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
         if atype == "command_ran":
             pattern = str(assertion.get("pattern", assertion.get("value", "")))
             hit = next((cmd for cmd in commands if regex_hit(pattern, cmd, ci)), None)
-            return hit is not None, f"matched command {hit!r}" if hit else f"no command matched /{pattern}/"
+            if hit is not None:
+                return True, f"matched command {hit!r}"
+            if any(e.get("type") == "command" and e.get("command_unavailable") is True for e in events):
+                return None, "command evidence is unavailable because a started command omitted command text"
+            return False, f"no command matched /{pattern}/"
         if atype == "command_not_ran":
             pattern = str(assertion.get("pattern", assertion.get("value", "")))
             hit = next((cmd for cmd in observed_commands if regex_hit(pattern, cmd, ci)), None)
-            return hit is None, "no banned command matched" if hit is None else f"banned command matched {hit!r}"
+            if hit is not None:
+                return False, f"banned command matched {hit!r}"
+            if any(e.get("type") == "command" and e.get("command_unavailable") is True for e in events):
+                return None, "command evidence is unavailable because a started command omitted command text"
+            return True, "no banned command matched"
         if atype == "command_order":
             patterns = [str(p) for p in assertion.get("patterns", [])]
             cursor = 0
@@ -7426,6 +7439,10 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
         event["raw_result_ref"] = {"file": "trace.jsonl", "line": raw_result_line}
     if record.get("is_error") is True:
         event["is_error"] = True
+    if record.get("command_unavailable") is True:
+        event["command_unavailable"] = True
+    if record.get("is_search") is True:
+        event["is_search"] = True
     if isinstance(raw_status, str) and raw_status.casefold() != status:
         event["raw_status"] = raw_status
     role = raw_trace_value(record, "role")
@@ -7913,7 +7930,7 @@ def _agy_tool_flat_record(evidence: object) -> dict[str, Any]:
         return {"type": "file_write", "name": evidence.tool,
                 "path": evidence.path}
     if isinstance(evidence, AgySearch):
-        return {"type": "tool_call", "name": evidence.tool}
+        return {"type": "tool_call", "name": evidence.tool, "is_search": True}
     if isinstance(evidence, AgyGenericCall):
         return {"type": "tool_call", "name": evidence.tool}
     raise TypeError(f"unhandled agy tool evidence: {evidence!r}")
@@ -7930,8 +7947,9 @@ def _agy_started_tool_flat_record(started: AgyStartedTool) -> dict[str, Any]:
     be seen without being counted as one that ran to completion.
     """
     if started.partition == "shell":
-        return {"type": "command", "tool": started.tool,
-                **({"command": started.command} if started.command else {})}
+        if started.command:
+            return {"type": "command", "tool": started.tool, "command": started.command}
+        return {"type": "command", "tool": started.tool, "command_unavailable": True}
     if started.partition in {"file_read", "file_write"}:
         return {"type": started.partition, "name": started.tool,
                 **({"path": started.path} if started.path else {})}
@@ -8215,6 +8233,18 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
             token_totals["input_tokens"] + token_totals["output_tokens"])
     counts = trace_event_counts(events)
     skill_events = counts["skill_events"]
+    has_search = any(
+        e.get("is_search") is True
+        or (isinstance(e.get("name"), str) and e["name"] in AGY_SEARCH_TOOLS)
+        for e in events
+    )
+    if skill_events:
+        skill_invoked_val: bool | None = True
+    elif has_search:
+        skill_invoked_val = None
+    else:
+        skill_invoked_val = False
+
     metrics: dict[str, Any] = {
         "schema_version": 2,
         "source": source,
@@ -8224,7 +8254,7 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
         "file_writes": counts["file_writes"],
         "errors": counts["errors"],
         "repeated_command_max": repeated_command_max(commands),
-        "skill_invoked": bool(skill_events),
+        "skill_invoked": skill_invoked_val,
         "skill_invocation_evidence": [command_text(e) or e.get("input_summary", "") for e in skill_events[:10]],
     }
     protocol_errors = [

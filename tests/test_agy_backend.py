@@ -485,6 +485,39 @@ class TheTraceDialectSeparatesSearchFromReads(unittest.TestCase):
         self.assertIn("agy", sb.TRACE_DIALECTS)
         self.assertIs(sb.TRACE_DIALECTS["agy"], sb.AGY_TRACE_DIALECT)
 
+    def test_search_only_trace_publishes_unavailable_skill_invoked(self) -> None:
+        text = fixture("stream-json-search-only.jsonl")
+        records, errors = sb.parse_trace_jsonl_text(text)
+        self.assertEqual(errors, [])
+        events, metrics = sb.normalize_trace_records(records, source="agy")
+        self.assertIsNone(metrics.get("skill_invoked"))
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "events.json").write_text(json.dumps(events))
+            (base / "metrics.json").write_text(json.dumps(metrics))
+            res, msg = sb.process_or_efficiency_assertion_result(
+                {"type": "skill_invoked", "expected": False}, base, metrics)
+            self.assertIsNone(res)
+            self.assertIn("unavailable", msg)
+
+    def test_missing_started_command_text_makes_command_not_ran_unavailable(self) -> None:
+        text = (
+            '{"event":"step_update","step_update":{"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"run_command","tool_info":{"parameters":{}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        records, errors = sb.parse_trace_jsonl_text(text)
+        self.assertEqual(errors, [])
+        events, metrics = sb.normalize_trace_records(records, source="agy")
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "events.json").write_text(json.dumps(events))
+            (base / "metrics.json").write_text(json.dumps(metrics))
+            res, msg = sb.process_or_efficiency_assertion_result(
+                {"type": "command_not_ran", "pattern": "rm -rf"}, base, metrics)
+            self.assertIsNone(res)
+            self.assertIn("unavailable", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -616,5 +616,35 @@ class ToolPartitionIsTotalAndDisjoint(unittest.TestCase):
             "silently default to a generic call")
 
 
+class RepeatedActiveUpdatesTests(unittest.TestCase):
+    """Repeated ACTIVE updates for the same step identity must preserve prior claims."""
+
+    def test_repeated_active_updates_preserve_command(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{"CommandLine":"rm -rf /tmp/foo"}}}}\n'
+            '{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        self.assertEqual(len(stream.incomplete_tools), 1)
+        self.assertEqual(stream.incomplete_tools[0].command, "rm -rf /tmp/foo")
+
+    def test_repeated_active_updates_reject_contradictory_command(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{"CommandLine":"rm -rf /tmp/foo"}}}}\n'
+            '{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{"CommandLine":"ls"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertIn("changes step command", stream.protocol_error)
+
+
 if __name__ == "__main__":
     unittest.main()
