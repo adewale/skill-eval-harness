@@ -100,7 +100,10 @@ Closed statement of what this PR does and does not claim.
 | Unknown tool vocabulary                      | **fails closed**                          | an unclassified invoked tool fails the stream and names the fix                |
 | Unreadable completed tool evidence           | **fails closed**                          | a completed read, write or shell step whose defining parameter cannot be recovered fails the stream rather than publishing a zero-valued count |
 | Normal tool lifecycle                        | **reconciled**                            | `ACTIVE` is closed by its matching `DONE`; only a step left open is incomplete |
-| Zero / one / many reported models            | **distinguishable end to end**            | the published model is the resolved one only; requested and reported identities travel separately into answer and judge metadata |
+| A step left open                             | **published, never counted**              | it becomes an `in_progress` action, so `command_not_ran` sees a banned command the run began, while every completed-only counter and detector ignores it |
+| One lifecycle per tool call                  | **fails closed**                          | a repeated terminal update for one `step_index` is refused rather than counted as a second call |
+| One conversation per observation             | **fails closed**                          | any id, nested or top-level, that disagrees with the established one is refused |
+| Zero / one / many reported models            | **distinguishable end to end**            | the published model is the resolved one only; requested and reported identities travel separately into answer and judge metadata, and an unresolved judge identity is stated as `agy/unreported` or `agy/multi-model` rather than left for the verdict writer to fill with the request |
 | Terminal result                              | **unique, final, status-bearing**         | a second result, a trailing record, or a missing `status` is refused           |
 | Tool identity                                | **preserved**                             | each event keeps its real tool name and cites its own source line              |
 | Provider error survives nonzero exit         | **fixed**                                 | verbatim 1.1.9 auth-failure capture asserted                                   |
@@ -144,7 +147,7 @@ hand-constructed.
 
 - [x] `ty check --error-on-warning` — **All checks passed**
 - [x] `ruff check .` — **All checks passed**
-- [x] `python3 -m unittest discover tests` — **Ran 1416 tests**, 94 of them
+- [x] `python3 -m unittest discover tests` — **Ran 1426 tests**, 101 of them
   agy-specific
 
 On the container used for development the suite is fully green. On a macOS host

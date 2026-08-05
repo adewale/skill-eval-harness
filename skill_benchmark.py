@@ -125,6 +125,7 @@ from agy_contracts import (
     AgyGenericCall,
     AgySearch,
     AgyShellCommand,
+    AgyStartedTool,
     AgyStream,
     AgyUsagePresent,
 )
@@ -7918,34 +7919,70 @@ def _agy_tool_flat_record(evidence: object) -> dict[str, Any]:
     raise TypeError(f"unhandled agy tool evidence: {evidence!r}")
 
 
+def _agy_started_tool_flat_record(started: AgyStartedTool) -> dict[str, Any]:
+    """Map one started-but-unfinished agy step into the trace vocabulary.
+
+    The kind stays faithful to the tool's partition rather than collapsing to a
+    generic call, because the assertions that read started actions select on
+    it. What is deliberately *not* faithful is the lifecycle: this record is
+    published `in_progress`, and every counter, trigger detector and per-step
+    judge in the harness selects completed events only, so a started step can
+    be seen without being counted as one that ran to completion.
+    """
+    if started.partition == "shell":
+        return {"type": "command", "tool": started.tool,
+                **({"command": started.command} if started.command else {})}
+    if started.partition in {"file_read", "file_write"}:
+        return {"type": started.partition, "name": started.tool,
+                **({"path": started.path} if started.path else {})}
+    return {"type": "tool_call", "name": started.tool}
+
+
 def agy_stream_flat_records(
     records: list[dict[str, Any]], *, record_lines: list[int] | None = None,
 ) -> list[tuple[int, dict[str, Any]]]:
-    """Flatten agy's step lifecycle into completed-item records.
+    """Flatten agy's step lifecycle into per-item records.
 
-    Only ``DONE`` tool steps become evidence.  A step that merely started is
-    dropped here and surfaces as an incomplete observation instead, so a tool
-    that never finished cannot be counted as one that did.
+    Only ``DONE`` tool steps become completed items. A step that merely started
+    is published `in_progress` -- never completed, so nothing counts it as a
+    tool that ran -- because dropping it outright was indistinguishable from a
+    step that never happened: a `command_not_ran` assertion, which reads
+    started commands precisely because beginning one is enough to have run it,
+    saw nothing and passed for a banned command agy had begun.
     """
     if record_lines is not None and len(record_lines) != len(records):
         raise ValueError("record_lines must have one physical line per trace record")
     parsed = AgyStream.parse(_agy_records_text(records))
-    flat: list[tuple[int, dict[str, Any]]] = []
     if parsed.protocol_error is not None:
         line = record_lines[0] if record_lines else 1
         return [(line, _claude_protocol_error(parsed.protocol_error))]
+
+    def line_of(record_index: int) -> int:
+        return record_lines[record_index - 1] if record_lines else record_index
+
     # Evidence is a filtered view of the stream, so its position in `tools` is
     # not its position in `records`: indexing `record_lines` by the former gave
     # the first tool the line of the init record. The parser reports which
     # record each piece of evidence came from; that is what resolves to a line.
-    for record_index, evidence in zip(parsed.tool_records, parsed.tools,
-                                      strict=True):
-        line = record_lines[record_index - 1] if record_lines else record_index
-        spec = _agy_tool_flat_record(evidence)
+    numbered: list[tuple[int, int, dict[str, Any]]] = [
         # Only DONE steps reach here, so every record is already terminal.
-        flat.append((line, {**spec, "status": "completed",
-                            "_raw_call_line": line, "_raw_result_line": line}))
-    return flat
+        (record_index, line_of(record_index),
+         {**_agy_tool_flat_record(evidence), "status": "completed",
+          "_raw_call_line": line_of(record_index),
+          "_raw_result_line": line_of(record_index)})
+        for record_index, evidence in zip(parsed.tool_records, parsed.tools,
+                                          strict=True)
+    ] + [
+        (started.record, line_of(started.record),
+         {**_agy_started_tool_flat_record(started), "status": "in_progress",
+          "_raw_call_line": line_of(started.record)})
+        for started in parsed.incomplete_tools
+    ]
+    # Back into stream order: an unfinished step is interleaved with the
+    # completed ones rather than appended after them, so the trace still reads
+    # as the sequence the run actually emitted.
+    numbered.sort(key=lambda item: item[0])
+    return [(line, spec) for _, line, spec in numbered]
 
 
 def _agy_stream_semantics(
@@ -12497,8 +12534,8 @@ def agy_judge_invoke(
     stderr = result.get("stderr", "") or ""
     if isinstance(error, str):
         stderr = _stderr_with_warning(stderr, error)
-    # `model_label` below is the resolved identity or nothing, so the request
-    # and the full reported list travel here rather than being folded into it.
+    # `model_label` below never folds in the request, so the request and the
+    # full reported list travel here as their own facts.
     metadata: dict[str, Any] = {
         "model_requested": (result.get("model_requested")
                             if isinstance(result.get("model_requested"), str)
@@ -12521,10 +12558,16 @@ def agy_judge_invoke(
         # agy reports its own counters. Absent telemetry has already been
         # normalized to None above, so this label never describes a zero.
         usage_source="provider_reported",
+        # An unresolved identity is stated, not left empty. `None` here is not
+        # neutral downstream: `run_one_judge_task` falls back to the requested
+        # model, so a run that reported no model -- or two -- was persisted and
+        # priced under the name that was merely asked for, which is exactly the
+        # substitution `agy_cli_invoke` refuses to make one layer down.
         model_label=(
             str(result["model"])
             if isinstance(result.get("model"), str) and result.get("model")
-            else None),
+            else "agy/multi-model" if len(metadata["model_reported"]) > 1
+            else "agy/unreported"),
         metadata=metadata,
     )
 

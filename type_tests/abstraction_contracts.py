@@ -25,6 +25,7 @@ from agy_contracts import (
     AgySkillNotActivated,
     AgySkillObservation,
     AgySkillObservationUnavailable,
+    AgyStartedTool,
     AgyStream,
     AgyToolEvidence,
     AgyUsage,
@@ -336,7 +337,7 @@ def agy_stream_types_are_precise(stream: AgyStream) -> None:
     _model: AgyModelIdentity = stream.model
     _tools: tuple[AgyToolEvidence, ...] = stream.tools
     _advertised: tuple[str, ...] = stream.advertised_tools
-    _incomplete: tuple[str, ...] = stream.incomplete_tools
+    _incomplete: tuple[AgyStartedTool, ...] = stream.incomplete_tools
     _conversation_id: str | None = stream.conversation_id
     _status: str | None = stream.status
     _provider_error: str | None = stream.provider_error

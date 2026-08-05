@@ -288,8 +288,12 @@ class MalformedStreamsFailClosed(unittest.TestCase):
              "tool_info": {"parameters": {"CommandLine": "ls"}}}))
         self.assertEqual(stream.tools, (),
                          "an ACTIVE tool step is not completed evidence")
-        self.assertIn("run_command", stream.incomplete_tools,
-                      "a tool step with no DONE must be recorded as incomplete")
+        self.assertEqual(
+            [(started.tool, started.partition, started.command)
+             for started in stream.incomplete_tools],
+            [("run_command", "shell", "ls")],
+            "a tool step with no DONE must be recorded as incomplete, with "
+            "what it had already claimed")
 
     def test_a_completed_step_closes_the_active_record_that_opened_it(
             self) -> None:
@@ -326,7 +330,87 @@ class MalformedStreamsFailClosed(unittest.TestCase):
              "tool_info": {"parameters": {"CommandLine": "ls"}}},
             {"state": "DONE", "step_type": "tool", "tool_name": "run_command",
              "tool_info": {"parameters": {"CommandLine": "ls"}}}))
-        self.assertIn("run_command", stream.incomplete_tools)
+        self.assertEqual([started.tool for started in stream.incomplete_tools],
+                         ["run_command"])
+
+    def test_one_step_cannot_report_two_terminal_updates(self) -> None:
+        # The first DONE closes the open step; the second finds nothing open.
+        # Appending both made one lifecycle into two tool calls, doubling every
+        # counter the step fed -- silently, since each record on its own is
+        # well formed.
+        stream = AgyStream.parse(_stream(
+            {"step_index": 4, "state": "ACTIVE", "step_type": "tool",
+             "tool_name": "run_command",
+             "tool_info": {"parameters": {"CommandLine": "ls"}}},
+            {"step_index": 4, "state": "DONE", "step_type": "tool",
+             "tool_name": "run_command",
+             "tool_info": {"parameters": {"CommandLine": "ls"}}},
+            {"step_index": 4, "state": "DONE", "step_type": "tool",
+             "tool_name": "run_command",
+             "tool_info": {"parameters": {"CommandLine": "ls"}}}))
+        self.assertIsNotNone(
+            stream.protocol_error,
+            "a repeated terminal update for one step was accepted as a second "
+            "tool call")
+
+    def test_a_started_step_need_not_have_reported_its_parameters(self) -> None:
+        # The lenience that makes the strictness above safe: an ACTIVE record
+        # is a step caught mid-flight, so a missing CommandLine is not the
+        # stream failure it is on a completed step.
+        stream = AgyStream.parse(_stream(
+            {"step_index": 4, "state": "ACTIVE", "step_type": "tool",
+             "tool_name": "run_command"}))
+        self.assertIsNone(stream.protocol_error)
+        self.assertEqual(
+            [(started.tool, started.command)
+             for started in stream.incomplete_tools],
+            [("run_command", "")])
+
+    def test_a_started_step_with_an_unreadable_tool_info_fails(self) -> None:
+        # Claimed activity this module cannot read fails the stream in either
+        # state: the started step is published, so an unreadable one would be
+        # published too.
+        stream = AgyStream.parse(_stream(
+            {"step_index": 4, "state": "ACTIVE", "step_type": "tool",
+             "tool_name": "run_command", "tool_info": "ran the command"}))
+        self.assertIsNotNone(stream.protocol_error)
+
+    def test_a_started_step_invoking_an_unclassified_tool_fails(self) -> None:
+        stream = AgyStream.parse(_stream(
+            {"step_index": 4, "state": "ACTIVE", "step_type": "tool",
+             "tool_name": "teleport_file"}))
+        self.assertIsNotNone(
+            stream.protocol_error,
+            "an unclassified tool must fail the stream whether or not its "
+            "step finished")
+
+    def test_records_naming_two_conversations_are_not_one_observation(
+            self) -> None:
+        # A truncated conversation followed by a complete one: taking the
+        # latest id credited the first conversation's tool evidence to the
+        # second conversation's answer and usage, as a single complete run.
+        stream = AgyStream.parse("\n".join(json.dumps(record) for record in [
+            {"event": "init", "conversation_id": "CONV-A",
+             "init": {"model": "gemini-3.1-pro-low"}},
+            {"event": "step_update", "step_update": {
+                "step_index": 4, "state": "DONE", "step_type": "tool",
+                "tool_name": "run_command",
+                "tool_info": {"parameters": {"CommandLine": "ls"}}}},
+            {"event": "init", "conversation_id": "CONV-B",
+             "init": {"model": "gemini-3.1-pro-low"}},
+            {"event": "result", "result": {"status": "SUCCESS",
+                                           "response": "done"}}]))
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertFalse(stream.complete)
+
+    def test_a_step_cannot_name_a_conversation_of_its_own(self) -> None:
+        # The nested spelling, which re-scoped step identity mid-stream: after
+        # it, no later DONE could close an earlier ACTIVE.
+        stream = AgyStream.parse(_stream(
+            {"step_index": 4, "state": "ACTIVE", "step_type": "tool",
+             "conversation_id": "OTHER", "tool_name": "run_command",
+             "tool_info": {"parameters": {"CommandLine": "ls"}}}))
+        self.assertIsNotNone(stream.protocol_error)
 
     def test_contradictory_token_accounting_is_invalid(self) -> None:
         line = ('{"event":"result","result":{"status":"SUCCESS","response":"hi",'

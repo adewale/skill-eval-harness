@@ -50,6 +50,14 @@ one changes. Steps 4, 6 and 7 remain done, but their contracts moved, so their
 result sections carry dated amendments rather than being rewritten in place.
 One of the four is a **precondition for step 12**, not a tidy-up.
 
+**Second review pass — 2026-08-05.** Four further findings, all verified
+against the code and reproduced before fixing; **F14** records them. Three are
+lifecycle or identity states the parser accepted as one valid observation (a
+started step that vanished from the trace, two conversations combined into one
+run, one lifecycle counted as two tool calls); the fourth is F13's model
+identity fix being undone by the judge writer one layer further out. No step's
+status changes.
+
 ### Working environment
 
 This work is being executed from a fork, which the original plan did not account
@@ -272,6 +280,34 @@ uv pip install --python .venv/bin/python -e ".[test]"
   as **no**: the published model is what agy reported, with `model_requested`
   and `model_reported` carried separately.
 
+- **F14 (second review pass, 2026-08-05) — four findings against the same
+  scope, all four real, all four fixed.** Three are lifecycle and identity
+  states the parser accepted as one valid observation; the fourth is F13's own
+  model-identity fix being undone one layer further out, which is the same
+  pattern F13 named, one layer up.
+
+  | Finding | What broke | Where |
+  |---|---|---|
+  | A started step vanished | A tool step with no `DONE` produced no record at all. `command_not_ran` reads *started* commands — beginning one is already enough to have run it — so a banned command agy had launched passed the assertion unseen. agy was the only dialect that dropped started calls; the others publish `in_progress` | `skill_benchmark.py` `agy_stream_flat_records` |
+  | Conflicting conversation identities | Any nonempty id overwrote the established one, and nested ids were never checked. A truncated conversation followed by a complete one combined the first's tool evidence with the second's answer and usage as one complete observation | `agy_contracts.py` `AgyStream.parse` |
+  | Repeated terminal updates | A second `DONE` for one `(conversation, step_index)` found nothing open and appended a second piece of evidence, doubling every counter that step fed | `agy_contracts.py` `AgyStream.parse` |
+  | Judge model identity re-resolved | `agy_judge_invoke` correctly returned no label for a zero- or many-reported run, then `run_one_judge_task`'s `invocation.model_label or judge_model` restored the requested name into the persisted verdict and its cost attribution — the exact substitution F13 removed from `agy_cli_invoke` | `skill_benchmark.py` `agy_judge_invoke` |
+
+  **Why a started step is published rather than rejected.** The reviewer's
+  alternative was to fail the stream. A missing `DONE` does not retract the
+  answer the run gave or the tokens it reported, so rejecting discards real
+  evidence to fix a visibility problem. `incomplete_tools` now carries what the
+  step had claimed and the dialect publishes it `in_progress`: visible to the
+  assertions that read started actions, counted by no metric that means "the
+  run did this", since every counter, trigger detector and per-step judge in
+  the harness selects completed events only. C1 in
+  `tests/test_trace_conservation.py` gained the matching half — a started step
+  must be published, and must not be published as completed.
+
+  **What this changes for step 12.** Nothing that blocks it. The trigger
+  observation already treated an unfinished step as unavailable rather than as
+  a clean negative, and still does.
+
 ### Step 0 result — measured 2026-08-01
 
 Branch reset to `upstream/main` `2297000`. All three gates green on that base
@@ -319,10 +355,11 @@ Every other commit passes. The history was deliberately left as-is rather than
 rewritten, so this table is the warning that replaces a clean bisect.
 
 The tip figure moves as work lands and is stated once, here: at step 8 it was
-**1385**; after the 2026-08-05 review pass (F13) `unittest discover tests`
-**runs 1416, up 14 from the 1402 before it**, with `ty --error-on-warning` and
-`ruff` clean. Anywhere else in this document a test count appears, it is a
-dated measurement of that step, not a claim about the tip.
+**1385**; after the 2026-08-05 review pass (F13) `unittest discover tests` ran
+1416, up 14 from the 1402 before it; after the second pass the same day (F14) it
+**runs 1426**, with `ty --error-on-warning` and `ruff` clean. Anywhere else in
+this document a test count appears, it is a dated measurement of that step, not
+a claim about the tip.
 
 One caveat on "green": three `GeminiIsolationTests` cases in
 `tests/test_gemini_backend.py` fail on a macOS host without gcloud ADC.
@@ -403,7 +440,10 @@ as it stands; the three blank rows are the honest gaps, not unknown risk.
 | Provider error survives nonzero exit (D3) | **fixed** | verbatim 1.1.9 auth-failure capture asserted |
 | Incomplete tool evidence ≠ a zero-valued metric | **fixed by construction** | unreadable completed evidence fails the stream, as an unclassified tool name does (F13) |
 | Normal tool lifecycle ≠ an incomplete run | **fixed** | `ACTIVE` reconciled against its `DONE` by conversation and `step_index`; the success fixture reports no incomplete tools (F13) |
-| Zero / one / many reported models distinguishable | **fixed end to end** | published model is the resolved one only; requested and reported identities travel separately through answer and judge metadata (F13) |
+| Zero / one / many reported models distinguishable | **fixed end to end** | published model is the resolved one only; requested and reported identities travel separately through answer and judge metadata (F13); the judge states `agy/unreported` or `agy/multi-model` rather than leaving a label the verdict writer fills with the request (F14) |
+| A started tool step is visible but never counted as completed | **fixed** | published `in_progress` like every other dialect, so `command_not_ran` sees a banned command the run began; C1 asserts both halves (F14) |
+| One conversation per observation | **fixed by construction** | any id disagreeing with the established one fails the stream, nested spellings included (F14) |
+| One lifecycle is one tool call | **fixed by construction** | a repeated terminal update for one `step_index` fails the stream instead of doubling the step's counters (F14) |
 | Red-test evidence | **recorded** | `docs/evidence/agy-red-tests.md`, 7 failures against the stub |
 | Token-backed answer semantics | **outstanding** | needs credentials (step 11 layer 3) |
 | Token-backed judge semantics | **outstanding** | needs credentials (step 11 layer 4) |
@@ -621,6 +661,12 @@ marks the observation incomplete rather than becoming a read of nowhere.
 > `incomplete_tools` consequently means exactly one thing: a step seen `ACTIVE`
 > whose `DONE` never arrived. Relatedly, `ACTIVE` records are now reconciled
 > against the `DONE` that closes them, keyed by conversation and `step_index`.
+> (**Amended by F14, same day.** "Nothing consumes the mark" was true of the
+> trace dialect when this was written and is no longer: each entry is published
+> as an `in_progress` action, because dropping a started step let a
+> `command_not_ran` assertion pass for a banned command the run had launched.
+> The rule above is unchanged — a *completed* step whose evidence cannot be
+> read still fails the stream rather than degrading into the incomplete set.)
 > Holding them open permanently — the normal lifecycle emits both, as the
 > success fixture does for step 4 — turned every run that completed any tool
 > at all into an unavailable observation, which would have cost step 12 every

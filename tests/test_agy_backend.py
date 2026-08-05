@@ -311,9 +311,12 @@ class TheJudgePathUsesTheLifecycleFormat(unittest.TestCase):
                          kwargs["json_schema"])
 
     def test_the_judge_keeps_both_model_identities(self) -> None:
-        # `model_label` is the resolved identity or nothing, so a judge run
-        # that reported two models must not be labelled with either, and the
-        # model that was asked for must still be recoverable.
+        # `model_label` is the resolved identity or an explicit statement that
+        # there is none, so a judge run that reported two models is labelled
+        # with neither, and the model that was asked for must still be
+        # recoverable. Leaving the label empty was not neutral: the verdict
+        # writer falls back to the requested model, so the run was persisted
+        # and priced under a name agy never confirmed.
         with mock.patch.object(
                 sb, "run_argv_capture",
                 return_value=completed(
@@ -321,11 +324,25 @@ class TheJudgePathUsesTheLifecycleFormat(unittest.TestCase):
             invocation = sb.agy_judge_invoke(
                 "verdict?", judge_model="gemini-3.1-pro-low", agy_cmd="agy",
                 assertion_schema=VERDICT_SCHEMA, explore_hint="/tmp")
-        self.assertIsNone(invocation.model_label)
+        self.assertEqual(invocation.model_label, "agy/multi-model")
         self.assertEqual(invocation.metadata["model_requested"],
                          "gemini-3.1-pro-low")
         self.assertEqual(list(invocation.metadata["model_reported"]),
                          ["gemini-3.1-pro-low", "gemini-3.1-pro-high"])
+
+    def test_a_judge_that_reported_no_model_is_not_labelled_with_the_request(
+            self) -> None:
+        with mock.patch.object(
+                sb, "run_argv_capture",
+                return_value=completed(
+                    fixture("stream-json-auth-failure.jsonl"), returncode=1)):
+            invocation = sb.agy_judge_invoke(
+                "verdict?", judge_model="gemini-3.1-pro-high", agy_cmd="agy",
+                assertion_schema=VERDICT_SCHEMA, explore_hint="/tmp")
+        self.assertEqual(invocation.model_label, "agy/unreported")
+        self.assertEqual(invocation.metadata["model_requested"],
+                         "gemini-3.1-pro-high")
+        self.assertEqual(list(invocation.metadata["model_reported"]), [])
 
     def test_the_judge_records_the_approval_it_was_launched_with(self) -> None:
         with mock.patch.object(sb, "run_argv_capture",

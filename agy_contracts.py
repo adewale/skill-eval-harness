@@ -112,6 +112,13 @@ AGY_CLASSIFIED_TOOLS = frozenset((
     *AGY_WRITE_TOOLS, *AGY_GENERIC_TOOLS,
 ))
 
+# The five buckets above, named.  A completed step becomes the evidence class
+# its bucket implies; a step that only started carries the bucket itself, since
+# there is no evidence to build.  Both resolve the name through one owner, so a
+# tool cannot be classified one way when it finishes and another when it does
+# not.
+AGY_TOOL_PARTITIONS = ("search", "file_read", "file_write", "shell", "generic")
+
 
 def _reject_constant(value: str) -> None:
     raise ValueError(f"non-finite numeric constant {value!r}")
@@ -349,6 +356,45 @@ AgyToolEvidence = (
 )
 
 
+@dataclass(frozen=True)
+class AgyStartedTool:
+    """A tool step that went ``ACTIVE`` and never reported ``DONE``.
+
+    Deliberately **not** part of `AgyToolEvidence`: nothing here completed, so
+    it can never satisfy an assertion about what a run did, and no counter sums
+    it.  It exists because a started step is still *claimed* activity.
+    Dropping it outright let a `command_not_ran` assertion pass for a banned
+    command agy had begun -- that check reads started calls precisely because
+    beginning one is already enough to have run it.
+
+    `partition` is which of this module's five tool buckets the name falls in,
+    resolved when the step starts so an unclassified name fails the stream
+    whether or not its step ever finished.  `command` and `path` are
+    best-effort: an ``ACTIVE`` record need not yet carry the parameters a
+    ``DONE`` record must, so an empty one here is a step caught mid-flight
+    rather than the stream failure the same gap is on a completed step.
+    """
+
+    tool: str
+    record: int
+    partition: str
+    command: str = ""
+    path: str = ""
+
+    def __post_init__(self) -> None:
+        _nonempty_string(self.tool, "agy started tool name")
+        if (isinstance(self.record, bool) or not isinstance(self.record, int)
+                or self.record < 1):
+            raise ValueError(
+                "agy started tool must carry a 1-based source record index")
+        if self.partition not in AGY_TOOL_PARTITIONS:
+            raise ValueError(
+                f"unknown agy tool partition {self.partition!r}")
+        for label, value in (("command", self.command), ("path", self.path)):
+            if not isinstance(value, str):
+                raise TypeError(f"agy started tool {label} must be text")
+
+
 # ---------------------------------------------------------------------------
 # Skill activation observation.
 # ---------------------------------------------------------------------------
@@ -416,6 +462,57 @@ def _read_path(params: Mapping[str, Any]) -> str:
     return ""
 
 
+def _step_parameters(step: Mapping[str, Any], index: int) -> Mapping[str, Any]:
+    """The parameters a step record carries, or a failed stream.
+
+    Absent is not malformed: agy omits ``tool_info`` on steps that have nothing
+    to report yet.  A present one that is not an object is claimed activity this
+    module cannot read, which fails the stream whatever state the step is in.
+    """
+    info = step.get("tool_info")
+    if info is not None and not isinstance(info, Mapping):
+        raise ValueError(f"agy step_update {index}.tool_info must be an object")
+    params = info.get("parameters") if isinstance(info, Mapping) else None
+    if params is not None and not isinstance(params, Mapping):
+        raise ValueError(
+            f"agy step_update {index} parameters must be an object")
+    return params if isinstance(params, Mapping) else {}
+
+
+def _started_command(params: Mapping[str, Any]) -> str:
+    """The shell command a step has claimed so far, if any.
+
+    Unlike the completed path this never fails: a step caught mid-flight need
+    not have reported its parameters yet.
+    """
+    command = params.get("CommandLine")
+    return command if isinstance(command, str) and command.strip() else ""
+
+
+def _tool_partition(name: str, index: int) -> str:
+    """Which of the five buckets a tool name falls in, or a failed stream.
+
+    The single owner of that decision, so a tool cannot be classified one way
+    when its step completes and another when it only starts.
+    """
+    if name in AGY_SEARCH_TOOLS:
+        return "search"
+    if name in AGY_FILE_READ_TOOLS:
+        return "file_read"
+    if name in AGY_WRITE_TOOLS:
+        return "file_write"
+    if name in AGY_SHELL_TOOLS:
+        return "shell"
+    if name in AGY_GENERIC_TOOLS:
+        return "generic"
+    raise ValueError(
+        f"agy step_update {index} invoked unclassified tool {name!r}. "
+        "Add it to one of AGY_SHELL_TOOLS, AGY_FILE_READ_TOOLS, "
+        "AGY_SEARCH_TOOLS, AGY_WRITE_TOOLS or AGY_GENERIC_TOOLS in "
+        "agy_contracts.py once its behaviour is known, and re-capture "
+        "tests/fixtures/agy/advertised-tools.json")
+
+
 def _step_identity(step: Mapping[str, Any], conversation_id: str | None,
                    index: int) -> object:
     """What makes two step records the same step.
@@ -457,8 +554,10 @@ class AgyStream:
     # Tools whose step was still open when the stream ended: an ACTIVE record
     # with no matching DONE.  Nothing else lands here -- a completed step whose
     # evidence cannot be read fails the stream instead, so this field means one
-    # thing and a caller can act on it.
-    incomplete_tools: tuple[str, ...] = ()
+    # thing and a caller can act on it.  Each entry keeps its source record and
+    # whatever the step had already claimed, because a caller that must publish
+    # the started step needs more than its name.
+    incomplete_tools: tuple[AgyStartedTool, ...] = ()
     status: str | None = None
     provider_error: str | None = None
     protocol_error: str | None = None
@@ -477,13 +576,26 @@ class AgyStream:
         if len(self.tool_records) != len(self.tools):
             raise ValueError(
                 "agy tool evidence must carry one source record index each")
+        for started in self.incomplete_tools:
+            if not isinstance(started, AgyStartedTool):
+                raise TypeError(
+                    "agy incomplete tools must be AgyStartedTool values")
         object.__setattr__(self, "records", tuple(
             freeze_json_mapping(record, f"agy stream record {index}")
             for index, record in enumerate(self.records, 1)))
 
     @property
     def complete(self) -> bool:
-        """A run that produced an answer and neither kind of error."""
+        """A run that produced an answer and neither kind of error.
+
+        `incomplete_tools` deliberately does not gate this.  A step whose
+        ``DONE`` never arrived does not retract the answer the run went on to
+        give or the tokens it reported spending, and failing the whole
+        observation over a missing lifecycle record would discard both.  What
+        an unfinished step must not do is *vanish*: it is published as a
+        started-not-completed action, so an assertion about what the run did
+        can see it without any counter treating it as finished.
+        """
         return (self.protocol_error is None
                 and self.provider_error is None
                 and bool(self.answer.strip()))
@@ -550,8 +662,6 @@ class AgyStream:
         if not records:
             return cls.invalid("agy stream is empty")
 
-        identity = AgyModelIdentity(requested=requested_model,
-                                    configured=configured_model)
         reported: list[str] = []
         advertised: list[str] = []
         conversation_id: str | None = None
@@ -564,7 +674,13 @@ class AgyStream:
         # Tool steps seen ACTIVE whose DONE has not arrived, keyed by step
         # identity so the matching DONE can close them.  A step is incomplete
         # only if it is still in here when the stream ends.
-        open_steps: dict[object, str] = {}
+        open_steps: dict[object, AgyStartedTool] = {}
+        # Step identities that have already reported a terminal update.  One
+        # lifecycle is one tool call: without this, a repeated DONE for the same
+        # step appended a second piece of evidence -- the first record closed
+        # the open step and the second found nothing open, so both passed
+        # through and doubled every counter the step fed.
+        closed_steps: set[object] = set()
         saw_result = False
 
         try:
@@ -584,9 +700,27 @@ class AgyStream:
                     # one that actually terminated the run.
                     raise ValueError(
                         f"agy record {index} follows the terminal result event")
-                raw_conversation = record.get("conversation_id")
-                if isinstance(raw_conversation, str) and raw_conversation:
-                    conversation_id = raw_conversation
+                # Every id the record states must name the same conversation.
+                # Taking the latest one let a truncated conversation followed by
+                # a complete one combine into a single "complete" observation,
+                # crediting the first conversation's tool evidence to the
+                # second's answer and usage.  The nested spellings are checked
+                # with the top-level one because a step carrying its own
+                # disagreeing id silently re-scoped step identity, after which
+                # no later DONE could close an earlier ACTIVE.
+                payload = record.get(event)
+                for candidate in (record.get("conversation_id"),
+                                  payload.get("conversation_id")
+                                  if isinstance(payload, Mapping) else None):
+                    if not isinstance(candidate, str) or not candidate:
+                        continue
+                    if (conversation_id is not None
+                            and candidate != conversation_id):
+                        raise ValueError(
+                            f"agy record {index} names conversation "
+                            f"{candidate!r} in a stream established as "
+                            f"{conversation_id!r}")
+                    conversation_id = candidate
 
                 if event == "init":
                     init = record.get("init")
@@ -632,7 +766,11 @@ class AgyStream:
                         continue
                     name = _nonempty_string(
                         step.get("tool_name"), f"agy step_update {index}.tool_name")
-                    identity = _step_identity(step, conversation_id, index)
+                    # Read on both paths.  A started step is published too, so a
+                    # tool_info this module cannot read is unreadable claimed
+                    # activity whichever state the record is in.
+                    params = _step_parameters(step, index)
+                    step_id = _step_identity(step, conversation_id, index)
                     if state != AGY_DONE_STATE:
                         # A tool that started is not a tool that finished.  It is
                         # held open so an observation can be marked incomplete,
@@ -641,29 +779,31 @@ class AgyStream:
                         # pending entry rather than a permanent one: recording
                         # it permanently made every run that used any tool at
                         # all look like it had left one unfinished.
-                        open_steps[identity] = name
+                        open_steps[step_id] = AgyStartedTool(
+                            tool=name, record=index,
+                            partition=_tool_partition(name, index),
+                            command=_started_command(params),
+                            path=_read_path(params))
                         continue
-                    started = open_steps.pop(identity, None)
-                    if started is not None and started != name:
+                    if step_id in closed_steps:
+                        # One lifecycle is one tool call.  A second DONE found
+                        # nothing open and appended a second piece of evidence,
+                        # so a repeated terminal update doubled the step's tool,
+                        # command and file counts.
+                        raise ValueError(
+                            f"agy step_update {index} is a second terminal "
+                            f"update for a step already completed")
+                    closed_steps.add(step_id)
+                    started = open_steps.pop(step_id, None)
+                    if started is not None and started.tool != name:
                         # The same step cannot have been two different tools.
                         # Reconciling on identity alone here would let a DONE
                         # close a step it does not describe, so the two records
                         # disagreeing is a protocol this adapter cannot read.
                         raise ValueError(
                             f"agy step_update {index} completes a step started "
-                            f"as {started!r} under the name {name!r}")
-                    info = step.get("tool_info")
-                    if info is not None and not isinstance(info, Mapping):
-                        raise ValueError(
-                            f"agy step_update {index}.tool_info must be an object")
-                    params = info.get("parameters") if isinstance(
-                        info, Mapping) else None
-                    if params is not None and not isinstance(params, Mapping):
-                        raise ValueError(
-                            f"agy step_update {index} parameters must be an object")
-                    tools.append(_tool_evidence(
-                        name, params if isinstance(params, Mapping) else {},
-                        index))
+                            f"as {started.tool!r} under the name {name!r}")
+                    tools.append(_tool_evidence(name, params, index))
                     tool_records.append(index)
                 else:
                     saw_result = True
@@ -757,24 +897,18 @@ def _tool_evidence(name: str, params: Mapping[str, Any],
     the mark.  In the answer and judge scope nothing does, so the incompleteness
     was dropped and the zero-valued metric published anyway.
     """
-    if name not in AGY_CLASSIFIED_TOOLS:
-        raise ValueError(
-            f"agy step_update {index} invoked unclassified tool {name!r}. "
-            "Add it to one of AGY_SHELL_TOOLS, AGY_FILE_READ_TOOLS, "
-            "AGY_SEARCH_TOOLS, AGY_WRITE_TOOLS or AGY_GENERIC_TOOLS in "
-            "agy_contracts.py once its behaviour is known, and re-capture "
-            "tests/fixtures/agy/advertised-tools.json")
-    if name in AGY_SEARCH_TOOLS:
+    partition = _tool_partition(name, index)
+    if partition == "search":
         return AgySearch(tool=name)
-    if name in AGY_FILE_READ_TOOLS:
+    if partition == "file_read":
         return AgyFileRead(path=_required_path(params, name, index, "read"),
                            tool=name)
-    if name in AGY_WRITE_TOOLS:
+    if partition == "file_write":
         return AgyFileWrite(path=_required_path(params, name, index, "wrote"),
                             tool=name)
-    if name in AGY_SHELL_TOOLS:
-        command = params.get("CommandLine")
-        if not isinstance(command, str) or not command.strip():
+    if partition == "shell":
+        command = _started_command(params)
+        if not command:
             raise ValueError(
                 f"agy step_update {index} completed {name!r} with no usable "
                 "CommandLine parameter, so what the run executed cannot be "
@@ -818,7 +952,8 @@ def observe_skill_activation(stream: AgyStream,
     if stream.incomplete_tools:
         return AgySkillObservationUnavailable(
             "run contains tool steps that never completed: "
-            + ", ".join(sorted(set(stream.incomplete_tools))))
+            + ", ".join(sorted({started.tool
+                                for started in stream.incomplete_tools})))
     if any(isinstance(evidence, AgySearch) for evidence in stream.tools):
         return AgySkillObservationUnavailable(
             "run searched for the skill without opening it, so neither "

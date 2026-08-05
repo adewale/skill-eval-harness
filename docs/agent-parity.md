@@ -110,11 +110,15 @@ classified as a read, a write or a shell command but `_read_path` (or the
 `CommandLine` lookup) does not recognize the parameter that defines what it
 acted on, the stream fails with a protocol error naming the tool and where to
 add the new spelling. An earlier version degraded these to a generic call and
-recorded the tool in `incomplete_tools` instead, which only works if something
-reads that field: in the answer and judge path nothing does, so the run stayed
-complete and published `file_reads: 0` alongside complete trace evidence. A
-wrong *bucket* still cannot be caught here — that is what the classification
-procedure below is for.
+recorded the tool in `incomplete_tools` instead. That is the wrong home for a
+step that *finished*: the run stayed complete and published `file_reads: 0`
+alongside complete trace evidence, because nothing about a completed-but-
+unreadable read is unfinished. `incomplete_tools` means one thing only — a step
+that went `ACTIVE` and never reported `DONE` — and each entry is published as an
+`in_progress` action, visible to the assertions that read started actions and
+counted by none of the metrics that mean "the run did this". A wrong *bucket*
+still cannot be caught here — that is what the classification procedure below is
+for.
 
 So classify from an observed stream — invoke the tool once and read its
 `tool_info.parameters` — rather than inferring from the name. Where that is not
