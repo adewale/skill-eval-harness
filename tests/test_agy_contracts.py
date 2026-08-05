@@ -7,6 +7,7 @@ mechanism that happened to break.
 """
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -33,6 +34,27 @@ MOUNTED_SKILL = "/WORKSPACE/.agents/skills/demo/SKILL.md"
 
 def fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _stream(*steps: dict[str, object]) -> str:
+    """A well-formed stream carrying exactly the given step records.
+
+    Everything around the steps is valid, so a test that fails is failing on
+    the step under test rather than on the envelope.
+    """
+    records: list[dict[str, object]] = [
+        {"event": "init", "conversation_id": "CONV",
+         "init": {"model": "gemini-3.1-pro-low",
+                  "tools": ["run_command", "view_file"]}}]
+    records += [{"event": "step_update", "step_update": step}
+                for step in steps]
+    records.append(
+        {"event": "result",
+         "result": {"conversation_id": "CONV", "status": "SUCCESS",
+                    "response": "done",
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "total_tokens": 15}}})
+    return "\n".join(json.dumps(record) for record in records)
 
 
 class SearchIsNotActivation(unittest.TestCase):
@@ -85,6 +107,28 @@ class SearchIsNotActivation(unittest.TestCase):
             observation, AgySkillActivated,
             "a completed view_file of the exact mounted SKILL.md path is the "
             "one thing that does count as activation")
+
+    def test_a_run_that_used_tools_but_not_the_skill_is_a_clean_negative(
+            self) -> None:
+        # The other half of D1: "unknown" must not be scored as "did not
+        # trigger", but neither may a clean negative be discarded as unknown.
+        # Every ACTIVE record was held open forever, so any run that used any
+        # tool at all before declining to read the skill became unavailable --
+        # which deflates the trigger matrix exactly as counting a search as a
+        # read inflates it.
+        stream = AgyStream.parse(_stream(
+            {"step_index": 4, "state": "ACTIVE", "step_type": "tool",
+             "tool_name": "run_command",
+             "tool_info": {"parameters": {"CommandLine": "ls"}}},
+            {"step_index": 4, "state": "DONE", "step_type": "tool",
+             "tool_name": "run_command",
+             "tool_info": {"parameters": {"CommandLine": "ls"},
+                           "output": "x\n"}}))
+        self.assertIsInstance(
+            observe_skill_activation(stream, MOUNTED_SKILL),
+            AgySkillNotActivated,
+            "a run whose every tool step completed, and which never opened "
+            "the mounted skill, is a clean negative observation")
 
 
 class AbsentTelemetryIsNotZero(unittest.TestCase):
@@ -236,13 +280,53 @@ class MalformedStreamsFailClosed(unittest.TestCase):
         self.assertIsNotNone(AgyStream.parse(line).protocol_error)
 
     def test_a_started_tool_is_not_evidence(self) -> None:
-        stream = AgyStream.parse(fixture("stream-json-success.jsonl"))
+        # One ACTIVE record and no DONE: nothing completed, so nothing is
+        # evidence and the step stays open.
+        stream = AgyStream.parse(_stream(
+            {"step_index": 4, "state": "ACTIVE", "step_type": "tool",
+             "tool_name": "run_command",
+             "tool_info": {"parameters": {"CommandLine": "ls"}}}))
+        self.assertEqual(stream.tools, (),
+                         "an ACTIVE tool step is not completed evidence")
         self.assertIn("run_command", stream.incomplete_tools,
-                      "an ACTIVE tool step must be recorded as incomplete")
+                      "a tool step with no DONE must be recorded as incomplete")
+
+    def test_a_completed_step_closes_the_active_record_that_opened_it(
+            self) -> None:
+        # The normal agy lifecycle is ACTIVE then DONE for one step_index, as
+        # the success fixture emits for step 4. Leaving the ACTIVE recorded
+        # made every run that used any tool at all look like it had left one
+        # unfinished, which cost every clean negative observation.
+        stream = AgyStream.parse(fixture("stream-json-success.jsonl"))
+        self.assertEqual(stream.incomplete_tools, (),
+                         "a step whose DONE arrived is not incomplete")
         self.assertEqual(
             [item for item in stream.tools
              if isinstance(item, AgySearch)], [],
             "the success fixture has no search tools")
+
+    def test_a_completion_cannot_close_a_step_it_does_not_describe(
+            self) -> None:
+        # Reconciling on step identity alone would let a DONE close a step
+        # started as a different tool.
+        stream = AgyStream.parse(_stream(
+            {"step_index": 4, "state": "ACTIVE", "step_type": "tool",
+             "tool_name": "run_command",
+             "tool_info": {"parameters": {"CommandLine": "ls"}}},
+            {"step_index": 4, "state": "DONE", "step_type": "tool",
+             "tool_name": "view_file",
+             "tool_info": {"parameters": {"AbsolutePath": "/a"}}}))
+        self.assertIsNotNone(stream.protocol_error)
+
+    def test_a_step_with_no_index_cannot_be_reconciled(self) -> None:
+        # Without a step_index there is nothing to match a DONE against, so
+        # the ACTIVE record stays open rather than being closed by proximity.
+        stream = AgyStream.parse(_stream(
+            {"state": "ACTIVE", "step_type": "tool", "tool_name": "run_command",
+             "tool_info": {"parameters": {"CommandLine": "ls"}}},
+            {"state": "DONE", "step_type": "tool", "tool_name": "run_command",
+             "tool_info": {"parameters": {"CommandLine": "ls"}}}))
+        self.assertIn("run_command", stream.incomplete_tools)
 
     def test_contradictory_token_accounting_is_invalid(self) -> None:
         line = ('{"event":"result","result":{"status":"SUCCESS","response":"hi",'
@@ -341,6 +425,58 @@ class ToolPartitionIsTotalAndDisjoint(unittest.TestCase):
             "is a read or a write, defaulting it to a generic call leaves the "
             "run complete while its file counters silently under-report")
         self.assertFalse(stream.complete)
+
+    def test_a_completed_read_with_no_usable_path_fails_the_stream(
+            self) -> None:
+        # Same harm as an unclassified tool name, so the same posture. A
+        # `DONE` view_file whose path parameter was renamed used to degrade to
+        # a generic call: the run stayed complete, `file_reads` published 0
+        # alongside complete trace evidence, and the incompleteness it recorded
+        # had no consumer in the answer or judge path.
+        stream = AgyStream.parse(_stream(
+            {"step_index": 1, "state": "DONE", "step_type": "tool",
+             "tool_name": "view_file",
+             "tool_info": {"parameters": {"Uri": "file:///w/f.py"}}}))
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertFalse(stream.complete)
+        self.assertIn("view_file", stream.protocol_error or "")
+        self.assertIn("_PATH_PARAMETERS", stream.protocol_error or "",
+                      "the failure must say where the parameter spelling is "
+                      "added")
+
+    def test_a_completed_write_with_no_usable_path_fails_the_stream(
+            self) -> None:
+        stream = AgyStream.parse(_stream(
+            {"step_index": 1, "state": "DONE", "step_type": "tool",
+             "tool_name": "write_to_file",
+             "tool_info": {"parameters": {"Contents": "x"}}}))
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertFalse(stream.complete)
+
+    def test_a_completed_shell_step_with_no_command_fails_the_stream(
+            self) -> None:
+        stream = AgyStream.parse(_stream(
+            {"step_index": 1, "state": "DONE", "step_type": "tool",
+             "tool_name": "run_command",
+             "tool_info": {"parameters": {"Cmd": "ls"}}}))
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertFalse(stream.complete)
+
+    def test_unreadable_completed_evidence_is_never_a_zero_valued_metric(
+            self) -> None:
+        # The property the fail-closed rule exists for, stated end to end:
+        # incomplete evidence must not reach the metric as a complete count.
+        stream = AgyStream.parse(_stream(
+            {"step_index": 1, "state": "DONE", "step_type": "tool",
+             "tool_name": "view_file",
+             "tool_info": {"parameters": {"Uri": "file:///w/f.py"}}}))
+        self.assertEqual(
+            [item for item in stream.tools if isinstance(item, AgyFileRead)],
+            [], "unreadable evidence produces no read")
+        self.assertFalse(
+            stream.complete,
+            "a run whose completed tool evidence could not be read must not "
+            "be publishable as a complete observation")
 
     def test_the_failure_names_the_tool_and_the_fix(self) -> None:
         stream = AgyStream.parse(

@@ -190,10 +190,10 @@ Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | Lo
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10878`), Claude (`run_claude:11064`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10924`), Claude (`run_claude:11110`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir),
 Google Antigravity (`run-agent --agent agy`, which has no isolable provider home and so is declared uncontained and belongs on a disposable host), the in-process
-subagent runner (`run_subagent:13721`, which hosts record/replay tool I/O via `ToolReplayStore`),
+subagent runner (`run_subagent:13774`, which hosts record/replay tool I/O via `ToolReplayStore`),
 Jetty (`JettyClient:4038` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they

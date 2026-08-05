@@ -105,11 +105,16 @@ classified correctly. Three ways to get it wrong, all silent:
 - A search filed as a read — a search counts as activation, inflating the
   trigger matrix.
 
-One case does fail safe. If a tool is classified as a read or a write but
-`_read_path` does not recognize its path parameter, the tool is recorded as
-incomplete and `observe_skill_activation` returns an explicitly unavailable
-observation. A misspelled parameter degrades to "unknown"; a wrong bucket does
-not.
+A renamed *parameter* fails the same way a renamed tool does. If a tool is
+classified as a read, a write or a shell command but `_read_path` (or the
+`CommandLine` lookup) does not recognize the parameter that defines what it
+acted on, the stream fails with a protocol error naming the tool and where to
+add the new spelling. An earlier version degraded these to a generic call and
+recorded the tool in `incomplete_tools` instead, which only works if something
+reads that field: in the answer and judge path nothing does, so the run stayed
+complete and published `file_reads: 0` alongside complete trace evidence. A
+wrong *bucket* still cannot be caught here — that is what the classification
+procedure below is for.
 
 So classify from an observed stream — invoke the tool once and read its
 `tool_info.parameters` — rather than inferring from the name. Where that is not

@@ -44,6 +44,12 @@ step.
 | 12 — trigger support | SHELL | **blocked** — needs authenticated `agy` on a disposable host |
 | 13 — PR presentation | SANDBOX/SHELL | draft table below; live rows outstanding |
 
+**Review pass — 2026-08-05.** Four review findings against the completed
+sandbox scope were verified and fixed; finding **F13** below records what each
+one changes. Steps 4, 6 and 7 remain done, but their contracts moved, so their
+result sections carry dated amendments rather than being rewritten in place.
+One of the four is a **precondition for step 12**, not a tidy-up.
+
 ### Working environment
 
 This work is being executed from a fork, which the original plan did not account
@@ -230,6 +236,42 @@ uv pip install --python .venv/bin/python -e ".[test]"
   execution, so this is still not proof. Unchanged from the plan's original
   assessment; step 10 must re-check it with credentials.
 
+- **F13 (review pass, 2026-08-05) — three of the four review findings were
+  contracts that held in `agy_contracts.py` and were lost one layer out.** The
+  pattern is worth naming, because it is the failure mode a typed leaf module
+  invites: the module states a property correctly, and the caller quietly
+  discards it. Verified against the code, each one reproduced before fixing.
+
+  | Finding | What broke | Where |
+  |---|---|---|
+  | Completed tool evidence that could not be read | `incomplete_tools` had exactly one consumer, `observe_skill_activation`. Neither `AgyBackend` nor the trace dialect reads it, so a `DONE` `view_file` with an unrecoverable path stayed a **complete** run publishing `file_reads: 0` | `agy_contracts.py` `_tool_evidence` |
+  | `ACTIVE` steps never reconciled | The normal lifecycle is `ACTIVE` then `DONE` for one `step_index`; the `ACTIVE` was recorded permanently, so *any* completed tool made the run look unfinished | `agy_contracts.py` `AgyStream.parse` |
+  | Model identity collapsed | `AgyModelIdentity` distinguishes zero/one/many correctly, but `parsed.model.resolved or model` substituted the requested name for both the zero and the many case, and `AgyBackend` dropped `model_reported` | `skill_benchmark.py` `agy_cli_invoke`, `AgyBackend`, `agy_judge_invoke` |
+  | Executable paths with spaces | `split()` refused a valid install path such as `/Applications/Google Antigravity/agy`, contradicting step 7's own "a path or bare command name" | `skill_benchmark.py` `agy_executable_token` |
+
+  **What this changes for step 12.** The reconciliation fix is a precondition,
+  not a cleanup. Trigger support needs one complete *negative* observation, and
+  before this fix every run that completed any tool at all before declining to
+  read the skill returned `AgySkillObservationUnavailable`. A negative
+  observation was effectively unobtainable for any run that did real work, so
+  step 12 would have failed to capture its required negative and the cause
+  would have looked like a live-environment problem rather than an adapter one.
+
+  **What this changes for step 4's stated rule.** The plan specified that a
+  read with no usable path "degrades to a generic call and marks the
+  observation incomplete". That only works if something consumes the mark, and
+  in the answer and judge scope nothing does. Such evidence now **fails the
+  stream**, matching the posture already applied to an unclassified tool name.
+  `incomplete_tools` consequently means one thing only: a step seen `ACTIVE`
+  whose `DONE` never arrived.
+
+  **What did not change.** The zero/one/many model identity requirement was
+  already stated correctly at step 4 and needed no amendment — only the
+  plumbing that lost it. Whether `metadata.model` should fall back to the
+  requested name for a zero-reported run was put to the maintainer and settled
+  as **no**: the published model is what agy reported, with `model_requested`
+  and `model_reported` carried separately.
+
 ### Step 0 result — measured 2026-08-01
 
 Branch reset to `upstream/main` `2297000`. All three gates green on that base
@@ -273,9 +315,20 @@ the suite at each commit, not from memory:
 | `bf340ae` — step 3 | FAILED (9) | Inherited the same 9. **This one matters**: the plan says step 3 "lands as its own PR, independent of agy", so it ought to be independently green. Anyone splitting it out for its own PR must rebase it ahead of step 2 first. |
 | `ece0644` — steps 6-7 | FAILED (1) | A broken markdown anchor in this file, caught by the doc-link gate and fixed in `ec72afd`. |
 
-Every other commit passes, and the tip passes with 1385 tests plus clean `ty`
-and `ruff`. The history was deliberately left as-is rather than rewritten, so
-this table is the warning that replaces a clean bisect.
+Every other commit passes. The history was deliberately left as-is rather than
+rewritten, so this table is the warning that replaces a clean bisect.
+
+The tip figure moves as work lands and is stated once, here: at step 8 it was
+**1385**; after the 2026-08-05 review pass (F13) `unittest discover tests`
+**runs 1416, up 14 from the 1402 before it**, with `ty --error-on-warning` and
+`ruff` clean. Anywhere else in this document a test count appears, it is a
+dated measurement of that step, not a claim about the tip.
+
+One caveat on "green": three `GeminiIsolationTests` cases in
+`tests/test_gemini_backend.py` fail on a macOS host without gcloud ADC.
+`DESCRIPTION.md` already records this and reports them failing identically on
+unmodified `main` at `2297000`. Re-confirmed during the review pass: they fail
+identically before and after it, so they remain unrelated to agy.
 
 The red-test evidence review requirement 8 asks for does **not** depend on that
 red history — `docs/evidence/agy-red-tests.md` holds the full transcript.
@@ -283,7 +336,8 @@ red history — `docs/evidence/agy-red-tests.md` holds the full transcript.
 ### Handover: what is left, and exactly how to do it
 
 Everything sandbox-completable is done. **Steps 0-8 are finished and the branch
-is green**, which is the first PR the plan describes. What remains needs an
+is green**, which is the first PR the plan describes. The 2026-08-05 review
+pass (F13) is also sandbox work and is included in that. What remains needs an
 authenticated `agy` on a disposable host, in this order:
 
 1. **Finish step 9** — on a disposable host, ask a run to write outside its
@@ -304,6 +358,14 @@ authenticated `agy` on a disposable host, in this order:
    registry refuses to advertise unattended runs on an uncontained backend. Two
    tests also assert no shipped backend uses that escape hatch, so waiving it is
    a visible decision.
+
+   Since the 2026-08-05 review pass (F13), `observe_skill_activation` returns a
+   clean `AgySkillNotActivated` for a run that completed its tools and did not
+   open the skill. Before it, any run that used a tool at all returned
+   unavailable, so the required negative observation could not have been
+   captured. If a negative still comes back unavailable on a live host, read
+   the reason string: it now names a genuinely unfinished tool step rather than
+   a normal `ACTIVE`/`DONE` pair.
 
 **Open questions still unanswered** (all deferred to step 10, all recorded in
 code comments where they bite):
@@ -328,7 +390,7 @@ as it stands; the three blank rows are the honest gaps, not unknown risk.
 | Claim | Status | Evidence |
 |---|---|---|
 | Tested `agy` version | **1.1.9** | `agy --version`, captured in a sandbox |
-| Answer runs | **supported** | `--agent agy`; 1385 tests green |
+| Answer runs | **supported** | `--agent agy`; suite green at 1416 tests |
 | Judge runs | **supported** | `--judge-backend agy`, stream-json + `--json-schema` |
 | Autonomous trigger | **deliberately unavailable** | no live activation observation; registry also forbids it while uncontained |
 | Trigger ablation | **deliberately unavailable** | same |
@@ -339,6 +401,9 @@ as it stands; the three blank rows are the honest gaps, not unknown risk.
 | Search ≠ activation (D1) | **fixed by construction** | disjoint partitions; `AgySearch` has no path field |
 | Absent telemetry ≠ zero (D2) | **fixed by construction** | `AgyUsagePresent` refuses all-zero counters |
 | Provider error survives nonzero exit (D3) | **fixed** | verbatim 1.1.9 auth-failure capture asserted |
+| Incomplete tool evidence ≠ a zero-valued metric | **fixed by construction** | unreadable completed evidence fails the stream, as an unclassified tool name does (F13) |
+| Normal tool lifecycle ≠ an incomplete run | **fixed** | `ACTIVE` reconciled against its `DONE` by conversation and `step_index`; the success fixture reports no incomplete tools (F13) |
+| Zero / one / many reported models distinguishable | **fixed end to end** | published model is the resolved one only; requested and reported identities travel separately through answer and judge metadata (F13) |
 | Red-test evidence | **recorded** | `docs/evidence/agy-red-tests.md`, 7 failures against the stub |
 | Token-backed answer semantics | **outstanding** | needs credentials (step 11 layer 3) |
 | Token-backed judge semantics | **outstanding** | needs credentials (step 11 layer 4) |
@@ -455,12 +520,27 @@ Step 6 specifics:
 - `AGY_TRACE_DIALECT` reuses `agy_contracts`, so the trace normalizer and the
   answer path cannot disagree about what a tool did. A search flattens to a
   `tool_call` **with no `path` key at all**.
+- **Amended 2026-08-05:** the adapter no longer substitutes the requested model
+  for the resolved one. `AgyModelIdentity` distinguishes zero, one and many
+  reported models as required, but `parsed.model.resolved or model` collapsed
+  both the zero and the many case onto the requested name, and `AgyBackend`
+  dropped `model_reported` entirely — so the identity contract held inside
+  `agy_contracts.py` and was lost one call later. `model` is now what agy
+  reported and nothing else, with `model_requested` and `model_reported`
+  carried through `metadata_extra` into the run's metadata.
 
 Step 7 specifics:
 
 - `agy_executable_token` accepts exactly one token. Tested against eleven
   rejected prefixes covering both the long flags the plan named and the short
   aliases finding F2 turned up (`-c`, `-p`, `-i`, `--prompt`, `--log-file`).
+  **Amended 2026-08-05:** a token containing whitespace is admitted when it
+  names a real executable, because an install path such as `/Applications/
+  Google Antigravity/agy` is one argv element and the step's own wording allows
+  "a path or bare command name". Whitespace was never the boundary: the token
+  is bound as `argv[0]` and no agy path uses a shell, so `agy --continue` would
+  reach the process as one literal filename and fail to exec. Refusing it is
+  legibility, and it stays refused because no such file exists.
 - Dash-prefixed prompt, model and schema values are each asserted to arrive as
   their own argv element, so data cannot become CLI structure.
 - `--disable-slash-commands` is implemented and **off by default**, with the
@@ -530,6 +610,21 @@ Beyond the three defects, `observe_skill_activation` now returns
 step, a search-only run, or a provider error — closing review requirement 5's
 list. A `view_file` with no usable path parameter degrades to a generic call and
 marks the observation incomplete rather than becoming a read of nowhere.
+
+> **Superseded on 2026-08-05 by review follow-up.** The degrade-and-mark rule
+> above only holds if something consumes the mark, and in the answer and judge
+> scope nothing does — neither `AgyBackend` nor the trace dialect reads
+> `incomplete_tools`, so such a run stayed complete and published `file_reads:
+> 0` alongside complete trace evidence. A completed read, write or shell step
+> whose defining parameter cannot be recovered now **fails the stream**, which
+> is the same posture, and the same reasoning, as an unclassified tool name.
+> `incomplete_tools` consequently means exactly one thing: a step seen `ACTIVE`
+> whose `DONE` never arrived. Relatedly, `ACTIVE` records are now reconciled
+> against the `DONE` that closes them, keyed by conversation and `step_index`.
+> Holding them open permanently — the normal lifecycle emits both, as the
+> success fixture does for step 4 — turned every run that completed any tool
+> at all into an unavailable observation, which would have cost step 12 every
+> clean negative it needs.
 
 The tool partition is total: `test_every_advertised_tool_is_classified` checks
 all **59** tools in `advertised-tools.json` against the five buckets and finds
@@ -1389,8 +1484,11 @@ Rather than one large PR:
 2. **Generalised conformance pack** (part of step 8) — extends the adversarial
    pack to gemini/codex/claude/vibe. Also independently useful, and it makes the
    agy PR a much smaller ask.
-3. **Agy answer + judge** (steps 0–2, 4–8) — the main deliverable, fully
-   sandbox-completable, trigger deliberately unadvertised.
+3. **Agy answer + judge** (steps 0–2, 4–8, plus the 2026-08-05 review pass
+   in F13) — the main deliverable, fully sandbox-completable, trigger
+   deliberately unadvertised. The review fixes belong in this PR, not after it:
+   two of them change contracts stated in steps 4 and 6, and one is a
+   precondition for PR 4.
 4. **Agy trigger** (steps 9–12) — gated on live proof.
 
 PR #62 should be closed or retargeted once (3) lands. Do not stack new commits on

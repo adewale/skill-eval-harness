@@ -416,6 +416,28 @@ def _read_path(params: Mapping[str, Any]) -> str:
     return ""
 
 
+def _step_identity(step: Mapping[str, Any], conversation_id: str | None,
+                   index: int) -> object:
+    """What makes two step records the same step.
+
+    ``step_index`` is scoped to a conversation, so both parts are needed to
+    match an ``ACTIVE`` record with the ``DONE`` that closes it.  agy spells the
+    conversation on the step itself; the id established so far is the fallback,
+    since the observed streams carry it only on the ``init`` record.
+
+    A step carrying no usable ``step_index`` gets an identity unique to its
+    record, which no later record can match.  That is deliberate: an unmatched
+    ``ACTIVE`` then stays open and the observation stays incomplete, which is
+    the safe reading of a lifecycle this module cannot follow.
+    """
+    raw = step.get("step_index")
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return ("unidentified-step", index)
+    own = step.get("conversation_id")
+    scope = own if isinstance(own, str) and own else conversation_id
+    return (scope, raw)
+
+
 @dataclass(frozen=True)
 class AgyStream:
     """One completely classified ``agy --output-format stream-json`` observation."""
@@ -432,6 +454,10 @@ class AgyStream:
     # none -- so its position in `tools` is not its position in `records`.
     tool_records: tuple[int, ...] = ()
     advertised_tools: tuple[str, ...] = ()
+    # Tools whose step was still open when the stream ended: an ACTIVE record
+    # with no matching DONE.  Nothing else lands here -- a completed step whose
+    # evidence cannot be read fails the stream instead, so this field means one
+    # thing and a caller can act on it.
     incomplete_tools: tuple[str, ...] = ()
     status: str | None = None
     provider_error: str | None = None
@@ -535,7 +561,10 @@ class AgyStream:
         raw_usage: Any = None
         tools: list[AgyToolEvidence] = []
         tool_records: list[int] = []
-        incomplete: list[str] = []
+        # Tool steps seen ACTIVE whose DONE has not arrived, keyed by step
+        # identity so the matching DONE can close them.  A step is incomplete
+        # only if it is still in here when the stream ends.
+        open_steps: dict[object, str] = {}
         saw_result = False
 
         try:
@@ -603,12 +632,26 @@ class AgyStream:
                         continue
                     name = _nonempty_string(
                         step.get("tool_name"), f"agy step_update {index}.tool_name")
+                    identity = _step_identity(step, conversation_id, index)
                     if state != AGY_DONE_STATE:
                         # A tool that started is not a tool that finished.  It is
-                        # recorded so an observation can be marked incomplete,
-                        # never translated into evidence.
-                        incomplete.append(name)
+                        # held open so an observation can be marked incomplete,
+                        # never translated into evidence.  The normal lifecycle
+                        # is ACTIVE then DONE for one step_index, so this is a
+                        # pending entry rather than a permanent one: recording
+                        # it permanently made every run that used any tool at
+                        # all look like it had left one unfinished.
+                        open_steps[identity] = name
                         continue
+                    started = open_steps.pop(identity, None)
+                    if started is not None and started != name:
+                        # The same step cannot have been two different tools.
+                        # Reconciling on identity alone here would let a DONE
+                        # close a step it does not describe, so the two records
+                        # disagreeing is a protocol this adapter cannot read.
+                        raise ValueError(
+                            f"agy step_update {index} completes a step started "
+                            f"as {started!r} under the name {name!r}")
                     info = step.get("tool_info")
                     if info is not None and not isinstance(info, Mapping):
                         raise ValueError(
@@ -620,7 +663,7 @@ class AgyStream:
                             f"agy step_update {index} parameters must be an object")
                     tools.append(_tool_evidence(
                         name, params if isinstance(params, Mapping) else {},
-                        incomplete, index))
+                        index))
                     tool_records.append(index)
                 else:
                     saw_result = True
@@ -684,7 +727,7 @@ class AgyStream:
             tools=tuple(tools),
             tool_records=tuple(tool_records),
             advertised_tools=tuple(advertised),
-            incomplete_tools=tuple(incomplete),
+            incomplete_tools=tuple(open_steps.values()),
             status=status,
             provider_error=provider_error,
             protocol_error=protocol_error,
@@ -692,20 +735,27 @@ class AgyStream:
 
 
 def _tool_evidence(name: str, params: Mapping[str, Any],
-                   incomplete: list[str], index: int) -> AgyToolEvidence:
+                   index: int) -> AgyToolEvidence:
     """One completed tool step as evidence of its own kind.
 
-    A search never becomes a read, and a read whose path is missing becomes an
-    unclassified call rather than a read of nowhere.
+    A search never becomes a read, and a read whose path cannot be recovered is
+    not a read of nowhere -- it **fails the stream**.
 
-    A name in none of the five buckets **fails the stream**, exactly as an
-    unknown event type or step state does.  Defaulting it to a generic call is
-    not the conservative choice it looks like: if the tool was really a read or
-    a write, the run stays complete while `file_reads`/`file_writes` under-count
+    Two conditions fail here, for one reason.  A name in none of the five
+    buckets fails, exactly as an unknown event type or step state does.  So does
+    a completed read, write or shell step whose defining parameter is missing.
+    Defaulting either to a generic call is not the conservative choice it looks
+    like: the run stays complete while `file_reads`/`file_writes` under-count
     it, and `observe_skill_activation` reports a confident "did not trigger"
-    for a run that may have opened the skill through the renamed tool.  Losing
-    the runs that touch a new tool is recoverable; publishing a measurement
-    derived from evidence this module could not classify is not.
+    for a run that may have opened the skill through the tool this module could
+    not read.  Losing the runs that touch a renamed tool or parameter is
+    recoverable; publishing a measurement derived from evidence this module
+    could not classify is not.
+
+    Degrading these to a generic call and marking the observation incomplete --
+    what PLAN.md step 4 originally specified -- only works if something consumes
+    the mark.  In the answer and judge scope nothing does, so the incompleteness
+    was dropped and the zero-valued metric published anyway.
     """
     if name not in AGY_CLASSIFIED_TOOLS:
         raise ValueError(
@@ -717,24 +767,34 @@ def _tool_evidence(name: str, params: Mapping[str, Any],
     if name in AGY_SEARCH_TOOLS:
         return AgySearch(tool=name)
     if name in AGY_FILE_READ_TOOLS:
-        path = _read_path(params)
-        if not path:
-            incomplete.append(name)
-            return AgyGenericCall(tool=name)
-        return AgyFileRead(path=path, tool=name)
+        return AgyFileRead(path=_required_path(params, name, index, "read"),
+                           tool=name)
     if name in AGY_WRITE_TOOLS:
-        path = _read_path(params)
-        if not path:
-            incomplete.append(name)
-            return AgyGenericCall(tool=name)
-        return AgyFileWrite(path=path, tool=name)
+        return AgyFileWrite(path=_required_path(params, name, index, "wrote"),
+                            tool=name)
     if name in AGY_SHELL_TOOLS:
         command = params.get("CommandLine")
         if not isinstance(command, str) or not command.strip():
-            incomplete.append(name)
-            return AgyGenericCall(tool=name)
+            raise ValueError(
+                f"agy step_update {index} completed {name!r} with no usable "
+                "CommandLine parameter, so what the run executed cannot be "
+                "recovered. Update the shell parameter handling in "
+                "agy_contracts.py once the new spelling is known")
         return AgyShellCommand(command=command)
     return AgyGenericCall(tool=name)
+
+
+def _required_path(params: Mapping[str, Any], name: str, index: int,
+                   verb: str) -> str:
+    """The path a completed read or write acted on, or a failed stream."""
+    path = _read_path(params)
+    if not path:
+        raise ValueError(
+            f"agy step_update {index} completed {name!r} with no usable path "
+            f"parameter, so the file it {verb} cannot be recovered. Add the "
+            "parameter's spelling to _PATH_PARAMETERS in agy_contracts.py once "
+            "it is known")
+    return path
 
 
 def observe_skill_activation(stream: AgyStream,

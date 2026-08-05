@@ -7,6 +7,8 @@ to build one at all, and which facts survive into a typed outcome.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -55,6 +57,46 @@ class TheCommandBoundaryIsOneToken(unittest.TestCase):
                        "agy -i", "agy --log-file /tmp/x"):
             with self.subTest(prefix=prefix), self.assertRaises(ValueError):
                 sb.agy_executable_token(prefix)
+
+    def test_an_install_path_containing_a_space_is_accepted(self) -> None:
+        # Whitespace is not what makes a string a launcher prefix. agy can be
+        # installed somewhere like `/Applications/Google Antigravity/agy`, and
+        # the token reaches the process as one literal argv element, so
+        # rejecting it blocked answer and judge runs on a valid installation.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "Google Antigravity"
+            directory.mkdir()
+            executable = directory / "agy"
+            executable.touch()
+            executable.chmod(0o755)
+            self.assertEqual(sb.agy_executable_token(str(executable)),
+                             str(executable))
+
+    def test_a_spaced_string_that_is_not_an_executable_is_still_refused(
+            self) -> None:
+        # The exemption is "names a real executable", not "contains a slash":
+        # a prefix must not become acceptable by pointing at a path that does
+        # not exist.
+        with self.assertRaises(ValueError):
+            sb.agy_executable_token("/nonexistent/Google Antigravity/agy")
+
+    def test_a_spaced_bare_name_is_refused_even_beside_a_matching_file(
+            self) -> None:
+        # What is checked must be what runs. A bare name is resolved by the OS
+        # against PATH, so admitting one because a file of that name sits in
+        # the current directory would vet a different file than the one that
+        # ends up executing.
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "my agy"
+            executable.touch()
+            executable.chmod(0o755)
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with self.assertRaises(ValueError):
+                    sb.agy_executable_token("my agy")
+            finally:
+                os.chdir(cwd)
 
     def test_a_bare_flag_is_not_an_executable(self) -> None:
         with self.assertRaises(ValueError):
@@ -149,7 +191,8 @@ class TheAnswerPathReportsWhatHappened(unittest.TestCase):
         self.assertEqual(outcome.reason, "authentication failed or timed out")
         self.assertNotEqual(outcome.returncode, 0)
 
-    def test_a_run_that_reported_no_model_falls_back_to_the_request(self) -> None:
+    def test_a_run_that_reported_no_model_is_not_labelled_with_the_request(
+            self) -> None:
         with mock.patch.object(
                 sb, "run_argv_capture",
                 return_value=completed(fixture("stream-json-auth-failure.jsonl"),
@@ -158,7 +201,10 @@ class TheAnswerPathReportsWhatHappened(unittest.TestCase):
                                        model="gemini-3.1-pro-high")
         self.assertEqual(result["model_reported"], [],
                          "the run reported no model of its own")
-        self.assertEqual(result["model"], "gemini-3.1-pro-high")
+        self.assertIsNone(result["model"],
+                          "a run that never reached a model reported none")
+        self.assertEqual(result["model_requested"], "gemini-3.1-pro-high",
+                         "what was asked for is still recorded, separately")
 
     def test_two_reported_models_leave_the_identity_unresolved(self) -> None:
         result = self.invoke(fixture("stream-json-multi-model.jsonl"))
@@ -166,6 +212,39 @@ class TheAnswerPathReportsWhatHappened(unittest.TestCase):
                          ["gemini-3.1-pro-low", "gemini-3.1-pro-high"])
         self.assertIsNone(result["model"],
                           "two reported models cannot collapse to one")
+
+    def test_a_request_cannot_resolve_an_ambiguous_reported_identity(
+            self) -> None:
+        # The regression this closes: with `--model` supplied, the requested
+        # name stood in for the resolved one, so zero-reported and
+        # many-reported both published a confident single identity.
+        with mock.patch.object(
+                sb, "run_argv_capture",
+                return_value=completed(
+                    fixture("stream-json-multi-model.jsonl"))):
+            result = sb.agy_cli_invoke("hi", cwd="/tmp", timeout=30,
+                                       model="gemini-3.1-pro-low")
+        self.assertIsNone(result["model"])
+        self.assertEqual(result["model_requested"], "gemini-3.1-pro-low")
+        self.assertEqual(result["model_reported"],
+                         ["gemini-3.1-pro-low", "gemini-3.1-pro-high"])
+
+    def test_both_model_identities_survive_into_the_outcome(self) -> None:
+        # `model` alone leaves zero-reported and many-reported identical, so
+        # the distinction only exists downstream if these travel with it.
+        with mock.patch.object(
+                sb, "run_argv_capture",
+                return_value=completed(
+                    fixture("stream-json-multi-model.jsonl"))):
+            outcome = sb.AgyBackend().invoke_answer(
+                sb.InvocationRequest(prompt="hi", workspace=Path("/tmp"),
+                                     model="gemini-3.1-pro-low", timeout_s=30))
+        context = sb.outcome_context(outcome)
+        self.assertIsNone(context.model)
+        self.assertEqual(context.metadata_extra["model_requested"],
+                         "gemini-3.1-pro-low")
+        self.assertEqual(list(context.metadata_extra["model_reported"]),
+                         ["gemini-3.1-pro-low", "gemini-3.1-pro-high"])
 
     def test_a_truncated_stream_is_not_a_completed_run(self) -> None:
         result = self.invoke(fixture("stream-json-bad-line.jsonl"))
@@ -230,6 +309,23 @@ class TheJudgePathUsesTheLifecycleFormat(unittest.TestCase):
                                json_schema=kwargs["json_schema"])
         self.assertEqual(argv[argv.index("--json-schema") + 1],
                          kwargs["json_schema"])
+
+    def test_the_judge_keeps_both_model_identities(self) -> None:
+        # `model_label` is the resolved identity or nothing, so a judge run
+        # that reported two models must not be labelled with either, and the
+        # model that was asked for must still be recoverable.
+        with mock.patch.object(
+                sb, "run_argv_capture",
+                return_value=completed(
+                    fixture("stream-json-multi-model.jsonl"))):
+            invocation = sb.agy_judge_invoke(
+                "verdict?", judge_model="gemini-3.1-pro-low", agy_cmd="agy",
+                assertion_schema=VERDICT_SCHEMA, explore_hint="/tmp")
+        self.assertIsNone(invocation.model_label)
+        self.assertEqual(invocation.metadata["model_requested"],
+                         "gemini-3.1-pro-low")
+        self.assertEqual(list(invocation.metadata["model_reported"]),
+                         ["gemini-3.1-pro-low", "gemini-3.1-pro-high"])
 
     def test_the_judge_records_the_approval_it_was_launched_with(self) -> None:
         with mock.patch.object(sb, "run_argv_capture",

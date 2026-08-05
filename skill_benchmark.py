@@ -10306,6 +10306,27 @@ AGY_HARNESS_OWNED_FLAGS = (
 )
 
 
+def _names_existing_executable(token: str) -> bool:
+    """Whether the whole string, spaces included, is an executable file.
+
+    Whitespace alone does not make a string a launcher prefix: an install path
+    such as `/Applications/Google Antigravity/agy` contains a space and is one
+    argv element. The check that matters is whether the string names something
+    executable, which `agy --continue` never does.
+
+    A path separator is required so that what is checked is what runs. A bare
+    name is resolved by the OS against `PATH`, while this check would resolve
+    it against the current directory -- so `"my agy"` could be admitted on the
+    strength of a local file and then exec a different one.
+    """
+    if os.sep not in token and (os.altsep or os.sep) not in token:
+        return False
+    try:
+        return os.path.isfile(token) and os.access(token, os.X_OK)
+    except (OSError, ValueError):
+        return False
+
+
 def agy_executable_token(agy_cmd: str | None) -> str:
     """The one executable token an agy launcher may specify.
 
@@ -10322,6 +10343,14 @@ def agy_executable_token(agy_cmd: str | None) -> str:
     Accepting exactly one token closes all of that by construction, including
     the short aliases a denylist of long flag names would miss, and stays
     correct when the next release adds another alias.
+
+    The whitespace rule is legibility, not containment: the token is bound as
+    `argv[0]` and no agy path uses a shell, so `"agy --continue"` would reach
+    the process as one literal filename and fail to exec. Rejecting it turns
+    that confusing spawn failure into a clear message. An install path that
+    happens to contain a space is therefore admitted when it names a real
+    executable -- PLAN.md allows "a path or bare command name", and refusing
+    one would have blocked answer and judge runs on a valid installation.
     """
     if agy_cmd is None:
         return AGY_DEFAULT_CMD
@@ -10333,7 +10362,7 @@ def agy_executable_token(agy_cmd: str | None) -> str:
     validate_json_text(token, "agy executable")
     if "\x00" in token:
         raise ValueError("--agy-cmd executable cannot contain NUL")
-    if len(token.split()) > 1:
+    if len(token.split()) > 1 and not _names_existing_executable(token):
         raise ValueError(
             "--agy-cmd must be one executable token with no arguments; a "
             "launcher prefix could add flags such as --continue/-c or "
@@ -10421,7 +10450,10 @@ def _agy_no_process_result(error: str, *, model: str | None,
         "answer": "", "provider_error": None, "protocol_error": error,
         "stdout": "", "stderr": error, "returncode": 127, "timed_out": False,
         "invocation_state": InvocationState.SPAWN_FAILED.value,
-        "elapsed_ms": None, "usage": None, "cost_usd": None, "model": model,
+        # No process ran, so agy reported no model of its own; only the request
+        # is known.
+        "elapsed_ms": None, "usage": None, "cost_usd": None, "model": None,
+        "model_requested": model, "model_reported": [],
         "trace_text": "", "trace_utf8_valid": True,
         "environment": {**AGY_CONFIG_METADATA,
                         "ambient_tools_auto_approved": auto_approve,
@@ -10488,8 +10520,13 @@ def agy_cli_invoke(prompt: str, *, model: str | None = None,
                   if isinstance(parsed.usage, AgyUsagePresent) else None),
         "cost_usd": None,
         # Requested and reported model identities stay distinct: a run that
-        # reported no model is not labelled with the one that was asked for.
-        "model": parsed.model.resolved or model,
+        # reported no model is not labelled with the one that was asked for,
+        # and a run that reported two does not collapse to either. `model` is
+        # what agy said it used and nothing else; substituting the requested
+        # name made both of those cases indistinguishable from a run that
+        # actually reported it.
+        "model": parsed.model.resolved,
+        "model_requested": model,
         "model_reported": list(parsed.model.reported),
         "trace_utf8_valid": result.stdout_utf8_valid,
         # The raw stream is the trace: it is already the normalized
@@ -10727,7 +10764,16 @@ class AgyBackend(AgentBackend):
                    if isinstance(result.get("model"), str) else None),
             trace_text=result.get("trace_text") or "",
             trace_utf8_valid=(result.get("trace_utf8_valid") is not False),
-            metadata_extra={},
+            # Both identities survive into the run's metadata. `model` alone
+            # cannot distinguish a run that reported nothing from one that
+            # reported several -- both leave it null -- so dropping these made
+            # the zero/one/many contract unobservable downstream.
+            metadata_extra={
+                "model_requested": (result.get("model_requested")
+                                    if isinstance(result.get("model_requested"),
+                                                  str) else None),
+                "model_reported": list(result.get("model_reported") or ()),
+            },
             environment={"runner": "agy", **environment},
         )
 
@@ -12451,7 +12497,14 @@ def agy_judge_invoke(
     stderr = result.get("stderr", "") or ""
     if isinstance(error, str):
         stderr = _stderr_with_warning(stderr, error)
-    metadata: dict[str, Any] = {}
+    # `model_label` below is the resolved identity or nothing, so the request
+    # and the full reported list travel here rather than being folded into it.
+    metadata: dict[str, Any] = {
+        "model_requested": (result.get("model_requested")
+                            if isinstance(result.get("model_requested"), str)
+                            else None),
+        "model_reported": list(result.get("model_reported") or ()),
+    }
     environment = result.get("environment")
     if isinstance(environment, Mapping):
         metadata["environment"] = dict(environment)
