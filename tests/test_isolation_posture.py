@@ -4,9 +4,9 @@ Capability booleans cannot express conditional safety such as "works only on a
 disposable host".  These tests hold the vocabulary closed and stop a backend
 that cannot be contained from quietly advertising unattended trigger runs.
 """
-from __future__ import annotations
-
+import os
 import unittest
+from unittest import mock
 
 import agent_capabilities as ac
 
@@ -86,12 +86,21 @@ class UncontainedBackendsCannotAdvertiseTrigger(unittest.TestCase):
         self.assertTrue(capability.isolation.disposable_host_required)
 
     def test_an_explicit_operator_optin_permits_trigger(self) -> None:
-        capability = capabilities(
-            autonomous_trigger=True,
-            isolation=ac.IsolationPosture(
-                **self.UNCONTAINED, trigger_optin_env="ALLOW_UNCONTAINED_TRIGGER"))
-        self.assertEqual(capability.isolation.trigger_optin_env,
-                         "ALLOW_UNCONTAINED_TRIGGER")
+        with mock.patch.dict(os.environ, {"ALLOW_UNCONTAINED_TRIGGER": "1"}):
+            capability = capabilities(
+                autonomous_trigger=True,
+                isolation=ac.IsolationPosture(
+                    **self.UNCONTAINED, trigger_optin_env="ALLOW_UNCONTAINED_TRIGGER"))
+            self.assertEqual(capability.isolation.trigger_optin_env,
+                             "ALLOW_UNCONTAINED_TRIGGER")
+
+    def test_unset_operator_optin_env_rejects_trigger(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError) as caught:
+            capabilities(
+                autonomous_trigger=True,
+                isolation=ac.IsolationPosture(
+                    **self.UNCONTAINED, trigger_optin_env="ALLOW_UNCONTAINED_TRIGGER"))
+        self.assertIn("operator opt-in", str(caught.exception))
 
     def test_no_shipped_backend_relies_on_the_optin_escape_hatch(self) -> None:
         for name, registration in ac.BACKENDS.items():

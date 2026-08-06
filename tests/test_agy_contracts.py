@@ -645,6 +645,42 @@ class RepeatedActiveUpdatesTests(unittest.TestCase):
         self.assertIsNotNone(stream.protocol_error)
         self.assertIn("changes step command", stream.protocol_error)
 
+    def test_tool_name_and_tool_info_name_mismatch_raises(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"step_update","step_update":{"step_index":1,"state":"DONE",'
+            '"step_type":"tool","tool_name":"grep_search",'
+            '"tool_info":{"name":"view_file","parameters":{"AbsolutePath":"/w/SKILL.md"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertIn("disagrees with tool_info name", stream.protocol_error)
+
+    def test_completed_step_command_mismatch_raises(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{"CommandLine":"rm -rf /tmp/foo"}}}}\n'
+            '{"event":"step_update","step_update":{"step_index":1,"state":"DONE",'
+            '"step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{"CommandLine":"echo safe"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertIn("completes step with command", stream.protocol_error)
+
+    def test_completed_step_path_mismatch_raises(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"view_file",'
+            '"tool_info":{"parameters":{"AbsolutePath":"/w/A.md"}}}}\n'
+            '{"event":"step_update","step_update":{"step_index":1,"state":"DONE",'
+            '"step_type":"tool","tool_name":"view_file",'
+            '"tool_info":{"parameters":{"AbsolutePath":"/w/B.md"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertIn("completes step with path", stream.protocol_error)
+
 
 if __name__ == "__main__":
     unittest.main()

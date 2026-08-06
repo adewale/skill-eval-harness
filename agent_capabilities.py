@@ -12,6 +12,7 @@ registries. Dedicated live-smoke commands are projected separately.
 from __future__ import annotations
 
 import importlib
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -252,7 +253,8 @@ class AgentCapabilities:
         # default to inherit from a registry row.
         if ((self.autonomous_trigger or self.trigger_ablation)
                 and self.isolation.disposable_host_required
-                and self.isolation.trigger_optin_env is None):
+                and (self.isolation.trigger_optin_env is None
+                     or not os.environ.get(self.isolation.trigger_optin_env, "").strip())):
             raise ValueError(
                 "a backend that cannot be contained must not advertise "
                 "autonomous trigger or trigger ablation without an explicit "

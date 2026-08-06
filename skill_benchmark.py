@@ -8238,12 +8238,18 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
         or (isinstance(e.get("name"), str) and e["name"] in AGY_SEARCH_TOOLS)
         for e in events
     )
+    has_unfinished_skill = any(
+        (e.get("type") == "skill_load" or event_mentions_skill_file(e))
+        for e in events
+        if not event_is_completed(e)
+    )
     if skill_events:
         skill_invoked_val: bool | None = True
-    elif has_search:
+    elif has_search or has_unfinished_skill:
         skill_invoked_val = None
     else:
         skill_invoked_val = False
+
 
     metrics: dict[str, Any] = {
         "schema_version": 2,

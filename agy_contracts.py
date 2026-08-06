@@ -766,6 +766,12 @@ class AgyStream:
                         continue
                     name = _nonempty_string(
                         step.get("tool_name"), f"agy step_update {index}.tool_name")
+                    info = step.get("tool_info")
+                    if isinstance(info, Mapping):
+                        info_name = info.get("name") if isinstance(info.get("name"), str) else info.get("tool_name")
+                        if isinstance(info_name, str) and info_name.strip() and info_name.strip() != name:
+                            raise ValueError(
+                                f"agy step_update {index} tool_name {name!r} disagrees with tool_info name {info_name.strip()!r}")
                     # Read on both paths.  A started step is published too, so a
                     # tool_info this module cannot read is unreadable claimed
                     # activity whichever state the record is in.
@@ -820,14 +826,25 @@ class AgyStream:
                             f"update for a step already completed")
                     closed_steps.add(step_id)
                     started = open_steps.pop(step_id, None)
-                    if started is not None and started.tool != name:
-                        # The same step cannot have been two different tools.
-                        # Reconciling on identity alone here would let a DONE
-                        # close a step it does not describe, so the two records
-                        # disagreeing is a protocol this adapter cannot read.
-                        raise ValueError(
-                            f"agy step_update {index} completes a step started "
-                            f"as {started.tool!r} under the name {name!r}")
+                    if started is not None:
+                        if started.tool != name:
+                            # The same step cannot have been two different tools.
+                            # Reconciling on identity alone here would let a DONE
+                            # close a step it does not describe, so the two records
+                            # disagreeing is a protocol this adapter cannot read.
+                            raise ValueError(
+                                f"agy step_update {index} completes a step started "
+                                f"as {started.tool!r} under the name {name!r}")
+                        done_cmd = _started_command(params)
+                        done_path = _read_path(params)
+                        if started.command and done_cmd and started.command != done_cmd:
+                            raise ValueError(
+                                f"agy step_update {index} completes step with command "
+                                f"{done_cmd!r} but started as {started.command!r}")
+                        if started.path and done_path and started.path != done_path:
+                            raise ValueError(
+                                f"agy step_update {index} completes step with path "
+                                f"{done_path!r} but started as {started.path!r}")
                     tools.append(_tool_evidence(name, params, index))
                     tool_records.append(index)
                 else:
