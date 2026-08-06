@@ -526,7 +526,18 @@ class TheTraceDialectSeparatesSearchFromReads(unittest.TestCase):
             '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
         records, errors = sb.parse_trace_jsonl_text(text)
         self.assertEqual(errors, [])
-        events, metrics = sb.normalize_trace_records(records, source="agy")
+        _events, metrics = sb.normalize_trace_records(records, source="agy")
+        self.assertIsNone(metrics.get("skill_invoked"))
+
+    def test_pathless_unfinished_skill_read_preserves_skill_invoked_unavailable(self) -> None:
+        text = (
+            '{"event":"step_update","step_update":{"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"view_file"}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        records, errors = sb.parse_trace_jsonl_text(text)
+        self.assertEqual(errors, [])
+        _events, metrics = sb.normalize_trace_records(records, source="agy")
         self.assertIsNone(metrics.get("skill_invoked"))
 
 

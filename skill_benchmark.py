@@ -120,6 +120,7 @@ from agent_capabilities import (
     workspace_builder_implementations,
 )
 from agy_contracts import (
+    AGY_FILE_READ_TOOLS,
     AGY_SEARCH_TOOLS,
     AgyFileRead,
     AgyFileWrite,
@@ -8233,22 +8234,29 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
             token_totals["input_tokens"] + token_totals["output_tokens"])
     counts = trace_event_counts(events)
     skill_events = counts["skill_events"]
-    has_search = any(
-        e.get("is_search") is True
-        or (isinstance(e.get("name"), str) and e["name"] in AGY_SEARCH_TOOLS)
-        for e in events
-    )
-    has_unfinished_skill = any(
-        (e.get("type") == "skill_load" or event_mentions_skill_file(e))
-        for e in events
-        if not event_is_completed(e)
-    )
-    if skill_events:
-        skill_invoked_val: bool | None = True
-    elif has_search or has_unfinished_skill:
-        skill_invoked_val = None
+    if source.casefold() == "agy":
+        has_search = any(
+            e.get("is_search") is True
+            or (isinstance(e.get("name"), str) and e["name"] in AGY_SEARCH_TOOLS)
+            for e in events
+        )
+        has_unfinished_skill = any(
+            (
+                e.get("type") == "skill_load"
+                or (isinstance(e.get("name"), str) and e["name"] in AGY_FILE_READ_TOOLS)
+                or event_mentions_skill_file(e)
+            )
+            for e in events
+            if not event_is_completed(e)
+        )
+        if skill_events:
+            skill_invoked_val: bool | None = True
+        elif has_search or has_unfinished_skill:
+            skill_invoked_val = None
+        else:
+            skill_invoked_val = False
     else:
-        skill_invoked_val = False
+        skill_invoked_val = bool(skill_events)
 
 
     metrics: dict[str, Any] = {
@@ -10801,7 +10809,8 @@ class AgyBackend(AgentBackend):
             cwd=request.workspace,
             output="stream-json",
         )
-        returncode = cast(int, result.get("returncode"))
+        raw_rc = result.get("returncode")
+        returncode = raw_rc if isinstance(raw_rc, int) else 1
         provider_error = result.get("provider_error")
         protocol_error = result.get("protocol_error")
         # A provider error is authoritative whatever the exit code. A protocol
@@ -12556,7 +12565,8 @@ def agy_judge_invoke(
         # A judge reads and decides; it has no reason to run shell tools.
         auto_approve=False,
     )
-    returncode = cast(int, result.get("returncode"))
+    raw_rc = result.get("returncode")
+    returncode = raw_rc if isinstance(raw_rc, int) else 1
     provider_error = result.get("provider_error")
     protocol_error = result.get("protocol_error")
     error = (

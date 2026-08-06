@@ -24,6 +24,7 @@ from agy_contracts import (
     AgyUsageInvalid,
     AgyUsagePresent,
     observe_skill_activation,
+    parse_agy_usage,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agy"
@@ -162,6 +163,10 @@ class AbsentTelemetryIsNotZero(unittest.TestCase):
     def test_missing_usage_block_is_absent(self) -> None:
         stream = AgyStream.parse(fixture("stream-json-no-usage.jsonl"))
         self.assertIsInstance(stream.usage, AgyUsageAbsent)
+
+    def test_unknown_usage_counter_is_invalid(self) -> None:
+        usage = parse_agy_usage({"billable_tokens": 7})
+        self.assertIsInstance(usage, AgyUsageInvalid)
 
 
 class ProviderErrorSurvivesNonzeroExit(unittest.TestCase):

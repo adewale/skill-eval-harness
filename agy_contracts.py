@@ -175,8 +175,10 @@ class AgyUsagePresent:
             raise ValueError("present usage needs at least one counter")
         for key, value in self.counters.items():
             _nonempty_string(key, "agy usage counter name")
+            if key not in AGY_USAGE_COUNTERS:
+                raise ValueError(f"unknown usage counter {key!r}")
             _nonnegative_int(value, f"agy usage {key}")
-        if not any(self.counters.get(key) for key in AGY_USAGE_COUNTERS):
+        if not any(self.counters.values()):
             raise ValueError("all-zero usage is absent telemetry, not a measurement")
         object.__setattr__(self, "counters", freeze_json_mapping(
             self.counters, "agy usage"))
@@ -221,6 +223,8 @@ def parse_agy_usage(raw: Any) -> AgyUsage:
     for key, value in raw.items():
         if not isinstance(key, str) or not key.strip():
             return AgyUsageInvalid("usage counter name is not a string")
+        if key not in AGY_USAGE_COUNTERS:
+            return AgyUsageInvalid(f"unknown usage counter {key!r}")
         if isinstance(value, bool) or not isinstance(value, int):
             return AgyUsageInvalid(f"usage {key} is not an integer")
         if value < 0:
@@ -228,7 +232,7 @@ def parse_agy_usage(raw: Any) -> AgyUsage:
         counters[key] = value
     if not counters:
         return AgyUsageAbsent("usage block is empty")
-    if not any(counters.get(key) for key in AGY_USAGE_COUNTERS):
+    if not any(counters.values()):
         return AgyUsageAbsent(
             "every reported counter is zero, so no model work was measured")
     total = counters.get("total_tokens")
