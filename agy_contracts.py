@@ -615,6 +615,7 @@ class AgyStream:
     def invalid(cls, message: str, *,
                 records: tuple[Mapping[str, Any], ...] = (),
                 conversation_id: str | None = None,
+                model: AgyModelIdentity | None = None,
                 provider_error: str | None = None,
                 advertised_tools: tuple[str, ...] = ()) -> AgyStream:
         """A stream that did not parse, keeping what was established first.
@@ -625,7 +626,10 @@ class AgyStream:
         pass instead of one failed run per new name -- so it must not be
         discarded by the failure it diagnoses.
         """
+        if model is None:
+            model = AgyModelIdentity()
         return cls(records=records, conversation_id=conversation_id,
+                   model=model,
                    usage=AgyUsageAbsent("stream did not parse"),
                    advertised_tools=advertised_tools,
                    provider_error=provider_error, protocol_error=message)
@@ -659,12 +663,16 @@ class AgyStream:
                 continue
             if not isinstance(value, Mapping):
                 return cls.invalid(f"non-object JSONL at line {line_number}",
-                                   records=tuple(materialized))
+                                   records=tuple(materialized),
+                                   model=AgyModelIdentity(requested=requested_model,
+                                                          configured=configured_model))
             materialized.append(value)
 
         records = tuple(materialized)
         if not records:
-            return cls.invalid("agy stream is empty")
+            return cls.invalid("agy stream is empty",
+                               model=AgyModelIdentity(requested=requested_model,
+                                                      configured=configured_model))
 
         reported: list[str] = []
         advertised: list[str] = []
@@ -680,10 +688,9 @@ class AgyStream:
         # only if it is still in here when the stream ends.
         open_steps: dict[object, AgyStartedTool] = {}
         # Step identities that have already reported a terminal update.  One
-        # lifecycle is one tool call: without this, a repeated DONE for the same
-        # step appended a second piece of evidence -- the first record closed
-        # the open step and the second found nothing open, so both passed
-        # through and doubled every counter the step fed.
+        # lifecycle is one tool call: without this, a repeated DONE or late ACTIVE
+        # for the same step appended a second piece of evidence or opened an
+        # already-closed step.
         closed_steps: set[object] = set()
         saw_result = False
 
@@ -694,6 +701,9 @@ class AgyStream:
                     return cls.invalid(
                         f"unknown event {event!r} at record {index}",
                         records=records, conversation_id=conversation_id,
+                        model=AgyModelIdentity(requested=requested_model,
+                                               configured=configured_model,
+                                               reported=tuple(reported)),
                         advertised_tools=tuple(advertised))
                 if saw_result:
                     # The result is terminal by definition.  Anything after it
@@ -716,8 +726,12 @@ class AgyStream:
                 for candidate in (record.get("conversation_id"),
                                   payload.get("conversation_id")
                                   if isinstance(payload, Mapping) else None):
-                    if not isinstance(candidate, str) or not candidate:
+                    if candidate is None or candidate == "":
                         continue
+                    if not isinstance(candidate, str):
+                        raise ValueError(
+                            f"agy record {index} carries non-string conversation_id "
+                            f"{candidate!r}")
                     if (conversation_id is not None
                             and candidate != conversation_id):
                         raise ValueError(
@@ -781,6 +795,12 @@ class AgyStream:
                     # activity whichever state the record is in.
                     params = _step_parameters(step, index)
                     step_id = _step_identity(step, conversation_id, index)
+                    if step_id in closed_steps:
+                        # One lifecycle is one tool call.  A step already completed
+                        # cannot receive further updates (ACTIVE or DONE).
+                        raise ValueError(
+                            f"agy step_update {index} is an update for a step "
+                            f"already completed")
                     if state != AGY_DONE_STATE:
                         # A tool that started is not a tool that finished.  It is
                         # held open so an observation can be marked incomplete,
@@ -820,14 +840,6 @@ class AgyStream:
                             command=cmd,
                             path=path)
                         continue
-                    if step_id in closed_steps:
-                        # One lifecycle is one tool call.  A second DONE found
-                        # nothing open and appended a second piece of evidence,
-                        # so a repeated terminal update doubled the step's tool,
-                        # command and file counts.
-                        raise ValueError(
-                            f"agy step_update {index} is a second terminal "
-                            f"update for a step already completed")
                     closed_steps.add(step_id)
                     started = open_steps.pop(step_id, None)
                     if started is not None:
@@ -878,6 +890,9 @@ class AgyStream:
         except (TypeError, ValueError) as exc:
             return cls.invalid(str(exc), records=records,
                                conversation_id=conversation_id,
+                               model=AgyModelIdentity(requested=requested_model,
+                                                      configured=configured_model,
+                                                      reported=tuple(reported)),
                                provider_error=provider_error,
                                advertised_tools=tuple(advertised))
 

@@ -686,6 +686,36 @@ class RepeatedActiveUpdatesTests(unittest.TestCase):
         self.assertIsNotNone(stream.protocol_error)
         self.assertIn("completes step with path", stream.protocol_error)
 
+    def test_present_non_string_conversation_id_is_rejected(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"init","conversation_id":12345,'
+            '"init":{"model":"gemini-3.1-pro-low"}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertIn("non-string conversation_id", stream.protocol_error)
+
+    def test_active_update_after_terminal_step_is_rejected(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"step_update","step_update":{"step_index":1,"state":"DONE",'
+            '"step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{"CommandLine":"ls"}}}}\n'
+            '{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{"CommandLine":"ls"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertIn("already completed", stream.protocol_error)
+
+    def test_established_model_identity_preserved_on_parse_failure(self) -> None:
+        stream = AgyStream.parse(
+            '{"event":"init","init":{"model":"gemini-3.1-pro-low"}}\n'
+            '{"event":"step_update","step_update":{"step_type":"unknown_type"}}\n')
+        self.assertIsNotNone(stream.protocol_error)
+        self.assertEqual(stream.model.reported, ("gemini-3.1-pro-low",))
+
 
 if __name__ == "__main__":
     unittest.main()
+
