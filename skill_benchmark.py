@@ -120,7 +120,6 @@ from agent_capabilities import (
     workspace_builder_implementations,
 )
 from agy_contracts import (
-    AGY_FILE_READ_TOOLS,
     AGY_SEARCH_TOOLS,
     AgyFileRead,
     AgyFileWrite,
@@ -8240,18 +8239,15 @@ def normalize_trace_records(records: list[dict[str, Any]], *, source: str = "gen
             or (isinstance(e.get("name"), str) and e["name"] in AGY_SEARCH_TOOLS)
             for e in events
         )
-        has_unfinished_skill = any(
-            (
-                e.get("type") == "skill_load"
-                or (isinstance(e.get("name"), str) and e["name"] in AGY_FILE_READ_TOOLS)
-                or event_mentions_skill_file(e)
-            )
-            for e in events
-            if not event_is_completed(e)
-        )
+        # `observe_skill_activation` treats every unfinished tool step -- not
+        # just an unfinished read -- as unavailable: a started shell, write, or
+        # generic call is exactly as unresolved as a started read for whether
+        # the skill was activated. Matching that here keeps an incomplete
+        # stream from being scored as a clean negative.
+        has_unfinished_tool = any(not event_is_completed(e) for e in events)
         if skill_events:
             skill_invoked_val: bool | None = True
-        elif has_search or has_unfinished_skill:
+        elif has_search or has_unfinished_tool:
             skill_invoked_val = None
         else:
             skill_invoked_val = False
@@ -10613,6 +10609,11 @@ def agy_cli_invoke(prompt: str, *, model: str | None = None,
         # The raw stream is the trace: it is already the normalized
         # dialect's input, so re-shaping it here would lose evidence.
         "trace_text": result.stdout,
+        # A judge that observes any tool lifecycle -- finished or not -- has
+        # left the text/trajectory-only contract every non-Claude judge is
+        # bound to, whatever `auto_approve` was asked with.
+        "tool_calls": len(parsed.tools),
+        "incomplete_tool_calls": len(parsed.incomplete_tools),
         "environment": {
             **AGY_CONFIG_METADATA, **dict(result.adapter_metadata or {}),
             "ambient_tools_auto_approved": auto_approve,
@@ -12569,12 +12570,27 @@ def agy_judge_invoke(
     returncode = raw_rc if isinstance(raw_rc, int) else 1
     provider_error = result.get("provider_error")
     protocol_error = result.get("protocol_error")
+    tool_calls = result.get("tool_calls")
+    incomplete_tool_calls = result.get("incomplete_tool_calls")
+    # `auto_approve=False` above only withholds ambient approval; it does not
+    # stop the model from calling a tool the CLI still advertises. A judge is
+    # text/trajectory-only, so any lifecycle it emits -- finished or not --
+    # means it consulted something the schema-valid verdict never disclosed.
+    tool_error = (
+        f"agy judge observed {tool_calls} completed tool lifecycle(s)"
+        if isinstance(tool_calls, int) and tool_calls
+        else f"agy judge left {incomplete_tool_calls} tool lifecycle(s) unfinished"
+        if isinstance(incomplete_tool_calls, int) and incomplete_tool_calls
+        else None
+    )
     error = (
         provider_error
         if isinstance(provider_error, str) and provider_error
         else protocol_error
         if (returncode == 0 and isinstance(protocol_error, str)
             and protocol_error)
+        else tool_error
+        if returncode == 0 and tool_error is not None
         else None
     )
     stderr = result.get("stderr", "") or ""
@@ -12587,6 +12603,10 @@ def agy_judge_invoke(
                             if isinstance(result.get("model_requested"), str)
                             else None),
         "model_reported": list(result.get("model_reported") or ()),
+        "tool_calls": tool_calls if isinstance(tool_calls, int) else None,
+        "incomplete_tool_calls": (incomplete_tool_calls
+                                  if isinstance(incomplete_tool_calls, int)
+                                  else None),
     }
     environment = result.get("environment")
     if isinstance(environment, Mapping):
@@ -12596,6 +12616,10 @@ def agy_judge_invoke(
         stdout=result.get("answer") or "",
         stderr=stderr,
         returncode=returncode,
+        # The raw stream is retained whether or not the run is accepted, so a
+        # rejected tool-using verdict can still be audited after the fact.
+        raw_response=(result.get("trace_text")
+                      if isinstance(result.get("trace_text"), str) else None),
         invocation_state=_judge_invocation_state(
             result, returncode=returncode, provider_error=error),
         provider_error=error,

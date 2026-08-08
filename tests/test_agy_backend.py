@@ -362,11 +362,39 @@ class TheJudgePathUsesTheLifecycleFormat(unittest.TestCase):
         self.assertTrue(result["environment"]["ambient_tools_auto_approved"])
 
     def test_a_judge_verdict_survives_the_stream_format(self) -> None:
-        invocation = self.judge(fixture("stream-json-success.jsonl"))
+        invocation = self.judge(fixture("stream-json-judge-success.jsonl"))
         self.assertEqual(invocation.stdout,
                          "The current stable version is 2.11.2.")
         self.assertIsNone(invocation.provider_error)
         self.assertEqual(invocation.usage["total_tokens"], 14439)
+
+    def test_a_completed_tool_lifecycle_is_rejected(self) -> None:
+        # `auto_approve=False` withholds ambient approval; it does not stop
+        # the model from calling a tool the CLI still advertises. A judge is
+        # text/trajectory-only, so a schema-valid verdict that also shows
+        # completed tool activity must not be accepted as a clean read.
+        invocation = self.judge(fixture("stream-json-success.jsonl"))
+        self.assertIsNotNone(invocation.provider_error)
+        self.assertIn("tool", invocation.provider_error)
+        self.assertFalse(invocation.succeeded)
+        self.assertEqual(invocation.metadata["tool_calls"], 2)
+
+    def test_the_raw_stream_survives_a_rejected_tool_using_verdict(self) -> None:
+        raw = fixture("stream-json-success.jsonl")
+        invocation = self.judge(raw)
+        self.assertEqual(invocation.raw_response, raw)
+
+    def test_an_unfinished_tool_lifecycle_is_rejected(self) -> None:
+        stream = (
+            '{"event":"step_update","step_update":{"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"run_command","tool_info":'
+            '{"parameters":{"CommandLine":"ls"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        invocation = self.judge(stream)
+        self.assertIsNotNone(invocation.provider_error)
+        self.assertIn("unfinished", invocation.provider_error)
+        self.assertFalse(invocation.succeeded)
 
     def test_a_judge_auth_failure_keeps_its_diagnosis(self) -> None:
         invocation = self.judge(fixture("stream-json-auth-failure.jsonl"),
@@ -533,6 +561,24 @@ class TheTraceDialectSeparatesSearchFromReads(unittest.TestCase):
         text = (
             '{"event":"step_update","step_update":{"state":"ACTIVE",'
             '"step_type":"tool","tool_name":"view_file"}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        records, errors = sb.parse_trace_jsonl_text(text)
+        self.assertEqual(errors, [])
+        _events, metrics = sb.normalize_trace_records(records, source="agy")
+        self.assertIsNone(metrics.get("skill_invoked"))
+
+    def test_an_unfinished_unrelated_tool_preserves_skill_invoked_unavailable(
+            self) -> None:
+        # `observe_skill_activation` treats every unfinished tool step as
+        # unavailable, not just an unfinished read: a started shell command
+        # is exactly as unresolved as a started file read for whether the
+        # skill was activated. A run that starts (but never finishes) a
+        # `run_command` must not be scored as a clean `skill_invoked=False`.
+        text = (
+            '{"event":"step_update","step_update":{"state":"ACTIVE",'
+            '"step_type":"tool","tool_name":"run_command","tool_info":'
+            '{"parameters":{"CommandLine":"ls"}}}}\n'
             '{"event":"result","result":{"status":"SUCCESS","response":"ok",'
             '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
         records, errors = sb.parse_trace_jsonl_text(text)

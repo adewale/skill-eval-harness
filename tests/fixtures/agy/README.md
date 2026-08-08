@@ -30,6 +30,7 @@ fails the stream rather than defaulting to a generic call. The procedure is
 | `stream-json-no-usage.jsonl` | 1.1.8 | derived from the success capture | success capture with `result.usage` removed |
 | `stream-json-nonstring-response.jsonl` | 1.1.8 | derived from the success capture | success capture with `response` replaced by an object |
 | `stream-json-unknown-event.jsonl` | 1.1.8 | derived from the success capture | success capture with an invented `tool_invocation` event |
+| `stream-json-judge-success.jsonl` | 1.1.8 | derived from the success capture | success capture with both `tool` step_updates removed |
 | `stream-json-auth-failure.jsonl` | **1.1.9** | **real capture, verbatim** | see below |
 | `stream-json-search-only.jsonl` | 1.1.8 vocabulary | **hand-constructed** | see below |
 | `stream-json-multi-model.jsonl` | 1.1.8 vocabulary | **hand-constructed** | see below |
@@ -86,6 +87,16 @@ One assumption is hand-made and flagged for step 10: `grep_search` is given a
 recorded, and the earlier branch's path extraction falls back to any parameter
 whose name ends in `Path`/`File`, so the exact spelling changes nothing about
 the defect — but it should be replaced with an observed name.
+
+## `stream-json-judge-success.jsonl` — derived from the success capture
+
+`stream-json-success.jsonl` is a real *answer* transcript, so it legitimately
+contains a completed `run_command` and `view_file`. A judge is text/trajectory
+only and must reject any run that shows tool activity, so the same fixture
+cannot also stand in for a judge's clean-verdict case. This fixture is the
+success capture with both `tool` step_updates removed, keeping the identical
+`response` and `result.usage` so judge-path tests can assert the verdict and
+telemetry survive the stream format without also exercising tool rejection.
 
 ## `stream-json-multi-model.jsonl` — hand-constructed
 
