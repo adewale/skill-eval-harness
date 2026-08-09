@@ -705,6 +705,20 @@ class AgyStream:
                                                configured=configured_model,
                                                reported=tuple(reported)),
                         advertised_tools=tuple(advertised))
+                present_payloads = AGY_EVENT_TYPES & record.keys()
+                if len(present_payloads) > 1:
+                    # Dispatch reads only record[event]; a record naming more than
+                    # one recognized payload key would silently drop whichever one
+                    # the event field doesn't point to (e.g. a "result" event that
+                    # also carries a "step_update" payload loses that tool step).
+                    return cls.invalid(
+                        f"record {index} carries multiple event payloads "
+                        f"{sorted(present_payloads)!r}",
+                        records=records, conversation_id=conversation_id,
+                        model=AgyModelIdentity(requested=requested_model,
+                                               configured=configured_model,
+                                               reported=tuple(reported)),
+                        advertised_tools=tuple(advertised))
                 if saw_result:
                     # The result is terminal by definition.  Anything after it
                     # is a second run's output concatenated onto this one, or a

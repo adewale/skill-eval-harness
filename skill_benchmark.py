@@ -7078,9 +7078,14 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
 
     if atype == "skill_invoked":
         expected = bool(assertion.get("expected", True))
-        if metrics.get("skill_invoked") is None and events is not None and not any(
+        if ("skill_invoked" in metrics and metrics["skill_invoked"] is None
+                and events is not None and not any(
                 event_is_completed(e) and (e.get("type") == "skill_load" or event_mentions_skill_file(e))
-                for e in events):
+                for e in events)):
+            # An explicit None (agy: search-only or an unfinished tool step) is
+            # a real "unavailable" measurement. A legacy artifact that simply
+            # predates this metric has no key at all and must fall through to
+            # the event-based evidence below instead of being treated the same.
             return None, f"skill invocation evidence is unavailable ({event_error or 'search-only or inconclusive trace'})"
         has_metric = isinstance(metrics.get("skill_invoked"), bool)
         invoked = bool(metrics.get("skill_invoked")) if has_metric else False
@@ -10556,14 +10561,16 @@ def agy_cli_invoke(prompt: str, *, model: str | None = None,
         argv = agy_cli_argv(
             agy_cmd, prompt=prompt, cwd=workspace, output=output, model=model,
             auto_approve=auto_approve, json_schema=json_schema, timeout=timeout)
+        plan = ProcessInvocationPlan.from_values(
+            argv, input_text="", cwd=workspace, timeout_s=timeout)
     except (TypeError, ValueError) as exc:
         # Invalid launch construction never became a process, so it is a spawn
-        # failure rather than a provider failure.
+        # failure rather than a provider failure. Plan construction (e.g. a
+        # prompt containing NUL) can fail here just as argv construction can.
         return _agy_no_process_result(
             f"agy invocation setup failed before spawn: {exc}", model=model,
             auto_approve=auto_approve)
-    result = run_argv_capture(ProcessInvocationPlan.from_values(
-        argv, input_text="", cwd=workspace, timeout_s=timeout))
+    result = run_argv_capture(plan)
     parsed = (AgyStream.parse(result.stdout, returncode=result.returncode,
                               requested_model=model)
               if result.stdout_utf8_valid
