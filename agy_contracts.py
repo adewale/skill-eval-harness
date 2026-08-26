@@ -6,7 +6,7 @@ constructs only complete observations or explicit failures.  Callers never infer
 success from a process exit, never reconstruct an answer from arbitrary trace
 bytes, and never receive a zero-valued measurement in place of a missing one.
 
-Three properties are load-bearing and each closes a defect the earlier adapter
+Four properties are load-bearing and each closes a defect the earlier adapter
 shipped:
 
 * **Search is not a read.**  ``AGY_FILE_READ_TOOLS`` and ``AGY_SEARCH_TOOLS`` are
@@ -19,6 +19,11 @@ shipped:
   run that never reached a model rather than a run that spent nothing.
 * **A nonzero exit does not erase a diagnosis.**  The provider error is taken
   from the parsed stream regardless of return code.
+* **A denied tool is not a completed one.**  A step whose terminal state is
+  ``ERROR`` (observed live: a headless permission gate auto-denying
+  ``run_command``) closes its lifecycle like ``DONE`` but contributes no
+  ``tools`` evidence, unlike ``DONE`` -- it ran and failed, producing no
+  effect a caller should treat as something the model did.
 """
 from __future__ import annotations
 
@@ -34,7 +39,7 @@ from json_contracts import (
 )
 
 # ---------------------------------------------------------------------------
-# Closed vocabularies, observed across real agy 1.1.8 and 1.1.9 runs.
+# Closed vocabularies, observed across real agy 1.1.8, 1.1.9 and 1.1.21 runs.
 #
 # Each is deliberately closed: a value a future release adds fails loudly on the
 # next run rather than being dropped and mis-scored, and the fix is to add the
@@ -47,11 +52,26 @@ from json_contracts import (
 # ---------------------------------------------------------------------------
 
 AGY_EVENT_TYPES = frozenset({"init", "step_update", "result"})
-AGY_STEP_STATES = frozenset({"ACTIVE", "DONE"})
+# `ERROR` was observed live on 1.1.21: a tool denied by the headless
+# permission gate (e.g. `run_command` without `--dangerously-skip-permissions`)
+# reports ACTIVE then ERROR for the same step_index, never DONE.  It is a
+# completed, failed lifecycle -- the tool ran and terminated, producing no
+# effect -- so it closes its step like DONE rather than leaving it open like
+# ACTIVE, but contributes no tool evidence.
+AGY_STEP_STATES = frozenset({"ACTIVE", "DONE", "ERROR"})
 AGY_STEP_TYPES = frozenset({"tool", "user_input", "agent_response", "checkpoint",
-                            "system_message", "unknown"})
+                            "system_message", "unknown",
+                            # Observed live on 1.1.21 under `--json-schema`
+                            # stream-json: a terminal, non-tool lifecycle
+                            # marker distinct from the `finish` *tool*,
+                            # closing the conversation ahead of the `result`
+                            # event. Carries no tool fields, so it falls
+                            # through the same non-tool branch as
+                            # `checkpoint`/`system_message`.
+                            "finish"})
 AGY_SUCCESS_STATUSES = frozenset({"SUCCESS", "COMPLETED", "OK"})
 AGY_DONE_STATE = "DONE"
+AGY_ERROR_STATE = "ERROR"
 
 # Tools that execute a shell command; their CommandLine is what `command_ran`
 # assertions match against once normalized.
@@ -63,10 +83,17 @@ AGY_FILE_READ_TOOLS = ("view_file",)
 
 # Discovery tools.  A search states an interest in a path; it does not establish
 # that anything was opened, so these carry no path and are never a file read.
-# `skill_search` sits here rather than in a category of its own until a real
-# capture settles whether it carries stronger signal than a generic grep.
-AGY_SEARCH_TOOLS = ("grep_search", "find_by_name", "list_dir", "code_search",
-                    "skill_search")
+# `skill_search` and `code_search` were classified here through 1.1.9 but are
+# dropped as of 1.1.21: neither was among the 57 tools a live capture
+# advertised, mounted skill or not (TASK-EE38A). A project skill under
+# `.agents/skills` was discovered and read through a plain `view_file` of its
+# `SKILL.md`, the same as any other file -- no dedicated skill-search tool
+# exists to carry stronger or weaker signal than a generic grep. Per
+# tests/test_trace_conservation.py's classification-is-not-stale check, a
+# name this module classifies must currently be advertised; if a future
+# release reintroduces either name, add it back with a fresh capture rather
+# than restoring this comment.
+AGY_SEARCH_TOOLS = ("grep_search", "find_by_name", "list_dir")
 
 # Tools that modify files.  Without these a run that wrote files publishes
 # `file_writes: 0` alongside complete trace evidence, which reads as a model
@@ -90,10 +117,18 @@ AGY_GENERIC_TOOLS = (
     # and published the URL as an OTel `file.path`, so telemetry claimed a
     # filesystem access that never happened.
     "read_url_content",
+    # New in 1.1.21: advertised alongside `ask_permission` and never observed
+    # invoked in a live capture, but shares its shape -- a consent prompt, not
+    # a file/shell/search operation.
+    "ask_custom_permission",
     "ask_permission", "ask_question", "call_mcp_tool", "command_status",
     "define_subagent", "delete_knowledge", "finish", "generate_image",
     "invoke_subagent", "list_permissions", "list_resources", "manage_inbox",
-    "manage_subagents", "manage_task", "moma_search", "notebook_execution",
+    # `moma_search` was classified here through 1.1.9 but is dropped as of
+    # 1.1.21: not among the 57 tools a live capture advertised (TASK-EE38A).
+    # Per tests/test_trace_conservation.py's classification-is-not-stale
+    # check, add it back only with a fresh capture that observes it again.
+    "manage_subagents", "manage_task", "notebook_execution",
     "read_resource", "schedule", "search_web", "send_command_input",
     "send_message", "wait", "wait_5_seconds",
     "browser_click_element", "browser_drag_pixel_to_pixel", "browser_get_dom",
@@ -547,6 +582,13 @@ class AgyStream:
     conversation_id: str | None = None
     model: AgyModelIdentity = AgyModelIdentity()
     answer: str = ""
+    # The schema-enforced verdict `--json-schema` produces under stream-json,
+    # observed live on 1.1.21 as its own `result.structured_output` field --
+    # not a substring of `response`.  `response` still carries the model's
+    # free text with the same JSON re-appended raw at the end, so a caller
+    # that wants the enforced value reads this field rather than scanning
+    # `answer` for an embedded object.
+    structured_output: Mapping[str, Any] | None = None
     usage: AgyUsage = AgyUsageAbsent("stream not parsed")
     tools: tuple[AgyToolEvidence, ...] = ()
     # The 1-based index of the record each entry in `tools` came from, so a
@@ -573,6 +615,9 @@ class AgyStream:
         if not isinstance(self.answer, str):
             raise TypeError("agy answer must be text")
         validate_json_text(self.answer, "agy answer")
+        if self.structured_output is not None:
+            object.__setattr__(self, "structured_output", freeze_json_mapping(
+                self.structured_output, "agy structured output"))
         for label, value in (("provider error", self.provider_error),
                              ("protocol error", self.protocol_error)):
             if value is not None:
@@ -678,6 +723,7 @@ class AgyStream:
         advertised: list[str] = []
         conversation_id: str | None = None
         answer = ""
+        structured_output: Mapping[str, Any] | None = None
         status: str | None = None
         provider_error: str | None = None
         raw_usage: Any = None
@@ -815,7 +861,7 @@ class AgyStream:
                         raise ValueError(
                             f"agy step_update {index} is an update for a step "
                             f"already completed")
-                    if state != AGY_DONE_STATE:
+                    if state == "ACTIVE":
                         # A tool that started is not a tool that finished.  It is
                         # held open so an observation can be marked incomplete,
                         # never translated into evidence.  The normal lifecycle
@@ -854,6 +900,13 @@ class AgyStream:
                             command=cmd,
                             path=path)
                         continue
+                    # DONE and ERROR both close the step -- a denied or failed
+                    # tool call is a completed lifecycle, not an open one -- so
+                    # a later update for the same step_index is still rejected
+                    # above.  Only DONE produces evidence: ERROR means the tool
+                    # ran and terminated without effect (e.g. the headless
+                    # permission gate auto-denied it), so nothing was read,
+                    # written or executed for `tools` to record.
                     closed_steps.add(step_id)
                     started = open_steps.pop(step_id, None)
                     if started is not None:
@@ -875,8 +928,15 @@ class AgyStream:
                             raise ValueError(
                                 f"agy step_update {index} completes step with path "
                                 f"{done_path!r} but started as {started.path!r}")
-                    tools.append(_tool_evidence(name, params, index))
-                    tool_records.append(index)
+                    else:
+                        # No ACTIVE preceded this terminal record.  Validate the
+                        # name is classified the same way an ACTIVE record would
+                        # have, so an unclassified tool that errors before this
+                        # module ever saw it start still fails the stream.
+                        _tool_partition(name, index)
+                    if state == AGY_DONE_STATE:
+                        tools.append(_tool_evidence(name, params, index))
+                        tool_records.append(index)
                 else:
                     saw_result = True
                     result = record.get("result")
@@ -901,6 +961,13 @@ class AgyStream:
                         provider_error = _nonempty_string(
                             error, f"agy result {index}.error")
                     raw_usage = result.get("usage")
+                    raw_structured = result.get("structured_output")
+                    if raw_structured is not None:
+                        if not isinstance(raw_structured, Mapping):
+                            raise ValueError(
+                                f"agy result {index}.structured_output must be "
+                                "an object")
+                        structured_output = raw_structured
         except (TypeError, ValueError) as exc:
             return cls.invalid(str(exc), records=records,
                                conversation_id=conversation_id,
@@ -938,6 +1005,7 @@ class AgyStream:
             conversation_id=conversation_id,
             model=identity,
             answer=answer,
+            structured_output=structured_output,
             usage=usage,
             tools=tuple(tools),
             tool_records=tuple(tool_records),

@@ -48,6 +48,35 @@ default. No shipped backend uses the opt-in.
 Each row's posture is the `Containment` and `Config authority` columns of the
 matrix above, and the stated reason lives on the registry row itself.
 
+### agy: re-verified on 1.1.21 (2026-08-26)
+
+`uncontained_requires_disposable_host` was re-checked live in a disposable
+container (TASK-EE38A), against the current release rather than 1.1.8/1.1.9:
+
+- `google-antigravity/antigravity-cli#36` (sandbox bypass) and `#155` (no
+  config-home override) are both still open.
+- A `write_to_file` targeting a path outside `--add-dir` succeeded under the
+  production flags (`--sandbox --dangerously-skip-permissions`), reproducing
+  #36 on the current release.
+- The same write **also succeeded with `--dangerously-skip-permissions`
+  dropped** — the headless permission gate (`permission_mode: "request-review"`
+  in the `init` event) only covers the `command` permission, not writes. Only
+  `run_command` is auto-denied without the flag; `write_to_file` is not gated
+  by it at all. This is a live finding, not yet acted on: it means the write
+  escape does not require the auto-approve flag the way the shell escape does.
+- The denial itself is not always visible on the tool step: sometimes
+  `run_command` reports a terminal `ERROR` state with a clear message,
+  sometimes it reports an ordinary `DONE` with no error field anywhere on the
+  step, and only the overall `result.status` (`CANCELED`) and an empty
+  response mark the run as failed. `agy_contracts.py` now closes an `ERROR`
+  step without recording tool evidence, but the `DONE`-looking variant still
+  produces `AgyShellCommand` evidence downstream of `AgyStream.parse` even
+  though the command never ran — see
+  `tests/fixtures/agy/README.md` and
+  `LiveCaptureOn1121Tests.test_a_permission_denied_tool_reporting_canceled_still_leaks_evidence`
+  in `tests/test_agy_contracts.py`. Nothing downstream currently corrects for
+  this; a consumer of `stream.tools` must also check `stream.provider_error`.
+
 ## Maintaining the agy tool vocabulary
 
 `agy_contracts.py` classifies every agy tool name into one of five buckets —

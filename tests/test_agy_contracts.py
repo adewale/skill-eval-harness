@@ -15,6 +15,7 @@ from agy_contracts import (
     AGY_FILE_READ_TOOLS,
     AGY_SEARCH_TOOLS,
     AgyFileRead,
+    AgyFileWrite,
     AgySearch,
     AgySkillActivated,
     AgySkillNotActivated,
@@ -74,14 +75,14 @@ class SearchIsNotActivation(unittest.TestCase):
         self.assertEqual(
             reads, [],
             "a run whose only skill-directory contact was grep_search and "
-            "skill_search recorded a file read; search intent is being counted "
+            "find_by_name recorded a file read; search intent is being counted "
             "as a completed read")
 
     def test_search_only_run_produces_search_evidence(self) -> None:
         stream = AgyStream.parse(fixture("stream-json-search-only.jsonl"))
         searches = [item for item in stream.tools if isinstance(item, AgySearch)]
         self.assertEqual(
-            [item.tool for item in searches], ["grep_search", "skill_search"],
+            [item.tool for item in searches], ["grep_search", "find_by_name"],
             "completed search operations must still be observed, as searches")
 
     def test_search_only_run_is_not_recorded_as_activation(self) -> None:
@@ -714,6 +715,125 @@ class RepeatedActiveUpdatesTests(unittest.TestCase):
             '{"event":"step_update","step_update":{"step_type":"unknown_type"}}\n')
         self.assertIsNotNone(stream.protocol_error)
         self.assertEqual(stream.model.reported, ("gemini-3.1-pro-low",))
+
+
+class LiveCaptureOn1121Tests(unittest.TestCase):
+    """Regressions from real `agy` 1.1.21 traces captured for TASK-EE38A.
+
+    Every fixture here is a real, redacted capture (conversation ids replaced
+    with ``CONV``) from an authenticated container run, not a hand-built
+    stream -- see tests/fixtures/agy/README.md for exact commands.
+    """
+
+    def test_a_permission_denied_tool_reporting_error_closes_without_evidence(
+            self) -> None:
+        # `run_command` without `--dangerously-skip-permissions` can report
+        # the denial as ACTIVE then a terminal ERROR for the same
+        # step_index. Status stays SUCCESS and response is empty. The tool
+        # ran and failed -- it must not be recorded as a completed command.
+        stream = AgyStream.parse(
+            fixture("stream-json-1.1.21-shell-permission-denied-error-state.jsonl"))
+        self.assertIsNone(stream.protocol_error)
+        self.assertIsNone(stream.provider_error)
+        self.assertEqual(stream.tools, ())
+        self.assertEqual(stream.incomplete_tools, ())
+        self.assertFalse(stream.complete, "an empty answer is not complete")
+
+    def test_a_permission_denied_tool_reporting_canceled_still_leaks_evidence(
+            self) -> None:
+        # The same denial can instead report the tool step as an ordinary
+        # DONE -- no ERROR, no error field anywhere in the step -- with only
+        # the overall result status (CANCELED) and empty response marking
+        # the run as failed. Since ERROR-detection can't help here, this
+        # command still surfaces in `stream.tools` as if it ran; only
+        # `provider_error`/`complete` distinguish the run as failed. A
+        # caller that reads `stream.tools` without also checking those (e.g.
+        # `agy_stream_flat_records` in skill_benchmark.py, which gates only
+        # on `protocol_error`) would wrongly treat a denied command as
+        # executed. Flagged as a live finding from TASK-EE38A, not fixed
+        # here -- fixing it means deciding whether every consumer of
+        # `stream.tools` must also gate on `provider_error`.
+        stream = AgyStream.parse(
+            fixture("stream-json-1.1.21-shell-permission-denied-canceled-status.jsonl"))
+        self.assertIsNone(stream.protocol_error)
+        self.assertEqual(stream.provider_error, "agy reported status CANCELED")
+        self.assertEqual(
+            [type(t).__name__ for t in stream.tools], ["AgyShellCommand"])
+        self.assertFalse(stream.complete)
+
+    def test_a_second_update_for_a_denied_step_is_still_rejected(self) -> None:
+        # ERROR closes the lifecycle exactly like DONE: a step already
+        # terminated by ERROR cannot receive a further update.
+        stream = AgyStream.parse(
+            '{"event":"step_update","step_update":{"step_index":1,'
+            '"state":"ACTIVE","step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{"CommandLine":"echo hi"}}}}\n'
+            '{"event":"step_update","step_update":{"step_index":1,'
+            '"state":"ERROR","step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{"CommandLine":"echo hi"}}}}\n'
+            '{"event":"step_update","step_update":{"step_index":1,'
+            '"state":"DONE","step_type":"tool","tool_name":"run_command",'
+            '"tool_info":{"parameters":{"CommandLine":"echo hi"}}}}\n'
+            '{"event":"result","result":{"status":"SUCCESS","response":"",'
+            '"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}\n')
+        self.assertEqual(stream.protocol_error,
+                         "agy step_update 3 is an update for a step already completed")
+
+    def test_write_outside_the_workspace_is_still_recorded_as_a_write(self) -> None:
+        # Containment is not this module's job: a completed `write_to_file`
+        # targeting a path outside the mounted workspace is real evidence of
+        # what the model did, whether or not the CLI's sandbox should have
+        # stopped it (it did not -- google-antigravity/antigravity-cli#36).
+        for name in ("stream-json-1.1.21-write-outside-sandboxed.jsonl",
+                     "stream-json-1.1.21-write-outside-no-skip-permissions.jsonl"):
+            with self.subTest(fixture=name):
+                stream = AgyStream.parse(fixture(name))
+                self.assertIsNone(stream.protocol_error)
+                self.assertIsNone(stream.provider_error)
+                writes = [t for t in stream.tools if isinstance(t, AgyFileWrite)]
+                self.assertEqual(len(writes), 1)
+                self.assertTrue(writes[0].path.startswith("/tmp/"))
+
+    def test_skill_discovery_survives_disable_slash_commands(self) -> None:
+        # Q3: `.agents/skills` discovery is a plain `view_file`, not the
+        # slash-command/skill expansion `--disable-slash-commands` disables.
+        for name in ("stream-json-1.1.21-skill-view-file.jsonl",
+                     "stream-json-1.1.21-skill-view-file-disable-slash.jsonl"):
+            with self.subTest(fixture=name):
+                stream = AgyStream.parse(fixture(name))
+                self.assertIsNone(stream.protocol_error)
+                self.assertIsNone(stream.provider_error)
+                reads = [t for t in stream.tools if isinstance(t, AgyFileRead)]
+                self.assertEqual(len(reads), 1)
+                self.assertTrue(reads[0].path.endswith(
+                    "/.agents/skills/probe-skill/SKILL.md"))
+
+    def test_a_finish_lifecycle_step_is_not_an_unknown_step_type(self) -> None:
+        # Observed only under `--json-schema` stream-json: a terminal,
+        # non-tool step_type distinct from the `finish` tool, closing the
+        # conversation ahead of the `result` event.
+        stream = AgyStream.parse(
+            fixture("stream-json-1.1.21-structured-output.jsonl"))
+        self.assertIsNone(stream.protocol_error)
+
+    def test_json_schema_verdict_is_read_from_structured_output_not_scanned(self) -> None:
+        # Q2: `--json-schema` really does constrain the final stream-json
+        # result, but the enforced value lives in its own field.  `answer`
+        # still carries the model's free text with the same JSON re-appended
+        # raw at the end, so a caller after the enforced value must read
+        # `structured_output` rather than scan `answer` for an embedded object.
+        stream = AgyStream.parse(
+            fixture("stream-json-1.1.21-structured-output.jsonl"))
+        self.assertEqual(
+            stream.structured_output,
+            {"passed": True,
+             "rationale": "The task was to judge whether 'the sky is blue' is "
+             "a true statement, write a long flowery essay detailing the "
+             "reasoning, and provide an informal verdict, which has been "
+             "fully completed."})
+        # The duplication this test guards against: the same object also
+        # appears raw at the tail of the free-text answer.
+        self.assertIn('"passed":true', stream.answer)
 
 
 if __name__ == "__main__":

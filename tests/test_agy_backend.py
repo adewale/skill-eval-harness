@@ -368,6 +368,25 @@ class TheJudgePathUsesTheLifecycleFormat(unittest.TestCase):
         self.assertIsNone(invocation.provider_error)
         self.assertEqual(invocation.usage["total_tokens"], 14439)
 
+    def test_the_enforced_verdict_is_read_from_structured_output(self) -> None:
+        # Q2 (TASK-EE38A): `--json-schema` really does constrain the final
+        # stream-json result, but the enforced value lives in its own
+        # `result.structured_output` field. `response` (what `invocation.stdout`
+        # fell back to before this fix) still carries the model's free-text
+        # essay with the same JSON re-appended raw at the end, plus extra
+        # `toolAction`/`toolSummary` keys `structured_output` does not have --
+        # so the two are not interchangeable, and a judge reading the wrong
+        # one would parse a much larger, differently-shaped object.
+        invocation = self.judge(fixture("stream-json-1.1.21-structured-output.jsonl"))
+        self.assertEqual(
+            json.loads(invocation.stdout),
+            {"passed": True,
+             "rationale": "The task was to judge whether 'the sky is blue' is "
+             "a true statement, write a long flowery essay detailing the "
+             "reasoning, and provide an informal verdict, which has been "
+             "fully completed."})
+        self.assertNotIn("toolAction", invocation.stdout)
+
     def test_a_completed_tool_lifecycle_is_rejected(self) -> None:
         # `auto_approve=False` withholds ambient approval; it does not stop
         # the model from calling a tool the CLI still advertises. A judge is

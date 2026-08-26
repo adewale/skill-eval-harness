@@ -10499,11 +10499,17 @@ def agy_cli_argv(agy_cmd: str | None = None, *, prompt: str,
     if auto_approve:
         argv.append("--dangerously-skip-permissions")
     if disable_slash_commands:
-        # 1.1.9's help describes this as disabling "slash command and skill
+        # 1.1.21's help describes this as disabling "slash command and skill
         # expansion in print mode", which is exactly what a without-skill
-        # ablation arm must not have. Whether the with-skill arm also needs it
-        # depends on whether agy's discovery from .agents/skills is itself
-        # implemented as that expansion, which is unresolved; see PLAN.md.
+        # ablation arm must not have. Live capture on 1.1.21 (TASK-EE38A)
+        # answered the with-skill question this docstring used to defer:
+        # discovery from `.agents/skills` survives the flag unchanged (same
+        # tool call, same answer, with or without it). That capture never
+        # exercised an actual `/slash-command` in the prompt, though, so it
+        # shows discovery does not depend on the flag without showing
+        # expansion was inert either way; the default stays `False` pending
+        # that separate check, and defaulting it on for every run is a policy
+        # call left to whoever wires a real without-skill arm.
         argv.append("--disable-slash-commands")
     if model:
         argv += ["--model", model]
@@ -10588,6 +10594,12 @@ def agy_cli_invoke(prompt: str, *, model: str | None = None,
               file=sys.stderr)
     return {
         "answer": parsed.answer,
+        # The `--json-schema` verdict, when the CLI enforced one. Distinct
+        # from `answer`: 1.1.21 also re-appends this same JSON raw at the end
+        # of `response`, so a caller after the enforced value reads this
+        # field rather than scanning `answer` for an embedded object.
+        "structured_output": (dict(parsed.structured_output)
+                              if parsed.structured_output is not None else None),
         # D3: the structured provider error survives a nonzero exit. It is the
         # only diagnosis an authentication failure produces.
         "provider_error": parsed.provider_error,
@@ -12557,9 +12569,14 @@ def agy_judge_invoke(
     permissive JSON parse with strictness disabled, which accepts invalid
     JSON -- exactly the fail-open shape this harness refuses elsewhere.
     `stream-json` carries the same verdict with a lifecycle around it, and
-    1.1.9's `--json-schema` help states the schema applies to the final result
-    under stream-json, so schema enforcement survives the switch. The permissive
-    parse is therefore deleted rather than preserved as a legacy dialect.
+    1.1.21's `--json-schema` help states the schema applies to the final result
+    under stream-json. Live capture (TASK-EE38A) confirmed enforcement is real:
+    the CLI publishes the schema-conforming verdict in its own
+    `result.structured_output` field, separate from `response`/`answer`, which
+    still carries the model's free text with the same JSON re-appended raw at
+    the end. The permissive parse is therefore deleted rather than preserved
+    as a legacy dialect, and `structured_output` is read directly rather than
+    scanned for out of the free-text answer.
 
     The verdict schema is named `assertion_schema` because that is the keyword
     the judge registry dispatches with; naming the parameter after the agy flag
@@ -12619,8 +12636,17 @@ def agy_judge_invoke(
     if isinstance(environment, Mapping):
         metadata["environment"] = dict(environment)
     usage = result.get("usage")
+    structured_output = result.get("structured_output")
+    # The enforced verdict, when the CLI produced one: `response`/`answer` also
+    # carries this same JSON, but re-appended raw after the model's own prose
+    # (observed live on 1.1.21), which only a brute-force scan across free
+    # text would recover reliably. Reading the dedicated field instead means
+    # the downstream `extract_json_object` call parses clean JSON rather than
+    # searching for an object that happens to be embedded in it.
+    stdout = (json.dumps(structured_output)
+              if isinstance(structured_output, dict) else (result.get("answer") or ""))
     return JudgeInvocation(
-        stdout=result.get("answer") or "",
+        stdout=stdout,
         stderr=stderr,
         returncode=returncode,
         # The raw stream is retained whether or not the run is accepted, so a
