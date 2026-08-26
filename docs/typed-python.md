@@ -37,6 +37,7 @@ Ruff-checked, byte-compiled, and executed on every supported Python version.
 | report population and rates | `ReportCohort`, `UnitRate` | `report_contracts.py` |
 | rendered human text and matching | normalized text/assertion values | `text_contracts.py` |
 | Gemini JSON and stream JSONL | frozen provider response/event values | `gemini_contracts.py` |
+| Antigravity stream JSONL | frozen event values, three-state usage, tool evidence kinds | `agy_contracts.py` |
 | Jetty attempts and imported results | lifecycle, receipt, and result observations | `jetty_contracts.py` |
 
 Strict JSON syntax is shared by `json_contracts.py`; backend registrations and their runtime

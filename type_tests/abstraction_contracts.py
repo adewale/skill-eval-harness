@@ -14,6 +14,25 @@ from typing import NoReturn
 from typing_extensions import assert_type
 
 from ablation_model import PreparedTask
+from agy_contracts import (
+    AgyFileRead,
+    AgyFileWrite,
+    AgyGenericCall,
+    AgyModelIdentity,
+    AgySearch,
+    AgyShellCommand,
+    AgySkillActivated,
+    AgySkillNotActivated,
+    AgySkillObservation,
+    AgySkillObservationUnavailable,
+    AgyStartedTool,
+    AgyStream,
+    AgyToolEvidence,
+    AgyUsage,
+    AgyUsageAbsent,
+    AgyUsageInvalid,
+    AgyUsagePresent,
+)
 from artifact_contracts import (
     ArtifactSetObservation,
     CompleteArtifactSet,
@@ -259,3 +278,69 @@ def cli_invocation_types_are_precise(invocation: CLIInvocation) -> None:
     _models: tuple[ModelId, ...] = invocation.models
     _judge_models: tuple[ModelId, ...] = invocation.judge_models
     _namespace: Namespace = invocation.to_legacy_namespace()
+
+
+def agy_usage_is_exhaustive(usage: AgyUsage) -> None:
+    """Telemetry is present, absent, or invalid -- never an implicit zero."""
+    if isinstance(usage, AgyUsagePresent):
+        _counters: Mapping[str, int] = usage.counters
+    elif isinstance(usage, AgyUsageAbsent):
+        _absent_reason: str = usage.reason
+    elif isinstance(usage, AgyUsageInvalid):
+        _invalid_reason: str = usage.reason
+    else:
+        _assert_never(usage)
+
+
+def agy_tool_evidence_is_exhaustive(evidence: AgyToolEvidence) -> None:
+    """A search narrows to a value that has no path to read off it."""
+    if isinstance(evidence, AgyFileRead):
+        _read_path: str = evidence.path
+    elif isinstance(evidence, AgySearch):
+        _search_tool: str = evidence.tool
+    elif isinstance(evidence, AgyShellCommand):
+        _command: str = evidence.command
+    elif isinstance(evidence, AgyFileWrite):
+        _write_path: str = evidence.path
+    elif isinstance(evidence, AgyGenericCall):
+        _tool: str = evidence.tool
+    else:
+        _assert_never(evidence)
+
+
+def agy_skill_observation_is_exhaustive(
+        observation: AgySkillObservation) -> None:
+    """Activation, a clean negative, and "unknown" are three distinct states."""
+    if isinstance(observation, AgySkillActivated):
+        _activated_path: str = observation.path
+    elif isinstance(observation, AgySkillNotActivated):
+        _negative: AgySkillNotActivated = observation
+    elif isinstance(observation, AgySkillObservationUnavailable):
+        _unavailable_reason: str = observation.reason
+    else:
+        _assert_never(observation)
+
+
+def agy_model_identity_is_precise(identity: AgyModelIdentity) -> None:
+    """Requested, configured and reported stay three separate facts."""
+    _requested: str | None = identity.requested
+    _configured: str | None = identity.configured
+    _reported: tuple[str, ...] = identity.reported
+    # `resolved` is optional precisely because zero and several reported models
+    # both mean "no single model", and neither may borrow `requested`.
+    _resolved: str | None = identity.resolved
+    _ambiguous: bool = identity.ambiguous
+
+
+def agy_stream_types_are_precise(stream: AgyStream) -> None:
+    _usage: AgyUsage = stream.usage
+    _model: AgyModelIdentity = stream.model
+    _tools: tuple[AgyToolEvidence, ...] = stream.tools
+    _advertised: tuple[str, ...] = stream.advertised_tools
+    _incomplete: tuple[AgyStartedTool, ...] = stream.incomplete_tools
+    _conversation_id: str | None = stream.conversation_id
+    _status: str | None = stream.status
+    _provider_error: str | None = stream.provider_error
+    _protocol_error: str | None = stream.protocol_error
+    _complete: bool = stream.complete
+    _unclassified: tuple[str, ...] = stream.unclassified_tools_advertised

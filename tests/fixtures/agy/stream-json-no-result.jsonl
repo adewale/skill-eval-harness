@@ -1,0 +1,3 @@
+{"event":"init","conversation_id":"CONV","init":{"model":"gemini-3.1-pro-low","cwd":"/WORKSPACE","tools":["run_command","view_file","skill_search"],"permission_mode":"always-proceed"}}
+{"event":"step_update","step_update":{"conversation_id":"CONV","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"CONV","step_index":4,"state":"DONE","step_type":"tool","tool_name":"run_command","duration_seconds":0.36,"tool_info":{"name":"run_command","parameters":{"CommandLine":"scripts/jetpack version androidx.work:work-runtime STABLE"},"output":"2.11.2\n"}}}
