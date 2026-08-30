@@ -25,10 +25,13 @@ Run these before opening a PR:
 pip install -e ".[test]"
 python3 -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
 ty check --error-on-warning
-python3 -m unittest discover tests -v
+python3 -m pytest tests -v
 ```
 
-(`pytest tests/` also works — `pyproject.toml` carries the pythonpath config — but CI runs `unittest discover`, so keep tests compatible with both.)
+CI uses pytest so that both the predominantly `unittest` suite and the
+Hypothesis/pytest property tests are collected. Keep ordinary unit tests
+compatible with `unittest discover` where practical, but validate the complete
+suite with pytest.
 
 `ty check` automatically covers every packaged top-level Python module, repository script,
 shipped example, and the static contracts under `type_tests/`. A new runtime boundary module
