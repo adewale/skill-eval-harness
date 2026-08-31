@@ -709,3 +709,24 @@ correctness protocol.
 - Treat inventories according to meaning: packaging, static-analysis coverage, and causal identity
   are different sets. A stack-wide guard should enforce their relationship, not collapse them into
   filesystem equality.
+
+## 2026-08-31 — A test exists only if the configured runner collects it
+
+**Problem:** The telemetry suite contained standalone Hypothesis properties and a
+pytest-parametrized test, and the test dependencies were installed, but CI used
+`unittest discover`. The affected file reported zero tests under that runner while the build
+stayed green.
+
+**Lesson:** Source files, decorators, and installed test libraries are not evidence of executed
+coverage. Collection is part of the test contract, especially in this repository's mixed
+`unittest`/pytest suite.
+
+**Rule:**
+- Use pytest as the canonical full-suite runner; it continues to collect the ordinary
+  `unittest.TestCase` suite while also collecting pytest-native and standalone Hypothesis tests.
+- After adding or changing a non-`TestCase` test, run a focused `pytest --collect-only` check and
+  confirm the intended test IDs appear before relying on the full-suite result.
+- Keep CI, contributor guidance, and the PR template on the same full-suite command so local proof
+  cannot silently describe a different suite from the one that gates changes.
+- Audit executed test IDs, not decorator or file counts. A green runner that collected zero tests
+  is missing evidence, not passing evidence.
