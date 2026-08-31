@@ -36,8 +36,11 @@ jobs:
       - name: Run ty
         run: ty check --error-on-warning --output-format github
 
-      - name: Run unit tests
-        run: python -m unittest discover tests -v
+      - name: Verify property tests are collected
+        run: python -m pytest --collect-only -q tests/test_telemetry_properties.py
+
+      - name: Run tests
+        run: python -m pytest tests -v
 
       - name: Check CLI entrypoints
         run: |
