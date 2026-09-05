@@ -259,6 +259,53 @@ class TheAnswerPathReportsWhatHappened(unittest.TestCase):
         self.assertEqual(environment["command_boundary"],
                          "single-executable-token")
 
+    def test_the_installed_cli_version_is_recorded_alongside_the_run(
+            self) -> None:
+        # A closed, pinned tool vocabulary fails a host on a different agy
+        # release closed rather than silently -- but attributing that failure
+        # to a stale/ahead CLI otherwise means guessing. The probe is a
+        # second, throwaway invocation, so it must resolve independently of
+        # the real run's stdout.
+        with mock.patch.object(
+                sb, "run_argv_capture",
+                side_effect=[completed("agy version 1.1.21\n"),
+                            completed(fixture("stream-json-success.jsonl"))]):
+            result = sb.agy_cli_invoke("hi", cwd="/tmp", timeout=30)
+        environment = result["environment"]
+        self.assertEqual(environment["agy_cli_version_status"], "reported")
+        self.assertEqual(environment["agy_cli_version"], "agy version 1.1.21")
+        self.assertEqual(result["answer"],
+                         "The current stable version is 2.11.2.")
+
+
+class TheInstalledCliVersionIsProbedSeparately(unittest.TestCase):
+    def test_a_reported_version_is_the_first_stdout_line(self) -> None:
+        with mock.patch.object(
+                sb, "run_argv_capture",
+                return_value=completed("agy version 1.1.21\n")):
+            meta = sb.probe_agy_cli_version("agy", cwd=Path("/tmp"), timeout=30)
+        self.assertEqual(meta["agy_cli_version_status"], "reported")
+        self.assertEqual(meta["agy_cli_version"], "agy version 1.1.21")
+
+    def test_a_nonzero_exit_is_unavailable_not_a_crash(self) -> None:
+        with mock.patch.object(
+                sb, "run_argv_capture",
+                return_value=completed("", returncode=127)):
+            meta = sb.probe_agy_cli_version("agy", cwd=Path("/tmp"), timeout=30)
+        self.assertEqual(meta["agy_cli_version_status"], "unavailable")
+        self.assertIn("127", meta["agy_cli_version_error"])
+
+    def test_invalid_utf8_output_is_unavailable_not_a_crash(self) -> None:
+        with mock.patch.object(
+                sb, "run_argv_capture",
+                return_value=InvocationResult(
+                    stdout="", stderr="", returncode=0, elapsed_ms=5,
+                    invocation_state=InvocationState.COMPLETE,
+                    stdout_utf8_valid=False, stderr_utf8_valid=True)):
+            meta = sb.probe_agy_cli_version("agy", cwd=Path("/tmp"), timeout=30)
+        self.assertEqual(meta["agy_cli_version_status"], "unavailable")
+        self.assertIn("UTF-8", meta["agy_cli_version_error"])
+
 
 VERDICT_SCHEMA = {
     "type": "object",
@@ -527,6 +574,28 @@ class TheTraceDialectSeparatesSearchFromReads(unittest.TestCase):
         records, _, lines = sb.parse_trace_jsonl_text_with_lines(text)
         flat = sb.agy_stream_flat_records(records, record_lines=lines)
         self.assertEqual([line for line, _ in flat], [1])
+
+    def test_a_provider_error_discards_tool_evidence(self) -> None:
+        # A permission-denied run can report its shell step as an ordinary
+        # DONE with no error field, distinguishable only by the overall
+        # result's CANCELED status (`provider_error`). A `command_ran`/
+        # `tool_call` assertion reads flattened events, not `AgyStream`
+        # directly, so the flattener -- not just `AgyStream.parse` -- must
+        # discard that evidence or the denied command would count as run.
+        text = fixture(
+            "stream-json-1.1.21-shell-permission-denied-canceled-status.jsonl")
+        records, errors = sb.parse_trace_jsonl_text(text)
+        self.assertEqual(errors, [])
+        flat = sb.agy_stream_flat_records(records)
+        self.assertEqual(len(flat), 1)
+        _, record = flat[0]
+        self.assertTrue(record.get("_trace_protocol_invalid"))
+        self.assertIn("CANCELED", record["message"])
+        _, metrics = sb.normalize_trace_records(records, source="agy")
+        self.assertEqual(metrics["commands"], 0)
+        self.assertEqual(metrics["tool_calls"], 0)
+        self.assertEqual(metrics.get("trace_protocol_errors"),
+                         [record["message"]])
 
     def test_the_registry_projects_the_agy_dialect(self) -> None:
         self.assertIn("agy", sb.TRACE_DIALECTS)

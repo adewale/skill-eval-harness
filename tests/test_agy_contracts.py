@@ -747,12 +747,11 @@ class LiveCaptureOn1121Tests(unittest.TestCase):
         # the run as failed. Since ERROR-detection can't help here, this
         # command still surfaces in `stream.tools` as if it ran; only
         # `provider_error`/`complete` distinguish the run as failed. A
-        # caller that reads `stream.tools` without also checking those (e.g.
-        # `agy_stream_flat_records` in skill_benchmark.py, which gates only
-        # on `protocol_error`) would wrongly treat a denied command as
-        # executed. Flagged as a live finding from TASK-EE38A, not fixed
-        # here -- fixing it means deciding whether every consumer of
-        # `stream.tools` must also gate on `provider_error`.
+        # caller must read `stream.tools` alongside those, never alone --
+        # `agy_stream_flat_records` in skill_benchmark.py does, discarding
+        # all tool evidence when `provider_error` is set (see
+        # test_a_provider_error_discards_tool_evidence in
+        # tests/test_agy_backend.py).
         stream = AgyStream.parse(
             fixture("stream-json-1.1.21-shell-permission-denied-canceled-status.jsonl"))
         self.assertIsNone(stream.protocol_error)

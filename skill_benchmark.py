@@ -7972,6 +7972,12 @@ def agy_stream_flat_records(
     step that never happened: a `command_not_ran` assertion, which reads
     started commands precisely because beginning one is enough to have run it,
     saw nothing and passed for a banned command agy had begun.
+
+    A `provider_error` (e.g. a permission-denied run agy reports as an
+    ordinary DONE step plus an overall CANCELED result) is treated the same
+    as a `protocol_error`: the step's own state can't distinguish "executed"
+    from "denied" here, so the whole stream's tool evidence is discarded
+    rather than published as if it ran.
     """
     if record_lines is not None and len(record_lines) != len(records):
         raise ValueError("record_lines must have one physical line per trace record")
@@ -7979,6 +7985,9 @@ def agy_stream_flat_records(
     if parsed.protocol_error is not None:
         line = record_lines[0] if record_lines else 1
         return [(line, _claude_protocol_error(parsed.protocol_error))]
+    if parsed.provider_error is not None:
+        line = record_lines[0] if record_lines else 1
+        return [(line, _claude_protocol_error(parsed.provider_error))]
 
     def line_of(record_index: int) -> int:
         return record_lines[record_index - 1] if record_lines else record_index
@@ -10549,6 +10558,47 @@ def _agy_no_process_result(error: str, *, model: str | None,
     }
 
 
+def probe_agy_cli_version(
+    executable: str, *, cwd: Path, timeout: int,
+) -> dict[str, Any]:
+    """Capture the installed agy CLI version alongside every invocation.
+
+    `agy_contracts.py`'s tool vocabulary is closed and pinned to whatever
+    release last had a live capture: a host still running an older or newer
+    CLI can invoke a tool this adapter no longer (or does not yet) classify,
+    which fails the run closed with a protocol error. Recording the version
+    here means that failure can be attributed to a stale/ahead CLI instead of
+    guessed at after the fact.
+    """
+    outcome = run_argv_capture(ProcessInvocationPlan.from_values(
+        [executable, "--version"], cwd=cwd,
+        timeout_s=max(1, min(timeout, 10)), input_text=""))
+    stdout_utf8_valid = outcome.stdout_utf8_valid
+    stderr_utf8_valid = outcome.stderr_utf8_valid
+    validity = {
+        "agy_cli_version_stdout_utf8_valid": stdout_utf8_valid,
+        "agy_cli_version_stderr_utf8_valid": stderr_utf8_valid,
+    }
+    if not stdout_utf8_valid or not stderr_utf8_valid:
+        return {
+            "agy_cli_version_status": "unavailable",
+            "agy_cli_version_error": "version probe output is not valid UTF-8",
+            **validity,
+        }
+    raw = outcome.stdout.strip() or outcome.stderr.strip()
+    version = " ".join(raw.splitlines()[:1]).strip()[:200]
+    if outcome.returncode == 0 and version:
+        return {"agy_cli_version_status": "reported",
+                "agy_cli_version": version, **validity}
+    return {
+        "agy_cli_version_status": "unavailable",
+        "agy_cli_version_error": (
+            "version probe timed out" if outcome.timed_out
+            else f"version probe exited {outcome.returncode}"),
+        **validity,
+    }
+
+
 def agy_cli_invoke(prompt: str, *, model: str | None = None,
                    agy_cmd: str | None = None,
                    timeout: int = DEFAULT_RUNNER_TIMEOUT_S,
@@ -10576,6 +10626,7 @@ def agy_cli_invoke(prompt: str, *, model: str | None = None,
         return _agy_no_process_result(
             f"agy invocation setup failed before spawn: {exc}", model=model,
             auto_approve=auto_approve)
+    version_meta = probe_agy_cli_version(argv[0], cwd=workspace, timeout=timeout)
     result = run_argv_capture(plan)
     parsed = (AgyStream.parse(result.stdout, returncode=result.returncode,
                               requested_model=model)
@@ -10634,7 +10685,8 @@ def agy_cli_invoke(prompt: str, *, model: str | None = None,
         "tool_calls": len(parsed.tools),
         "incomplete_tool_calls": len(parsed.incomplete_tools),
         "environment": {
-            **AGY_CONFIG_METADATA, **dict(result.adapter_metadata or {}),
+            **AGY_CONFIG_METADATA, **version_meta,
+            **dict(result.adapter_metadata or {}),
             "ambient_tools_auto_approved": auto_approve,
             "command_boundary": "single-executable-token",
             "unclassified_tools_advertised": list(unclassified),

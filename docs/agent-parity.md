@@ -68,14 +68,17 @@ container (TASK-EE38A), against the current release rather than 1.1.8/1.1.9:
   `run_command` reports a terminal `ERROR` state with a clear message,
   sometimes it reports an ordinary `DONE` with no error field anywhere on the
   step, and only the overall `result.status` (`CANCELED`) and an empty
-  response mark the run as failed. `agy_contracts.py` now closes an `ERROR`
-  step without recording tool evidence, but the `DONE`-looking variant still
+  response mark the run as failed. `agy_contracts.py` closes an `ERROR` step
+  without recording tool evidence, and the `DONE`-looking variant still
   produces `AgyShellCommand` evidence downstream of `AgyStream.parse` even
-  though the command never ran — see
-  `tests/fixtures/agy/README.md` and
+  though the command never ran — see `tests/fixtures/agy/README.md` and
   `LiveCaptureOn1121Tests.test_a_permission_denied_tool_reporting_canceled_still_leaks_evidence`
-  in `tests/test_agy_contracts.py`. Nothing downstream currently corrects for
-  this; a consumer of `stream.tools` must also check `stream.provider_error`.
+  in `tests/test_agy_contracts.py`. `AgyStream.parse` itself does not correct
+  for this — a caller must still check `stream.provider_error` alongside
+  `stream.tools` — but `agy_stream_flat_records` in `skill_benchmark.py`
+  (the consumer every process assertion actually reads through) does:
+  it discards all tool evidence whenever `provider_error` is set, the same
+  way it already did for `protocol_error`.
 
 ## Maintaining the agy tool vocabulary
 
@@ -94,13 +97,23 @@ through the renamed tool. Losing the cases that touch a new tool is recoverable.
 Publishing a measurement derived from evidence the adapter could not classify is
 not.
 
+This cuts both ways: a name *dropped* from the vocabulary (because a live
+capture no longer advertises it — see `AGY_SEARCH_TOOLS`'s history) fails a
+host still running the older release exactly the same way a name *added* by a
+newer release fails a host still running this one. Neither is silent.
+
 ### How you find out
 
-Two signals, and the first one arrives before anything fails:
+Three signals, and the first two arrive before anything fails:
 
 - **Every agy run** prints unclassified *advertised* names to stderr, read from
   the `init` event's tool list. This fires whether or not the run invoked them,
-  so the first run after an upgrade names the complete new vocabulary.
+  so the first run after an upgrade (or downgrade) names the complete
+  mismatched vocabulary.
+- **Every agy run** also probes and records the installed CLI's `--version`
+  output in `environment.agy_cli_version` (`probe_agy_cli_version` in
+  `skill_benchmark.py`), so a failure below can be attributed to a specific
+  stale or ahead release instead of guessed at.
 - **A run that invokes one** fails with a protocol error naming the tool and the
   buckets. The `init` tool list survives that failure, so the stderr warning
   still lists the full set — the fix is one pass, not one failed run per name.
