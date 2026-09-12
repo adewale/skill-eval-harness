@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "claudeVersion": "2.1.269",
+  "startedAt": "2026-09-12T01:07:31.510Z",
+  "durationSeconds": 6,
+  "costUsd": 0.046597,
+  "partial": false,
+  "suite": {
+    "root": "/work/probe-plugin",
+    "ablation": "none",
+    "threshold": 1,
+    "concurrency": 1,
+    "plugins": [
+      {
+        "name": "probe-plugin",
+        "version": "0.0.1",
+        "path": "/work/probe-plugin"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "first-case",
+      "dir": "evals/first-case",
+      "source": "prose",
+      "promptMarkdown": "Write me a commit message for this change: I renamed getUser to fetchUser and updated the three call sites.",
+      "runsPerCase": 3,
+      "timeoutSeconds": 300,
+      "maxTurns": 6,
+      "graders": [
+        {
+          "name": "criteria",
+          "type": "regex",
+          "weight": 1,
+          "config": {
+            "target": "last_message",
+            "pattern": "^(feat|fix|refactor|chore)(\\([\\w-]+\\))?: ",
+            "flags": "m",
+            "match": "contains"
+          }
+        },
+        {
+          "name": "skill-fired",
+          "type": "tool_used",
+          "weight": 1,
+          "config": {
+            "tool": "Skill",
+            "input_match": "\"skill\"\\s*:\\s*\"(?:[\\w-]+:)?tidy-commit\""
+          }
+        }
+      ],
+      "arms": {
+        "with": [
+          {
+            "score": 1,
+            "passed": true,
+            "turns": 3,
+            "costUsd": 0.046597,
+            "judgeCostUsd": 0,
+            "durationSeconds": 6,
+            "startedAt": "2026-09-12T01:07:31.525Z",
+            "error": null,
+            "tracePath": "/tmp/claude-eval-REDACTED/out/trace.jsonl",
+            "skippedPaidGraders": false,
+            "graders": [
+              {
+                "name": "criteria",
+                "passed": true,
+                "weight": 1,
+                "explanation": "matched ^(feat|fix|refactor|chore)(\\([\\w-]+\\))?: ",
+                "withOnly": false,
+                "scored": true
+              },
+              {
+                "name": "skill-fired",
+                "passed": true,
+                "weight": 1,
+                "explanation": "Skill called 1x (expected 1..\u221e)",
+                "withOnly": false,
+                "scored": true
+              }
+            ]
+          }
+        ]
+      },
+      "aggregates": {
+        "score": 1,
+        "passRate": 1
+      }
+    }
+  ],
+  "aggregates": {
+    "casesTotal": 1,
+    "casesPassed": 1,
+    "overallScore": 1,
+    "overallPassRate": 1
+  }
+}

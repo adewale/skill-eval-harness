@@ -245,6 +245,19 @@ skill-benchmark suggest-cases --benchmark benchmark.json --manifest evals/shared
 
 `migrate` upgrades a version-1 manifest to version 2: stamps default severities and oracle tiers, marks binary judge rubrics with a `graded?` todo, prints the diff plus the judgment-call checklist (`--check` for a dry run, `--out-checklist` to save it). See [`migrating-evals.md`](migrating-evals.md) for the agent runbook.
 
+## Import a `claude plugin eval` suite
+
+`import-plugin-evals` reads a plugin's `evals/<case>/prompt.md` + `graders/*.md` (and `case.yaml`) suite, the layout Claude Code's built-in `claude plugin eval` runs, and writes a validated harness manifest: `regex`/`tool_used`/`tool_order`/`file_exists` graders become the matching objective assertions, `llm` rubrics become gate-severity `judge` assertions, `tool_used: Skill` becomes `skill_invoked` scoped to `with_skill`, and `context.add_dirs` fixtures are listed under `files`. Everything without a verbatim equivalent (`baseline` graders, file/trace targets, `weight`, runner limits, scaffold scripts) is printed as a checklist rather than dropped. See [`comparing-with-claude-plugin-eval.md`](comparing-with-claude-plugin-eval.md).
+
+```bash
+skill-benchmark import-plugin-evals path/to/plugin --check        # dry run: checklist only
+skill-benchmark import-plugin-evals path/to/plugin                # writes <eval dir>/shared-benchmark.json
+skill-benchmark import-plugin-evals path/to/plugin --eval-dir quality/evals \
+  --skill-path skills/one-of-several/SKILL.md --split holdout --out evals/ported.json --out-checklist checklist.json
+```
+
+The eval directory defaults to the plugin manifest's `experimental.evals`, else `evals/`; `--force` overwrites an existing `--out`.
+
 ## Judge backends
 
 Run deferred `judge`/`rubric` assertions with either a native backend (`--judge-backend claude`, `--judge-backend codex`, `--judge-backend gemini`, or `--judge-backend vibe`) or a shell command (`--judge-cmd`) that reads one grading prompt from stdin and emits JSON on stdout. The prompt contains the original case prompt, `expected_behavior`, `review_rubric`, the assertion, and the saved candidate output.

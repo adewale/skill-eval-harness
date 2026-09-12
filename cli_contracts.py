@@ -42,6 +42,7 @@ class CLICommand(str, Enum):
     TRIGGER_COMPARE = "trigger-compare"
     MIGRATE = "migrate"
     MIGRATE_TELEMETRY = "migrate-telemetry"
+    IMPORT_PLUGIN_EVALS = "import-plugin-evals"
     COST_SUMMARY = "cost-summary"
     TREND = "trend"
     SUGGEST_CASES = "suggest-cases"
@@ -61,8 +62,9 @@ _PATH_ARGUMENTS = frozenset({
     "truth", "results", "out_checklist", "history", "add", "workspace",
     "previous_workspace", "skill_path", "truth_out", "cost_history", "md",
     "runs_root", "runs_subdir", "suite_file", "workspace_root", "pins", "out_dir",
+    "plugin",
 })
-_PATH_SEQUENCES = frozenset({"manifests"})
+_PATH_SEQUENCES = frozenset({"manifests", "skill_paths"})
 _POSITIVE_NUMBERS = frozenset({
     "timeout", "poll_interval", "concurrency", "runs_per_variant", "judge_runs",
     "quorum", "ngram", "port", "leakage_min_chars", "assumed_tokens_per_run",
