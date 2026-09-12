@@ -9,8 +9,8 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Generic, TypeVar
 
@@ -912,3 +912,166 @@ def display_aggregate(aggregate: Mapping[str, Any] | Aggregate[Any], *, prefix: 
         raise TypeError("aggregate reason_counts must be a mapping")
     reason = next(iter(reasons), "unavailable")
     return f"— unavailable ({reason})"
+
+
+# --------------------------------------------------------------------------- #
+# Runtime spend ceiling.
+#
+# `suite-run` projects spend BEFORE a model call and refuses to start when the
+# projection exceeds a budget. The ceiling here is the runtime half of the same
+# policy: a runner charges each completed run's cost measurement against one
+# frozen `SpendCeiling` and stops STARTING runs once the ceiling is reached.
+# Runs already in flight finish and are paid for; the runs it never started
+# are listed in a `spend-ceiling.json` ledger at the runs root so the benchmark
+# report can say WHY its answer design is incomplete, instead of leaving a gap
+# that reads like a runner crash.
+#
+# Fail-closed like everything else in this module: a run whose cost is
+# unavailable cannot be charged silently as zero. Either the caller supplies an
+# assumed per-run cost, or the ceiling stops with `cost_unobservable`.
+# --------------------------------------------------------------------------- #
+SPEND_LEDGER_NAME = "spend-ceiling.json"
+SPEND_LEDGER_SCHEMA_VERSION = 1
+SPEND_STOP_CEILING = "cost_ceiling"
+SPEND_STOP_UNOBSERVABLE = "cost_unobservable"
+SPEND_STOP_REASONS = frozenset({SPEND_STOP_CEILING, SPEND_STOP_UNOBSERVABLE})
+SPEND_CHARGE_OBSERVED = "observed"
+SPEND_CHARGE_ASSUMED = "assumed"
+
+
+class SpendUnobservable(ValueError):
+    """A completed run's dollar cost is unavailable and no assumed cost exists."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"run cost is unobservable ({reason}); pass an assumed cost per run "
+            "to keep the ceiling enforceable")
+        self.reason = reason
+
+
+def _ceiling_amount(value: Any, label: str) -> Decimal:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite non-negative amount")
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite non-negative amount") from exc
+    if not amount.is_finite() or amount < 0:
+        raise ValueError(f"{label} must be a finite non-negative amount")
+    return amount
+
+
+@dataclass(frozen=True)
+class SpendCeiling:
+    """A USD ceiling plus the exact charges made against it so far."""
+
+    ceiling_usd: Decimal
+    assumed_cost_per_run_usd: Decimal | None = None
+    charges: tuple[Mapping[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "ceiling_usd", _ceiling_amount(self.ceiling_usd, "ceiling_usd"))
+        if self.assumed_cost_per_run_usd is not None:
+            object.__setattr__(
+                self, "assumed_cost_per_run_usd",
+                _ceiling_amount(self.assumed_cost_per_run_usd, "assumed_cost_per_run_usd"))
+        if not isinstance(self.charges, tuple):
+            raise TypeError("spend charges must be a tuple")
+        frozen = []
+        for charge in self.charges:
+            if not isinstance(charge, Mapping):
+                raise TypeError("each spend charge must be a mapping")
+            if charge.get("basis") not in {SPEND_CHARGE_OBSERVED, SPEND_CHARGE_ASSUMED}:
+                raise ValueError("spend charge basis must be observed or assumed")
+            _ceiling_amount(charge.get("amount_usd"), "charge amount_usd")
+            if not isinstance(charge.get("label"), str) or not charge.get("label"):
+                raise ValueError("spend charge requires a label")
+            frozen.append(freeze_json_mapping(charge, "spend charge"))
+        object.__setattr__(self, "charges", tuple(frozen))
+
+    @property
+    def spent_usd(self) -> Decimal:
+        return sum((Decimal(str(charge["amount_usd"])) for charge in self.charges), Decimal(0))
+
+    @property
+    def exhausted(self) -> bool:
+        return self.spent_usd >= self.ceiling_usd
+
+    @property
+    def remaining_usd(self) -> Decimal:
+        return max(self.ceiling_usd - self.spent_usd, Decimal(0))
+
+    def charge(self, label: str, cost: Measurement[Money]) -> SpendCeiling:
+        """Charge one completed run. An available USD cost is charged exactly;
+        anything else is charged the assumed per-run cost, or refused."""
+        if not isinstance(label, str) or not label:
+            raise ValueError("spend charge requires a label")
+        if not isinstance(cost, Measurement):
+            raise TypeError("spend charge requires a cost Measurement")
+        if cost.availability == AVAILABLE:
+            money = cost.value
+            if not isinstance(money, Money):
+                raise TypeError("spend charge requires a Money measurement")
+            if money.currency != "USD":
+                raise SpendUnobservable(f"non_usd_cost:{money.currency}")
+            charge: dict[str, Any] = {
+                "label": label, "basis": SPEND_CHARGE_OBSERVED,
+                "amount_usd": format(money.amount, "f"), "provenance": cost.provenance,
+            }
+        else:
+            if self.assumed_cost_per_run_usd is None:
+                raise SpendUnobservable(cost.reason or cost.availability)
+            charge = {
+                "label": label, "basis": SPEND_CHARGE_ASSUMED,
+                "amount_usd": format(self.assumed_cost_per_run_usd, "f"),
+                "reason": cost.reason or cost.availability,
+            }
+        return replace(self, charges=(*self.charges, charge))
+
+    def to_dict(self) -> dict[str, Any]:
+        observed = sum(1 for charge in self.charges if charge["basis"] == SPEND_CHARGE_OBSERVED)
+        return {
+            "ceiling_usd": format(self.ceiling_usd, "f"),
+            "assumed_cost_per_run_usd": (
+                None if self.assumed_cost_per_run_usd is None
+                else format(self.assumed_cost_per_run_usd, "f")),
+            "spent_usd": format(self.spent_usd, "f"),
+            "exhausted": self.exhausted,
+            "charged_runs": len(self.charges),
+            "observed_runs": observed,
+            "assumed_runs": len(self.charges) - observed,
+            "charges": [dict(charge) for charge in self.charges],
+        }
+
+
+def spend_ledger(
+    ceiling: SpendCeiling, *, population: str, started: int,
+    skipped: Sequence[Mapping[str, Any]], stop_reason: str | None,
+) -> dict[str, Any]:
+    """The persisted `spend-ceiling.json` document: the ceiling's exact charges,
+    how many runs started, which planned runs never started, and why."""
+    if not isinstance(ceiling, SpendCeiling):
+        raise TypeError("spend ledger requires a SpendCeiling")
+    if not isinstance(population, str) or not population:
+        raise ValueError("spend ledger requires a population")
+    if isinstance(started, bool) or not isinstance(started, int) or started < 0:
+        raise ValueError("spend ledger runs_started must be a non-negative integer")
+    if stop_reason is not None and stop_reason not in SPEND_STOP_REASONS:
+        raise ValueError(f"unknown spend stop reason {stop_reason!r}")
+    skipped_rows = []
+    for row in skipped:
+        if not isinstance(row, Mapping):
+            raise TypeError("skipped runs must be mappings")
+        skipped_rows.append(dict(row))
+    if skipped_rows and stop_reason is None:
+        raise ValueError("skipped runs require a stop reason")
+    return {
+        "schema_version": SPEND_LEDGER_SCHEMA_VERSION,
+        "population": population,
+        **ceiling.to_dict(),
+        "runs_started": started,
+        "runs_skipped": len(skipped_rows),
+        "stopped": stop_reason is not None,
+        "stop_reason": stop_reason,
+        "skipped": skipped_rows,
+    }

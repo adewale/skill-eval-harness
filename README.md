@@ -38,7 +38,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 - Local grading: deterministic assertions run without model calls.
 - Eval hygiene: leakage lint, manifest audit, trigger checks, repeated-run stats, and fixture recommendations.
 - Activation: does the skill load on its own? `skill-trigger-matrix` reports autonomous trigger rates per (agent × model), split by should-fire / should-not-fire.
-- Cost as a signal: normalized token/dollar telemetry per run, a suite cost ledger, and lift-per-dollar (`cost-summary`, `token-overhead`).
+- Cost as a signal: normalized token/dollar telemetry per run, a suite cost ledger, lift-per-dollar (`cost-summary`, `token-overhead`), and a runtime spend ceiling (`--max-cost-usd` on every runner and the judge) that stops starting runs at the cap and leaves `spend-ceiling.json` explaining the gap.
 - Interop: Anthropic-style exports, static/served HTML review pages, and Jetty runbook-mode import/export.
 - Judge plumbing: `judge`/`rubric` assertions can be exported or run through native Claude/Codex/Gemini/Vibe backends (`--judge-backend`) or a user-supplied `--judge-cmd`; the harness does not choose a model for you.
 

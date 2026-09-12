@@ -266,6 +266,7 @@ available.
 | Surface | Result |
 |---|---|
 | Answer/import runners | Emit canonical availability, provenance, and basis data; no fabricated zero defaults. |
+| `--max-cost-usd` (runners, judge) | Charge each completed run's cost measurement against a frozen `SpendCeiling`; unavailable cost is never charged as zero — it is charged the declared assumed cost or stops the loop with `cost_unobservable`. The `spend-ceiling.json` ledger keeps exact decimal amounts and the unstarted design rows. |
 | Trigger runners | Record whether observation is complete; absence of a trace cannot become zero tokens, zero tools, or a false negative trigger result. |
 | Judge runners | Keep judge spend/population separate and expose unavailable shell-wrapper telemetry honestly. |
 | `benchmark`, `aggregate`, `cost-summary` | Emit complete/partial/unavailable compatible buckets rather than ambiguous totals. |

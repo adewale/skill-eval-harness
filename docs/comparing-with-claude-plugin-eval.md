@@ -27,7 +27,7 @@ live run is a recorded one, dated and costed.
 | Runner | Claude Code only (`claude -p` child, one plugin loaded) | Codex, Claude, Gemini, Vibe, Jetty, subagent, or any runner that writes the run-output contract |
 | Isolation | Throwaway home and config, no personal settings, OS sandbox for granted shell tools, MCP mocks | Isolated per-CLI homes, deny-by-default tool policy; no MCP mocking |
 | Hidden cases / leakage | None; the agent cannot read the eval directory, but nothing checks whether a prompt hands the grader its answer | `tune`/`holdout`/`holdback` splits, prompt-leakage lint, canaries, contamination checks |
-| CI | Exit code on `--threshold`, `--json` document, `--max-cost-usd` | `report --format junit\|github`, `audit-manifest --fail-on-blockers`, `suite-run` |
+| CI | Exit code on `--threshold`, `--json` document, `--max-cost-usd` | `report --format junit\|github`, `audit-manifest --fail-on-blockers`, `suite-run`, runtime `--max-cost-usd` on every paid loop |
 | Cost signal | List-price estimate per run and suite | Normalized token/dollar telemetry, lift-per-dollar, suite cost ledger |
 
 ## Three semantics worth knowing before you import
@@ -56,8 +56,17 @@ score it. If any run was left unstarted the command exits `2` with `partial: tru
 `partialReason: "cost_ceiling"` in the JSON. Two consequences: leave `partial` documents
 and runs with `skippedPaidGraders: true` out of any trend, and `--max-cost-usd 0` is a
 free way to check that every case file still loads (the fixture README shows it). The
-harness keeps the ceiling on the *prepare* side instead (`prepare --max-estimated-cost-usd`),
-and records real cost after the fact through the telemetry contract.
+harness has both halves: `suite-run --max-estimated-cost-usd` gates on a projection before
+any model call, and every paid loop (`run-agent`, `run-codex`, `run-claude`,
+`run-subagent`, `run-jetty`, `judge`) takes the same runtime `--max-cost-usd`, checked
+before each run against the cost telemetry of the runs that finished. It differs in two
+deliberate ways. There is no `partial: true` flag: the answer design already records what
+was planned, so the benchmark's existing availability rules withhold headline numbers,
+and `spend-ceiling.json` at the runs root names the reason (`answer_design.stopped_by`).
+And it fails closed on cost it cannot see: a backend that does not report dollars needs
+`--assumed-cost-per-run-usd`, and a run whose cost turns out unobservable stops the loop
+rather than being charged as free, where the built-in runner only ever sees its own
+list-price estimate.
 
 **Tool grants.** Runs never stop to ask permission. The case's `allowed_tools` may only
 name read-only tools (`Read`, `Glob`, `Grep`, `NotebookRead`, `Skill`, `Agent`,

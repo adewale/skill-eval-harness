@@ -96,6 +96,8 @@ skill-benchmark run-agent --agent gemini --tasks tasks.jsonl --runs ../repo/eval
   --model gemini-2.5-flash
 ```
 
+Every answer runner accepts `--max-cost-usd` (and `--assumed-cost-per-run-usd` for backends that do not report dollars); see [Cost telemetry](#cost-telemetry-tokens-and-dollars) for the ceiling's semantics and the `spend-ceiling.json` ledger it leaves behind.
+
 The Gemini backend invokes the official CLI in headless `stream-json` mode and
 accepts final text only from a complete typed stream. It creates a fresh
 `GEMINI_CLI_HOME` outside the task workspace, copies only minimal auth state,
@@ -371,6 +373,7 @@ Consumers of the blocks:
 
 - `benchmark`/`aggregate` emit `cost_summary`: availability-aware coverage and operational totals (**every run counts here, including execution errors — a timed-out run still cost money — while quality rates keep excluding them**). A mixed set renders a partial known subtotal, not a false total. Per-variant stats, per-case spend, paired deltas, ablation marginal cost, and judge spend retain their basis/provenance.
 - `cost-summary` writes the standalone suite ledger (`--out cost-summary.json`, `--md cost-summary.md`): coverage, totals, by variant/case/runner, top expensive cases and ablation arms, and `cost_quality_findings` when a `--benchmark` report is joined.
+- Every paid loop takes a runtime **spend ceiling**: `--max-cost-usd <usd>` on `run-agent`, `run-codex`, `run-claude`, `run-subagent`, `run-jetty`, and `judge`. Each completed run's cost measurement (the same v3 telemetry the ledgers read) is charged against the ceiling; once it is reached no further run starts, runs in flight finish and are paid for, and the command exits `2`. The runs that never started are listed in `spend-ceiling.json` at the runs root (`<out>.spend-ceiling.json` for `run-jetty` and `judge`; `import-jetty-results` moves the Jetty one into the runs tree), so `benchmark` reports `answer_design.stopped_by: "cost_ceiling"` and a `spend_ceiling` block instead of an unexplained gap. `--max-cost-usd 0` starts nothing and writes the plan. A backend that does not report dollars (Codex, Gemini, Vibe, the stub) refuses the ceiling before the first run unless `--assumed-cost-per-run-usd` names a fixed charge per run; a run whose cost turns out unobservable mid-suite stops the loop with `cost_unobservable` rather than counting as free. There is no separate "partial result" flag: the answer design already says what was planned, the existing availability rules already withhold headline numbers from an incomplete design, and the ledger supplies the reason.
 - `suite-run` projects spend **before any model call** from previous ledgers (`--cost-history <dir>`, per-run medians) or a static assumption (`--assumed-tokens-per-run`), and gates on `--max-estimated-tokens` / `--max-estimated-cost-usd` — failing closed when a dollar cap is set but no dollar estimate exists — unless `--allow-over-budget`.
 - `audit-manifest --runs` adds cost-quality findings above `--expensive-case-usd` (default $1): `expensive-saturated-case`, `expensive-no-lift-case`, `high-cost-judge-only-case`, `ablation-high-spend-no-structured-regression`, and `high-footprint-low-lift-skill`.
 

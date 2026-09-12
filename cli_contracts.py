@@ -73,6 +73,7 @@ _NONNEGATIVE_NUMBERS = frozenset({
     "magnitude_eps", "min_positive", "min_negative", "min_adversarial",
     "min_trigger_pos", "min_trigger_neg", "expensive_case_usd",
     "max_estimated_tokens", "max_estimated_cost_usd", "assumed_cost_per_run_usd",
+    "max_cost_usd",
     "min_labels", "limit", "top", "max_skill_tokens", "max_reference_tokens",
     "max_references", "max_modules",
 })
