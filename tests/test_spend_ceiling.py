@@ -1,6 +1,7 @@
-"""Runtime spend ceiling (`--max-cost-usd`): the typed SpendCeiling contract,
-the per-loop stop/skip behaviour on every paid entry point, the ledger the
-loop leaves behind, and how the benchmark report surfaces it.
+"""Runtime spend ceiling (`--max-cost-usd`) at every paid entry point: the
+stop/skip behaviour, the ledger the loop leaves behind, and how the benchmark
+report surfaces it. The ledger state machine itself is proven in
+tests/test_spend_contracts.py.
 
 The design intent under test: no new partial-result flag. A ceiling stop leaves
 the answer design incomplete on purpose, the existing availability rules
@@ -22,76 +23,17 @@ from helpers import file_judge_cmd, make_eval_repo, stub_claude, write_run
 
 import skill_benchmark as sb
 import telemetry as td
+from spend_contracts import (
+    PlannedSpendRow,
+    SpendLedger,
+    SpendObservation,
+    SpendPolicy,
+    SpendPopulation,
+)
 
 
 def usd(amount: str) -> td.Measurement:
     return td.Measurement.available(td.Money.from_raw(amount, "USD"), provenance="provider_reported")
-
-
-class SpendCeilingContractTests(unittest.TestCase):
-    def test_observed_charges_accumulate_exactly_and_exhaust_at_the_ceiling(self):
-        ceiling = td.SpendCeiling(0.02)
-        self.assertFalse(ceiling.exhausted)
-        ceiling = ceiling.charge("a", usd("0.0123"))
-        self.assertEqual(ceiling.spent_usd, Decimal("0.0123"))
-        self.assertFalse(ceiling.exhausted)
-        ceiling = ceiling.charge("b", usd("0.0123"))
-        self.assertEqual(ceiling.spent_usd, Decimal("0.0246"))     # exact decimal, no float drift
-        self.assertTrue(ceiling.exhausted)
-        self.assertEqual(ceiling.remaining_usd, Decimal(0))
-        doc = ceiling.to_dict()
-        self.assertEqual((doc["ceiling_usd"], doc["spent_usd"], doc["charged_runs"], doc["observed_runs"], doc["assumed_runs"]),
-                         ("0.02", "0.0246", 2, 2, 0))
-        self.assertEqual(doc["charges"][0], {"label": "a", "basis": "observed", "amount_usd": "0.0123", "provenance": "provider_reported"})
-
-    def test_zero_ceiling_is_exhausted_before_any_charge(self):
-        self.assertTrue(td.SpendCeiling(0).exhausted)
-
-    def test_unavailable_cost_is_never_charged_as_zero(self):
-        ceiling = td.SpendCeiling(1.0)
-        with self.assertRaises(td.SpendUnobservable) as ctx:
-            ceiling.charge("a", td.Measurement.unavailable("runner_does_not_report_cost"))
-        self.assertEqual(ctx.exception.reason, "runner_does_not_report_cost")
-        with self.assertRaises(td.SpendUnobservable):
-            ceiling.charge("a", td.Measurement.not_applicable("offline_runner"))
-        with self.assertRaises(td.SpendUnobservable) as ctx:
-            ceiling.charge("a", td.Measurement.available(td.Money.from_raw("1", "EUR"), provenance="provider_reported"))
-        self.assertEqual(ctx.exception.reason, "non_usd_cost:EUR")
-        self.assertEqual(ceiling.spent_usd, Decimal(0))        # a refused charge changes nothing
-
-    def test_assumed_cost_covers_unavailable_runs_and_is_labelled(self):
-        ceiling = td.SpendCeiling(1.0, 0.4)
-        ceiling = ceiling.charge("a", td.Measurement.unavailable("runner_does_not_report_cost"))
-        ceiling = ceiling.charge("b", usd("0.25"))
-        self.assertEqual(ceiling.spent_usd, Decimal("0.65"))
-        doc = ceiling.to_dict()
-        self.assertEqual((doc["observed_runs"], doc["assumed_runs"], doc["assumed_cost_per_run_usd"]), (1, 1, "0.4"))
-        self.assertEqual(doc["charges"][0], {"label": "a", "basis": "assumed", "amount_usd": "0.4", "reason": "runner_does_not_report_cost"})
-
-    def test_rejects_malformed_inputs(self):
-        for bad in (-1, float("nan"), float("inf"), True, "x"):
-            with self.assertRaises((TypeError, ValueError)):
-                td.SpendCeiling(bad)
-        with self.assertRaises(ValueError):
-            td.SpendCeiling(1, -0.5)
-        with self.assertRaises(ValueError):
-            td.SpendCeiling(1).charge("", usd("1"))
-        with self.assertRaises(TypeError):
-            td.SpendCeiling(1).charge("a", {"availability": "available"})
-        with self.assertRaises(ValueError):
-            td.SpendCeiling(1, charges=({"label": "a", "basis": "guess", "amount_usd": "1"},))
-
-    def test_ledger_requires_a_reason_for_skipped_runs(self):
-        ceiling = td.SpendCeiling(1.0).charge("a", usd("1"))
-        ledger = td.spend_ledger(ceiling, population="answer", started=1,
-                                 skipped=[{"case_id": "c", "run_dir": "c/with_skill"}], stop_reason=td.SPEND_STOP_CEILING)
-        self.assertEqual((ledger["schema_version"], ledger["stopped"], ledger["runs_started"], ledger["runs_skipped"]), (1, True, 1, 1))
-        self.assertEqual(ledger["spent_usd"], "1")
-        with self.assertRaises(ValueError):
-            td.spend_ledger(ceiling, population="answer", started=1, skipped=[{"case_id": "c"}], stop_reason=None)
-        with self.assertRaises(ValueError):
-            td.spend_ledger(ceiling, population="answer", started=1, skipped=[], stop_reason="budget")
-        self.assertFalse(td.spend_ledger(ceiling, population="answer", started=1, skipped=[], stop_reason=None)["stopped"])
 
 
 def three_with_skill_tasks(root: Path) -> tuple[Path, Path, list[dict]]:
@@ -123,7 +65,8 @@ class NativeRunnerCeilingTests(unittest.TestCase):
                              ("answer", "cost_ceiling", 2, 1))
             self.assertEqual(ledger["spent_usd"], "0.0246")
             self.assertEqual([c["basis"] for c in ledger["charges"]], ["observed", "observed"])
-            self.assertEqual(ledger["skipped"], [{"case_id": "c2", "model": "m", "variant": "with_skill", "run_number": 1, "run_dir": "c2/with_skill"}])
+            self.assertEqual(ledger["spent_availability"], "complete")
+            self.assertEqual(ledger["skipped"], [{"label": "c2/with_skill", "case_id": "c2", "variant": "with_skill", "run_number": 1, "model": "m"}])
             # The benchmark reads the same tree: design incomplete, reason named, no headline numbers.
             report = sb.build_benchmark_report(manifest, runs)
             self.assertEqual(report["availability"], "partial")
@@ -185,7 +128,7 @@ class NativeRunnerCeilingTests(unittest.TestCase):
                                               timeout=30, max_cost_usd=1.0, assumed_cost_per_run_usd=0.5))
             self.assertEqual(rc, sb.SPEND_CEILING_EXIT_CODE)
             ledger = json.loads((runs / sb.SPEND_LEDGER_NAME).read_text(encoding="utf-8"))
-            self.assertEqual((ledger["runs_started"], ledger["runs_skipped"], ledger["assumed_runs"], ledger["spent_usd"]), (2, 1, 2, "1.0"))
+            self.assertEqual((ledger["runs_started"], ledger["runs_skipped"], [c["basis"] for c in ledger["charges"]], ledger["spent_usd"]), (2, 1, ["assumed", "assumed"], "1.0"))
             self.assertEqual(ledger["charges"][0]["basis"], "assumed")
 
 
@@ -201,7 +144,7 @@ class SubagentCeilingTests(unittest.TestCase):
                 return {"answer": "token", "usage": {"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.01}}
 
             runs = root / "runs"
-            rc = sb.run_subagent_tasks(rows, runs, agent, replay_mode="off", spend_ceiling=td.SpendCeiling(0.015))
+            rc = sb.run_subagent_tasks(rows, runs, agent, replay_mode="off", spend_policy=SpendPolicy.from_raw(0.015))
             self.assertEqual(rc, sb.SPEND_CEILING_EXIT_CODE)
             self.assertEqual(len(calls), 2)
             ledger = json.loads((runs / sb.SPEND_LEDGER_NAME).read_text(encoding="utf-8"))
@@ -217,11 +160,12 @@ class SubagentCeilingTests(unittest.TestCase):
                 return {"answer": "token"}
 
             runs = root / "runs"
-            rc = sb.run_subagent_tasks(rows, runs, agent, replay_mode="off", spend_ceiling=td.SpendCeiling(5.0))
+            rc = sb.run_subagent_tasks(rows, runs, agent, replay_mode="off", spend_policy=SpendPolicy.from_raw(5.0))
             self.assertEqual(rc, sb.SPEND_CEILING_EXIT_CODE)
             ledger = json.loads((runs / sb.SPEND_LEDGER_NAME).read_text(encoding="utf-8"))
-            self.assertEqual((ledger["stop_reason"], ledger["runs_started"], ledger["runs_skipped"], ledger["charged_runs"]),
-                             ("cost_unobservable", 1, 2, 0))
+            self.assertEqual((ledger["stop_reason"], ledger["runs_started"], ledger["runs_skipped"], ledger["charges"], ledger["spent_availability"]),
+                             ("cost_unobservable", 1, 2, [], "partial"))
+            self.assertEqual(ledger["unpriced"], {"label": "c0/with_skill", "reason": "missing"})
 
 
 class JudgeCeilingTests(unittest.TestCase):
@@ -253,7 +197,7 @@ class JudgeCeilingTests(unittest.TestCase):
             ledger = json.loads(Path(str(out) + ".spend-ceiling.json").read_text(encoding="utf-8"))
             self.assertEqual((ledger["population"], ledger["stop_reason"], ledger["runs_started"], ledger["runs_skipped"]),
                              ("judge", "cost_unobservable", 1, 2))
-            self.assertEqual(ledger["skipped"][0]["case_id"], "c1")
+            self.assertEqual((ledger["skipped"][0]["case_id"], ledger["unpriced"]["reason"]), ("c1", "missing"))
 
     def test_assumed_judge_cost_stops_at_the_ceiling(self):
         with tempfile.TemporaryDirectory() as td_:
@@ -332,8 +276,8 @@ class JettyCeilingTests(unittest.TestCase):
             self.assertEqual((ledger["stop_reason"], ledger["runs_started"], ledger["runs_skipped"], ledger["spent_usd"]),
                              ("cost_ceiling", 2, 1, "0.08"))
             self.assertEqual(ledger["charges"][0]["provenance"], "provider_reported")
-            self.assertEqual(ledger["skipped"], [{"case_id": "case-3", "model": "model-1", "variant": "with_skill",
-                                                  "run_number": 1, "run_dir": "case-3/with_skill"}])
+            self.assertEqual(ledger["skipped"], [{"label": "case-3/with_skill", "case_id": "case-3", "variant": "with_skill",
+                                                  "run_number": 1, "model": "model-1"}])
 
     def test_import_moves_the_jetty_ledger_into_the_runs_tree(self):
         from helpers import attach_jetty_task_contract
@@ -353,11 +297,10 @@ class JettyCeilingTests(unittest.TestCase):
             }
             attach_jetty_task_contract(record, marker=1)
             jetty_runs.write_text(json.dumps(record) + "\n", encoding="utf-8")
-            ceiling = td.SpendCeiling(0.05).charge("case-1/with_skill", usd("0.04"))
-            ledger = td.spend_ledger(ceiling, population="answer", started=1,
-                                     skipped=[{"case_id": "case-1", "variant": "without_skill", "run_number": 1, "run_dir": "case-1/without_skill", "model": None}],
-                                     stop_reason=td.SPEND_STOP_CEILING)
-            sb.jetty_spend_ledger_path(jetty_runs).write_text(json.dumps(ledger), encoding="utf-8")
+            ledger = (SpendLedger(SpendPolicy.from_raw(0.03), SpendPopulation.ANSWER, planned=2)
+                      .charge("case-1/with_skill", usd("0.04"))
+                      .skip(PlannedSpendRow.parse("case-1/without_skill", "case-1", "without_skill", 1)))
+            sb.jetty_spend_ledger_path(jetty_runs).write_text(json.dumps(ledger.to_dict()), encoding="utf-8")
             runs = root / "runs"
             sb.import_jetty_results(SimpleNamespace(manifest=str(manifest), jetty_runs=str(jetty_runs), runs=str(runs)))
             self.assertEqual(json.loads((runs / sb.SPEND_LEDGER_NAME).read_text(encoding="utf-8"))["stop_reason"], "cost_ceiling")
@@ -388,19 +331,22 @@ class CliSurfaceTests(unittest.TestCase):
             args = parser.parse_args([command, *argv, "--max-cost-usd", "2.5", "--assumed-cost-per-run-usd", "0.1"])
             invocation = sb.CLIInvocation.from_namespace(args)
             self.assertEqual((invocation.arguments["max_cost_usd"], invocation.arguments["assumed_cost_per_run_usd"]), (2.5, 0.1), command)
-            self.assertEqual(sb.spend_ceiling_from_args(invocation.to_legacy_namespace()).ceiling_usd, Decimal("2.5"))
+            self.assertEqual(sb.spend_policy_from_args(invocation.to_legacy_namespace()).ceiling.amount, Decimal("2.5"))
             with self.assertRaises(ValueError):
                 sb.CLIInvocation.from_namespace(parser.parse_args([command, *argv, "--max-cost-usd", "-1"]))
-        self.assertIsNone(sb.spend_ceiling_from_args(parser.parse_args(["run-claude", "--tasks", "t", "--runs", "r"])))
+        self.assertIsNone(sb.spend_policy_from_args(parser.parse_args(["run-claude", "--tasks", "t", "--runs", "r"])))
 
     def test_preflight_names_the_backends_that_cannot_report_dollars(self):
-        sb.spend_ceiling_preflight(None, "codex")                       # no ceiling: nothing to enforce
-        sb.spend_ceiling_preflight(td.SpendCeiling(1), "claude")        # claude reports provider cost
-        sb.spend_ceiling_preflight(td.SpendCeiling(1, 0.1), "codex")    # assumed cost makes codex enforceable
-        sb.spend_ceiling_preflight(td.SpendCeiling(1), "not-a-backend") # unregistered: observed at runtime
-        for name in ("codex", "gemini", "vibe", "stub"):
+        declared, runtime = SpendObservation.DECLARED, SpendObservation.RUNTIME
+        sb.spend_preflight(None, "codex", declared)                            # no ceiling: nothing to enforce
+        sb.spend_preflight(SpendPolicy.from_raw(1), "claude", declared)        # claude reports provider cost
+        sb.spend_preflight(SpendPolicy.from_raw(1, 0.1), "codex", declared)    # assumed cost makes codex enforceable
+        sb.spend_preflight(SpendPolicy.from_raw(1), "subagent", runtime)       # observed per run, never by registry
+        for name in ("codex", "gemini", "vibe", "stub", "subagent"):
             with self.assertRaises(SystemExit):
-                sb.spend_ceiling_preflight(td.SpendCeiling(1), name)
+                sb.spend_preflight(SpendPolicy.from_raw(1), name, declared)
+        with self.assertRaises(SystemExit):
+            sb.spend_preflight(SpendPolicy.from_raw(1), "not-a-backend", declared)
 
 
 if __name__ == "__main__":

@@ -176,6 +176,14 @@ from manifest_contracts import (
     RunNumber,
     Split,
 )
+from spend_contracts import (
+    SPEND_LEDGER_NAME,
+    PlannedSpendRow,
+    SpendLedger,
+    SpendObservation,
+    SpendPolicy,
+    SpendPopulation,
+)
 from text_contracts import (
     ComparisonProfile,
     ComparisonText,
@@ -5362,20 +5370,16 @@ def run_jetty(args: argparse.Namespace) -> int:
         lock.acquire()
     except (JettyJournalInUse, OSError, ValueError) as exc:
         die(str(exc))
-    ceiling = spend_ceiling_from_args(args)
-    spend_ceiling_preflight(ceiling, "jetty")
-    stop_reason: str | None = None
-    started = 0
+    policy = spend_policy_from_args(args)
+    spend_preflight(policy, "jetty", SpendObservation.DECLARED)
+    ledger = plan_spend_ledger(policy, SpendPopulation.ANSWER, len(payloads))
     produced = 0
-    skipped: list[dict[str, Any]] = []
     try:
         journal = JettyAttemptJournal(journal_path)
         result_slots = durable_jetty_result_slots(payloads, journal)
         atomic_write_jsonl(
             out, (record for record in result_slots if record is not None))
         incomplete = False
-        if ceiling is not None and ceiling.exhausted:
-            stop_reason = telemetry_domain.SPEND_STOP_CEILING
         # The executor submits a payload only when the loop asks for the next
         # record, so breaking after a charge stops the NEXT submission.
         records = execute_jetty_payloads(
@@ -5385,7 +5389,7 @@ def run_jetty(args: argparse.Namespace) -> int:
             poll_interval_s=getattr(args, "poll_interval", 5),
             journal=journal,
             resubmit_unknown=getattr(args, "resubmit_unknown", False),
-        ) if stop_reason is None else iter(())
+        ) if ledger is None or ledger.can_start else iter(())
         for index, record in enumerate(records):
             produced = index + 1
             result_slots[index] = record
@@ -5403,27 +5407,19 @@ def run_jetty(args: argparse.Namespace) -> int:
                 "artifacts_downloaded", "result_committed",
             }:
                 incomplete = True
-            if ceiling is not None and jetty_record_was_attempted(record):
-                started += 1
-                ceiling, stop_reason = charge_spend(
-                    ceiling, jetty_record_label(record, index),
-                    jetty_record_cost_measurement(record))
-                if stop_reason is None and ceiling.exhausted:
-                    stop_reason = telemetry_domain.SPEND_STOP_CEILING
-                if stop_reason is not None:
+            if ledger is not None and jetty_record_was_attempted(record):
+                ledger = ledger.charge(
+                    jetty_record_label(record, index), jetty_record_cost_measurement(record))
+                if not ledger.can_start:
                     break
-        if stop_reason is not None:
-            skipped = [jetty_payload_skip_row(row) for row in payloads[produced:]]
-            incomplete = incomplete or bool(skipped)
-        if ceiling is not None:
-            write_spend_ledger(
-                jetty_spend_ledger_path(out), ceiling, population="answer",
-                started=started, skipped=skipped, stop_reason=stop_reason)
+        if ledger is not None:
+            for row in payloads[produced:]:
+                ledger = ledger.skip(jetty_planned_spend_row(row))
+            incomplete = incomplete or bool(ledger.skipped)
+            persist_spend_ledger(jetty_spend_ledger_path(out), ledger)
     finally:
         lock.release()
-    if stop_reason is not None:
-        return SPEND_CEILING_EXIT_CODE
-    return 1 if incomplete else 0
+    return spend_exit_code(ledger) or (1 if incomplete else 0)
 
 
 def jetty_spend_ledger_path(out: Path) -> Path:
@@ -5438,8 +5434,9 @@ def _jetty_dict_field(record: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def jetty_record_was_attempted(record: dict[str, Any]) -> bool:
-    harness = _jetty_dict_field(record, "harness")
-    return harness.get("executable") is not False and record.get("status") != "dry_run"
+    """A non-executable payload (dry-run placeholder, missing hidden prompt)
+    never reached the provider and costs nothing to charge."""
+    return _jetty_dict_field(record, "harness").get("executable") is not False
 
 
 def jetty_record_label(record: dict[str, Any], index: int) -> str:
@@ -5447,12 +5444,14 @@ def jetty_record_label(record: dict[str, Any], index: int) -> str:
     return run_dir if isinstance(run_dir, str) and run_dir else f"payload-{index}"
 
 
-def jetty_payload_skip_row(payload: dict[str, Any]) -> dict[str, Any]:
+def jetty_planned_spend_row(payload: dict[str, Any]) -> PlannedSpendRow:
     harness = _jetty_dict_field(payload, "harness")
     request = _jetty_dict_field(payload, "jetty_request")
-    return {"case_id": harness.get("case_id"), "model": request.get("model"),
-            "variant": harness.get("variant"), "run_number": harness.get("run_number"),
-            "run_dir": harness.get("run_dir")}
+    try:
+        return PlannedSpendRow.parse(harness.get("run_dir"), harness.get("case_id"), harness.get("variant"),
+                                     harness.get("run_number"), request.get("model"))
+    except (TypeError, ValueError) as exc:
+        die(f"Jetty payload carries an invalid run identity: {exc}")
 
 
 def jetty_record_cost_measurement(record: dict[str, Any]) -> telemetry_domain.Measurement[Any]:
@@ -10457,16 +10456,16 @@ def registered_agent_backend(name: str) -> AgentBackend:
 #
 # `suite-run` gates on a PROJECTED spend before any model call; this is the
 # runtime half of the same policy, shared by every paid loop (native answer
-# backends, the subagent seam, Jetty, and judges). Each completed run's cost
-# measurement — the same v3 telemetry the ledgers read — is charged against one
-# frozen SpendCeiling; once it is reached no further run STARTS. Nothing is
-# invented for the runs that never started: the answer design already records
-# the plan, so the benchmark's existing availability logic marks the design
-# incomplete, and `spend-ceiling.json` beside it says why. A backend that
-# cannot report dollars fails closed before the first run unless the caller
-# supplies --assumed-cost-per-run-usd.
+# backends, the subagent seam, Jetty, and judges). The loop state lives in one
+# frozen `SpendLedger` (spend_contracts.py): it is asked `can_start` before
+# every run, charged each completed run's cost measurement — the same v3
+# telemetry the ledgers read — and told which planned runs it refused. Nothing
+# is invented for the runs that never started: the answer design already
+# records the plan, so the benchmark's existing availability logic marks the
+# design incomplete, and `spend-ceiling.json` beside it says why. A backend
+# that cannot report dollars fails closed before the first run unless the
+# caller supplies --assumed-cost-per-run-usd.
 # --------------------------------------------------------------------------- #
-SPEND_LEDGER_NAME = telemetry_domain.SPEND_LEDGER_NAME
 SPEND_CEILING_EXIT_CODE = 2
 
 
@@ -10480,24 +10479,26 @@ def add_spend_ceiling_options(parser: argparse.ArgumentParser) -> None:
         "required to enforce --max-cost-usd on such backends (fails closed otherwise)"))
 
 
-def spend_ceiling_from_args(args: argparse.Namespace) -> telemetry_domain.SpendCeiling | None:
+def spend_policy_from_args(args: argparse.Namespace) -> SpendPolicy | None:
     raw = getattr(args, "max_cost_usd", None)
     if raw is None:
         return None
     try:
-        return telemetry_domain.SpendCeiling(raw, getattr(args, "assumed_cost_per_run_usd", None))
+        return SpendPolicy.from_raw(raw, getattr(args, "assumed_cost_per_run_usd", None))
     except (TypeError, ValueError) as exc:
         die(f"--max-cost-usd: {exc}")
 
 
-def spend_ceiling_preflight(ceiling: telemetry_domain.SpendCeiling | None, backend_name: str) -> None:
-    """Fail closed before the first paid run: a registered backend that never
-    reports dollar cost cannot enforce a ceiling without an assumed per-run cost."""
-    if ceiling is None or ceiling.assumed_cost_per_run_usd is not None:
+def spend_preflight(policy: SpendPolicy | None, backend_name: str, observation: SpendObservation) -> None:
+    """Fail closed before the first paid run: a backend whose registry entry
+    declares no dollar cost cannot enforce a ceiling without an assumed per-run
+    cost. A RUNTIME observation (the cost depends on a caller-supplied
+    function) is enforced per run instead and stops at the first unpriced one."""
+    if policy is None or policy.assumed_cost_per_run is not None or observation is SpendObservation.RUNTIME:
         return
     registration = BACKENDS.get(backend_name)
     if registration is None:
-        return  # unregistered (a shell judge command): observed at runtime, stops if unobservable
+        die(f"--max-cost-usd: {backend_name!r} is not a registered backend")
     capability = registration.capabilities.telemetry_contract()["cost"]
     if capability.availability != "available":
         die(
@@ -10506,16 +10507,8 @@ def spend_ceiling_preflight(ceiling: telemetry_domain.SpendCeiling | None, backe
             "to charge every run a fixed amount instead")
 
 
-def charge_spend(
-    ceiling: telemetry_domain.SpendCeiling, label: str, cost: telemetry_domain.Measurement[Any],
-) -> tuple[telemetry_domain.SpendCeiling, str | None]:
-    """Charge one completed run; an uncharged run stops the loop rather than
-    counting as free."""
-    try:
-        return ceiling.charge(label, cost), None
-    except telemetry_domain.SpendUnobservable as exc:
-        print(f"WARN spend ceiling: {label}: {exc}", file=sys.stderr)
-        return ceiling, telemetry_domain.SPEND_STOP_UNOBSERVABLE
+def plan_spend_ledger(policy: SpendPolicy | None, population: SpendPopulation, planned: int) -> SpendLedger | None:
+    return None if policy is None else SpendLedger(policy, population, planned)
 
 
 def run_cost_measurement(base: Path, source: str) -> telemetry_domain.Measurement[Any]:
@@ -10523,48 +10516,46 @@ def run_cost_measurement(base: Path, source: str) -> telemetry_domain.Measuremen
     return telemetry_domain.measurement_from_envelope_or_cost(read_metadata_base(base), source=source)
 
 
-def spend_skip_row(pt: PreparedTask, model: str | None) -> dict[str, Any]:
-    return {"case_id": pt.case_id, "model": model, "variant": pt.variant_truth,
-            "run_number": pt.run_number, "run_dir": pt.run_dir}
+def planned_spend_row(pt: PreparedTask, model: str | None) -> PlannedSpendRow:
+    return PlannedSpendRow.parse(pt.run_dir, pt.case_id, pt.variant_truth, pt.run_number, model)
 
 
-def write_spend_ledger(
-    path: Path | None, ceiling: telemetry_domain.SpendCeiling, *, population: str,
-    started: int, skipped: list[dict[str, Any]], stop_reason: str | None,
-) -> dict[str, Any]:
-    ledger = telemetry_domain.spend_ledger(
-        ceiling, population=population, started=started, skipped=skipped, stop_reason=stop_reason)
+def persist_spend_ledger(path: Path | None, ledger: SpendLedger) -> None:
+    doc = ledger.to_dict()
     if path is not None:
-        write_json(path, ledger)
+        write_json(path, doc)
     where = f"; see {path}" if path is not None else ""
-    if stop_reason is not None:
+    stop = ledger.stop_reason
+    if stop is not None:
         print(
-            f"spend ceiling: stopped after {started} {population} run(s) at "
-            f"${ledger['spent_usd']} of ${ledger['ceiling_usd']} ({stop_reason}); "
-            f"{len(skipped)} planned run(s) never started{where}",
+            f"spend ceiling: stopped after {ledger.started} {ledger.population.value} run(s) at "
+            f"${doc['spent_usd']} of ${doc['ceiling_usd']} ({stop.value}); "
+            f"{len(ledger.skipped)} planned run(s) never started{where}",
             file=sys.stderr)
     else:
         print(
-            f"spend ceiling: {started} {population} run(s) cost ${ledger['spent_usd']} "
-            f"of ${ledger['ceiling_usd']}{where}",
+            f"spend ceiling: {ledger.started} {ledger.population.value} run(s) cost "
+            f"${doc['spent_usd']} of ${doc['ceiling_usd']}{where}",
             file=sys.stderr)
-    return ledger
 
 
-def read_spend_ledger(runs: Path) -> dict[str, Any] | None:
+def spend_exit_code(ledger: SpendLedger | None) -> int:
+    return SPEND_CEILING_EXIT_CODE if ledger is not None and ledger.stop_reason is not None else 0
+
+
+def read_spend_ledger(runs: Path) -> SpendLedger | None:
+    """Parse a persisted ledger back into the typed value; a ledger that
+    contradicts its own records is refused rather than displayed."""
     path = runs / SPEND_LEDGER_NAME
     if not path.is_file():
         return None
     try:
-        ledger = strict_json_loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        die(f"{path}: unreadable spend ledger: {exc}")
-    if not isinstance(ledger, dict) or ledger.get("schema_version") != telemetry_domain.SPEND_LEDGER_SCHEMA_VERSION:
-        die(f"{path}: unsupported spend ledger schema")
-    return ledger
+        return SpendLedger.from_dict(strict_json_loads(path.read_text(encoding="utf-8")))
+    except (OSError, TypeError, ValueError) as exc:
+        die(f"{path}: invalid spend ledger: {exc}")
 
 
-def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, spend_ceiling: telemetry_domain.SpendCeiling | None = None, **options: Any) -> int:
+def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, spend_policy: SpendPolicy | None = None, **options: Any) -> int:
     """Shared answer-runner loop for native CLI backends.
 
     Existing `run-claude` and `run-codex` now use this path, and the new
@@ -10597,15 +10588,11 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
         validated.append((task, pt, row_model, base))
     runs.mkdir(parents=True, exist_ok=True)
     design = persist_answer_design(runs, tasks, default_model=model)
-    spend_ceiling_preflight(spend_ceiling, backend.name)
-    stop_reason: str | None = None
-    started = 0
-    skipped: list[dict[str, Any]] = []
+    spend_preflight(spend_policy, backend.name, SpendObservation.DECLARED)
+    ledger = plan_spend_ledger(spend_policy, SpendPopulation.ANSWER, len(validated))
     for task, pt, row_model, base in validated:
-        if spend_ceiling is not None and stop_reason is None and spend_ceiling.exhausted:
-            stop_reason = telemetry_domain.SPEND_STOP_CEILING
-        if stop_reason is not None:
-            skipped.append(spend_skip_row(pt, row_model))
+        if ledger is not None and not ledger.can_start:
+            ledger = ledger.skip(planned_spend_row(pt, row_model))
             continue
         base.mkdir(parents=True, exist_ok=True)
         prov_extra = {
@@ -10645,14 +10632,11 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             context.enriched(metadata=prov_extra, environment=env),
         )
         write_runner_outcome(base, outcome)
-        started += 1
-        if spend_ceiling is not None:
-            spend_ceiling, stop_reason = charge_spend(
-                spend_ceiling, pt.run_dir, run_cost_measurement(base, backend.name))
-    if spend_ceiling is not None:
-        write_spend_ledger(runs / SPEND_LEDGER_NAME, spend_ceiling, population="answer",
-                           started=started, skipped=skipped, stop_reason=stop_reason)
-    return SPEND_CEILING_EXIT_CODE if stop_reason is not None else 0
+        if ledger is not None:
+            ledger = ledger.charge(pt.run_dir, run_cost_measurement(base, backend.name))
+    if ledger is not None:
+        persist_spend_ledger(runs / SPEND_LEDGER_NAME, ledger)
+    return spend_exit_code(ledger)
 
 
 def run_agent(args: argparse.Namespace) -> int:
@@ -10664,7 +10648,7 @@ def run_agent(args: argparse.Namespace) -> int:
         surface_option_values(args, "answer"))
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), backend,
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
-                           spend_ceiling=spend_ceiling_from_args(args), **provider_options)
+                           spend_policy=spend_policy_from_args(args), **provider_options)
 
 
 def agent_capabilities_command(args: argparse.Namespace) -> int:
@@ -10680,7 +10664,7 @@ def run_codex(args: argparse.Namespace) -> int:
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("codex"),
                            timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
                            codex_cmd=getattr(args, "codex_cmd", None) or CODEX_ANSWER_DEFAULT_CMD,
-                           spend_ceiling=spend_ceiling_from_args(args))
+                           spend_policy=spend_policy_from_args(args))
 
 
 # --------------------------------------------------------------------------- #
@@ -10867,7 +10851,7 @@ def run_claude(args: argparse.Namespace) -> int:
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("claude"),
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
                            claude_bin=getattr(args, "claude_bin", None) or "claude",
-                           spend_ceiling=spend_ceiling_from_args(args))
+                           spend_policy=spend_policy_from_args(args))
 
 
 SUPPORTED_JSON_SCHEMA_TYPES = {
@@ -13181,7 +13165,7 @@ def run_subagent_tasks(
     model: str | None = None,
     live_tools: dict[str, Any] | None = None,
     replay_mode: str | None = None,
-    spend_ceiling: telemetry_domain.SpendCeiling | None = None,
+    spend_policy: SpendPolicy | None = None,
 ) -> int:
     """The built-in subagent runner (roadmap 2.7): no external CLI required —
     `agent_fn(prompt, workspace, model, tool_executor)` is the seam (a Claude
@@ -13217,17 +13201,13 @@ def run_subagent_tasks(
         validated.append((task, pt, row_model, base))
     runs.mkdir(parents=True, exist_ok=True)
     design = persist_answer_design(runs, tasks, default_model=model)
-    # No registry preflight here: the seam's dollar cost depends on the agent
-    # function behind it, so the ceiling is enforced from what each run reports
-    # and stops at the first run whose cost is unobservable.
-    stop_reason: str | None = None
-    completed_runs = 0
-    skipped: list[dict[str, Any]] = []
+    # The seam's dollar cost depends on the agent function behind it, so the
+    # ceiling is observed per run and stops at the first unpriced one.
+    spend_preflight(spend_policy, "subagent", SpendObservation.RUNTIME)
+    ledger = plan_spend_ledger(spend_policy, SpendPopulation.ANSWER, len(validated))
     for task, pt, row_model, base in validated:
-        if spend_ceiling is not None and stop_reason is None and spend_ceiling.exhausted:
-            stop_reason = telemetry_domain.SPEND_STOP_CEILING
-        if stop_reason is not None:
-            skipped.append(spend_skip_row(pt, row_model))
+        if ledger is not None and not ledger.can_start:
+            ledger = ledger.skip(planned_spend_row(pt, row_model))
             continue
         base.parent.mkdir(parents=True, exist_ok=True)
         sidecars = Path(tempfile.mkdtemp(prefix=f".{base.name}.sidecars-", dir=base.parent))
@@ -13439,14 +13419,11 @@ def run_subagent_tasks(
             write_runner_outcome(base, ro, sidecars=sidecars)
         finally:
             shutil.rmtree(sidecars, ignore_errors=True)
-        completed_runs += 1
-        if spend_ceiling is not None:
-            spend_ceiling, stop_reason = charge_spend(
-                spend_ceiling, pt.run_dir, run_cost_measurement(base, "subagent"))
-    if spend_ceiling is not None:
-        write_spend_ledger(runs / SPEND_LEDGER_NAME, spend_ceiling, population="answer",
-                           started=completed_runs, skipped=skipped, stop_reason=stop_reason)
-    return SPEND_CEILING_EXIT_CODE if stop_reason is not None else 0
+        if ledger is not None:
+            ledger = ledger.charge(pt.run_dir, run_cost_measurement(base, "subagent"))
+    if ledger is not None:
+        persist_spend_ledger(runs / SPEND_LEDGER_NAME, ledger)
+    return spend_exit_code(ledger)
 
 
 def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S) -> Any:
@@ -13493,7 +13470,7 @@ def run_subagent(args: argparse.Namespace) -> int:
                     "usage": claude_run_metrics(result)}
     return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
                               replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode(),
-                              spend_ceiling=spend_ceiling_from_args(args))
+                              spend_policy=spend_policy_from_args(args))
 
 
 JUDGE_NEGATIVE_CONTROLS = {
@@ -13681,19 +13658,15 @@ def judge_command(args: argparse.Namespace) -> int:
     repeat = max(1, int(getattr(args, "judge_runs", 1)))
     out = Path(args.out) if getattr(args, "out", None) else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
-    ceiling = spend_ceiling_from_args(args)
-    if judge_backend != "cmd":
-        spend_ceiling_preflight(ceiling, judge_backend)
-    stop_reason: str | None = None
-    judged = 0
-    skipped: list[dict[str, Any]] = []
+    policy = spend_policy_from_args(args)
+    spend_preflight(policy, judge_backend,
+                    SpendObservation.RUNTIME if judge_backend == "cmd" else SpendObservation.DECLARED)
+    ledger = plan_spend_ledger(policy, SpendPopulation.JUDGE, len(tasks))
     try:
         quorum = getattr(args, "quorum", None)
         for task in tasks:
-            if ceiling is not None and stop_reason is None and ceiling.exhausted:
-                stop_reason = telemetry_domain.SPEND_STOP_CEILING
-            if stop_reason is not None:
-                skipped.append({key: task.get(key) for key in ("judge_task_id", "case_id", "variant", "run_number")})
+            if ledger is not None and not ledger.can_start:
+                ledger = ledger.skip(judge_planned_spend_row(task))
                 continue
             # Two-level merge (G3): repeat-merge kills within-judge noise per model;
             # cross-judge consensus then folds the panel into one verdict per task.
@@ -13706,22 +13679,27 @@ def judge_command(args: argparse.Namespace) -> int:
                 members = [merge_repeated_judge_rows([run_one_judge_task(task, None, transcripts, i, judge_model=model, judge_backend=judge_backend, backend_options=backend_options, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory, explore=explore) for i in range(1, repeat + 1)]) for model in panel]
             consensus = merge_cross_judge_rows(members, quorum=quorum)
             fh.write(json.dumps(consensus, ensure_ascii=False) + "\n")
-            judged += 1
-            if ceiling is not None:
+            if ledger is not None:
                 # Panel and repeat spend is summed onto the consensus row, so one
                 # charge per task covers every member call it took.
-                ceiling, stop_reason = charge_spend(
-                    ceiling, str(task.get("judge_task_id") or f"judge-task-{judged}"),
+                ledger = ledger.charge(
+                    judge_planned_spend_row(task).label,
                     telemetry_domain.measurement_from_envelope_or_cost(
-                        consensus, source=judge_backend, population="judge"))
+                        consensus, source=judge_backend, population=SpendPopulation.JUDGE.value))
     finally:
         if out:
             fh.close()
-    if ceiling is not None:
-        write_spend_ledger(
-            Path(str(out) + ".spend-ceiling.json") if out is not None else None, ceiling,
-            population="judge", started=judged, skipped=skipped, stop_reason=stop_reason)
-    return SPEND_CEILING_EXIT_CODE if stop_reason is not None else 0
+    if ledger is not None:
+        persist_spend_ledger(Path(str(out) + ".spend-ceiling.json") if out is not None else None, ledger)
+    return spend_exit_code(ledger)
+
+
+def judge_planned_spend_row(task: dict[str, Any]) -> PlannedSpendRow:
+    try:
+        return PlannedSpendRow.parse(task.get("judge_task_id"), task.get("case_id"), task.get("variant"),
+                                     task.get("run_number"))
+    except (TypeError, ValueError) as exc:
+        die(f"judge task carries an invalid identity: {exc}")
 
 
 def judge_panel_sensitivity(reports_by_judge: dict[str, dict[str, Any]], *, magnitude_eps: float = 0.1) -> dict[str, Any]:
@@ -17308,10 +17286,10 @@ def build_benchmark_report(
         case_ids=answer_case_ids, variants=variants)
     # A runner that stopped at its spend ceiling leaves the design incomplete on
     # purpose; the ledger names that cause so the gap is not read as a crash.
-    spend_ceiling_ledger = read_spend_ledger(runs)
-    if (spend_ceiling_ledger is not None and spend_ceiling_ledger.get("stopped")
+    spend_ledger = read_spend_ledger(runs)
+    if (spend_ledger is not None and spend_ledger.stop_reason is not None
             and not design_coverage.get("complete")):
-        design_coverage = {**design_coverage, "stopped_by": spend_ceiling_ledger.get("stop_reason")}
+        design_coverage = {**design_coverage, "stopped_by": spend_ledger.stop_reason.value}
     paired_summary = build_paired_summary(results)
     unscorable_results = [row for row in results if not scorable_run(row)]
     grading_blocked_results = [
@@ -17422,7 +17400,7 @@ def build_benchmark_report(
                            and not pairing_incomplete)
             else "partial"),
         "answer_design": design_coverage,
-        "spend_ceiling": spend_ceiling_ledger,
+        "spend_ceiling": None if spend_ledger is None else spend_ledger.to_dict(),
         "skipped_trigger_cases": skipped_trigger_cases,
         "deferred_judge_tasks": deferred_judge_tasks,
         "summary": summary,

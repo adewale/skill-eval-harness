@@ -14,9 +14,13 @@ withholds headline numbers from an incomplete design. A ceiling only needs to st
 runs and say why.
 
 **Rule:**
-- One `SpendCeiling` value, charged from each completed run's cost *measurement*, is shared
-  by every paid loop (`run-agent`/`run-codex`/`run-claude`, `run-subagent`, `run-jetty`,
-  `judge`); no runner re-implements the arithmetic.
+- One `SpendLedger` value (`spend_contracts.py`), charged from each completed run's cost
+  *measurement*, is shared by every paid loop (`run-agent`/`run-codex`/`run-claude`,
+  `run-subagent`, `run-jetty`, `judge`). The loop asks it `can_start`, charges, and skips;
+  started/spent/exhausted/stopped are derived from its records, never kept as loop-local
+  counters. The first draft kept four such counters in four loops and let a
+  started-but-unpriced run vanish from the total; correctness-by-construction review caught
+  both.
 - The stop is recorded in `spend-ceiling.json` (exact decimal charges, the unstarted design
   rows, the reason); `benchmark` surfaces it as `answer_design.stopped_by`. No new
   `partial` flag.
