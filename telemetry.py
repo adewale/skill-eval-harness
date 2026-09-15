@@ -912,3 +912,4 @@ def display_aggregate(aggregate: Mapping[str, Any] | Aggregate[Any], *, prefix: 
         raise TypeError("aggregate reason_counts must be a mapping")
     reason = next(iter(reasons), "unavailable")
     return f"— unavailable ({reason})"
+

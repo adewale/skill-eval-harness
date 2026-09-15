@@ -41,10 +41,11 @@ import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Executor, Future, wait
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
-from typing import Any, NoReturn, Protocol, cast
+from typing import Any, NoReturn, Protocol, TypeVar, cast
 
 # Direct ``python skill_benchmark.py`` execution must share the canonical module
 # identity used by lazy backend references. Otherwise importing
@@ -168,6 +169,7 @@ from judge_verdict import (
 )
 from manifest_contracts import (
     DEFAULT_EXECUTION_VARIANTS,
+    WITH_SKILL,
     CaseId,
     CaseKind,
     CasePopulation,
@@ -175,6 +177,15 @@ from manifest_contracts import (
     ModelId,
     RunNumber,
     Split,
+)
+from spend_contracts import (
+    SPEND_LEDGER_NAME,
+    PlannedSpendRow,
+    SpendLedger,
+    SpendObservation,
+    SpendPolicy,
+    SpendPopulation,
+    SpendStopReason,
 )
 from text_contracts import (
     ComparisonProfile,
@@ -5362,20 +5373,28 @@ def run_jetty(args: argparse.Namespace) -> int:
         lock.acquire()
     except (JettyJournalInUse, OSError, ValueError) as exc:
         die(str(exc))
+    policy = spend_policy_from_args(args)
+    spend_preflight(policy, "jetty", SpendObservation.DECLARED)
+    ledger = plan_spend_ledger(policy, SpendPopulation.ANSWER, len(payloads))
+    produced = 0
     try:
         journal = JettyAttemptJournal(journal_path)
         result_slots = durable_jetty_result_slots(payloads, journal)
         atomic_write_jsonl(
             out, (record for record in result_slots if record is not None))
         incomplete = False
-        for index, record in enumerate(execute_jetty_payloads(
+        # The executor submits a payload only when the loop asks for the next
+        # record, so breaking after a charge stops the NEXT submission.
+        records = execute_jetty_payloads(
             payloads,
             client=client,
             timeout_s=getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S),
             poll_interval_s=getattr(args, "poll_interval", 5),
             journal=journal,
             resubmit_unknown=getattr(args, "resubmit_unknown", False),
-        )):
+        ) if ledger is None or ledger.can_start else iter(())
+        for index, record in enumerate(records):
+            produced = index + 1
             result_slots[index] = record
             atomic_write_jsonl(
                 out,
@@ -5391,9 +5410,68 @@ def run_jetty(args: argparse.Namespace) -> int:
                 "artifacts_downloaded", "result_committed",
             }:
                 incomplete = True
+            if ledger is not None and jetty_record_was_attempted(record):
+                ledger = ledger.charge(
+                    jetty_record_label(record, index), jetty_record_cost_measurement(record))
+                if not ledger.can_start:
+                    break
+        if ledger is not None:
+            for row in payloads[produced:]:
+                ledger = ledger.skip(jetty_planned_spend_row(row))
+            incomplete = incomplete or bool(ledger.skipped)
+            persist_spend_ledger(jetty_spend_ledger_path(out), ledger)
     finally:
         lock.release()
-    return 1 if incomplete else 0
+    return spend_exit_code(ledger) or (1 if incomplete else 0)
+
+
+def jetty_spend_ledger_path(out: Path) -> Path:
+    """The Jetty runner has no runs tree yet; the ledger rides beside the result
+    JSONL and `import-jetty-results` moves it to the runs root."""
+    return Path(str(out) + ".spend-ceiling.json")
+
+
+def _jetty_dict_field(record: dict[str, Any], key: str) -> dict[str, Any]:
+    value = record.get(key)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def jetty_record_was_attempted(record: dict[str, Any]) -> bool:
+    """A non-executable payload (dry-run placeholder, missing hidden prompt)
+    never reached the provider and costs nothing to charge."""
+    return _jetty_dict_field(record, "harness").get("executable") is not False
+
+
+def jetty_record_label(record: dict[str, Any], index: int) -> str:
+    run_dir = _jetty_dict_field(record, "harness").get("run_dir")
+    return run_dir if isinstance(run_dir, str) and run_dir else f"payload-{index}"
+
+
+def jetty_planned_spend_row(payload: dict[str, Any]) -> PlannedSpendRow:
+    harness = _jetty_dict_field(payload, "harness")
+    request = _jetty_dict_field(payload, "jetty_request")
+    try:
+        return PlannedSpendRow.parse(harness.get("run_dir"), harness.get("case_id"), harness.get("variant"),
+                                     harness.get("run_number"), request.get("model"))
+    except (TypeError, ValueError) as exc:
+        die(f"Jetty payload carries an invalid run identity: {exc}")
+
+
+def jetty_record_cost_measurement(record: dict[str, Any]) -> telemetry_domain.Measurement[Any]:
+    """A Jetty trajectory's provider-reported dollar cost, or an explicit
+    unavailable measurement — never a zero the provider did not report."""
+    basis = telemetry_domain.basis_from_run(
+        {"provider": "jetty", "runner": "jetty", "billing_scope": "run"}, source="jetty")
+    trajectory = _jetty_dict_field(record, "trajectory")
+    value = trajectory.get("cost_usd")
+    raw_currency = _jetty_dict_field(trajectory, "usage").get("currency")
+    currency = raw_currency if isinstance(raw_currency, str) else "USD"
+    if (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) and value >= 0):
+        return telemetry_domain.Measurement.available(
+            telemetry_domain.Money.from_raw(value, currency),
+            provenance="provider_reported", basis=basis)
+    return telemetry_domain.Measurement.unavailable("jetty_trajectory_cost_missing", basis=basis)
 
 
 def artifact_content(artifact: dict[str, Any]) -> Any:
@@ -6067,6 +6145,9 @@ def import_jetty_results(args: argparse.Namespace) -> int:
     finally:
         if not keep_for_recovery and transaction_root.exists():
             shutil.rmtree(transaction_root)
+    ledger_path = jetty_spend_ledger_path(Path(args.jetty_runs))
+    if ledger_path.is_file():
+        shutil.copy2(ledger_path, runs / SPEND_LEDGER_NAME)
     return 0
 
 
@@ -10373,7 +10454,188 @@ def registered_agent_backend(name: str) -> AgentBackend:
     return backend
 
 
-def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, **options: Any) -> int:
+# --------------------------------------------------------------------------- #
+# Runtime spend ceiling (`--max-cost-usd`).
+#
+# `suite-run` gates on a PROJECTED spend before any model call; this is the
+# runtime half of the same policy, shared by every paid loop (native answer
+# backends, the subagent seam, Jetty, and judges). The loop state lives in one
+# frozen `SpendLedger` (spend_contracts.py): it is asked `can_start` before
+# every run, charged each completed run's cost measurement — the same v3
+# telemetry the ledgers read — and told which planned runs it refused. Nothing
+# is invented for the runs that never started: the answer design already
+# records the plan, so the benchmark's existing availability logic marks the
+# design incomplete, and `spend-ceiling.json` beside it says why. A backend
+# that cannot report dollars fails closed before the first run unless the
+# caller supplies --assumed-cost-per-run-usd.
+# --------------------------------------------------------------------------- #
+SPEND_CEILING_EXIT_CODE = 2
+
+
+def add_spend_ceiling_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--max-cost-usd", type=float, help=(
+        "stop starting new runs once observed spend reaches this USD ceiling; "
+        "runs in flight finish, unstarted runs are listed in spend-ceiling.json, "
+        f"and the command exits {SPEND_CEILING_EXIT_CODE} (0 = plan only, run nothing)"))
+    parser.add_argument("--assumed-cost-per-run-usd", type=float, help=(
+        "charge this amount for a run whose dollar cost the backend does not report; "
+        "required to enforce --max-cost-usd on such backends (fails closed otherwise)"))
+
+
+def spend_policy_from_args(args: argparse.Namespace) -> SpendPolicy | None:
+    raw = getattr(args, "max_cost_usd", None)
+    if raw is None:
+        return None
+    try:
+        return SpendPolicy.from_raw(raw, getattr(args, "assumed_cost_per_run_usd", None))
+    except (TypeError, ValueError) as exc:
+        die(f"--max-cost-usd: {exc}")
+
+
+def spend_preflight(policy: SpendPolicy | None, backend_name: str, observation: SpendObservation) -> None:
+    """Fail closed before the first paid run: a backend whose registry entry
+    declares no dollar cost cannot enforce a ceiling without an assumed per-run
+    cost. A RUNTIME observation (the cost depends on a caller-supplied
+    function) is enforced per run instead and stops at the first unpriced one."""
+    if policy is None or policy.assumed_cost_per_run is not None or observation is SpendObservation.RUNTIME:
+        return
+    registration = BACKENDS.get(backend_name)
+    if registration is None:
+        die(f"--max-cost-usd: {backend_name!r} is not a registered backend")
+    capability = registration.capabilities.telemetry_contract()["cost"]
+    if capability.availability != "available":
+        die(
+            f"--max-cost-usd cannot be enforced on {backend_name}: its dollar cost is "
+            f"{capability.availability} ({capability.reason}); pass --assumed-cost-per-run-usd "
+            "to charge every run a fixed amount instead")
+
+
+def plan_spend_ledger(policy: SpendPolicy | None, population: SpendPopulation, planned: int) -> SpendLedger | None:
+    return None if policy is None else SpendLedger(policy, population, planned)
+
+
+def run_cost_measurement(base: Path, source: str) -> telemetry_domain.Measurement[Any]:
+    """The persisted run's cost, read back through the one telemetry reader."""
+    return telemetry_domain.measurement_from_envelope_or_cost(read_metadata_base(base), source=source)
+
+
+def planned_spend_row(pt: PreparedTask, model: str | None) -> PlannedSpendRow:
+    return PlannedSpendRow.parse(pt.run_dir, pt.case_id, pt.variant_truth, pt.run_number, model)
+
+
+def persist_spend_ledger(path: Path | None, ledger: SpendLedger) -> None:
+    doc = ledger.to_dict()
+    if path is not None:
+        write_json(path, doc)
+    where = f"; see {path}" if path is not None else ""
+    stop = ledger.stop_reason
+    if stop is not None:
+        print(
+            f"spend ceiling: stopped after {ledger.started} {ledger.population.value} run(s) at "
+            f"${doc['spent_usd']} of ${doc['ceiling_usd']} ({stop.value}); "
+            f"{len(ledger.skipped)} planned run(s) never started{where}",
+            file=sys.stderr)
+    else:
+        print(
+            f"spend ceiling: {ledger.started} {ledger.population.value} run(s) cost "
+            f"${doc['spent_usd']} of ${doc['ceiling_usd']}{where}",
+            file=sys.stderr)
+
+
+def spend_exit_code(ledger: SpendLedger | None) -> int:
+    return SPEND_CEILING_EXIT_CODE if ledger is not None and ledger.stop_reason is not None else 0
+
+
+def read_spend_ledger(runs: Path) -> SpendLedger | None:
+    """Parse a persisted ledger back into the typed value; a ledger that
+    contradicts its own records is refused rather than displayed."""
+    path = runs / SPEND_LEDGER_NAME
+    if not path.is_file():
+        return None
+    try:
+        return SpendLedger.from_dict(strict_json_loads(path.read_text(encoding="utf-8")))
+    except (OSError, TypeError, ValueError) as exc:
+        die(f"{path}: invalid spend ledger: {exc}")
+
+
+_AdmittedPlan = TypeVar("_AdmittedPlan")
+_AdmittedResult = TypeVar("_AdmittedResult")
+
+
+def run_admitted(
+    executor: Executor,
+    plan: Sequence[_AdmittedPlan],
+    workers: int,
+    ledger: SpendLedger | None,
+    *,
+    submit: Callable[[_AdmittedPlan], Future[_AdmittedResult]],
+    on_error: Callable[[_AdmittedPlan, BaseException], _AdmittedResult],
+    cost_of: Callable[[_AdmittedResult], telemetry_domain.Measurement[Any]],
+    label_of: Callable[[_AdmittedPlan], str],
+    row_of: Callable[[_AdmittedPlan], PlannedSpendRow],
+    refused: Callable[[_AdmittedPlan, SpendStopReason], _AdmittedResult],
+) -> tuple[list[_AdmittedResult], SpendLedger | None]:
+    """The concurrent loop's spend discipline, shared by the trigger runners.
+
+    At most `workers` cells are in flight and none is submitted once the
+    ledger refuses admission; each completed cell settles its cost before the
+    next admission decision, so overrun is bounded by the in-flight window.
+    Cells the ledger refuses are not dropped: `refused` turns each into a
+    result that records why it never ran, so the report's cohort stays honest
+    about its planned size. Results are returned in completion order."""
+    results: list[_AdmittedResult] = []
+    pending: dict[Future[_AdmittedResult], _AdmittedPlan] = {}
+    queue = list(plan)
+    index = 0
+    while index < len(queue) or pending:
+        while index < len(queue) and len(pending) < workers and (ledger is None or ledger.can_start):
+            cell = queue[index]
+            index += 1
+            if ledger is not None:
+                ledger = ledger.admit(label_of(cell))
+            pending[submit(cell)] = cell
+        if ledger is not None and ledger.refusal is not None:
+            # Spend only grows and an unpriced run is permanent, so nothing
+            # still in flight can reopen admission: refuse the remainder now.
+            reason = ledger.refusal
+            while index < len(queue):
+                cell = queue[index]
+                index += 1
+                ledger = ledger.skip(row_of(cell))
+                results.append(refused(cell, reason))
+        if not pending:
+            continue
+        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+        for future in done:
+            cell = pending.pop(future)
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = on_error(cell, exc)
+            results.append(result)
+            if ledger is not None:
+                ledger = ledger.settle(label_of(cell), cost_of(result))
+    return results, ledger
+
+
+def trigger_cost_measurement(observation: TriggerObservation) -> telemetry_domain.Measurement[Any]:
+    """One trigger cell's dollar cost through the one legacy-block reader."""
+    basis = telemetry_domain.basis_from_run(
+        {"provider": observation.agent, "runner": observation.agent, "billing_scope": "run"},
+        source=observation.agent, population=SpendPopulation.TRIGGER.value)
+    return telemetry_domain.measurement_from_cost_block(observation.cost, basis=basis)
+
+
+def trigger_planned_spend_row(*, agent: str, model: str | None, query_id: Any,
+                              run_number: int, ablation: str | None) -> PlannedSpendRow:
+    """A trigger cell's stable identity for the spend ledger: the arm is the
+    mounted tree (baseline skill or one ablation), the case is the query."""
+    variant = ExecutionVariant.ablation(ablation) if ablation else WITH_SKILL
+    label = f"{agent}/{model or 'default'}/{query_id}/run-{run_number}"
+    return PlannedSpendRow.parse(label, str(query_id), variant, run_number, model)
+
+
+def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, spend_policy: SpendPolicy | None = None, **options: Any) -> int:
     """Shared answer-runner loop for native CLI backends.
 
     Existing `run-claude` and `run-codex` now use this path, and the new
@@ -10406,7 +10668,12 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
         validated.append((task, pt, row_model, base))
     runs.mkdir(parents=True, exist_ok=True)
     design = persist_answer_design(runs, tasks, default_model=model)
+    spend_preflight(spend_policy, backend.name, SpendObservation.DECLARED)
+    ledger = plan_spend_ledger(spend_policy, SpendPopulation.ANSWER, len(validated))
     for task, pt, row_model, base in validated:
+        if ledger is not None and not ledger.can_start:
+            ledger = ledger.skip(planned_spend_row(pt, row_model))
+            continue
         base.mkdir(parents=True, exist_ok=True)
         prov_extra = {
             "population": "answer",
@@ -10445,7 +10712,11 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             context.enriched(metadata=prov_extra, environment=env),
         )
         write_runner_outcome(base, outcome)
-    return 0
+        if ledger is not None:
+            ledger = ledger.charge(pt.run_dir, run_cost_measurement(base, backend.name))
+    if ledger is not None:
+        persist_spend_ledger(runs / SPEND_LEDGER_NAME, ledger)
+    return spend_exit_code(ledger)
 
 
 def run_agent(args: argparse.Namespace) -> int:
@@ -10457,7 +10728,7 @@ def run_agent(args: argparse.Namespace) -> int:
         surface_option_values(args, "answer"))
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), backend,
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
-                           **provider_options)
+                           spend_policy=spend_policy_from_args(args), **provider_options)
 
 
 def agent_capabilities_command(args: argparse.Namespace) -> int:
@@ -10472,7 +10743,8 @@ def agent_capabilities_command(args: argparse.Namespace) -> int:
 def run_codex(args: argparse.Namespace) -> int:
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("codex"),
                            timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
-                           codex_cmd=getattr(args, "codex_cmd", None) or CODEX_ANSWER_DEFAULT_CMD)
+                           codex_cmd=getattr(args, "codex_cmd", None) or CODEX_ANSWER_DEFAULT_CMD,
+                           spend_policy=spend_policy_from_args(args))
 
 
 # --------------------------------------------------------------------------- #
@@ -10658,7 +10930,8 @@ def claude_run_metrics(result: dict[str, Any]) -> dict[str, Any]:
 def run_claude(args: argparse.Namespace) -> int:
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("claude"),
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
-                           claude_bin=getattr(args, "claude_bin", None) or "claude")
+                           claude_bin=getattr(args, "claude_bin", None) or "claude",
+                           spend_policy=spend_policy_from_args(args))
 
 
 SUPPORTED_JSON_SCHEMA_TYPES = {
@@ -12972,6 +13245,7 @@ def run_subagent_tasks(
     model: str | None = None,
     live_tools: dict[str, Any] | None = None,
     replay_mode: str | None = None,
+    spend_policy: SpendPolicy | None = None,
 ) -> int:
     """The built-in subagent runner (roadmap 2.7): no external CLI required —
     `agent_fn(prompt, workspace, model, tool_executor)` is the seam (a Claude
@@ -13007,7 +13281,14 @@ def run_subagent_tasks(
         validated.append((task, pt, row_model, base))
     runs.mkdir(parents=True, exist_ok=True)
     design = persist_answer_design(runs, tasks, default_model=model)
+    # The seam's dollar cost depends on the agent function behind it, so the
+    # ceiling is observed per run and stops at the first unpriced one.
+    spend_preflight(spend_policy, "subagent", SpendObservation.RUNTIME)
+    ledger = plan_spend_ledger(spend_policy, SpendPopulation.ANSWER, len(validated))
     for task, pt, row_model, base in validated:
+        if ledger is not None and not ledger.can_start:
+            ledger = ledger.skip(planned_spend_row(pt, row_model))
+            continue
         base.parent.mkdir(parents=True, exist_ok=True)
         sidecars = Path(tempfile.mkdtemp(prefix=f".{base.name}.sidecars-", dir=base.parent))
         prov_extra = {
@@ -13218,7 +13499,11 @@ def run_subagent_tasks(
             write_runner_outcome(base, ro, sidecars=sidecars)
         finally:
             shutil.rmtree(sidecars, ignore_errors=True)
-    return 0
+        if ledger is not None:
+            ledger = ledger.charge(pt.run_dir, run_cost_measurement(base, "subagent"))
+    if ledger is not None:
+        persist_spend_ledger(runs / SPEND_LEDGER_NAME, ledger)
+    return spend_exit_code(ledger)
 
 
 def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S) -> Any:
@@ -13264,7 +13549,8 @@ def run_subagent(args: argparse.Namespace) -> int:
                     "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
                     "usage": claude_run_metrics(result)}
     return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
-                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode())
+                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode(),
+                              spend_policy=spend_policy_from_args(args))
 
 
 JUDGE_NEGATIVE_CONTROLS = {
@@ -13452,9 +13738,16 @@ def judge_command(args: argparse.Namespace) -> int:
     repeat = max(1, int(getattr(args, "judge_runs", 1)))
     out = Path(args.out) if getattr(args, "out", None) else None
     fh = out.open("w", encoding="utf-8") if out else sys.stdout
+    policy = spend_policy_from_args(args)
+    spend_preflight(policy, judge_backend,
+                    SpendObservation.RUNTIME if judge_backend == "cmd" else SpendObservation.DECLARED)
+    ledger = plan_spend_ledger(policy, SpendPopulation.JUDGE, len(tasks))
     try:
         quorum = getattr(args, "quorum", None)
         for task in tasks:
+            if ledger is not None and not ledger.can_start:
+                ledger = ledger.skip(judge_planned_spend_row(task))
+                continue
             # Two-level merge (G3): repeat-merge kills within-judge noise per model;
             # cross-judge consensus then folds the panel into one verdict per task.
             # A shell --judge-cmd is one opaque judge (a 1-member panel); native
@@ -13464,11 +13757,29 @@ def judge_command(args: argparse.Namespace) -> int:
                 members = [merge_repeated_judge_rows([run_one_judge_task(task, judge_cmd, transcripts, i, judge_backend="cmd", schema_enforcement=schema_enforcement, include_trajectory=include_trajectory) for i in range(1, repeat + 1)])]
             else:
                 members = [merge_repeated_judge_rows([run_one_judge_task(task, None, transcripts, i, judge_model=model, judge_backend=judge_backend, backend_options=backend_options, schema_enforcement=schema_enforcement, include_trajectory=include_trajectory, explore=explore) for i in range(1, repeat + 1)]) for model in panel]
-            fh.write(json.dumps(merge_cross_judge_rows(members, quorum=quorum), ensure_ascii=False) + "\n")
+            consensus = merge_cross_judge_rows(members, quorum=quorum)
+            fh.write(json.dumps(consensus, ensure_ascii=False) + "\n")
+            if ledger is not None:
+                # Panel and repeat spend is summed onto the consensus row, so one
+                # charge per task covers every member call it took.
+                ledger = ledger.charge(
+                    judge_planned_spend_row(task).label,
+                    telemetry_domain.measurement_from_envelope_or_cost(
+                        consensus, source=judge_backend, population=SpendPopulation.JUDGE.value))
     finally:
         if out:
             fh.close()
-    return 0
+    if ledger is not None:
+        persist_spend_ledger(Path(str(out) + ".spend-ceiling.json") if out is not None else None, ledger)
+    return spend_exit_code(ledger)
+
+
+def judge_planned_spend_row(task: dict[str, Any]) -> PlannedSpendRow:
+    try:
+        return PlannedSpendRow.parse(task.get("judge_task_id"), task.get("case_id"), task.get("variant"),
+                                     task.get("run_number"))
+    except (TypeError, ValueError) as exc:
+        die(f"judge task carries an invalid identity: {exc}")
 
 
 def judge_panel_sensitivity(reports_by_judge: dict[str, dict[str, Any]], *, magnitude_eps: float = 0.1) -> dict[str, Any]:
@@ -17053,6 +17364,12 @@ def build_benchmark_report(
     design_coverage = answer_design_coverage(
         runs, results, manifest=manifest, manifest_path=path,
         case_ids=answer_case_ids, variants=variants)
+    # A runner that stopped at its spend ceiling leaves the design incomplete on
+    # purpose; the ledger names that cause so the gap is not read as a crash.
+    spend_ledger = read_spend_ledger(runs)
+    if (spend_ledger is not None and spend_ledger.stop_reason is not None
+            and not design_coverage.get("complete")):
+        design_coverage = {**design_coverage, "stopped_by": spend_ledger.stop_reason.value}
     paired_summary = build_paired_summary(results)
     unscorable_results = [row for row in results if not scorable_run(row)]
     grading_blocked_results = [
@@ -17163,6 +17480,7 @@ def build_benchmark_report(
                            and not pairing_incomplete)
             else "partial"),
         "answer_design": design_coverage,
+        "spend_ceiling": None if spend_ledger is None else spend_ledger.to_dict(),
         "skipped_trigger_cases": skipped_trigger_cases,
         "deferred_judge_tasks": deferred_judge_tasks,
         "summary": summary,
@@ -18490,6 +18808,446 @@ def migrate_command(args: argparse.Namespace) -> int:
     path.write_text(json.dumps(migrated, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     validate_manifest(path)
     print(f"\nwrote version-2 manifest to {path} (re-validated)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# `claude plugin eval` suite import (docs/comparing-with-claude-plugin-eval.md)
+#
+# Claude Code's built-in `claude plugin eval` keeps a suite as one directory
+# per case under the plugin's eval directory: `prompt.md` (frontmatter + the
+# prompt), an optional `case.yaml` (context.* fields, or the whole case), and
+# one grader per `graders/*.md`. Six grader types exist (regex, tool_used,
+# tool_order, file_exists, llm, baseline) and there are no custom graders.
+# The importer carries that layout onto a harness manifest so the same cases
+# can run paired, split, leakage-linted, and ablated here. Everything the
+# harness cannot express verbatim lands on a checklist instead of being
+# silently dropped — the same shape `migrate` uses.
+# ---------------------------------------------------------------------------
+PLUGIN_EVAL_GRADER_TYPES = frozenset({"regex", "tool_used", "tool_order", "file_exists", "llm", "baseline"})
+PLUGIN_EVAL_SUITE_DIRS = frozenset({"results", "mocks"})
+PLUGIN_EVAL_EXECUTION_FIELDS = ("model", "max_turns", "timeout_seconds", "allowed_tools", "append_system_prompt", "env")
+PLUGIN_EVAL_DEFAULT_HARNESS_VERSION = ">=0.6.0"
+
+
+def plugin_eval_manifest(plugin_root: Path) -> dict[str, Any]:
+    """The plugin's own manifest (`.claude-plugin/plugin.json` or `plugin.json`), {} if absent."""
+    for rel in (".claude-plugin/plugin.json", "plugin.json"):
+        candidate = plugin_root / rel
+        if candidate.is_file():
+            try:
+                data = strict_json_loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                die(f"{candidate}: unreadable plugin manifest: {exc}")
+            if not isinstance(data, dict):
+                die(f"{candidate}: plugin manifest must be a JSON object")
+            return data
+    return {}
+
+
+def plugin_eval_dir(plugin_root: Path, eval_dir: str | None) -> Path:
+    """Resolve the eval directory the way `claude plugin eval` does: the flag,
+    else the plugin manifest's `experimental.evals`, else `evals/`. Only a
+    relative path of plain directory names is accepted."""
+    candidate = eval_dir
+    if candidate is None:
+        experimental = plugin_eval_manifest(plugin_root).get("experimental")
+        value = experimental.get("evals") if isinstance(experimental, dict) else None
+        if isinstance(value, str) and value:
+            candidate = value
+    candidate = candidate or "evals"
+    rel = Path(candidate)
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+        die(f"eval dir must be a relative path without '..': {candidate!r}")
+    return plugin_root / rel
+
+
+def discover_plugin_eval_cases(eval_root: Path) -> list[Path]:
+    """Case directories under the eval root: any directory holding `prompt.md`
+    or `case.yaml`. A case directory's own subtree belongs to it (graders,
+    fixtures, mocks), grouping directories are recursed, and the suite-level
+    `results/` and `mocks/` directories are never cases."""
+    found: list[Path] = []
+
+    def walk(directory: Path, top: bool) -> None:
+        if (directory / "prompt.md").is_file() or (directory / "case.yaml").is_file():
+            found.append(directory)
+            return
+        for child in sorted(p for p in directory.iterdir() if p.is_dir()):
+            if child.name.startswith(".") or (top and child.name in PLUGIN_EVAL_SUITE_DIRS):
+                continue
+            walk(child, False)
+
+    if not eval_root.is_dir():
+        die(f"eval directory does not exist: {eval_root}")
+    walk(eval_root, True)
+    return found
+
+
+def _plugin_eval_grader_file(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    grader = dict(parse_frontmatter(text))
+    _, body = split_frontmatter(text)
+    grader.setdefault("name", path.stem)
+    if body.strip() and grader.get("type") in {"llm", "baseline"}:
+        grader.setdefault("criteria", body.strip())
+    elif body.strip():
+        grader.setdefault("_body", body.strip())
+    return grader
+
+
+def load_plugin_eval_case(case_dir: Path, eval_root: Path) -> dict[str, Any]:
+    """Read one case the way `claude plugin eval` merges it: `prompt.md`
+    frontmatter overrides the matching `case.yaml` fields, the `prompt.md`
+    body is the prompt (else `execution.prompt`), and `graders/*.md` follow
+    any graders listed in `case.yaml`."""
+    fields: dict[str, Any] = {}
+    yaml_path = case_dir / "case.yaml"
+    if yaml_path.is_file():
+        try:
+            loaded = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            die(f"{yaml_path}: invalid YAML: {exc}")
+        if not isinstance(loaded, dict):
+            die(f"{yaml_path}: case.yaml must be a mapping")
+        fields.update(loaded)
+    raw_execution = fields.get("execution")
+    execution: dict[str, Any] = dict(raw_execution) if isinstance(raw_execution, dict) else {}
+    prompt = execution.get("prompt") if isinstance(execution.get("prompt"), str) else None
+    limits = {key: execution[key] for key in PLUGIN_EVAL_EXECUTION_FIELDS if key in execution}
+    prompt_md = case_dir / "prompt.md"
+    if prompt_md.is_file():
+        text = prompt_md.read_text(encoding="utf-8")
+        frontmatter = parse_frontmatter(text)
+        _, body = split_frontmatter(text)
+        fields.update(frontmatter)
+        limits.update({key: frontmatter[key] for key in PLUGIN_EVAL_EXECUTION_FIELDS if key in frontmatter})
+        if body.strip():
+            prompt = body.strip()
+    graders: list[dict[str, Any]] = []
+    listed = fields.get("graders")
+    if isinstance(listed, list):
+        for index, grader in enumerate(listed, 1):
+            if not isinstance(grader, dict) or not isinstance(grader.get("name"), str):
+                die(f"{yaml_path}: graders[{index}] needs a name and a type")
+            graders.append({str(key): value for key, value in grader.items()})
+    graders_dir = case_dir / "graders"
+    if graders_dir.is_dir():
+        graders.extend(_plugin_eval_grader_file(path) for path in sorted(graders_dir.glob("*.md")))
+    raw_context = fields.get("context")
+    context: dict[str, Any] = dict(raw_context) if isinstance(raw_context, dict) else {}
+    name = fields.get("name") if isinstance(fields.get("name"), str) and fields.get("name") else case_dir.name
+    return {
+        "name": name,
+        "dir": case_dir,
+        "relative_dir": case_dir.relative_to(eval_root),
+        "prompt": prompt,
+        "fields": fields,
+        "limits": limits,
+        "context": context,
+        "graders": graders,
+    }
+
+
+def _plugin_eval_regex(pattern: Any, flags: Any) -> tuple[str, bool]:
+    """Translate a JavaScript regex + flags into the harness's Python regex plus
+    a `ci` bit. `i` becomes `ci`; `m`/`s` become inline flags; `g`/`y`/`u`/`d`
+    have no meaning for a single search and are dropped."""
+    source = str(pattern)
+    flag_text = str(flags or "")
+    prefix = "".join(f"(?{flag})" for flag in "ms" if flag in flag_text)
+    return prefix + source, "i" in flag_text
+
+
+def _plugin_eval_target_note(target: Any) -> str | None:
+    """None when the grader reads the final reply (what the harness grades);
+    else why the target has no verbatim harness equivalent."""
+    if target in (None, "last_message"):
+        return None
+    if isinstance(target, dict) and target.get("source") == "file":
+        return (f"reads the produced file {target.get('path')!r}; grade it here with "
+                "golden_output, structured_output, or a script oracle over outputs/")
+    if target == "trace":
+        return "reads the session trace; use command_ran/tool_call over events.json"
+    if target == "files":
+        return "reads the list of created paths; use file_exists per path"
+    if target == "mock_calls":
+        return "reads mocked MCP calls; the harness has no MCP mocks"
+    return f"unsupported target {target!r}"
+
+
+def plugin_eval_grader_to_assertion(
+    grader: dict[str, Any], case_id: str,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """One `claude plugin eval` grader -> one harness assertion (or None) plus
+    the checklist entries for whatever could not be carried verbatim."""
+    name = str(grader.get("name") or "grader")
+    gtype = grader.get("type")
+    notes: list[dict[str, Any]] = []
+
+    def note(decision: str, text: str) -> None:
+        notes.append({"case_id": case_id, "assertion": name, "decision": decision, "note": text})
+
+    if gtype not in PLUGIN_EVAL_GRADER_TYPES:
+        note("unsupported grader", f"unknown grader type {gtype!r}; nothing imported")
+        return None, notes
+    weight = grader.get("weight", 1)
+    if weight != 1:
+        note("weight", f"weight {weight!r} has no harness equivalent; every gate counts once — use severity: critical for a veto")
+    assertion: dict[str, Any] | None = None
+    if gtype == "regex":
+        target_note = _plugin_eval_target_note(grader.get("target"))
+        if target_note:
+            note("target", target_note)
+            return None, notes
+        if not isinstance(grader.get("pattern"), str) or not grader.get("pattern"):
+            note("pattern", "regex grader has no pattern; nothing imported")
+            return None, notes
+        pattern, ci = _plugin_eval_regex(grader["pattern"], grader.get("flags"))
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            note("pattern", f"JavaScript regex {grader['pattern']!r} does not compile as a Python regex ({exc}); rewrite it")
+            return None, notes
+        match = grader.get("match", "contains")
+        if match == "not_contains":
+            assertion = {"name": name, "type": "not_regex", "pattern": pattern, "ci": ci}
+        else:
+            assertion = {"name": name, "type": "regex", "pattern": pattern, "ci": ci}
+            if isinstance(match, str) and match.startswith("count:"):
+                note("match", f"match {match!r} imported as presence; the harness regex has no exact-count mode")
+    elif gtype == "tool_used":
+        tool = grader.get("tool")
+        if not isinstance(tool, str) or not tool:
+            note("tool", "tool_used grader names no tool; nothing imported")
+            return None, notes
+        minimum = grader.get("min", 1)
+        maximum = grader.get("max")
+        never = minimum == 0 and maximum == 0
+        if tool == "Skill":
+            assertion = {"name": name, "type": "skill_invoked", "expected": not never}
+            if not never:
+                # Cannot fire on the no-skill arm — the same reason
+                # `claude plugin eval` reports it unscored in two-arm mode.
+                assertion["variants"] = ["with_skill"]
+            if grader.get("input_match"):
+                note("input_match", "skill_invoked checks that the manifest's skill loaded; the input_match regex is not applied")
+        elif never:
+            assertion = {"name": name, "type": "tool_call", "tool": tool, "expected_no_call": True}
+            if grader.get("input_match"):
+                note("input_match", "expected_no_call matches the tool name only; input_match dropped")
+        else:
+            assertion = {"name": name, "type": "tool_call", "tool": tool}
+            if isinstance(grader.get("input_match"), str) and grader["input_match"]:
+                assertion["pattern"] = grader["input_match"]
+                note("input_match", "input_match is matched against the harness's rendered call text (tool name + input summary), not the raw JSON input; check it against events.json")
+            if isinstance(minimum, int) and minimum > 1:
+                assertion["min_count"] = minimum
+            elif minimum == 0:
+                note("min", "min: 0 with an upper bound is not expressible; imported as at-least-one")
+            if isinstance(maximum, int) and maximum >= 1:
+                assertion["max_count"] = maximum
+    elif gtype == "tool_order":
+        order: list[str] = []
+        for key in ("before", "after"):
+            spec = grader.get(key)
+            tool = spec.get("tool") if isinstance(spec, dict) else spec
+            if not isinstance(tool, str) or not tool:
+                note(key, f"tool_order {key} names no tool; nothing imported")
+                return None, notes
+            order.append(rf"\b{re.escape(tool)}\b")
+            if isinstance(spec, dict) and spec.get("input_match"):
+                note("input_match", f"tool_order {key} input_match dropped; order matches tool names only")
+        assertion = {"name": name, "type": "tool_call", "order": order}
+    elif gtype == "file_exists":
+        path = grader.get("path")
+        if not isinstance(path, str) or not path:
+            note("path", "file_exists grader names no path; nothing imported")
+            return None, notes
+        if grader.get("exists") is False:
+            note("exists", "exists: false has no harness equivalent; nothing imported")
+            return None, notes
+        if any(char in path for char in "*?["):
+            note("path", f"glob {path!r} is not supported; name one file under outputs/")
+            return None, notes
+        assertion = {"name": name, "type": "file_exists", "path": f"outputs/{path}"}
+    elif gtype == "llm":
+        focus_note = _plugin_eval_target_note(grader.get("focus"))
+        if focus_note:
+            note("focus", focus_note)
+            return None, notes
+        criteria = grader.get("criteria")
+        if not isinstance(criteria, str) or not criteria.strip():
+            note("criteria", "llm grader has no rubric; nothing imported")
+            return None, notes
+        # A plugin-eval llm grader is pass/fail and counts toward the score, so
+        # it enters the harness as a gate rather than the soft default.
+        assertion = {"name": name, "type": "judge", "rubric": [criteria.strip()], "severity": "gate"}
+        note("judge", "deferred judge task: run `skill-benchmark judge` with a backend or --judge-cmd; the plugin-eval judge (haiku, 2-of-3 votes) is not reproduced")
+    elif gtype == "baseline":
+        note("baseline", "no harness equivalent for judge-vs-reference-transcript; use similarity or golden_output against the reference's final text")
+        return None, notes
+    if assertion is not None:
+        if grader.get("arm") == "with-only" and "variants" not in assertion:
+            assertion["variants"] = ["with_skill"]
+        assertion["severity"] = assertion_severity(assertion)
+        assertion["oracle"] = oracle_tier(assertion)
+    return assertion, notes
+
+
+def _plugin_eval_case_files(case: dict[str, Any], manifest_dir: Path) -> tuple[list[str], list[dict[str, Any]]]:
+    files: list[str] = []
+    notes: list[dict[str, Any]] = []
+    add_dirs = case["context"].get("add_dirs")
+    if isinstance(add_dirs, list):
+        for entry in add_dirs:
+            directory = case["dir"] / str(entry)
+            if not directory.is_dir():
+                notes.append({"case_id": case["name"], "decision": "add_dirs", "note": f"add_dirs entry {entry!r} is not a directory under the case"})
+                continue
+            for path in sorted(p for p in directory.rglob("*") if p.is_file()):
+                files.append(os.path.relpath(path, manifest_dir).replace(os.sep, "/"))
+    return files, notes
+
+
+def import_plugin_evals_data(
+    plugin_root: Path, eval_root: Path, out_path: Path, *,
+    skill_paths: list[str] | None = None, skill_name: str | None = None,
+    split: str = "tune",
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Build the harness manifest for a `claude plugin eval` suite and the
+    checklist of everything the import could not carry verbatim."""
+    plugin_root = plugin_root.resolve()
+    manifest_dir = out_path.resolve().parent
+    repo_root = repo_root_for_manifest(out_path.resolve())
+    checklist: list[dict[str, Any]] = []
+    if skill_paths:
+        resolved_skills = [plugin_root / rel for rel in skill_paths]
+    else:
+        resolved_skills = sorted(plugin_root.glob("skills/*/SKILL.md"))
+        if not resolved_skills and (plugin_root / "SKILL.md").is_file():
+            resolved_skills = [plugin_root / "SKILL.md"]
+    for skill in resolved_skills:
+        if not skill.is_file():
+            die(f"skill file does not exist: {skill}")
+    if not resolved_skills:
+        die(f"no skills/*/SKILL.md under {plugin_root}; pass --skill-path")
+    if len(resolved_skills) > 1 and not skill_paths:
+        listed = ", ".join(str(p.relative_to(plugin_root)) for p in resolved_skills)
+        die(f"the plugin ships several skills ({listed}); pass --skill-path for the one under test")
+    if skill_name is None:
+        frontmatter = parse_frontmatter(resolved_skills[0].read_text(encoding="utf-8"))
+        candidate = frontmatter.get("name")
+        if not isinstance(candidate, str) or not candidate.strip():
+            candidate = plugin_eval_manifest(plugin_root).get("name")
+        skill_name = candidate if isinstance(candidate, str) and candidate.strip() else resolved_skills[0].parent.name
+    cases: list[dict[str, Any]] = []
+    seen: dict[str, Path] = {}
+    for case_dir in discover_plugin_eval_cases(eval_root):
+        case = load_plugin_eval_case(case_dir, eval_root)
+        case_id = case["name"]
+        if case_id in seen:
+            case_id = "-".join(case["relative_dir"].parts)
+        seen[case_id] = case_dir
+        if not case["prompt"]:
+            checklist.append({"case_id": case_id, "decision": "prompt", "note": "no prompt.md body or execution.prompt; case skipped"})
+            continue
+        assertions: list[dict[str, Any]] = []
+        for grader in case["graders"]:
+            assertion, notes = plugin_eval_grader_to_assertion(grader, case_id)
+            checklist.extend(notes)
+            if assertion is not None:
+                assertions.append(assertion)
+        files, notes = _plugin_eval_case_files(case, manifest_dir)
+        checklist.extend(notes)
+        entry: dict[str, Any] = {
+            "id": case_id,
+            "split": split,
+            "kind": "behavior",
+            "prompt": case["prompt"],
+        }
+        tags = case["fields"].get("tags")
+        if isinstance(tags, list) and tags:
+            entry["tags"] = [str(tag) for tag in tags]
+        outcome = case["fields"].get("expected_outcome")
+        if isinstance(outcome, str) and outcome.strip():
+            entry["expected_behavior"] = [outcome.strip()]
+        if files:
+            entry["files"] = files
+        entry["assertions"] = assertions
+        cases.append(entry)
+        if not assertions:
+            checklist.append({"case_id": case_id, "decision": "assertions", "note": "no grader survived the import; the case has nothing to grade"})
+        runs = case["fields"].get("runs")
+        if isinstance(runs, int) and not isinstance(runs, bool) and runs != 3:
+            checklist.append({"case_id": case_id, "decision": "runs", "note": f"runs: {runs} is a runner setting here: prepare --runs-per-variant {runs}"})
+        if case["limits"]:
+            keys = ", ".join(sorted(case["limits"]))
+            checklist.append({"case_id": case_id, "decision": "runner limits", "note": f"{keys} belong to the runner, not the manifest (run-agent --timeout, --models; tool grants are the agent CLI's)"})
+        for key, text in (
+            ("scaffold_script", "workspace scaffold has no manifest slot; commit the fixture files and list them under files"),
+            ("history_file", "conversation history is not imported; express the earlier turns with the case's turns list"),
+        ):
+            if case["context"].get(key):
+                checklist.append({"case_id": case_id, "decision": key, "note": text})
+    if not cases:
+        die(f"no importable cases under {eval_root}")
+    manifest = {
+        "version": 2,
+        "skill_name": skill_name,
+        "harness": {
+            "name": "skill-eval-harness",
+            "url": "https://github.com/adewale/skill-eval-harness",
+            "version": PLUGIN_EVAL_DEFAULT_HARNESS_VERSION,
+        },
+        "skill_paths": [os.path.relpath(skill, repo_root).replace(os.sep, "/") for skill in resolved_skills],
+        "variants": list(DEFAULT_VARIANTS),
+        "source": {"format": "claude-plugin-eval", "eval_dir": os.path.relpath(eval_root.resolve(), plugin_root).replace(os.sep, "/")},
+        "cases": cases,
+        "ablations": [],
+    }
+    checklist.append({"decision": "splits", "note": f"every case landed in {split!r}; move release-gating cases to holdout/holdback (docs/authoring-evals.md)"})
+    checklist.append({"decision": "ablations", "note": "the plugin-eval suite had one baseline arm; declare component ablations to learn which part of the skill is load-bearing"})
+    return manifest, checklist
+
+
+def import_plugin_evals_command(args: argparse.Namespace) -> int:
+    plugin_root = Path(args.plugin)
+    if not plugin_root.is_dir():
+        die(f"plugin directory does not exist: {plugin_root}")
+    eval_root = plugin_eval_dir(plugin_root, getattr(args, "eval_dir", None))
+    out_path = Path(args.out) if getattr(args, "out", None) else eval_root / "shared-benchmark.json"
+    manifest, checklist = import_plugin_evals_data(
+        plugin_root, eval_root, out_path,
+        skill_paths=list(getattr(args, "skill_paths", None) or []) or None,
+        skill_name=getattr(args, "skill_name", None),
+        split=getattr(args, "split", None) or "tune",
+    )
+    print(f"{len(manifest['cases'])} case(s) imported from {eval_root} for skill {manifest['skill_name']!r}")
+    if checklist:
+        print(f"\n{len(checklist)} item(s) the import could not carry verbatim (see docs/comparing-with-claude-plugin-eval.md):")
+        for item in checklist:
+            where = item.get("case_id") or "suite"
+            label = f" / {item['assertion']}" if item.get("assertion") else ""
+            print(f"- [{item['decision']}] {where}{label}: {item['note']}")
+    if getattr(args, "out_checklist", None):
+        write_json(Path(args.out_checklist), {"plugin": str(plugin_root), "eval_dir": str(eval_root), "checklist": checklist})
+    if getattr(args, "check", False):
+        print("\n--check: dry run, no manifest written")
+        return 0
+    if out_path.exists() and not getattr(args, "force", False):
+        die(f"{out_path} already exists; pass --force to overwrite it")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    validate_manifest(out_path)
+    leakage = prompt_assertion_leakage_findings(manifest, out_path)
+    for finding in leakage:
+        print(
+            f"WARN {finding['case_id']}: assertion {finding['assertion']!r} "
+            f"value {finding['value']!r} appears in prompt (leakage; case may saturate)",
+            file=sys.stderr,
+        )
+    print(f"\nwrote {out_path} (validated; {len(leakage)} leakage warning(s))")
     return 0
 
 
@@ -20656,6 +21414,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(may duplicate a paid run)"),
     )
     p.add_argument("--dry-run", action="store_true")
+    add_spend_ceiling_options(p)
 
     p = sub.add_parser("import-jetty-results")
     p.add_argument("--manifest", required=True)
@@ -20676,6 +21435,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--codex-cmd", default=CODEX_ANSWER_DEFAULT_CMD, help="argv-style Codex command prefix that reads prompt on stdin and emits Codex JSONL; shell metacharacters are not interpreted")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
+    add_spend_ceiling_options(p)
 
     p = sub.add_parser("run-claude", help="run prepared tasks through `claude -p --output-format json`, capturing cost/usage")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
@@ -20683,6 +21443,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", help="claude model id (e.g. claude-haiku-4-5-20251001); omit for the CLI default")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
+    add_spend_ceiling_options(p)
 
     p = sub.add_parser("run-agent", help="run prepared tasks through a registered native agent backend")
     p.add_argument("--agent", required=True, choices=sorted(AGENT_BACKENDS), help="native backend to use")
@@ -20690,6 +21451,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
+    add_spend_ceiling_options(p)
     add_surface_cli_options(p, "answer")
 
     p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")
@@ -20700,6 +21462,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable for the default backend")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
     p.add_argument("--tool-replay", choices=sorted(TOOL_REPLAY_MODES), help=f"tool replay mode; defaults from ${TOOL_REPLAY_ENV} (off)")
+    add_spend_ceiling_options(p)
 
     p = sub.add_parser("grade")
     p.add_argument("manifest")
@@ -20730,6 +21493,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--quorum", type=int, help="consensus: require k-of-n panel members to pass (default: strict majority; an even tie resolves to 'unresolved')")
     p.add_argument("--transcripts", help="directory for per-task prompt/stdout/stderr/result audit transcripts")
     p.add_argument("--out")
+    add_spend_ceiling_options(p)
     add_surface_cli_options(p, "judge")
 
     p = sub.add_parser("benchmark")
@@ -20820,6 +21584,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("manifest")
     p.add_argument("--check", action="store_true", help="dry run: print the diff and checklist, write nothing")
     p.add_argument("--out-checklist", help="also write the judgment-call checklist as JSON")
+
+    p = sub.add_parser("import-plugin-evals", help="import a `claude plugin eval` suite (evals/<case>/prompt.md + graders/*.md) as a harness manifest; unmappable graders and runner limits go on a checklist")
+    p.add_argument("plugin", nargs="?", default=".", help="plugin root (the directory holding plugin.json or .claude-plugin/plugin.json)")
+    p.add_argument("--eval-dir", help="eval directory below the plugin root (default: the plugin manifest's experimental.evals, else evals/)")
+    p.add_argument("--out", help="manifest to write (default: <eval dir>/shared-benchmark.json)")
+    p.add_argument("--skill-path", dest="skill_paths", action="append", help="SKILL.md under test, relative to the plugin root (repeatable; required when the plugin ships several skills)")
+    p.add_argument("--skill-name", help="manifest skill_name (default: the SKILL.md frontmatter name, else the plugin name)")
+    p.add_argument("--split", choices=sorted(VALID_SPLITS), default="tune", help="split every imported case lands in")
+    p.add_argument("--check", action="store_true", help="dry run: print the checklist, write nothing")
+    p.add_argument("--out-checklist", help="also write the checklist as JSON")
+    p.add_argument("--force", action="store_true", help="overwrite an existing manifest at --out")
 
     p = sub.add_parser("migrate-telemetry", help="upgrade run metadata/metrics to availability-aware telemetry schema v3")
     p.add_argument("--runs", required=True, help="run tree containing metadata.json and/or metrics.json artifacts")
@@ -21003,6 +21778,7 @@ def main() -> int:
         CLICommand.TRIGGER_COMPARE: trigger_compare,
         CLICommand.MIGRATE: migrate_command,
         CLICommand.MIGRATE_TELEMETRY: migrate_telemetry_command,
+        CLICommand.IMPORT_PLUGIN_EVALS: import_plugin_evals_command,
         CLICommand.COST_SUMMARY: cost_summary_command,
         CLICommand.TREND: trend,
         CLICommand.SUGGEST_CASES: suggest_cases,

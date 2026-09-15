@@ -26,6 +26,7 @@ class InvocationState(str, Enum):
     PROCESS_FAILED = "process_failed"
     PROVIDER_FAILED = "provider_failed"
     HARNESS_FAILED = "harness_failed"
+    NOT_STARTED = "not_started"
 
 
 def validate_invocation_lifecycle(
@@ -81,6 +82,13 @@ def validate_invocation_lifecycle(
             raise ValueError("process invocation cannot represent harness failure")
         if provider_error is not None:
             raise ValueError("harness failure cannot carry a provider error")
+    elif state is InvocationState.NOT_STARTED:
+        # The harness declined to spawn the process at all (a spend ceiling);
+        # nothing ran, so there is no exit code and no provider error.
+        if not allow_harness_failure or returncode is not None:
+            raise ValueError("process invocation cannot represent a run that never started")
+        if provider_error is not None:
+            raise ValueError("a run that never started cannot carry a provider error")
 
 
 class TimeoutSeconds(int):

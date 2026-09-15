@@ -24,6 +24,7 @@ title is the question; the body is the loop that answers it, runnable on
 | How do I upgrade a v1 manifest to v2? | [`migrating-evals.md`](migrating-evals.md) |
 | How do I upgrade the harness from 0.5.1 to 0.6.0? | [`upgrading.md`](upgrading.md) |
 | How do I port my existing evals into the harness? | [`porting-existing-evals.md`](porting-existing-evals.md) |
+| Should I use `claude plugin eval` or this harness? | [`comparing-with-claude-plugin-eval.md`](comparing-with-claude-plugin-eval.md) |
 
 The journey backlog lives in [`TODO.md`](../TODO.md) under "User journeys the code
 supports but the docs don't walk"; an unticked entry there is a journey whose

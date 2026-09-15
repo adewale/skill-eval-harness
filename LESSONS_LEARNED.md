@@ -2,6 +2,38 @@
 
 This file records durable lessons from building and using the shared skill evaluation harness across Adewale’s skill repos. Keep it practical: each lesson should change how the harness, manifests, or skill iteration process is run next time.
 
+## 2026-09-12 — A spend ceiling is a stop rule, not a partial-result flag
+
+**Problem:** Claude Code's `claude plugin eval --max-cost-usd` stops launching runs at a
+list-price ceiling and marks the whole result `partial: true`. Porting that literally would
+have added a second "incomplete" signal beside the answer design the harness already
+attests, and would have let a dollar-blind runner count an unpriced run as free.
+
+**Lesson:** The harness already knows what was planned (`answer-design.json`) and already
+withholds headline numbers from an incomplete design. A ceiling only needs to stop starting
+runs and say why.
+
+**Rule:**
+- One `SpendLedger` value (`spend_contracts.py`), charged from each completed run's cost
+  *measurement*, is shared by every paid loop (`run-agent`/`run-codex`/`run-claude`,
+  `run-subagent`, `run-jetty`, `judge`, and the two trigger runners). The loop asks it `can_start`,
+  charges, and skips (a concurrent loop admits and settles through one shared scheduler);
+  started/spent/exhausted/stopped are derived from its records, never kept as loop-local
+  counters. The first draft kept four such counters in four loops and let a
+  started-but-unpriced run vanish from the total; correctness-by-construction review caught
+  both.
+- The stop is recorded in `spend-ceiling.json` (exact decimal charges, the unstarted design
+  rows, the reason); `benchmark` surfaces it as `answer_design.stopped_by`. No new
+  `partial` flag.
+- Unavailable cost is never charged as zero: a backend that does not report dollars refuses
+  the ceiling before the first run unless `--assumed-cost-per-run-usd` is given, and a run
+  whose cost turns out unobservable stops the loop with `cost_unobservable`.
+- A refused run is never dropped from a report: an answer design lists it as unstarted, and a
+  trigger cell becomes a `not_started` observation, so a stopped suite reads as incomplete of its
+  planned size rather than complete and smaller.
+- `--max-cost-usd 0` is the free plan-only mode, the same way `claude plugin eval
+  --max-cost-usd 0` parses every case and starts nothing.
+
 ## 2026-06-09 — Eval generation must fail closed
 
 **Problem:** Early task preparation could leak answer keys or silently proceed with missing hidden prompts.

@@ -73,6 +73,16 @@ from runner_contracts import (
     SpawnFailed,
     TimedOut,
 )
+from spend_contracts import (
+    AssumedCharge,
+    ObservedCharge,
+    PlannedSpendRow,
+    SpendCharge,
+    SpendLedger,
+    SpendPolicy,
+    SpendPopulation,
+    SpendStopReason,
+)
 from trace_contracts import (
     EventLogObservation,
     InvalidEventLog,
@@ -259,3 +269,23 @@ def cli_invocation_types_are_precise(invocation: CLIInvocation) -> None:
     _models: tuple[ModelId, ...] = invocation.models
     _judge_models: tuple[ModelId, ...] = invocation.judge_models
     _namespace: Namespace = invocation.to_legacy_namespace()
+
+
+def spend_charge_is_exhaustive(charge: SpendCharge) -> None:
+    if isinstance(charge, ObservedCharge):
+        _provenance: str = charge.provenance
+    elif isinstance(charge, AssumedCharge):
+        _reason: str = charge.reason
+    else:
+        _assert_never(charge)
+
+
+def spend_ledger_identity_is_precise(ledger: SpendLedger, row: PlannedSpendRow) -> None:
+    _policy: SpendPolicy = ledger.policy
+    _population: SpendPopulation = ledger.population
+    _stop: SpendStopReason | None = ledger.stop_reason
+    _can_start: bool = ledger.can_start
+    _case_id: CaseId = row.case_id
+    _variant: ExecutionVariant = row.variant
+    _run_number: RunNumber = row.run_number
+    _model: ModelId | None = row.model

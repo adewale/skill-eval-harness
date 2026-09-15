@@ -86,7 +86,7 @@ a more specific unit.
 | Task preparation and outbound handoff | `prepare`, `export-jetty`, `compare-tasks` | prepare/export root; durable run group plus task/export digest | 2 |
 | Native and in-process answers | `run-agent`, `run-codex`, `run-claude`, `run-subagent`; Pi answer smoke | one root per prepared attempt; runner invocation and artifact commit | 1, 3 |
 | Remote answer execution | `run-jetty` | one root per remote attempt; submit, poll, and download operations with remote links | 3 |
-| Ingestion and artifact mutation | `import-jetty-results`, `import-trace`, `migrate-telemetry`, `compare-results` | new ingest/migration root; validate then atomic commit, linked to producer/export context | 3, 5 |
+| Ingestion and artifact mutation | `import-jetty-results`, `import-trace`, `import-plugin-evals`, `migrate-telemetry`, `compare-results` | new ingest/migration root; validate then atomic commit, linked to producer/export context | 3, 5 |
 | Autonomous activation | `skill-trigger-matrix`, `skill-pi-trigger-eval`, `trigger-compare` | one root per query repetition; bounded comparison root over completed observations | 3, 5 |
 | Deterministic evaluation and judges | `grade`, `judge`, `judge-robustness`, `compare-judges`, `judge-alignment` | one grade root per discovered run; bounded opt-in script/embed operations; judge task, invocation, result-ingest, and analysis operations | 4, 5 |
 | Aggregation and analysis | `benchmark`, `aggregate`, `cost-summary`, `token-overhead`, `contamination`, `error-analysis`, `trend` | bounded aggregate/analysis roots linked to inputs; shared grade roots where those commands re-grade | 5 |

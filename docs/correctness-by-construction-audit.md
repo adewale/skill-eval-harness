@@ -36,7 +36,8 @@ subprocess bytes
 ```
 
 - `InvocationOutcome` is a frozen, closed state machine. Completion, timeout, spawn failure,
-  process failure, provider failure, protocol failure, and harness failure are mutually exclusive.
+  process failure, provider failure, protocol failure, harness failure, and not-started (the harness
+  declined to spawn the process, as a spend ceiling does) are mutually exclusive.
 - `PiStream` parses provider status and cumulative telemetry together. A complete process with a
   terminal provider error, malformed JSON stream, or no final non-retrying `agent_end` is failed.
   Failed streams cannot carry numeric usage or cost.
@@ -400,6 +401,42 @@ observed numeric rate -> UnitRate(0 <= value <= 1)
   never permission to average only the surviving values.
 - Rate validation rejects bool, NaN, infinity, and out-of-range values before aggregation.
 - `ty` checks exhaustive narrowing across all four coverage states.
+
+## Runtime spend ceiling
+
+Every paid loop (native answer backends, the subagent seam, Jetty, judges, both trigger runners)
+runs under one closed ledger from `spend_contracts.py`:
+
+```text
+--max-cost-usd / --assumed-cost-per-run-usd -> SpendPolicy (exact USD Money)
+planned run count + population               -> SpendLedger
+completed run's cost Measurement             -> ObservedCharge | AssumedCharge | UnpricedRun
+refused planned run                          -> PlannedSpendRow (CaseId, ExecutionVariant, RunNumber, ModelId)
+ledger                                       -> persisted spend-ceiling.json, parsed back by from_dict
+```
+
+- The ledger is the single owner of loop state. `started`, `spent`, `exhausted`, `can_start`, and
+  `stop_reason` (`cost_ceiling | cost_unobservable`) are derived from its records; no loop keeps a
+  separately writable counter or stop flag. Sequential loops share `can_start`, `charge`, `skip`;
+  the concurrent trigger runners share `admit`/`settle` through one scheduler (`run_admitted`),
+  which admits at most `--workers` cells, settles each before the next admission, and turns every
+  refused cell into a `not_started` trigger observation so the cohort's planned size is preserved.
+  A ledger with unsettled runs cannot be persisted.
+- Transitions are total only where the state allows them: a run the ledger did not allow to start
+  cannot be charged, and a run it allows to start cannot be skipped. Construction rejects more
+  records than were planned, duplicate labels, and skipped rows without an exhausted ceiling or an
+  unpriced run.
+- An unavailable, not-applicable, or non-USD cost is never charged as zero. With an assumed per-run
+  cost it becomes an `AssumedCharge` that names the reason; without one it becomes the terminal
+  `UnpricedRun`, the spent total's availability drops from complete to partial, and the loop stops.
+- Whether a backend can price a run at all is an explicit `SpendObservation` chosen by the caller
+  (`DECLARED` consults the backend registry before the first run; `RUNTIME` observes per run), not
+  something inferred from a missing registry entry.
+- Amounts are exact `Decimal` `Money` values persisted as strings; `SpendLedger.from_dict` rejects
+  unknown or missing fields and a persisted ledger whose derived fields contradict its own records,
+  so the benchmark report embeds only a ledger that re-parsed.
+- `ty` checks exhaustive narrowing over `ObservedCharge | AssumedCharge` and the precision of the
+  planned-row identity; runtime model-gap tests attempt each contradictory construction.
 
 ## Ablation provenance vocabulary
 

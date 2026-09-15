@@ -18,7 +18,8 @@ import re
 import shutil
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from skill_benchmark import (
     AblationError,
     PiStream,
     ProcessInvocationPlan,
+    add_spend_ceiling_options,
     build_canonical_skill_tree,
     canonical_json_sha256,
     canonical_trigger_query,
@@ -41,15 +43,28 @@ from skill_benchmark import (
     load_manifest_source,
     materialize_trigger_ablation,
     mount_skill_tree,
+    persist_spend_ledger,
     pi_stream_terminal_error,
+    plan_spend_ledger,
     repo_root_for_manifest,
+    run_admitted,
     safe_trace_label,
     skill_tree_hash,
+    spend_exit_code,
+    spend_policy_from_args,
+    spend_preflight,
     strict_json_loads,
+    trigger_cost_measurement,
     trigger_harness_identity,
     trigger_manifest_identity,
+    trigger_planned_spend_row,
     write_json,
     write_trace_artifacts,
+)
+from spend_contracts import (
+    PlannedSpendRow,
+    SpendObservation,
+    SpendPopulation,
 )
 from trigger_contracts import (
     InvocationOutcome,
@@ -242,18 +257,7 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
             cost_normalized = dict(stream.cost_normalized)
         else:
             usage_normalized, cost_normalized = {"source": "missing"}, {"source": "missing"}
-        is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
-        # The materialized ablation's provenance goes through Provenance (one
-        # schema). skill_tree_hash names the bytes this arm actually mounted;
-        # parent_skill_hash in the ablation provenance links those edited bytes
-        # back to the baseline's canonical revision.
-        if is_ablation:
-            prov = Provenance.from_dict(abl_prov)
-            ablation_field = prov.as_dict()
-            skill_tree_hash = prov.identity.edited
-        else:
-            ablation_field = ablation
-            skill_tree_hash = (abl_prov or {}).get("skill_tree_hash")
+        ablation_field, skill_tree_hash = pi_arm_identity(abl_prov, ablation)
         # RAW measurement, NOT a confirmed ablation effect: this is one arm's
         # autonomous-trigger outcome. Pass/completeness/timeout are derived from
         # the typed invocation and expectation; callers cannot set them independently.
@@ -280,6 +284,32 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
         if trace_dir is not None:
             write_trigger_trace_artifacts(trace_dir, invocation.stdout, result, stream)
         return observation
+
+
+def pi_arm_identity(abl_prov: dict[str, Any] | None, ablation: str | None) -> tuple[Any, str | None]:
+    """The arm a Pi observation ran against. The materialized ablation's
+    provenance goes through Provenance (one schema). skill_tree_hash names the
+    bytes this arm actually mounted; parent_skill_hash in the ablation
+    provenance links those edited bytes back to the baseline's canonical
+    revision."""
+    is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
+    if is_ablation:
+        prov = Provenance.from_dict(abl_prov)
+        return prov.as_dict(), prov.identity.edited
+    return ablation, (abl_prov or {}).get("skill_tree_hash")
+
+
+@dataclass(frozen=True)
+class PiCell:
+    """One planned (query, repetition) cell before it is admitted."""
+
+    query: str
+    query_id: Any
+    should_trigger: bool
+    run_number: int
+    trace_dir: Path | None
+    identity: TriggerRepetitionIdentity
+    spend_row: PlannedSpendRow
 
 
 def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int,
@@ -404,6 +434,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", required=True)
     ap.add_argument("--trace-runs", help="optional directory for per-query trace.jsonl/events.json/metrics.json artifacts")
     ap.add_argument("--ablation", help="materialize this (discovery-population) ablation id and trigger-test the altered skill")
+    add_spend_ceiling_options(ap)
     return ap
 
 
@@ -424,26 +455,65 @@ def main() -> int:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    futures = []
-    observations: list[TriggerObservation] = []
     protocol = pi_trigger_protocol(
         timeout=timeout, runs_per_query=runs_per_query,
         workers=workers, model=args.model)
     protocol_sha256 = canonical_json_sha256(protocol)
+    spend_policy = spend_policy_from_args(args)
+    spend_preflight(spend_policy, "pi", SpendObservation.DECLARED)
+    plan: list[PiCell] = []
+    for i, row in enumerate(rows, 1):
+        for run_number in range(1, runs_per_query + 1):
+            trace_dir = None
+            if args.trace_runs:
+                label = safe_trace_label(str(row.get("query", f"query-{i}")), f"query-{i}")
+                trace_dir = Path(args.trace_runs) / f"query-{i:03d}-{label}" / f"run-{run_number}"
+            plan.append(PiCell(
+                query=str(row["query"]), query_id=row["query_id"],
+                should_trigger=bool(row["should_trigger"]), run_number=run_number,
+                trace_dir=trace_dir,
+                identity=TriggerRepetitionIdentity(row["query_id"], run_number),
+                spend_row=trigger_planned_spend_row(
+                    agent="pi", model=args.model, query_id=row["query_id"],
+                    run_number=run_number, ablation=args.ablation),
+            ))
+    ledger = plan_spend_ledger(spend_policy, SpendPopulation.TRIGGER, len(plan))
+    refused_metadata: dict[str, Any] = {}
+    if ledger is not None:
+        # A refused cell must still name the arm it was planned against, so the
+        # report keeps one consistent tree hash and ablation provenance.
+        with tempfile.TemporaryDirectory(prefix="pi-trigger-plan-") as td:
+            _, abl_prov = copy_skill_to_config(manifest_path, manifest, Path(td), ablation_id=args.ablation)
+        ablation_field, tree_hash_planned = pi_arm_identity(abl_prov, args.ablation)
+        refused_metadata = {
+            "measurement": EvidenceClass.RAW_MEASUREMENT.value,
+            "ablation": ablation_field,
+            "skill_tree_hash": tree_hash_planned,
+            "protocol_sha256": protocol_sha256,
+            "protocol_observation": {},
+        }
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for i, row in enumerate(rows, 1):
-            for run_number in range(1, runs_per_query + 1):
-                trace_dir = None
-                if args.trace_runs:
-                    label = safe_trace_label(str(row.get("query", f"query-{i}")), f"query-{i}")
-                    trace_dir = Path(args.trace_runs) / f"query-{i:03d}-{label}" / f"run-{run_number}"
-                identity = TriggerRepetitionIdentity(row["query_id"], run_number)
-                futures.append(ex.submit(
-                    observe_query, manifest_path, row["query"], row["should_trigger"],
-                    timeout, args.model, trace_dir, args.ablation, identity,
-                    protocol_sha256))
-        for fut in as_completed(futures):
-            observations.append(fut.result())
+        observations, ledger = run_admitted(
+            ex, plan, workers, ledger,
+            submit=lambda cell: ex.submit(
+                observe_query, manifest_path, cell.query, cell.should_trigger,
+                timeout, args.model, cell.trace_dir, args.ablation, cell.identity,
+                protocol_sha256),
+            on_error=lambda cell, exc: TriggerObservation.harness_failure(
+                agent="pi", model=args.model, query=cell.query,
+                expectation=TriggerExpectation.from_bool(cell.should_trigger), error=exc,
+                metadata=refused_metadata or None, identity=cell.identity),
+            cost_of=trigger_cost_measurement,
+            label_of=lambda cell: cell.spend_row.label,
+            row_of=lambda cell: cell.spend_row,
+            refused=lambda cell, reason: TriggerObservation.not_started(
+                agent="pi", model=args.model, query=cell.query,
+                expectation=TriggerExpectation.from_bool(cell.should_trigger),
+                reason=f"spend ceiling refused admission ({reason.value})",
+                metadata=refused_metadata, identity=cell.identity),
+        )
+    if ledger is not None:
+        persist_spend_ledger(Path(str(args.out) + ".spend-ceiling.json"), ledger)
     observations.sort(key=lambda observation: (
         str(observation.identity.query_id if observation.identity else ""),
         int(observation.identity.run_number if observation.identity else 0),
@@ -487,11 +557,12 @@ def main() -> int:
             for row in rows
         ],
         "summary": summary,
+        "spend_ceiling": None if ledger is None else ledger.to_dict(),
         "results": [observation.as_row() for observation in observations],
     }
     write_json(Path(args.out), output)
     print(json.dumps(output["summary"], indent=2))
-    return trigger_cohort_exit_code(cohort)
+    return spend_exit_code(ledger) or trigger_cohort_exit_code(cohort)
 
 
 if __name__ == "__main__":

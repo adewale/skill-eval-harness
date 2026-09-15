@@ -57,10 +57,38 @@ class InvocationOutcomeInvariantTests(unittest.TestCase):
             {"returncode": 0, "state": InvocationState.PROCESS_FAILED},
             {"returncode": 0, "state": InvocationState.PROVIDER_FAILED},
             {"returncode": 0, "state": InvocationState.HARNESS_FAILED},
+            {"returncode": 0, "state": InvocationState.NOT_STARTED},
         ]
         for fields in invalid:
             with self.subTest(fields=fields), self.assertRaises((TypeError, ValueError)):
                 InvocationOutcome(stdout="", stderr="", elapsed_ms=0, **fields)
+
+    def test_not_started_is_a_distinct_incomplete_state_that_round_trips(self):
+        # A run the harness declined to spawn: no process, no evidence, no cost.
+        invocation = InvocationOutcome.not_started("spend ceiling refused admission (cost_ceiling)")
+        self.assertIs(invocation.state, InvocationState.NOT_STARTED)
+        self.assertIsNone(invocation.returncode)
+        self.assertFalse(invocation.observation_complete)
+        self.assertFalse(invocation.process_observation_complete)
+        with self.assertRaises(ValueError):
+            InvocationOutcome.not_started("")
+        with self.assertRaises(ValueError):
+            InvocationOutcome("", "x", 0, 1, InvocationState.NOT_STARTED)
+        observation = TriggerObservation.not_started(
+            agent="stub", model="offline", query="review this",
+            expectation=TriggerExpectation.TRIGGER,
+            reason="spend ceiling refused admission (cost_ceiling)",
+            metadata={"skill_tree_hash": "abc"},
+            identity=TriggerRepetitionIdentity("q1", 2))
+        self.assertIsNone(observation.passed)
+        self.assertEqual((observation.usage, observation.cost), ({"source": "missing"}, {"source": "missing"}))
+        row = observation.as_row()
+        self.assertEqual(row["invocation_state"], "not_started")
+        self.assertEqual(row["not_started"], "spend ceiling refused admission (cost_ceiling)")
+        reparsed = TriggerObservation.from_row(row)
+        self.assertIs(reparsed.invocation.state, InvocationState.NOT_STARTED)
+        self.assertEqual(reparsed.result, observation.result)
+        self.assertEqual(reparsed.identity, observation.identity)
 
     def test_nonzero_completion_requires_the_named_agent_window_transition(self):
         failed = InvocationOutcome.from_process(

@@ -38,7 +38,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 - Local grading: deterministic assertions run without model calls.
 - Eval hygiene: leakage lint, manifest audit, trigger checks, repeated-run stats, and fixture recommendations.
 - Activation: does the skill load on its own? `skill-trigger-matrix` reports autonomous trigger rates per (agent × model), split by should-fire / should-not-fire.
-- Cost as a signal: normalized token/dollar telemetry per run, a suite cost ledger, and lift-per-dollar (`cost-summary`, `token-overhead`).
+- Cost as a signal: normalized token/dollar telemetry per run, a suite cost ledger, lift-per-dollar (`cost-summary`, `token-overhead`), and a runtime spend ceiling (`--max-cost-usd` on every runner, both trigger runners, and the judge) that stops starting runs at the cap and leaves `spend-ceiling.json` explaining the gap.
 - Interop: Anthropic-style exports, static/served HTML review pages, and Jetty runbook-mode import/export.
 - Judge plumbing: `judge`/`rubric` assertions can be exported or run through native Claude/Codex/Gemini/Vibe backends (`--judge-backend`) or a user-supplied `--judge-cmd`; the harness does not choose a model for you.
 
@@ -179,6 +179,7 @@ skill-benchmark --help
 | `docs/migrating-evals.md` | Upgrading a manifest between versions (v1 → v2): what `migrate` stamps and the judgment calls it leaves. |
 | `docs/upgrading.md` | Version-by-version harness upgrades: saved-run backup, artifact migration, strict input repairs, expected report changes, and rollback. |
 | `docs/porting-existing-evals.md` | Arriving from another framework: `dataset_files` + a template case carry the rows across, then the paired baseline, splits, leakage lint, and the `audit-manifest` punch list supply what the old suite had no slot for. |
+| `docs/comparing-with-claude-plugin-eval.md` | `claude plugin eval` vs this harness: what each owns, its grader-scoring / cost-ceiling / tool-grant semantics, `import-plugin-evals` with the checklist reading guide, and the recorded-run + `--keep-temp` trace bridge. |
 | `docs/vocabulary.md` | Glossary of harness terms: variants, splits, models, ablations, assertions, severity/oracle tiers, graded scoring, cost telemetry, trace artifacts, agent/judge backends, judge calibration, reliability, contamination, and report flags. |
 | `docs/evals-are-not-tests.md` | Why a skill eval is not a unit test, and what that changes about reading results. |
 | `docs/academic-grounding.md` | The research constructs behind the harness's terms, with citations; meshes the workflow, measurement, and theory layers. |
@@ -529,6 +530,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 | `skill-benchmark export-anthropic` | Emit an Anthropic-skill-creator-compatible `benchmark.json`. |
 | `skill-benchmark compare-tasks` / `skill-benchmark compare-results` | Blind A/B comparison export and scoring. |
 | `skill-benchmark export-jetty` / `skill-benchmark run-jetty` / `skill-benchmark import-jetty-results` | Jetty runbook-mode export, execute, and import (optional; see the [Jetty adapter](docs/commands.md#jetty-adapter)). |
+| `skill-benchmark import-plugin-evals` | Import a `claude plugin eval` suite (`evals/<case>/prompt.md` + `graders/*.md`) as a harness manifest; unmappable graders and runner limits go on a checklist (see [`docs/comparing-with-claude-plugin-eval.md`](docs/comparing-with-claude-plugin-eval.md)). |
 
 **Activation** (separate entry points — does the skill load on its own?)
 
