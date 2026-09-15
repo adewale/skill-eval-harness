@@ -41,10 +41,11 @@ import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Executor, Future, wait
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
-from typing import Any, NoReturn, Protocol, cast
+from typing import Any, NoReturn, Protocol, TypeVar, cast
 
 # Direct ``python skill_benchmark.py`` execution must share the canonical module
 # identity used by lazy backend references. Otherwise importing
@@ -168,6 +169,7 @@ from judge_verdict import (
 )
 from manifest_contracts import (
     DEFAULT_EXECUTION_VARIANTS,
+    WITH_SKILL,
     CaseId,
     CaseKind,
     CasePopulation,
@@ -183,6 +185,7 @@ from spend_contracts import (
     SpendObservation,
     SpendPolicy,
     SpendPopulation,
+    SpendStopReason,
 )
 from text_contracts import (
     ComparisonProfile,
@@ -10553,6 +10556,83 @@ def read_spend_ledger(runs: Path) -> SpendLedger | None:
         return SpendLedger.from_dict(strict_json_loads(path.read_text(encoding="utf-8")))
     except (OSError, TypeError, ValueError) as exc:
         die(f"{path}: invalid spend ledger: {exc}")
+
+
+_AdmittedPlan = TypeVar("_AdmittedPlan")
+_AdmittedResult = TypeVar("_AdmittedResult")
+
+
+def run_admitted(
+    executor: Executor,
+    plan: Sequence[_AdmittedPlan],
+    workers: int,
+    ledger: SpendLedger | None,
+    *,
+    submit: Callable[[_AdmittedPlan], Future[_AdmittedResult]],
+    on_error: Callable[[_AdmittedPlan, BaseException], _AdmittedResult],
+    cost_of: Callable[[_AdmittedResult], telemetry_domain.Measurement[Any]],
+    label_of: Callable[[_AdmittedPlan], str],
+    row_of: Callable[[_AdmittedPlan], PlannedSpendRow],
+    refused: Callable[[_AdmittedPlan, SpendStopReason], _AdmittedResult],
+) -> tuple[list[_AdmittedResult], SpendLedger | None]:
+    """The concurrent loop's spend discipline, shared by the trigger runners.
+
+    At most `workers` cells are in flight and none is submitted once the
+    ledger refuses admission; each completed cell settles its cost before the
+    next admission decision, so overrun is bounded by the in-flight window.
+    Cells the ledger refuses are not dropped: `refused` turns each into a
+    result that records why it never ran, so the report's cohort stays honest
+    about its planned size. Results are returned in completion order."""
+    results: list[_AdmittedResult] = []
+    pending: dict[Future[_AdmittedResult], _AdmittedPlan] = {}
+    queue = list(plan)
+    index = 0
+    while index < len(queue) or pending:
+        while index < len(queue) and len(pending) < workers and (ledger is None or ledger.can_start):
+            cell = queue[index]
+            index += 1
+            if ledger is not None:
+                ledger = ledger.admit(label_of(cell))
+            pending[submit(cell)] = cell
+        if ledger is not None and ledger.refusal is not None:
+            # Spend only grows and an unpriced run is permanent, so nothing
+            # still in flight can reopen admission: refuse the remainder now.
+            reason = ledger.refusal
+            while index < len(queue):
+                cell = queue[index]
+                index += 1
+                ledger = ledger.skip(row_of(cell))
+                results.append(refused(cell, reason))
+        if not pending:
+            continue
+        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+        for future in done:
+            cell = pending.pop(future)
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = on_error(cell, exc)
+            results.append(result)
+            if ledger is not None:
+                ledger = ledger.settle(label_of(cell), cost_of(result))
+    return results, ledger
+
+
+def trigger_cost_measurement(observation: TriggerObservation) -> telemetry_domain.Measurement[Any]:
+    """One trigger cell's dollar cost through the one legacy-block reader."""
+    basis = telemetry_domain.basis_from_run(
+        {"provider": observation.agent, "runner": observation.agent, "billing_scope": "run"},
+        source=observation.agent, population=SpendPopulation.TRIGGER.value)
+    return telemetry_domain.measurement_from_cost_block(observation.cost, basis=basis)
+
+
+def trigger_planned_spend_row(*, agent: str, model: str | None, query_id: Any,
+                              run_number: int, ablation: str | None) -> PlannedSpendRow:
+    """A trigger cell's stable identity for the spend ledger: the arm is the
+    mounted tree (baseline skill or one ablation), the case is the query."""
+    variant = ExecutionVariant.ablation(ablation) if ablation else WITH_SKILL
+    label = f"{agent}/{model or 'default'}/{query_id}/run-{run_number}"
+    return PlannedSpendRow.parse(label, str(query_id), variant, run_number, model)
 
 
 def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, spend_policy: SpendPolicy | None = None, **options: Any) -> int:

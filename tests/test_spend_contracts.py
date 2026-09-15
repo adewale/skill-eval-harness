@@ -73,7 +73,7 @@ class SpendLedgerStateTests(unittest.TestCase):
     def test_unavailable_cost_is_never_charged_as_zero(self):
         ledger = SpendLedger(SpendPolicy.from_raw(1.0), SpendPopulation.ANSWER, planned=2)
         ledger = ledger.charge("a", td.Measurement.unavailable("runner_does_not_report_cost"))
-        self.assertEqual(ledger.unpriced, UnpricedRun("a", "runner_does_not_report_cost"))
+        self.assertEqual(ledger.unpriced, (UnpricedRun("a", "runner_does_not_report_cost"),))
         self.assertEqual((ledger.started, ledger.spent.amount, ledger.spent_availability), (1, Decimal(0), td.PARTIAL))
         self.assertFalse(ledger.can_start)
         self.assertEqual(ledger.stop_reason, SpendStopReason.COST_UNOBSERVABLE)
@@ -83,7 +83,7 @@ class SpendLedgerStateTests(unittest.TestCase):
             self.assertEqual(stopped.stop_reason, SpendStopReason.COST_UNOBSERVABLE)
         self.assertEqual(
             SpendLedger(SpendPolicy.from_raw(1.0), "answer", planned=1).charge(
-                "b", td.Measurement.available(td.Money.from_raw("1", "EUR"), provenance="provider_reported")).unpriced.reason,
+                "b", td.Measurement.available(td.Money.from_raw("1", "EUR"), provenance="provider_reported")).unpriced[0].reason,
             "non_usd_cost:EUR")
 
     def test_assumed_cost_prices_unavailable_runs_and_keeps_the_total_complete(self):
@@ -114,8 +114,12 @@ class SpendLedgerStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):    # duplicate labels across records
             SpendLedger(policy, "answer", planned=3, charges=(ObservedCharge("a", td.Money.from_raw("1"), "provider_reported"),),
                         skipped=(row("a"),))
+        with self.assertRaises(TypeError):
+            SpendLedger(policy, "answer", planned=2, unpriced=UnpricedRun("a", "x"))
+        with self.assertRaises(TypeError):
+            SpendLedger(policy, "answer", planned=2, in_flight=("a", ""))
         with self.assertRaises(ValueError):
-            SpendLedger(policy, "trigger", planned=1)
+            SpendLedger(policy, "sideways", planned=1)
         for bad_planned in (-1, True, 1.5):
             with self.assertRaises(ValueError):
                 SpendLedger(policy, "answer", planned=bad_planned)
@@ -131,6 +135,52 @@ class SpendLedgerStateTests(unittest.TestCase):
             PlannedSpendRow.parse("a", "c", "sideways", 1)
         with self.assertRaises(ValueError):
             PlannedSpendRow.parse("a", "c", "with_skill", 0)
+
+
+class SpendLedgerAdmissionTests(unittest.TestCase):
+    """A concurrent loop admits before submitting and settles on completion."""
+
+    def test_admitted_runs_count_as_started_and_settle_in_any_order(self):
+        ledger = SpendLedger(SpendPolicy.from_raw(0.05), SpendPopulation.TRIGGER, planned=3)
+        ledger = ledger.admit("a").admit("b")
+        self.assertEqual((ledger.started, ledger.in_flight, ledger.settled), (2, ("a", "b"), False))
+        self.assertTrue(ledger.can_start)                         # in-flight cost is not yet known
+        with self.assertRaises(ValueError):
+            ledger.to_dict()                                      # never persist unsettled runs
+        ledger = ledger.settle("b", usd("0.03")).settle("a", usd("0.03"))
+        self.assertEqual((ledger.settled, ledger.spent.amount, ledger.exhausted), (True, Decimal("0.06"), True))
+        self.assertEqual(ledger.refusal, SpendStopReason.COST_CEILING)
+        self.assertIsNone(ledger.stop_reason)                     # nothing refused yet
+        ledger = ledger.skip(row("c", case_id="c3"))
+        self.assertEqual(ledger.stop_reason, SpendStopReason.COST_CEILING)
+        self.assertEqual(SpendLedger.from_dict(ledger.to_dict()), ledger)
+
+    def test_admission_transitions_are_total_only_where_allowed(self):
+        ledger = SpendLedger(SpendPolicy.from_raw(1.0), "trigger", planned=2)
+        with self.assertRaises(ValueError):
+            ledger.settle("a", usd("0.1"))                        # never admitted
+        ledger = ledger.admit("a")
+        with self.assertRaises(ValueError):
+            ledger.admit("a")                                     # duplicate label
+        with self.assertRaises(ValueError):
+            ledger.skip(row("b"))                                 # still startable
+        stopped = ledger.settle("a", td.Measurement.unavailable("missing"))
+        with self.assertRaises(ValueError):
+            stopped.admit("b")                                    # admission closed
+        self.assertEqual(stopped.refusal, SpendStopReason.COST_UNOBSERVABLE)
+
+    def test_several_in_flight_runs_can_all_turn_out_unpriced(self):
+        ledger = SpendLedger(SpendPolicy.from_raw(1.0), "trigger", planned=3).admit("a").admit("b")
+        ledger = ledger.settle("a", td.Measurement.unavailable("missing"))
+        self.assertFalse(ledger.can_start)
+        ledger = ledger.settle("b", td.Measurement.unavailable("missing"))   # was admitted before the stop
+        ledger = ledger.skip(row("c"))
+        self.assertEqual([run.label for run in ledger.unpriced], ["a", "b"])
+        self.assertEqual((ledger.started, ledger.spent_availability, ledger.stop_reason),
+                         (2, td.PARTIAL, SpendStopReason.COST_UNOBSERVABLE))
+        doc = ledger.to_dict()
+        self.assertEqual(doc["unpriced"], [{"label": "a", "reason": "missing"}, {"label": "b", "reason": "missing"}])
+        self.assertEqual(SpendLedger.from_dict(doc), ledger)
 
 
 class SpendLedgerPersistenceTests(unittest.TestCase):
@@ -151,13 +201,13 @@ class SpendLedgerPersistenceTests(unittest.TestCase):
         self.assertEqual(SpendLedger.from_dict(doc), ledger)
         unpriced = SpendLedger(SpendPolicy.from_raw(1.0), "answer", planned=2).charge("a", td.Measurement.unavailable("x")).skip(row("b"))
         self.assertEqual(SpendLedger.from_dict(unpriced.to_dict()), unpriced)
-        self.assertEqual(unpriced.to_dict()["unpriced"], {"label": "a", "reason": "x"})
+        self.assertEqual(unpriced.to_dict()["unpriced"], [{"label": "a", "reason": "x"}])
 
     def test_persisted_derived_fields_must_agree_with_the_records(self):
         base = self.ledger().to_dict()
         for key, value in (("spent_usd", "0.04"), ("runs_started", 3), ("stop_reason", None),
                            ("spent_availability", "partial"), ("exhausted", False), ("runs_skipped", 1),
-                           ("schema_version", 2), ("population", "trigger"), ("planned", 1)):
+                           ("schema_version", 2), ("population", "sideways"), ("planned", 1)):
             doc = dict(base)
             doc[key] = value
             with self.assertRaises(ValueError, msg=key):

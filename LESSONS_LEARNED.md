@@ -16,7 +16,8 @@ runs and say why.
 **Rule:**
 - One `SpendLedger` value (`spend_contracts.py`), charged from each completed run's cost
   *measurement*, is shared by every paid loop (`run-agent`/`run-codex`/`run-claude`,
-  `run-subagent`, `run-jetty`, `judge`). The loop asks it `can_start`, charges, and skips;
+  `run-subagent`, `run-jetty`, `judge`, and the two trigger runners). The loop asks it `can_start`,
+  charges, and skips (a concurrent loop admits and settles through one shared scheduler);
   started/spent/exhausted/stopped are derived from its records, never kept as loop-local
   counters. The first draft kept four such counters in four loops and let a
   started-but-unpriced run vanish from the total; correctness-by-construction review caught
@@ -27,6 +28,9 @@ runs and say why.
 - Unavailable cost is never charged as zero: a backend that does not report dollars refuses
   the ceiling before the first run unless `--assumed-cost-per-run-usd` is given, and a run
   whose cost turns out unobservable stops the loop with `cost_unobservable`.
+- A refused run is never dropped from a report: an answer design lists it as unstarted, and a
+  trigger cell becomes a `not_started` observation, so a stopped suite reads as incomplete of its
+  planned size rather than complete and smaller.
 - `--max-cost-usd 0` is the free plan-only mode, the same way `claude plugin eval
   --max-cost-usd 0` parses every case and starts nothing.
 

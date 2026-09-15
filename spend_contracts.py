@@ -35,6 +35,7 @@ SPEND_CURRENCY = "USD"
 class SpendPopulation(str, Enum):
     ANSWER = "answer"
     JUDGE = "judge"
+    TRIGGER = "trigger"
 
 
 class SpendStopReason(str, Enum):
@@ -161,8 +162,10 @@ SpendCharge = ObservedCharge | AssumedCharge
 class UnpricedRun:
     """A run that started and finished but whose cost could not be charged.
 
-    It is terminal: the ledger's spent total becomes a partial known subtotal
-    and no further run may start."""
+    Any unpriced run is terminal for admission: the ledger's spent total
+    becomes a partial known subtotal and no further run may start. Runs that
+    were already in flight still settle, so a concurrent loop can end with
+    more than one."""
 
     label: str
     reason: str
@@ -243,19 +246,30 @@ _LEDGER_FIELDS = frozenset({
 })
 
 
+def _unique_labels(*groups: tuple[str, ...]) -> None:
+    labels = [label for group in groups for label in group]
+    if len(set(labels)) != len(labels):
+        raise ValueError("spend ledger labels must be unique")
+
+
 @dataclass(frozen=True)
 class SpendLedger:
     """The closed state of one paid loop under a spend policy.
 
-    Every fact a consumer needs — started, spent, exhausted, stopped and why —
-    is derived from the records; nothing is a separately writable flag."""
+    Every fact a consumer needs — started, spent, exhausted, whether another
+    run may start, and why the loop stopped — is derived from the records;
+    nothing is a separately writable flag. A sequential loop uses `charge`;
+    a concurrent loop `admit`s a run before it is submitted and `settle`s it
+    when it completes, so a ledger can hold several in-flight runs but is
+    never persisted until all of them have settled."""
 
     policy: SpendPolicy
     population: SpendPopulation
     planned: int
     charges: tuple[SpendCharge, ...] = ()
-    unpriced: UnpricedRun | None = None
+    unpriced: tuple[UnpricedRun, ...] = ()
     skipped: tuple[PlannedSpendRow, ...] = ()
+    in_flight: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.policy, SpendPolicy):
@@ -269,24 +283,33 @@ class SpendLedger:
         if not isinstance(self.charges, tuple) or not all(
                 isinstance(charge, (ObservedCharge, AssumedCharge)) for charge in self.charges):
             raise TypeError("spend charges must be a tuple of ObservedCharge/AssumedCharge")
-        if self.unpriced is not None and not isinstance(self.unpriced, UnpricedRun):
-            raise TypeError("unpriced run must be an UnpricedRun or None")
+        if not isinstance(self.unpriced, tuple) or not all(
+                isinstance(run, UnpricedRun) for run in self.unpriced):
+            raise TypeError("unpriced runs must be a tuple of UnpricedRun")
         if not isinstance(self.skipped, tuple) or not all(
                 isinstance(row, PlannedSpendRow) for row in self.skipped):
             raise TypeError("skipped runs must be a tuple of PlannedSpendRow")
-        labels = [charge.label for charge in self.charges] + [row.label for row in self.skipped]
-        if self.unpriced is not None:
-            labels.append(self.unpriced.label)
-        if len(set(labels)) != len(labels):
-            raise ValueError("spend ledger labels must be unique")
+        if not isinstance(self.in_flight, tuple) or not all(
+                isinstance(label, str) and label for label in self.in_flight):
+            raise TypeError("in-flight runs must be a tuple of non-empty labels")
+        _unique_labels(
+            tuple(charge.label for charge in self.charges),
+            tuple(run.label for run in self.unpriced),
+            tuple(row.label for row in self.skipped),
+            self.in_flight,
+        )
         if self.started + len(self.skipped) > self.planned:
             raise ValueError("spend ledger records more runs than were planned")
-        if self.skipped and self.unpriced is None and not self.exhausted:
+        if self.skipped and not self.unpriced and not self.exhausted:
             raise ValueError("skipped runs require an exhausted ceiling or an unpriced run")
 
     @property
     def started(self) -> int:
-        return len(self.charges) + (0 if self.unpriced is None else 1)
+        return len(self.charges) + len(self.unpriced) + len(self.in_flight)
+
+    @property
+    def settled(self) -> bool:
+        return not self.in_flight
 
     @property
     def spent(self) -> Money:
@@ -295,45 +318,71 @@ class SpendLedger:
 
     @property
     def spent_availability(self) -> str:
-        return COMPLETE if self.unpriced is None else PARTIAL
+        return COMPLETE if not self.unpriced else PARTIAL
 
     @property
     def exhausted(self) -> bool:
         return self.spent.amount >= self.policy.ceiling.amount
 
     @property
-    def stop_reason(self) -> SpendStopReason | None:
-        if self.unpriced is not None:
+    def refusal(self) -> SpendStopReason | None:
+        """Why the next run may not start right now, or None when it may."""
+        if self.unpriced:
             return SpendStopReason.COST_UNOBSERVABLE
-        if self.skipped:
+        if self.exhausted:
             return SpendStopReason.COST_CEILING
         return None
 
     @property
     def can_start(self) -> bool:
-        return self.unpriced is None and not self.exhausted
+        return self.refusal is None
 
-    def charge(self, label: str, cost: Measurement[Money]) -> SpendLedger:
-        """Record one completed run. Only a run the ledger allowed to start may
-        be charged; an unpriceable cost ends the ledger rather than costing $0."""
+    @property
+    def stop_reason(self) -> SpendStopReason | None:
+        """Why the loop stopped: only a ledger that refused a planned run, or
+        met an unpriced one, has stopped. Reaching the ceiling on the last
+        planned run is not a stop."""
+        if self.unpriced:
+            return SpendStopReason.COST_UNOBSERVABLE
+        if self.skipped:
+            return SpendStopReason.COST_CEILING
+        return None
+
+    def admit(self, label: str) -> SpendLedger:
+        """Record that a run is about to be submitted; only allowed while the
+        ledger says a run may start."""
         if not self.can_start:
-            raise ValueError("cannot charge a run the ledger did not allow to start")
+            raise ValueError("cannot admit a run the ledger does not allow to start")
+        return replace(self, in_flight=(*self.in_flight, _label(label)))
+
+    def settle(self, label: str, cost: Measurement[Money]) -> SpendLedger:
+        """Price an admitted run. An unpriceable cost becomes an UnpricedRun
+        rather than $0, and closes admission."""
+        label = _label(label)
+        if label not in self.in_flight:
+            raise ValueError(f"cannot settle {label!r}: it was never admitted")
         if not isinstance(cost, Measurement):
             raise TypeError("spend charge requires a cost Measurement")
-        label = _label(label)
+        remaining = tuple(item for item in self.in_flight if item != label)
         reason: str
         if cost.availability == AVAILABLE:
             money = cost.value
             if not isinstance(money, Money):
                 raise TypeError("spend charge requires a Money measurement")
             if money.currency == SPEND_CURRENCY:
-                return replace(self, charges=(*self.charges, ObservedCharge(label, money, str(cost.provenance))))
+                return replace(self, in_flight=remaining,
+                               charges=(*self.charges, ObservedCharge(label, money, str(cost.provenance))))
             reason = f"non_usd_cost:{money.currency}"
         else:
             reason = cost.reason or cost.availability
         if self.policy.assumed_cost_per_run is not None:
-            return replace(self, charges=(*self.charges, AssumedCharge(label, self.policy.assumed_cost_per_run, reason)))
-        return replace(self, unpriced=UnpricedRun(label, reason))
+            return replace(self, in_flight=remaining,
+                           charges=(*self.charges, AssumedCharge(label, self.policy.assumed_cost_per_run, reason)))
+        return replace(self, in_flight=remaining, unpriced=(*self.unpriced, UnpricedRun(label, reason)))
+
+    def charge(self, label: str, cost: Measurement[Money]) -> SpendLedger:
+        """A sequential loop's admit-and-settle in one step."""
+        return self.admit(label).settle(label, cost)
 
     def skip(self, row: PlannedSpendRow) -> SpendLedger:
         """Record a planned run the ledger refused to start."""
@@ -344,6 +393,8 @@ class SpendLedger:
         return replace(self, skipped=(*self.skipped, row))
 
     def to_dict(self) -> dict[str, Any]:
+        if not self.settled:
+            raise ValueError("cannot persist a spend ledger with unsettled runs in flight")
         stop = self.stop_reason
         return {
             "schema_version": SPEND_LEDGER_SCHEMA_VERSION,
@@ -357,7 +408,7 @@ class SpendLedger:
             "runs_skipped": len(self.skipped),
             "stop_reason": None if stop is None else stop.value,
             "charges": [charge_to_dict(charge) for charge in self.charges],
-            "unpriced": None if self.unpriced is None else {"label": self.unpriced.label, "reason": self.unpriced.reason},
+            "unpriced": [{"label": run.label, "reason": run.reason} for run in self.unpriced],
             "skipped": [row.to_dict() for row in self.skipped],
         }
 
@@ -380,15 +431,17 @@ class SpendLedger:
         if not isinstance(charges_raw, list) or not isinstance(skipped_raw, list):
             raise ValueError("spend ledger charges and skipped must be lists")
         unpriced_raw = data["unpriced"]
-        unpriced = None
-        if unpriced_raw is not None:
-            if not isinstance(unpriced_raw, Mapping) or set(unpriced_raw) != {"label", "reason"}:
+        if not isinstance(unpriced_raw, list):
+            raise ValueError("spend ledger unpriced must be a list")
+        unpriced = []
+        for item in unpriced_raw:
+            if not isinstance(item, Mapping) or set(item) != {"label", "reason"}:
                 raise ValueError("spend ledger unpriced run must carry exactly label and reason")
-            unpriced = UnpricedRun(unpriced_raw["label"], unpriced_raw["reason"])
+            unpriced.append(UnpricedRun(item["label"], item["reason"]))
         ledger = cls(
             policy, data["population"], data["planned"],
             tuple(charge_from_dict(item) for item in charges_raw),
-            unpriced,
+            tuple(unpriced),
             tuple(PlannedSpendRow.from_dict(item) for item in skipped_raw),
         )
         derived = ledger.to_dict()

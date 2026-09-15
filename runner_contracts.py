@@ -268,7 +268,7 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
                  if invocation_state is not None else None)
     except ValueError as exc:
         raise ValueError("invalid answer-runner invocation_state") from exc
-    if state in {InvocationState.PROVIDER_FAILED, InvocationState.HARNESS_FAILED}:
+    if state in {InvocationState.PROVIDER_FAILED, InvocationState.HARNESS_FAILED, InvocationState.NOT_STARTED}:
         raise ValueError(
             "answer-runner invocation_state must describe process provenance")
     if timed_out and state not in {None, InvocationState.TIMED_OUT}:

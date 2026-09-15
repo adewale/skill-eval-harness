@@ -165,7 +165,7 @@ class SubagentCeilingTests(unittest.TestCase):
             ledger = json.loads((runs / sb.SPEND_LEDGER_NAME).read_text(encoding="utf-8"))
             self.assertEqual((ledger["stop_reason"], ledger["runs_started"], ledger["runs_skipped"], ledger["charges"], ledger["spent_availability"]),
                              ("cost_unobservable", 1, 2, [], "partial"))
-            self.assertEqual(ledger["unpriced"], {"label": "c0/with_skill", "reason": "missing"})
+            self.assertEqual(ledger["unpriced"], [{"label": "c0/with_skill", "reason": "missing"}])
 
 
 class JudgeCeilingTests(unittest.TestCase):
@@ -197,7 +197,7 @@ class JudgeCeilingTests(unittest.TestCase):
             ledger = json.loads(Path(str(out) + ".spend-ceiling.json").read_text(encoding="utf-8"))
             self.assertEqual((ledger["population"], ledger["stop_reason"], ledger["runs_started"], ledger["runs_skipped"]),
                              ("judge", "cost_unobservable", 1, 2))
-            self.assertEqual((ledger["skipped"][0]["case_id"], ledger["unpriced"]["reason"]), ("c1", "missing"))
+            self.assertEqual((ledger["skipped"][0]["case_id"], ledger["unpriced"][0]["reason"]), ("c1", "missing"))
 
     def test_assumed_judge_cost_stops_at_the_ceiling(self):
         with tempfile.TemporaryDirectory() as td_:
@@ -351,3 +351,179 @@ class CliSurfaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TriggerRunnerCeilingTests(unittest.TestCase):
+    """The trigger population shares the ledger through the bounded admission
+    scheduler: no cell is submitted once the ledger refuses, refused cells
+    become not-started observations so the cohort stays honest about its
+    planned size, and the report carries the ledger."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+    DEMO_MANIFEST = ROOT / "examples" / "demo-skill" / "evals" / "shared-benchmark.json"
+
+    def demo_rows(self):
+        import run_trigger_matrix as tm
+        return tm.cases_from_manifest(tm.load_manifest(self.DEMO_MANIFEST), "tune")
+
+    def test_matrix_refuses_admission_at_the_ceiling_and_reports_not_started_cells(self):
+        import run_trigger_matrix as tm
+        with tempfile.TemporaryDirectory() as td_:
+            ledger_path = Path(td_) / "matrix.json.spend-ceiling.json"
+            report = tm.run_matrix(self.DEMO_MANIFEST, self.demo_rows(), agents=["stub"], models=["offline"],
+                                   runs_per_query=3, timeout=30, workers=1,
+                                   spend_policy=SpendPolicy.from_raw(0.05, 0.02), spend_ledger_path=ledger_path)
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        # 2 queries x 3 runs planned; assumed $0.02 each: the third settled run reaches $0.06 >= $0.05
+        self.assertEqual((ledger["population"], ledger["planned"], ledger["runs_started"], ledger["runs_skipped"]),
+                         ("trigger", 6, 3, 3))
+        self.assertEqual((ledger["stop_reason"], ledger["spent_usd"], ledger["spent_availability"]), ("cost_ceiling", "0.06", "complete"))
+        self.assertEqual(ledger["skipped"][0]["variant"], "with_skill")
+        self.assertEqual(report["spend_ceiling"], ledger)
+        states = sorted(row["invocation_state"] for row in report["results"])
+        self.assertEqual(states, ["complete"] * 3 + ["not_started"] * 3)
+        not_started = [row for row in report["results"] if row["invocation_state"] == "not_started"]
+        self.assertTrue(all(row["not_started"] == "spend ceiling refused admission (cost_ceiling)" for row in not_started))
+        self.assertTrue(all(row["cost_normalized"] == {"source": "missing"} for row in not_started))
+        summary = report["summary"]
+        self.assertEqual((summary["measurement_status"], summary["total"], summary["observed"]), ("incomplete", 6, 3))
+        self.assertEqual(summary["incomplete_reasons"], {"not_started": 3})
+        # every planned cell is accounted for exactly once
+        self.assertEqual(len(report["results"]), 6)
+        self.assertEqual(len({(r["query_id"], r["run_number"]) for r in report["results"]}), 6)
+
+    def test_matrix_without_assumed_cost_refuses_a_dollar_blind_adapter_before_any_cell(self):
+        import run_trigger_matrix as tm
+        with self.assertRaises(SystemExit):
+            tm.run_matrix(self.DEMO_MANIFEST, self.demo_rows(), agents=["stub"], models=["offline"],
+                          runs_per_query=1, timeout=30, workers=1, spend_policy=SpendPolicy.from_raw(1.0))
+
+    def test_matrix_cli_exits_2_and_writes_the_ledger_sidecar(self):
+        import sys
+
+        import run_trigger_matrix as tm
+        with tempfile.TemporaryDirectory() as td_:
+            out = Path(td_) / "matrix.json"
+            argv = ["skill-trigger-matrix", str(self.DEMO_MANIFEST), "--agent", "stub", "--model", "offline",
+                    "--runs-per-query", "2", "--workers", "1", "--out", str(out),
+                    "--max-cost-usd", "0.03", "--assumed-cost-per-run-usd", "0.02"]
+            with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print"):
+                self.assertEqual(tm.main(), sb.SPEND_CEILING_EXIT_CODE)
+            report = json.loads(out.read_text(encoding="utf-8"))
+            sidecar = json.loads(Path(str(out) + ".spend-ceiling.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["spend_ceiling"], sidecar)
+        self.assertEqual((sidecar["runs_started"], sidecar["runs_skipped"]), (2, 2))
+        self.assertEqual(report["summary"]["measurement_status"], "incomplete")
+
+    def test_pi_runner_stops_unpriced_and_charges_assumed_cost(self):
+        import sys
+
+        import run_pi_trigger_eval as tr
+        from trigger_contracts import InvocationOutcome
+        terminal = InvocationOutcome.from_process(
+            stdout=json.dumps({"type": "agent_end", "messages": [{"role": "assistant", "stopReason": "stop"}]}) + "\n",
+            stderr="", returncode=0, elapsed_ms=1)
+        with tempfile.TemporaryDirectory() as td_:
+            root = Path(td_)
+            eval_set = root / "rows.json"
+            eval_set.write_text(json.dumps([
+                {"query_id": "negative", "query": "ordinary chat", "should_trigger": False},
+                {"query_id": "positive", "query": "review this pull request", "should_trigger": True},
+            ]), encoding="utf-8")
+            base = ["skill-pi-trigger-eval", str(self.DEMO_MANIFEST), "--eval-set", str(eval_set),
+                    "--runs-per-query", "2", "--workers", "1", "--timeout", "12"]
+            # The mocked stream reports no cost: the first settled cell is unpriced and closes admission.
+            out = root / "unpriced.json"
+            with mock.patch.object(sys, "argv", [*base, "--out", str(out), "--max-cost-usd", "5"]), \
+                 mock.patch.object(tr, "invoke_argv_with_timeout", return_value=terminal), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(tr.main(), sb.SPEND_CEILING_EXIT_CODE)
+            report = json.loads(out.read_text(encoding="utf-8"))
+            ledger = report["spend_ceiling"]
+            self.assertEqual((ledger["stop_reason"], ledger["runs_started"], ledger["runs_skipped"], ledger["spent_availability"]),
+                             ("cost_unobservable", 1, 3, "partial"))
+            self.assertEqual(sorted(r["invocation_state"] for r in report["results"]), ["complete", "not_started", "not_started", "not_started"])
+            self.assertEqual(report["summary"]["incomplete_reasons"], {"not_started": 3})
+            self.assertEqual(len({r["skill_tree_hash"] for r in report["results"]}), 1)   # refused cells name the same arm
+            self.assertTrue(Path(str(out) + ".spend-ceiling.json").is_file())
+            # An assumed cost makes the ceiling enforceable: $0.02 x 3 >= $0.05 leaves one cell refused.
+            out2 = root / "assumed.json"
+            with mock.patch.object(sys, "argv", [*base, "--out", str(out2), "--max-cost-usd", "0.05", "--assumed-cost-per-run-usd", "0.02"]), \
+                 mock.patch.object(tr, "invoke_argv_with_timeout", return_value=terminal), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(tr.main(), sb.SPEND_CEILING_EXIT_CODE)
+            ledger2 = json.loads(out2.read_text(encoding="utf-8"))["spend_ceiling"]
+            self.assertEqual((ledger2["stop_reason"], ledger2["runs_started"], ledger2["runs_skipped"], ledger2["spent_usd"]),
+                             ("cost_ceiling", 3, 1, "0.06"))
+            # and without a ceiling nothing changes: every cell runs, no ledger, exit 0
+            out3 = root / "plain.json"
+            with mock.patch.object(sys, "argv", [*base, "--out", str(out3)]), \
+                 mock.patch.object(tr, "invoke_argv_with_timeout", return_value=terminal), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(tr.main(), 0)
+            self.assertIsNone(json.loads(out3.read_text(encoding="utf-8"))["spend_ceiling"])
+            self.assertFalse(Path(str(out3) + ".spend-ceiling.json").exists())
+
+
+class AdmissionSchedulerTests(unittest.TestCase):
+    """run_admitted: the bounded window, settle-before-admit, and refusal."""
+
+    def test_never_submits_past_the_ledger_and_bounds_the_window(self):
+        from concurrent.futures import ThreadPoolExecutor
+        submitted: list[str] = []
+        plan = [f"cell-{i}" for i in range(6)]
+        ledger = SpendLedger(SpendPolicy.from_raw(0.05), SpendPopulation.TRIGGER, planned=len(plan))
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            results, ledger = sb.run_admitted(
+                ex, plan, 2, ledger,
+                submit=lambda cell: (submitted.append(cell), ex.submit(lambda: cell))[1],
+                on_error=lambda cell, exc: f"error:{cell}",
+                cost_of=lambda result: usd("0.02"),
+                label_of=lambda cell: cell,
+                row_of=lambda cell: PlannedSpendRow.parse(cell, "q", "with_skill", 1),
+                refused=lambda cell, reason: f"refused:{cell}:{reason.value}",
+            )
+        # Admission stops once the settled spend reaches the ceiling; with a window
+        # of two, at most one extra cell was admitted before the deciding settle.
+        self.assertIn(len(submitted), (3, 4))
+        self.assertEqual(ledger.started, len(submitted))
+        self.assertEqual(len(results), 6)
+        self.assertEqual(sorted(r for r in results if r.startswith("refused")),
+                         sorted(f"refused:{c}:cost_ceiling" for c in plan if c not in submitted))
+        self.assertTrue(ledger.settled)
+        self.assertEqual(ledger.stop_reason.value, "cost_ceiling")
+
+    def test_without_a_ledger_every_cell_runs_and_errors_become_results(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def boom():
+            raise RuntimeError("provider exploded")
+
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            results, ledger = sb.run_admitted(
+                ex, ["a", "b", "c"], 3, None,
+                submit=lambda cell: ex.submit(boom) if cell == "b" else ex.submit(lambda: cell),
+                on_error=lambda cell, exc: f"error:{cell}:{exc}",
+                cost_of=lambda result: usd("1"),
+                label_of=lambda cell: cell,
+                row_of=lambda cell: PlannedSpendRow.parse(cell, "q", "with_skill", 1),
+                refused=lambda cell, reason: f"refused:{cell}",
+            )
+        self.assertIsNone(ledger)
+        self.assertEqual(sorted(results), ["a", "c", "error:b:provider exploded"])
+
+    def test_unpriced_settle_closes_admission_for_the_rest(self):
+        from concurrent.futures import ThreadPoolExecutor
+        ledger = SpendLedger(SpendPolicy.from_raw(9.0), "trigger", planned=4)
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            results, ledger = sb.run_admitted(
+                ex, ["a", "b", "c", "d"], 1, ledger,
+                submit=lambda cell: ex.submit(lambda: cell),
+                on_error=lambda cell, exc: f"error:{cell}",
+                cost_of=lambda result: td.Measurement.unavailable("missing"),
+                label_of=lambda cell: cell,
+                row_of=lambda cell: PlannedSpendRow.parse(cell, "q", "with_skill", 1),
+                refused=lambda cell, reason: f"refused:{cell}:{reason.value}",
+            )
+        self.assertEqual(results, ["a", "refused:b:cost_unobservable", "refused:c:cost_unobservable", "refused:d:cost_unobservable"])
+        self.assertEqual((ledger.started, [r.label for r in ledger.unpriced], ledger.stop_reason.value), (1, ["a"], "cost_unobservable"))

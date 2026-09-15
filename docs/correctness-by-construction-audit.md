@@ -36,7 +36,8 @@ subprocess bytes
 ```
 
 - `InvocationOutcome` is a frozen, closed state machine. Completion, timeout, spawn failure,
-  process failure, provider failure, protocol failure, and harness failure are mutually exclusive.
+  process failure, provider failure, protocol failure, harness failure, and not-started (the harness
+  declined to spawn the process, as a spend ceiling does) are mutually exclusive.
 - `PiStream` parses provider status and cumulative telemetry together. A complete process with a
   terminal provider error, malformed JSON stream, or no final non-retrying `agent_end` is failed.
   Failed streams cannot carry numeric usage or cost.
@@ -403,8 +404,8 @@ observed numeric rate -> UnitRate(0 <= value <= 1)
 
 ## Runtime spend ceiling
 
-Every paid loop (native answer backends, the subagent seam, Jetty, judges) runs under one closed
-ledger from `spend_contracts.py`:
+Every paid loop (native answer backends, the subagent seam, Jetty, judges, both trigger runners)
+runs under one closed ledger from `spend_contracts.py`:
 
 ```text
 --max-cost-usd / --assumed-cost-per-run-usd -> SpendPolicy (exact USD Money)
@@ -416,8 +417,11 @@ ledger                                       -> persisted spend-ceiling.json, pa
 
 - The ledger is the single owner of loop state. `started`, `spent`, `exhausted`, `can_start`, and
   `stop_reason` (`cost_ceiling | cost_unobservable`) are derived from its records; no loop keeps a
-  separately writable counter or stop flag, and all four loops share the same three transitions:
-  ask `can_start`, `charge`, `skip`.
+  separately writable counter or stop flag. Sequential loops share `can_start`, `charge`, `skip`;
+  the concurrent trigger runners share `admit`/`settle` through one scheduler (`run_admitted`),
+  which admits at most `--workers` cells, settles each before the next admission, and turns every
+  refused cell into a `not_started` trigger observation so the cohort's planned size is preserved.
+  A ledger with unsettled runs cannot be persisted.
 - Transitions are total only where the state allows them: a run the ledger did not allow to start
   cannot be charged, and a run it allows to start cannot be skipped. Construction rejects more
   records than were planned, duplicate labels, and skipped rows without an exhausted ceiling or an

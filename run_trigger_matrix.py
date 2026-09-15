@@ -60,7 +60,8 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,7 @@ from skill_benchmark import (
     AblationError,
     PiStream,
     ProcessInvocationPlan,
+    add_spend_ceiling_options,
     build_canonical_skill_tree,
     build_vibe_cli_argv,
     canonical_json_sha256,
@@ -108,19 +110,34 @@ from skill_benchmark import (
     mount_skill_tree,
     normalize_trace_records,
     parse_trace_jsonl_text,
+    persist_spend_ledger,
+    plan_spend_ledger,
     repo_root_for_manifest,
+    run_admitted,
     safe_trace_label,
     skill_tree_hash,
+    spend_exit_code,
+    spend_policy_from_args,
+    spend_preflight,
     stream_usage_and_cost,
     strict_json_loads,
     trace_dialect_for,
+    trigger_cost_measurement,
     trigger_harness_identity,
     trigger_manifest_identity,
+    trigger_planned_spend_row,
     vibe_env_for_home,
     vibe_final_answer,
     vibe_skill_tool_evidence,
     write_json,
     write_trace_artifacts,
+)
+from spend_contracts import (
+    PlannedSpendRow,
+    SpendLedger,
+    SpendObservation,
+    SpendPolicy,
+    SpendPopulation,
 )
 from trigger_contracts import (
     InvocationOutcome,
@@ -995,12 +1012,28 @@ def print_matrix(matrix: list[dict[str, Any]]) -> None:
               f"{overall:>9}")
 
 
+@dataclass(frozen=True)
+class MatrixCell:
+    """One planned (agent, model, query, repetition) cell before it is admitted."""
+
+    adapter: AgentAdapter
+    model: str | None
+    query: str
+    should_trigger: bool
+    trace_dir: Path | None
+    metadata: dict[str, Any]
+    identity: TriggerRepetitionIdentity
+    spend_row: PlannedSpendRow
+
+
 def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str],
                models: list[str | None] | None, runs_per_query: int, timeout: int, workers: int,
                claude_bin: str = "claude", codex_cmd: str | None = None,
                vibe_cmd: str | None = None, max_turns: int = 6,
                backend_options: dict[str, Any] | None = None,
-               trace_runs: Path | None = None, ablation: str | None = None) -> dict[str, Any]:
+               trace_runs: Path | None = None, ablation: str | None = None,
+               spend_policy: SpendPolicy | None = None,
+               spend_ledger_path: Path | None = None) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     rows = validate_trigger_rows(rows, "trigger matrix rows")
     if not rows:
@@ -1036,6 +1069,7 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         if ablation and not cap.trigger_ablation:
             raise SystemExit(f"agent {name!r} does not support trigger ablations")
         capability_rows[name] = cap
+        spend_preflight(spend_policy, name, SpendObservation.DECLARED)
         adapter = adapter_instance(
             name, claude_bin=claude_bin, codex_cmd=codex_cmd,
             vibe_cmd=vibe_cmd, max_turns=max_turns,
@@ -1057,48 +1091,62 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         if trace_runs is not None:
             trace_runs.mkdir(parents=True, exist_ok=True)
             trace_root = Path(tempfile.mkdtemp(prefix="matrix-", dir=trace_runs))
-        futures, observations, design = [], [], []
-        future_context: dict[Any, tuple[str, str | None, str, bool, dict[str, Any], TriggerRepetitionIdentity]] = {}
+        design: list[dict[str, Any]] = []
+        plan: list[MatrixCell] = []
+        for adapter in adapters:
+            for model in (models if models is not None else adapter.default_models):
+                for row_index, row in enumerate(rows, 1):
+                    query = str(row["query"])
+                    design.append({
+                        "agent": adapter.name, "model": model,
+                        "query_id": row["query_id"], "query": query,
+                        "should_trigger": row["should_trigger"],
+                    })
+                    for run_number in range(1, runs_per_query + 1):
+                        trace_dir = None
+                        if trace_root is not None:
+                            agent_segment = safe_trace_segment(adapter.name, "agent")
+                            model_segment = safe_trace_segment(str(model or "default"), "default")
+                            trace_dir = (trace_root / agent_segment / model_segment /
+                                         f"query-{row_index:03d}-{safe_trace_label(query, f'query-{row_index}')}" /
+                                         f"run-{run_number}")
+                        metadata = {
+                            "measurement": EvidenceClass.RAW_MEASUREMENT.value,
+                            "ablation": ablation,
+                            "skill_tree_hash": tree_hash,
+                            "protocol_sha256": protocol_sha256,
+                            "protocol_observation": {},
+                        }
+                        plan.append(MatrixCell(
+                            adapter=adapter, model=model, query=query,
+                            should_trigger=bool(row["should_trigger"]), trace_dir=trace_dir,
+                            metadata=metadata,
+                            identity=TriggerRepetitionIdentity(row["query_id"], run_number),
+                            spend_row=trigger_planned_spend_row(
+                                agent=adapter.name, model=model, query_id=row["query_id"],
+                                run_number=run_number, ablation=ablation),
+                        ))
+        ledger = plan_spend_ledger(spend_policy, SpendPopulation.TRIGGER, len(plan))
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            for adapter in adapters:
-                for model in (models if models is not None else adapter.default_models):
-                    for row_index, row in enumerate(rows, 1):
-                        query = str(row["query"])
-                        design.append({
-                            "agent": adapter.name, "model": model,
-                            "query_id": row["query_id"], "query": query,
-                            "should_trigger": row["should_trigger"],
-                        })
-                        for run_number in range(1, runs_per_query + 1):
-                            trace_dir = None
-                            if trace_root is not None:
-                                agent_segment = safe_trace_segment(adapter.name, "agent")
-                                model_segment = safe_trace_segment(str(model or "default"), "default")
-                                trace_dir = (trace_root / agent_segment / model_segment /
-                                             f"query-{row_index:03d}-{safe_trace_label(query, f'query-{row_index}')}" /
-                                             f"run-{run_number}")
-                            metadata = {
-                                "measurement": EvidenceClass.RAW_MEASUREMENT.value,
-                                "ablation": ablation,
-                                "skill_tree_hash": tree_hash,
-                                "protocol_sha256": protocol_sha256,
-                                "protocol_observation": {},
-                            }
-                            should_trigger = row["should_trigger"]
-                            identity = TriggerRepetitionIdentity(row["query_id"], run_number)
-                            future = ex.submit(observe_cell_query, adapter, tree_dir,
-                                               query, should_trigger,
-                                               model, timeout, trace_dir, metadata, identity)
-                            futures.append(future)
-                            future_context[future] = (
-                                adapter.name, model, query, should_trigger, metadata, identity)
-            for fut in as_completed(futures):
-                try:
-                    observations.append(fut.result())
-                except Exception as exc:
-                    agent, model, query, should_trigger, metadata, identity = future_context[fut]
-                    observations.append(matrix_failure_observation(
-                        agent, model, query, should_trigger, exc, metadata, identity))
+            observations, ledger = run_admitted(
+                ex, plan, workers, ledger,
+                submit=lambda cell: ex.submit(
+                    observe_cell_query, cell.adapter, tree_dir, cell.query, cell.should_trigger,
+                    cell.model, timeout, cell.trace_dir, cell.metadata, cell.identity),
+                on_error=lambda cell, exc: matrix_failure_observation(
+                    cell.adapter.name, cell.model, cell.query, cell.should_trigger, exc,
+                    cell.metadata, cell.identity),
+                cost_of=trigger_cost_measurement,
+                label_of=lambda cell: cell.spend_row.label,
+                row_of=lambda cell: cell.spend_row,
+                refused=lambda cell, reason: TriggerObservation.not_started(
+                    agent=cell.adapter.name, model=cell.model, query=cell.query,
+                    expectation=TriggerExpectation.from_bool(cell.should_trigger),
+                    reason=f"spend ceiling refused admission ({reason.value})",
+                    metadata=cell.metadata, identity=cell.identity),
+            )
+        if ledger is not None and spend_ledger_path is not None:
+            persist_spend_ledger(spend_ledger_path, ledger)
     observations.sort(key=lambda observation: (
         observation.agent, str(observation.model or ""),
         str(observation.identity.query_id if observation.identity else ""),
@@ -1125,6 +1173,7 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         "design": design,
         "summary": summary,
         "matrix": matrix,
+        "spend_ceiling": None if ledger is None else ledger.to_dict(),
         "results": [observation.as_row() for observation in observations],
     }
 
@@ -1145,6 +1194,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--trace-runs", help="optional directory for per-run trace.jsonl/events.json/metrics.json artifacts for every selected agent")
     ap.add_argument("--ablation", help="materialize this discovery/trigger-population ablation id and trigger-test the altered skill")
     ap.add_argument("--out", required=True)
+    add_spend_ceiling_options(ap)
     add_surface_cli_options(ap, "trigger")
     return ap
 
@@ -1158,16 +1208,22 @@ def main() -> int:
     if not rows:
         raise SystemExit("no trigger queries: add kind:'trigger' cases to the manifest or pass --eval-set")
 
+    spend_policy = spend_policy_from_args(args)
     report = run_matrix(manifest_path, rows, agents=args.agent or ["claude"], models=args.model,
                         runs_per_query=args.runs_per_query, timeout=args.timeout, workers=args.workers,
                         max_turns=args.max_turns,
                         backend_options=surface_option_values(args, "trigger"),
                         trace_runs=Path(args.trace_runs) if args.trace_runs else None,
-                        ablation=args.ablation)
+                        ablation=args.ablation,
+                        spend_policy=spend_policy,
+                        spend_ledger_path=(Path(str(args.out) + ".spend-ceiling.json")
+                                           if spend_policy is not None else None))
     write_json(Path(args.out), report)
     print_matrix(report["matrix"])
     print(f"\nreport: {args.out}")
-    return 0 if report["summary"]["measurement_status"] == "complete" else 1
+    ledger_doc = report.get("spend_ceiling")
+    spend_code = spend_exit_code(SpendLedger.from_dict(ledger_doc)) if ledger_doc is not None else 0
+    return spend_code or (0 if report["summary"]["measurement_status"] == "complete" else 1)
 
 
 if __name__ == "__main__":
