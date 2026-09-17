@@ -1,0 +1,5 @@
+{"event":"init","conversation_id":"CONV","init":{"model":"gemini-3.1-pro-low","cwd":"/WORKSPACE","tools":["run_command","view_file","grep_search","find_by_name"],"permission_mode":"always-proceed"}}
+{"event":"step_update","step_update":{"conversation_id":"CONV","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"CONV","step_index":1,"state":"DONE","step_type":"tool","tool_name":"grep_search","duration_seconds":0.11,"tool_info":{"name":"grep_search","parameters":{"Query":"demo","SearchPath":"/WORKSPACE/.agents/skills/demo/SKILL.md"},"output":"no matches\n"}}}
+{"event":"step_update","step_update":{"conversation_id":"CONV","step_index":2,"state":"DONE","step_type":"tool","tool_name":"find_by_name","duration_seconds":0.08,"tool_info":{"name":"find_by_name","parameters":{"Query":"demo"},"output":"no skills matched\n"}}}
+{"event":"result","result":{"conversation_id":"CONV","status":"SUCCESS","response":"I could not find a relevant skill.","duration_seconds":2.4,"num_turns":1,"usage":{"input_tokens":8100,"output_tokens":120,"thinking_tokens":90,"cache_read_tokens":0,"total_tokens":8220}}}

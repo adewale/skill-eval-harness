@@ -12,6 +12,7 @@ registries. Dedicated live-smoke commands are projected separately.
 from __future__ import annotations
 
 import importlib
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -27,6 +28,13 @@ TelemetryProvenance = Literal[
     "price_table_estimated",
 ]
 Availability = Literal["available", "unavailable", "not_applicable"]
+Containment = Literal[
+    "contained", "config_isolated_only", "uncontained_requires_disposable_host",
+]
+ConfigAuthority = Literal[
+    "isolated_home_enforced", "isolated_home_conditional", "ambient_user_config",
+    "not_applicable",
+]
 SmokePopulation = Literal["answer", "trigger"]
 BackendSurface = Literal["answer", "trigger", "judge"]
 AnswerRoute = Literal["native", "export_import", "subagent", "none"]
@@ -43,6 +51,7 @@ CODEX_TRIGGER_DEFAULT_CMD = (
 )
 VIBE_DEFAULT_CMD = "vibe"
 GEMINI_DEFAULT_CMD = "gemini"
+AGY_DEFAULT_CMD = "agy"
 
 
 @dataclass(frozen=True)
@@ -114,6 +123,67 @@ class TelemetryCapability:
 
 
 @dataclass(frozen=True)
+class IsolationPosture:
+    """How far a backend can be constrained, and by what.
+
+    A boolean cannot express "safe only on a disposable host", which is the
+    posture of any provider whose sandbox is bypassable or whose configuration
+    home cannot be overridden.  Recording that as a capability flag would make
+    an unconstrainable backend indistinguishable from a constrained one, so it
+    is a closed vocabulary here instead, and the reason is mandatory: a posture
+    nobody can justify in one sentence is a posture nobody has checked.
+    """
+
+    containment: Containment
+    config_authority: ConfigAuthority
+    reason: str
+    trigger_optin_env: str | None = None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.containment, str)
+                or self.containment not in {
+                    "contained", "config_isolated_only",
+                    "uncontained_requires_disposable_host"}):
+            raise ValueError("containment must use the closed vocabulary")
+        if (not isinstance(self.config_authority, str)
+                or self.config_authority not in {
+                    "isolated_home_enforced", "isolated_home_conditional",
+                    "ambient_user_config", "not_applicable"}):
+            raise ValueError("config authority must use the closed vocabulary")
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError("an isolation posture needs a non-empty reason")
+        # A run whose configuration comes from the invoking user is not
+        # contained, whatever its tool policy claims: the user's own config can
+        # reintroduce tools, servers, and credentials the policy meant to
+        # exclude.
+        if (self.containment == "contained"
+                and self.config_authority == "ambient_user_config"):
+            raise ValueError(
+                "a backend reading the invoking user's configuration cannot be "
+                "declared contained")
+        if (self.containment == "config_isolated_only"
+                and self.config_authority not in {
+                    "isolated_home_enforced", "isolated_home_conditional"}):
+            raise ValueError(
+                "config_isolated_only requires a config home that can be isolated")
+        # An opt-in only means something where containment is the thing being
+        # waived.  Attaching one to a contained backend implies a risk that is
+        # not there.
+        if self.trigger_optin_env is not None:
+            if (not isinstance(self.trigger_optin_env, str)
+                    or not self.trigger_optin_env.strip()):
+                raise ValueError(
+                    "a trigger opt-in environment variable must be non-empty")
+            if self.containment != "uncontained_requires_disposable_host":
+                raise ValueError(
+                    "only an uncontained backend needs a trigger opt-in")
+
+    @property
+    def disposable_host_required(self) -> bool:
+        return self.containment == "uncontained_requires_disposable_host"
+
+
+@dataclass(frozen=True)
 class AgentCapabilities:
     answer_runner: bool
     autonomous_trigger: bool
@@ -124,6 +194,7 @@ class AgentCapabilities:
     judge_backend: bool
     tool_replay: bool
     live_smoke_env: str | None
+    isolation: IsolationPosture
     elapsed_ms: Availability = "available"
     usage_provenance: TelemetryProvenance | None = None
     elapsed_provenance: TelemetryProvenance | None = None
@@ -173,6 +244,21 @@ class AgentCapabilities:
             raise TypeError("agent capability notes must be a string")
         if self.token_usage and self.usage_not_applicable:
             raise ValueError("reported token usage cannot also be not applicable")
+        if not isinstance(self.isolation, IsolationPosture):
+            raise TypeError("agent capabilities need an explicit isolation posture")
+        # Autonomous trigger and trigger ablation hand a provider an unattended
+        # run against a workspace the harness assembled.  On a backend that
+        # cannot be contained that is only safe on a host nobody minds losing,
+        # which is an operator's decision to make explicitly rather than a
+        # default to inherit from a registry row.
+        if ((self.autonomous_trigger or self.trigger_ablation)
+                and self.isolation.disposable_host_required
+                and (self.isolation.trigger_optin_env is None
+                     or not os.environ.get(self.isolation.trigger_optin_env, "").strip())):
+            raise ValueError(
+                "a backend that cannot be contained must not advertise "
+                "autonomous trigger or trigger ablation without an explicit "
+                "operator opt-in")
 
     def telemetry_contract(self) -> dict[str, TelemetryCapability]:
         """Per-signal declaration used by artifacts, docs, and conformance tests."""
@@ -510,6 +596,16 @@ _GEMINI_JUDGE = SurfaceBinding(
     (_option("--gemini-cmd", "gemini_cmd", GEMINI_DEFAULT_CMD,
              "one literal Gemini CLI executable for --judge-backend gemini; spaces are path characters and no shell is used"),),
 )
+_AGY_ANSWER = SurfaceBinding(
+    ObjectRef("skill_benchmark", "AgyBackend"),
+    (_option("--agy-cmd", "agy_cmd", AGY_DEFAULT_CMD,
+             "one literal agy executable for --agent agy answer runs; a launcher prefix is refused because it could add --continue/-c or --conversation and seed the run with prior conversation state"),),
+)
+_AGY_JUDGE = SurfaceBinding(
+    ObjectRef("skill_benchmark", "agy_judge_invoke"),
+    (_option("--agy-cmd", "agy_cmd", AGY_DEFAULT_CMD,
+             "one literal agy executable for --judge-backend agy; a launcher prefix is refused for the same reason as the answer surface"),),
+)
 _VIBE_ANSWER = SurfaceBinding(
     ObjectRef("skill_benchmark", "VibeBackend"),
     (_option("--vibe-cmd", "vibe_cmd", VIBE_DEFAULT_CMD,
@@ -607,6 +703,17 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             usage_provenance="provider_reported",
             elapsed_provenance="process_measured",
             tool_replay=True, live_smoke_env="RUN_TRIGGER_SMOKE",
+            isolation=IsolationPosture(
+                containment="contained",
+                config_authority="isolated_home_conditional",
+                reason=(
+                    "--allowedTools constrains the run to Skill/Read/Glob/Grep. "
+                    "CLAUDE_CONFIG_DIR isolates configuration only when auth is "
+                    "portable; OAuth/keychain logins are not file-seedable, so "
+                    "the adapter preserves the normal config path and records "
+                    "config_isolated=False for that run."
+                ),
+            ),
             notes="run-claude drives stream-json so answer runs keep the full tool-use stream as trace evidence and capture the Claude CLI cost envelope; trigger matrix detects Skill tool-use plus path evidence.",
         ),
         answer_route="native",
@@ -628,6 +735,16 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             elapsed_provenance="process_measured",
             judge_backend=True, tool_replay=False,
             live_smoke_env="RUN_CODEX_TRIGGER_SMOKE",
+            isolation=IsolationPosture(
+                containment="contained",
+                config_authority="isolated_home_enforced",
+                reason=(
+                    "Trigger runs pass --sandbox read-only --ephemeral "
+                    "--ignore-user-config --ignore-rules, and CODEX_HOME is "
+                    "redirected to an ephemeral root outside the model's "
+                    "workdir with a skills-only add-dir."
+                ),
+            ),
             notes="Codex answer/trigger support uses codex exec JSONL; native judging uses codex exec --output-last-message/--output-schema. Dollar cost remains explicit missing unless the stream reports cost or a wrapper estimates it.",
         ),
         answer_route="native",
@@ -649,6 +766,15 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             usage_provenance="provider_reported",
             elapsed_provenance="process_measured",
             live_smoke_env="RUN_GEMINI_SMOKE",
+            isolation=IsolationPosture(
+                containment="contained",
+                config_authority="isolated_home_enforced",
+                reason=(
+                    "GEMINI_CLI_HOME is redirected to an isolated root and the "
+                    "run carries a deny-by-default policy file, so tool access "
+                    "is allowlisted rather than inherited."
+                ),
+            ),
             notes=(
                 "Official Gemini CLI answer and judge support uses isolated "
                 "GEMINI_CLI_HOME roots, deny-by-default policy files, and "
@@ -669,6 +795,61 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
         failure_marker="[GEMINI FAILURE",
     ),
     BackendRegistration(
+        name="agy",
+        capabilities=AgentCapabilities(
+            answer_runner=True, autonomous_trigger=False,
+            trigger_ablation=False, trace_artifacts=True, token_usage=True,
+            dollar_cost="missing", judge_backend=True, tool_replay=False,
+            usage_provenance="provider_reported",
+            elapsed_provenance="process_measured",
+            live_smoke_env="RUN_AGY_SMOKE",
+            isolation=IsolationPosture(
+                containment="uncontained_requires_disposable_host",
+                config_authority="ambient_user_config",
+                reason=(
+                    "agy exposes no config-home override "
+                    "(antigravity-cli#155), so the invoking user's "
+                    "configuration is in play, and --sandbox restricts "
+                    "terminal operations only while "
+                    "--dangerously-skip-permissions auto-approves the "
+                    "sandbox-bypass prompt itself (antigravity-cli#36). A run "
+                    "asked to write outside its workspace succeeded on 1.1.8."
+                ),
+            ),
+            notes=(
+                "Google Antigravity answer and judge support parses "
+                "stream-json through agy_contracts, where search tools are "
+                "disjoint from file reads, absent telemetry stays absent "
+                "rather than becoming a zero-token measurement, and the "
+                "provider error survives a nonzero exit. Autonomous trigger "
+                "and trigger ablation are withheld until one positive and one "
+                "negative activation are observed live, following the "
+                "precedent set for Gemini. Dollar cost remains explicit "
+                "missing because agy reports tokens but no cost. agy cannot "
+                "be contained at its CLI surface, so runs belong on a "
+                "disposable host."
+            ),
+        ),
+        answer_route="native",
+        trace=ObjectRef("skill_benchmark", "AGY_TRACE_DIALECT"),
+        answer_entrypoints=(_RUN_AGENT,),
+        answer=_AGY_ANSWER,
+        judge=_AGY_JUDGE,
+        workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
+        # Deliberately a dedicated smoke rather than a SmokeTarget. A
+        # SmokeTarget joins scripts/smoke_supported_clis.py, which sweeps every
+        # supported CLI in one run -- and agy cannot be contained, so sweeping
+        # it would invite an uncontained agent onto whatever machine ran the
+        # convenience script. Requiring its own opt-in keeps the disposable-host
+        # decision in front of the operator.
+        smoke=DedicatedSmokeTarget(
+            "agy",
+            ("python3", "-m", "unittest", "discover", "tests", "-k",
+             "smoke_agy", "-v"),
+        ),
+        failure_marker="[AGY FAILURE",
+    ),
+    BackendRegistration(
         name="pi",
         capabilities=AgentCapabilities(
             answer_runner=False, autonomous_trigger=True, trigger_ablation=True,
@@ -677,6 +858,16 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             usage_provenance="trace_normalized",
             elapsed_provenance="process_measured",
             tool_replay=False, live_smoke_env="RUN_PI_TRIGGER_SMOKE",
+            isolation=IsolationPosture(
+                containment="config_isolated_only",
+                config_authority="isolated_home_enforced",
+                reason=(
+                    "PI_CODING_AGENT_DIR is seeded fresh without the invoking "
+                    "user's skills, so configuration is isolated; the adapter "
+                    "declares no tool allowlist, so tool reach is not "
+                    "separately constrained."
+                ),
+            ),
             notes="Pi trigger support is shared by skill-pi-trigger-eval and skill-trigger-matrix; cost is parsed when the JSON stream reports it.",
         ),
         answer_route="none",
@@ -693,6 +884,16 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             usage_provenance="provider_reported",
             elapsed_provenance="provider_reported",
             tool_replay=False, live_smoke_env="RUN_JETTY_SMOKE",
+            isolation=IsolationPosture(
+                containment="contained",
+                config_authority="not_applicable",
+                reason=(
+                    "Jetty executes remotely in the provider's own sandbox; "
+                    "the harness uploads a workspace and never launches a "
+                    "local CLI, so there is no local configuration home to "
+                    "isolate."
+                ),
+            ),
             notes="Jetty supports answer-path export/run/import; autonomous trigger and judge export/import remain separate Jetty TODOs.",
         ),
         answer_route="export_import",
@@ -713,6 +914,15 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             judge_backend=True, tool_replay=False,
             elapsed_provenance="process_measured",
             live_smoke_env="RUN_VIBE_TRIGGER_SMOKE",
+            isolation=IsolationPosture(
+                containment="contained",
+                config_authority="isolated_home_enforced",
+                reason=(
+                    "VIBE_HOME is redirected to a temporary root outside the "
+                    "model's workdir and the run carries an explicit tool "
+                    "allowlist."
+                ),
+            ),
             notes="Mistral Vibe support uses isolated VIBE_HOME, programmatic JSON/streaming output, Agent Skills discovery from .agents/skills, and VIBE_ACTIVE_MODEL for model selection. Current Vibe JSON/streaming output does not export usage/cost telemetry, so both are explicit missing unless a future CLI adds fields.",
         ),
         answer_route="native",
@@ -733,6 +943,15 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             judge_backend=False, tool_replay=True, live_smoke_env=None,
             usage_provenance="provider_reported",
             elapsed_provenance="process_measured",
+            isolation=IsolationPosture(
+                containment="config_isolated_only",
+                config_authority="isolated_home_conditional",
+                reason=(
+                    "A generic seam around a caller-supplied command. The "
+                    "harness controls the workspace and environment it hands "
+                    "over, but cannot constrain a process it did not define."
+                ),
+            ),
             notes="Generic in-process/shell seam for answer runs and tool replay; not an autonomous discovery adapter.",
         ),
         answer_route="subagent",
@@ -750,6 +969,14 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             tool_replay=False, live_smoke_env=None,
             usage_not_applicable=True,
             elapsed_provenance="process_measured",
+            isolation=IsolationPosture(
+                containment="contained",
+                config_authority="not_applicable",
+                reason=(
+                    "Offline deterministic adapter; it reaches no network and "
+                    "no provider configuration."
+                ),
+            ),
             notes="Offline deterministic demo/CI adapter; never spends model tokens.",
         ),
         answer_route="none",

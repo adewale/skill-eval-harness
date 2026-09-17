@@ -1,0 +1,2 @@
+{"event":"init","conversation_id":"CONV","init":{"model":"gemini-3.1-pro-low","cwd":"/WORKSPACE","tools":["run_command","view_file","skill_search"],"permission_mode":"always-proceed"}}
+{"event":"result","result":{"conversation_id":"CONV","status":"SUCCESS","response":{"text":"The current stable version is 2.11.2.","parts":1},"duration_seconds":9.86,"num_turns":1,"usage":{"input_tokens":13387,"output_tokens":1052,"total_tokens":14439}}}

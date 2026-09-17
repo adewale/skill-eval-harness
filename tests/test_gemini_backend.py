@@ -917,6 +917,7 @@ class GeminiIsolationTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {
                     "GOOGLE_GENAI_USE_VERTEXAI": "true",
                     "GOOGLE_APPLICATION_CREDENTIALS": str(source),
+                    "GEMINI_CLI_HOME": str(root),
             }, clear=True):
                 env, metadata = sb.gemini_env_for_home(root / "isolated")
         self.assertNotEqual(env["GOOGLE_APPLICATION_CREDENTIALS"], str(source))
@@ -933,6 +934,7 @@ class GeminiIsolationTests(unittest.TestCase):
                     "GOOGLE_APPLICATION_CREDENTIALS": str(adc),
                     "GOOGLE_CLOUD_PROJECT_ID": "alias-project",
                     "GOOGLE_CLOUD_LOCATION": "us-central1",
+                    "GEMINI_CLI_HOME": str(root),
             }, clear=True):
                 env, metadata = sb.gemini_env_for_home(root / "isolated")
 
@@ -941,13 +943,16 @@ class GeminiIsolationTests(unittest.TestCase):
         self.assertTrue(metadata["google_cloud_project_id_canonicalized"])
 
     def test_conflicting_project_aliases_fail_auth_preflight(self):
-        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {
-                "GOOGLE_GENAI_USE_VERTEXAI": "true",
-                "GOOGLE_API_KEY": "key",
-                "GOOGLE_CLOUD_PROJECT": "canonical-project",
-                "GOOGLE_CLOUD_PROJECT_ID": "different-project",
-        }, clear=True):
-            _, metadata = sb.gemini_env_for_home(Path(td) / "isolated")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with mock.patch.dict(os.environ, {
+                    "GOOGLE_GENAI_USE_VERTEXAI": "true",
+                    "GOOGLE_API_KEY": "key",
+                    "GOOGLE_CLOUD_PROJECT": "canonical-project",
+                    "GOOGLE_CLOUD_PROJECT_ID": "different-project",
+                    "GEMINI_CLI_HOME": str(root),
+            }, clear=True):
+                _, metadata = sb.gemini_env_for_home(root / "isolated")
 
         self.assertIn("conflicting", metadata["gemini_auth_preflight_error"])
 

@@ -94,6 +94,8 @@ skill-benchmark run-agent --agent claude --tasks tasks.jsonl --runs ../repo/eval
   --model claude-haiku-4-5-20251001
 skill-benchmark run-agent --agent gemini --tasks tasks.jsonl --runs ../repo/eval-runs/gemini-tune \
   --model gemini-2.5-flash
+skill-benchmark run-agent --agent agy --tasks tasks.jsonl --runs ../repo/eval-runs/agy-tune \
+  --model gemini-3.1-pro-low
 ```
 
 The Gemini backend invokes the official CLI in headless `stream-json` mode and
@@ -108,6 +110,20 @@ executable path; free-form launcher/prefix arguments are rejected. Artifacts
 record the sandbox/auth transport decision, installed `gemini --version`, and
 pinned wire-fixture revision. Token stats are normalized when the CLI returns
 them; missing token stats and unsupported dollar cost remain explicit `missing`.
+
+The Antigravity (`agy`) backend also runs headless `stream-json` and takes its
+answer only from a complete typed stream. **Run it only on a disposable host:**
+agy has no config-home override, so the invoking user's configuration is in
+play, and neither `--sandbox` nor dropping auto-approval contains the run. Every
+run repeats that exposure in `environment.json`, and the registry records it as
+an explicit `uncontained_requires_disposable_host` posture, which is also what
+stops the backend advertising autonomous trigger. `--agy-cmd` accepts exactly
+one executable token; a launcher prefix is rejected because it could add
+`--continue` or `--conversation` and seed the run with prior conversation state.
+Completed searches are recorded as searches rather than file reads, so a run
+that searched for a skill without opening it is never scored as having used it.
+Token counters are normalized when a run reached a model; an all-zero block is
+absent telemetry, not a zero-cost measurement, and dollar cost stays `missing`.
 
 ## Run Claude tasks (with cost capture)
 

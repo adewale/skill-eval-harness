@@ -516,3 +516,45 @@ sys.exit({returncode})
     path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return path
+
+
+# Which CLI-path option each native answer backend is named by. Driven from the
+# registry rather than hand-listed, so a backend that adds a differently spelled
+# option cannot silently fall out of the cross-backend conformance sweep.
+BACKEND_CMD_OPTION = {
+    "claude": "claude_bin",
+    "codex": "codex_cmd",
+    "gemini": "gemini_cmd",
+    "vibe": "vibe_cmd",
+    "agy": "agy_cmd",
+}
+
+
+def fake_cli(
+    path: Path,
+    *,
+    stdout: str = "",
+    returncode: int = 0,
+    sidecar_flag: str | None = None,
+    sidecar_text: str = "",
+) -> Path:
+    """Write an executable fake agent CLI that replays a fixed response.
+
+    This is the suite's deterministic-CI seam (agent-backend-interface-spec
+    item 5): every native backend can be driven through a real subprocess that
+    emits checked-in fixture bytes, so parser and failure-semantics coverage
+    needs no CLI, no credentials, and no tokens.
+
+    `sidecar_flag` covers backends that deliver the final answer in a file
+    named by a flag rather than on stdout (codex's `--output-last-message`).
+    """
+    parts = ["#!/usr/bin/env python3", "import sys", "_ = sys.stdin.read()"]
+    if sidecar_flag is not None:
+        parts.append(f'''flag = {json.dumps(sidecar_flag)}
+if flag in sys.argv:
+    open(sys.argv[sys.argv.index(flag) + 1], "w").write({json.dumps(sidecar_text)})''')
+    parts.append(f"sys.stdout.write({json.dumps(stdout)})")
+    parts.append(f"sys.exit({returncode})")
+    path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return path
