@@ -105,6 +105,57 @@
           ]
         }
       }
+    },
+    {
+      "note": "is_error: true selects only completed calls whose result was an error; a clean run has none",
+      "assertion": {
+        "type": "tool_call",
+        "tool": "bash",
+        "pattern": "pytest",
+        "is_error": true
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 2,
+          "source": "subagent",
+          "events": [
+            {
+              "type": "command",
+              "name": "bash",
+              "command": "python -m pytest -q",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "note": "ordered recovery with is_error: false fails when the retry itself errored",
+      "assertion": {
+        "type": "tool_call",
+        "tool": "bash",
+        "order": [
+          "pytest"
+        ],
+        "is_error": false
+      },
+      "output": "done",
+      "files": {
+        "events.json": {
+          "schema_version": 2,
+          "source": "subagent",
+          "events": [
+            {
+              "type": "command",
+              "name": "bash",
+              "command": "python -m pytest -q",
+              "status": "completed",
+              "is_error": true
+            }
+          ]
+        }
+      }
     }
   ]
 }

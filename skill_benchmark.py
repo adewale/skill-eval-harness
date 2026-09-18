@@ -299,7 +299,7 @@ ASSERTION_TYPE_FIELDS: dict[str, set[str]] = {
     "command_order": {"patterns"},
     "tool_call": {
         "tool", "pattern", "expected_no_call", "required_calls", "call_set",
-        "order", "min_count", "max_count",
+        "order", "min_count", "max_count", "is_error",
     },
     "tool_count_le": {"tool", "max", "value"},
     "no_repeated_command_loop": {"max_repeats", "max", "value"},
@@ -853,6 +853,58 @@ def prompt_assertion_leakage_findings(manifest: dict[str, Any], manifest_path: P
     return findings
 
 
+TOOL_FAULT_FIELDS = {"tool", "match", "output", "times"}
+
+
+def parse_tool_faults(raw: Any, where: str) -> list[dict[str, Any]]:
+    """Validate a case's declared tool faults: hand-authored replay records the
+    subagent runner serves to BOTH arms of a pair so the fault, not the model's
+    luck, is the controlled stimulus. Each fault names a `tool`, an optional
+    `match` regex over the canonical JSON of the call payload, the `output` the
+    call receives instead of a live/recorded result, and optionally `times`
+    (how many matching calls receive it; omitted = every matching call).
+    Raises TypeError/ValueError; manifest validation and the replay store both
+    fail closed on it. The output is model-visible text, so it is a leakage
+    surface: it must describe the failure, never the recovery the assertions
+    expect."""
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{where}: tool_faults must be a non-empty list of fault objects")
+    faults: list[dict[str, Any]] = []
+    for index, fault in enumerate(raw, 1):
+        label = f"{where}: tool_faults[{index}]"
+        fault = string_keyed_dict(fault, label)
+        unknown = set(fault) - TOOL_FAULT_FIELDS
+        if unknown:
+            raise ValueError(f"{label} has unknown field(s): {', '.join(sorted(map(str, unknown)))}")
+        tool = fault.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            raise ValueError(f"{label} tool must be a non-empty string")
+        match = fault.get("match")
+        if match is not None:
+            if not isinstance(match, str) or not match:
+                raise ValueError(f"{label} match must be a non-empty regex string")
+            try:
+                re.compile(match)
+            except re.error as exc:
+                raise ValueError(f"{label} invalid match regex {match!r}: {exc}") from exc
+        if "output" not in fault:
+            raise ValueError(f"{label} needs an output (the result the faulted call receives)")
+        try:
+            output = json.loads(json.dumps(fault["output"], ensure_ascii=False))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} output must be a JSON value: {exc}") from exc
+        times = fault.get("times")
+        if times is not None and (isinstance(times, bool) or not isinstance(times, int) or times < 1):
+            raise ValueError(f"{label} times must be a positive integer when present")
+        normalized: dict[str, Any] = {"tool": tool, "output": output}
+        if match is not None:
+            normalized["match"] = match
+        if times is not None:
+            normalized["times"] = times
+        faults.append(normalized)
+    return faults
+
+
 def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, path: Path) -> None:
     """One validator for every assertion an eval can declare — case-level and
     per-turn alike, so no assertion shape can dodge validate and fail later
@@ -1075,6 +1127,16 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
         # name-matched `required_calls`/`call_set` are literal tool names.
         if "expected_no_call" in assertion and not isinstance(assertion["expected_no_call"], bool):
             die(f"{where} tool_call expected_no_call must be true or false")
+        if "is_error" in assertion:
+            # `is_error` narrows the COMPLETED calls every positive selector sees
+            # to those whose result was (true) or was not (false) an error, so
+            # "the failed call happened, then the prescribed recovery ran" is
+            # expressible with `order`. `expected_no_call` reasons over observed
+            # invocations regardless of result, so the two cannot combine.
+            if not isinstance(assertion["is_error"], bool):
+                die(f"{where} tool_call is_error must be true or false")
+            if assertion.get("expected_no_call") is True:
+                die(f"{where} tool_call is_error cannot combine with expected_no_call; expected_no_call forbids any observed invocation regardless of its result")
         for key in ("tool", "pattern"):
             value = assertion.get(key)
             if value is not None and (not isinstance(value, str) or not value):
@@ -1307,6 +1369,16 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
             ref = path.parent / f
             if not ref.exists() and not (allow_missing_holdback and split in {"holdout", "holdback"}):
                 die(f"{cid}: input file does not exist: {ref}")
+        if "tool_faults" in case:
+            # Answer population only: a fault is served through the subagent
+            # runner's tool executor, which the autonomous-trigger runners never
+            # host, and a fault before the skill loads measures nothing.
+            if trigger_case:
+                die(f"{cid}: tool_faults are only valid on answer-population cases, not trigger cases")
+            try:
+                parse_tool_faults(case["tool_faults"], cid)
+            except (TypeError, ValueError) as exc:
+                die(str(exc))
         assertions = case.get("assertions", [])
         if assertions is None:
             assertions = []
@@ -1743,6 +1815,10 @@ def prepared_task_rows(
                         # The scripted send/respond sequence rides the row too
                         # (roadmap 3.1); turn-aware runners drive it in order.
                         row["turns"] = [str((t or {}).get("prompt", "")) for t in case["turns"]]
+                    if case.get("tool_faults"):
+                        # Same declared faults on every arm and repetition: the
+                        # stimulus is identical, so only the skill differs.
+                        row["tool_faults"] = parse_tool_faults(case["tool_faults"], str(case.get("id")))
                     rows.append(row)
     return rows
 
@@ -1800,8 +1876,18 @@ def answer_case_input_fingerprint(task: dict[str, Any], pt: PreparedTask) -> str
         "prompt": pt.prompt,
         "tags": list(pt.tags),
         "turns": raw_turns,
+        **_tool_faults_fingerprint_field(task.get("tool_faults")),
     }
     return canonical_json_sha256(payload)
+
+
+def _tool_faults_fingerprint_field(raw: Any) -> dict[str, Any]:
+    """Declared faults are part of the case input every arm shares. The key is
+    present only when faults are declared so fault-free designs keep their
+    existing digests."""
+    if raw is None or raw == []:
+        return {}
+    return {"tool_faults": parse_tool_faults(raw, "prepared task")}
 
 
 def answer_task_fingerprint(task: dict[str, Any], pt: PreparedTask,
@@ -1829,6 +1915,7 @@ def answer_task_fingerprint(task: dict[str, Any], pt: PreparedTask,
         "tags": list(pt.tags),
         "turns": raw_turns,
         "answer_key": pt.answer_key,
+        **_tool_faults_fingerprint_field(task.get("tool_faults")),
     }
     return canonical_json_sha256(payload)
 
@@ -1891,6 +1978,7 @@ def manifest_case_input_fingerprint(
         "tags": list(case.get("tags", [])),
         "turns": [str((turn or {}).get("prompt", ""))
                   for turn in case.get("turns", [])],
+        **_tool_faults_fingerprint_field(case.get("tool_faults")),
     }
     return canonical_json_sha256(payload)
 
@@ -3819,6 +3907,15 @@ def export_jetty(args: argparse.Namespace) -> int:
         die(
             "Jetty export does not support multi-turn prepared tasks: "
             + ", ".join(sorted(set(multi_turn_cases)))
+        )
+    fault_cases = [
+        str(case.get("id")) for case in iter_cases(manifest, getattr(args, "split", None))
+        if not is_trigger_case(case) and case.get("tool_faults")
+    ]
+    if fault_cases:
+        die(
+            "Jetty export cannot serve tool_faults (no harness-hosted tool replay): "
+            + ", ".join(sorted(set(fault_cases)))
         )
     agent = getattr(args, "jetty_agent", None) or manifest.get("jetty", {}).get("agent") or JETTY_DEFAULT_AGENT
     if agent not in JETTY_ALLOWED_AGENTS:
@@ -7098,6 +7195,13 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
                                and event_is_completed(e)]
             observed_calls = [e for e in events
                               if e.get("type") in TRAJECTORY_STEP_TYPES]
+            is_error = assertion.get("is_error")
+            if isinstance(is_error, bool):
+                # A call that completed WITH an error result still ran (see the
+                # Claude flattener); this selector splits the completed set by
+                # that result. Only an explicit boolean marks an error result.
+                completed_calls = [e for e in completed_calls
+                                   if (e.get("is_error") is True) == is_error]
             tool = assertion.get("tool")
             if tool:
                 tool_folded = str(tool).casefold()
@@ -7172,7 +7276,8 @@ def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: 
             min_count = int(assertion.get("min_count", 1))
             max_count = assertion.get("max_count")
             if len(hits) < min_count:
-                return False, f"{len(hits)} matching tool call(s) < min_count {min_count} (tool={tool or '<any>'}, pattern={pattern or '<any>'})"
+                result_filter = f", is_error={is_error}" if isinstance(is_error, bool) else ""
+                return False, f"{len(hits)} matching tool call(s) < min_count {min_count} (tool={tool or '<any>'}, pattern={pattern or '<any>'}{result_filter})"
             if isinstance(max_count, int) and len(hits) > max_count:
                 return False, f"{len(hits)} matching tool call(s) > max_count {max_count}"
             detail = f"; first={hits[0]!r}" if hits else ""
@@ -10395,6 +10500,8 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             die(f"invalid prepared task: {exc}")
         if task.get("turns"):
             die(f"{backend.name} backend does not support multi-turn prepared tasks")
+        if task.get("tool_faults"):
+            die(f"{backend.name} backend does not host tool replay and cannot serve tool_faults; run these tasks with run-subagent")
         identity = (pt.case_id, row_model, pt.variant_truth, pt.run_number, "answer")
         if identity in seen_identities:
             die(f"duplicate prepared task identity: {identity}")
@@ -12735,14 +12842,62 @@ class ToolReplayStore:
                 self.recorded.setdefault(str(row.get("key")), []).append(row.get("output"))
         self.mode = ("replay" if had_recording else "record") if mode == "auto" else mode
         self.new_records: list[dict[str, Any]] = []
+        # Declared faults (parse_tool_faults shape) with per-fault remaining
+        # budgets; served faults are logged for the run's evidence, never
+        # written into `records` — they are declared stimulus, not observation.
+        self.faults: list[dict[str, Any]] = []
+        self._fault_budget: list[int | None] = []
+        self.served_faults: list[dict[str, Any]] = []
+
+    def install_faults(self, raw: Any) -> None:
+        """Declare hand-authored faults for this run. Validated through the one
+        manifest-side parser so a hand-edited task row cannot smuggle a malformed
+        fault past `validate`."""
+        faults = parse_tool_faults(raw, "tool replay store")
+        self.faults.extend(faults)
+        self._fault_budget.extend(fault.get("times") for fault in faults)
 
     @staticmethod
-    def call_key(tool: str, payload: Any) -> str:
-        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    def canonical_payload(payload: Any) -> str:
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+
+    @classmethod
+    def call_key(cls, tool: str, payload: Any) -> str:
+        canonical = cls.canonical_payload(payload)
         return hashlib.sha256(f"{tool}\n{canonical}".encode()).hexdigest()[:32]
+
+    def _serve_fault(self, tool: str, payload: Any, key: str) -> tuple[bool, Any]:
+        canonical = self.canonical_payload(payload)
+        for index, fault in enumerate(self.faults):
+            if fault["tool"] != tool:
+                continue
+            match = fault.get("match")
+            if match is not None and re.search(match, canonical) is None:
+                continue
+            remaining = self._fault_budget[index]
+            if remaining is not None and remaining <= 0:
+                continue
+            if remaining is not None:
+                self._fault_budget[index] = remaining - 1
+            self.served_faults.append({"fault_index": index + 1, "tool": tool, "key": key})
+            return True, copy.deepcopy(fault["output"])
+        return False, None
+
+    def fault_log(self) -> dict[str, Any] | None:
+        """Evidence of the stimulus this run received; None when none declared."""
+        if not self.faults:
+            return None
+        return {"schema_version": 1, "declared": copy.deepcopy(self.faults),
+                "served": list(self.served_faults)}
 
     def resolve(self, tool: str, payload: Any, live: Any = None) -> Any:
         key = self.call_key(tool, payload)
+        # A declared fault outranks every recording and every live tool in every
+        # mode: it is the controlled stimulus of the case, and in `strict` mode
+        # an unfaulted, unrecorded call still raises so the run fails closed.
+        served, fault_output = self._serve_fault(tool, payload, key)
+        if served:
+            return fault_output
         if self.mode in {"replay", "strict"}:
             queue = self.recorded.get(key)
             if queue:
@@ -12984,6 +13139,9 @@ def run_subagent_tasks(
     ``turn-N/`` regardless. Tool replay (2.3) wraps the executor per run."""
     mode = replay_mode or tool_replay_mode()
     workspace_builder = registered_workspace_builder("subagent")
+    if mode == "off" and any(task.get("tool_faults") for task in tasks):
+        die("prepared tasks declare tool_faults, which only the tool replay store can serve; "
+            "rerun with --tool-replay strict (or record/replay/auto), not off")
     validated: list[tuple[dict[str, Any], PreparedTask, str | None, Path]] = []
     seen_identities: set[tuple[str, str | None, str, int, str]] = set()
     seen_destinations: set[Path] = set()
@@ -12997,6 +13155,14 @@ def run_subagent_tasks(
         except ValueError as exc:
             die(f"invalid prepared task: {exc}")
         base = safe_child_path(runs, pt.run_dir)
+        if task.get("tool_faults"):
+            # Validate before the design is persisted so a malformed fault dies
+            # with the other prepared-task errors instead of surfacing as a
+            # fingerprint exception.
+            try:
+                parse_tool_faults(task["tool_faults"], f"prepared task {pt.case_id}")
+            except (TypeError, ValueError) as exc:
+                die(f"invalid prepared task: {exc}")
         identity = (pt.case_id, row_model, pt.variant_truth, pt.run_number, "answer")
         if identity in seen_identities:
             die(f"duplicate prepared task identity: {identity}")
@@ -13028,6 +13194,11 @@ def run_subagent_tasks(
         if mode in {"replay", "strict", "auto"} and existing_replay.is_file():
             shutil.copy2(existing_replay, replay_path)
         store = ToolReplayStore(replay_path, mode) if mode != "off" else None
+        if store is not None and task.get("tool_faults"):
+            try:
+                store.install_faults(task["tool_faults"])
+            except (TypeError, ValueError) as exc:
+                die(f"invalid prepared task {pt.case_id}: {exc}")
 
         def tool_executor(tool: str, payload: Any, replay_store=store) -> Any:
             live = (live_tools or {}).get(tool)
@@ -13183,8 +13354,14 @@ def run_subagent_tasks(
                     if isinstance(raw_single_usage, dict) else None
                 )
                 aggregate_cost_usd = _subagent_cost_usd(outcome)
+        fault_extra: dict[str, Any] = {}
         if store is not None:
             store.save()
+            fault_log = store.fault_log()
+            if fault_log is not None:
+                write_json(sidecars / "tool-faults.json", fault_log)
+                fault_extra = {"tool_faults_declared": len(fault_log["declared"]),
+                               "tool_faults_served": len(fault_log["served"])}
         # The subagent seam returns structured trace records; single-turn traces
         # remain direct. Multi-turn root traces are safe composites whose exact
         # provider records live under turn-<n>/trace.jsonl.
@@ -13212,7 +13389,7 @@ def run_subagent_tasks(
             elapsed_ms=(int(elapsed_ms) if isinstance(elapsed_ms, (int, float)) else None),
             trace_text=trace_text,
             usage=raw_usage, cost_usd=aggregate_cost_usd, model=row_model,
-            metadata_extra={"tool_replay_mode": mode, **prov_extra, **multi_turn_extra},
+            metadata_extra={"tool_replay_mode": mode, **prov_extra, **multi_turn_extra, **fault_extra},
             diagnose_returncode=False)
         try:
             write_runner_outcome(base, ro, sidecars=sidecars)
@@ -16838,6 +17015,12 @@ def invalidate_variant_summaries(
     }
 
 
+# The per-arm counters the paired trajectory diff subtracts (with - without).
+# `errors` is the skill-eval signal for fault cases: a skill that prescribes
+# recovery should lower it, one that prescribes unavailable tools raises it.
+TRAJECTORY_DELTA_KEYS = ("steps", "commands", "tool_calls", "file_reads", "file_writes", "errors")
+
+
 def _trajectory_profile(events: list[dict[str, Any]]) -> dict[str, Any]:
     """One arm's trajectory shape. Counts come from trace_event_counts — the
     same owner metrics.json uses — so a diff delta is a delta of exactly the
@@ -16848,7 +17031,7 @@ def _trajectory_profile(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "commands": [str(e.get("input_summary") or e.get("command") or e.get("cmd") or e.get("name") or "")
                      for e in command_events(events)],
-        "counts": {key: counts[key] for key in ("steps", "commands", "tool_calls", "file_reads", "file_writes")},
+        "counts": {key: counts[key] for key in TRAJECTORY_DELTA_KEYS},
         "skill_invoked": bool(counts["skill_events"]),
     }
 
@@ -16856,7 +17039,7 @@ def _trajectory_profile(events: list[dict[str, Any]]) -> dict[str, Any]:
 def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
     """Per-case paired event-stream comparison: HOW the arms behaved, not just
     whether they passed — the commands only one arm ran, count deltas
-    (with - without), and per-arm skill-load rates. The diagnosis companion to
+    (with - without, including tool errors), and per-arm skill-load rates. The diagnosis companion to
     lift: on a no-lift or qualitative-only case it shows whether the skill
     changed behavior at all. Pairing rides the experimental-pair owner, and an
     arm without readable trace evidence BLOCKS its pair with a named reason —
@@ -16883,7 +17066,7 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
         population=pair_domain.ExperimentalPopulation.ANSWER,
         eligibility=eligibility,
     )
-    delta_keys = ("steps", "commands", "tool_calls", "file_reads", "file_writes")
+    delta_keys = TRAJECTORY_DELTA_KEYS
     by_case: dict[str, dict[str, Any]] = {}
     for pair in construction.pairs:
         with_profile = profiles[str(pair.with_skill.payload.get("run_base"))]

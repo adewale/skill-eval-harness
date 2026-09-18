@@ -338,6 +338,118 @@ class ToolReplayTests(unittest.TestCase):
             self.assertEqual(replayer.resolve("t", {"x": 1}), "out")
 
 
+class ToolFaultTests(unittest.TestCase):
+    """Case-declared tool faults: hand-authored results the replay store serves
+    to every arm ahead of recordings and live tools, so the fault is the
+    controlled stimulus and only the skill differs. Answer population, subagent
+    runner only; everything else refuses the rows rather than dropping the
+    stimulus silently."""
+
+    FAULT = {"tool": "search", "match": "alpha", "output": "EACCES: permission denied"}
+
+    def agent(self):
+        def run(*, prompt, workspace, model, tool_executor):
+            a = tool_executor("search", {"q": "alpha"})
+            b = tool_executor("search", {"q": "beta"})
+            return {"answer": f"{a} then {b}"}
+        return run
+
+    def _tasks(self, root: Path, faults: list) -> list[dict]:
+        tasks = make_tasks(root)[:1]
+        tasks[0]["tool_faults"] = faults
+        return tasks
+
+    def test_fault_outranks_live_tool_and_leaves_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = self._tasks(root, [dict(self.FAULT)])
+            runs = root / "runs"
+            sb.run_subagent_tasks(tasks, runs, self.agent(),
+                                  live_tools={"search": lambda payload: f"live-{payload['q']}"},
+                                  replay_mode="record")
+            base = runs / "case-1" / "with_skill"
+            output = (base / "output.md").read_text(encoding="utf-8")
+            log = json.loads((base / "tool-faults.json").read_text(encoding="utf-8"))
+            replay = json.loads((base / "tool-replay.json").read_text(encoding="utf-8"))
+            metadata = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(output, "EACCES: permission denied then live-beta")
+        self.assertEqual(log["declared"], [self.FAULT])
+        self.assertEqual([(row["fault_index"], row["tool"]) for row in log["served"]], [(1, "search")])
+        # The served fault is declared stimulus, never a recorded observation.
+        self.assertEqual(len(replay["records"]), 1)
+        self.assertEqual(replay["records"][0]["key"], sb.ToolReplayStore.call_key("search", {"q": "beta"}))
+        self.assertEqual((metadata["tool_faults_declared"], metadata["tool_faults_served"]), (1, 1))
+
+    def test_strict_mode_serves_the_fault_corpus_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runs = root / "runs"
+            every_search = self._tasks(root, [{"tool": "search", "output": "denied"}])
+            sb.run_subagent_tasks(every_search, runs, self.agent(),
+                                  live_tools={"search": lambda payload: self.fail("strict must not go live")},
+                                  replay_mode="strict")
+            covered = (runs / "case-1" / "with_skill" / "output.md").read_text(encoding="utf-8")
+            partial = self._tasks(root, [dict(self.FAULT)])
+            sb.run_subagent_tasks(partial, root / "runs-partial", self.agent(), replay_mode="strict")
+            uncovered = (root / "runs-partial" / "case-1" / "with_skill" / "output.md").read_text(encoding="utf-8")
+        self.assertEqual(covered, "denied then denied")
+        self.assertIn("tool replay miss", uncovered)   # beta was neither faulted nor recorded: fail closed
+
+    def test_times_budget_then_falls_through(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = self._tasks(root, [{"tool": "search", "output": "flaky", "times": 1}])
+            sb.run_subagent_tasks(tasks, root / "runs", self.agent(),
+                                  live_tools={"search": lambda payload: f"live-{payload['q']}"},
+                                  replay_mode="record")
+            output = (root / "runs" / "case-1" / "with_skill" / "output.md").read_text(encoding="utf-8")
+        self.assertEqual(output, "flaky then live-beta")
+
+    def test_replay_off_refuses_declared_faults(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = self._tasks(root, [dict(self.FAULT)])
+            with self.assertRaises(SystemExit):
+                sb.run_subagent_tasks(tasks, root / "runs", self.agent(), replay_mode="off")
+
+    def test_native_runner_refuses_declared_faults(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = self._tasks(root, [dict(self.FAULT)])
+            with self.assertRaises(SystemExit):
+                sb.run_agent_tasks(tasks, root / "runs", sb.registered_agent_backend("claude"))
+
+    def test_malformed_fault_on_a_task_row_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks = self._tasks(root, [{"tool": "search"}])   # no output
+            with self.assertRaises(SystemExit):
+                sb.run_subagent_tasks(tasks, root / "runs", self.agent(), replay_mode="strict")
+
+    def test_prepare_copies_faults_onto_every_arm_and_into_the_fingerprints(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = base_manifest()
+            manifest["cases"][0]["tool_faults"] = [dict(self.FAULT)]
+            path = write_manifest(root, manifest)
+            rows = sb.prepared_task_rows(path, sb.validate_manifest(path), split="tune")
+            plain = make_tasks(root / "plain")
+        self.assertEqual({row["variant"] for row in rows}, {"with_skill", "without_skill"})
+        for row in rows:
+            self.assertEqual(row["tool_faults"], [self.FAULT])
+        faulted = {row["variant"]: row for row in rows}
+        unfaulted = {row["variant"]: row for row in plain}
+        for variant in ("with_skill", "without_skill"):
+            with_fault = sb.PreparedTask.from_row(faulted[variant])
+            without_fault = sb.PreparedTask.from_row(unfaulted[variant])
+            self.assertNotEqual(
+                sb.answer_case_input_fingerprint(faulted[variant], with_fault),
+                sb.answer_case_input_fingerprint(unfaulted[variant], without_fault))
+            self.assertNotEqual(
+                sb.answer_task_fingerprint(faulted[variant], with_fault, None),
+                sb.answer_task_fingerprint(unfaulted[variant], without_fault, None))
+
+
 class ClosedRunnerOutcomeTests(unittest.TestCase):
     def test_capture_rejects_a_non_process_outcome_from_the_subprocess_owner(self):
         outcome = sb.InvocationOutcome.harness_failed("fixture setup failed")

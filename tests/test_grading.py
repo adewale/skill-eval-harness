@@ -1218,6 +1218,62 @@ class ToolCallTaxonomyTests(unittest.TestCase):
         self.assertIn("tool_count=1", result["evidence"])
 
 
+class ToolCallErrorSelectorTests(unittest.TestCase):
+    """`is_error` splits the completed calls by their RESULT so a fault case can
+    assert "the failed call happened, then the prescribed recovery ran cleanly"
+    with the existing pattern/order/count forms."""
+    def _base(self):
+        tmp = tempfile.TemporaryDirectory(prefix="toolcall-err-")
+        self.addCleanup(tmp.cleanup)
+        td = Path(tmp.name)
+        events = {"schema_version": 2, "source": "subagent", "events": [
+            {"type": "command", "name": "bash", "command": "npm test", "status": "completed", "is_error": True},
+            {"type": "command", "name": "bash", "command": "npm ci", "status": "completed"},
+            {"type": "command", "name": "bash", "command": "npm test", "status": "completed"},
+            {"type": "tool_call", "name": "Read", "input_summary": "package.json", "status": "completed", "is_error": False},
+        ]}
+        (td / "events.json").write_text(json.dumps(events), encoding="utf-8")
+        (td / "output.md").write_text("out", encoding="utf-8")
+        return td
+
+    def _grade(self, assertion):
+        base = self._base()
+        return sb.assertion_result(assertion, "out", base / "output.md", run_base=base)
+
+    def test_true_selects_only_error_results(self):
+        failed = self._grade({"type": "tool_call", "tool": "bash", "pattern": "npm test", "is_error": True, "max_count": 1})
+        self.assertTrue(failed["passed"], failed["evidence"])
+        no_failed_install = self._grade({"type": "tool_call", "tool": "bash", "pattern": "npm ci", "is_error": True})
+        self.assertFalse(no_failed_install["passed"])
+        self.assertIn("is_error=True", no_failed_install["evidence"])
+
+    def test_false_selects_only_clean_results(self):
+        clean = self._grade({"type": "tool_call", "tool": "bash", "pattern": "npm test", "is_error": False, "max_count": 1})
+        self.assertTrue(clean["passed"], clean["evidence"])
+        # An explicit `is_error: false` on the event and an absent flag both read as clean.
+        read = self._grade({"type": "tool_call", "tool": "Read", "is_error": False})
+        self.assertTrue(read["passed"], read["evidence"])
+
+    def test_ordered_recovery_after_a_fault(self):
+        recovery = self._grade({"type": "tool_call", "tool": "bash", "order": ["npm ci", "npm test"], "is_error": False})
+        self.assertTrue(recovery["passed"], recovery["evidence"])
+        # Without the selector the errored first `npm test` satisfies the order too
+        # early: cursor lands after index 0, `npm ci` at 1, `npm test` at 2 — still
+        # passes; with is_error: true there is no clean `npm ci` to match at all.
+        wrong_arm = self._grade({"type": "tool_call", "tool": "bash", "order": ["npm ci", "npm test"], "is_error": True})
+        self.assertFalse(wrong_arm["passed"])
+
+    def test_name_set_selectors_honor_the_result_filter(self):
+        only_bash_failed = self._grade({"type": "tool_call", "call_set": ["bash"], "is_error": True})
+        self.assertTrue(only_bash_failed["passed"], only_bash_failed["evidence"])
+        read_never_failed = self._grade({"type": "tool_call", "required_calls": ["Read"], "is_error": True})
+        self.assertFalse(read_never_failed["passed"])
+
+    def test_unselected_assertions_are_unchanged(self):
+        both = self._grade({"type": "tool_call", "tool": "bash", "pattern": "npm test", "min_count": 2})
+        self.assertTrue(both["passed"], both["evidence"])
+
+
 class ToolCallValidationTests(unittest.TestCase):
     """P2: validate_case_assertion rejects malformed tool_call assertions at
     manifest-validation time rather than degrading silently in grading."""
@@ -1253,6 +1309,16 @@ class ToolCallValidationTests(unittest.TestCase):
             self._validate({"type": "tool_call", "pattern": "["})
         with self.assertRaises(SystemExit):
             self._validate({"type": "tool_call", "order": ["ok", "("]})
+
+    def test_is_error_must_be_boolean_and_cannot_combine_with_expected_no_call(self):
+        self._validate({"type": "tool_call", "tool": "bash", "is_error": True})
+        self._validate({"type": "tool_call", "order": ["npm ci"], "is_error": False})
+        self._validate({"type": "tool_call", "call_set": ["bash"], "is_error": True})
+        for bad in ("true", 1, None):
+            with self.assertRaises(SystemExit):
+                self._validate({"type": "tool_call", "tool": "bash", "is_error": bad})
+        with self.assertRaises(SystemExit):
+            self._validate({"type": "tool_call", "tool": "bash", "expected_no_call": True, "is_error": True})
 
     def test_literal_name_selectors_are_not_regex_validated(self):
         # required_calls/call_set are exact tool NAMES, so a regex-special name is fine

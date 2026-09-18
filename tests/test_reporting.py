@@ -651,6 +651,21 @@ class TrajectoryDiffTests(unittest.TestCase):
         self.assertEqual(case["mean_deltas"]["steps"], 4.0)
         self.assertEqual(case["skill_invoked"], {"with_skill": 1.0, "without_skill": 0.0})
 
+    def test_tool_error_delta_is_reported_beside_the_step_counts(self):
+        # Fault cases: the skill-eval signal is whether the skilled arm hit
+        # fewer error results than the baseline under the same stimulus.
+        failing = self._events(["npm test", "npm test"])
+        failing["events"][0]["is_error"] = True
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._rows(td, with_events=self._events(["npm test", "npm test"]),
+                              without_events=failing)
+            diff = sb.build_trajectory_diff(rows)
+        case = diff["cases"][0]
+        self.assertEqual(set(case["mean_deltas"]), set(sb.TRAJECTORY_DELTA_KEYS))
+        self.assertIn("errors", sb.TRAJECTORY_DELTA_KEYS)
+        self.assertEqual(case["mean_deltas"]["errors"], -1.0)
+        self.assertEqual(case["mean_deltas"]["commands"], 0.0)   # the failed call still ran
+
     def test_missing_trace_evidence_blocks_the_pair(self):
         with tempfile.TemporaryDirectory() as td:
             rows = self._rows(td, with_events=self._events(["ls"]), without_events=None)

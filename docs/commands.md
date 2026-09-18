@@ -125,6 +125,14 @@ skill-benchmark run-claude --tasks tasks.jsonl --runs ../repo/eval-runs/claude-t
 
 `run-subagent` drives prepared rows through an in-process backend — the Claude CLI by default, any provider via `--agent-cmd` (prompt JSON on stdin, `{answer, trace?, usage?}` JSON on stdout), or a plain function in tests. It writes the same run-output contract (plus normalized `events.json`/`metrics.json` from a returned trace), reuses the isolated per-variant workspace (so the CF.2 baseline-isolation invariant covers it), honors row-level models, and drives multi-turn `turns` sequences into `turn-<n>/output.md`. Tool I/O can be recorded and replayed deterministically via `--tool-replay record|replay|strict|auto` (or `$SKILL_BENCHMARK_TOOL_REPLAY`), stored as `tool-replay.json` beside each run; `strict` fails closed on an unrecorded call.
 
+Replay and faults reach only backends that route their tool calls through the executor the runner hands them (an in-process function or SDK dispatch); the default Claude CLI backend and `--agent-cmd` shells run their own tools, so for them the store is inert.
+
+A case may declare `tool_faults` (see the manifest format in the README). `prepare` copies them onto every arm's row, and the store serves a matching call the declared `output` ahead of any recording or live tool, in every mode except `off` (which the runner refuses when faults are declared). Under `strict` an unfaulted, unrecorded call still raises, so the run is fully deterministic: the fault corpus and nothing else. Each faulted run writes `tool-faults.json` (declared faults plus which calls were served) and stamps `tool_faults_declared`/`tool_faults_served` into `metadata.json`. Grade the response with `tool_call` `is_error` selectors and read the paired `errors` delta in the report's `trajectory_diff`.
+
+```bash
+skill-benchmark run-subagent --tasks fault-tasks.jsonl --runs eval-runs/faults --tool-replay strict
+```
+
 ```bash
 skill-benchmark run-subagent --tasks tasks.jsonl --runs eval-runs/subagent --tool-replay record
 ```
