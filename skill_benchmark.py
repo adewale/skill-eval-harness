@@ -24,6 +24,7 @@ import itertools
 import json
 import math
 import os
+import queue
 import random
 import re
 import shlex
@@ -34,6 +35,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -44,7 +46,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
-from typing import Any, NoReturn, Protocol, cast
+from typing import Any, Literal, NoReturn, Protocol, cast
 
 # Direct ``python skill_benchmark.py`` execution must share the canonical module
 # identity used by lazy backend references. Otherwise importing
@@ -853,7 +855,7 @@ def prompt_assertion_leakage_findings(manifest: dict[str, Any], manifest_path: P
     return findings
 
 
-TOOL_FAULT_FIELDS = {"tool", "match", "output", "times"}
+TOOL_FAULT_FIELDS = {"tool", "match", "output", "times", "is_error"}
 
 
 def parse_tool_faults(raw: Any, where: str) -> list[dict[str, Any]]:
@@ -861,8 +863,10 @@ def parse_tool_faults(raw: Any, where: str) -> list[dict[str, Any]]:
     subagent runner serves to BOTH arms of a pair so the fault, not the model's
     luck, is the controlled stimulus. Each fault names a `tool`, an optional
     `match` regex over the canonical JSON of the call payload, the `output` the
-    call receives instead of a live/recorded result, and optionally `times`
-    (how many matching calls receive it; omitted = every matching call).
+    call receives instead of a live/recorded result, optionally `is_error`
+    (the result is an error result; the trace must then account for it as one,
+    see tool_fault_conservation_errors), and optionally `times` (how many
+    matching calls receive it; omitted = every matching call).
     Raises TypeError/ValueError; manifest validation and the replay store both
     fail closed on it. The output is model-visible text, so it is a leakage
     surface: it must describe the failure, never the recovery the assertions
@@ -896,13 +900,48 @@ def parse_tool_faults(raw: Any, where: str) -> list[dict[str, Any]]:
         times = fault.get("times")
         if times is not None and (isinstance(times, bool) or not isinstance(times, int) or times < 1):
             raise ValueError(f"{label} times must be a positive integer when present")
-        normalized: dict[str, Any] = {"tool": tool, "output": output}
+        is_error = fault.get("is_error", False)
+        if not isinstance(is_error, bool):
+            raise TypeError(f"{label} is_error must be true or false when present")
+        normalized: dict[str, Any] = {"tool": tool, "output": output, "is_error": is_error}
         if match is not None:
             normalized["match"] = match
         if times is not None:
             normalized["times"] = times
         faults.append(normalized)
     return faults
+
+
+def tool_fault_conservation_errors(served: list[dict[str, Any]],
+                                   records: list[dict[str, Any]]) -> list[str]:
+    """Conservation law for served tool faults: every fault the store served
+    must be accounted for by a completed call of that tool in the run's trace,
+    and a fault declared `is_error` must appear there as an error result. The
+    harness knows exactly which stimuli it applied; a trace that omits them
+    (a backend that dropped the call, or reported a denial as a clean result)
+    would let `tool_call is_error` and the paired `errors` delta grade a
+    stimulus that never shows. Returns one message per violated tool."""
+    if not served:
+        return []
+    events_doc, _ = normalize_trace_records(list(records), source="subagent")
+    raw_events = events_doc.get("events")
+    events: list[dict[str, Any]] = [e for e in (raw_events if isinstance(raw_events, list) else [])
+                                    if isinstance(e, dict)]
+    completed = [e for e in events if e.get("name") and event_is_completed(e)]
+    errors: list[str] = []
+    for tool in sorted({str(row.get("tool")) for row in served}):
+        served_total = sum(1 for row in served if str(row.get("tool")) == tool)
+        served_error = sum(1 for row in served
+                           if str(row.get("tool")) == tool and row.get("is_error") is True)
+        seen = [e for e in completed if str(e.get("name")).casefold() == tool.casefold()]
+        seen_error = sum(1 for e in seen if e.get("is_error") is True)
+        if len(seen) < served_total:
+            errors.append(f"tool {tool!r}: {served_total} fault(s) served but the trace shows "
+                          f"{len(seen)} completed call(s)")
+        elif seen_error < served_error:
+            errors.append(f"tool {tool!r}: {served_error} fault(s) served as error results but "
+                          f"the trace marks {seen_error} error result(s)")
+    return errors
 
 
 def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, path: Path) -> None:
@@ -8422,11 +8461,15 @@ def write_trace_artifacts(
     artifact_set_complete: bool | None = None,
     retain_invalid_provider_trace: bool = False,
     trace_utf8_valid: bool = True,
+    conservation_errors: tuple[str, ...] | list[str] = (),
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(retain_invalid_provider_trace, bool):
         raise TypeError("retain_invalid_provider_trace must be boolean")
     if not isinstance(trace_utf8_valid, bool):
         raise TypeError("trace_utf8_valid must be boolean")
+    if (not isinstance(conservation_errors, (tuple, list))
+            or not all(isinstance(item, str) and item.strip() for item in conservation_errors)):
+        raise TypeError("conservation_errors must be a sequence of non-empty strings")
     for label, value in (("process_observation_complete", process_observation_complete),
                          ("provider_response_complete", provider_response_complete),
                          ("artifact_set_complete", artifact_set_complete)):
@@ -8459,12 +8502,19 @@ def write_trace_artifacts(
     if parse_errors:
         metrics["parse_errors"] = parse_errors[:20]
         metrics["errors"] = int(metrics.get("errors", 0) or 0) + len(parse_errors)
+    if conservation_errors:
+        # The runner did something to this run (served a declared tool fault)
+        # that the trace does not account for. A trace that omits a stimulus
+        # the harness knows it applied is not a complete observation.
+        metrics["trace_conservation_errors"] = list(conservation_errors)[:20]
     # A trace-derived count is observed only when at least one valid event was
     # captured and parsing completed. Completion is derived here and reserved:
     # arbitrary caller metrics cannot promote an absent trace.
     trace_observation_complete = (
-        bool(records) and not parse_errors and not metrics.get("trace_protocol_errors"))
+        bool(records) and not parse_errors and not metrics.get("trace_protocol_errors")
+        and not conservation_errors)
     reserved = set(metrics) | {
+        "trace_conservation_errors",
         "observation_complete", "trace_observation_complete", "process_observation_complete",
         "provider_response_complete", "operation_observation_complete",
         "artifact_set_complete", "observation_evidence", "telemetry",
@@ -8757,6 +8807,7 @@ def _write_runner_outcome_files(run_dir: Path, outcome: AnswerOutcome,
         # transaction. Direct/import callers retain strict rejection.
         retain_invalid_provider_trace=True,
         trace_utf8_valid=context.trace_utf8_valid,
+        conservation_errors=context.trace_conservation_errors,
     )
     marker = RUNNER_FAILURE_MARKER_BY_PROVIDER[context.provider.value]
     if isinstance(outcome, TimedOut):
@@ -10478,7 +10529,7 @@ def registered_agent_backend(name: str) -> AgentBackend:
     return backend
 
 
-def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, **options: Any) -> int:
+def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, skip_fault_cases: bool = False, **options: Any) -> int:
     """Shared answer-runner loop for native CLI backends.
 
     Existing `run-claude` and `run-codex` now use this path, and the new
@@ -10489,6 +10540,7 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
     validated: list[tuple[dict[str, Any], PreparedTask, str | None, Path]] = []
     seen_identities: set[tuple[str, str | None, str, int, str]] = set()
     seen_destinations: set[Path] = set()
+    skipped_fault_rows: list[str] = []
     for task in tasks:
         try:
             pt = PreparedTask.from_row(task)
@@ -10501,7 +10553,13 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
         if task.get("turns"):
             die(f"{backend.name} backend does not support multi-turn prepared tasks")
         if task.get("tool_faults"):
-            die(f"{backend.name} backend does not host tool replay and cannot serve tool_faults; run these tasks with run-subagent")
+            if not skip_fault_cases:
+                die(f"{backend.name} backend does not host tool replay and cannot serve tool_faults; "
+                    "run these tasks with run-subagent --only-fault-cases, and pass --skip-fault-cases here")
+            # The row still counts toward the persisted answer design (the same
+            # JSONL goes to run-subagent), it just is not this runner's to run.
+            skipped_fault_rows.append(pt.case_id)
+            continue
         identity = (pt.case_id, row_model, pt.variant_truth, pt.run_number, "answer")
         if identity in seen_identities:
             die(f"duplicate prepared task identity: {identity}")
@@ -10511,6 +10569,10 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             die(f"duplicate prepared task run_dir: {pt.run_dir}")
         seen_destinations.add(base)
         validated.append((task, pt, row_model, base))
+    if skipped_fault_rows:
+        print(f"note: {backend.name} skipped {len(skipped_fault_rows)} tool_faults row(s) "
+              f"({', '.join(sorted(set(skipped_fault_rows)))}); run them with "
+              "run-subagent --only-fault-cases into the same runs directory", file=sys.stderr)
     runs.mkdir(parents=True, exist_ok=True)
     design = persist_answer_design(runs, tasks, default_model=model)
     for task, pt, row_model, base in validated:
@@ -10563,6 +10625,7 @@ def run_agent(args: argparse.Namespace) -> int:
     provider_options = binding_for(agent, "answer").option_values(
         surface_option_values(args, "answer"))
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), backend,
+                           skip_fault_cases=bool(getattr(args, "skip_fault_cases", False)),
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
                            **provider_options)
 
@@ -10578,6 +10641,7 @@ def agent_capabilities_command(args: argparse.Namespace) -> int:
 
 def run_codex(args: argparse.Namespace) -> int:
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("codex"),
+                           skip_fault_cases=bool(getattr(args, "skip_fault_cases", False)),
                            timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
                            codex_cmd=getattr(args, "codex_cmd", None) or CODEX_ANSWER_DEFAULT_CMD)
 
@@ -10764,6 +10828,7 @@ def claude_run_metrics(result: dict[str, Any]) -> dict[str, Any]:
 
 def run_claude(args: argparse.Namespace) -> int:
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("claude"),
+                           skip_fault_cases=bool(getattr(args, "skip_fault_cases", False)),
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
                            claude_bin=getattr(args, "claude_bin", None) or "claude")
 
@@ -12819,6 +12884,15 @@ class ToolReplayMiss(Exception):
     """A replayed run requested a tool call that was never recorded."""
 
 
+@_dataclass(frozen=True)
+class ToolResolution:
+    """Where a tool result came from. `is_error` is known only for a declared
+    fault; recorded and live results carry whatever envelope the backend chose."""
+    output: Any
+    source: Literal["fault", "recorded", "live"]
+    is_error: bool | None = None
+
+
 class ToolReplayStore:
     """Record/replay for tool I/O (roadmap 2.3). Recording writes
     tool-replay.json beside the run outputs — keyed, versioned, FIFO per
@@ -12866,7 +12940,7 @@ class ToolReplayStore:
         canonical = cls.canonical_payload(payload)
         return hashlib.sha256(f"{tool}\n{canonical}".encode()).hexdigest()[:32]
 
-    def _serve_fault(self, tool: str, payload: Any, key: str) -> tuple[bool, Any]:
+    def _serve_fault(self, tool: str, payload: Any, key: str) -> tuple[bool, ToolResolution | None]:
         canonical = self.canonical_payload(payload)
         for index, fault in enumerate(self.faults):
             if fault["tool"] != tool:
@@ -12879,8 +12953,10 @@ class ToolReplayStore:
                 continue
             if remaining is not None:
                 self._fault_budget[index] = remaining - 1
-            self.served_faults.append({"fault_index": index + 1, "tool": tool, "key": key})
-            return True, copy.deepcopy(fault["output"])
+            self.served_faults.append({"fault_index": index + 1, "tool": tool, "key": key,
+                                       "is_error": fault.get("is_error") is True})
+            return True, ToolResolution(copy.deepcopy(fault["output"]), "fault",
+                                        fault.get("is_error") is True)
         return False, None
 
     def fault_log(self) -> dict[str, Any] | None:
@@ -12891,17 +12967,20 @@ class ToolReplayStore:
                 "served": list(self.served_faults)}
 
     def resolve(self, tool: str, payload: Any, live: Any = None) -> Any:
+        return self.resolve_detailed(tool, payload, live=live).output
+
+    def resolve_detailed(self, tool: str, payload: Any, live: Any = None) -> ToolResolution:
         key = self.call_key(tool, payload)
         # A declared fault outranks every recording and every live tool in every
         # mode: it is the controlled stimulus of the case, and in `strict` mode
         # an unfaulted, unrecorded call still raises so the run fails closed.
-        served, fault_output = self._serve_fault(tool, payload, key)
-        if served:
-            return fault_output
+        served, resolution = self._serve_fault(tool, payload, key)
+        if served and resolution is not None:
+            return resolution
         if self.mode in {"replay", "strict"}:
             queue = self.recorded.get(key)
             if queue:
-                return queue.pop(0)
+                return ToolResolution(queue.pop(0), "recorded")
             if self.mode == "strict":
                 raise ToolReplayMiss(f"unrecorded tool call in strict replay: {tool} (key {key})")
         if live is None:
@@ -12909,7 +12988,7 @@ class ToolReplayStore:
         output = live(payload)
         if self.mode == "record":
             self.new_records.append({"tool": tool, "key": key, "output": output})
-        return output
+        return ToolResolution(output, "live")
 
     def save(self) -> None:
         if self.mode != "record" or not self.new_records:
@@ -13127,6 +13206,7 @@ def run_subagent_tasks(
     model: str | None = None,
     live_tools: dict[str, Any] | None = None,
     replay_mode: str | None = None,
+    only_fault_cases: bool = False,
 ) -> int:
     """The built-in subagent runner (roadmap 2.7): no external CLI required —
     `agent_fn(prompt, workspace, model, tool_executor)` is the seam (a Claude
@@ -13170,6 +13250,10 @@ def run_subagent_tasks(
             die(f"duplicate prepared task run_dir: {pt.run_dir}")
         seen_identities.add(identity)
         seen_destinations.add(base)
+        if only_fault_cases and not task.get("tool_faults"):
+            # Routed to a native runner (--skip-fault-cases there); this row
+            # still belongs to the shared answer design persisted below.
+            continue
         validated.append((task, pt, row_model, base))
     runs.mkdir(parents=True, exist_ok=True)
     design = persist_answer_design(runs, tasks, default_model=model)
@@ -13200,13 +13284,20 @@ def run_subagent_tasks(
             except (TypeError, ValueError) as exc:
                 die(f"invalid prepared task {pt.case_id}: {exc}")
 
-        def tool_executor(tool: str, payload: Any, replay_store=store) -> Any:
-            live = (live_tools or {}).get(tool)
+        def tool_executor(tool: str, payload: Any, replay_store=store, *,
+                          live: Any = None, detailed: bool = False) -> Any:
+            # `live` lets a backend that owns its own tools (the tool bridge)
+            # offer live execution for calls the store neither faults nor
+            # replays; registered live_tools win. `detailed` returns the
+            # ToolResolution (source + declared is_error) instead of the output.
+            live_fn = (live_tools or {}).get(tool) or live
             if replay_store is None:
-                if live is None:
+                if live_fn is None:
                     raise ToolReplayMiss(f"no live executor for tool {tool!r}")
-                return live(payload)
-            return replay_store.resolve(tool, payload, live=live)
+                output = live_fn(payload)
+                return ToolResolution(output, "live") if detailed else output
+            resolution = replay_store.resolve_detailed(tool, payload, live=live_fn)
+            return resolution if detailed else resolution.output
 
         turns = [str(t) for t in task.get("turns") or [] if str(t)]
         multi_turn_extra: dict[str, Any] = {}
@@ -13221,6 +13312,8 @@ def run_subagent_tasks(
             prov_extra["fixture_tree_hash"] = attestation.fixture_tree_hash
             prompt = build_task_prompt(pt, skill_paths=skill_rel, input_files=input_rel)
             started = time.time()
+            # Raw records of every attempted turn, for the fault conservation law.
+            law_records: list[dict[str, Any]] = []
             if turns:
                 # Each attempted turn is a complete committed run-output subtree.
                 # The root remains the final-answer compatibility surface, with
@@ -13328,6 +13421,10 @@ def run_subagent_tasks(
                  multi_turn_summary, trace_text) = _subagent_multi_turn_aggregate(
                      turn_rows, len(turns))
                 multi_turn_extra = {"multi_turn_telemetry": multi_turn_summary}
+                for turn_row in turn_rows:
+                    turn_records = turn_row.get("trace_records")
+                    if isinstance(turn_records, list):
+                        law_records.extend(r for r in turn_records if isinstance(r, dict))
             else:
                 try:
                     outcome = validate_subagent_response(
@@ -13347,6 +13444,8 @@ def run_subagent_tasks(
                     elapsed_ms = int((time.time() - started) * 1000)
                 trace_records = (outcome.get("trace")
                                  if isinstance(outcome.get("trace"), list) else [])
+                if isinstance(trace_records, list):
+                    law_records.extend(r for r in trace_records if isinstance(r, dict))
                 trace_text = _subagent_trace_text(trace_records)
                 raw_single_usage = outcome.get("usage")
                 raw_usage: dict[str, Any] | None = (
@@ -13355,13 +13454,21 @@ def run_subagent_tasks(
                 )
                 aggregate_cost_usd = _subagent_cost_usd(outcome)
         fault_extra: dict[str, Any] = {}
+        conservation_errors: list[str] = []
         if store is not None:
             store.save()
             fault_log = store.fault_log()
             if fault_log is not None:
+                # Conservation law: what the harness served must be what the
+                # trace shows. Checked over the raw records of every attempted
+                # turn, before they become this run's events.json.
+                conservation_errors = tool_fault_conservation_errors(
+                    fault_log["served"], law_records)
+                fault_log["conservation_errors"] = conservation_errors
                 write_json(sidecars / "tool-faults.json", fault_log)
                 fault_extra = {"tool_faults_declared": len(fault_log["declared"]),
-                               "tool_faults_served": len(fault_log["served"])}
+                               "tool_faults_served": len(fault_log["served"]),
+                               "tool_faults_unaccounted": len(conservation_errors)}
         # The subagent seam returns structured trace records; single-turn traces
         # remain direct. Multi-turn root traces are safe composites whose exact
         # provider records live under turn-<n>/trace.jsonl.
@@ -13388,6 +13495,7 @@ def run_subagent_tasks(
             error=error or ("subagent timed out" if timed_out else None),
             elapsed_ms=(int(elapsed_ms) if isinstance(elapsed_ms, (int, float)) else None),
             trace_text=trace_text,
+            trace_conservation_errors=tuple(conservation_errors),
             usage=raw_usage, cost_usd=aggregate_cost_usd, model=row_model,
             metadata_extra={"tool_replay_mode": mode, **prov_extra, **multi_turn_extra, **fault_extra},
             diagnose_returncode=False)
@@ -13422,12 +13530,193 @@ def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S)
     return backend
 
 
+TOOL_BRIDGE_ENVELOPE_KEYS = frozenset({"bridge_output", "is_error"})
+
+
+class ToolBridgeProtocolError(ValueError):
+    """The tool bridge process broke the JSON-lines protocol."""
+
+
+def _bridge_envelope(output: Any, is_error: bool) -> dict[str, Any]:
+    """The recorded shape of a bridge-observed result: the bridge reports both
+    the output and whether the tool failed, and replay must reproduce both."""
+    return {"bridge_output": output, "is_error": bool(is_error)}
+
+
+def _unwrap_bridge_envelope(value: Any) -> tuple[Any, bool]:
+    if (isinstance(value, dict) and set(value) == TOOL_BRIDGE_ENVELOPE_KEYS
+            and isinstance(value["is_error"], bool)):
+        return value["bridge_output"], value["is_error"]
+    return value, False
+
+
+def tool_bridge_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S) -> Any:
+    """Adapt a shell command into the subagent seam WITH its tool calls routed
+    through the harness (`run-subagent --tool-bridge`). Unlike
+    shell_agent_backend, the bridge owns its model loop and its live tools but
+    asks the harness before every tool result, so declared faults, recordings,
+    and strict replay all apply. JSON lines, one object per line:
+
+      harness -> bridge  {"type": "prompt", "prompt", "model", "workspace", "history"?}
+      bridge  -> harness {"type": "tool_call", "id", "tool", "input": {...}}
+      harness -> bridge  {"type": "execute", "id"}            # only when nothing is
+      bridge  -> harness {"type": "tool_observed", "id", "output", "is_error"}  # faulted/recorded
+      harness -> bridge  {"type": "tool_result", "id", "output", "is_error", "source"}
+      bridge  -> harness {"type": "final", "answer", "trace"?, "usage"?, ...}
+
+    The harness writes one completed trace record per tool exchange (with the
+    `is_error` it decided), so the fault conservation law holds by construction
+    here; records the bridge returns in `final.trace` are appended after them.
+    Under `--tool-replay strict` an `execute` is never sent: an unfaulted,
+    unrecorded call fails the run closed as a replay miss."""
+    def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any,
+                history: list | None = None) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        opening: dict[str, Any] = {"type": "prompt", "prompt": prompt, "model": model,
+                                   "workspace": str(workspace)}
+        if history:
+            opening["history"] = history
+        proc = subprocess.Popen(agent_cmd, shell=True, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace")
+        assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+        stdin, stdout, stderr = proc.stdin, proc.stdout, proc.stderr
+        lines: queue.Queue[str | None] = queue.Queue()
+        stderr_text: list[str] = []
+
+        def pump_stdout() -> None:
+            for line in stdout:
+                lines.put(line)
+            lines.put(None)
+
+        def pump_stderr() -> None:
+            stderr_text.append(stderr.read())
+
+        pumps = [threading.Thread(target=pump_stdout, daemon=True),
+                 threading.Thread(target=pump_stderr, daemon=True)]
+        for pump in pumps:
+            pump.start()
+        harness_trace: list[dict[str, Any]] = []
+
+        def send(message: dict[str, Any]) -> None:
+            try:
+                stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+                stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise ToolBridgeProtocolError(f"tool bridge closed its stdin: {exc}") from exc
+
+        def receive() -> dict[str, Any] | None:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(agent_cmd, timeout)
+                try:
+                    line = lines.get(timeout=remaining)
+                except queue.Empty:
+                    raise subprocess.TimeoutExpired(agent_cmd, timeout) from None
+                if line is None:
+                    return None
+                if not line.strip():
+                    continue
+                try:
+                    parsed = strict_json_loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ToolBridgeProtocolError(
+                        f"tool bridge emitted a non-JSON line: {exc}") from exc
+                return string_keyed_dict(parsed, "tool bridge message")
+
+        def finish() -> None:
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                stdin.close()
+            except OSError:
+                pass
+            proc.wait()
+            for pump in pumps:
+                pump.join(timeout=5)
+            for stream in (stdout, stderr):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+        def stderr_tail() -> str:
+            return "".join(stderr_text)[-2000:]
+
+        try:
+            send(opening)
+            while True:
+                message = receive()
+                if message is None:
+                    returncode = proc.wait()
+                    return {"answer": "", "returncode": returncode if returncode != 0 else 1}
+                kind = message.get("type")
+                if kind == "tool_call":
+                    call_id = message.get("id")
+                    tool = message.get("tool")
+                    payload = message.get("input")
+                    if not isinstance(call_id, str) or not call_id.strip():
+                        raise ToolBridgeProtocolError("tool_call needs a non-empty string id")
+                    if not isinstance(tool, str) or not tool.strip():
+                        raise ToolBridgeProtocolError(f"tool_call {call_id!r} needs a non-empty tool name")
+                    if not isinstance(payload, dict):
+                        raise ToolBridgeProtocolError(f"tool_call {call_id!r} input must be an object")
+
+                    def live(_payload: Any, call_id: str = call_id) -> dict[str, Any]:
+                        send({"type": "execute", "id": call_id})
+                        observed = receive()
+                        if (observed is None or observed.get("type") != "tool_observed"
+                                or observed.get("id") != call_id):
+                            raise ToolBridgeProtocolError(
+                                f"expected tool_observed for {call_id!r} after execute")
+                        observed_error = observed.get("is_error", False)
+                        if not isinstance(observed_error, bool):
+                            raise ToolBridgeProtocolError(
+                                f"tool_observed {call_id!r} is_error must be boolean")
+                        return _bridge_envelope(observed.get("output"), observed_error)
+
+                    resolution = tool_executor(tool, payload, live=live, detailed=True)
+                    if resolution.source == "fault":
+                        output, is_error = resolution.output, bool(resolution.is_error)
+                    else:
+                        output, is_error = _unwrap_bridge_envelope(resolution.output)
+                    send({"type": "tool_result", "id": call_id, "output": output,
+                          "is_error": is_error, "source": resolution.source})
+                    harness_trace.append({
+                        "type": "tool_call", "tool": tool, "input": payload,
+                        "output": stringify_trace_value(output)[:1000],
+                        "status": "completed", "is_error": is_error,
+                        "result_source": resolution.source,
+                    })
+                elif kind == "final":
+                    body = {key: value for key, value in message.items() if key != "type"}
+                    extra_trace = body.get("trace")
+                    body["trace"] = harness_trace + (
+                        [r for r in extra_trace if isinstance(r, dict)]
+                        if isinstance(extra_trace, list) else [])
+                    return validate_subagent_response(body)
+                else:
+                    raise ToolBridgeProtocolError(
+                        f"unknown tool bridge message type {kind!r}; stderr: {stderr_tail()!r}")
+        except subprocess.TimeoutExpired:
+            return {"answer": "", "returncode": 124, "timed_out": True}
+        finally:
+            finish()
+    return backend
+
+
 def run_subagent(args: argparse.Namespace) -> int:
     tasks = load_jsonl(Path(args.tasks))
     runs = Path(args.runs)
     agent_cmd = getattr(args, "agent_cmd", None)
-    if agent_cmd:
-        backend = shell_agent_backend(agent_cmd, timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)))
+    timeout_s = int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S))
+    if getattr(args, "tool_bridge", False):
+        if not agent_cmd:
+            die("--tool-bridge requires --agent-cmd (the bridge process to run)")
+        backend = tool_bridge_backend(agent_cmd, timeout=timeout_s)
+    elif agent_cmd:
+        backend = shell_agent_backend(agent_cmd, timeout=timeout_s)
     else:
         claude_bin = getattr(args, "claude_bin", None) or "claude"
         timeout = int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S))
@@ -13441,7 +13730,8 @@ def run_subagent(args: argparse.Namespace) -> int:
                     "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
                     "usage": claude_run_metrics(result)}
     return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
-                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode())
+                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode(),
+                              only_fault_cases=bool(getattr(args, "only_fault_cases", False)))
 
 
 JUDGE_NEGATIVE_CONTROLS = {
@@ -20855,12 +21145,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--write-metadata", action="store_true", help="deprecated compatibility flag; metadata.json is always written with telemetry v3")
 
     p = sub.add_parser("run-codex")
+    p.add_argument("--skip-fault-cases", action="store_true", help="skip rows that declare tool_faults (run them with run-subagent --only-fault-cases into the same runs dir); without this flag such rows are an error")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--codex-cmd", default=CODEX_ANSWER_DEFAULT_CMD, help="argv-style Codex command prefix that reads prompt on stdin and emits Codex JSONL; shell metacharacters are not interpreted")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-claude", help="run prepared tasks through `claude -p --output-format json`, capturing cost/usage")
+    p.add_argument("--skip-fault-cases", action="store_true", help="skip rows that declare tool_faults (run them with run-subagent --only-fault-cases into the same runs dir); without this flag such rows are an error")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="claude model id (e.g. claude-haiku-4-5-20251001); omit for the CLI default")
@@ -20868,6 +21160,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
 
     p = sub.add_parser("run-agent", help="run prepared tasks through a registered native agent backend")
+    p.add_argument("--skip-fault-cases", action="store_true", help="skip rows that declare tool_faults (run them with run-subagent --only-fault-cases into the same runs dir); without this flag such rows are an error")
     p.add_argument("--agent", required=True, choices=sorted(AGENT_BACKENDS), help="native backend to use")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
@@ -20883,6 +21176,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable for the default backend")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
     p.add_argument("--tool-replay", choices=sorted(TOOL_REPLAY_MODES), help=f"tool replay mode; defaults from ${TOOL_REPLAY_ENV} (off)")
+    p.add_argument("--tool-bridge", action="store_true", help="treat --agent-cmd as a tool bridge: it asks the harness before every tool result over JSON lines, so faults, recordings, and strict replay apply to its tools")
+    p.add_argument("--only-fault-cases", action="store_true", help="run only rows that declare tool_faults; the other rows still count toward the shared answer design (run them with a native runner and --skip-fault-cases)")
 
     p = sub.add_parser("grade")
     p.add_argument("manifest")

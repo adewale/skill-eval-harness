@@ -7,6 +7,7 @@ subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
 import errno
+import io
 import json
 import os
 import shutil
@@ -346,12 +347,20 @@ class ToolFaultTests(unittest.TestCase):
     stimulus silently."""
 
     FAULT = {"tool": "search", "match": "alpha", "output": "EACCES: permission denied"}
+    # parse_tool_faults stamps the is_error default so the served log and the
+    # conservation law never have to guess.
+    NORMALIZED = {**FAULT, "is_error": False}
 
     def agent(self):
         def run(*, prompt, workspace, model, tool_executor):
             a = tool_executor("search", {"q": "alpha"})
             b = tool_executor("search", {"q": "beta"})
-            return {"answer": f"{a} then {b}"}
+            # A compliant backend reports every call it made; the conservation
+            # law (FaultConservationLawTests) checks that it did.
+            trace = [{"type": "tool_call", "tool": "search", "input": {"q": q},
+                      "output": str(out), "status": "completed"}
+                     for q, out in (("alpha", a), ("beta", b))]
+            return {"answer": f"{a} then {b}", "trace": trace}
         return run
 
     def _tasks(self, root: Path, faults: list) -> list[dict]:
@@ -372,13 +381,17 @@ class ToolFaultTests(unittest.TestCase):
             log = json.loads((base / "tool-faults.json").read_text(encoding="utf-8"))
             replay = json.loads((base / "tool-replay.json").read_text(encoding="utf-8"))
             metadata = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
         self.assertEqual(output, "EACCES: permission denied then live-beta")
-        self.assertEqual(log["declared"], [self.FAULT])
+        self.assertEqual(log["declared"], [self.NORMALIZED])
+        self.assertEqual(log["conservation_errors"], [])
+        self.assertTrue(metrics["trace_observation_complete"])
         self.assertEqual([(row["fault_index"], row["tool"]) for row in log["served"]], [(1, "search")])
         # The served fault is declared stimulus, never a recorded observation.
         self.assertEqual(len(replay["records"]), 1)
         self.assertEqual(replay["records"][0]["key"], sb.ToolReplayStore.call_key("search", {"q": "beta"}))
-        self.assertEqual((metadata["tool_faults_declared"], metadata["tool_faults_served"]), (1, 1))
+        self.assertEqual((metadata["tool_faults_declared"], metadata["tool_faults_served"],
+                          metadata["tool_faults_unaccounted"]), (1, 1, 0))
 
     def test_strict_mode_serves_the_fault_corpus_and_nothing_else(self):
         with tempfile.TemporaryDirectory() as td:
@@ -436,7 +449,7 @@ class ToolFaultTests(unittest.TestCase):
             plain = make_tasks(root / "plain")
         self.assertEqual({row["variant"] for row in rows}, {"with_skill", "without_skill"})
         for row in rows:
-            self.assertEqual(row["tool_faults"], [self.FAULT])
+            self.assertEqual(row["tool_faults"], [self.NORMALIZED])
         faulted = {row["variant"]: row for row in rows}
         unfaulted = {row["variant"]: row for row in plain}
         for variant in ("with_skill", "without_skill"):
@@ -448,6 +461,223 @@ class ToolFaultTests(unittest.TestCase):
             self.assertNotEqual(
                 sb.answer_task_fingerprint(faulted[variant], with_fault, None),
                 sb.answer_task_fingerprint(unfaulted[variant], without_fault, None))
+
+
+STUB_BRIDGE = """
+import json, sys
+def send(m):
+    sys.stdout.write(json.dumps(m) + "\\n"); sys.stdout.flush()
+def recv():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+opening = recv()
+mode = "{mode}"
+if mode == "garbage":
+    sys.stdout.write("not json\\n"); sys.stdout.flush(); sys.exit(0)
+if mode == "hang":
+    import time; time.sleep(30)
+results = []
+for n, q in enumerate(("alpha", "beta"), 1):
+    send({{"type": "tool_call", "id": f"c{{n}}", "tool": "search", "input": {{"q": q}}}})
+    while True:
+        r = recv()
+        if r is None:
+            sys.exit(3)
+        if r["type"] == "execute":
+            if mode == "poisoned":
+                sys.exit(7)   # replay must never ask the bridge to run live
+            send({{"type": "tool_observed", "id": r["id"], "output": f"ran-{{q}}", "is_error": q == "beta"}})
+            continue
+        results.append((r["output"], r["is_error"], r["source"]))
+        break
+send({{"type": "final", "answer": " | ".join(f"{{o}}/{{e}}/{{s}}" for o, e, s in results),
+      "trace": [{{"type": "message", "role": "assistant", "content": "done"}}],
+      "usage": {{"total_tokens": 3}}}})
+"""
+
+
+class ToolBridgeTests(unittest.TestCase):
+    """`run-subagent --tool-bridge`: the bridge owns its loop and live tools but
+    every tool result passes through the harness first, so faults, recordings
+    and strict replay govern a process backend, not only in-process functions."""
+
+    def _bridge_cmd(self, root: Path, mode: str = "live") -> str:
+        script = root / f"bridge-{mode}.py"
+        script.write_text(STUB_BRIDGE.format(mode=mode), encoding="utf-8")
+        return f"{sys.executable} {script}"
+
+    def _run(self, root: Path, runs: Path, *, mode: str = "live", replay: str = "record",
+             faults: list | None = None, timeout: int = 60) -> Path:
+        tasks = make_tasks(root / f"m-{mode}-{replay}")[:1]
+        if faults is not None:
+            tasks[0]["tool_faults"] = faults
+        backend = sb.tool_bridge_backend(self._bridge_cmd(root, mode), timeout=timeout)
+        sb.run_subagent_tasks(tasks, runs, backend, replay_mode=replay)
+        return runs / "case-1" / "with_skill"
+
+    def test_faults_reach_the_bridge_with_their_error_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = self._run(root, root / "runs", replay="strict",
+                             faults=[{"tool": "search", "output": {"stderr": "EACCES"}, "is_error": True}])
+            output = (base / "output.md").read_text(encoding="utf-8")
+            events = json.loads((base / "events.json").read_text(encoding="utf-8"))["events"]
+            log = json.loads((base / "tool-faults.json").read_text(encoding="utf-8"))
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual(output, "{'stderr': 'EACCES'}/True/fault | {'stderr': 'EACCES'}/True/fault")
+        tool_events = [e for e in events if e.get("name") == "search"]
+        self.assertEqual([e.get("is_error") for e in tool_events], [True, True])
+        self.assertEqual(log["conservation_errors"], [])
+        self.assertTrue(metrics["trace_observation_complete"])
+        self.assertEqual(metrics["errors"], 2)
+
+    def test_live_execution_is_recorded_with_its_error_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = self._run(root, root / "runs", mode="live", replay="record")
+            first = (base / "output.md").read_text(encoding="utf-8")
+            replay = json.loads((base / "tool-replay.json").read_text(encoding="utf-8"))
+            events = json.loads((base / "events.json").read_text(encoding="utf-8"))["events"]
+        self.assertEqual(first, "ran-alpha/False/live | ran-beta/True/live")
+        self.assertEqual([r["output"] for r in replay["records"]],
+                         [{"bridge_output": "ran-alpha", "is_error": False},
+                          {"bridge_output": "ran-beta", "is_error": True}])
+        self.assertEqual([e.get("is_error") for e in events if e.get("name") == "search"], [None, True])
+
+    def test_strict_replay_without_a_recording_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = self._run(root, root / "runs", mode="poisoned", replay="strict")
+            output = (base / "output.md").read_text(encoding="utf-8")
+        self.assertIn("tool replay miss", output)
+
+    def test_replay_reproduces_a_recording_without_going_live(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runs = root / "runs"
+            tasks = make_tasks(root / "m")[:1]
+            sb.run_subagent_tasks(tasks, runs, sb.tool_bridge_backend(self._bridge_cmd(root, "live")),
+                                  replay_mode="record")
+            base = runs / "case-1" / "with_skill"
+            first = (base / "output.md").read_text(encoding="utf-8")
+            sb.run_subagent_tasks(tasks, runs, sb.tool_bridge_backend(self._bridge_cmd(root, "poisoned")),
+                                  replay_mode="strict")
+            second = (base / "output.md").read_text(encoding="utf-8")
+            events = json.loads((base / "events.json").read_text(encoding="utf-8"))["events"]
+        self.assertEqual(second, "ran-alpha/False/recorded | ran-beta/True/recorded")
+        self.assertEqual(first.replace("/live", "/recorded"), second)
+        self.assertEqual([e.get("is_error") for e in events if e.get("name") == "search"], [None, True])
+
+    def test_protocol_breach_and_timeout_fail_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            garbage = self._run(root, root / "runs-garbage", mode="garbage", replay="strict")
+            garbage_output = (garbage / "output.md").read_text(encoding="utf-8")
+            hung = self._run(root, root / "runs-hang", mode="hang", replay="strict", timeout=1)
+            hung_meta = json.loads((hung / "metadata.json").read_text(encoding="utf-8"))
+        self.assertIn("non-JSON line", garbage_output)
+        self.assertEqual((hung_meta["returncode"], hung_meta["timed_out"]), (124, True))
+
+
+class FaultConservationLawTests(unittest.TestCase):
+    """What the harness served must be what the trace shows. A backend that
+    drops a faulted call, or reports a declared error result as clean, gets an
+    incomplete trace observation, never a graded stimulus that is not there."""
+
+    ERROR_FAULT = {"tool": "search", "output": "denied", "is_error": True}
+
+    def _agent(self, report_error: bool, *, drop: bool = False):
+        def run(*, prompt, workspace, model, tool_executor):
+            out = tool_executor("search", {"q": "alpha"})
+            trace = [] if drop else [{"type": "tool_call", "tool": "search", "input": {"q": "alpha"},
+                                      "output": str(out), "status": "completed",
+                                      **({"is_error": True} if report_error else {})}]
+            return {"answer": f"got {out}", "trace": trace}
+        return run
+
+    def _run(self, root: Path, agent, tag: str) -> tuple[dict, dict]:
+        tasks = make_tasks(root / tag)[:1]
+        tasks[0]["tool_faults"] = [dict(self.ERROR_FAULT)]
+        runs = root / f"runs-{tag}"
+        sb.run_subagent_tasks(tasks, runs, agent, replay_mode="strict")
+        base = runs / "case-1" / "with_skill"
+        return (json.loads((base / "metrics.json").read_text(encoding="utf-8")),
+                json.loads((base / "tool-faults.json").read_text(encoding="utf-8")))
+
+    def test_compliant_trace_keeps_the_observation_complete(self):
+        with tempfile.TemporaryDirectory() as td:
+            metrics, log = self._run(Path(td), self._agent(True), "ok")
+        self.assertTrue(metrics["trace_observation_complete"])
+        self.assertNotIn("trace_conservation_errors", metrics)
+        self.assertEqual(log["conservation_errors"], [])
+
+    def test_error_fault_reported_as_clean_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as td:
+            metrics, log = self._run(Path(td), self._agent(False), "clean")
+        self.assertFalse(metrics["trace_observation_complete"])
+        self.assertEqual(len(log["conservation_errors"]), 1)
+        self.assertIn("error result", log["conservation_errors"][0])
+        self.assertEqual(metrics["trace_conservation_errors"], log["conservation_errors"])
+
+    def test_dropped_faulted_call_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as td:
+            metrics, log = self._run(Path(td), self._agent(True, drop=True), "drop")
+        self.assertFalse(metrics["trace_observation_complete"])
+        self.assertIn("completed call(s)", log["conservation_errors"][0])
+
+    def test_law_is_pure_over_served_log_and_records(self):
+        served = [{"tool": "search", "key": "k", "fault_index": 1, "is_error": True}]
+        clean = [{"type": "tool_call", "tool": "search", "status": "completed"}]
+        flagged = [{**clean[0], "is_error": True}]
+        self.assertEqual(sb.tool_fault_conservation_errors([], []), [])
+        self.assertEqual(sb.tool_fault_conservation_errors(served, flagged), [])
+        self.assertEqual(len(sb.tool_fault_conservation_errors(served, clean)), 1)
+        self.assertEqual(len(sb.tool_fault_conservation_errors(served, [])), 1)
+
+
+class FaultRowRoutingTests(unittest.TestCase):
+    """One prepared JSONL, two runners, one runs dir: the native runner skips
+    fault rows only when told to, the subagent runner takes only them, and both
+    attest the same answer design so the report sees every identity."""
+
+    def _rows(self, root: Path) -> list[dict]:
+        manifest = base_manifest()
+        plain = dict(manifest["cases"][0])
+        faulted = {**plain, "id": "case-2",
+                   "tool_faults": [{"tool": "search", "output": "denied", "is_error": True}]}
+        manifest["cases"] = [plain, faulted]
+        path = write_manifest(root, manifest)
+        return sb.prepared_task_rows(path, sb.validate_manifest(path), split="tune")
+
+    def test_native_runner_needs_the_explicit_skip(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._rows(Path(td))
+            with self.assertRaises(SystemExit):
+                sb.run_agent_tasks(rows, Path(td) / "runs", sb.registered_agent_backend("claude"))
+
+    def test_split_runners_share_one_answer_design(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rows = self._rows(root)
+            runs = root / "runs"
+
+            def agent(*, prompt, workspace, model, tool_executor):
+                out = tool_executor("search", {"q": "x"})
+                return {"answer": f"alpha {out}", "trace": [
+                    {"type": "tool_call", "tool": "search", "status": "completed", "is_error": True}]}
+
+            sb.run_subagent_tasks(rows, runs, agent, replay_mode="strict", only_fault_cases=True)
+            design_after_subagent = (runs / sb.ANSWER_DESIGN_NAME).read_text(encoding="utf-8")
+            self.assertFalse((runs / "case-1").exists())          # not this runner's rows
+            self.assertTrue((runs / "case-2" / "with_skill" / "output.md").is_file())
+            stub = f"{sys.executable} {ROOT / 'examples' / 'demo-skill' / 'stub_runner.py'}"
+            with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+                sb.run_agent_tasks(rows, runs, sb.registered_agent_backend("codex"),
+                                   skip_fault_cases=True, codex_cmd=stub, timeout=120)
+            self.assertIn("skipped 2 tool_faults row(s)", err.getvalue())
+            self.assertEqual((runs / sb.ANSWER_DESIGN_NAME).read_text(encoding="utf-8"),
+                             design_after_subagent)
+            self.assertTrue((runs / "case-1" / "with_skill" / "output.md").is_file())
 
 
 class ClosedRunnerOutcomeTests(unittest.TestCase):

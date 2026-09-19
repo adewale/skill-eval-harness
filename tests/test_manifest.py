@@ -777,7 +777,11 @@ class ToolFaultValidationTests(unittest.TestCase):
 
     def test_parser_normalizes_and_is_shared_with_the_store(self):
         parsed = sb.parse_tool_faults([{"tool": "bash", "output": "x", "match": "a", "times": 1}], "t")
-        self.assertEqual(parsed, [{"tool": "bash", "output": "x", "match": "a", "times": 1}])
+        self.assertEqual(parsed, [{"tool": "bash", "output": "x", "is_error": False, "match": "a", "times": 1}])
+        flagged = sb.parse_tool_faults([{"tool": "bash", "output": "x", "is_error": True}], "t")
+        self.assertEqual(flagged, [{"tool": "bash", "output": "x", "is_error": True}])
+        with self.assertRaises(TypeError):
+            sb.parse_tool_faults([{"tool": "bash", "output": "x", "is_error": "yes"}], "t")
         with self.assertRaises(TypeError):
             sb.parse_tool_faults(["bash"], "t")
         with self.assertRaises(ValueError):

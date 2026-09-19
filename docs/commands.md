@@ -125,12 +125,31 @@ skill-benchmark run-claude --tasks tasks.jsonl --runs ../repo/eval-runs/claude-t
 
 `run-subagent` drives prepared rows through an in-process backend — the Claude CLI by default, any provider via `--agent-cmd` (prompt JSON on stdin, `{answer, trace?, usage?}` JSON on stdout), or a plain function in tests. It writes the same run-output contract (plus normalized `events.json`/`metrics.json` from a returned trace), reuses the isolated per-variant workspace (so the CF.2 baseline-isolation invariant covers it), honors row-level models, and drives multi-turn `turns` sequences into `turn-<n>/output.md`. Tool I/O can be recorded and replayed deterministically via `--tool-replay record|replay|strict|auto` (or `$SKILL_BENCHMARK_TOOL_REPLAY`), stored as `tool-replay.json` beside each run; `strict` fails closed on an unrecorded call.
 
-Replay and faults reach only backends that route their tool calls through the executor the runner hands them (an in-process function or SDK dispatch); the default Claude CLI backend and `--agent-cmd` shells run their own tools, so for them the store is inert.
+Replay and faults reach only backends that route their tool calls through the executor the runner hands them: an in-process function, or a **tool bridge** (below). The default Claude CLI backend and a plain `--agent-cmd` shell run their own tools, so for them the store is inert.
 
-A case may declare `tool_faults` (see the manifest format in the README). `prepare` copies them onto every arm's row, and the store serves a matching call the declared `output` ahead of any recording or live tool, in every mode except `off` (which the runner refuses when faults are declared). Under `strict` an unfaulted, unrecorded call still raises, so the run is fully deterministic: the fault corpus and nothing else. Each faulted run writes `tool-faults.json` (declared faults plus which calls were served) and stamps `tool_faults_declared`/`tool_faults_served` into `metadata.json`. Grade the response with `tool_call` `is_error` selectors and read the paired `errors` delta in the report's `trajectory_diff`.
+A case may declare `tool_faults` (see the manifest format in the README). `prepare` copies them onto every arm's row, and the store serves a matching call the declared `output` ahead of any recording or live tool, in every mode except `off` (which the runner refuses when faults are declared). Under `strict` an unfaulted, unrecorded call still raises, so the run is fully deterministic: the fault corpus and nothing else. Each faulted run writes `tool-faults.json` (declared faults, which calls were served, and any conservation errors) and stamps `tool_faults_declared`/`tool_faults_served`/`tool_faults_unaccounted` into `metadata.json`. Grade the response with `tool_call` `is_error` selectors and read the paired `errors` delta in the report's `trajectory_diff`.
+
+**Conservation law.** The harness knows exactly which faults it served, so the run's trace must account for them: every served fault needs a completed call of that tool in the trace, and a fault declared `is_error: true` must appear there as an error result. A backend that drops the call or reports the denial as a clean result gets `trace_observation_complete: false` with the reasons under `trace_conservation_errors` in `metrics.json`, which blocks the pair in `trajectory_diff` and withholds process-assertion evidence, instead of grading a stimulus the trace never shows. The tool bridge satisfies the law by construction because the harness writes the tool records itself; an in-process function backend must mark `is_error` on its own records.
+
+**Routing a mixed manifest.** Fault rows belong to `run-subagent`; everything else can go to a native runner. Feed both the *same* prepared JSONL and the *same* runs directory: `run-codex|run-claude|run-agent --skip-fault-cases` runs the non-fault rows and prints which rows it skipped, `run-subagent --only-fault-cases` runs the rest. Each attests the full answer design, so the report sees every identity. Without the explicit flag a native runner still refuses fault rows rather than dropping the stimulus silently.
+
+**Tool bridge (`--tool-bridge`).** `--agent-cmd` normally runs a process that owns its tools, which the store cannot see. With `--tool-bridge` the same command instead speaks JSON lines with the harness and asks before every tool result. The bridge owns its model loop and its live tools; the harness decides each result:
+
+```text
+harness -> bridge  {"type": "prompt", "prompt", "model", "workspace", "history"?}
+bridge  -> harness {"type": "tool_call", "id", "tool", "input": {...}}
+harness -> bridge  {"type": "execute", "id"}                                  # only when no fault/recording applies
+bridge  -> harness {"type": "tool_observed", "id", "output", "is_error"}     # the live result, which gets recorded
+harness -> bridge  {"type": "tool_result", "id", "output", "is_error", "source": fault|recorded|live}
+bridge  -> harness {"type": "final", "answer", "trace"?, "usage"?, "returncode"?, ...}
+```
+
+The harness writes one completed trace record per exchange with the `is_error` it decided; records in `final.trace` are appended after them. Under `strict` an `execute` is never sent: an unfaulted, unrecorded call fails the run closed as a replay miss. A non-JSON line or an unknown message type fails the run; a silent bridge hits the `--timeout`. `examples/tool-bridge/claude_tool_bridge.py` is a live reference bridge over the Anthropic SDK's manual tool loop (opt-in, needs credentials, refusal fallbacks deliberately off so the eval runs on the model it names); `examples/demo-skill/stub_bridge.py` is the deterministic one the demo and the test suite use.
 
 ```bash
-skill-benchmark run-subagent --tasks fault-tasks.jsonl --runs eval-runs/faults --tool-replay strict
+# same tasks.jsonl and runs dir as the native runner that ran the other rows with --skip-fault-cases
+skill-benchmark run-subagent --tasks tasks.jsonl --runs eval-runs/latest --only-fault-cases \
+  --tool-bridge --agent-cmd "python3 examples/tool-bridge/claude_tool_bridge.py" --tool-replay strict
 ```
 
 ```bash

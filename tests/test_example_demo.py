@@ -26,7 +26,16 @@ class DemoExampleTests(unittest.TestCase):
         rows = sb.prepared_task_rows(mp, manifest, include_ablations=True, ablation_dir=str(td / "abl"), runs_per_variant=6)
         (td / "tasks.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
         stub = f"{sys.executable} {DEMO / 'stub_runner.py'}"
-        sb.run_codex(argparse.Namespace(tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"), codex_cmd=stub, timeout=120))
+        # Two runners, one JSONL, one runs dir. The native stub runner skips the
+        # fault case; the subagent runner takes only it, driving the stub tool
+        # bridge under strict replay so the declared denial is the only tool
+        # result that exists. Both attest the same answer design.
+        sb.run_codex(argparse.Namespace(tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"),
+                                        codex_cmd=stub, timeout=120, skip_fault_cases=True))
+        sb.run_subagent(argparse.Namespace(
+            tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"),
+            agent_cmd=f"{sys.executable} {DEMO / 'stub_bridge.py'}", tool_bridge=True,
+            tool_replay="strict", only_fault_cases=True, timeout=120, model=None))
         variants = sorted({r["variant"] for r in rows})   # include the ablation arms, not just the manifest variants
         # The example declares one judge assertion, so an executable end-to-end
         # report must also materialize its verdicts. Leaving them deferred would
@@ -49,7 +58,8 @@ class DemoExampleTests(unittest.TestCase):
     def test_materialized_ablations_confirm_offline(self):
         rep = self._run()
         regs = {e["id"]: e for e in rep["ablation_regressions"]}
-        for aid, assertion in (("no-severity", "severity-label"), ("no-checklist", "cite-checklist")):
+        for aid, assertion in (("no-severity", "severity-label"), ("no-checklist", "cite-checklist"),
+                               ("no-fallback", "fallback-declared")):
             entry = regs[aid]
             self.assertEqual(entry["status"], "measured", f"{aid} should be measured")
             self.assertTrue(entry["provenance_verified"], f"{aid} provenance must verify (materialized, same revision)")
@@ -61,6 +71,28 @@ class DemoExampleTests(unittest.TestCase):
         s = rep["summary"]
         self.assertEqual(s["with_skill"]["objective_pass_rate"]["mean"], 1.0)      # skill present -> both assertions pass
         self.assertEqual(s["without_skill"]["objective_pass_rate"]["mean"], 0.0)   # no skill -> both fail
+
+    def test_fault_case_measures_the_fallback_rule_not_the_model(self):
+        """Both arms get the same denied runner. Only the skill's fallback text
+        differs, and it shows as one error result versus two, a declared
+        fallback versus a rubber-stamp, and a paired errors delta of -1."""
+        rep = self._run()
+        fault = next(c for c in rep["trajectory_diff"]["cases"] if c["case_id"] == "c-fault-denied-runner")
+        self.assertEqual(fault["pairs"], 6)
+        self.assertEqual(fault["mean_deltas"]["errors"], -1.0)
+        self.assertEqual(fault["mean_deltas"]["tool_calls"], -1.0)
+        rows = [r for r in rep["results"] if r["case_id"] == "c-fault-denied-runner"]
+        by_variant = {}
+        for row in rows:
+            by_variant.setdefault(row["variant"], set()).add(
+                tuple(sorted((a["name"], a["passed"]) for a in row["assertions"])))
+        self.assertEqual(by_variant["with_skill"],
+                         {(("denied-once", True), ("fallback-declared", True), ("severity-label", True))})
+        self.assertEqual(by_variant["without_skill"],
+                         {(("denied-once", False), ("fallback-declared", False), ("severity-label", False))})
+        self.assertEqual(by_variant["ablation:no-fallback"], by_variant["without_skill"])
+        # The other ablations leave the fallback section intact, so they pass the fault case.
+        self.assertEqual(by_variant["ablation:no-severity"], by_variant["with_skill"])
 
 
 class DemoJudgeTests(unittest.TestCase):
@@ -85,7 +117,9 @@ class DemoJudgeTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         td = Path(tmp.name)
         rows = sb.prepared_task_rows(mp, manifest, include_ablations=True, ablation_dir=str(td / "abl"))
-        rows = [r for r in rows if r["variant"] in self.VARIANTS]
+        # The judge calibration story is the c-review arms; fault rows belong to
+        # the tool bridge (DemoExampleTests) and are left out of this design.
+        rows = [r for r in rows if r["variant"] in self.VARIANTS and not r.get("tool_faults")]
         (td / "tasks.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
         sb.run_codex(argparse.Namespace(tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"),
                                         codex_cmd=f"{sys.executable} {DEMO / 'stub_runner.py'}", timeout=120))
