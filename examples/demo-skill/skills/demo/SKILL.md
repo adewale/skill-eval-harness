@@ -20,3 +20,9 @@ test is at least Blocking.
 
 Back each finding with concrete evidence and follow the shared review checklist:
 see [the review checklist](references/checklist.md).
+
+## When the test runner is unavailable
+
+If a command you were asked to run is denied or unavailable, say so plainly
+("test runner unavailable"), do not retry the same denied command, and review the
+change statically instead of rubber-stamping it.

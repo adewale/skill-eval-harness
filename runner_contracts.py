@@ -43,6 +43,7 @@ def _finite_nonnegative(value: Any, label: str, *, integer: bool = False) -> int
 
 _RESERVED_EVIDENCE_KEYS = frozenset({
     "schema_version", "source", "tool_calls", "commands", "file_reads",
+    "trace_conservation_errors",
     "file_writes", "errors", "retries", "repeated_command_max",
     "skill_invoked", "skill_invocation_evidence", "parse_errors",
     "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
@@ -74,6 +75,10 @@ class OutcomeContext:
     stderr: str = ""
     trace_text: str = ""
     trace_utf8_valid: bool = True
+    # Conservation-law violations the runner established between what it did
+    # to the run (e.g. tool faults it served) and what the trace accounts for.
+    # Non-empty makes the trace observation incomplete at the artifact boundary.
+    trace_conservation_errors: tuple[str, ...] = ()
     usage: Mapping[str, Any] | None = None
     cost_usd: float | None = None
     metadata_extra: Mapping[str, Any] = field(default_factory=dict)
@@ -100,6 +105,12 @@ class OutcomeContext:
         validate_json_text(self.trace_text, "runner trace_text")
         if not isinstance(self.trace_utf8_valid, bool):
             raise TypeError("trace_utf8_valid must be boolean")
+        if (not isinstance(self.trace_conservation_errors, (tuple, list))
+                or not all(isinstance(item, str) and item.strip()
+                           for item in self.trace_conservation_errors)):
+            raise TypeError("trace_conservation_errors must be a sequence of non-empty strings")
+        object.__setattr__(self, "trace_conservation_errors",
+                           tuple(self.trace_conservation_errors))
         if self.cost_usd is not None:
             _finite_nonnegative(self.cost_usd, "cost_usd")
         if self.usage is not None:
@@ -247,6 +258,7 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
                   elapsed_ms: int | None = None, stderr: str = "",
                   error: str | None = None, timeout_s: int | None = None,
                   trace_text: str | None = None, trace_utf8_valid: bool = True,
+                  trace_conservation_errors: tuple[str, ...] | list[str] = (),
                   usage: Mapping[str, Any] | None = None,
                   cost_usd: float | None = None, model: str | None = None,
                   metadata_extra: Mapping[str, Any] | None = None,
@@ -279,6 +291,7 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
         provider=Provider(provider), model=model, elapsed_ms=elapsed_ms, stderr=stderr,
         trace_text="" if trace_text is None else trace_text,
         trace_utf8_valid=trace_utf8_valid,
+        trace_conservation_errors=tuple(trace_conservation_errors),
         usage=usage, cost_usd=cost_usd,
         metadata_extra={} if metadata_extra is None else metadata_extra,
         metrics_extra={} if metrics_extra is None else metrics_extra,

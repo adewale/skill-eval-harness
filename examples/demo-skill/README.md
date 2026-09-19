@@ -5,7 +5,7 @@ API key**: a deterministic stub stands in for the model, so the whole
 prepare → run → report → ablation-confirmation loop is reproducible (and runs in
 CI via `tests/test_example_demo.py`).
 
-The skill (`skills/demo/`) has two answer-path load-bearing pieces, each targeted by one
+The skill (`skills/demo/`) has three answer-path load-bearing pieces, each targeted by one
 **materialized** ablation in `evals/shared-benchmark.json`. It also has a
 discovery-population ablation for autonomous trigger examples.
 
@@ -13,6 +13,7 @@ discovery-population ablation for autonomous trigger examples.
 |---|---|---|---|
 | `no-severity` | `section` | the `## Severity rules` section of SKILL.md | the `severity-label` assertion |
 | `no-checklist` | `reference` (`remove: content`) | the body of `references/checklist.md` | the `cite-checklist` assertion |
+| `no-fallback` | `section` | the `## When the test runner is unavailable` section of SKILL.md | the `fallback-declared` and `denied-once` assertions of the fault case |
 | `weaker-description` | `frontmatter_field` | the extra `when_to_use` trigger hints | measured by `skill-trigger-matrix --ablation weaker-description` |
 
 `stub_runner.py` answers by reading the skill that the harness actually mounted into
@@ -39,14 +40,18 @@ python3 $HARNESS prepare evals/shared-benchmark.json --split tune \
   --include-ablations --ablation-dir /tmp/demo-abl --runs-per-variant 4 \
   --out /tmp/demo-tasks.jsonl
 
-# 3. run every arm with the deterministic stub 'model'
+# 3a. run every non-fault arm with the deterministic stub 'model'
 python3 $HARNESS run-codex --tasks /tmp/demo-tasks.jsonl --runs /tmp/demo-runs \
-  --codex-cmd "python3 $(pwd)/stub_runner.py"
+  --codex-cmd "python3 $(pwd)/stub_runner.py" --skip-fault-cases
+
+# 3b. run the fault case through the stub tool bridge: same JSONL, same runs dir
+python3 $HARNESS run-subagent --tasks /tmp/demo-tasks.jsonl --runs /tmp/demo-runs \
+  --only-fault-cases --tool-bridge --agent-cmd "python3 $(pwd)/stub_bridge.py" --tool-replay strict
 
 # 4. score + see the ablation_regressions block
 python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/demo-runs \
   --variant with_skill --variant without_skill \
-  --variant ablation:no-severity --variant ablation:no-checklist
+  --variant ablation:no-severity --variant ablation:no-checklist --variant ablation:no-fallback
 ```
 
 You should see `with_skill` pass both objective assertions, `without_skill` fail both
@@ -57,6 +62,25 @@ edited tree, blind, with verified provenance) and the four repeated runs clear t
 per-case significance gate. With a single run per arm the same observed drop is reported
 as indeterminate, not confirmed. Swap the stub for a real runner
 (`--codex-cmd "codex exec"`, etc.) to run it against an actual model — for Claude, use `skill-benchmark run-claude` instead, which parses the `claude -p` JSON envelope and captures cost.
+
+## The fault case (does the skill's failure handling matter?)
+
+`c-fault-denied-runner` asks for the test suite to be run, and declares a `tool_faults`
+entry: every `run_tests` call is answered with a permission denial (`is_error: true`),
+in every arm and repetition. Nothing about the model's luck varies; only the skill does.
+`stub_bridge.py` keys off the mounted skill exactly as `stub_runner.py` does: with the
+`## When the test runner is unavailable` section present it runs the command once, takes
+the denial as final, says the runner is unavailable and reviews statically; without it
+(no skill, or the `no-fallback` ablation) it retries the denied command and rubber-stamps.
+
+Read the result in three places: the `fallback-declared` and `denied-once` assertions
+(`tool_call` with `is_error: true, max_count: 1`), the `no-fallback` entry in
+`ablation_regressions` (confirmed, because the section is materially removed and six
+repetitions clear the gate), and the `errors` delta for the case in `trajectory_diff`
+(`-1.0`: one error result with the skill, two without). The bridge runs under
+`--tool-replay strict`, so a tool call the case did not fault would fail the run
+rather than reach anything live, and `tool-faults.json` in each run dir records which
+calls were served and that the trace accounts for them.
 
 ## Measure activation (does the skill load on its own?)
 

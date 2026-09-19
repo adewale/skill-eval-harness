@@ -735,6 +735,59 @@ class ContaminationPerimeterTests(unittest.TestCase):
         self.assertEqual(report["cases"][0]["findings"][0]["kind"], "canary-hit")
 
 
+class ToolFaultValidationTests(unittest.TestCase):
+    """`tool_faults` is validated at manifest time through the one parser the
+    replay store also uses, and is answer-population only."""
+    FAULT = {"tool": "bash", "match": "pytest", "output": {"is_error": True, "content": "EACCES"}}
+
+    def _validate(self, case_over: dict):
+        manifest = base_manifest()
+        case = dict(manifest["cases"][0])
+        case.update(case_over)
+        manifest["cases"] = [case]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_manifest(Path(td), manifest)
+            return sb.validate_manifest(path)
+
+    def test_well_formed_faults_validate(self):
+        self._validate({"tool_faults": [dict(self.FAULT)]})
+        self._validate({"tool_faults": [{"tool": "bash", "output": "denied", "times": 2}]})
+        self._validate({"tool_faults": [{"tool": "Read", "output": None}]})
+
+    def test_trigger_cases_cannot_declare_faults(self):
+        with self.assertRaises(SystemExit):
+            self._validate({"kind": "trigger", "should_trigger": True, "tool_faults": [dict(self.FAULT)]})
+
+    def test_malformed_faults_fail_closed(self):
+        for bad in (
+            [],                                             # empty
+            {"tool": "bash", "output": "x"},                # not a list
+            ["bash"],                                       # not an object
+            [{"output": "x"}],                              # no tool
+            [{"tool": "", "output": "x"}],                  # empty tool
+            [{"tool": "bash"}],                             # no output
+            [{"tool": "bash", "output": "x", "match": "["}],   # bad regex
+            [{"tool": "bash", "output": "x", "match": ""}],
+            [{"tool": "bash", "output": "x", "times": 0}],
+            [{"tool": "bash", "output": "x", "times": True}],
+            [{"tool": "bash", "output": "x", "payload": {}}],  # unknown field
+        ):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                self._validate({"tool_faults": bad})
+
+    def test_parser_normalizes_and_is_shared_with_the_store(self):
+        parsed = sb.parse_tool_faults([{"tool": "bash", "output": "x", "match": "a", "times": 1}], "t")
+        self.assertEqual(parsed, [{"tool": "bash", "output": "x", "is_error": False, "match": "a", "times": 1}])
+        flagged = sb.parse_tool_faults([{"tool": "bash", "output": "x", "is_error": True}], "t")
+        self.assertEqual(flagged, [{"tool": "bash", "output": "x", "is_error": True}])
+        with self.assertRaises(TypeError):
+            sb.parse_tool_faults([{"tool": "bash", "output": "x", "is_error": "yes"}], "t")
+        with self.assertRaises(TypeError):
+            sb.parse_tool_faults(["bash"], "t")
+        with self.assertRaises(ValueError):
+            sb.parse_tool_faults([{"tool": "bash"}], "t")
+
+
 class ClosedManifestBoundaryTests(unittest.TestCase):
     def _validate(self, case: dict, *, judge: dict | None = None):
         manifest = base_manifest()

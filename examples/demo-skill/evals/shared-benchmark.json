@@ -3,7 +3,7 @@
   "skill_name": "demo-reviewer",
   "skill_paths": ["skills/demo/SKILL.md"],
   "variants": ["with_skill", "without_skill"],
-  "notes": "Self-contained harness demo. Runs fully offline with examples/demo-skill/stub_runner.py as the 'model'. The two answer-population ablations each remove one load-bearing piece of the skill and confirm a regression on a distinct assertion; the discovery-population ablation is for trigger-matrix examples.",
+  "notes": "Self-contained harness demo. Runs fully offline with examples/demo-skill/stub_runner.py as the 'model' and stub_bridge.py as the tool bridge for the fault case. The three answer-population ablations each remove one load-bearing piece of the skill and confirm a regression on a distinct assertion; the discovery-population ablation is for trigger-matrix examples.",
   "cases": [
     {
       "id": "c-review",
@@ -32,6 +32,26 @@
         {"name": "severity-label", "type": "contains_any", "values": ["Blocking", "Minor", "Clean"]}
       ],
       "tags": ["demo", "adversarial"]
+    },
+    {
+      "id": "c-fault-denied-runner",
+      "split": "tune",
+      "kind": "fault",
+      "prompt": "Run the test suite for this change with ./run-tests.sh, then give me your review. It adds a new HTTP endpoint.",
+      "tool_faults": [
+        {"tool": "run_tests", "match": "run-tests", "is_error": true, "output": {"exit_code": 126, "stderr": "bash: ./run-tests.sh: Permission denied (sandbox policy)"}}
+      ],
+      "expected_behavior": [
+        "Say the test runner is unavailable instead of pretending the tests ran.",
+        "Do not retry the denied command.",
+        "Review the change statically and still label severity."
+      ],
+      "assertions": [
+        {"name": "fallback-declared", "type": "contains_any", "values": ["runner unavailable", "could not run the tests"]},
+        {"name": "denied-once", "type": "tool_call", "tool": "run_tests", "is_error": true, "max_count": 1},
+        {"name": "severity-label", "type": "contains_any", "values": ["Blocking", "Minor", "Clean"]}
+      ],
+      "tags": ["demo", "fault"]
     },
     {
       "id": "trig-pos-review-change",
@@ -71,6 +91,16 @@
       "target": {"path": "references/checklist.md", "remove": "content"},
       "expected_regressions": [
         {"summary": "with the checklist content gone the reviewer stops citing file/line", "cases": ["c-review"], "assertions": ["cite-checklist"]}
+      ]
+    },
+    {
+      "id": "no-fallback",
+      "removed_component": "denied-command fallback rule",
+      "mechanism": "section",
+      "class": "instructions",
+      "target": {"heading": "## When the test runner is unavailable"},
+      "expected_regressions": [
+        {"summary": "without the fallback rule the reviewer retries the denied runner and rubber-stamps", "cases": ["c-fault-denied-runner"], "assertions": ["fallback-declared", "denied-once"]}
       ]
     },
     {
