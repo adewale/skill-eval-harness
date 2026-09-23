@@ -118,9 +118,16 @@ Each rule below exists because its violation produced a wrong number at least on
 - **Run the real prompt.** A meta-prompt ("Would the skill trigger on: …?") tests
   the model's opinion of the classifier, not skill discovery.
 - **Detect loading from evidence, not names.** The detector matches the mounted
-  skill's temp path (or Claude Code's `Skill` tool call carrying the mounted skill's
-  name). The skill's name appearing in the answer text proves nothing — reading
+  skill's temp path, or Claude Code's `Skill` tool call carrying one of the mounted
+  skill's exact names: its declared `name` or the directory it is mounted under. The
+  skill's name appearing in the answer text proves nothing — reading
   `good-readme/README.md` once looked like loading the `good-readme` skill.
+- **Re-check detection when the agent CLI changes.** Claude Code 2.1.269 invokes project
+  skills by directory name (`skills_tidy-commit_SKILL.md`), not the declared name. The
+  matrix reported 0/3 on Haiku and Sonnet for a skill a traced run showed being invoked;
+  with the directory name accepted, the same measurement read 3/3 on both (2026-09-23).
+  A sudden drop to zero across every model is a detector symptom before it is a
+  description problem: run one cell with `--trace-runs` and read the `Skill` call.
 - **Isolate the sandbox, keep the harness.** Each run gets a fresh config dir so
   the experimenter's personal skills can't shadow the one under test. The agent's
   built-in skills stay, because your users run against them too — losing a routing

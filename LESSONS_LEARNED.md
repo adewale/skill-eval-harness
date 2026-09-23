@@ -2,6 +2,25 @@
 
 This file records durable lessons from building and using the shared skill evaluation harness across Adewale’s skill repos. Keep it practical: each lesson should change how the harness, manifests, or skill iteration process is run next time.
 
+## 2026-09-23 — A zero across every model is a detector symptom first
+
+**Problem:** `skill-trigger-matrix --agent claude` reported 0/3 should-fire on both
+Haiku and Sonnet for a skill Claude Code's own runner had just activated. A traced run
+showed the model calling `Skill` with `skills_tidy-commit_SKILL.md`, the mounted
+directory name; the detector only accepted the declared `name: tidy-commit`. Claude Code
+2.1.269 changed which name it invokes skills by.
+
+**Lesson:** Activation detection is coupled to the agent CLI's version. A uniform zero is
+more likely a detection gap than a description that stopped working on every model.
+
+**Rule:**
+- Accept every exact name the agent may use for a mounted skill (declared name and
+  mounted directory name); never match names in prose.
+- When a trigger rate collapses across all models, trace one cell before editing the
+  skill description.
+- Keep mount keys and tree hashes stable when fixing detection, so earlier reports stay
+  comparable.
+
 ## 2026-09-23 — An importer is a verifier; dogfood it on real runs
 
 **Problem:** `import-plugin-evals` passed every offline test, yet on the first real Claude

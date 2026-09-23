@@ -201,7 +201,11 @@ candidates, and `error-analysis` puts them first in the queue with `verifier_sus
 `format_near_miss` fires exactly on the example below (the check passes once markdown and
 case are ignored), `never_passes` on a check no run ever satisfied, and
 `oracle_disagreement` where a judge passed the run the check failed. A suspicion is a
-reason to read the output, not a verdict. `LESSONS_LEARNED.md`'s 2026-06-09 entry *"Assertions
+reason to read the output, not a verdict. On real Claude runs (2026-09-23,
+`tests/fixtures/eval-quality/`), `format_near_miss` flagged a Sonnet review that wrote
+`Severity: **Blocking**` against a check demanding `Severity: Blocking`, and
+`never_passes` flagged a verdict check whose `APPROVE|REQUEST CHANGES` vocabulary the
+prompt never asked for (12 of 12 runs failed it). `LESSONS_LEARNED.md`'s 2026-06-09 entry *"Assertions
 should allow equivalent good behavior"* records exactly this — a correct output failing
 because the check demanded `Decision: BLOCK` while the model wrote `**Decision: BLOCK.**`.
 When you open the `output.md` for a failing row and the answer is *obviously right* but

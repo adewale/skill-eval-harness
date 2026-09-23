@@ -192,8 +192,17 @@ every stream for it. The first real run therefore failed, and the spend ceiling 
 the loop after one unpriced run instead of paying for five more failures. Both the
 answer parser and the trace dialect now share one rule: exactly one `result`, followed
 only by `system` records. With the fixes in place, the paired lift on `first-case` held
-on both models (with skill 1.0, without 0.0), and the two imported trigger cases ran
-through `skill-trigger-matrix --agent claude` for $0.13 of a $0.30 ceiling.
+on both models (with skill 1.0, without 0.0).
+
+The two imported trigger cases then ran through `skill-trigger-matrix --agent claude`
+three times per model. The first pass reported the should-fire case at 0/3 on both Haiku
+and Sonnet. A traced run showed the model *did* call `Skill`, under the mounted
+directory name `skills_tidy-commit_SKILL.md`; the detector only accepted the declared
+name `tidy-commit`. With both names accepted, the same measurement read 3/3 should-fire
+and 3/3 should-not-fire on both models, for $0.34 of a $1.20 ceiling. One caveat stands:
+these runs report `config_isolated: false`, because Claude OAuth credentials were not
+portable into a fresh config, so the machine's other installed skills were visible to
+the model and competed for routing.
 
 ## Get real data: recorded runs and the trace bridge
 

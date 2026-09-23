@@ -158,7 +158,7 @@ These are flags a `benchmark` report raises so you read pass rates correctly.
 
 **Verifier suspicion** — a benchmark `verifier_review` finding that an assertion may be rejecting correct answers: `never_passes` (no observed run of any arm or model passed it), `format_near_miss` (the failing answer passes once case and markdown formatting are ignored), or `oracle_disagreement` (a judge passed a run this gate failed). Evidence for a human to read the run, never a verdict; it does not change any pass rate. Owned by `review_contracts.py`.
 
-**Model-order inversion** — with a declared `--model-order` (weakest first; never inferred from names), a weaker model that fully passes more runs than a stronger one in the same case and arm, or pooled over the cases both ran. Reported with a one-sided Fisher exact p-value. Often a harness restricting the stronger model or a verifier tuned to one model's phrasing.
+**Model-order inversion** — with a declared `--model-order` (weakest first; never inferred from names), a weaker model that fully passes more runs than a stronger one in the same case and arm, pooled over the cases both ran, or passes one objective assertion more often. Reported with a one-sided Fisher exact p-value. Often a harness restricting the stronger model or a verifier tuned to one model's phrasing.
 
 **Missing output** — a case/variant that was never run. It is marked `missing_output` and excluded from no-lift and saturation comparisons, because "not measured" is not "measured and failed."
 

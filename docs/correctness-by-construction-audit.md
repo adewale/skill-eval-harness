@@ -409,7 +409,7 @@ observed numeric rate -> UnitRate(0 <= value <= 1)
 ```text
 graded row + manifest definition -> AssertionOutcome (RunRef, role, gate, passed, near miss)
 AssertionOutcome*                -> VerifierSuspicion (never_passes | format_near_miss | oracle_disagreement)
-declared order + RunPass*        -> ModelOrderCheck (ModelOrderInversion with Fisher p-value)
+declared order + RunPass* + AssertionOutcome* -> ModelOrderCheck (ModelOrderInversion with Fisher p-value)
 ```
 
 - Only complete boolean verdicts enter review; an unavailable assertion is not evidence
@@ -418,7 +418,9 @@ declared order + RunPass*        -> ModelOrderCheck (ModelOrderInversion with Fi
   relaxed because relaxing an absence check makes it stricter.
 - A suspicion's runs share its case and are unique; an inversion requires the weaker
   model's rate to be strictly higher, and its p-value and significance are derived, not
-  stored.
+  stored. A per-assertion inversion names one case and can never be suite-scoped, and
+  each run's verdict on an assertion counts once. Both findings consume the same
+  `review_outcomes` adapter, so they cannot disagree about which verdicts exist.
 - `ModelOrder` exists only when the caller declares it (at least two unique models).
   Suite-level pooling adds a case to a pair only when both models ran it, so pooling
   never compares different case mixes, and a run with a blocked objective assertion is

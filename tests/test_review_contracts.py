@@ -143,6 +143,23 @@ class ModelOrderTests(unittest.TestCase):
         self.assertEqual({(i.scope, str(i.variant)) for i in check.inversions}, {("c1", "without_skill"), ("suite", "without_skill")})
         self.assertEqual((check.unordered_models, check.unobserved_models), (("gpt-x",), ("sonnet",)))
 
+    def test_per_assertion_view_catches_a_verifier_tuned_to_one_model(self):
+        # Neither model fully passes (a second gate always fails), so the full-run
+        # view is silent; one assertion still passes only for the weaker model.
+        runs = {m: [run("c", "with_skill", n, m) for n in (1, 2, 3)] for m in ("haiku", "opus")}
+        outcomes = ([outcome(r, "exact", True) for r in runs["haiku"]] + [outcome(r, "exact", False) for r in runs["opus"]]
+                    + [outcome(r, "other", False) for rs in runs.values() for r in rs])
+        passes = [rc.RunPass(r, False) for rs in runs.values() for r in rs]
+        check = rc.model_order_check(passes, self.ORDER, outcomes)
+        self.assertEqual([(i.scope, i.assertion, i.significant) for i in check.inversions], [("c", "exact", True)])
+        self.assertEqual((check.compared_pairs, check.compared_assertion_pairs), (1, 2))
+        self.assertEqual(check.to_dict()["inversions"][0]["assertion"], "exact")
+        with self.assertRaises(ValueError):
+            rc.model_order_check(passes, self.ORDER, outcomes + outcomes[:1])      # a verdict counts once
+        with self.assertRaises(ValueError):
+            rc.ModelOrderInversion("suite", runs["haiku"][0].variant, ModelId("haiku"), ModelId("opus"),
+                                   rc.PassCount(1, 1), rc.PassCount(1, 0), "exact")
+
     def test_contradictory_values_are_refused(self):
         with self.assertRaises(ValueError):
             rc.ModelOrderInversion("c", rc.RunRef.parse("c", "with_skill", 1).variant, ModelId("a"), ModelId("b"),

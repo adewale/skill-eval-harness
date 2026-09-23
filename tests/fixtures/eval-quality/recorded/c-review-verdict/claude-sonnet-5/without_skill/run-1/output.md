@@ -1,0 +1,5 @@
+I can't actually review this change — no diff, file, or code was provided ("Input files available to inspect: none"), so there's nothing concrete to inspect. I won't fabricate specifics about an endpoint I haven't seen.
+
+What I can offer generically: a new HTTP endpoint shipped without any test is a real gap regardless of implementation quality — it means there's no automated check for the happy path, auth/authz behavior, input validation, error responses, or status codes, and future refactors could silently break it. Before merging, I'd want at minimum a test hitting the route with valid input (asserting status + body), a test for invalid/missing input, and a test for unauthorized access if the endpoint is protected.
+
+**Verdict: Cannot review — no change was actually provided to inspect; if a real PR adds an endpoint with zero tests, that should block merge until basic request/response and auth-path tests are added.**

@@ -6,6 +6,7 @@ importer: on real Claude runs, `never_passes` caught an imported file check
 that native runners can never satisfy, and `never_passes` plus
 `oracle_disagreement` together caught an imported Skill-order check."""
 import argparse
+import shutil
 import sys
 import tempfile
 import unittest
@@ -134,6 +135,40 @@ class ModelOrderReportTests(unittest.TestCase):
         self.assertEqual(sb.model_order_from_args(sb.CLIInvocation.from_namespace(args).to_legacy_namespace()).to_list(),
                          ["haiku", "opus"])
         self.assertIsNone(sb.model_order_from_args(parser.parse_args(["benchmark", "m", "--runs", "r"])))
+
+
+class RecordedRealOutputTests(unittest.TestCase):
+    """Twelve real Claude outputs (2026-09-23) of a deliberately format-strict
+    case; see tests/fixtures/eval-quality/README.md."""
+
+    FIXTURE = Path(__file__).resolve().parent / "fixtures" / "eval-quality"
+
+    def report(self, root: Path) -> dict:
+        repo = root / "repo"
+        shutil.copytree(self.FIXTURE / "repo", repo)
+        runs = root / "runs"
+        shutil.copytree(self.FIXTURE / "recorded", runs)
+        manifest = repo / "evals" / "shared-benchmark.json"
+        attest_answer_design(manifest, runs)
+        return sb.build_benchmark_report(
+            manifest, runs, model_order=sb.ModelOrder.parse("claude-haiku-4-5,claude-sonnet-5"))
+
+    def test_all_three_findings_hold_on_real_model_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = self.report(Path(td))
+        suspicions = {(s["assertion"], s["signal"]): s for s in report["verifier_review"]["suspicions"]}
+        near = suspicions[("severity-exact", "format_near_miss")]
+        self.assertIn({"case_id": "c-review-verdict", "model": "claude-sonnet-5", "variant": "with_skill",
+                       "run_number": 2}, near["runs"])
+        never = suspicions[("verdict-line", "never_passes")]
+        self.assertEqual(len(never["runs"]), 12)
+        check = report["model_order_check"]
+        significant = [i for i in check["inversions"] if i["significant"]]
+        self.assertEqual([(i["assertion"], i["variant"], i["weaker_pass"]["passed"], i["stronger_pass"]["passed"])
+                          for i in significant], [("severity-exact", "with_skill", 3, 0)])
+        self.assertEqual(significant[0]["p_value"], 0.05)
+        # the full-run view alone could not see it: neither model fully passed this case
+        self.assertFalse([i for i in check["inversions"] if i["assertion"] is None and i["significant"]])
 
 
 if __name__ == "__main__":

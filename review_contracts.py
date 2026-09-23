@@ -10,9 +10,9 @@ point a human at the runs worth reading:
   or markdown formatting (``format_near_miss``), or a judge passed the same
   run the deterministic check failed (``oracle_disagreement``).
 - ``ModelOrderInversion``: a weaker model, by an order the operator
-  declared, fully passes more runs than a stronger one — often a harness
-  that restricts the stronger model, or a verifier tuned to one model's
-  phrasing.
+  declared, fully passes more runs than a stronger one, or passes one
+  assertion more often — often a harness that restricts the stronger model,
+  or a verifier tuned to one model's phrasing.
 
 Both are evidence for review, never verdicts: nothing here changes a pass
 rate. Model capability order is never inferred from model names; it exists
@@ -290,15 +290,23 @@ def fisher_one_sided_p(weaker: PassCount, stronger: PassCount) -> float:
 
 @dataclass(frozen=True)
 class ModelOrderInversion:
+    """``assertion`` is None for a full-run comparison (every objective gate
+    passed) and names one objective assertion for a per-assertion one."""
+
     scope: str
     variant: ExecutionVariant
     weaker: ModelId
     stronger: ModelId
     weaker_count: PassCount
     stronger_count: PassCount
+    assertion: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scope", _label(self.scope, "inversion scope"))
+        if self.assertion is not None:
+            object.__setattr__(self, "assertion", _label(self.assertion, "inversion assertion"))
+            if self.scope == SUITE_SCOPE:
+                raise ValueError("a per-assertion inversion belongs to one case, never the suite")
         if not isinstance(self.variant, ExecutionVariant):
             raise TypeError("inversion variant must be ExecutionVariant")
         if not isinstance(self.weaker, ModelId) or not isinstance(self.stronger, ModelId):
@@ -319,7 +327,7 @@ class ModelOrderInversion:
         return self.p_value <= SIGNIFICANCE_ALPHA
 
     def to_dict(self) -> dict[str, Any]:
-        return {"scope": self.scope, "variant": str(self.variant), "weaker": str(self.weaker),
+        return {"scope": self.scope, "assertion": self.assertion, "variant": str(self.variant), "weaker": str(self.weaker),
                 "stronger": str(self.stronger), "weaker_pass": self.weaker_count.to_dict(),
                 "stronger_pass": self.stronger_count.to_dict(),
                 "p_value": round(self.p_value, 6), "significant": self.significant}
@@ -344,6 +352,7 @@ class ModelOrderCheck:
     order: ModelOrder
     inversions: tuple[ModelOrderInversion, ...]
     compared_pairs: int
+    compared_assertion_pairs: int
     unordered_models: tuple[str, ...]
     unobserved_models: tuple[str, ...]
 
@@ -351,16 +360,22 @@ class ModelOrderCheck:
         return {
             "availability": "complete", "evidence_class": DIAGNOSTIC_EVIDENCE_CLASS,
             "order_weakest_first": self.order.to_list(), "compared_pairs": self.compared_pairs,
+            "compared_assertion_pairs": self.compared_assertion_pairs,
             "unordered_models": list(self.unordered_models), "unobserved_models": list(self.unobserved_models),
             "inversions": [inversion.to_dict() for inversion in self.inversions],
             "significant_inversions": sum(1 for inversion in self.inversions if inversion.significant),
         }
 
 
-def model_order_check(passes: Iterable[RunPass], order: ModelOrder) -> ModelOrderCheck:
-    """Compare every declared weaker/stronger pair per (case, arm), and at
-    suite level per arm pooled only over cases both models ran, so pooling
-    never compares different case mixes."""
+def model_order_check(
+    passes: Iterable[RunPass], order: ModelOrder,
+    assertion_outcomes: Iterable[AssertionOutcome] = (),
+) -> ModelOrderCheck:
+    """Compare every declared weaker/stronger pair per (case, arm), at suite
+    level per arm pooled only over cases both models ran (so pooling never
+    compares different case mixes), and per (case, objective assertion, arm).
+    The per-assertion view catches a verifier tuned to one model's phrasing
+    even when neither model fully passes the case."""
     if not isinstance(order, ModelOrder):
         raise TypeError("model order check requires a declared ModelOrder")
     rows = list(passes)
@@ -368,6 +383,11 @@ def model_order_check(passes: Iterable[RunPass], order: ModelOrder) -> ModelOrde
         raise TypeError("model order check consumes RunPass values")
     if len({row.run for row in rows}) != len(rows):
         raise ValueError("each run may be counted once")
+    verdicts = [row for row in assertion_outcomes if row.role is AssertionRole.OBJECTIVE]
+    if not all(isinstance(row, AssertionOutcome) for row in verdicts):
+        raise TypeError("model order check consumes AssertionOutcome values")
+    if len({(row.run, row.assertion) for row in verdicts}) != len(verdicts):
+        raise ValueError("each run's assertion verdict may be counted once")
     counts: dict[tuple[CaseId, ExecutionVariant, ModelId], PassCount] = {}
     seen_models: set[str] = set()
     for row in rows:
@@ -400,12 +420,32 @@ def model_order_check(passes: Iterable[RunPass], order: ModelOrder) -> ModelOrde
                 if pooled_weak is not None and pooled_strong is not None and pooled_weak.rate > pooled_strong.rate:
                     inversions.append(ModelOrderInversion(
                         SUITE_SCOPE, variant, weaker, stronger, pooled_weak, pooled_strong))
+    per_assertion: dict[tuple[CaseId, str, ExecutionVariant, ModelId], PassCount] = {}
+    for row in verdicts:
+        if row.run.model is None or order.rank(row.run.model) is None:
+            continue
+        key = (row.run.case_id, row.assertion, row.run.variant, row.run.model)
+        one = PassCount(1, 1 if row.passed else 0)
+        per_assertion[key] = per_assertion[key].plus(one) if key in per_assertion else one
+    compared_assertions = 0
+    for case, name, variant in sorted({(case, name, variant) for case, name, variant, _ in per_assertion}):
+        for i, weaker in enumerate(order.models):
+            for stronger in order.models[i + 1:]:
+                weak = per_assertion.get((case, name, variant, weaker))
+                strong = per_assertion.get((case, name, variant, stronger))
+                if weak is None or strong is None:
+                    continue
+                compared_assertions += 1
+                if weak.rate > strong.rate:
+                    inversions.append(ModelOrderInversion(str(case), variant, weaker, stronger, weak, strong, name))
     ordered = {str(model) for model in order.models}
     return ModelOrderCheck(
         order=order,
         inversions=tuple(sorted(inversions, key=lambda item: (
-            item.scope != SUITE_SCOPE, item.scope, str(item.variant), str(item.weaker), str(item.stronger)))),
+            item.scope != SUITE_SCOPE, item.assertion is not None, item.scope, item.assertion or "",
+            str(item.variant), str(item.weaker), str(item.stronger)))),
         compared_pairs=compared,
+        compared_assertion_pairs=compared_assertions,
         unordered_models=tuple(sorted(seen_models - ordered)),
         unobserved_models=tuple(sorted(ordered - seen_models)),
     )

@@ -661,7 +661,25 @@ class ClaudeDetectionTests(unittest.TestCase):
             skill_md = Path(td) / "some-dir" / "SKILL.md"
             skill_md.parent.mkdir()
             skill_md.write_text("---\nname: demo-reviewer\ndescription: x\n---\n", encoding="utf-8")
-            self.assertEqual(tm.mounted_skill_names([skill_md]), ["demo-reviewer"])
+            self.assertEqual(tm.mounted_skill_names([skill_md]), ["demo-reviewer", "some-dir"])
+
+    def test_skill_tool_called_by_mounted_directory_name_is_trigger_evidence(self):
+        # Claude Code 2.1.269 invokes project skills by directory name. Before this
+        # fix the matrix reported 0/3 on both Haiku and Sonnet for a skill a traced
+        # run showed being invoked (2026-09-23).
+        with tempfile.TemporaryDirectory() as td:
+            skill_md = Path(td) / ".claude" / "skills" / "skills_tidy-commit_SKILL.md" / "SKILL.md"
+            skill_md.parent.mkdir(parents=True)
+            skill_md.write_text("---\nname: tidy-commit\ndescription: x\n---\n", encoding="utf-8")
+            names = tm.mounted_skill_names([skill_md])
+        stream = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "skills_tidy-commit_SKILL.md", "args": "..."}}]}})
+        detection = self._adapter().detect(completed_invocation(stream), names, [skill_md])
+        self.assertTrue(detection.triggered)
+        self.assertIn("Skill tool invoked: skills_tidy-commit_SKILL.md", detection.legacy_evidence)
+        other = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "skills_other_SKILL.md"}}]}})
+        self.assertFalse(self._adapter().detect(completed_invocation(other), names, [skill_md]).triggered)
 
     def test_claude_invoke_seeds_portable_auth_into_isolated_config(self):
         seen = {}

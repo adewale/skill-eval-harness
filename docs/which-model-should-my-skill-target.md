@@ -101,6 +101,11 @@ against `case_flags`:
   points at the harness (for example a tool policy that restricts the stronger model);
   in the `with_skill` arm it can mean the skill over-constrains a stronger model, or a
   verifier tuned to one model's phrasing. The harness never infers the order from names.
+  Per-assertion inversions set `assertion`, and they matter most: on 2026-09-23 a
+  `contains "Severity: Blocking"` check passed Haiku 3/3 and Sonnet 0/3 (p = 0.05)
+  because Haiku habitually writes `**Severity: Blocking**` and Sonnet phrases the label
+  other ways. Neither model fully passed the case, so only the per-assertion view saw it
+  (the recorded outputs are in `tests/fixtures/eval-quality/`).
 
 A live worked example of the underlying effect already lives in the harness:
 [`tuning-skill-activation.md`](tuning-skill-activation.md)'s Haiku cell, where the

@@ -17417,6 +17417,7 @@ def build_benchmark_report(
     # A runner that stopped at its spend ceiling leaves the design incomplete on
     # purpose; the ledger names that cause so the gap is not read as a crash.
     spend_ledger = read_spend_ledger(runs)
+    outcomes_for_review = review_outcomes(results, selected_cases)
     if (spend_ledger is not None and spend_ledger.stop_reason is not None
             and not design_coverage.get("complete")):
         design_coverage = {**design_coverage, "stopped_by": spend_ledger.stop_reason.value}
@@ -17557,8 +17558,8 @@ def build_benchmark_report(
         # Eval-quality diagnostics: runs whose failure may be the verifier's,
         # and weaker-beats-stronger model orderings. Evidence for review over
         # observed verdicts; neither changes a pass rate.
-        "verifier_review": verifier_review_block(results, selected_cases),
-        "model_order_check": model_order_block(results, model_order),
+        "verifier_review": verifier_review_block(outcomes_for_review),
+        "model_order_check": model_order_block(results, model_order, outcomes_for_review),
         "case_flags_availability": (
             "partial" if observed_case_flags is not None else "complete"),
         **({"observed_case_flags": observed_case_flags}
@@ -17592,9 +17593,9 @@ def _review_run_ref(row: Mapping[str, Any]) -> RunRef:
         die(f"graded row carries an invalid run identity: {exc}")
 
 
-def verifier_review_block(results: Sequence[Mapping[str, Any]], cases: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Adapt graded rows into AssertionOutcome values and summarize the
-    verifier suspicions (review_contracts owns the signals)."""
+def review_outcomes(results: Sequence[Mapping[str, Any]], cases: Sequence[Mapping[str, Any]]) -> list[AssertionOutcome]:
+    """The ONE adapter from graded rows to AssertionOutcome values, shared by
+    the verifier review and the model-order check."""
     definitions = {
         str(case.get("id")): {str(a.get("name")): a for a in (case.get("assertions") or []) if isinstance(a, Mapping)}
         for case in cases
@@ -17626,10 +17627,15 @@ def verifier_review_block(results: Sequence[Mapping[str, Any]], cases: Sequence[
                 continue
             passed, gate = verdict
             outcomes.append(AssertionOutcome(run, entry["name"], AssertionRole.QUALITATIVE, gate, passed))
+    return outcomes
+
+
+def verifier_review_block(outcomes: Sequence[AssertionOutcome]) -> dict[str, Any]:
     return suspicion_summary(verifier_suspicions(outcomes))
 
 
-def model_order_block(results: Sequence[Mapping[str, Any]], order: ModelOrder | None) -> dict[str, Any]:
+def model_order_block(results: Sequence[Mapping[str, Any]], order: ModelOrder | None,
+                      outcomes: Sequence[AssertionOutcome] = ()) -> dict[str, Any]:
     """A run counts as passed only when it is scorable, not vetoed, and passed
     every objective gate. Runs with a blocked objective assertion are left
     out (their objective verdict is unknown); a pending judge is not, since
@@ -17643,7 +17649,7 @@ def model_order_block(results: Sequence[Mapping[str, Any]], order: ModelOrder | 
                 or isinstance(rate, bool) or not isinstance(rate, (int, float))):
             continue
         passes.append(RunPass(_review_run_ref(row), rate == 1 and not row.get("vetoed")))
-    return model_order_check(passes, order).to_dict()
+    return model_order_check(passes, order, outcomes).to_dict()
 
 
 def model_order_from_args(args: argparse.Namespace) -> ModelOrder | None:
