@@ -163,7 +163,7 @@ The end-to-end calibration loop over this command, `compare-judges`, and `judge-
 
 ## Error analysis (open coding → axial taxonomy)
 
-`error-analysis` turns a `benchmark.json` into the "look at your data" surface: an open-coding **review queue** (one row per failing/errored run, anchored on its *first* upstream failure, with an open `note` slot) and an axial **failure taxonomy** (first-failures counted by category, so the few dominant buckets are visible), alongside the report's own case-flag histogram. Model-free.
+`error-analysis` turns a `benchmark.json` into the "look at your data" surface: an open-coding **review queue** (one row per failing/errored run, anchored on its *first* upstream failure, with an open `note` slot) and an axial **failure taxonomy** (first-failures counted by category, so the few dominant buckets are visible), alongside the report's own case-flag histogram. Runs the report's `verifier_review` suspects carry `verifier_suspects` and sort to the top of the queue, since their failure may belong to the eval rather than the model. Model-free.
 
 ```bash
 skill-benchmark error-analysis --benchmark benchmark.json --out error-analysis.json
@@ -222,6 +222,16 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
 ```
 
 Multi-model runs prepare with `--models a,b,c` (run dirs gain a model segment: `<case>/<model>/<variant>`); grading discovers both layouts and pairs lift per (case, model).
+
+Two eval-quality blocks sit beside the numbers; both are diagnostics that never change a pass rate:
+
+- `verifier_review` flags assertions that may be rejecting correct answers, with three signals over observed verdicts: `never_passes` (no run of any arm or model ever passed it, over at least two runs), `format_near_miss` (a failed `contains`/`contains_any`/`contains_all`/`regex` passes once case and markdown formatting are ignored, re-checked through the same bounded matcher; negative checks are never relaxed), and `oracle_disagreement` (a judge passed a run this gate failed). `review_queue` lists every suspect run once.
+- `model_order_check` compares declared model tiers. Pass `--model-order weakest,...,strongest` and each weaker/stronger pair is compared per (case, arm) and pooled per arm over cases both models ran; an `inversion` is a weaker model fully passing more runs than a stronger one, with a one-sided Fisher exact `p_value`. The order is never inferred from model names; without the flag the block is `not_applicable`.
+
+```bash
+skill-benchmark benchmark ../repo/evals/shared-benchmark.json --runs ../repo/eval-runs/latest \
+  --model-order claude-haiku-4-5,claude-sonnet-5,claude-opus-5 --out benchmark.json
+```
 
 ## CI report formats
 

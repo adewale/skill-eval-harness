@@ -43,10 +43,14 @@ with-arm as a plugin-fired indicator only (`withOnly: true`, `scored: false` in 
 are scored normally again, and `arm: both` forces scoring in both arms, which is what a
 "must not invoke the skill" check with `min: 0` / `max: 0` needs. Under `--ablation none`
 nothing is excluded, so the same suite can print a different absolute score in the two
-modes. The harness expresses the same rule per assertion with `variants`: the importer
-writes `skill_invoked` with `variants: ["with_skill"]` so the no-skill baseline is never
-penalized for not loading a skill it does not have, and a `min: 0`/`max: 0` Skill grader
-becomes `skill_invoked: expected: false` on both arms.
+modes. The harness resolves the same problem one level up: a check on whether the skill
+fired measures *activation*, which is its own population here. Answer runs instruct the
+model to read the skill, so a skill-fired check inside an answer case would only measure
+instruction following, and a must-not-fire check would fail by design. The importer
+therefore turns every `tool_used: Skill` grader into a `kind: trigger` case
+(`should_trigger: true` for `min >= 1`, `false` for `min: 0` / `max: 0`) that
+`skill-trigger-matrix` runs autonomously, and leaves the answer case with only the
+graders about the answer.
 
 **Cost ceiling.** `--max-cost-usd` caps the run's *list-price estimate*, not plan usage.
 It is checked before each run launches; once spent, nothing further starts, runs already
@@ -99,46 +103,51 @@ python3 $H import-plugin-evals "$P"              # writes evals/shared-benchmark
 python3 $H audit-manifest "$P/evals/shared-benchmark.json"
 ```
 
-Real output (2026-09-12, Python 3.11, harness 0.6.0 tree), trimmed to the lines that
-carry a decision:
+Real output (2026-09-23, Python 3.11, harness 0.6.0 tree):
 
 ```text
-3 case(s) imported from /tmp/probe-plugin/evals for skill 'tidy-commit'
+5 case(s) imported from /tmp/probe-plugin/evals for skill 'tidy-commit'
 
-13 item(s) the import could not carry verbatim (see docs/comparing-with-claude-plugin-eval.md):
-- [input_match] first-case / skill-fired: skill_invoked checks that the manifest's skill loaded; the input_match regex is not applied
+15 item(s) the import could not carry verbatim (see docs/comparing-with-claude-plugin-eval.md):
+- [trigger] first-case / skill-fired: Skill graders measure autonomous activation; imported as a kind: trigger case, not an answer assertion
 - [runner limits] first-case: allowed_tools, max_turns belong to the runner, not the manifest (run-agent --timeout, --models; tool grants are the agent CLI's)
 - [weight] changelog-from-diff / mentions-rename: weight 2 has no harness equivalent; every gate counts once — use severity: critical for a veto
 - [judge] changelog-from-diff / mentions-rename: deferred judge task: run `skill-benchmark judge` with a backend or --judge-cmd; the plugin-eval judge (haiku, 2-of-3 votes) is not reproduced
-- [input_match] changelog-from-diff / read-before-skill: tool_order after input_match dropped; order matches tool names only
+- [trigger] changelog-from-diff / read-before-skill: tool_order on the Skill tool measures autonomous activation; answer runs load the skill by reading SKILL.md, so the order can never be satisfied; nothing imported
 - [baseline] changelog-from-diff / as-good-as-reference: no harness equivalent for judge-vs-reference-transcript; use similarity or golden_output against the reference's final text
-- [target] changelog-from-diff / changelog-has-entry: reads the produced file 'CHANGELOG.md'; grade it here with golden_output, structured_output, or a script oracle over outputs/
+- [target] changelog-from-diff / changelog-has-entry: reads the produced file 'CHANGELOG.md'; native runners keep only the final answer (only Jetty persists outputs/), so ask for the file's content in the answer and grade that with regex, golden_output, or structured_output
+- [file output] changelog-from-diff / changelog-written: file_exists 'CHANGELOG.md' cannot pass on native runners, which keep only the final answer (only Jetty persists outputs/); ask for the file's content in the answer and grade that, or use a script oracle; nothing imported
 - [runs] changelog-from-diff: runs: 2 is a runner setting here: prepare --runs-per-variant 2
+- [runner limits] changelog-from-diff: allowed_tools, max_turns, timeout_seconds belong to the runner, not the manifest (run-agent --timeout, --models; tool grants are the agent CLI's)
 - [scaffold_script] changelog-from-diff: workspace scaffold has no manifest slot; commit the fixture files and list them under files
+- [trigger] ignores-unrelated-request / no-skill: Skill graders measure autonomous activation; imported as a kind: trigger case, not an answer assertion
+- [runner limits] ignores-unrelated-request: allowed_tools, max_turns belong to the runner, not the manifest (run-agent --timeout, --models; tool grants are the agent CLI's)
 - [splits] suite: every case landed in 'tune'; move release-gating cases to holdout/holdback (docs/authoring-evals.md)
 - [ablations] suite: the plugin-eval suite had one baseline arm; declare component ablations to learn which part of the skill is load-bearing
 
 wrote evals/shared-benchmark.json (validated; 0 leakage warning(s))
 ```
 
-Three cases came across with seven objective assertions and one judge. Two graders did
-not: the `baseline` grader (a judge comparing against a reference transcript, which the
-harness does not have) and the `regex` over the produced `CHANGELOG.md` (the harness's
-`regex` reads the final answer; file contents are graded by `golden_output`,
-`structured_output`, or a `script` oracle). Neither was dropped silently; both are on the
-checklist with the assertion that replaces them. `audit-manifest` then adds the usual
-post-port punch list (`no adversarial cases`, `missing-hidden-splits`,
-`missing-trigger-no-trigger-cases`, `missing-ablation-plan`) because the plugin layout
-has no slot for any of them.
+Five cases came across: three answer cases and two trigger cases split out of the Skill
+graders. Six graders did not become assertions, and each is on the checklist with the
+reason and the replacement. Two cannot be expressed here at all: the `baseline` grader (a
+judge against a reference transcript) and the `regex` over the produced `CHANGELOG.md`.
+Three would have become checks that can never pass, which the next section shows on real
+runs: a file check native runners cannot satisfy, and two Skill-tool checks for a tool
+that answer runs never call. `audit-manifest` then adds the usual post-port punch list
+(`no adversarial cases`, `missing-hidden-splits`, `missing-ablation-plan`) because the
+plugin layout has no slot for any of them.
 
 ## Read the checklist, item by item
 
 | Decision | What you see | What it means | The edit |
 |---|---|---|---|
-| `input_match` on a Skill grader | `skill_invoked` imported without the regex | The harness detects the skill load from the mounted skill path, not from a regex over the tool input | Nothing, unless the plugin ships several skills: then set `--skill-path` to the one under test |
+| `trigger` | A `tool_used: Skill` grader became a `kind: trigger` case; a `tool_order` on `Skill` was not imported | Activation is its own population; answer runs load the skill by reading `SKILL.md` because they are told to | Run the trigger cases with `skill-trigger-matrix` ([`tuning-skill-activation.md`](tuning-skill-activation.md)) |
+| `file output` | A `file_exists` grader was not imported | Native answer runners keep only the final answer; only Jetty persists `outputs/` | Ask for the file's content in the answer and grade that, or run on Jetty |
+| `input_match` | A regex over raw JSON input (`"key"\s*:`) was refused; a plain one became `tool_call.pattern` | The harness matches rendered call text such as `probe-plugin:tidy-commit Skill`, never the raw JSON | Rewrite the regex against `events.json` |
 | `weight` | A weighted grader became an unweighted gate | Harness gates count once each; a veto is `severity: critical`, a nice-to-have is `severity: soft` | Pick the severity that matches the weight's intent |
 | `judge` | The `llm` rubric is a deferred `judge` assertion with `severity: gate` | The plugin-eval judge (a small model, two of three votes) is not reproduced; you choose the backend | Run `judge` with `--judge-backend` or `--judge-cmd`; calibrate it first ([`can-i-trust-my-judge.md`](can-i-trust-my-judge.md)) |
-| `target` / `focus` | A grader over a file, the trace, or mock calls was skipped | The harness grades the answer, `events.json`, and `outputs/` through different assertion types | `golden_output`/`structured_output`/`script` for a file, `command_ran`/`tool_call` for the trace |
+| `target` / `focus` | A grader over a file, the trace, or mock calls was skipped | The harness grades the answer and `events.json` through different assertion types | Put the file's content in the answer and grade that; `command_ran`/`tool_call` for the trace |
 | `baseline` | Skipped | No judge-vs-reference-transcript grader here | `similarity` or `golden_output` against the reference's final text |
 | `match: count:N` | Imported as presence | The harness regex has no exact-count mode | A `script` oracle if the count is the property |
 | `min: 0` with an upper bound | Imported as at-least-one | `tool_call.min_count` is at least 1 | `expected_no_call` for never, `max_count` for at-most |
@@ -149,6 +158,42 @@ has no slot for any of them.
 Every imported case lands in `tune` (or `--split`). That is deliberate: a suite that
 lived next to the skill's source was visible while the skill was written, which is what
 `tune` means here.
+
+## Does the import hold up on real runs?
+
+The first version of this importer passed every offline test and still produced checks
+that could never pass. Running it for real is what found them. On 2026-09-23 the fixture
+suite was imported, prepared, and run through `run-claude` on Claude Code 2.1.269, under
+a spend ceiling:
+
+```bash
+python3 $H prepare evals/shared-benchmark.json --split tune \
+  --models claude-haiku-4-5,claude-sonnet-5 --out tasks.jsonl
+python3 $H run-claude --tasks tasks.jsonl --runs runs --max-cost-usd 1.00
+python3 $H judge evals/shared-benchmark.json --runs runs --judge-backend claude \
+  --judge-model claude-haiku-4-5 --max-cost-usd 0.20 --out judge.jsonl
+python3 $H benchmark evals/shared-benchmark.json --runs runs --judge-results judge.jsonl \
+  --model-order claude-haiku-4-5,claude-sonnet-5 --out bench.json
+```
+
+Twelve answer runs cost $0.50 of the $1.00 ceiling and four judge calls $0.06 of $0.20.
+The report's `verifier_review` block, which exists for exactly this, flagged what the
+offline tests could not:
+
+| Imported check | What the review said | Cause | Fix now in the importer |
+|---|---|---|---|
+| `changelog-written` (`file_exists`) | `never_passes`: failed every run in both arms | Native runners discard the workspace; only the final answer survives | Not imported; `file output` checklist line |
+| `read-before-skill` (`tool_order` … `Skill`) | `never_passes` on 4 of 4 runs across both models **and** `oracle_disagreement`: the judge passed all four | Answer runs load the skill by reading `SKILL.md`; no `Skill` call exists | Not imported; `trigger` checklist line |
+| `no-skill` (`tool_used: Skill`, `max: 0`) | Failed in the with-skill arm by design | The with-skill prompt tells the model to read the skill | Became a `should_trigger: false` trigger case |
+
+The same run also found a harness bug unrelated to the importer: Claude Code 2.1.269
+appends a `system` record after the terminal `result` event, and `run-claude` rejected
+every stream for it. The first real run therefore failed, and the spend ceiling stopped
+the loop after one unpriced run instead of paying for five more failures. Both the
+answer parser and the trace dialect now share one rule: exactly one `result`, followed
+only by `system` records. With the fixes in place, the paired lift on `first-case` held
+on both models (with skill 1.0, without 0.0), and the two imported trigger cases ran
+through `skill-trigger-matrix --agent claude` for $0.13 of a $0.30 ceiling.
 
 ## Get real data: recorded runs and the trace bridge
 
@@ -211,9 +256,12 @@ every case, exits with `partialReason: "cost_ceiling"`, and costs $0. The opt-in
   it carries `i`; the importer sets `ci` from the flags rather than inheriting the
   harness's case-insensitive default, so a ported `regex` cannot pass on a match its
   author never accepted.
-- **Skill-fired checks stay off the baseline arm.** `skill_invoked` is imported with
-  `variants: ["with_skill"]` for the same reason `claude plugin eval` reports it
-  unscored, so the without-arm is not penalized for a skill it cannot load.
+- **Activation is measured as activation.** Skill graders become trigger cases, so a
+  skill-fired check is never an answer assertion the arm's own prompt decides.
+- **No imported check is dead on arrival.** A grader the default runners cannot satisfy
+  (a created file, a `Skill` tool call, a JSON-shaped `input_match`) is refused with a
+  reason, because an assertion that always fails is a verifier flaw, not a measurement.
+  The benchmark's `verifier_review` is the backstop that caught these on real runs.
 - **The recorded numbers are labelled as what they are.** One run per arm, one case, one
   model, from one account on one day. They prove the result contract and the trace
   bridge; they establish nothing about the fixture skill's lift.

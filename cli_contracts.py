@@ -13,6 +13,7 @@ from typing import Any
 
 from json_contracts import freeze_json_mapping, thaw_json_value
 from manifest_contracts import ExecutionVariant, ModelId, Split
+from review_contracts import ModelOrder
 
 
 class CLICommand(str, Enum):
@@ -195,6 +196,9 @@ class ValidatedLegacyCLIInvocation:
                 raise TypeError("judge-panel must be a repeated string option")
             judge_values.extend(ModelId.parse(item) for item in raw_judge_panel)
         judge_models = tuple(judge_values)
+        raw_model_order = arguments.get("model_order")
+        if raw_model_order is not None:
+            ModelOrder.parse(raw_model_order)
 
         for name in _POSITIVE_NUMBERS:
             value = arguments.get(name)

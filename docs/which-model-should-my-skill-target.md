@@ -94,6 +94,14 @@ against `case_flags`:
   skill, sets your ceiling on that tier. The `no objective lift` case flag names which
   cases have gone flat there; harder fixtures may reveal lift the easy cases hide.
 
+- **A weaker tier fully passes more runs than a stronger one** → be suspicious before
+  you celebrate. Declare the tiers with `benchmark --model-order weakest,...,strongest`
+  and read `model_order_check.inversions`: each names the case, arm, and pair, with a
+  one-sided Fisher exact `p_value`. A significant inversion in the `without_skill` arm
+  points at the harness (for example a tool policy that restricts the stronger model);
+  in the `with_skill` arm it can mean the skill over-constrains a stronger model, or a
+  verifier tuned to one model's phrasing. The harness never infers the order from names.
+
 A live worked example of the underlying effect already lives in the harness:
 [`tuning-skill-activation.md`](tuning-skill-activation.md)'s Haiku cell, where the
 identical skill that routed Sonnet and Opus 3/3 loaded on only 1 of 3 Haiku runs. That

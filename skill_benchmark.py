@@ -178,6 +178,19 @@ from manifest_contracts import (
     RunNumber,
     Split,
 )
+from review_contracts import (
+    AssertionOutcome,
+    AssertionRole,
+    ModelOrder,
+    RunPass,
+    RunRef,
+    formatting_relaxed_text,
+    model_order_check,
+    model_order_not_declared,
+    suspicion_summary,
+    verdict_mapping,
+    verifier_suspicions,
+)
 from spend_contracts import (
     SPEND_LEDGER_NAME,
     PlannedSpendRow,
@@ -7999,8 +8012,7 @@ def _codex_trace_protocol_error(
 def _claude_trace_protocol_error(
     records: list[dict[str, Any]], pi_stream: PiStream | None,
 ) -> str | None:
-    terminals = [i for i, record in enumerate(records) if record.get("type") == "result"]
-    if terminals != [len(records) - 1]:
+    if claude_terminal_result_index(records) is None:
         return "Claude trace must contain exactly one final result event"
     return None
 
@@ -10768,6 +10780,25 @@ CLAUDE_USAGE_KEYS = {
 }
 
 
+# Record types Claude Code may emit after the terminal result event without
+# changing the session's outcome (observed: `system`/`task_summary`, 2.1.269).
+CLAUDE_POST_RESULT_RECORD_TYPES = frozenset({"system"})
+
+
+def claude_terminal_result_index(records: Sequence[Mapping[str, Any]]) -> int | None:
+    """The ONE owner of Claude's terminal-event rule, shared by the answer
+    parser and the trace dialect: exactly one `result` record, followed only
+    by informational `system` records. Anything else (no result, two results,
+    session content after the result) is None: the stream has no final word."""
+    results = [i for i, record in enumerate(records) if record.get("type") == "result"]
+    if len(results) != 1:
+        return None
+    trailing = records[results[0] + 1:]
+    if any(record.get("type") not in CLAUDE_POST_RESULT_RECORD_TYPES for record in trailing):
+        return None
+    return results[0]
+
+
 def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     """Parse `claude -p` output in either output format.
 
@@ -10789,11 +10820,16 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
         if errors:
             return {"answer": "", "raw_response": text, "cost_usd": None,
                     "usage": {}, "parse_error": f"malformed Claude stream: {errors[0]}"}
-        if len(results) != 1 or not records or records[-1] is not results[0]:
+        if len(results) != 1:
             return {"answer": "", "raw_response": text, "cost_usd": None,
                     "usage": {}, "parse_error": (
                         "Claude stream must contain exactly one terminal result event")}
-        env = results[0]
+        terminal_index = claude_terminal_result_index(records)
+        if terminal_index is None:
+            return {"answer": "", "raw_response": text, "cost_usd": None,
+                    "usage": {}, "parse_error": (
+                        "Claude stream carries session content after its terminal result event")}
+        env = records[terminal_index]
     else:
         if isinstance(single, dict):
             env = single
@@ -14036,6 +14072,12 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
         for row in results
         if row.get("grading_availability") != "complete"
     ]
+    raw_review = report.get("verifier_review")
+    review: dict[str, Any] = dict(raw_review) if isinstance(raw_review, dict) else {}
+    suspects: dict[tuple[Any, Any, Any, Any], list[str]] = {
+        (item.get("case_id"), item.get("model"), item.get("variant"), item.get("run_number")): list(item.get("suspects", []))
+        for item in review.get("review_queue", []) or [] if isinstance(item, dict)
+    }
     taxonomy: dict[str, dict[str, Any]] = {}
     for r in results:
         if r.get("missing_output"):
@@ -14055,6 +14097,8 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
             "run_base": r.get("run_base"), "category": category,
             "objective_pass_rate": r.get("objective_pass_rate"), "combined_pass_rate": r.get("combined_pass_rate"),
             "first_failure": ff, "note": "",   # open-text slot for a human annotation
+            "verifier_suspects": suspects.get(
+                (r.get("case_id"), r.get("model"), r.get("variant"), r.get("run_number", 1)), []),
         }
         queue.append(entry)
         bucket = taxonomy.setdefault(category, {"category": category, "count": 0, "example_case": r.get("case_id"), "example_evidence": (ff or {}).get("evidence", "")})
@@ -14069,9 +14113,14 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
         for flag in cf.get("flags", []):
             key = flag.split(":")[0].strip() if ":" in flag else flag
             flag_hist[key] = flag_hist.get(key, 0) + 1
+    # Runs the report's verifier review suspects go first: their failure may
+    # belong to the eval rather than the model.
+    queue.sort(key=lambda entry: not entry["verifier_suspects"])
     observed = {
-        "summary": {"failing_or_errored_runs": total, "distinct_categories": len(ranked)},
+        "summary": {"failing_or_errored_runs": total, "distinct_categories": len(ranked),
+                    "verifier_suspect_runs": sum(1 for entry in queue if entry["verifier_suspects"])},
         "taxonomy": ranked,
+        "verifier_signals": review.get("signals", {}),
         "case_flag_histogram": dict(sorted(flag_hist.items(), key=lambda kv: (-kv[1], kv[0]))),
         "review_queue": queue[:limit],
         "review_queue_truncated": max(0, total - limit),
@@ -17252,6 +17301,7 @@ def build_benchmark_report(
     allow_scripts: bool = False,
     strict: bool = False,
     embed_cmd: str | None = None,
+    model_order: ModelOrder | None = None,
 ) -> dict[str, Any]:
     manifest = validate_manifest(path)
     variants = variants_arg or manifest.get("variants", DEFAULT_VARIANTS)
@@ -17504,6 +17554,11 @@ def build_benchmark_report(
         # deltas, ablation marginal cost, and separated judge spend.
         "cost_summary": cost_surface,
         "case_flags": case_flags_surface,
+        # Eval-quality diagnostics: runs whose failure may be the verifier's,
+        # and weaker-beats-stronger model orderings. Evidence for review over
+        # observed verdicts; neither changes a pass rate.
+        "verifier_review": verifier_review_block(results, selected_cases),
+        "model_order_check": model_order_block(results, model_order),
         "case_flags_availability": (
             "partial" if observed_case_flags is not None else "complete"),
         **({"observed_case_flags": observed_case_flags}
@@ -17512,8 +17567,97 @@ def build_benchmark_report(
     }
 
 
+# Text assertion types whose failures are re-checked with formatting relaxed.
+# Negative checks (excludes_any, not_regex) are never relaxed: relaxing an
+# absence check makes it stricter, which is not evidence about the verifier.
+FORMAT_NEAR_MISS_TYPES = frozenset({"contains", "contains_any", "contains_all", "regex"})
+
+
+def format_near_miss(definition: Mapping[str, Any], text: str) -> bool:
+    """Whether a failed text assertion passes once case and markdown
+    formatting are ignored, through the same bounded matcher that graded it."""
+    try:
+        relaxed = parse_human_text_assertion({**definition, "ci": True})
+        if not isinstance(relaxed, (LiteralTextAssertion, RegexTextAssertion)):
+            return False
+        return relaxed.evaluate(formatting_relaxed_text(text)).passed is True
+    except (RegexEvaluationUnavailable, TypeError, ValueError):
+        return False
+
+
+def _review_run_ref(row: Mapping[str, Any]) -> RunRef:
+    try:
+        return RunRef.parse(row.get("case_id"), row.get("variant"), row.get("run_number", 1), row.get("model"))
+    except (TypeError, ValueError) as exc:
+        die(f"graded row carries an invalid run identity: {exc}")
+
+
+def verifier_review_block(results: Sequence[Mapping[str, Any]], cases: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Adapt graded rows into AssertionOutcome values and summarize the
+    verifier suspicions (review_contracts owns the signals)."""
+    definitions = {
+        str(case.get("id")): {str(a.get("name")): a for a in (case.get("assertions") or []) if isinstance(a, Mapping)}
+        for case in cases
+    }
+    outcomes: list[AssertionOutcome] = []
+    for row in results:
+        if not scorable_run(row):
+            continue
+        run = _review_run_ref(row)
+        text: str | None = None
+        for entry in row.get("assertions", []) or []:
+            verdict = verdict_mapping(entry)
+            if verdict is None or not isinstance(entry.get("name"), str):
+                continue
+            passed, gate = verdict
+            near = False
+            definition = definitions.get(str(row.get("case_id")), {}).get(entry["name"])
+            if not passed and entry.get("type") in FORMAT_NEAR_MISS_TYPES and definition is not None:
+                if text is None:
+                    try:
+                        text = read_output_base(Path(str(row.get("run_base") or "")))[0] or ""
+                    except (OSError, ValueError):
+                        text = ""
+                near = bool(text) and format_near_miss(definition, text)
+            outcomes.append(AssertionOutcome(run, entry["name"], AssertionRole.OBJECTIVE, gate, passed, near))
+        for entry in row.get("qualitative_assertions", []) or []:
+            verdict = verdict_mapping(entry)
+            if verdict is None or not isinstance(entry.get("name"), str):
+                continue
+            passed, gate = verdict
+            outcomes.append(AssertionOutcome(run, entry["name"], AssertionRole.QUALITATIVE, gate, passed))
+    return suspicion_summary(verifier_suspicions(outcomes))
+
+
+def model_order_block(results: Sequence[Mapping[str, Any]], order: ModelOrder | None) -> dict[str, Any]:
+    """A run counts as passed only when it is scorable, not vetoed, and passed
+    every objective gate. Runs with a blocked objective assertion are left
+    out (their objective verdict is unknown); a pending judge is not, since
+    this check reads objective gates only. The order is never inferred."""
+    if order is None:
+        return model_order_not_declared()
+    passes: list[RunPass] = []
+    for row in results:
+        rate = row.get("objective_pass_rate")
+        if (not scorable_run(row) or row.get("blocked_assertions")
+                or isinstance(rate, bool) or not isinstance(rate, (int, float))):
+            continue
+        passes.append(RunPass(_review_run_ref(row), rate == 1 and not row.get("vetoed")))
+    return model_order_check(passes, order).to_dict()
+
+
+def model_order_from_args(args: argparse.Namespace) -> ModelOrder | None:
+    raw = getattr(args, "model_order", None)
+    if raw is None:
+        return None
+    try:
+        return ModelOrder.parse(raw)
+    except (TypeError, ValueError) as exc:
+        die(f"--model-order: {exc}")
+
+
 def benchmark(args: argparse.Namespace) -> int:
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None), model_order=model_order_from_args(args))
     emit_report(report, args.out)
     return 0
 
@@ -18828,6 +18972,24 @@ PLUGIN_EVAL_GRADER_TYPES = frozenset({"regex", "tool_used", "tool_order", "file_
 PLUGIN_EVAL_SUITE_DIRS = frozenset({"results", "mocks"})
 PLUGIN_EVAL_EXECUTION_FIELDS = ("model", "max_turns", "timeout_seconds", "allowed_tools", "append_system_prompt", "env")
 PLUGIN_EVAL_DEFAULT_HARNESS_VERSION = ">=0.6.0"
+# An input_match written against the raw JSON input (`"key"\s*:` …), the form
+# the Claude Code docs recommend, can never match the harness's rendered text.
+PLUGIN_EVAL_JSON_INPUT_MATCH = re.compile(r'"(?:\\s[*+?])?\s*:')
+
+
+def plugin_eval_skill_expectation(grader: dict[str, Any]) -> bool | None:
+    """A `tool_used: Skill` grader's activation expectation: True for must
+    fire (min >= 1), False for must not fire (min 0 and max 0), None when the
+    grader is not a Skill grader or bounds a count the trigger population
+    cannot express."""
+    if grader.get("type") != "tool_used" or grader.get("tool") != "Skill":
+        return None
+    minimum, maximum = grader.get("min", 1), grader.get("max")
+    if minimum == 0 and maximum == 0:
+        return False
+    if isinstance(minimum, int) and not isinstance(minimum, bool) and minimum >= 1:
+        return True
+    return None
 
 
 def plugin_eval_manifest(plugin_root: Path) -> dict[str, Any]:
@@ -18965,8 +19127,9 @@ def _plugin_eval_target_note(target: Any) -> str | None:
     if target in (None, "last_message"):
         return None
     if isinstance(target, dict) and target.get("source") == "file":
-        return (f"reads the produced file {target.get('path')!r}; grade it here with "
-                "golden_output, structured_output, or a script oracle over outputs/")
+        return (f"reads the produced file {target.get('path')!r}; native runners keep only the final "
+                "answer (only Jetty persists outputs/), so ask for the file's content in the answer "
+                "and grade that with regex, golden_output, or structured_output")
     if target == "trace":
         return "reads the session trace; use command_ran/tool_call over events.json"
     if target == "files":
@@ -19024,22 +19187,26 @@ def plugin_eval_grader_to_assertion(
         minimum = grader.get("min", 1)
         maximum = grader.get("max")
         never = minimum == 0 and maximum == 0
+        input_match = grader.get("input_match")
         if tool == "Skill":
-            assertion = {"name": name, "type": "skill_invoked", "expected": not never}
-            if not never:
-                # Cannot fire on the no-skill arm — the same reason
-                # `claude plugin eval` reports it unscored in two-arm mode.
-                assertion["variants"] = ["with_skill"]
-            if grader.get("input_match"):
-                note("input_match", "skill_invoked checks that the manifest's skill loaded; the input_match regex is not applied")
-        elif never:
+            # Autonomous activation is its own population here: the answer
+            # arm's prompt instructs the model to read the skill, so a
+            # skill-fired check inside an answer case measures instruction
+            # following, and a must-not-fire check would fail by design.
+            # import_plugin_evals_data turns these graders into trigger cases.
+            note("trigger", "Skill graders measure autonomous activation; imported as a kind: trigger case, not an answer assertion")
+            return None, notes
+        if isinstance(input_match, str) and PLUGIN_EVAL_JSON_INPUT_MATCH.search(input_match):
+            note("input_match", f"input_match {input_match!r} is written against the raw JSON tool input; the harness matches rendered call text (tool name + input summary), so it could never match — rewrite it against events.json; nothing imported")
+            return None, notes
+        if never:
             assertion = {"name": name, "type": "tool_call", "tool": tool, "expected_no_call": True}
-            if grader.get("input_match"):
+            if input_match:
                 note("input_match", "expected_no_call matches the tool name only; input_match dropped")
         else:
             assertion = {"name": name, "type": "tool_call", "tool": tool}
-            if isinstance(grader.get("input_match"), str) and grader["input_match"]:
-                assertion["pattern"] = grader["input_match"]
+            if isinstance(input_match, str) and input_match:
+                assertion["pattern"] = input_match
                 note("input_match", "input_match is matched against the harness's rendered call text (tool name + input summary), not the raw JSON input; check it against events.json")
             if isinstance(minimum, int) and minimum > 1:
                 assertion["min_count"] = minimum
@@ -19055,22 +19222,23 @@ def plugin_eval_grader_to_assertion(
             if not isinstance(tool, str) or not tool:
                 note(key, f"tool_order {key} names no tool; nothing imported")
                 return None, notes
+            if tool == "Skill":
+                # Harness answer runs load a skill by reading its SKILL.md when
+                # instructed; no Skill tool call ever happens, so this order
+                # could never be satisfied (seen in the 2026-09-23 dogfood).
+                note("trigger", "tool_order on the Skill tool measures autonomous activation; answer runs load the skill by reading SKILL.md, so the order can never be satisfied; nothing imported")
+                return None, notes
             order.append(rf"\b{re.escape(tool)}\b")
             if isinstance(spec, dict) and spec.get("input_match"):
                 note("input_match", f"tool_order {key} input_match dropped; order matches tool names only")
         assertion = {"name": name, "type": "tool_call", "order": order}
     elif gtype == "file_exists":
-        path = grader.get("path")
-        if not isinstance(path, str) or not path:
-            note("path", "file_exists grader names no path; nothing imported")
-            return None, notes
-        if grader.get("exists") is False:
-            note("exists", "exists: false has no harness equivalent; nothing imported")
-            return None, notes
-        if any(char in path for char in "*?["):
-            note("path", f"glob {path!r} is not supported; name one file under outputs/")
-            return None, notes
-        assertion = {"name": name, "type": "file_exists", "path": f"outputs/{path}"}
+        # Native answer runners keep only the final answer and discard the
+        # workspace; only the Jetty runner persists outputs/. An imported
+        # file_exists would therefore fail in every arm on the default
+        # runners — a verifier flaw, not a measurement.
+        note("file output", f"file_exists {grader.get('path')!r} cannot pass on native runners, which keep only the final answer (only Jetty persists outputs/); ask for the file's content in the answer and grade that, or use a script oracle; nothing imported")
+        return None, notes
     elif gtype == "llm":
         focus_note = _plugin_eval_target_note(grader.get("focus"))
         if focus_note:
@@ -19142,6 +19310,7 @@ def import_plugin_evals_data(
             candidate = plugin_eval_manifest(plugin_root).get("name")
         skill_name = candidate if isinstance(candidate, str) and candidate.strip() else resolved_skills[0].parent.name
     cases: list[dict[str, Any]] = []
+    trigger_cases: list[dict[str, Any]] = []
     seen: dict[str, Path] = {}
     for case_dir in discover_plugin_eval_cases(eval_root):
         case = load_plugin_eval_case(case_dir, eval_root)
@@ -19153,11 +19322,34 @@ def import_plugin_evals_data(
             checklist.append({"case_id": case_id, "decision": "prompt", "note": "no prompt.md body or execution.prompt; case skipped"})
             continue
         assertions: list[dict[str, Any]] = []
+        expectations: set[bool] = set()
         for grader in case["graders"]:
+            expectation = plugin_eval_skill_expectation(grader)
+            if expectation is not None:
+                expectations.add(expectation)
             assertion, notes = plugin_eval_grader_to_assertion(grader, case_id)
             checklist.extend(notes)
             if assertion is not None:
                 assertions.append(assertion)
+        if len(expectations) == 1:
+            should_trigger = next(iter(expectations))
+            trigger_case = {
+                "id": f"{case_id}-trigger",
+                "split": split,
+                "kind": "trigger",
+                "should_trigger": should_trigger,
+                "prompt": case["prompt"],
+                "expected_behavior": [
+                    "The skill loads autonomously from its description alone."
+                    if should_trigger else
+                    "The skill does not load on this request."],
+            }
+            tags = case["fields"].get("tags")
+            if isinstance(tags, list) and tags:
+                trigger_case["tags"] = [str(tag) for tag in tags]
+            trigger_cases.append(trigger_case)
+        elif len(expectations) > 1:
+            checklist.append({"case_id": case_id, "decision": "trigger", "note": "Skill graders disagree on whether the skill should fire; no trigger case imported"})
         files, notes = _plugin_eval_case_files(case, manifest_dir)
         checklist.extend(notes)
         entry: dict[str, Any] = {
@@ -19175,9 +19367,10 @@ def import_plugin_evals_data(
         if files:
             entry["files"] = files
         entry["assertions"] = assertions
-        cases.append(entry)
-        if not assertions:
-            checklist.append({"case_id": case_id, "decision": "assertions", "note": "no grader survived the import; the case has nothing to grade"})
+        if assertions:
+            cases.append(entry)
+        else:
+            checklist.append({"case_id": case_id, "decision": "assertions", "note": "no answer grader survived the import; no answer case imported" + (" (its trigger case was)" if len(expectations) == 1 else "")})
         runs = case["fields"].get("runs")
         if isinstance(runs, int) and not isinstance(runs, bool) and runs != 3:
             checklist.append({"case_id": case_id, "decision": "runs", "note": f"runs: {runs} is a runner setting here: prepare --runs-per-variant {runs}"})
@@ -19190,6 +19383,7 @@ def import_plugin_evals_data(
         ):
             if case["context"].get(key):
                 checklist.append({"case_id": case_id, "decision": key, "note": text})
+    cases.extend(trigger_cases)
     if not cases:
         die(f"no importable cases under {eval_root}")
     manifest = {
@@ -21505,6 +21699,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
     p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
     p.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in)")
+    p.add_argument("--model-order", help="comma-separated models from weakest to strongest; flags cases where a weaker model fully passes more runs than a stronger one (never inferred from names)")
     p.add_argument("--out")
 
     p = sub.add_parser("report", help="serialize a benchmark.json for CI: JUnit XML or GitHub job-summary markdown + annotations")

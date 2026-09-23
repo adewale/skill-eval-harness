@@ -143,16 +143,31 @@ class GraderMappingTests(unittest.TestCase):
         self.assertIsNone(assertion)
         self.assertEqual(self.decisions(notes), ["pattern"])
 
-    def test_skill_grader_becomes_skill_invoked_scoped_to_the_with_arm(self):
+    def test_skill_graders_become_trigger_expectations_not_answer_assertions(self):
+        # The answer arm's prompt instructs the model to read the skill, so a
+        # skill-fired check there measures instruction following and a
+        # must-not-fire check fails by design (seen in the 2026-09-23 dogfood).
+        for grader, expected in (
+            ({"type": "tool_used", "tool": "Skill"}, True),
+            ({"type": "tool_used", "tool": "Skill", "min": 2}, True),
+            ({"type": "tool_used", "tool": "Skill", "min": 0, "max": 0, "arm": "both"}, False),
+            ({"type": "tool_used", "tool": "Skill", "min": 0, "max": 3}, None),
+            ({"type": "tool_used", "tool": "Bash"}, None),
+            ({"type": "regex", "pattern": "x"}, None),
+        ):
+            self.assertIs(sb.plugin_eval_skill_expectation(grader), expected, grader)
         assertion, notes = self.convert(type="tool_used", tool="Skill", input_match='"skill"\\s*:\\s*"tidy-commit"')
-        self.assertEqual(assertion["type"], "skill_invoked")
-        self.assertTrue(assertion["expected"])
-        self.assertEqual(assertion["variants"], ["with_skill"])
+        self.assertIsNone(assertion)
+        self.assertEqual(self.decisions(notes), ["trigger"])
+
+    def test_json_shaped_input_match_is_refused_not_imported_as_a_dead_pattern(self):
+        # Rendered call text for a real Claude Skill call is "probe-plugin:tidy-commit Skill";
+        # a regex over the raw JSON input can never match it.
+        assertion, notes = self.convert(type="tool_used", tool="Bash", input_match='"command"\\s*:\\s*"npm test"')
+        self.assertIsNone(assertion)
         self.assertEqual(self.decisions(notes), ["input_match"])
-        never, notes = self.convert(type="tool_used", tool="Skill", min=0, max=0, arm="both")
-        self.assertFalse(never["expected"])
-        self.assertNotIn("variants", never)      # graded on both arms, as `arm: both` means
-        self.assertEqual(notes, [])
+        plain, notes = self.convert(type="tool_used", tool="Bash", input_match="npm test")
+        self.assertEqual(plain["pattern"], "npm test")
 
     def test_other_tools_become_tool_call_with_bounds(self):
         assertion, notes = self.convert(type="tool_used", tool="Bash", input_match="npm test", min=2, max=4)
@@ -170,13 +185,19 @@ class GraderMappingTests(unittest.TestCase):
         self.assertEqual(self.decisions(notes), ["min"])
 
     def test_tool_order_file_exists_llm_baseline_and_weight(self):
-        order, notes = self.convert(type="tool_order", before="Read", after={"tool": "Skill", "input_match": "tidy"})
-        self.assertEqual(order["order"], ["\\bRead\\b", "\\bSkill\\b"])
+        order, notes = self.convert(type="tool_order", before="Read", after={"tool": "Bash", "input_match": "npm"})
+        self.assertEqual(order["order"], ["\\bRead\\b", "\\bBash\\b"])
         self.assertEqual(self.decisions(notes), ["input_match"])
+        # No Skill tool call exists in harness answer runs (the 2026-09-23 dogfood
+        # saw this order fail 4 of 4 runs across both models and arms).
+        skill_order, notes = self.convert(type="tool_order", before="Read", after={"tool": "Skill"})
+        self.assertIsNone(skill_order)
+        self.assertEqual(self.decisions(notes), ["trigger"])
+        # Native runners discard the workspace, so a file grader would fail in
+        # every arm; it goes on the checklist instead.
         exists, notes = self.convert(type="file_exists", path="CHANGELOG.md")
-        self.assertEqual(exists["path"], "outputs/CHANGELOG.md")
-        self.assertIsNone(self.convert(type="file_exists", path="*.md")[0])
-        self.assertIsNone(self.convert(type="file_exists", path="x", exists=False)[0])
+        self.assertIsNone(exists)
+        self.assertEqual(self.decisions(notes), ["file output"])
         judge, notes = self.convert(type="llm", criteria="PASS if ...\nFAIL if ...", weight=2)
         self.assertEqual(judge["type"], "judge")
         self.assertEqual(judge["rubric"], ["PASS if ...\nFAIL if ..."])
@@ -206,20 +227,24 @@ class ImportCommandTests(unittest.TestCase):
             self.assertEqual(manifest["skill_paths"], ["skills/tidy-commit/SKILL.md"])
             self.assertEqual(manifest["source"], {"format": "claude-plugin-eval", "eval_dir": "evals"})
             cases = {c["id"]: c for c in manifest["cases"]}
-            self.assertEqual(set(cases), {"first-case", "changelog-from-diff", "ignores-unrelated-request"})
+            self.assertEqual(set(cases), {"first-case", "changelog-from-diff", "ignores-unrelated-request",
+                                          "first-case-trigger", "ignores-unrelated-request-trigger"})
             self.assertEqual(cases["changelog-from-diff"]["files"], ["grouped/changelog-from-diff/resources/change.diff"])
             self.assertEqual(cases["changelog-from-diff"]["expected_behavior"],
                              ["A CHANGELOG.md entry under Unreleased plus a conventional commit line."])
             self.assertEqual([a["type"] for a in cases["changelog-from-diff"]["assertions"]],
-                             ["judge", "tool_call", "file_exists", "not_regex"])
-            self.assertEqual({a["type"] for a in cases["ignores-unrelated-request"]["assertions"]},
-                             {"regex", "skill_invoked"})
+                             ["judge", "not_regex"])
+            self.assertEqual([a["type"] for a in cases["first-case"]["assertions"]], ["regex"])
+            self.assertEqual([a["type"] for a in cases["ignores-unrelated-request"]["assertions"]], ["regex"])
+            self.assertEqual((cases["first-case-trigger"]["kind"], cases["first-case-trigger"]["should_trigger"]), ("trigger", True))
+            self.assertEqual(cases["ignores-unrelated-request-trigger"]["should_trigger"], False)
+            self.assertEqual(cases["first-case-trigger"]["prompt"], cases["first-case"]["prompt"])
             self.assertTrue(all(c["split"] == "tune" for c in cases.values()))
             checklist = json.loads(checklist_path.read_text(encoding="utf-8"))["checklist"]
             self.assertEqual(
                 {item["decision"] for item in checklist},
-                {"input_match", "runner limits", "weight", "judge", "baseline", "target",
-                 "runs", "scaffold_script", "splits", "ablations"},
+                {"trigger", "runner limits", "weight", "judge", "baseline", "target",
+                 "file output", "runs", "scaffold_script", "splits", "ablations"},
             )
             # the manifest can go straight into the offline pipeline
             self.assertEqual(sb.prompt_assertion_leakage_findings(manifest, out), [])

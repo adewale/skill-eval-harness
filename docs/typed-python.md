@@ -35,6 +35,7 @@ Ruff-checked, byte-compiled, and executed on every supported Python version.
 | assertion and deferred judge rows | `AssertionObservation`, `JudgeTask` | `grading_contracts.py` |
 | provider telemetry | availability/provenance/comparability domain values | `telemetry.py` |
 | report population and rates | `ReportCohort`, `UnitRate` | `report_contracts.py` |
+| eval-quality review | `VerifierSignal`, `AssertionOutcome`, `VerifierSuspicion`, `ModelOrder`, `ModelOrderInversion` | `review_contracts.py` |
 | runtime spend ceiling | `SpendPolicy`, `SpendLedger`, `ObservedCharge | AssumedCharge`, `UnpricedRun`, `PlannedSpendRow` | `spend_contracts.py` |
 | rendered human text and matching | normalized text/assertion values | `text_contracts.py` |
 | Gemini JSON and stream JSONL | frozen provider response/event values | `gemini_contracts.py` |

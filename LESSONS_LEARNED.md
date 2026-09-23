@@ -2,6 +2,29 @@
 
 This file records durable lessons from building and using the shared skill evaluation harness across Adewale’s skill repos. Keep it practical: each lesson should change how the harness, manifests, or skill iteration process is run next time.
 
+## 2026-09-23 — An importer is a verifier; dogfood it on real runs
+
+**Problem:** `import-plugin-evals` passed every offline test, yet on the first real Claude
+run three of its imported checks could never pass: a `file_exists` (native runners keep
+only the final answer), a `tool_order` on the `Skill` tool (answer runs load a skill by
+reading `SKILL.md`), and a must-not-fire Skill check (the with-skill prompt tells the model
+to read the skill). The same run found that `run-claude` rejected every stream from
+Claude Code 2.1.269 because a `system` record now follows the terminal `result`.
+
+**Lesson:** A translated check is only as good as its fit to the runner that executes it.
+An assertion that always fails is a verifier flaw, and it silently caps measurable lift.
+
+**Rule:**
+- Refuse a translated check the default runners cannot satisfy; put the reason on the
+  checklist instead of emitting a dead assertion.
+- Keep activation checks in the trigger population, never inside an answer case whose
+  prompt instructs the model to load the skill.
+- Run a new import path end to end on real runs, under a spend ceiling, before calling it
+  done; `verifier_review` (`never_passes`, `oracle_disagreement`) is the backstop that
+  caught all three on 2026-09-23.
+- One function owns a provider's terminal-event rule; the answer parser and the trace
+  dialect had two copies, and both broke on the same version bump.
+
 ## 2026-09-12 — A spend ceiling is a stop rule, not a partial-result flag
 
 **Problem:** Claude Code's `claude plugin eval --max-cost-usd` stops launching runs at a

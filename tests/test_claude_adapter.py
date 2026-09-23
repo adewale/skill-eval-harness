@@ -93,6 +93,38 @@ class ParseClaudeStreamTests(unittest.TestCase):
         self.assertEqual(p["answer"], "")
         self.assertIsNotNone(p["parse_error"])
 
+    def test_system_records_after_the_result_are_tolerated(self):
+        # Claude Code 2.1.269 appends `system`/`task_summary` after the result
+        # (observed in a real run on 2026-09-23); the envelope is still final.
+        records = claude_stream_records() + [
+            {"type": "system", "subtype": "task_summary", "session_id": "stub"}]
+        p = sb.parse_claude_cli_json(stream_text(records))
+        self.assertIsNone(p["parse_error"])
+        self.assertEqual((p["answer"], p["cost_usd"]), ("All tests pass.", 0.05))
+
+    def test_parser_and_trace_dialect_share_one_terminal_rule(self):
+        tolerated = claude_stream_records() + [{"type": "system", "subtype": "task_summary"}]
+        rejected = claude_stream_records() + [{"type": "assistant", "message": {"content": []}}]
+        self.assertIsNotNone(sb.claude_terminal_result_index(tolerated))
+        self.assertIsNone(sb.claude_terminal_result_index(rejected))
+        self.assertIsNone(sb.claude_terminal_result_index(claude_stream_records(result_event=False)))
+        dialect = sb.trace_dialect_for("claude")
+        self.assertIsNone(dialect.protocol_error(tolerated, None))
+        self.assertIsNotNone(dialect.protocol_error(rejected, None))
+        _, metrics = sb.normalize_trace_records(tolerated, source="claude")
+        self.assertTrue(metrics["skill_invoked"])
+
+    def test_session_content_after_the_result_is_protocol_invalid(self):
+        for trailing in (
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "late"}]}},
+            {"type": "user", "message": {"role": "user", "content": "more"}},
+            {"type": "rate_limit_event"},
+        ):
+            with self.subTest(trailing=trailing["type"]):
+                p = sb.parse_claude_cli_json(stream_text(claude_stream_records() + [trailing]))
+                self.assertEqual(p["answer"], "")
+                self.assertIn("after its terminal result event", p["parse_error"])
+
     def test_malformed_line_before_terminal_result_is_protocol_invalid(self):
         text = "not-json\n" + stream_text(claude_stream_records())
         p = sb.parse_claude_cli_json(text)

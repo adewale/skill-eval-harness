@@ -19,6 +19,8 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 | Does the agent discover/load the skill when it should, and stay quiet when it should not? | `skill-trigger-matrix` or `skill-pi-trigger-eval`, split by should-fire / should-not-fire cases. |
 | Which model tier should this skill target? | `prepare --models`, then `benchmark` `by_model` and `model_analysis`. |
 | Is this eval safe to spend model budget on? | `validate --strict-leakage --leakage-min-chars 1 --check-ablations` and `audit-manifest --fail-on-blockers`. |
+| Is this failure the model's, or the eval's? | `benchmark`'s `verifier_review` (never-passing checks, formatting near misses, judge disagreement) and `error-analysis`, which puts those runs first. |
+| Does a weaker model beat a stronger one, which usually means the harness or verifier is wrong? | `benchmark --model-order weakest,...,strongest` and its `model_order_check`. |
 | Can I trust this LLM judge or rubric result? | `judge`, `compare-judges`, `judge-robustness`, and `judge-alignment`. |
 | Could the eval be contaminated by leaked answer keys or memorized canaries? | Prompt leakage lint plus `contamination` over generated outputs. |
 | Can this become a CI gate? | `suite-run`, `report --format junit|github`, and readiness blockers from `audit-manifest`. |
