@@ -2,6 +2,82 @@
 
 This file records durable lessons from building and using the shared skill evaluation harness across Adewale’s skill repos. Keep it practical: each lesson should change how the harness, manifests, or skill iteration process is run next time.
 
+## 2026-09-24 — Budget small real runs; the ceiling makes them safe
+
+**Problem:** Across one session, 1,300+ offline tests passed while every real run found
+something they had missed: a Claude stream change that failed every `run-claude` run, three
+imported checks that could never pass, a trigger detector reporting 0/3 for 3/3, and a
+per-assertion model inversion. About $3 of capped Claude runs found all of it.
+
+**Lesson:** Offline tests prove a component agrees with itself. Only a real run proves it
+measures something. With a spend ceiling, real runs are cheap and bounded enough to be a
+routine step, not a special occasion.
+
+**Rule:**
+- Before calling a runner, importer, or report signal done, run it end to end on real
+  outputs under `--max-cost-usd`, starting with one or two runs per cell.
+- Keep the first real failure cheap: a run whose cost cannot be seen stops the loop, so a
+  broken adapter costs one run, not a suite.
+- Turn each real finding into a recorded fixture (`tests/fixtures/eval-quality/`,
+  `tests/fixtures/plugin-evals/recorded/`) with a test that asserts it, so the signal stays
+  proven on real model text rather than on synthetic strings.
+
+## 2026-09-24 — Design review signals against real data, not imagined failures
+
+**Problem:** The first `model_order_check` compared only runs that passed every gate. On 36
+real runs it reported no inversion while one assertion passed Haiku 3/3 and Sonnet 0/3
+(p = 0.05): Haiku habitually writes `**Severity: Blocking**`, which contains the exact
+string the check demanded, and Sonnet phrases it three other ways. Neither model fully
+passed the case, so the coarse view was blind to it.
+
+**Lesson:** A verifier can be tuned to one model's phrasing, and the resulting pass rate
+reads as a capability difference. Signals designed before looking at real outputs tend to
+aggregate at the wrong grain.
+
+**Rule:**
+- Compare models per assertion as well as per run; an inversion on one check is often
+  the most useful finding.
+- Treat two independent signals on the same check (for example `never_passes` plus a judge
+  passing the same runs) as strong evidence of a verifier flaw; either alone is a prompt to
+  read the output.
+- Read a handful of real outputs for each new signal before fixing its aggregation.
+
+## 2026-09-24 — Record isolation with every activation number
+
+**Problem:** The real Claude trigger runs reported `config_isolated: false`: Claude OAuth
+credentials were not portable into a fresh config, so the model also saw this machine's
+other installed skills, which compete for routing. Separately, the harness mounts skills
+under flattened keys (`skills_tidy-commit_SKILL.md`), which is the name Claude Code shows
+the model, not the name a real deployment would show.
+
+**Lesson:** An activation rate is a property of skill, model, CLI version, and environment.
+A number measured without isolation, or under a name users never see, is not comparable to
+one measured with it.
+
+**Rule:**
+- Keep `config_isolated` and its warning on every trigger row, and do not compare isolated
+  and unisolated rates.
+- Prefer API-key authentication for trigger measurements, which lets the config be
+  isolated.
+- State the CLI version and the mounted skill name next to any activation number quoted in
+  docs.
+
+## 2026-09-24 — Apply correctness by construction at design time, not as a cleanup
+
+**Problem:** The spend ceiling took three passes: a first version with loop-local
+counters, a correctness-by-construction rework that found an unpriced run vanishing from the
+total, and a third pass for concurrent admission. The Claude terminal-event rule had two
+copies, in the answer parser and the trace dialect, and both broke on the same version bump.
+
+**Lesson:** The repo's construction rule (wire data, smart constructor, one closed variant,
+derived claims, re-parsed persistence) catches real bugs, but only once applied. Applied
+after the fact, it costs a rewrite.
+
+**Rule:**
+- Before writing a new stateful loop or a new provider rule, name its single owner and its
+  closed states, and write the contradiction tests first.
+- When the same rule appears in two places, extract one function before fixing either.
+
 ## 2026-09-23 — A zero across every model is a detector symptom first
 
 **Problem:** `skill-trigger-matrix --agent claude` reported 0/3 should-fire on both
