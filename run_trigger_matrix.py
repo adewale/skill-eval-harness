@@ -169,7 +169,17 @@ SENSITIVE_WORKSPACE_FILES = (
     ".pi-config/APPEND_SYSTEM.md",
     ".vibe-home/.env",
 )
-SENSITIVE_ENV_VARS = ("MISTRAL_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN")
+SENSITIVE_ENV_VARS = ("MISTRAL_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN",
+                      "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+# Claude Code authenticates from these without any config file, so a fresh,
+# empty CLAUDE_CONFIG_DIR still logs in (verified 2026-09-24 on 2.1.281 behind
+# an ANTHROPIC_BASE_URL auth proxy). A wrong guess fails closed: the run
+# reports a provider failure and is an incomplete observation.
+CLAUDE_ENV_AUTH_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                        "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX")
+# Environment-managed skill sources that would put an organization's skills in
+# front of the model beside the one under test; dropped from isolated runs.
+CLAUDE_ENV_SKILL_SOURCES = ("CLAUDE_CODE_SYNC_SKILLS",)
 
 
 def mounted_skill_names(copied: list[Path]) -> list[str]:
@@ -177,9 +187,11 @@ def mounted_skill_names(copied: list[Path]) -> list[str]:
     SKILL.md declares (parsed with the harness's real frontmatter parser) and
     the directory it is mounted under. Claude Code 2.1.269 lists and invokes
     project skills by directory name (observed 2026-09-23: `Skill` called with
-    `skills_tidy-commit_SKILL.md`), while older builds and other agents used
-    the declared name, so both are load evidence. Each is an exact-match
-    needle; a name in prose or another skill firing never matches."""
+    `skills_tidy-commit_SKILL.md`, the pre-v3 flattened mount key), while
+    older builds and other agents used the declared name, so both are load
+    evidence. Mounts now use the skill's own directory name, so the two
+    usually coincide. Each is an exact-match needle; a name in prose or
+    another skill firing never matches."""
     names: list[str] = []
     for p in copied:
         skill_md = p if p.name == "SKILL.md" else p / "SKILL.md"
@@ -242,6 +254,20 @@ def vibe_stream_protocol_error(stdout: str) -> str | None:
                        and bool(records[-1]["content"].strip()))
     if not terminal_answer:
         return "Vibe JSON stream must end with one non-empty assistant response"
+    return None
+
+
+def claude_competing_skills(stdout: str, workspace: Path) -> list[str] | None:
+    """The skills Claude Code's init event offered the model, minus the ones
+    this run mounted; None when the stream carries no init event."""
+    mounted_dir = workspace / ".claude" / "skills"
+    mounted = {path.name for path in mounted_dir.iterdir() if path.is_dir()} if mounted_dir.is_dir() else set()
+    for event in iter_json_objects(stdout):
+        if isinstance(event, dict) and event.get("type") == "system" and event.get("subtype") == "init":
+            skills = event.get("skills")
+            if not isinstance(skills, list):
+                return None
+            return sorted({str(skill) for skill in skills if isinstance(skill, str)} - mounted)
     return None
 
 
@@ -430,16 +456,17 @@ class ClaudeAdapter(AgentAdapter):
             "command": executable_identity(self.claude_bin),
             "max_turns": self.max_turns,
             "allowed_tools": ["Skill", "Read", "Glob", "Grep"],
-            "isolation_policy": "isolated config when portable auth exists; otherwise normal config",
+            "isolation_policy": "isolated config and no synced skills when auth is portable (env or credentials file); otherwise normal config",
             "required_observations": {"config_isolated": True},
         }
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
-        # Use a fresh config dir when auth is portable, so personal config does
-        # not bleed into the run. Claude Code's current OAuth/keychain login is
-        # not file-seedable; pointing CLAUDE_CONFIG_DIR at an empty directory
-        # turns a valid login into "not logged in", so preserve the normal CLI
-        # config path in that case.
+        # Use a fresh config dir when auth is portable (env credentials, or a
+        # seedable credentials file), so personal config and synced org skills
+        # do not compete with the skill under test. Claude Code's OAuth/keychain
+        # login is not file-seedable; pointing CLAUDE_CONFIG_DIR at an empty
+        # directory turns a valid login into "not logged in", so preserve the
+        # normal CLI config path in that case and say so in the metadata.
         config_dir = workspace / ".trigger-config"
         argv = [self.claude_bin, "-p", query, "--output-format", "stream-json", "--verbose",
                 "--max-turns", str(self.max_turns),
@@ -448,8 +475,11 @@ class ClaudeAdapter(AgentAdapter):
             argv += ["--model", model]
         env = os.environ.copy()
         config_isolated = False
-        if os.environ.get("ANTHROPIC_API_KEY") or seed_claude_config_dir(config_dir):
+        if any(os.environ.get(name) for name in CLAUDE_ENV_AUTH_VARS) or seed_claude_config_dir(config_dir):
+            config_dir.mkdir(parents=True, exist_ok=True)
             env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+            for name in CLAUDE_ENV_SKILL_SOURCES:
+                env.pop(name, None)
             config_isolated = True
         result = validate_invoke_result(
             self.name, self._run_argv(ProcessInvocationPlan.from_values(
@@ -457,6 +487,10 @@ class ClaudeAdapter(AgentAdapter):
                 environment=env))
         )
         metadata: dict[str, Any] = {"config_isolated": config_isolated}
+        competing = claude_competing_skills(result.stdout, workspace)
+        if competing is not None:
+            # Evidence, not inference: every other skill the model was offered.
+            metadata["competing_skills"] = competing
         if not config_isolated:
             metadata["config_isolation_warning"] = (
                 "Claude OAuth/keychain auth was not portable; preserved the normal Claude config, "

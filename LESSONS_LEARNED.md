@@ -62,6 +62,19 @@ one measured with it.
 - State the CLI version and the mounted skill name next to any activation number quoted in
   docs.
 
+**Follow-up (same day):** Environment auth turned out to be portable: with
+`ANTHROPIC_BASE_URL` or a key set, an empty `CLAUDE_CONFIG_DIR` authenticates, so the
+matrix now isolates in that case too. Isolation alone was not enough, because
+`CLAUDE_CODE_SYNC_SKILLS` injected the organization's skills into the fresh config, so
+isolated runs drop it. Skills now mount under their own directory name (trigger identity
+v3). The first isolated run then failed every cell at once: the adapter's new
+`competing_skills` metadata was also copied into the row by hand, and the row contract
+refused the duplicate field. A test that drives the full matrix row path now covers it.
+Re-running the tuning guide's July matrix this way read Haiku 3/3 where July read 1/3, even
+with the weaker description. The CLI, mount name, and isolation all changed between the
+two runs, so the published number is now labelled as dated evidence instead of a property
+of the description.
+
 ## 2026-09-24 — Apply correctness by construction at design time, not as a cleanup
 
 **Problem:** The spend ceiling took three passes: a first version with loop-local

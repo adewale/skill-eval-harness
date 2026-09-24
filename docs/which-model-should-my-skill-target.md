@@ -109,7 +109,8 @@ against `case_flags`:
 
 A live worked example of the underlying effect already lives in the harness:
 [`tuning-skill-activation.md`](tuning-skill-activation.md)'s Haiku cell, where the
-identical skill that routed Sonnet and Opus 3/3 loaded on only 1 of 3 Haiku runs. That
+identical skill that routed Sonnet and Opus 3/3 loaded on only 1 of 3 Haiku runs
+(2026-07-03; a 2026-09-24 re-run under a newer CLI and an isolated config read 3/3). That
 is the *activation* face of the same truth this journey measures on the *answer* face:
 the weakest tier you support sets the bound, and a skill's value is a property of
 `skill × model`, never of the skill alone.

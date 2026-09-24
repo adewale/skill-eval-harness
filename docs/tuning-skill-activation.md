@@ -56,11 +56,21 @@ claude   opus                3/3              3/3       6/6
 claude   sonnet              3/3              3/3       6/6
 ```
 
-Even this two-case demo skill shows the thesis: the identical description that
+Even this two-case demo skill showed the thesis: the identical description that
 routed Sonnet and Opus 3/3 loaded on only one of Haiku's three runs. A single-run
 smoke earlier the same day had that same Haiku cell pass 1/1 — one sample sat on
 the lucky side of a 1-in-3 rate and hid it. The JSON report keeps per-query
 trigger rates and per-run evidence for the cells that disagree.
+
+The same command re-run on 2026-09-24 (Claude Code CLI 2.1.281; the aliases resolved
+to `claude-haiku-4-5-20251001`, `claude-sonnet-5`, and `claude-opus-5-5`) read 3/3 and
+3/3 on every model, including Haiku, for $0.75. So did `--ablation weaker-description`,
+which strips the description's extra trigger hints. Three things changed between the two
+readings: the CLI version, the mounted name (the skill now mounts as `demo`, not
+`skills_demo_SKILL.md`), and isolation (every new row reports `config_isolated: true`,
+and `competing_skills` lists the 20 skills bundled with Claude Code). The runs cannot
+say which one moved Haiku. That is the point of the closing rule below: a published
+rate is dated evidence, not a property of the description.
 
 The same run is wired into a manual smoke test (it spends real tokens, so CI skips
 it):
@@ -123,15 +133,22 @@ Each rule below exists because its violation produced a wrong number at least on
   skill's name appearing in the answer text proves nothing — reading
   `good-readme/README.md` once looked like loading the `good-readme` skill.
 - **Re-check detection when the agent CLI changes.** Claude Code 2.1.269 invokes project
-  skills by directory name (`skills_tidy-commit_SKILL.md`), not the declared name. The
-  matrix reported 0/3 on Haiku and Sonnet for a skill a traced run showed being invoked;
-  with the directory name accepted, the same measurement read 3/3 on both (2026-09-23).
+  skills by directory name, not the declared name, and the harness then mounted skills
+  under a flattened path (`skills_tidy-commit_SKILL.md`). The matrix reported 0/3 on
+  Haiku and Sonnet for a skill a traced run showed being invoked; with the directory name
+  accepted, the same measurement read 3/3 on both (2026-09-23). Skills now mount under
+  their own directory name, the one a user's install shows.
   A sudden drop to zero across every model is a detector symptom before it is a
   description problem: run one cell with `--trace-runs` and read the `Skill` call.
 - **Isolate the sandbox, keep the harness.** Each run gets a fresh config dir so
   the experimenter's personal skills can't shadow the one under test. The agent's
   built-in skills stay, because your users run against them too — losing a routing
-  fight to a built-in is a real activation failure.
+  fight to a built-in is a real activation failure. Claude isolation needs portable
+  auth: an API key, auth token, OAuth token, or `ANTHROPIC_BASE_URL` in the environment,
+  or a copyable credentials file. A keychain login cannot move into a fresh config, so
+  those runs keep the normal config and say `config_isolated: false`. Isolated runs also
+  drop `CLAUDE_CODE_SYNC_SKILLS`, and every row lists the skills that competed as
+  `competing_skills`. Never compare an isolated rate with an unisolated one.
 - **A passing answer benchmark proves nothing about discovery.** The answer runners
   force-load the skill (`prepare` refuses to even emit trigger-case rows for them).
   Only an autonomous-trigger run measures whether the skill loads by itself.
@@ -194,6 +211,7 @@ reports it, and the same evidence-class stamp.
 
 The demo's Haiku cell is the method in miniature: one run said the description was
 fine, three runs put its Haiku trigger rate at 1-in-3, and only the matrix made the
-gap between those two readings visible. A rate measured today is only as durable as
+gap between those two readings visible. Twelve weeks later, under a newer CLI, a new
+mount name, and an isolated config, the same cell read 3/3. A rate measured today is only as durable as
 the description, the harness version, and the model behind it — which is why the
 loop ends with "re-run," not with a number.

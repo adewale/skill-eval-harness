@@ -44,7 +44,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Executor, Future, wait
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn, Protocol, TypeVar, cast
 
 # Direct ``python skill_benchmark.py`` execution must share the canonical module
@@ -233,7 +233,7 @@ from trigger_contracts import (
 from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 
 VALID_SPLITS = frozenset(Split.values())
-TRIGGER_HARNESS_IDENTITY_VERSION = 2
+TRIGGER_HARNESS_IDENTITY_VERSION = 3
 # Conservative at module granularity: skill_benchmark.py still combines trigger
 # and non-trigger orchestration, so every edit to that monolith invalidates the
 # trigger identity until its owners are extracted.
@@ -1220,6 +1220,10 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         die("manifest.skill_name is required")
     if not isinstance(manifest.get("skill_paths", []), list) or not manifest.get("skill_paths") or not all(isinstance(p, str) for p in manifest.get("skill_paths", [])):
         die("manifest.skill_paths must be a non-empty list of strings")
+    for label in ("skill_paths", "old_skill_paths"):
+        for first, second, key in skill_root_key_collisions([str(item) for item in manifest.get(label, []) or []]):
+            die(f"manifest.{label}: {first!r} and {second!r} both mount as skill directory {key!r}; "
+                "agents list skills by directory name, so rename one directory")
     variants = manifest.get("variants", DEFAULT_VARIANTS)
     if (not isinstance(variants, list) or len(variants) != len(set(variants))
             or set(variants) != {"with_skill", "without_skill"}):
@@ -2301,12 +2305,38 @@ def resolve_skill_root(comp: dict[str, Any], skill_paths: list[str]) -> str | No
 
 
 def _skill_root_key(rel: str) -> str:
-    """Sanitized directory name for a skill root inside a built tree. The SAME
-    function must name the canonical (with_skill) tree and the materialized pre-edit
-    tree, because _hash_tree includes this directory name — any divergence would make
+    """The directory a skill root is mounted under inside a built tree: the
+    skill's own directory name, sanitized. The SAME function must name the
+    canonical (with_skill) tree and the materialized pre-edit tree, because
+    _hash_tree includes this directory name — any divergence would make
     canonical_skill_tree_hash != the ablation's parent_skill_hash and break
-    TreeIdentity.same_revision_as."""
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", rel)
+    TreeIdentity.same_revision_as. Distinct roots that share a directory name
+    are rejected at validation (skill_root_key_collisions).
+
+    Agents list and invoke a skill by this name, so it matches what a user's
+    install shows. Before trigger identity v3 the key flattened the whole
+    manifest path (`skills_tidy-commit_SKILL.md`), and Claude Code 2.1.269+
+    showed the model that string as the skill's name. The key is hashed with
+    the tree, so the change moved every skill-tree hash."""
+    path = PurePosixPath(str(rel).replace("\\", "/"))
+    name = path.parent.name if (path.name == "SKILL.md" or "." in path.name) else path.name
+    key = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    if not key or key in {".", ".."}:
+        key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(rel))
+    return key
+
+
+def skill_root_key_collisions(paths: Sequence[str]) -> list[tuple[str, str, str]]:
+    """(first root, second root, shared key) for every pair of distinct skill
+    roots that would mount under the same directory name."""
+    seen: dict[str, str] = {}
+    collisions: list[tuple[str, str, str]] = []
+    for root in paths:
+        key = _skill_root_key(root)
+        if key in seen and seen[key] != root:
+            collisions.append((seen[key], root, key))
+        seen.setdefault(key, root)
+    return collisions
 
 
 def derived_population(components: list[dict[str, Any]]) -> str:

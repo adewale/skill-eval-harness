@@ -199,10 +199,16 @@ three times per model. The first pass reported the should-fire case at 0/3 on bo
 and Sonnet. A traced run showed the model *did* call `Skill`, under the mounted
 directory name `skills_tidy-commit_SKILL.md`; the detector only accepted the declared
 name `tidy-commit`. With both names accepted, the same measurement read 3/3 should-fire
-and 3/3 should-not-fire on both models, for $0.34 of a $1.20 ceiling. One caveat stands:
-these runs report `config_isolated: false`, because Claude OAuth credentials were not
-portable into a fresh config, so the machine's other installed skills were visible to
-the model and competed for routing.
+and 3/3 should-not-fire on both models, for $0.34 of a $1.20 ceiling. Those runs
+reported `config_isolated: false`, so the machine's other installed skills also competed
+for routing.
+
+The harness now mounts skills under their own directory name and isolates the Claude
+config whenever authentication comes from the environment. Re-run that way on 2026-09-24
+(Claude Code 2.1.281), every row reported `config_isolated: true`, the model called
+`Skill` with `tidy-commit`, and the result held at 3/3 and 3/3 on both models for $0.29.
+Each row's `competing_skills` listed the 20 skills bundled with Claude Code and none of
+the organization's synced skills.
 
 ## Get real data: recorded runs and the trace bridge
 
