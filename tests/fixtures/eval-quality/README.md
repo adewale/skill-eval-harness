@@ -21,3 +21,19 @@ models, both arms, three runs each) from Claude Code 2.1.269 on 2026-09-23, run 
 `tests/test_eval_quality_review.py` rebuilds the benchmark report from these files and
 asserts all three findings, so the signals stay proven on real model output rather than
 on synthetic strings.
+
+## Replication (`replication/`)
+
+`replication/` holds 36 more real outputs of the same case from 2026-09-24 (Claude Code
+2.1.281): Haiku, Sonnet, and Opus, both arms, six runs each, for $2.08 of a $4.00
+ceiling. Metadata is reduced the same way. The aliases resolved to
+`claude-haiku-4-5-20251001`, `claude-sonnet-5`, and `claude-opus-5-5`.
+
+| Finding | Replicated? |
+|---|---|
+| `verdict-line` / `never_passes` | Yes: 36 of 36 across all three models and both arms. With the skill every model writes `Verdict: Blocking`; without it Sonnet writes `Verdict: Cannot review` on all six runs, Haiku on four (the other two ask for the code and give no verdict), and Opus writes `**Verdict:** Request changes`, which the near-miss signal flags on all six runs |
+| `severity-exact` inversion | No: Haiku 3/6, Sonnet 2/6, Opus 2/6 with the skill (p = 0.5). Sonnet and Opus also write `**Severity: Blocking**` |
+
+At three runs per cell, 3-to-0 is the only split that reaches significance, and it lands
+exactly on p = 0.05, with no correction across the twelve per-assertion comparisons.
+The original finding was a lead, not a result.

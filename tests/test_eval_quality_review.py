@@ -143,15 +143,15 @@ class RecordedRealOutputTests(unittest.TestCase):
 
     FIXTURE = Path(__file__).resolve().parent / "fixtures" / "eval-quality"
 
-    def report(self, root: Path) -> dict:
+    def report(self, root: Path, recording: str = "recorded",
+               order: str = "claude-haiku-4-5,claude-sonnet-5") -> dict:
         repo = root / "repo"
         shutil.copytree(self.FIXTURE / "repo", repo)
         runs = root / "runs"
-        shutil.copytree(self.FIXTURE / "recorded", runs)
+        shutil.copytree(self.FIXTURE / recording, runs)
         manifest = repo / "evals" / "shared-benchmark.json"
         attest_answer_design(manifest, runs)
-        return sb.build_benchmark_report(
-            manifest, runs, model_order=sb.ModelOrder.parse("claude-haiku-4-5,claude-sonnet-5"))
+        return sb.build_benchmark_report(manifest, runs, model_order=sb.ModelOrder.parse(order))
 
     def test_all_three_findings_hold_on_real_model_output(self):
         with tempfile.TemporaryDirectory() as td:
@@ -170,6 +170,21 @@ class RecordedRealOutputTests(unittest.TestCase):
         # the full-run view alone could not see it: neither model fully passed this case
         self.assertFalse([i for i in check["inversions"] if i["assertion"] is None and i["significant"]])
 
+
+    def test_replication_keeps_the_verifier_flaw_and_drops_the_inversion(self):
+        # 36 fresh runs (2026-09-24): n=6 per cell, Opus added as a third tier.
+        with tempfile.TemporaryDirectory() as td:
+            report = self.report(Path(td), "replication",
+                                 "claude-haiku-4-5,claude-sonnet-5,claude-opus-5-5")
+        suspicions = {(s["assertion"], s["signal"]): s for s in report["verifier_review"]["suspicions"]}
+        # The verifier flaw replicates on every model and arm.
+        self.assertEqual(len(suspicions[("verdict-line", "never_passes")]["runs"]), 36)
+        # The p = 0.05 inversion does not: Haiku 3/6, Sonnet 2/6, Opus 2/6.
+        check = report["model_order_check"]
+        self.assertEqual(check["significant_inversions"], 0)
+        self.assertEqual(sorted((i["stronger"], i["weaker_pass"]["passed"], i["stronger_pass"]["passed"], i["p_value"])
+                                for i in check["inversions"]),
+                         [("claude-opus-5-5", 3, 2, 0.5), ("claude-sonnet-5", 3, 2, 0.5)])
 
 if __name__ == "__main__":
     unittest.main()

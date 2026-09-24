@@ -34,9 +34,16 @@ passed the case, so the coarse view was blind to it.
 reads as a capability difference. Signals designed before looking at real outputs tend to
 aggregate at the wrong grain.
 
+**Follow-up (2026-09-24):** Six runs per cell with Opus added did not reproduce the
+inversion: Haiku 3/6, Sonnet 2/6, Opus 2/6 (p = 0.5). Sonnet and Opus write
+`**Severity: Blocking**` too. At n=3 only a perfect split can reach significance, and it
+lands exactly on p = 0.05, among twelve uncorrected per-assertion comparisons. The
+`never_passes` verifier flaw on the same case did replicate, 36 of 36 on all three models.
+The "Haiku habitually writes it" reading above was a story fitted to three samples.
+
 **Rule:**
-- Compare models per assertion as well as per run; an inversion on one check is often
-  the most useful finding.
+- Compare models per assertion as well as per run, and treat a single significant
+  inversion at n=3 as a lead to replicate at n>=6, never as a finding about a model.
 - Treat two independent signals on the same check (for example `never_passes` plus a judge
   passing the same runs) as strong evidence of a verifier flaw; either alone is a prompt to
   read the output.
