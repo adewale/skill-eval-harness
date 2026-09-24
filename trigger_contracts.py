@@ -94,7 +94,7 @@ class InvocationOutcome:
             allow_nonzero_completion=(
                 self.completion_evidence is CompletionEvidence.AGENT_WINDOW_EXHAUSTED),
         )
-        if self.state is InvocationState.HARNESS_FAILED:
+        if self.state in {InvocationState.HARNESS_FAILED, InvocationState.NOT_STARTED}:
             if self.returncode is not None or self.elapsed_ms is not None:
                 raise ValueError("harness failure has no process returncode or measured elapsed time")
         elif self.returncode is None or self.elapsed_ms is None:
@@ -159,6 +159,15 @@ class InvocationOutcome:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("harness failure requires a non-empty message")
         return cls("", message, None, None, InvocationState.HARNESS_FAILED,
+                   metadata={} if metadata is None else metadata)
+
+    @classmethod
+    def not_started(cls, reason: str, *,
+                    metadata: Mapping[str, Any] | None = None) -> InvocationOutcome:
+        """The harness never spawned this invocation (a spend ceiling refused it)."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("a run that never started requires a non-empty reason")
+        return cls("", reason, None, None, InvocationState.NOT_STARTED,
                    metadata={} if metadata is None else metadata)
 
     @classmethod
@@ -283,7 +292,7 @@ class InvocationOutcome:
         return replace(self, stdout=stdout, stderr=stderr, provider_error=provider_error)
 
     def with_provider_error(self, error: str | None, *, payload: Any = None) -> InvocationOutcome:
-        if not error or self.state in {InvocationState.TIMED_OUT, InvocationState.SPAWN_FAILED, InvocationState.HARNESS_FAILED}:
+        if not error or self.state in {InvocationState.TIMED_OUT, InvocationState.SPAWN_FAILED, InvocationState.HARNESS_FAILED, InvocationState.NOT_STARTED}:
             return replace(self, provider_payload=payload if payload is not None else self.provider_payload)
         state = (
             InvocationState.PROVIDER_FAILED
@@ -759,11 +768,18 @@ class TriggerObservation:
             "invocation_state": raw.get("invocation_state"),
             **({"provider_error": raw["provider_error"]} if "provider_error" in raw else {}),
         }
-        if (raw.get("returncode") is None and raw.get("elapsed_ms") is None
-                and raw.get("observation_complete") is False
-                and raw.get("timed_out") is False
-                and raw.get("completion_evidence") is None
-                and "provider_error" not in raw
+        never_ran = (
+            raw.get("returncode") is None and raw.get("elapsed_ms") is None
+            and raw.get("observation_complete") is False
+            and raw.get("timed_out") is False
+            and raw.get("completion_evidence") is None
+            and "provider_error" not in raw
+        )
+        if (never_ran and raw.get("invocation_state") == InvocationState.NOT_STARTED.value
+                and isinstance(raw.get("not_started"), str) and raw.get("not_started", "").strip()):
+            invocation = InvocationOutcome.not_started(
+                raw["not_started"], metadata=invocation_metadata)
+        elif (never_ran and raw.get("invocation_state") in {None, InvocationState.HARNESS_FAILED.value}
                 and isinstance(raw.get("error"), str) and raw.get("error", "").strip()):
             invocation = InvocationOutcome.harness_failed(
                 raw["error"], metadata=invocation_metadata)
@@ -838,6 +854,21 @@ class TriggerObservation:
                 raise ValueError(
                     "an incomplete trigger observation cannot carry a passing verdict")
         return observation
+
+    @classmethod
+    def not_started(cls, *, agent: str, model: str | None, query: str,
+                    expectation: TriggerExpectation, reason: str,
+                    metadata: Mapping[str, Any] | None = None,
+                    identity: TriggerRepetitionIdentity | None = None) -> TriggerObservation:
+        """A planned cell the harness declined to run; it carries no evidence,
+        no usage, and no cost, and counts as an incomplete observation."""
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise TypeError("trigger not-started metadata must be a mapping or None")
+        invocation = InvocationOutcome.not_started(reason)
+        return cls(agent, model, query, expectation, invocation, TriggerDetection.absent(),
+                   {"source": "missing"}, {"source": "missing"},
+                   {"not_started": reason, **dict({} if metadata is None else metadata)},
+                   identity)
 
     @classmethod
     def harness_failure(cls, *, agent: str, model: str | None, query: str,

@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:11598`, merged in `grade_case_variant:13903`).
+threshold, evidence}` (`load_judge_results:11937`, merged in `grade_case_variant:14293`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -375,6 +375,15 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       `import-trace` path for already-recorded outputs. Runnable offline against the demo
       skill (real 2026-07-10 lint/lift/audit output), including the leakage lint firing on a
       genuinely leaky ported row.
+- [x] **"Should I use `claude plugin eval` or this harness?"** —
+      [`docs/comparing-with-claude-plugin-eval.md`](docs/comparing-with-claude-plugin-eval.md):
+      what the built-in runner owns (isolated runs, tool grants, cost ceiling, MCP mocks, one
+      with/without comparison) vs what the harness owns (splits, leakage lint, ablations,
+      significance, judge calibration, other runners); `import-plugin-evals` carries the
+      `evals/<case>/prompt.md` + `graders/*.md` layout onto a manifest with a checklist for
+      every unmappable grader. Runnable offline on `tests/fixtures/plugin-evals/probe-plugin`
+      (real 2026-09-12 import/audit output) with recorded `claude plugin eval` results and a
+      real trace for the `--keep-temp` -> `import-trace --source claude` bridge.
 - [x] **"How do I upgrade the harness from 0.5.1 to 0.6.0?"** —
       [`docs/upgrading.md`](docs/upgrading.md): preserve the old run tree, inspect
       and apply telemetry migration, repair strict judge/pair/trigger/Jetty inputs, regenerate

@@ -2,6 +2,35 @@
 
 Each section covers one released-version boundary. Follow every section after your installed version; do not skip an intermediate artifact migration.
 
+## 0.6.0 → unreleased
+
+### Skill mount names and trigger identity version 3
+
+Skill trees now mount each skill under its own directory name (`skills/demo/SKILL.md` mounts
+as `demo`), where 0.6.0 flattened the whole manifest path (`skills_demo_SKILL.md`). Agents
+list and invoke a skill by that directory name, and Claude Code 2.1.269+ showed the model the
+flattened string as the skill's name, so activation was being measured under a name no user
+would see.
+
+The mount name is hashed with the tree, so this moves every skill-tree hash, and trigger
+`harness_identity` is now schema version 3. Regenerate prepared tasks, answer runs, and
+trigger reports before comparing them with new ones; `trigger-compare` refuses a version-2
+baseline rather than guess that the two layouts are equivalent.
+
+Two skill roots that share a directory name (`team-a/review/SKILL.md` and
+`team-b/review/SKILL.md`) now fail manifest validation, because an agent would see two
+skills with one name. Rename one directory.
+
+### Claude trigger isolation
+
+`skill-trigger-matrix --agent claude` now isolates its config whenever authentication comes
+from the environment (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+`ANTHROPIC_BASE_URL`, or the Bedrock and Vertex switches), not only when a credentials file
+can be copied. An isolated run also drops `CLAUDE_CODE_SYNC_SKILLS`, so organization skills
+no longer compete with the skill under test. Each row records the other skills Claude Code
+offered the model as `competing_skills`. Rates measured with `config_isolated: false` are not
+comparable with isolated ones; re-measure instead of comparing across the change.
+
 ## 0.5.1 → 0.6.0
 
 Most version-1 and version-2 manifests continue to validate without edits. The

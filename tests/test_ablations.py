@@ -161,14 +161,14 @@ class SkillAblationTests(unittest.TestCase):
             text = self.skill_text(res)
             self.assertNotIn("](references/severity.md)", text)
             self.assertIn("the severity guide", text)   # visible text kept; no new prose
-            self.assertTrue((Path(res["dir"]) / "skills_good-pr_SKILL.md" / "references" / "severity.md").exists())
+            self.assertTrue((Path(res["dir"]) / "good-pr" / "references" / "severity.md").exists())
 
     def test_reference_content_deletes_file_keeps_pointer(self):
         with tempfile.TemporaryDirectory() as td:
             res = self.materialize_one(Path(td), {"id": "no-sev-file", "removed_component": "severity ref", "mechanism": "reference", "target": {"path": "references/severity.md", "remove": "content"}})
             text = self.skill_text(res)
             self.assertIn("](references/severity.md)", text)
-            self.assertFalse((Path(res["dir"]) / "skills_good-pr_SKILL.md" / "references" / "severity.md").exists())
+            self.assertFalse((Path(res["dir"]) / "good-pr" / "references" / "severity.md").exists())
 
     def test_patch_deletion_only_ok_and_plus_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1418,19 +1418,19 @@ class AblationCoverageTests(unittest.TestCase):
     def test_script_mechanism_removes_file(self):
         with tempfile.TemporaryDirectory() as td:
             res = self.materialize(Path(td), {"id": "no-script", "removed_component": "s", "mechanism": "script", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "scripts/run.py"}})
-            base = Path(res["dir"]) / "skills_good-pr_SKILL.md"
+            base = Path(res["dir"]) / "good-pr"
             self.assertFalse((base / "scripts" / "run.py").exists())
 
     def test_asset_mechanism_removes_file(self):
         with tempfile.TemporaryDirectory() as td:
             res = self.materialize(Path(td), {"id": "no-asset", "removed_component": "a", "mechanism": "asset", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "assets/tmpl.txt"}})
-            base = Path(res["dir"]) / "skills_good-pr_SKILL.md"
+            base = Path(res["dir"]) / "good-pr"
             self.assertFalse((base / "assets" / "tmpl.txt").exists())
 
     def test_reference_both_unlinks_and_deletes(self):
         with tempfile.TemporaryDirectory() as td:
             res = self.materialize(Path(td), {"id": "no-sev", "removed_component": "r", "mechanism": "reference", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "references/severity.md", "remove": "both"}})
-            base = Path(res["dir"]) / "skills_good-pr_SKILL.md"
+            base = Path(res["dir"]) / "good-pr"
             self.assertFalse((base / "references" / "severity.md").exists())
             self.assertNotIn("](references/severity.md)", (base / "SKILL.md").read_text(encoding="utf-8"))
 
@@ -1441,8 +1441,8 @@ class AblationCoverageTests(unittest.TestCase):
                 {"mechanism": "frontmatter_field", "class": "runtime", "target": {"skill_root": "skills/audit/SKILL.md", "field": "allowed-tools"}},
             ]})
             d = Path(res["dir"])
-            pr = d / "skills_good-pr_SKILL.md"
-            au = d / "skills_audit_SKILL.md"
+            pr = d / "good-pr"
+            au = d / "audit"
             # both roots present and independently ablated
             self.assertNotIn("Regression-proof requirement", (pr / "SKILL.md").read_text(encoding="utf-8"))
             self.assertNotIn("allowed-tools", (au / "SKILL.md").read_text(encoding="utf-8"))
@@ -2198,13 +2198,15 @@ class P1_BomFrontmatterTests(unittest.TestCase):
 
 
 class P3_KeyCollisionTests(unittest.TestCase):
-    """Two distinct skill roots whose sanitized tree-key collides are rejected as an
-    AblationError, not an unwrapped FileExistsError mid-materialization."""
+    """Two distinct skill roots that would mount under the same directory name are
+    rejected: at validation (the early, user-facing error) and, for callers that
+    skip validation, as an AblationError rather than an unwrapped FileExistsError
+    mid-materialization."""
 
     def test_colliding_sanitized_roots_raise_ablation_error(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); rp = root / "repo"
-            for name in ("skill+x", "skill_x"):   # both sanitize to skill_x_SKILL.md
+            for name in ("skill+x", "skill_x"):   # both mount as directory skill_x
                 d = rp / name; d.mkdir(parents=True)
                 (d / "SKILL.md").write_text("---\nname: s\ndescription: d. Use it.\n---\n\n# A\n\n## S\n\nx\n", encoding="utf-8")
             (rp / "evals").mkdir()
@@ -2215,9 +2217,23 @@ class P3_KeyCollisionTests(unittest.TestCase):
                  "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
                  "ablations": [abl]}
             p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
-            manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
+            with self.assertRaises(SystemExit):
+                sb.validate_manifest(p)
+            repo_root = sb.repo_root_for_manifest(p)
             with self.assertRaises(sb.AblationError):
-                sb.ValidatedAblation.validate(repo_root, manifest, abl)
+                sb.ValidatedAblation.validate(repo_root, m, abl)
+
+    def test_same_directory_name_under_different_parents_collides(self):
+        self.assertEqual(sb.skill_root_key_collisions(["team-a/review/SKILL.md", "team-b/review/SKILL.md"]),
+                         [("team-a/review/SKILL.md", "team-b/review/SKILL.md", "review")])
+        self.assertEqual(sb.skill_root_key_collisions(["skills/a/SKILL.md", "skills/b/SKILL.md"]), [])
+
+    def test_mount_key_is_the_skill_directory_name(self):
+        # Agents list skills by directory name, so mount under the one a user's
+        # install would show, never the flattened manifest path.
+        for rel, key in (("skills/tidy-commit/SKILL.md", "tidy-commit"), ("skills/reviewer", "reviewer"),
+                         ("skills/my skill/SKILL.md", "my_skill"), ("SKILL.md", "SKILL.md")):
+            self.assertEqual(sb._skill_root_key(rel), key, rel)
 
 
 class P5_PreprocessFenceTests(unittest.TestCase):

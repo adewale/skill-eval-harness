@@ -109,6 +109,7 @@ class JudgeInvocationTests(unittest.TestCase):
             (InvocationState.SPAWN_FAILED, 0),
             (InvocationState.PROCESS_FAILED, 0),
             (InvocationState.HARNESS_FAILED, 0),
+            (InvocationState.NOT_STARTED, 0),
             (InvocationState.PROVIDER_FAILED, 1),
         )
         for state, returncode in contradictory:

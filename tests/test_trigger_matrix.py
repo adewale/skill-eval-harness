@@ -661,7 +661,25 @@ class ClaudeDetectionTests(unittest.TestCase):
             skill_md = Path(td) / "some-dir" / "SKILL.md"
             skill_md.parent.mkdir()
             skill_md.write_text("---\nname: demo-reviewer\ndescription: x\n---\n", encoding="utf-8")
-            self.assertEqual(tm.mounted_skill_names([skill_md]), ["demo-reviewer"])
+            self.assertEqual(tm.mounted_skill_names([skill_md]), ["demo-reviewer", "some-dir"])
+
+    def test_skill_tool_called_by_mounted_directory_name_is_trigger_evidence(self):
+        # Claude Code 2.1.269 invokes project skills by directory name. Before this
+        # fix the matrix reported 0/3 on both Haiku and Sonnet for a skill a traced
+        # run showed being invoked (2026-09-23).
+        with tempfile.TemporaryDirectory() as td:
+            skill_md = Path(td) / ".claude" / "skills" / "skills_tidy-commit_SKILL.md" / "SKILL.md"
+            skill_md.parent.mkdir(parents=True)
+            skill_md.write_text("---\nname: tidy-commit\ndescription: x\n---\n", encoding="utf-8")
+            names = tm.mounted_skill_names([skill_md])
+        stream = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "skills_tidy-commit_SKILL.md", "args": "..."}}]}})
+        detection = self._adapter().detect(completed_invocation(stream), names, [skill_md])
+        self.assertTrue(detection.triggered)
+        self.assertIn("Skill tool invoked: skills_tidy-commit_SKILL.md", detection.legacy_evidence)
+        other = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "skills_other_SKILL.md"}}]}})
+        self.assertFalse(self._adapter().detect(completed_invocation(other), names, [skill_md]).triggered)
 
     def test_claude_invoke_seeds_portable_auth_into_isolated_config(self):
         seen = {}
@@ -708,6 +726,72 @@ class ClaudeDetectionTests(unittest.TestCase):
         self.assertFalse((workspace / ".trigger-config").exists())
         self.assertFalse(result.metadata["config_isolated"])
         self.assertIn("personal config may influence", result.metadata["config_isolation_warning"])
+
+    def test_claude_invoke_isolates_env_auth_and_drops_synced_skills(self):
+        seen = {}
+        init = {"type": "system", "subtype": "init",
+                "skills": ["tidy-commit", "update-config", "anthropic-skills:pdf"]}
+
+        def fake_run(plan):
+            seen["env"] = dict(plan.environment or {})
+            return {"stdout": json.dumps(init) + "\n" + json.dumps({"type": "result", "subtype": "success"}) + "\n",
+                    "stderr": "", "returncode": 0, "timed_out": False,
+                    "elapsed_ms": 1, "observation_complete": True}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)):
+            workspace = Path(td) / "run"
+            (workspace / ".claude" / "skills" / "tidy-commit").mkdir(parents=True)
+            env = {"ANTHROPIC_BASE_URL": "https://proxy.invalid", "CLAUDE_CODE_SYNC_SKILLS": "1"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                result = tm.ClaudeAdapter().invoke("q", "haiku", workspace, 12)
+            self.assertTrue((workspace / ".trigger-config").is_dir())
+        self.assertTrue(seen["env"]["CLAUDE_CONFIG_DIR"].endswith(".trigger-config"))
+        self.assertNotIn("CLAUDE_CODE_SYNC_SKILLS", seen["env"])
+        self.assertTrue(result.metadata["config_isolated"])
+        # Every skill offered besides the mounted one is recorded, not inferred.
+        self.assertEqual(list(result.metadata["competing_skills"]), ["anthropic-skills:pdf", "update-config"])
+
+    def test_competing_skills_reach_the_persisted_row(self):
+        # The adapter's metadata flows into the row once; a second copy is a
+        # collision the contract refuses (a real run found that).
+        def fake_run(plan):
+            skills = sorted(path.name for path in (plan.cwd / ".claude" / "skills").iterdir())
+            init = {"type": "system", "subtype": "init", "skills": [*skills, "update-config"]}
+            return {"stdout": json.dumps(init) + "\n" + json.dumps(
+                        {"type": "result", "subtype": "success", "total_cost_usd": 0.001}) + "\n",
+                    "stderr": "", "returncode": 0, "timed_out": False,
+                    "elapsed_ms": 1, "observation_complete": True}
+
+        with mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)), \
+             mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://proxy.invalid"}, clear=True):
+            report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["claude"],
+                                   models=["haiku"], runs_per_query=1, timeout=30, workers=1)
+        row = report["results"][0]
+        self.assertTrue(row["observation_complete"], row)
+        self.assertEqual(list(row["competing_skills"]), ["update-config"])
+        self.assertTrue(row["protocol_observation"]["config_isolated"])
+
+    def test_claude_nonportable_config_keeps_synced_skills_and_omits_unknown_competitors(self):
+        seen = {}
+
+        def fake_run(plan):
+            seen["env"] = dict(plan.environment or {})
+            return {"stdout": json.dumps({"type": "result", "subtype": "success"}) + "\n",
+                    "stderr": "", "returncode": 0, "timed_out": False,
+                    "elapsed_ms": 1, "observation_complete": True}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)):
+            root = Path(td)
+            source = root / "oauth-backed-claude"
+            source.mkdir()
+            env = {"CLAUDE_CONFIG_DIR": str(source), "CLAUDE_CODE_SYNC_SKILLS": "1"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                result = tm.ClaudeAdapter().invoke("q", "haiku", root / "run", 12)
+        # Not isolated: the run is left as the user's normal CLI would see it.
+        self.assertEqual(seen["env"]["CLAUDE_CODE_SYNC_SKILLS"], "1")
+        self.assertFalse(result.metadata["config_isolated"])
+        # No init event means no evidence, so no claim either way.
+        self.assertNotIn("competing_skills", result.metadata)
 
     def test_claude_malformed_stream_is_not_a_valid_negative_observation(self):
         def fake_run(*args, **kwargs):

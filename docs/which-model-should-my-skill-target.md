@@ -94,9 +94,31 @@ against `case_flags`:
   skill, sets your ceiling on that tier. The `no objective lift` case flag names which
   cases have gone flat there; harder fixtures may reveal lift the easy cases hide.
 
+- **A weaker tier fully passes more runs than a stronger one** → be suspicious before
+  you celebrate. Declare the tiers with `benchmark --model-order weakest,...,strongest`
+  and read `model_order_check.inversions`: each names the case, arm, and pair, with a
+  one-sided Fisher exact `p_value`. A significant inversion in the `without_skill` arm
+  points at the harness (for example a tool policy that restricts the stronger model);
+  in the `with_skill` arm it can mean the skill over-constrains a stronger model, or a
+  verifier tuned to one model's phrasing. The harness never infers the order from names.
+  Per-assertion inversions set `assertion`. They can see what the full-run view cannot:
+  on 2026-09-23 a `contains "Severity: Blocking"` check passed Haiku 3/3 and Sonnet 0/3
+  (p = 0.05), and neither model fully passed the case, so only the per-assertion view
+  saw it. **Replicate before you act on one.** At three runs per cell only a perfect
+  3-to-0 split can reach significance, and it lands exactly on p = 0.05; the check also
+  makes one comparison per assertion, model pair, and arm (12 in that run) with no
+  correction for testing many at once. The next day, six runs per cell with Opus added
+  read Haiku 3/6, Sonnet 2/6, Opus 2/6 (p = 0.5): Sonnet and Opus write
+  `**Severity: Blocking**` too. The verifier flaw on the same case did replicate — the
+  `verdict-line` check failed all 36 runs on all three models, because every model
+  writes a verdict like `Verdict: Blocking` when the check wants `APPROVE` or `REQUEST
+  CHANGES`, a vocabulary the prompt never gave. Both recordings are in
+  `tests/fixtures/eval-quality/`.
+
 A live worked example of the underlying effect already lives in the harness:
 [`tuning-skill-activation.md`](tuning-skill-activation.md)'s Haiku cell, where the
-identical skill that routed Sonnet and Opus 3/3 loaded on only 1 of 3 Haiku runs. That
+identical skill that routed Sonnet and Opus 3/3 loaded on only 1 of 3 Haiku runs
+(2026-07-03; a 2026-09-24 re-run under a newer CLI and an isolated config read 3/3). That
 is the *activation* face of the same truth this journey measures on the *answer* face:
 the weakest tier you support sets the bound, and a skill's value is a property of
 `skill × model`, never of the skill alone.

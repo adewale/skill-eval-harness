@@ -1,0 +1,7 @@
+--- a/src/user.js
++++ b/src/user.js
+@@ -1,3 +1,3 @@
+-export async function getUser(id) {
++export async function fetchUser(id) {
+   return api.get(`/users/${id}`);
+ }

@@ -96,6 +96,8 @@ skill-benchmark run-agent --agent gemini --tasks tasks.jsonl --runs ../repo/eval
   --model gemini-2.5-flash
 ```
 
+Every answer runner accepts `--max-cost-usd` (and `--assumed-cost-per-run-usd` for backends that do not report dollars); see [Cost telemetry](#cost-telemetry-tokens-and-dollars) for the ceiling's semantics and the `spend-ceiling.json` ledger it leaves behind.
+
 The Gemini backend invokes the official CLI in headless `stream-json` mode and
 accepts final text only from a complete typed stream. It creates a fresh
 `GEMINI_CLI_HOME` outside the task workspace, copies only minimal auth state,
@@ -161,7 +163,7 @@ The end-to-end calibration loop over this command, `compare-judges`, and `judge-
 
 ## Error analysis (open coding → axial taxonomy)
 
-`error-analysis` turns a `benchmark.json` into the "look at your data" surface: an open-coding **review queue** (one row per failing/errored run, anchored on its *first* upstream failure, with an open `note` slot) and an axial **failure taxonomy** (first-failures counted by category, so the few dominant buckets are visible), alongside the report's own case-flag histogram. Model-free.
+`error-analysis` turns a `benchmark.json` into the "look at your data" surface: an open-coding **review queue** (one row per failing/errored run, anchored on its *first* upstream failure, with an open `note` slot) and an axial **failure taxonomy** (first-failures counted by category, so the few dominant buckets are visible), alongside the report's own case-flag histogram. Runs the report's `verifier_review` suspects carry `verifier_suspects` and sort to the top of the queue, since their failure may belong to the eval rather than the model. Model-free.
 
 ```bash
 skill-benchmark error-analysis --benchmark benchmark.json --out error-analysis.json
@@ -221,6 +223,16 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
 
 Multi-model runs prepare with `--models a,b,c` (run dirs gain a model segment: `<case>/<model>/<variant>`); grading discovers both layouts and pairs lift per (case, model).
 
+Two eval-quality blocks sit beside the numbers; both are diagnostics that never change a pass rate:
+
+- `verifier_review` flags assertions that may be rejecting correct answers, with three signals over observed verdicts: `never_passes` (no run of any arm or model ever passed it, over at least two runs), `format_near_miss` (a failed `contains`/`contains_any`/`contains_all`/`regex` passes once case and markdown formatting are ignored, re-checked through the same bounded matcher; negative checks are never relaxed), and `oracle_disagreement` (a judge passed a run this gate failed). `review_queue` lists every suspect run once.
+- `model_order_check` compares declared model tiers. Pass `--model-order weakest,...,strongest` and each weaker/stronger pair is compared per (case, arm), pooled per arm over cases both models ran, and per (case, objective assertion, arm); an `inversion` is a weaker model fully passing more runs, or passing one assertion more often, than a stronger one, with a one-sided Fisher exact `p_value`. The per-assertion view (`assertion` set on the inversion) catches a verifier tuned to one model's phrasing even when neither model fully passes the case. The order is never inferred from model names; without the flag the block is `not_applicable`.
+
+```bash
+skill-benchmark benchmark ../repo/evals/shared-benchmark.json --runs ../repo/eval-runs/latest \
+  --model-order claude-haiku-4-5,claude-sonnet-5,claude-opus-5 --out benchmark.json
+```
+
 ## CI report formats
 
 `report` serializes a `benchmark.json` for CI: `--format junit` writes one `<testcase>` per case/variant/run with evidence on failures and the paired lift as suite properties; `--format github` writes job-summary markdown plus `::warning` annotations per flagged case (and an `::error` on negative lift).
@@ -244,6 +256,19 @@ skill-benchmark suggest-cases --benchmark benchmark.json --manifest evals/shared
 ## Migrate a manifest
 
 `migrate` upgrades a version-1 manifest to version 2: stamps default severities and oracle tiers, marks binary judge rubrics with a `graded?` todo, prints the diff plus the judgment-call checklist (`--check` for a dry run, `--out-checklist` to save it). See [`migrating-evals.md`](migrating-evals.md) for the agent runbook.
+
+## Import a `claude plugin eval` suite
+
+`import-plugin-evals` reads a plugin's `evals/<case>/prompt.md` + `graders/*.md` (and `case.yaml`) suite, the layout Claude Code's built-in `claude plugin eval` runs, and writes a validated harness manifest: `regex`/`tool_used`/`tool_order`/`file_exists` graders become the matching objective assertions, `llm` rubrics become gate-severity `judge` assertions, `tool_used: Skill` becomes `skill_invoked` scoped to `with_skill`, and `context.add_dirs` fixtures are listed under `files`. Everything without a verbatim equivalent (`baseline` graders, file/trace targets, `weight`, runner limits, scaffold scripts) is printed as a checklist rather than dropped. See [`comparing-with-claude-plugin-eval.md`](comparing-with-claude-plugin-eval.md).
+
+```bash
+skill-benchmark import-plugin-evals path/to/plugin --check        # dry run: checklist only
+skill-benchmark import-plugin-evals path/to/plugin                # writes <eval dir>/shared-benchmark.json
+skill-benchmark import-plugin-evals path/to/plugin --eval-dir quality/evals \
+  --skill-path skills/one-of-several/SKILL.md --split holdout --out evals/ported.json --out-checklist checklist.json
+```
+
+The eval directory defaults to the plugin manifest's `experimental.evals`, else `evals/`; `--force` overwrites an existing `--out`.
 
 ## Judge backends
 
@@ -358,6 +383,7 @@ Consumers of the blocks:
 
 - `benchmark`/`aggregate` emit `cost_summary`: availability-aware coverage and operational totals (**every run counts here, including execution errors — a timed-out run still cost money — while quality rates keep excluding them**). A mixed set renders a partial known subtotal, not a false total. Per-variant stats, per-case spend, paired deltas, ablation marginal cost, and judge spend retain their basis/provenance.
 - `cost-summary` writes the standalone suite ledger (`--out cost-summary.json`, `--md cost-summary.md`): coverage, totals, by variant/case/runner, top expensive cases and ablation arms, and `cost_quality_findings` when a `--benchmark` report is joined.
+- Every paid loop takes a runtime **spend ceiling**: `--max-cost-usd <usd>` on `run-agent`, `run-codex`, `run-claude`, `run-subagent`, `run-jetty`, `judge`, `skill-trigger-matrix`, and `skill-pi-trigger-eval`. Each completed run's cost measurement (the same v3 telemetry the ledgers read) is charged against the ceiling; once it is reached no further run starts, runs in flight finish and are paid for, and the command exits `2`. The concurrent trigger runners admit at most `--workers` cells at once and none past the ceiling, settle each completed cell before the next admission decision (so overrun is bounded by the window), and record every refused cell as a `not_started` observation, which makes the cohort `INCOMPLETE` with reason `not_started` rather than quietly smaller. The runs that never started are listed in `spend-ceiling.json` at the runs root (`<out>.spend-ceiling.json` for `run-jetty` and `judge`; `import-jetty-results` moves the Jetty one into the runs tree), so `benchmark` reports `answer_design.stopped_by: "cost_ceiling"` and a `spend_ceiling` block instead of an unexplained gap. `--max-cost-usd 0` starts nothing and writes the plan. A backend that does not report dollars (Codex, Gemini, Vibe, the stub) refuses the ceiling before the first run unless `--assumed-cost-per-run-usd` names a fixed charge per run; a run whose cost turns out unobservable mid-suite stops the loop with `cost_unobservable` rather than counting as free. There is no separate "partial result" flag: the answer design already says what was planned, the existing availability rules already withhold headline numbers from an incomplete design, and the ledger supplies the reason.
 - `suite-run` projects spend **before any model call** from previous ledgers (`--cost-history <dir>`, per-run medians) or a static assumption (`--assumed-tokens-per-run`), and gates on `--max-estimated-tokens` / `--max-estimated-cost-usd` — failing closed when a dollar cap is set but no dollar estimate exists — unless `--allow-over-budget`.
 - `audit-manifest --runs` adds cost-quality findings above `--expensive-case-usd` (default $1): `expensive-saturated-case`, `expensive-no-lift-case`, `high-cost-judge-only-case`, `ablation-high-spend-no-structured-regression`, and `high-footprint-low-lift-skill`.
 
@@ -502,6 +528,8 @@ skill-pi-trigger-eval ../repo/evals/shared-benchmark.json \
   --runs-per-query 3 \
   --out trigger-report.json
 ```
+
+Both trigger runners accept `--max-cost-usd` (and `--assumed-cost-per-run-usd` for an adapter that does not report dollars, such as the stub); the ledger lands beside the report as `<out>.spend-ceiling.json` and inside it as `spend_ceiling`. See [Cost telemetry](#cost-telemetry-tokens-and-dollars).
 
 This creates a temporary `PI_CODING_AGENT_DIR`, copies the skill under `skills/`, runs Pi without forced `--skill`, and detects whether the model loaded the skill from JSON stream events. It is the deeper Pi-specific tool: discovery-population ablation arms, per-query trace artifacts, and cost telemetry.
 

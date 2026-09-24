@@ -66,12 +66,30 @@ from report_contracts import (
     ReportCohort,
     UnitRate,
 )
+from review_contracts import (
+    AssertionRole,
+    ModelOrder,
+    ModelOrderInversion,
+    RunRef,
+    VerifierSignal,
+    VerifierSuspicion,
+)
 from runner_contracts import (
     AnswerOutcome,
     Completed,
     ProviderFailed,
     SpawnFailed,
     TimedOut,
+)
+from spend_contracts import (
+    AssumedCharge,
+    ObservedCharge,
+    PlannedSpendRow,
+    SpendCharge,
+    SpendLedger,
+    SpendPolicy,
+    SpendPopulation,
+    SpendStopReason,
 )
 from trace_contracts import (
     EventLogObservation,
@@ -259,3 +277,57 @@ def cli_invocation_types_are_precise(invocation: CLIInvocation) -> None:
     _models: tuple[ModelId, ...] = invocation.models
     _judge_models: tuple[ModelId, ...] = invocation.judge_models
     _namespace: Namespace = invocation.to_legacy_namespace()
+
+
+def spend_charge_is_exhaustive(charge: SpendCharge) -> None:
+    if isinstance(charge, ObservedCharge):
+        _provenance: str = charge.provenance
+    elif isinstance(charge, AssumedCharge):
+        _reason: str = charge.reason
+    else:
+        _assert_never(charge)
+
+
+def spend_ledger_identity_is_precise(ledger: SpendLedger, row: PlannedSpendRow) -> None:
+    _policy: SpendPolicy = ledger.policy
+    _population: SpendPopulation = ledger.population
+    _stop: SpendStopReason | None = ledger.stop_reason
+    _can_start: bool = ledger.can_start
+    _case_id: CaseId = row.case_id
+    _variant: ExecutionVariant = row.variant
+    _run_number: RunNumber = row.run_number
+    _model: ModelId | None = row.model
+
+
+def verifier_signal_is_exhaustive(signal: VerifierSignal) -> None:
+    if signal is VerifierSignal.NEVER_PASSES:
+        _never: VerifierSignal = signal
+    elif signal is VerifierSignal.FORMAT_NEAR_MISS:
+        _near: VerifierSignal = signal
+    elif signal is VerifierSignal.ORACLE_DISAGREEMENT:
+        _disagree: VerifierSignal = signal
+    else:
+        _assert_never(signal)
+
+
+def assertion_role_is_exhaustive(role: AssertionRole) -> None:
+    if role is AssertionRole.OBJECTIVE:
+        _objective: AssertionRole = role
+    elif role is AssertionRole.QUALITATIVE:
+        _qualitative: AssertionRole = role
+    else:
+        _assert_never(role)
+
+
+def review_identities_are_precise(
+    run: RunRef, suspicion: VerifierSuspicion, order: ModelOrder, inversion: ModelOrderInversion,
+) -> None:
+    _case_id: CaseId = run.case_id
+    _variant: ExecutionVariant = run.variant
+    _run_number: RunNumber = run.run_number
+    _model: ModelId | None = run.model
+    _runs: tuple[RunRef, ...] = suspicion.runs
+    _models: tuple[ModelId, ...] = order.models
+    _weaker: ModelId = inversion.weaker
+    _p_value: float = inversion.p_value
+    _significant: bool = inversion.significant

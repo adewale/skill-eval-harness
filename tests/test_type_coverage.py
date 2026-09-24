@@ -52,7 +52,7 @@ class TypeCoverageContractTests(unittest.TestCase):
         self.assertIs(sb.TRIGGER_SEMANTIC_MODULES, sb.TRIGGER_IDENTITY_MODULES)
         self.assertIs(sb.HARNESS_SEMANTIC_MODULES, sb.TRIGGER_IDENTITY_MODULES)
         self.assertTrue(trigger_modules <= packaged)
-        self.assertEqual(sb.TRIGGER_HARNESS_IDENTITY_VERSION, 2)
+        self.assertEqual(sb.TRIGGER_HARNESS_IDENTITY_VERSION, 3)
         self.assertTrue({
             "skill_benchmark.py", "run_pi_trigger_eval.py",
             "run_trigger_matrix.py", "trigger_contracts.py",

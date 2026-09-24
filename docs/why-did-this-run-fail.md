@@ -195,8 +195,17 @@ anchored this row on `cite-checklist`, not `severity-label`, because severity *p
 here — the anchor moves to the first thing that actually broke.
 
 **An assertion that fails a *correct* answer — the fixable false failure.** Now the case
-`error-analysis` cannot distinguish from a real miss on its own: an assertion too narrow
-to accept equivalent good behavior. `LESSONS_LEARNED.md`'s 2026-06-09 entry *"Assertions
+a pass/fail number cannot distinguish from a real miss: an assertion too narrow
+to accept equivalent good behavior. The benchmark's `verifier_review` now nominates
+candidates, and `error-analysis` puts them first in the queue with `verifier_suspects`:
+`format_near_miss` fires exactly on the example below (the check passes once markdown and
+case are ignored), `never_passes` on a check no run ever satisfied, and
+`oracle_disagreement` where a judge passed the run the check failed. A suspicion is a
+reason to read the output, not a verdict. On real Claude runs (2026-09-23,
+`tests/fixtures/eval-quality/`), `format_near_miss` flagged a Sonnet review that wrote
+`Severity: **Blocking**` against a check demanding `Severity: Blocking`, and
+`never_passes` flagged a verdict check whose `APPROVE|REQUEST CHANGES` vocabulary the
+prompt never asked for (12 of 12 runs failed it). `LESSONS_LEARNED.md`'s 2026-06-09 entry *"Assertions
 should allow equivalent good behavior"* records exactly this — a correct output failing
 because the check demanded `Decision: BLOCK` while the model wrote `**Decision: BLOCK.**`.
 When you open the `output.md` for a failing row and the answer is *obviously right* but
@@ -221,6 +230,7 @@ as a quality miss. A timed-out run cost money but proves nothing about quality.
 | Queue row anchored on a `first_failure`, downstream failures absent | An upstream miss cascades; the queue points at the seam | Fix the first break; re-run before chasing anything downstream |
 | `evidence: "none matched: [...]"` and `output.md` is clearly wrong | Objective assertion, model genuinely missed it | The eval is right — fix the skill (or accept the baseline) |
 | `evidence: "none matched: [...]"` but `output.md` is clearly *right* | Assertion too narrow, failing equivalent good behavior | The eval is wrong — broaden the assertion (the calibration lesson) |
+| Row carries `verifier_suspects`, e.g. `severity:format_near_miss` or `order:never_passes` | The check may be the thing that is wrong | Read `output.md` first; broaden or remove the check if the answer is right |
 | Category `missing-output` / `execution-error`, or `metadata.json` shows `timed_out: true` / `returncode: 124` | Not measured, ≠ measured-and-failed | Check termination first; re-run; keep it out of the pass-rate denominator |
 | `without_skill` (or an ablation) row failing its cited assertion, `returncode: 0` | Baseline / materialized regression working as designed | No action — this is the lift the skill buys, made visible |
 
