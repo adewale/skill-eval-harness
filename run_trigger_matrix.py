@@ -646,12 +646,14 @@ class VibeAdapter(AgentAdapter):
 
 class StubAdapter(AgentAdapter):
     """Deterministic in-process 'agent' for offline runs and CI: it reads the
-    description of the skill that was ACTUALLY mounted and triggers iff the
-    query shares >= 2 content words with it. Like the demo's stub_runner, the
-    behavior is genuine — weaken the mounted description and the stub
-    measurably under-triggers."""
+    discovery text of the skill that was ACTUALLY mounted — `description`
+    plus the `when_to_use` trigger hints, the frontmatter a discovery ablation
+    removes — and triggers iff the query shares >= 2 content words with it.
+    Like the demo's stub_runner, the behavior is genuine — weaken the mounted
+    discovery text and the stub measurably under-triggers."""
 
     name = "stub"
+    DISCOVERY_TEXT_FIELDS = ("description", "when_to_use")
 
     def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
         return self._mount_tree(tree_dir, workspace / "skills")
@@ -664,8 +666,10 @@ class StubAdapter(AgentAdapter):
         started = time.monotonic()
         lines: list[str] = []
         for skill_md in sorted((workspace / "skills").glob("*/SKILL.md")):
-            description = str(frontmatter_value(skill_md.read_text(encoding="utf-8"), "description") or "")
-            if len(self._content_words(query) & self._content_words(description)) >= 2:
+            text = skill_md.read_text(encoding="utf-8")
+            discovery_text = " ".join(str(frontmatter_value(text, field) or "")
+                                      for field in self.DISCOVERY_TEXT_FIELDS)
+            if len(self._content_words(query) & self._content_words(discovery_text)) >= 2:
                 # Same stream shape the real agents emit, so the shared
                 # detector — not stub-private logic — decides "triggered".
                 lines.append(json.dumps({"type": "file_read", "path": str(skill_md),
