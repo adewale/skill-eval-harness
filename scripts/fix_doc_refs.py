@@ -17,14 +17,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Every top-level module plus the shipped Pi smoke example, so a module added or
+# split out later is citable without editing this map. A name defined in two
+# modules must be cited qualified.
 MODULES = {
-    "skill_benchmark.py": ROOT / "skill_benchmark.py",
-    "ablation_model.py": ROOT / "ablation_model.py",
-    "run_pi_trigger_eval.py": ROOT / "run_pi_trigger_eval.py",
-    "run_trigger_matrix.py": ROOT / "run_trigger_matrix.py",
+    **{path.name: path for path in sorted(ROOT.glob("*.py"))},
     "run_pi_smoke.py": ROOT / "examples" / "adewale-workspace" / "run_pi_smoke.py",
 }
-MODULE_SEARCH_ORDER = ["skill_benchmark.py", "ablation_model.py", "run_pi_trigger_eval.py", "run_trigger_matrix.py", "run_pi_smoke.py"]
+MODULE_SEARCH_ORDER = list(MODULES)
 
 # Scan every prose surface that cites code, not only docs/ — the 2026-07
 # consolidation audit found README/CHANGELOG-class drift precisely because they

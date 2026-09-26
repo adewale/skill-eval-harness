@@ -7,6 +7,17 @@ import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+# Packaged modules audited as unable to change trigger evidence: the standalone
+# CLI, grading, judge, report, Jetty, and unsupported-Gemini-trigger contracts.
+# Every other packaged module must be in TRIGGER_IDENTITY_MODULES, so a new
+# module (including one split out of an identified module) cannot silently
+# escape trigger identity.
+NON_TRIGGER_MODULES = frozenset({
+    "artifact_contracts.py", "cli_contracts.py", "gemini_contracts.py",
+    "grading_contracts.py", "jetty_contracts.py", "judge_contracts.py",
+    "judge_verdict.py", "report_contracts.py", "runner_contracts.py",
+    "text_contracts.py",
+})
 
 
 def toml_array(section: str, key: str) -> list[str]:
@@ -59,13 +70,22 @@ class TypeCoverageContractTests(unittest.TestCase):
             "trigger_reporting.py", "invocation_contracts.py",
             "experimental_pairs.py",
         } <= trigger_modules)
-        self.assertTrue({
-            "cli_contracts.py", "grading_contracts.py", "judge_contracts.py",
-            "report_contracts.py", "jetty_contracts.py", "gemini_contracts.py",
-        }.isdisjoint(trigger_modules))
         upgrading = (ROOT / "docs" / "upgrading.md").read_text(encoding="utf-8")
         self.assertIn("conservative audited module-level", upgrading)
         self.assertIn("skill_benchmark.py` remains a monolith", upgrading)
+
+    def test_every_packaged_module_is_classified_for_trigger_identity(self):
+        packaged = {
+            f"{name}.py" for name in toml_array("tool.setuptools", "py-modules")
+        }
+        trigger_modules = set(sb.TRIGGER_IDENTITY_MODULES)
+        self.assertTrue(NON_TRIGGER_MODULES <= packaged)
+        self.assertTrue(trigger_modules.isdisjoint(NON_TRIGGER_MODULES))
+        self.assertEqual(
+            sorted(packaged - trigger_modules - NON_TRIGGER_MODULES), [],
+            "unclassified packaged modules: add each to TRIGGER_IDENTITY_MODULES "
+            "unless an audit shows it cannot change trigger evidence",
+        )
 
     def test_every_boundary_module_is_named_in_the_abstraction_docs(self):
         documented = "\n".join(
