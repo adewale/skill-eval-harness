@@ -709,3 +709,35 @@ correctness protocol.
 - Treat inventories according to meaning: packaging, static-analysis coverage, and causal identity
   are different sets. A stack-wide guard should enforce their relationship, not collapse them into
   filesystem equality.
+
+## 2026-09-26 — Moving code changes what names resolve to
+
+**Problem:** Splitting the 21k-line `skill_benchmark.py` moved 665 statements verbatim, and the suite
+stayed green through three regressions. 48 test patches on `skill_benchmark` stopped reaching the
+code under test; 15 of the 36 tests holding them still passed, most because they assert that nothing
+was spawned. The trigger identity, which hashes an explicit file inventory, stopped covering the
+moved code. Lazy registry references resolved at import time still named the module that merely
+re-exported their objects; only that one failed loudly, as a circular import. Once the trigger runners
+stopped importing the monolith, a real offline trigger run showed the identity was wrong in both
+directions: it hashed 15 files no trigger run loads, and it had omitted four contract modules every
+trigger run loads, because an earlier audit judged them unable to affect trigger evidence.
+
+**Lesson:** A name means what the module that looks it up binds, not what another module
+re-exports. A re-export is a binding, not an owner; an inventory keyed on files silently shrinks
+when code leaves a file; and a string reference resolves against the module it names at the moment
+it runs, even while that module is still initializing. An inventory maintained by judgment drifts
+from what the code does; one derived from the code's behavior cannot.
+
+**Rule:**
+- Before moving code between modules, land guards that hold for the current layout and for any split
+  of it: every packaged module is classified for trigger identity, every test patch targets a module
+  whose code looks the name up, and every lazy reference names the defining module.
+- Define a causal identity by what the evidence-producing process can load: its entry points' import
+  closure, checked against a real run for loads by name. Do not maintain an audited exception list.
+- Patch where the name is looked up. `mock.patch.object(facade, name)` affects only the facade's code.
+- Split a large move into a stack of dependency-ordered layers, each a pure move plus the hand edits
+  it forces, and check every tip against the base: AST-identical statements, identical CLI help, and
+  an unchanged public namespace.
+- Cite code in docs with module-qualified, checked references, so a moved definition fails the doc
+  check instead of leaving prose pointing at the old file.
+- After adding top-level modules, re-run editable installs; their module map is fixed at install time.

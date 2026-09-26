@@ -579,7 +579,7 @@ skill-eval-harness/
 ├── LESSONS_LEARNED.md
 ├── TODO.md
 ├── pyproject.toml
-├── skill_benchmark.py          # the CLI and the harness code not yet split out; re-exports the modules below
+├── skill_benchmark.py          # the CLI; re-exports every name of the harness modules below
 ├── eval_manifests.py           # manifest vocabulary, loading, and validation
 ├── prepared_tasks.py           # prepared answer tasks and the answer design they bind
 ├── skill_ablations.py          # skill trees, frontmatter, and ablation materialization
@@ -644,7 +644,7 @@ The test suite is organized by subject: manifest validation and eval hygiene (`t
 
 This README was written against:
 
-- `skill_benchmark.py` CLI and assertion implementation
+- `skill_benchmark.py` CLI and the harness modules it re-exports
 - `run_pi_trigger_eval.py` trigger runner
 - `run_trigger_matrix.py` agent×model activation matrix
 - `pyproject.toml` package metadata
