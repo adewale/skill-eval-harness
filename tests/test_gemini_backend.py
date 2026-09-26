@@ -14,6 +14,8 @@ from helpers import make_eval_repo
 
 import ablation_model as am
 import agent_capabilities as ac
+import agent_clis
+import answer_backends
 import judge_contracts as jc
 import runner_contracts as rc
 import skill_benchmark as sb
@@ -499,7 +501,7 @@ class GeminiIsolationTests(unittest.TestCase):
                     "GEMINI_CLI_HOME": str(source.parent),
                     "GEMINI_API_KEY": "key",
             }, clear=True), mock.patch.object(
-                    sb, "run_argv_capture") as spawn:
+                    agent_clis, "run_argv_capture") as spawn:
                 result = sb.gemini_cli_invoke(
                     "prompt", cwd=root / "workspace", gemini_cmd="gemini")
             spawn.assert_not_called()
@@ -523,7 +525,7 @@ class GeminiIsolationTests(unittest.TestCase):
                             "GEMINI_CLI_HOME": str(source.parent),
                             "GEMINI_API_KEY": "unrelated-key",
                     }, clear=True), mock.patch.object(
-                            sb, "run_argv_capture") as spawn:
+                            agent_clis, "run_argv_capture") as spawn:
                         result = sb.gemini_cli_invoke(
                             "prompt", cwd=root / f"workspace-{selected}",
                             gemini_cmd="gemini")
@@ -555,7 +557,7 @@ class GeminiIsolationTests(unittest.TestCase):
     def test_initial_temp_creation_failure_has_the_closed_result_shape(self):
         with mock.patch.object(
                 sb.tempfile, "mkdtemp", side_effect=OSError("secret temp path")), \
-                mock.patch.object(sb, "run_argv_capture") as spawn:
+                mock.patch.object(agent_clis, "run_argv_capture") as spawn:
             result = sb.gemini_cli_invoke("prompt", gemini_cmd="gemini")
 
         spawn.assert_not_called()
@@ -586,7 +588,7 @@ class GeminiIsolationTests(unittest.TestCase):
             }, clear=True), mock.patch.object(
                     Path, "read_text", autospec=True,
                     side_effect=fail_settings), mock.patch.object(
-                    sb, "run_argv_capture") as spawn:
+                    agent_clis, "run_argv_capture") as spawn:
                 result = sb.gemini_cli_invoke(
                     "prompt", cwd=root / "workspace", gemini_cmd="gemini")
 
@@ -599,7 +601,7 @@ class GeminiIsolationTests(unittest.TestCase):
                 "GOOGLE_GENAI_USE_VERTEXAI": "true",
                 "GOOGLE_APPLICATION_CREDENTIALS": (
                     "~definitely-no-such-user-xyz/adc.json"),
-        }, clear=True), mock.patch.object(sb, "run_argv_capture") as spawn:
+        }, clear=True), mock.patch.object(agent_clis, "run_argv_capture") as spawn:
             result = sb.gemini_cli_invoke(
                 "prompt", cwd=Path(td) / "workspace", gemini_cmd="gemini")
 
@@ -633,8 +635,8 @@ class GeminiIsolationTests(unittest.TestCase):
                     **overrides,
                 }
                 with self.subTest(name=name), mock.patch.object(
-                        sb, "run_argv_capture") as spawn, mock.patch.object(
-                        sb, "probe_gemini_cli_version") as probe:
+                        agent_clis, "run_argv_capture") as spawn, mock.patch.object(
+                        agent_clis, "probe_gemini_cli_version") as probe:
                     result = sb.gemini_cli_invoke(**arguments)
                 spawn.assert_not_called()
                 probe.assert_not_called()
@@ -645,7 +647,7 @@ class GeminiIsolationTests(unittest.TestCase):
 
     def test_invalid_model_text_never_reenters_durable_metadata(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
-                sb, "run_argv_capture") as spawn:
+                agent_clis, "run_argv_capture") as spawn:
             result = sb.gemini_cli_invoke(
                 "prompt", model="gemini-\ud800", cwd=Path(td) / "workspace",
                 gemini_cmd="gemini")
@@ -789,7 +791,7 @@ class GeminiIsolationTests(unittest.TestCase):
                 self.assertIn("--prompt=<prompt>", redacted)
 
     def test_version_probe_without_owned_prompt_is_total(self):
-        with mock.patch.object(sb, "invoke_argv_with_timeout") as invoke:
+        with mock.patch.object(agent_clis, "invoke_argv_with_timeout") as invoke:
             metadata = sb.probe_gemini_cli_version(
                 ["gemini", "--version"], cwd=Path.cwd(), env={}, timeout=30)
         invoke.assert_not_called()
@@ -1287,7 +1289,7 @@ class GeminiAnswerBackendTests(unittest.TestCase):
         self.assertEqual(result["metadata"]["reported_models"],
                          ["model-a", "model-b"])
 
-        with mock.patch.object(sb, "gemini_cli_invoke", return_value=result):
+        with mock.patch.object(answer_backends, "gemini_cli_invoke", return_value=result):
             outcome = sb.GeminiBackend().invoke_answer(
                 sb.InvocationRequest(
                     "prompt", Path(tempfile.gettempdir()), "requested-model", 30))
@@ -1366,7 +1368,7 @@ class GeminiAnswerBackendTests(unittest.TestCase):
             "usage": None, "metadata": {}, "environment": {}, "model": None,
         }
         with mock.patch.object(
-                sb, "gemini_cli_invoke", return_value=provider_result):
+                answer_backends, "gemini_cli_invoke", return_value=provider_result):
             outcome = sb.GeminiBackend().invoke_answer(
                 sb.InvocationRequest("prompt", Path(tempfile.gettempdir()), None, 30))
         self.assertIsInstance(outcome, rc.ProviderFailed)
@@ -1579,7 +1581,7 @@ class GeminiJudgeBackendTests(unittest.TestCase):
         self.assertEqual(invocation.metadata["session_id"], "session-judge")
 
     def test_invalid_requested_model_is_a_typed_judge_failure(self):
-        with mock.patch.object(sb, "run_argv_capture") as spawn:
+        with mock.patch.object(agent_clis, "run_argv_capture") as spawn:
             invocation = sb.gemini_judge_invoke(
                 "prompt", judge_model="gemini-\ud800", gemini_cmd="gemini",
                 explore_hint=None)

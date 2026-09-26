@@ -583,6 +583,12 @@ skill-eval-harness/
 ├── eval_manifests.py           # manifest vocabulary, loading, and validation
 ├── prepared_tasks.py           # prepared answer tasks and the answer design they bind
 ├── skill_ablations.py          # skill trees, frontmatter, and ablation materialization
+├── agent_clis.py               # Claude/Codex/Gemini/Vibe CLI homes, argv, invocation, parsing
+├── answer_backends.py          # native answer backends and the run-agent commands
+├── subagent_runner.py          # in-process subagent runner and tool replay
+├── jetty_adapter.py            # Jetty export/run/import and the durable attempt journal
+├── run_artifacts.py            # run discovery, artifact-contract readers, workspaces
+├── trace_normalization.py      # trace dialects, normalization, trigger detection
 ├── telemetry_blocks.py         # normalized usage and cost blocks
 ├── json_schema_subset.py       # the JSON Schema subset behind structured-output checks
 ├── trigger_identity.py         # trigger harness and manifest-treatment identity
