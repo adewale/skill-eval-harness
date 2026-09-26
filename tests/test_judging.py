@@ -27,6 +27,7 @@ from helpers import (
 )
 
 import judge_contracts as jc
+import judge_execution
 import judge_verdict as jv
 import skill_benchmark as sb
 
@@ -412,17 +413,17 @@ class VerdictSchemaTests(unittest.TestCase):
             "cost_usd": 0.02,
             "usage": {"input_tokens": 2, "output_tokens": 1},
         }
-        with mock.patch.object(sb, "claude_cli_invoke", return_value=provider_result):
+        with mock.patch.object(judge_execution, "claude_cli_invoke", return_value=provider_result):
             claude = sb.claude_judge_invoke(
                 "prompt", judge_model="sonnet", claude_bin="claude",
                 assertion_schema=assertion_schema, extra_args=None,
                 explore_hint=None)
-        with mock.patch.object(sb, "codex_cli_invoke", return_value={
+        with mock.patch.object(judge_execution, "codex_cli_invoke", return_value={
                 **provider_result, "model": "codex/gpt-mini"}):
             codex = sb.codex_judge_invoke(
                 "prompt", judge_model="gpt-mini", codex_cmd="codex exec",
                 assertion_schema=assertion_schema, explore_hint=None)
-        with mock.patch.object(sb, "gemini_cli_invoke", return_value={
+        with mock.patch.object(judge_execution, "gemini_cli_invoke", return_value={
                 **provider_result, "model": "gemini-2.5-flash",
                 "raw_response": '{"response":"{\\"passed\\":true}"}',
                 "metadata": {"session_id": "session-1",
@@ -430,7 +431,7 @@ class VerdictSchemaTests(unittest.TestCase):
             gemini = sb.gemini_judge_invoke(
                 "prompt", judge_model="gemini-2.5-flash",
                 gemini_cmd="gemini", explore_hint=None)
-        with mock.patch.object(sb, "vibe_cli_invoke", return_value=provider_result):
+        with mock.patch.object(judge_execution, "vibe_cli_invoke", return_value=provider_result):
             vibe = sb.vibe_judge_invoke(
                 "prompt", judge_model="mistral", vibe_cmd="vibe",
                 explore_hint=None)
@@ -448,7 +449,7 @@ class VerdictSchemaTests(unittest.TestCase):
             invocation_state=sb.InvocationState.COMPLETE,
             model_label="opaque-shell-judge")
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
-                sb, "shell_judge_invoke", return_value=invocation) as invoke:
+                judge_execution, "shell_judge_invoke", return_value=invocation) as invoke:
             row = sb.run_one_judge_task(
                 self._task(td), judge_cmd="unused", judge_model="opaque-shell-judge")
 
@@ -464,7 +465,7 @@ class VerdictSchemaTests(unittest.TestCase):
             provider_error="provider envelope was malformed",
             model_label="opaque-shell-judge")
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
-                sb, "shell_judge_invoke", return_value=invocation):
+                judge_execution, "shell_judge_invoke", return_value=invocation):
             row = sb.run_one_judge_task(
                 self._task(td), judge_cmd="unused",
                 judge_model="opaque-shell-judge")
@@ -1135,7 +1136,7 @@ class JudgeRobustnessTests(unittest.TestCase):
                     "judge_prompt_sha256": "a" * 64,
                     "judge_evidence_mode": "text-only"}
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
-                sb, "run_one_judge_task",
+                judge_execution, "run_one_judge_task",
                 side_effect=[failed, complete, failed, complete]):
             report = sb.judge_robustness_report(
                 [self._task(td)], tmp_dir=Path(td))
@@ -1212,7 +1213,7 @@ class JudgeRobustnessTests(unittest.TestCase):
             args = self._args(
                 td, p, runs, "robust", self.ROBUST,
                 fail_on_findings=True)
-            with mock.patch.object(sb, "collect_judge_tasks", return_value=[]):
+            with mock.patch.object(judge_execution, "collect_judge_tasks", return_value=[]):
                 self.assertEqual(sb.judge_robustness_command(args), 1)
             report = json.loads(Path(args.out).read_text(encoding="utf-8"))
         self.assertEqual(report["summary"]["availability"], "unavailable")

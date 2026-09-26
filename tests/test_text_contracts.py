@@ -14,6 +14,7 @@ from helpers import demo_manifest, write_demo_manifest
 from hypothesis import given
 from hypothesis import strategies as st
 
+import eval_grading
 import skill_benchmark as sb
 import text_contracts as tc
 from text_contracts import (
@@ -351,7 +352,7 @@ class TypedTextAssertionTests(unittest.TestCase):
         self.assertEqual(result["score"], 1.0)
 
     def test_embedding_verdict_uses_the_public_rounded_score(self):
-        with mock.patch.object(sb, "embedding_similarity", return_value=(0.79996, "")):
+        with mock.patch.object(eval_grading, "embedding_similarity", return_value=(0.79996, "")):
             result = self.result_with_embedder(
                 {"type": "similarity", "mode": "embedding", "expected": "target", "threshold": 0.8},
                 "candidate",

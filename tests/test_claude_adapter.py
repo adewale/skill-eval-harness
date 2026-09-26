@@ -14,6 +14,7 @@ from helpers import make_eval_repo
 from helpers import stub_claude as _stub_claude
 from helpers import stub_claude_stream as _stub_claude_stream
 
+import judge_execution
 import skill_benchmark as sb
 
 
@@ -494,8 +495,8 @@ class ClaudeJudgeAndPanelTests(unittest.TestCase):
         ):
             args = argparse.Namespace(report=reports, magnitude_eps=0.1, out=None)
             with self.subTest(reports=reports), \
-                 mock.patch.object(sb, "load_json") as load_json, \
-                 mock.patch.object(sb, "die", side_effect=rejected), \
+                 mock.patch.object(judge_execution, "load_json") as load_json, \
+                 mock.patch.object(judge_execution, "die", side_effect=rejected), \
                  self.assertRaisesRegex(ValueError, message):
                 sb.compare_judges(args)
             load_json.assert_not_called()

@@ -17,6 +17,7 @@ import agent_capabilities as ac
 import agent_clis
 import answer_backends
 import judge_contracts as jc
+import judge_execution
 import runner_contracts as rc
 import skill_benchmark as sb
 
@@ -1572,7 +1573,7 @@ class GeminiJudgeBackendTests(unittest.TestCase):
                          "provider_tool_calls": 0},
         }
         with mock.patch.object(
-                sb, "gemini_cli_invoke", return_value=provider_result):
+                judge_execution, "gemini_cli_invoke", return_value=provider_result):
             invocation = sb.gemini_judge_invoke(
                 "prompt", judge_model="gemini-judge", gemini_cmd="gemini",
                 explore_hint=None)
@@ -1600,7 +1601,7 @@ class GeminiJudgeBackendTests(unittest.TestCase):
             "protocol_error": None, "provider_error": None,
         }
         with mock.patch.object(
-                sb, "gemini_cli_invoke", return_value=provider_result):
+                judge_execution, "gemini_cli_invoke", return_value=provider_result):
             invocation = sb.gemini_judge_invoke(
                 "prompt", judge_model="gemini-judge", gemini_cmd="gemini",
                 explore_hint=None)
@@ -1620,7 +1621,7 @@ class GeminiJudgeBackendTests(unittest.TestCase):
             "protocol_error": None, "provider_error": None,
         }
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
-                sb, "gemini_cli_invoke", return_value=provider_result) as invoke:
+                judge_execution, "gemini_cli_invoke", return_value=provider_result) as invoke:
             row = sb.run_one_judge_task(
                 self._task(Path(td)), judge_backend="gemini",
                 judge_model="gemini-judge")
@@ -1635,7 +1636,7 @@ class GeminiJudgeBackendTests(unittest.TestCase):
             "provider_error": "APIError: denied",
         }
         with mock.patch.object(
-                sb, "gemini_cli_invoke", return_value=provider_result):
+                judge_execution, "gemini_cli_invoke", return_value=provider_result):
             invocation = sb.gemini_judge_invoke(
                 "prompt", judge_model="gemini-judge", gemini_cmd="gemini",
                 explore_hint=None)
@@ -1651,7 +1652,7 @@ class GeminiJudgeBackendTests(unittest.TestCase):
             "environment": {}, "protocol_error": None, "provider_error": None,
         }
         with mock.patch.object(
-                sb, "gemini_cli_invoke", return_value=provider_result):
+                judge_execution, "gemini_cli_invoke", return_value=provider_result):
             invocation = sb.gemini_judge_invoke(
                 "prompt", judge_model="requested-model", gemini_cmd="gemini",
                 explore_hint=None)
@@ -1666,7 +1667,7 @@ class GeminiJudgeBackendTests(unittest.TestCase):
             "environment": {}, "protocol_error": None, "provider_error": None,
         }
         with mock.patch.object(
-                sb, "gemini_cli_invoke", return_value=provider_result):
+                judge_execution, "gemini_cli_invoke", return_value=provider_result):
             invocation = sb.gemini_judge_invoke(
                 "prompt", judge_model="requested-model", gemini_cmd="gemini",
                 explore_hint=None)
