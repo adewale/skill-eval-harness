@@ -5,7 +5,7 @@ becomes task rows, task rows become files on disk, files on disk become graded r
 and result rows become a report. Because the boundaries are explicit, you can swap the
 runner without touching grading, and the default grading path never has to call a model.
 
-This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md): what each object *is* in the code and what it hands downstream. The glossary defines the words; this page shows their shape. Symbols below point at `skill_benchmark.py` at the line where each abstraction is defined.
+This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md): what each object *is* in the code and what it hands downstream. The glossary defines the words; this page shows their shape. Symbols below cite the line where each abstraction is defined, in the module that owns it.
 
 ## The objects, in pipeline order
 
@@ -89,7 +89,7 @@ boundary, and the executable task carries their precise types thereafter.
 
 An assertion is one check. The code-side registries are `TEXT_ASSERTIONS`,
 `PROCESS_ASSERTIONS`, `EFFICIENCY_ASSERTIONS`, and `QUALITATIVE_ASSERTIONS`
-(`skill_benchmark.py:66-95`):
+(`skill_benchmark.py:275`):
 
 - **Text** (`contains`, `contains_any`, `contains_all`, `excludes_any`, `regex`,
   `not_regex`, `file_exists`, `json_field_equals`, `golden_output`, `similarity`,

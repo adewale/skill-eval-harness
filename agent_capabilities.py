@@ -4,6 +4,9 @@ Provider implementations still live beside the command paths they serve, but
 their registration does not.  Lazy object references keep this module a leaf:
 ``skill_benchmark`` and ``run_trigger_matrix`` can both project their legacy
 registries from ``BACKENDS`` without importing one another through this file.
+Each reference names the module that defines the object, never one that merely
+re-exports it: a registry view materialized at import time resolves references
+while modules are still initializing.
 
 ``AGENT_CAPABILITIES`` and ``SMOKE_TARGETS`` remain compatibility projections
 for integrations that used the original capability-only and supported-CLI

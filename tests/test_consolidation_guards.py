@@ -15,7 +15,9 @@ source of truth and make the sync executable —
     every member exactly where promised.
 """
 import argparse
+import ast
 import contextlib
+import importlib
 import inspect
 import io
 import json
@@ -900,6 +902,72 @@ else:
         self.assertNotIn("OpenCode/Gemini CLI", trace_spec)
         self.assertNotIn("Add OpenCode/Gemini adapters", trace_spec)
 
+
+
+class ModuleBoundaryTests(unittest.TestCase):
+    """Moving code between modules must not silently change what a patch or a
+    lazy registry reference resolves to. Both guards hold for the single-module
+    harness and for any split of it."""
+
+    def test_patches_on_skill_benchmark_reach_the_code_under_test(self):
+        """`patch.object(sb, "X")` replaces only skill_benchmark's binding of
+        X, so it can only affect code in skill_benchmark.py that looks X up.
+        Once the caller lives in another module, the patch silently misses:
+        the real function runs, and an assertion that nothing was called can
+        never fail."""
+        lookups = {
+            node.id
+            for node in ast.walk(ast.parse(
+                (ROOT / "skill_benchmark.py").read_text(encoding="utf-8")))
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        misses = []
+        for path in sorted((ROOT / "tests").glob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            aliases = {
+                alias.asname or alias.name
+                for node in ast.walk(tree) if isinstance(node, ast.Import)
+                for alias in node.names if alias.name == "skill_benchmark"
+            }
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and node.args
+                        and isinstance(node.func, ast.Attribute)):
+                    continue
+                target = None
+                if (node.func.attr == "object" and len(node.args) >= 2
+                        and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id in aliases
+                        and isinstance(node.args[1], ast.Constant)):
+                    target = node.args[1].value
+                elif (node.func.attr == "patch"
+                      and isinstance(node.args[0], ast.Constant)
+                      and isinstance(node.args[0].value, str)
+                      and node.args[0].value.startswith("skill_benchmark.")):
+                    target = node.args[0].value.split(".", 2)[1]
+                if target is not None and target not in lookups:
+                    misses.append(f"{path.name}:{node.lineno} patches sb.{target}")
+        self.assertEqual(
+            misses, [],
+            "patch the module whose code looks the name up, not skill_benchmark")
+
+    def test_lazy_registry_references_name_the_defining_module(self):
+        """A registry view materialized at import time resolves its references
+        while modules are still initializing. A reference must therefore name
+        the module that defines the object, not one that re-exports it."""
+        tree = ast.parse((ROOT / "agent_capabilities.py").read_text(encoding="utf-8"))
+        refs = [
+            (node.args[0].value, node.args[1].value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "ObjectRef" and len(node.args) == 2
+            and all(isinstance(arg, ast.Constant) for arg in node.args)
+        ]
+        self.assertGreater(len(refs), 20)
+        for module, attribute in refs:
+            with self.subTest(ref=f"{module}.{attribute}"):
+                owner = getattr(importlib.import_module(module), attribute)
+                if inspect.isclass(owner) or inspect.isfunction(owner):
+                    self.assertEqual(owner.__module__, module)
 
 class TimeoutConventionTests(unittest.TestCase):
     """One timeout encoding: timed_out=True (the flag execution_valid keys on)
