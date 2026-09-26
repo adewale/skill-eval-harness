@@ -39,6 +39,7 @@ from helpers import (
 )
 
 import ablation_model as am
+import agent_clis
 import run_pi_trigger_eval as tr
 import runner_contracts as rc
 import skill_benchmark as sb
@@ -341,7 +342,7 @@ class ToolReplayTests(unittest.TestCase):
 class ClosedRunnerOutcomeTests(unittest.TestCase):
     def test_capture_rejects_a_non_process_outcome_from_the_subprocess_owner(self):
         outcome = sb.InvocationOutcome.harness_failed("fixture setup failed")
-        with mock.patch.object(sb, "invoke_argv_with_timeout", return_value=outcome), \
+        with mock.patch.object(agent_clis, "invoke_argv_with_timeout", return_value=outcome), \
              self.assertRaisesRegex(RuntimeError, "non-process invocation"):
             sb.run_argv_capture(sb.ProcessInvocationPlan.from_values(
                 ["unused"], input_text="", cwd=Path.cwd(), timeout_s=1

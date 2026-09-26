@@ -5,7 +5,7 @@ becomes task rows, task rows become files on disk, files on disk become graded r
 and result rows become a report. Because the boundaries are explicit, you can swap the
 runner without touching grading, and the default grading path never has to call a model.
 
-This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md): what each object *is* in the code and what it hands downstream. The glossary defines the words; this page shows their shape. Symbols below point at `skill_benchmark.py` at the line where each abstraction is defined.
+This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md): what each object *is* in the code and what it hands downstream. The glossary defines the words; this page shows their shape. Symbols below cite the line where each abstraction is defined, in the harness module that owns it; `skill_benchmark.py` is the CLI and re-exports them all.
 
 ## The objects, in pipeline order
 
@@ -89,7 +89,7 @@ boundary, and the executable task carries their precise types thereafter.
 
 An assertion is one check. The code-side registries are `TEXT_ASSERTIONS`,
 `PROCESS_ASSERTIONS`, `EFFICIENCY_ASSERTIONS`, and `QUALITATIVE_ASSERTIONS`
-(`skill_benchmark.py:66-95`):
+(`eval_manifests.py`):
 
 - **Text** (`contains`, `contains_any`, `contains_all`, `excludes_any`, `regex`,
   `not_regex`, `file_exists`, `json_field_equals`, `golden_output`, `similarity`,
@@ -190,10 +190,10 @@ Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | Lo
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10500`), Claude (`run_claude:10686`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:322`), Claude (`run_claude:328`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13276`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:4028` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:577`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:776` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -290,7 +290,7 @@ those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplica
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:813`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:449`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 `report_contracts.report_cohort` classifies each attempted reporting population as

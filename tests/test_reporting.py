@@ -38,6 +38,7 @@ from helpers import (
     write_good_pr_skill as _skill,
 )
 
+import benchmark_reports
 import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -142,7 +143,7 @@ class ReportFormatsTests(unittest.TestCase):
         }
         for manifests in (["same.json", "same.json"], ["one.json", "two.json"]):
             with self.subTest(manifests=manifests), mock.patch.object(
-                sb, "build_benchmark_report", side_effect=[report, report]
+                benchmark_reports, "build_benchmark_report", side_effect=[report, report]
             ), self.assertRaises(SystemExit):
                 sb.aggregate(SimpleNamespace(
                     manifests=manifests, runs_root=".", runs_subdir="runs",

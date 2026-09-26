@@ -118,12 +118,18 @@ migrate. Keep the old environment for rollback; regenerate stale prepared tasks 
 reports after correcting rejected rows. Do not edit digests, availability, or repetition ids merely
 to make old artifacts pass the new constructors.
 
-Trigger `harness_identity` is now schema version 2 and names a conservative audited module-level
-inventory instead of every packaged module. Version-1 trigger reports must be regenerated before a
-new causal comparison; this deliberate incompatibility refuses to guess equivalence with the old
-overbroad set. Standalone report, judge, CLI, and unsupported-provider modules are excluded, but
-`skill_benchmark.py` remains a monolith shared by trigger and non-trigger orchestration. Any edit to
-that file still invalidates trigger identity until those owners are extracted into separate modules.
+Trigger `harness_identity` is now schema version 3 and names a conservative audited module-level
+inventory instead of every packaged module. Version-1 and version-2 trigger reports must be
+regenerated before a new causal comparison; this deliberate incompatibility refuses to guess
+equivalence with an older module set. Standalone report, judge, CLI, and unsupported-provider
+modules are excluded. `skill_benchmark.py` is now the CLI over modules split out by subsystem, and
+the inventory names every module split out of `skill_benchmark.py`, so an edit to any of them still
+invalidates trigger identity exactly as an edit to the former monolith did.
+
+`import skill_benchmark as sb` keeps working: the CLI module re-exports every name the split modules
+define, as the same objects. A re-export is a binding, not an owner, so code that monkeypatched
+`skill_benchmark.<name>` must now patch the module that looks the name up (for example
+`jetty_adapter.JettyClient` for `run_jetty`); a patch on `skill_benchmark` reaches only the CLI.
 
 #### Prepared task and result identities
 

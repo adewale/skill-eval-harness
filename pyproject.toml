@@ -39,7 +39,10 @@ skill-pi-trigger-eval = "run_pi_trigger_eval:main"
 skill-trigger-matrix = "run_trigger_matrix:main"
 
 [tool.setuptools]
-py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model", "agent_capabilities", "artifact_contracts", "cli_contracts", "telemetry", "trigger_contracts", "trigger_reporting", "trace_contracts", "runner_contracts", "judge_contracts", "judge_verdict", "experimental_pairs", "jetty_contracts", "gemini_contracts", "grading_contracts", "invocation_contracts", "json_contracts", "manifest_contracts", "report_contracts", "text_contracts"]
+py-modules = [
+  "skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model", "agent_capabilities", "artifact_contracts", "cli_contracts", "telemetry", "trigger_contracts", "trigger_reporting", "trace_contracts", "runner_contracts", "judge_contracts", "judge_verdict", "experimental_pairs", "jetty_contracts", "gemini_contracts", "grading_contracts", "invocation_contracts", "json_contracts", "manifest_contracts", "report_contracts", "text_contracts",
+  "agent_clis", "answer_backends", "benchmark_reports", "blind_comparisons", "eval_audits", "eval_grading", "eval_manifests", "harness_io", "jetty_adapter", "json_schema_subset", "judge_execution", "judge_tasks", "lift_statistics", "prepared_tasks", "run_artifacts", "skill_ablations", "subagent_runner", "suite_runs", "telemetry_blocks", "trace_normalization", "trigger_comparison", "trigger_identity",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -66,10 +69,19 @@ required-version = "==0.16.0"
 "runner_contracts.py" = ["TRY004"]
 "telemetry.py" = ["TRY004"]
 # Runner boundaries must report arbitrary provider/CLI failures as evaluation
-# results, and the matrix's class attributes are immutable fixture shapes.
+# results, and the matrix's class attributes are immutable fixture shapes. The
+# modules split out of skill_benchmark.py keep exactly the exemptions their code
+# needed there; skill_benchmark.py itself now only re-exports their names.
+"agent_clis.py" = ["BLE001"]
+"eval_audits.py" = ["BLE001", "S112"]
+"eval_grading.py" = ["BLE001"]
+"harness_io.py" = ["BLE001"]
+"jetty_adapter.py" = ["BLE001"]
+"judge_execution.py" = ["BLE001"]
 "run_pi_trigger_eval.py" = ["F401"]
 "run_trigger_matrix.py" = ["BLE001", "F401", "RUF012"]
-"skill_benchmark.py" = ["BLE001", "F401", "S112"]
+"skill_benchmark.py" = ["F401"]
+"subagent_runner.py" = ["BLE001"]
 # Test classes use container-valued fixtures, while nested patch contexts make
 # teardown ownership explicit.
 "tests/**/*.py" = ["BLE001", "RUF012", "SIM117"]

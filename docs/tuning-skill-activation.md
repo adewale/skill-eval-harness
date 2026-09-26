@@ -169,7 +169,7 @@ BackendRegistration(
         judge_backend=False, tool_replay=False, live_smoke_env=None,
     ),
     answer_route="none",
-    trace=ObjectRef("skill_benchmark", "MY_AGENT_TRACE_DIALECT"),
+    trace=ObjectRef("trace_normalization", "MY_AGENT_TRACE_DIALECT"),
     trigger=SurfaceBinding(ObjectRef("run_trigger_matrix", "MyAgentAdapter")),
 )
 ```

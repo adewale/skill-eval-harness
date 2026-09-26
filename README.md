@@ -579,7 +579,29 @@ skill-eval-harness/
 ├── LESSONS_LEARNED.md
 ├── TODO.md
 ├── pyproject.toml
-├── skill_benchmark.py          # the CLI, grading, reporting, and runner adapters
+├── skill_benchmark.py          # the CLI; re-exports every name of the harness modules below
+├── eval_manifests.py           # manifest vocabulary, loading, and validation
+├── prepared_tasks.py           # prepared answer tasks and the answer design they bind
+├── skill_ablations.py          # skill trees, frontmatter, and ablation materialization
+├── agent_clis.py               # Claude/Codex/Gemini/Vibe CLI homes, argv, invocation, parsing
+├── answer_backends.py          # native answer backends and the run-agent commands
+├── subagent_runner.py          # in-process subagent runner and tool replay
+├── jetty_adapter.py            # Jetty export/run/import and the durable attempt journal
+├── run_artifacts.py            # run discovery, artifact-contract readers, workspaces
+├── trace_normalization.py      # trace dialects, normalization, trigger detection
+├── telemetry_blocks.py         # normalized usage and cost blocks
+├── eval_grading.py             # deterministic assertions and the grade command
+├── json_schema_subset.py       # the JSON Schema subset behind structured-output checks
+├── judge_tasks.py              # judge task identity, prompts, and verdict schemas
+├── judge_execution.py          # judge backends, verdict merges, and judge calibration
+├── lift_statistics.py          # paired statistics, significance, and reliability
+├── benchmark_reports.py        # benchmark reports, costs, renderings, viewer, and trend
+├── blind_comparisons.py        # blind A/B comparisons
+├── eval_audits.py              # migration, skill profiling, readiness, contamination, audit
+├── trigger_identity.py         # trigger harness and manifest-treatment identity
+├── trigger_comparison.py       # the trigger-compare command
+├── suite_runs.py               # multi-manifest suite runs
+├── harness_io.py               # strict JSON/YAML I/O, atomic writes, subprocess invocation
 ├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
 ├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance/task value objects
@@ -622,7 +644,7 @@ The test suite is organized by subject: manifest validation and eval hygiene (`t
 
 This README was written against:
 
-- `skill_benchmark.py` CLI and assertion implementation
+- `skill_benchmark.py` CLI and the harness modules it re-exports
 - `run_pi_trigger_eval.py` trigger runner
 - `run_trigger_matrix.py` agent×model activation matrix
 - `pyproject.toml` package metadata

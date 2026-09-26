@@ -15,7 +15,9 @@ source of truth and make the sync executable —
     every member exactly where promised.
 """
 import argparse
+import ast
 import contextlib
+import importlib
 import inspect
 import io
 import json
@@ -899,6 +901,81 @@ else:
                 encoding="utf-8")
         self.assertNotIn("OpenCode/Gemini CLI", trace_spec)
         self.assertNotIn("Add OpenCode/Gemini adapters", trace_spec)
+
+
+class CliModuleLayeringTests(unittest.TestCase):
+    """`skill_benchmark` is the CLI over the harness modules and re-exports
+    their names. The reverse edge would re-enter a partially initialized
+    module, and a re-export is a binding, not an owner."""
+
+    def test_no_packaged_module_imports_the_cli_module(self):
+        importers = []
+        for path in sorted(ROOT.glob("*.py")):
+            if path.name == "skill_benchmark.py":
+                continue
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                names = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
+                         else [node.module] if isinstance(node, ast.ImportFrom) else [])
+                if "skill_benchmark" in names:
+                    importers.append(f"{path.name}:{node.lineno}")
+        self.assertEqual(importers, [], "import the owning module instead")
+
+    def test_lazy_registry_references_name_the_defining_module(self):
+        tree = ast.parse((ROOT / "agent_capabilities.py").read_text(encoding="utf-8"))
+        refs = [
+            (node.args[0].value, node.args[1].value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "ObjectRef" and len(node.args) == 2
+            and all(isinstance(arg, ast.Constant) for arg in node.args)
+        ]
+        self.assertGreater(len(refs), 20)
+        for module, attribute in refs:
+            with self.subTest(ref=f"{module}.{attribute}"):
+                self.assertNotEqual(module, "skill_benchmark")
+                owner = getattr(importlib.import_module(module), attribute)
+                if inspect.isclass(owner) or inspect.isfunction(owner):
+                    self.assertEqual(owner.__module__, module)
+
+    def test_patches_on_the_cli_module_reach_the_code_under_test(self):
+        """Patching `sb.X` only replaces the CLI module's binding, so it can
+        only affect code that looks X up there. A patch the CLI never reads
+        silently misses and lets the real function run."""
+        cli = ast.parse((ROOT / "skill_benchmark.py").read_text(encoding="utf-8"))
+        cli_lookups = {
+            node.id
+            for function in cli.body if isinstance(function, ast.FunctionDef)
+            for node in ast.walk(function)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        misses = []
+        for path in sorted((ROOT / "tests").glob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            aliases = {
+                alias.asname or alias.name
+                for node in ast.walk(tree) if isinstance(node, ast.Import)
+                for alias in node.names if alias.name == "skill_benchmark"
+            }
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and node.args
+                        and isinstance(node.func, ast.Attribute)):
+                    continue
+                target = None
+                if (node.func.attr == "object" and len(node.args) >= 2
+                        and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id in aliases
+                        and isinstance(node.args[1], ast.Constant)):
+                    target = node.args[1].value
+                elif (node.func.attr == "patch"
+                      and isinstance(node.args[0], ast.Constant)
+                      and isinstance(node.args[0].value, str)
+                      and node.args[0].value.startswith("skill_benchmark.")):
+                    target = node.args[0].value.split(".", 2)[1]
+                if target is not None and target not in cli_lookups:
+                    misses.append(f"{path.name}:{node.lineno} patches sb.{target}")
+        self.assertEqual(
+            misses, [],
+            "patch the module whose code looks the name up, not skill_benchmark")
 
 
 class TimeoutConventionTests(unittest.TestCase):

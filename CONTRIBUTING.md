@@ -33,7 +33,8 @@ python3 -m unittest discover tests -v
 `ty check` automatically covers every packaged top-level Python module, repository script,
 shipped example, and the static contracts under `type_tests/`. A new runtime boundary module
 enters the gate without another registry edit. `tests/test_type_coverage.py` also requires it to
-enter packaging, semantic identity, and the abstraction docs. Runtime tests are intentionally
+enter packaging and the abstraction docs, and to be classified for semantic identity: identified,
+or audited as unable to change trigger evidence. Runtime tests are intentionally
 outside the type-check source set because many are negative tests that pass forbidden values to
 prove runtime rejection; they remain linted, compiled, and executed. Keep production contracts
 precise and do not hide diagnostics behind broad rule exclusions, file exclusions, blanket

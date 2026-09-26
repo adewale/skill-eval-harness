@@ -74,16 +74,18 @@ consumer-only type check does not prove malformed wire data cannot construct the
 3. the explicit `TRIGGER_IDENTITY_MODULES` conservative module inventory to be packaged, versioned,
    and to contain the trigger entrypoints and shared process/pair owners without pulling their
    standalone CLI, grading, judge, report, Jetty, or unsupported-Gemini-trigger modules into causal
-   identity;
+   identity, and every packaged module to be either in that inventory or in the test's audited
+   `NON_TRIGGER_MODULES`;
 4. every `*_contracts.py` boundary module to be named by the abstraction documentation; and
 5. Linux and Windows CI to promote `ty` warnings to failures.
 
 Packaging, static analysis, and causal identity answer different questions; filesystem equality
 between them would make every unrelated report or CLI module edit invalidate trigger comparability.
-The inventory is conservative at module granularity: because `skill_benchmark.py` still combines
-trigger and non-trigger orchestration, every edit to that file intentionally invalidates trigger
-identity. When adding a Python module, let the packaging/docs failures enumerate integration points
-and update a semantic identity only when that module can change the named evidence surface. When
+The inventory is conservative at module granularity: it names every module split out of the former
+`skill_benchmark.py` monolith, so every edit to that code intentionally invalidates trigger identity.
+When adding a Python module, let the packaging/docs failures enumerate integration points, then
+classify it: into the semantic identity if it can change the named evidence surface, otherwise into
+the audited non-trigger set. When
 adding a closed union or refined scalar, add a runtime malformed-input test and a static narrowing
 or precision proof in `type_tests/abstraction_contracts.py`. Do not make a diagnostic disappear by
 broadening the domain to `Any`, adding a blanket ignore, or excluding the file.

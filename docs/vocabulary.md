@@ -26,7 +26,7 @@ Terms are grouped by what they describe: the units you evaluate, the comparison 
 
 What role a case plays in the comparison. A useful suite carries all three polarities, the way
 behavioral testing pairs functionality tests with their controls (Ribeiro et al. 2020).
-`audit-manifest` counts each and warns when one is thin; `case_polarity` (`skill_benchmark.py`)
+`audit-manifest` counts each and warns when one is thin; `case_polarity` (`eval_manifests.py`)
 derives the label from the `id` prefix or `kind`.
 
 **Positive eval** — the skill *should* fire and leave verifiable evidence of its core workflow.
