@@ -9,6 +9,10 @@ explicit runner and judge commands DO call a model — `run-agent --agent claude
 and `judge` (via `--judge-cmd`, or natively `--judge-model`/`--judge-backend`) to grade
 them. Everything from `grade`/`benchmark` onward is model-free and reproducible from saved artifacts.
 """
+# This module is the CLI. The harness itself lives in the modules imported
+# below, and every name they define is re-exported here, so
+# ``import skill_benchmark as sb`` callers keep working. Re-exports are bindings,
+# not owners: patch a function in the module that looks it up, not here.
 from __future__ import annotations
 
 import argparse
@@ -46,10 +50,9 @@ from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from typing import Any, NoReturn, Protocol, cast
 
-# Direct ``python skill_benchmark.py`` execution must share the canonical module
-# identity used by lazy backend references. Otherwise importing
-# ``skill_benchmark`` from the registry executes this 17k-line module a second
-# time with distinct classes and mutable compatibility views.
+# Direct ``python skill_benchmark.py`` execution registers the canonical module
+# name, so a later ``import skill_benchmark`` reuses this instance instead of
+# executing the CLI a second time.
 if __name__ == "__main__":
     sys.modules.setdefault("skill_benchmark", sys.modules[__name__])
 

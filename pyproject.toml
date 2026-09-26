@@ -71,7 +71,7 @@ required-version = "==0.16.0"
 # Runner boundaries must report arbitrary provider/CLI failures as evaluation
 # results, and the matrix's class attributes are immutable fixture shapes.
 # Modules split out of skill_benchmark.py keep exactly the exemptions their
-# code needed there.
+# code needed there; skill_benchmark.py itself now only re-exports their names.
 "agent_clis.py" = ["BLE001"]
 "eval_audits.py" = ["BLE001", "S112"]
 "eval_grading.py" = ["BLE001"]

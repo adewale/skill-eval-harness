@@ -23,32 +23,35 @@ from pathlib import Path
 from typing import Any
 
 from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Provenance
-from skill_benchmark import (
+from eval_manifests import (
     VALID_SPLITS,
-    AblationError,
-    PiStream,
-    ProcessInvocationPlan,
-    build_canonical_skill_tree,
-    canonical_json_sha256,
-    canonical_trigger_query,
-    detect_trigger,
-    detect_trigger_records,
-    event_texts_for_tool_input,
     expected_trigger_polarity,
-    invoke_argv_with_timeout,
     is_trigger_case,
     iter_cases,
     load_manifest_source,
-    materialize_trigger_ablation,
-    mount_skill_tree,
-    pi_stream_terminal_error,
     repo_root_for_manifest,
-    safe_trace_label,
-    skill_tree_hash,
-    strict_json_loads,
-    trigger_harness_identity,
-    trigger_manifest_identity,
+)
+from harness_io import (
+    canonical_json_sha256,
+    invoke_argv_with_timeout,
+    mount_skill_tree,
     write_json,
+)
+from invocation_contracts import ProcessInvocationPlan
+from json_contracts import strict_json_loads
+from skill_ablations import (
+    AblationError,
+    build_canonical_skill_tree,
+    materialize_trigger_ablation,
+    skill_tree_hash,
+)
+from trace_normalization import (
+    PiStream,
+    detect_trigger,
+    detect_trigger_records,
+    event_texts_for_tool_input,
+    pi_stream_terminal_error,
+    safe_trace_label,
     write_trace_artifacts,
 )
 from trigger_contracts import (
@@ -59,6 +62,11 @@ from trigger_contracts import (
     TriggerRepetitionIdentity,
     validated_trigger_model,
     validated_trigger_protocol_limits,
+)
+from trigger_identity import (
+    canonical_trigger_query,
+    trigger_harness_identity,
+    trigger_manifest_identity,
 )
 from trigger_reporting import (
     summarize_trigger_cohort,
@@ -313,7 +321,7 @@ def cases_from_manifest(manifest: dict[str, Any], split: str | None) -> list[dic
     for c in iter_cases(manifest, split):
         if is_trigger_case(c):
             prompt = trigger_query_from_case(c)
-            # Single shared resolver with the manifest audit (skill_benchmark), so the
+            # Single shared resolver with the manifest audit (eval_manifests), so the
             # eval and the audit cannot disagree on a case's expected polarity.
             should = expected_trigger_polarity(c) == "TRIGGER"
             out.append({"query_id": str(c.get("id") or ""),
