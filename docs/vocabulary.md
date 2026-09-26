@@ -109,7 +109,7 @@ Trigger polarity is the load-time analogue, defined under **Trigger / no-trigger
 
 - `trace.jsonl` — the raw runner event stream, preserved before normalization.
 - `events.json` — normalized events that process assertions read.
-- `metrics.json` — tokens, command counts, tool calls, elapsed time, retries.
+- `metrics.json` — tokens, command counts, tool calls, elapsed time, and retries where the runner's stream marks retried attempts (Pi's `agent_end.willRetry`). A runner whose protocol has no retry marker omits `retries`, so the v3 envelope reports it unavailable (`missing_retries`) — never a measured zero.
 - `environment.json` — runner, model, and sandbox details where available.
 
 The normalized shapes are an adapter boundary: Pi, Codex, Gemini, and Jetty emit different raw events, so each shape gets fixture tests rather than an assumed common schema.

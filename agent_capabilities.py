@@ -837,7 +837,7 @@ def trace_dialect_implementations(
     """Materialize registered trace semantics after their module is ready."""
     rows = BACKENDS if registrations is None else registrations
     implementations: dict[str, Any] = {}
-    required_methods = ("flatten", "stream_semantics", "usage_and_cost", "protocol_error")
+    required_methods = ("flatten", "stream_semantics", "usage_and_cost", "protocol_error", "retries")
     for name, registration in rows.items():
         if registration.trace is None:
             continue

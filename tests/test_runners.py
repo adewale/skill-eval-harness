@@ -1519,6 +1519,45 @@ class TraceDialectRegistryTests(unittest.TestCase):
         self.assertIsNone(failure)
         self.assertEqual(sb.usage_number(terminal_usage, "total_tokens"), 13.0)
 
+    def test_pi_dialect_counts_retries_from_will_retry_markers(self):
+        # Pi marks every retried attempt explicitly (agent_end willRetry:true),
+        # so on a stream that reaches its final agent_end the count is an
+        # observation — including a measured zero.
+        for fixture, expected in (("retry-then-success.jsonl", 1),
+                                  ("retries-exhausted.jsonl", 1),
+                                  ("lifecycle-success.jsonl", 0)):
+            with self.subTest(fixture=fixture):
+                raw = (ROOT / "tests" / "fixtures" / "pi" / fixture).read_text(encoding="utf-8")
+                records, _ = sb.parse_trace_jsonl_text(raw)
+                self.assertEqual(sb.TRACE_DIALECTS["pi"].retries(records, None), expected)
+
+    def test_truncated_pi_stream_does_not_observe_retries(self):
+        # Without the final agent_end, later attempts may be missing: a count
+        # would be a lower bound presented as a total, so none is reported.
+        records = [{"type": "agent_start"}, {"type": "agent_end", "willRetry": True},
+                   {"type": "agent_start"}]
+        self.assertIsNone(sb.TRACE_DIALECTS["pi"].retries(records, None))
+
+    def test_only_dialects_whose_protocol_marks_retries_observe_them(self):
+        # A retry-shaped marker in a stream whose provider protocol does not
+        # define one is not evidence: every other dialect reports "not observed".
+        records = [{"type": "agent_start"}, {"type": "agent_end", "willRetry": True},
+                   {"type": "agent_start"}, {"type": "agent_end"}]
+        for source, dialect in sb.TRACE_DIALECTS.items():
+            if source == "pi":
+                continue
+            with self.subTest(source=source):
+                self.assertIsNone(dialect.retries(records, None))
+
+    def test_retries_metric_is_derived_or_absent_never_a_default_zero(self):
+        raw = (ROOT / "tests" / "fixtures" / "pi" / "retry-then-success.jsonl").read_text(encoding="utf-8")
+        records, _ = sb.parse_trace_jsonl_text(raw)
+        _, pi_metrics = sb.normalize_trace_records(records, source="pi")
+        self.assertEqual(pi_metrics["retries"], 1)
+        _, generic_metrics = sb.normalize_trace_records(
+            [{"type": "command", "command": "ls", "status": "completed"}], source="generic")
+        self.assertNotIn("retries", generic_metrics)
+
 
 if __name__ == "__main__":
     unittest.main()
