@@ -39,7 +39,10 @@ skill-pi-trigger-eval = "run_pi_trigger_eval:main"
 skill-trigger-matrix = "run_trigger_matrix:main"
 
 [tool.setuptools]
-py-modules = ["skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model", "agent_capabilities", "artifact_contracts", "cli_contracts", "telemetry", "trigger_contracts", "trigger_reporting", "trace_contracts", "runner_contracts", "judge_contracts", "judge_verdict", "experimental_pairs", "jetty_contracts", "gemini_contracts", "grading_contracts", "invocation_contracts", "json_contracts", "manifest_contracts", "report_contracts", "text_contracts"]
+py-modules = [
+  "skill_benchmark", "run_pi_trigger_eval", "run_trigger_matrix", "ablation_model", "agent_capabilities", "artifact_contracts", "cli_contracts", "telemetry", "trigger_contracts", "trigger_reporting", "trace_contracts", "runner_contracts", "judge_contracts", "judge_verdict", "experimental_pairs", "jetty_contracts", "gemini_contracts", "grading_contracts", "invocation_contracts", "json_contracts", "manifest_contracts", "report_contracts", "text_contracts",
+  "eval_manifests", "harness_io", "json_schema_subset", "prepared_tasks", "skill_ablations", "telemetry_blocks", "trigger_identity",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -67,6 +70,9 @@ required-version = "==0.16.0"
 "telemetry.py" = ["TRY004"]
 # Runner boundaries must report arbitrary provider/CLI failures as evaluation
 # results, and the matrix's class attributes are immutable fixture shapes.
+# Modules split out of skill_benchmark.py keep exactly the exemptions their
+# code needed there.
+"harness_io.py" = ["BLE001"]
 "run_pi_trigger_eval.py" = ["F401"]
 "run_trigger_matrix.py" = ["BLE001", "F401", "RUF012"]
 "skill_benchmark.py" = ["BLE001", "F401", "S112"]

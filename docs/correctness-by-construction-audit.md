@@ -370,8 +370,9 @@ raw output string
 - Packaging inventory, `ty` source coverage, and the versioned trigger-semantic module inventory
   are separate contracts. A standalone report-only module is excluded from trigger identity, while
   a declared trigger dependency changes `harness_identity` and blocks causal reuse. The inventory is
-  deliberately conservative at module granularity: because `skill_benchmark.py` still owns both
-  trigger and non-trigger orchestration, any edit to that monolith invalidates trigger evidence.
+  deliberately conservative at module granularity: it names `skill_benchmark.py` and every module
+  split out of it, so any edit to that code invalidates trigger evidence, and every packaged module
+  must be classified as identified or audited non-trigger.
 - The command line crosses the same kind of boundary. `argparse.Namespace` becomes a frozen
   `ValidatedLegacyCLIInvocation`; commands form a closed enum, paths and domain identities are projected to their
   typed values, numeric limits reject booleans and non-finite/out-of-range values, and dispatch
@@ -449,7 +450,8 @@ legacy artifact never recorded. In particular:
 - Jetty aliases and response shapes still need token-backed live validation before production claims;
 - `RunnerOutcome` is retained as a compatibility factory, so new code should construct the explicit
   union variants directly;
-- `skill_benchmark.py` remains a shared orchestration monolith, so the conservative trigger identity
-  must invalidate on unrelated edits to that module until trigger ownership is extracted; and
+- `skill_benchmark.py` and every module split out of it are in the conservative trigger identity, so
+  it still invalidates on unrelated edits to that code until it is narrowed to what trigger paths
+  import; and
 - provider payload dictionaries are preserved for diagnostics, but no downstream decision should
   bypass the typed adapter to read them directly.

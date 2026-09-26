@@ -579,7 +579,14 @@ skill-eval-harness/
 ├── LESSONS_LEARNED.md
 ├── TODO.md
 ├── pyproject.toml
-├── skill_benchmark.py          # the CLI, grading, reporting, and runner adapters
+├── skill_benchmark.py          # the CLI and the harness code not yet split out; re-exports the modules below
+├── eval_manifests.py           # manifest vocabulary, loading, and validation
+├── prepared_tasks.py           # prepared answer tasks and the answer design they bind
+├── skill_ablations.py          # skill trees, frontmatter, and ablation materialization
+├── telemetry_blocks.py         # normalized usage and cost blocks
+├── json_schema_subset.py       # the JSON Schema subset behind structured-output checks
+├── trigger_identity.py         # trigger harness and manifest-treatment identity
+├── harness_io.py               # strict JSON/YAML I/O, atomic writes, subprocess invocation
 ├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
 ├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance/task value objects
