@@ -594,7 +594,13 @@ skill-eval-harness/
 ├── json_schema_subset.py       # the JSON Schema subset behind structured-output checks
 ├── judge_tasks.py              # judge task identity, prompts, and verdict schemas
 ├── judge_execution.py          # judge backends, verdict merges, and judge calibration
+├── lift_statistics.py          # paired statistics, significance, and reliability
+├── benchmark_reports.py        # benchmark reports, costs, renderings, viewer, and trend
+├── blind_comparisons.py        # blind A/B comparisons
+├── eval_audits.py              # migration, skill profiling, readiness, contamination, audit
 ├── trigger_identity.py         # trigger harness and manifest-treatment identity
+├── trigger_comparison.py       # the trigger-compare command
+├── suite_runs.py               # multi-manifest suite runs
 ├── harness_io.py               # strict JSON/YAML I/O, atomic writes, subprocess invocation
 ├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
 ├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
