@@ -40,7 +40,7 @@ tests are where that claim is checked rather than trusted.
 
 The buckets below extend what the harness can measure. This floor decides whether the number it
 already prints can be believed. The harness reports one thing: lift, `with_skill` minus
-`without_skill` on the same case (`build_paired_summary` (`skill_benchmark.py:1799`)). That number is believable only
+`without_skill` on the same case (`build_paired_summary` (`lift_statistics.py:452`)). That number is believable only
 when three preconditions hold, each intended today, none enforced, and each restating a claim from
 `evals-are-not-tests.md`:
 
@@ -111,7 +111,7 @@ multi-model (2.1) feature built on unverified detectors only scales an unverifie
 
 ### Boundary
 The set stops here deliberately. Report-level correctness — whether the saturation, no-lift, flaky,
-and negative-delta flags (`build_benchmark_report` (`skill_benchmark.py:3324`)) are computed right — sits a layer
+and negative-delta flags (`build_benchmark_report` (`benchmark_reports.py:1406`)) are computed right — sits a layer
 above the raw measurement, where the golden-report tests the buckets already plan (1.2, 2.6) cover
 it. CF.1–CF.4 are the floor underneath that work: once they pass, a printed lift carries a checked
 measurement, and every feature in the buckets builds on a number that has been verified rather than
@@ -146,7 +146,7 @@ assumed.
 ### 1.3 Judge config slot and the "judge is not the model under test" guard
 - **Goal:** make an existing convention enforceable.
 - **Abstractions used or changed:** read an optional `judge` block in the manifest; add a check
-  in `audit_manifest_report` (`skill_benchmark.py:6114`) comparing the declared judge model against `jetty.model`
+  in `audit_manifest_report` (`eval_audits.py:1051`) comparing the declared judge model against `jetty.model`
   or the run metadata `model`.
 - **Design:** warn by default, error under `--strict-judge`.
 - **Testing:** unit tests for matching and differing model ids.
@@ -163,7 +163,7 @@ assumed.
 - **Status:** `docs/authoring-evals.md` shipped, alongside `architecture.md` and
   `abstractions.md`.
 - **Follow-on:** surface the guide's rules where they are checkable. Extend the messaging in
-  `prompt_assertion_leakage_findings` (`eval_manifests.py:449`) and `fixture_recommendations` (`skill_benchmark.py:5807`) to point
+  `prompt_assertion_leakage_findings` (`eval_manifests.py:449`) and `fixture_recommendations` (`eval_audits.py:744`) to point
   at the relevant section.
 - **Testing:** assert the new hint strings appear for crafted manifests.
 
@@ -188,9 +188,9 @@ assumed.
   not name it.
 - **Abstractions used or changed:** an optional `oracle` tier on an assertion
   (`strong` / `demo` / `live`), defaulting by type (deterministic text/process are `strong`,
-  `script` is `demo` unless marked, judge/live are `live`). `build_benchmark_report` (`skill_benchmark.py:3324`)
+  `script` is `demo` unless marked, judge/live are `live`). `build_benchmark_report` (`benchmark_reports.py:1406`)
   reports, per case, the share of its pass rate carried by `strong` oracles;
-  `audit_manifest_report` (`skill_benchmark.py:6114`) warns when a case passes only on weak ones. This extends
+  `audit_manifest_report` (`eval_audits.py:1051`) warns when a case passes only on weak ones. This extends
   leakage lint (`:164`) from prompts to oracles.
 - **Strongest tier — the rendered-artifact oracle:** the top of the ladder is an oracle that
   builds or renders the artifact and inspects the result, not the source text.
@@ -223,9 +223,9 @@ assumed.
   past it — either way, question it. This is the inverse of the saturation flag: saturation marks
   a case as too easy *now*; staleness marks a case that has never discriminated *over time*.
 - **Abstractions used or changed:** reads the cross-run history from 2.6. A `prune` report (or a
-  flag in `build_benchmark_report` (`skill_benchmark.py:3324`)) marks a case a removal candidate when, across the
+  flag in `build_benchmark_report` (`benchmark_reports.py:1406`)) marks a case a removal candidate when, across the
   last N runs, it never failed and never showed lift (`with_skill` == `without_skill` every time).
-  `audit_manifest_report` (`skill_benchmark.py:6114`) lists the candidates; removal stays a human decision.
+  `audit_manifest_report` (`eval_audits.py:1051`) lists the candidates; removal stays a human decision.
 - **Design:** the harness suggests, never deletes. A case may be kept deliberately as a
   regression guard even when stale; the report says so rather than acting.
 - **Depends on:** 2.6 (needs run history to judge "never failed over time").
@@ -243,8 +243,8 @@ assumed.
   beside `variant` and `run_number`. Each row carries its target `model`, and `run_dir` gains a
   model segment (`<case>/<model>/<variant>/run-<n>`), kept backward-compatible when one model
   runs. Runners pass the row `model` through; per-run `model` already lands in `metadata.json`,
-  so grading needs no change. `build_benchmark_report` (`skill_benchmark.py:3324`) groups `by_variant` within
-  `by_model`, and `build_paired_summary` (`skill_benchmark.py:1799`) computes lift per (case, model).
+  so grading needs no change. `build_benchmark_report` (`benchmark_reports.py:1406`) groups `by_variant` within
+  `by_model`, and `build_paired_summary` (`lift_statistics.py:452`) computes lift per (case, model).
 - **Design:** model is a third axis, not a new variant. Variants stay orthogonal, giving a
   model-by-variant grid. CLI: `--models a,b,c` on `prepare`.
 - **Testing:** a fan-out test asserting row count equals cases × variants × runs × models with
@@ -282,7 +282,7 @@ assumed.
   - `grade_case_variant` (`eval_grading.py:811`) splits totals into critical, gated, and soft. A `critical`
     failure vetoes the case; a `gate` failure lowers the pass rate; a `soft` failure lowers
     neither and fills a `scored` bucket. A `--strict` flag promotes soft to gate.
-  - **Statistical lift** in `build_paired_summary` (`skill_benchmark.py:1799`): alongside the raw delta, compute a
+  - **Statistical lift** in `build_paired_summary` (`lift_statistics.py:452`): alongside the raw delta, compute a
     significance test over the per-case graded scores (paired bootstrap or sign-flip
     permutation, mirroring `score_delta.py`), so lift is tested, not eyeballed.
   - **Reference-anchor floor:** an optional `reference_score` / `reference_graded_score` on a
@@ -351,7 +351,7 @@ assumed.
 - **Goal:** watch lift, saturation, and token drift over time.
 - **Abstractions used or changed:** a consumer of `build_benchmark_report`. Add an append-only
   history store and a `trend` subcommand that diffs successive `benchmark.json` files, reusing
-  the `compare_results` (`skill_benchmark.py:4491`) logic.
+  the `compare_results` (`blind_comparisons.py:587`) logic.
 - **Severity-weighted ranking (from the macro-evals notebook):** when surfacing recurring
   failures across runs, rank them by `prevalence × severity`, not raw count, so a rare but severe
   failure outranks a common trivial one. This is the floor-raising principle made quantitative;
@@ -390,7 +390,7 @@ assumed.
 ### 2.8 Interactive served report and richer artifacts
 - **Goal:** capture feedback in the browser and render image, PDF, and xlsx artifacts, beyond the
   static `render_viewer`.
-- **Abstractions used or changed:** extend `render_viewer` (`skill_benchmark.py:5288`) with a `serve` mode and
+- **Abstractions used or changed:** extend `render_viewer` (`benchmark_reports.py:2578`) with a `serve` mode and
   artifact encoders. Anthropic's `eval-viewer/generate_review.py` is the blueprint, including
   `feedback.json` persistence and a `--previous-workspace` diff.
 - **Testing:** unit-test the artifact embedding and categorization and the feedback round trip;
@@ -435,7 +435,7 @@ assumed.
   the model axis, plus a viewer panel.
 - **Slice-lift concentration (from the macro-evals notebook):** compute, per slice, where lift (or
   a failure) concentrates — `slice share ÷ overall share`, the macro-eval `lift` metric one level
-  up from per-case lift. `build_slice_summary` (`skill_benchmark.py:2025`) already groups by domain/difficulty/
+  up from per-case lift. `build_slice_summary` (`lift_statistics.py:678`) already groups by domain/difficulty/
   trigger/goal, so this is a ratio over groups it already forms, not new plumbing.
 - **Testing:** a report test over a two-model by two-variant fixture grid, plus a concentration
   test asserting a failure confined to one slice scores a high ratio there.
