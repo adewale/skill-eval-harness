@@ -73,11 +73,30 @@ from ablation_model import TRIGGER_MEASUREMENT_EVIDENCE_CLASS, EvidenceClass, Pr
 from agent_capabilities import (
     AGENT_CAPABILITIES,
     CODEX_TRIGGER_DEFAULT_CMD,
+    VIBE_DEFAULT_CMD,
     add_surface_cli_options,
     binding_for,
     surface_implementations,
     surface_option_values,
 )
+from agent_clis import (
+    VIBE_READ_ONLY_TOOLS,
+    build_vibe_cli_argv,
+    codex_env_for_home,
+    vibe_env_for_home,
+    vibe_final_answer,
+    vibe_skill_tool_evidence,
+)
+from eval_manifests import VALID_SPLITS, repo_root_for_manifest
+from harness_io import (
+    canonical_json_sha256,
+    invoke_argv_with_timeout,
+    iter_json_objects,
+    mount_skill_tree,
+    write_json,
+)
+from invocation_contracts import ProcessInvocationPlan
+from json_contracts import strict_json_loads
 from run_pi_trigger_eval import (
     cases_from_manifest,
     eval_rows_from_args,
@@ -88,38 +107,22 @@ from run_pi_trigger_eval import (
     skill_name_from_manifest,
     validate_trigger_rows,
 )
-from skill_benchmark import (
-    VALID_SPLITS,
-    VIBE_DEFAULT_CMD,
-    VIBE_READ_ONLY_TOOLS,
+from skill_ablations import (
     AblationError,
-    PiStream,
-    ProcessInvocationPlan,
     build_canonical_skill_tree,
-    build_vibe_cli_argv,
-    canonical_json_sha256,
-    codex_env_for_home,
+    frontmatter_value,
+    materialize_trigger_ablation,
+    skill_tree_hash,
+)
+from trace_normalization import (
+    PiStream,
     detect_trigger_detection,
     detect_trigger_records,
-    frontmatter_value,
-    invoke_argv_with_timeout,
-    iter_json_objects,
-    materialize_trigger_ablation,
-    mount_skill_tree,
     normalize_trace_records,
     parse_trace_jsonl_text,
-    repo_root_for_manifest,
     safe_trace_label,
-    skill_tree_hash,
     stream_usage_and_cost,
-    strict_json_loads,
     trace_dialect_for,
-    trigger_harness_identity,
-    trigger_manifest_identity,
-    vibe_env_for_home,
-    vibe_final_answer,
-    vibe_skill_tool_evidence,
-    write_json,
     write_trace_artifacts,
 )
 from trigger_contracts import (
@@ -134,6 +137,7 @@ from trigger_contracts import (
     validated_trigger_model,
     validated_trigger_protocol_limits,
 )
+from trigger_identity import trigger_harness_identity, trigger_manifest_identity
 from trigger_reporting import (
     summarize_trigger_cohort,
     summarize_trigger_matrix,
@@ -366,7 +370,7 @@ class AgentAdapter:
                 pi_stream=invocation.provider_payload)
         return detect_trigger_detection(invocation.stdout, copied, source=self.name)
 
-    # The shared mount and subprocess conventions (skill_benchmark owns them;
+    # The shared mount and subprocess conventions (harness_io owns them;
     # the Pi runner uses the very same functions, so adapters cannot drift).
     _mount_tree = staticmethod(mount_skill_tree)
     _run_argv = staticmethod(invoke_argv_with_timeout)
