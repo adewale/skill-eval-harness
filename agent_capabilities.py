@@ -484,7 +484,7 @@ _CLAUDE_TRIGGER = SurfaceBinding(
     ("max_turns",),
 )
 _CLAUDE_JUDGE = SurfaceBinding(
-    ObjectRef("skill_benchmark", "claude_judge_invoke"),
+    ObjectRef("judge_execution", "claude_judge_invoke"),
     (_option("--claude-bin", "claude_bin", "claude",
              "path to the claude executable when using the claude judge backend"),),
 )
@@ -499,7 +499,7 @@ _CODEX_TRIGGER = SurfaceBinding(
              "Codex command prefix; the raw query is appended as one argv element"),),
 )
 _CODEX_JUDGE = SurfaceBinding(
-    ObjectRef("skill_benchmark", "codex_judge_invoke"),
+    ObjectRef("judge_execution", "codex_judge_invoke"),
     (_option("--codex-cmd", "codex_cmd", CODEX_JUDGE_DEFAULT_CMD,
              "argv-style Codex command prefix for --judge-backend codex; shell metacharacters are not interpreted"),),
 )
@@ -509,7 +509,7 @@ _GEMINI_ANSWER = SurfaceBinding(
              "one literal Gemini CLI executable for --agent gemini answer runs; spaces are path characters and no shell is used"),),
 )
 _GEMINI_JUDGE = SurfaceBinding(
-    ObjectRef("skill_benchmark", "gemini_judge_invoke"),
+    ObjectRef("judge_execution", "gemini_judge_invoke"),
     (_option("--gemini-cmd", "gemini_cmd", GEMINI_DEFAULT_CMD,
              "one literal Gemini CLI executable for --judge-backend gemini; spaces are path characters and no shell is used"),),
 )
@@ -525,7 +525,7 @@ _VIBE_TRIGGER = SurfaceBinding(
     ("max_turns",),
 )
 _VIBE_JUDGE = SurfaceBinding(
-    ObjectRef("skill_benchmark", "vibe_judge_invoke"),
+    ObjectRef("judge_execution", "vibe_judge_invoke"),
     (_option("--vibe-cmd", "vibe_cmd", VIBE_DEFAULT_CMD,
              "argv-style Vibe command prefix for --judge-backend vibe; shell metacharacters are not interpreted"),),
 )

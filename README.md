@@ -590,7 +590,10 @@ skill-eval-harness/
 ├── run_artifacts.py            # run discovery, artifact-contract readers, workspaces
 ├── trace_normalization.py      # trace dialects, normalization, trigger detection
 ├── telemetry_blocks.py         # normalized usage and cost blocks
+├── eval_grading.py             # deterministic assertions and the grade command
 ├── json_schema_subset.py       # the JSON Schema subset behind structured-output checks
+├── judge_tasks.py              # judge task identity, prompts, and verdict schemas
+├── judge_execution.py          # judge backends, verdict merges, and judge calibration
 ├── trigger_identity.py         # trigger harness and manifest-treatment identity
 ├── harness_io.py               # strict JSON/YAML I/O, atomic writes, subprocess invocation
 ├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
