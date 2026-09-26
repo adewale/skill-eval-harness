@@ -17,7 +17,9 @@ discovery-population ablation for autonomous trigger examples.
 
 `stub_runner.py` answers by reading the skill that the harness actually mounted into
 the isolated workspace, so removing a piece really changes the output — the
-regression is genuine, not scripted into the runner.
+regression is genuine, not scripted into the runner. Its trace is genuine too:
+every skill file it reads appears as one `cat <path>` command in the run's
+`events.json`.
 
 The `c-review` case also carries one qualitative assertion (`actionable-review`,
 `severity: "gate"`), judged offline by `stub_judge.py` — a deterministic judge with a
@@ -56,14 +58,27 @@ as an `expected_regression_confirmed` because the ablation is **materialized** (
 edited tree, blind, with verified provenance) and the four repeated runs clear the
 per-case significance gate. With a single run per arm the same observed drop is reported
 as indeterminate, not confirmed. Swap the stub for a real runner
-(`--codex-cmd "codex exec"`, etc.) to run it against an actual model — for Claude, use `skill-benchmark run-claude` instead, which parses the `claude -p` JSON envelope and captures cost.
+(`--codex-cmd "codex exec"`, etc.) to run it against an actual model — for Claude, use `skill-benchmark run-claude` instead, which streams `claude -p` output, capturing cost and the run's tool-use trace.
+
+## Grade the path, not just the answer
+
+`trajectory-benchmark.json` (beside `skills/`) is a companion manifest for
+[`docs/did-my-skill-change-how-the-model-works.md`](../../docs/did-my-skill-change-how-the-model-works.md).
+Its `c-weak-outcome` case shows no lift while `trajectory_diff` shows the skill
+changing the path, and its `c-review-path` case grades the path with process
+assertions and a `per_step` judge. Run the stub as
+`--codex-cmd "python3 $(pwd)/stub_runner.py --loop"` to reach the same answer
+through a redundant path (it re-reads `SKILL.md` twice more). `stub_judge.py`
+answers per-step prompts too: careful mode flags a step that repeats an earlier
+one verbatim, and `--lenient` passes every step.
 
 ## Measure activation (does the skill load on its own?)
 
 Everything above force-loads the skill, so it says nothing about whether an agent
 would *discover* it. The manifest also carries one should-fire and one
 should-not-fire `kind: "trigger"` case for that question. Offline first (the stub
-'agent' decides from the mounted description, deterministically):
+'agent' decides from the mounted discovery text — `description` plus
+`when_to_use` — deterministically):
 
 ```bash
 python3 ../../run_trigger_matrix.py evals/shared-benchmark.json \
@@ -82,7 +97,12 @@ python3 ../../run_trigger_matrix.py evals/shared-benchmark.json \
 The loop for acting on the resulting per-model trigger rates is
 [`docs/tuning-skill-activation.md`](../../docs/tuning-skill-activation.md).
 To exercise the bundled discovery ablation, add
-`--ablation weaker-description --trace-runs /tmp/demo-trigger-traces`.
+`--ablation weaker-description --trace-runs /tmp/demo-trigger-traces`. To turn a
+baseline run and an ablation run into a causal verdict, pair them with
+`skill-benchmark trigger-compare`. `evals/trigger-eval-set.json` holds eleven
+queries in both polarities, six phrased only in `when_to_use`'s words, enough for
+the removal to reach `confirmed_causal`
+([`docs/did-removing-this-break-discovery.md`](../../docs/did-removing-this-break-discovery.md)).
 
 ## What it teaches
 

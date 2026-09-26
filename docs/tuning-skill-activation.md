@@ -131,7 +131,9 @@ Each rule below exists because its violation produced a wrong number at least on
 - **Every number is a raw measurement.** The report is stamped
   `raw_autonomous_trigger_measurement` — a rate to steer description edits, not a
   provenance-verified causal comparison like the benchmark path's confirmed
-  ablation regressions.
+  ablation regressions. To ask whether removing discovery text *caused* a drop,
+  pair a baseline run with an `--ablation` run through `trigger-compare`
+  ([`did-removing-this-break-discovery.md`](did-removing-this-break-discovery.md)).
 
 ## Extending the matrix to other agents
 

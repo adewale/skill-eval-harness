@@ -380,14 +380,19 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       and apply telemetry migration, repair strict judge/pair/trigger/Jetty inputs, regenerate
       reports, distinguish expected semantic changes from regressions, and roll back from the
       untouched 0.5.1 artifacts.
-- [ ] **"Did my skill change HOW the model works, not just whether it passes?"** — the
-      machinery shipped with the trace-depth slice: Claude answer runs now stream real
-      tool-use traces, the report's `trajectory_diff` block shows paired command/count/skill-load
-      deltas per case, and a `per_step` judge grades each completed step (raw records resolved
-      through `raw_ref`). The walkthrough should run the demo offline, read a no-lift case
-      through `trajectory_diff`, then escalate to `per_step` where outcome assertions saturate.
-- [ ] **"Did removing this description actually break discovery?"** — extends
-      [`docs/tuning-skill-activation.md`](docs/tuning-skill-activation.md): baseline
-      `skill-trigger-matrix` run + `--ablation` run → `skill-benchmark trigger-compare` →
-      read the evidence class (confirmed/refuted/indeterminate), the ≥6-query significance
-      bound, and blocked-pair reasons before editing the description again.
+- [x] **"Did my skill change HOW the model works, not just whether it passes?"** —
+      [`docs/did-my-skill-change-how-the-model-works.md`](docs/did-my-skill-change-how-the-model-works.md):
+      a no-lift case read through `trajectory_diff` (the skill changed the path; the
+      assertion was blind to it), then process assertions and a `per_step` judge over the
+      path. Runnable offline on `examples/demo-skill`: the stub runner's trace records the
+      reads it performs, `--loop` reaches the same answer through a redundant path, and the
+      stub judge gained a per-step mode (real 2026-09-26 output; guarded by
+      `tests/test_example_demo.py`).
+- [x] **"Did removing this description actually break discovery?"** —
+      [`docs/did-removing-this-break-discovery.md`](docs/did-removing-this-break-discovery.md):
+      baseline + `--ablation` trigger-matrix runs → `trigger-compare`, walked through all
+      three evidence classes on real output — refuted (the manifest's queries never
+      exercised `when_to_use`), indeterminate (three regressed queries, p = 0.25), confirmed
+      (six, p = 0.03125). Runnable offline: the stub trigger agent now routes on the
+      discovery text a discovery ablation removes (`description` + `when_to_use`), and the
+      demo ships `evals/trigger-eval-set.json` (guarded by `tests/test_example_demo.py`).

@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "skill_name": "demo-reviewer",
+  "skill_paths": ["skills/demo/SKILL.md"],
+  "variants": ["with_skill", "without_skill"],
+  "notes": "Companion manifest for docs/did-my-skill-change-how-the-model-works.md. Same skill and stub runner as shared-benchmark.json; the cases here grade the PATH a run took, not only its answer. Run the stub with --loop to reach the same answer through a redundant path.",
+  "cases": [
+    {
+      "id": "c-weak-outcome",
+      "split": "tune",
+      "kind": "review",
+      "prompt": "Review this change: it adds a new HTTP endpoint with no test. Give me your review.",
+      "expected_behavior": ["Give a review of the change."],
+      "assertions": [
+        {"name": "gives-a-review", "type": "contains", "value": "Review of the change"}
+      ],
+      "tags": ["demo", "trajectory"]
+    },
+    {
+      "id": "c-review-path",
+      "split": "tune",
+      "kind": "review",
+      "prompt": "Review this change: it adds a new HTTP endpoint with no test. Give me your review.",
+      "expected_behavior": [
+        "Label the finding's severity (Blocking / Minor / Clean).",
+        "Consult the skill before answering, and do not re-read context already in hand."
+      ],
+      "assertions": [
+        {"name": "severity-label", "type": "contains_any", "values": ["Blocking", "Minor", "Clean"]},
+        {"name": "skill-read", "type": "skill_invoked", "expected": true, "variants": ["with_skill"]},
+        {"name": "no-reread-loop", "type": "no_repeated_command_loop", "max_repeats": 1},
+        {"name": "sound-steps", "type": "judge", "per_step": true, "severity": "gate", "variants": ["with_skill"],
+         "prompt": "Judge each step of the run's path: was it a sound action for this review — not redundant, not destructive?"}
+      ],
+      "tags": ["demo", "trajectory"]
+    }
+  ],
+  "ablations": []
+}

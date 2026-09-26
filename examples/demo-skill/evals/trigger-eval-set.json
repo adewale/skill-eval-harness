@@ -1,0 +1,15 @@
+{
+  "queries": [
+    {"id": "desc-review-change", "query": "Review this proposed change and label each finding.", "should_trigger": true},
+    {"id": "desc-label-severity", "query": "Label the severity of the findings in this change.", "should_trigger": true},
+    {"id": "wtu-inspect-diff", "query": "Can you inspect this diff?", "should_trigger": true},
+    {"id": "wtu-serious-code", "query": "How serious is this bug in my code?", "should_trigger": true},
+    {"id": "wtu-inspect-code", "query": "Please inspect the code in this diff.", "should_trigger": true},
+    {"id": "wtu-code-diff-serious", "query": "Is this code diff serious?", "should_trigger": true},
+    {"id": "wtu-asked-check", "query": "I was asked to check this code diff.", "should_trigger": true},
+    {"id": "wtu-serious-problems", "query": "How serious are these code problems?", "should_trigger": true},
+    {"id": "neg-capital", "query": "What is the capital of France?", "should_trigger": false},
+    {"id": "neg-haiku", "query": "Write a haiku about autumn leaves.", "should_trigger": false},
+    {"id": "neg-csv", "query": "Convert this CSV file to JSON.", "should_trigger": false}
+  ]
+}

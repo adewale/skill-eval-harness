@@ -529,10 +529,25 @@ class StubMatrixOfflineTests(unittest.TestCase):
         self.assertNotIn("SECRET-TOKEN-12345", metrics_text)
         self.assertIn("[REDACTED]", trace_text)
 
+    def test_stub_routes_on_when_to_use_hints(self):
+        """The stub models the discovery text the harness ablates — description
+        AND when_to_use — so a query phrased only in when_to_use's words fires
+        the mounted skill, and the demo's weaker-description ablation (which
+        removes when_to_use) measurably stops it offline."""
+        rows = tr.validate_trigger_rows(
+            [{"query": "Can you inspect this diff?", "should_trigger": True}], "test")
+        baseline = tm.run_matrix(DEMO_MANIFEST, rows, agents=["stub"], models=["offline"],
+                                 runs_per_query=1, timeout=30, workers=1)
+        ablated = tm.run_matrix(DEMO_MANIFEST, rows, agents=["stub"], models=["offline"],
+                                runs_per_query=1, timeout=30, workers=1,
+                                ablation="weaker-description")
+        self.assertTrue(baseline["results"][0]["triggered"])
+        self.assertFalse(ablated["results"][0]["triggered"])
+
     def test_weakened_description_under_triggers_offline(self):
-        """The loop's core signal, deterministic: strip the description of the
-        words users actually type and the (stub) agent stops loading the skill
-        on the should-fire query."""
+        """The loop's core signal, deterministic: strip the discovery text
+        (description and when_to_use) of the words users actually type and the
+        (stub) agent stops loading the skill on the should-fire query."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             skill_dir = root / "skills" / "demo"
@@ -540,7 +555,9 @@ class StubMatrixOfflineTests(unittest.TestCase):
             source = (ROOT / "examples" / "demo-skill" / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8")
             weakened = source.replace(
                 "description: Demo skill for the Skill Eval Harness example. Use it to review a proposed change and label the severity of each finding.",
-                "description: General assistance helper.")
+                "description: General assistance helper.").replace(
+                "when_to_use: Use this skill when asked to review a proposed code change, inspect a diff, or label how serious a finding is.\n",
+                "")
             (skill_dir / "SKILL.md").write_text(weakened, encoding="utf-8")
             (skill_dir / "references" / "checklist.md").write_text("checklist\n", encoding="utf-8")
             evals = root / "evals"

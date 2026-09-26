@@ -175,6 +175,8 @@ skill-benchmark --help
 | `docs/which-model-should-my-skill-target.md` | Ranking model tiers by lift: `prepare --models` fan-out, the `by_model` / `model_analysis` blocks, and reading real lift vs. base-model saturation per tier. |
 | `docs/why-did-this-run-fail.md` | Debugging one failing run: the `error-analysis` taxonomy + review queue, then the run dir (`output.md`/`metadata.json`), mapped to a failure class and a manifest-or-skill decision. |
 | `docs/can-i-trust-my-judge.md` | Calibrating a judge before believing its numbers: `judge-robustness` (order-flip + negative controls), `judge-alignment` (human labels, Cohen's kappa, precision/recall), and `compare-judges` (does the lift survive a judge swap?). |
+| `docs/did-my-skill-change-how-the-model-works.md` | Grading the path, not just the answer: read a no-lift case through `trajectory_diff`, then grade the path with process assertions and a `per_step` judge — a looping run that keeps the right answer is caught only by the path checks. |
+| `docs/did-removing-this-break-discovery.md` | Turning a before/after pair of trigger-matrix runs into an evidence class with `trigger-compare`: refuted on queries that never exercised the removed text, indeterminate below six regressed queries, confirmed on an eval set in the users' words. |
 | `docs/eval-framework-roadmap-spec.md` | The implemented eval-framework roadmap: goals, abstractions, and tests per feature (CF.1–CF.4, buckets 1–4, migration). |
 | `docs/migrating-evals.md` | Upgrading a manifest between versions (v1 → v2): what `migrate` stamps and the judgment calls it leaves. |
 | `docs/upgrading.md` | Version-by-version harness upgrades: saved-run backup, artifact migration, strict input repairs, expected report changes, and rollback. |
