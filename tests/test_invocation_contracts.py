@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import harness_io
 import skill_benchmark as sb
 from invocation_contracts import (
     InvocationRequest,
@@ -51,7 +52,7 @@ class InvocationPlanContractTests(unittest.TestCase):
             return InvocationOutcome.from_process(
                 stdout="", stderr="", returncode=0, elapsed_ms=0)
 
-        with mock.patch.object(sb, "invoke_argv_with_timeout", side_effect=invoke):
+        with mock.patch.object(harness_io, "invoke_argv_with_timeout", side_effect=invoke):
             sb.run_argv_with_timeout(["provider"], timeout=1, input_text=None)
 
         self.assertIsNone(observed[0].input_text)

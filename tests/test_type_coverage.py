@@ -63,7 +63,7 @@ class TypeCoverageContractTests(unittest.TestCase):
         self.assertIs(sb.TRIGGER_SEMANTIC_MODULES, sb.TRIGGER_IDENTITY_MODULES)
         self.assertIs(sb.HARNESS_SEMANTIC_MODULES, sb.TRIGGER_IDENTITY_MODULES)
         self.assertTrue(trigger_modules <= packaged)
-        self.assertEqual(sb.TRIGGER_HARNESS_IDENTITY_VERSION, 2)
+        self.assertEqual(sb.TRIGGER_HARNESS_IDENTITY_VERSION, 3)
         self.assertTrue({
             "skill_benchmark.py", "run_pi_trigger_eval.py",
             "run_trigger_matrix.py", "trigger_contracts.py",
@@ -72,7 +72,7 @@ class TypeCoverageContractTests(unittest.TestCase):
         } <= trigger_modules)
         upgrading = (ROOT / "docs" / "upgrading.md").read_text(encoding="utf-8")
         self.assertIn("conservative audited module-level", upgrading)
-        self.assertIn("skill_benchmark.py` remains a monolith", upgrading)
+        self.assertIn("names every module split out of `skill_benchmark.py`", upgrading)
 
     def test_every_packaged_module_is_classified_for_trigger_identity(self):
         packaged = {

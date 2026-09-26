@@ -38,12 +38,26 @@ to make old artifacts pass the new constructors.
 
 ### Trigger harness identity
 
-Trigger `harness_identity` is now schema version 2 and names a conservative audited module-level
-inventory instead of every packaged module. Version-1 trigger reports must be regenerated before a
-new causal comparison; this deliberate incompatibility refuses to guess equivalence with the old
-overbroad set. Standalone report, judge, CLI, and unsupported-provider modules are excluded, but
-`skill_benchmark.py` remains a monolith shared by trigger and non-trigger orchestration. Any edit to
-that file still invalidates trigger identity until those owners are extracted into separate modules.
+Trigger `harness_identity` is now schema version 3 and names a conservative audited module-level
+inventory instead of every packaged module. Version-1 and version-2 trigger reports must be
+regenerated before a new causal comparison; this deliberate incompatibility refuses to guess
+equivalence with an older module set. Standalone report, judge, CLI, and unsupported-provider
+modules are excluded. `skill_benchmark.py` is being split into modules by subsystem, and the
+inventory names every module split out of `skill_benchmark.py` as well as the file itself, so an
+edit to any of that code still invalidates trigger identity, exactly as an edit to the single file
+did.
+
+### Code moving out of `skill_benchmark.py`
+
+`import skill_benchmark as sb` keeps working: `skill_benchmark` re-exports every name the split
+modules define, as the same objects. A re-export is a binding, not an owner, so code that
+monkeypatched `skill_benchmark.<name>` must patch the module that looks the name up instead (for
+example `harness_io.invoke_argv_with_timeout` for `run_argv_with_timeout`); a patch on
+`skill_benchmark` reaches only code still in that file.
+
+An editable install (`pip install -e .`) records the top-level modules that existed when it ran.
+After pulling a change that adds modules, run `pip install -e .` again; until then the
+`skill-benchmark` console script fails with `ModuleNotFoundError` outside the repository root.
 
 ## 0.5.1 → 0.6.0
 
