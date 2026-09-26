@@ -2,7 +2,7 @@
 
 Provider implementations still live beside the command paths they serve, but
 their registration does not.  Lazy object references keep this module a leaf:
-``skill_benchmark`` and ``run_trigger_matrix`` can both project their legacy
+the harness modules and ``run_trigger_matrix`` can both project their legacy
 registries from ``BACKENDS`` without importing one another through this file.
 Each reference names the module that defines the object, never one that merely
 re-exports it: a registry view materialized at import time resolves references
@@ -473,7 +473,7 @@ def _option(flag: str, dest: str, default: str, help_text: str) -> BackendCliOpt
 
 
 _CLAUDE_ANSWER = SurfaceBinding(
-    ObjectRef("skill_benchmark", "ClaudeBackend"),
+    ObjectRef("answer_backends", "ClaudeBackend"),
     (_option("--claude-bin", "claude_bin", "claude",
              "path to the claude executable for --agent claude"),),
 )
@@ -489,7 +489,7 @@ _CLAUDE_JUDGE = SurfaceBinding(
              "path to the claude executable when using the claude judge backend"),),
 )
 _CODEX_ANSWER = SurfaceBinding(
-    ObjectRef("skill_benchmark", "CodexBackend"),
+    ObjectRef("answer_backends", "CodexBackend"),
     (_option("--codex-cmd", "codex_cmd", CODEX_ANSWER_DEFAULT_CMD,
              "argv-style Codex command prefix for --agent codex answer runs; shell metacharacters are not interpreted"),),
 )
@@ -504,7 +504,7 @@ _CODEX_JUDGE = SurfaceBinding(
              "argv-style Codex command prefix for --judge-backend codex; shell metacharacters are not interpreted"),),
 )
 _GEMINI_ANSWER = SurfaceBinding(
-    ObjectRef("skill_benchmark", "GeminiBackend"),
+    ObjectRef("answer_backends", "GeminiBackend"),
     (_option("--gemini-cmd", "gemini_cmd", GEMINI_DEFAULT_CMD,
              "one literal Gemini CLI executable for --agent gemini answer runs; spaces are path characters and no shell is used"),),
 )
@@ -514,7 +514,7 @@ _GEMINI_JUDGE = SurfaceBinding(
              "one literal Gemini CLI executable for --judge-backend gemini; spaces are path characters and no shell is used"),),
 )
 _VIBE_ANSWER = SurfaceBinding(
-    ObjectRef("skill_benchmark", "VibeBackend"),
+    ObjectRef("answer_backends", "VibeBackend"),
     (_option("--vibe-cmd", "vibe_cmd", VIBE_DEFAULT_CMD,
              "argv-style Vibe command prefix for --agent vibe answer runs; shell metacharacters are not interpreted"),),
 )
@@ -531,20 +531,20 @@ _VIBE_JUDGE = SurfaceBinding(
 )
 
 _RUN_AGENT = AnswerEntrypoint(
-    "run-agent", ObjectRef("skill_benchmark", "run_agent"))
+    "run-agent", ObjectRef("answer_backends", "run_agent"))
 _RUN_CODEX = AnswerEntrypoint(
-    "run-codex", ObjectRef("skill_benchmark", "run_codex"))
+    "run-codex", ObjectRef("answer_backends", "run_codex"))
 _RUN_CLAUDE = AnswerEntrypoint(
-    "run-claude", ObjectRef("skill_benchmark", "run_claude"))
+    "run-claude", ObjectRef("answer_backends", "run_claude"))
 _RUN_SUBAGENT = AnswerEntrypoint(
-    "run-subagent", ObjectRef("skill_benchmark", "run_subagent"))
+    "run-subagent", ObjectRef("subagent_runner", "run_subagent"))
 _EXPORT_JETTY = AnswerEntrypoint(
-    "export-jetty", ObjectRef("skill_benchmark", "export_jetty"), "export")
+    "export-jetty", ObjectRef("jetty_adapter", "export_jetty"), "export")
 _RUN_JETTY = AnswerEntrypoint(
-    "run-jetty", ObjectRef("skill_benchmark", "run_jetty"))
+    "run-jetty", ObjectRef("jetty_adapter", "run_jetty"))
 _IMPORT_JETTY = AnswerEntrypoint(
     "import-jetty-results",
-    ObjectRef("skill_benchmark", "import_jetty_results"),
+    ObjectRef("jetty_adapter", "import_jetty_results"),
     "import",
 )
 
@@ -613,12 +613,12 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             notes="run-claude drives stream-json so answer runs keep the full tool-use stream as trace evidence and capture the Claude CLI cost envelope; trigger matrix detects Skill tool-use plus path evidence.",
         ),
         answer_route="native",
-        trace=ObjectRef("skill_benchmark", "CLAUDE_TRACE_DIALECT"),
+        trace=ObjectRef("trace_normalization", "CLAUDE_TRACE_DIALECT"),
         answer_entrypoints=(_RUN_AGENT, _RUN_CLAUDE),
         answer=_CLAUDE_ANSWER,
         trigger=_CLAUDE_TRIGGER,
         judge=_CLAUDE_JUDGE,
-        workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
+        workspace_builder=ObjectRef("run_artifacts", "build_skill_workspace"),
         smoke=SmokeTarget("claude", "SMOKE_CLAUDE_MODEL", "haiku", "answer"),
         failure_marker="[CLAUDE FAILURE",
     ),
@@ -634,12 +634,12 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             notes="Codex answer/trigger support uses codex exec JSONL; native judging uses codex exec --output-last-message/--output-schema. Dollar cost remains explicit missing unless the stream reports cost or a wrapper estimates it.",
         ),
         answer_route="native",
-        trace=ObjectRef("skill_benchmark", "CODEX_TRACE_DIALECT"),
+        trace=ObjectRef("trace_normalization", "CODEX_TRACE_DIALECT"),
         answer_entrypoints=(_RUN_AGENT, _RUN_CODEX),
         answer=_CODEX_ANSWER,
         trigger=_CODEX_TRIGGER,
         judge=_CODEX_JUDGE,
-        workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
+        workspace_builder=ObjectRef("run_artifacts", "build_skill_workspace"),
         smoke=SmokeTarget("codex", "SMOKE_CODEX_MODEL", "gpt-5.4-mini", "answer"),
         failure_marker="[CODEX FAILURE",
     ),
@@ -662,11 +662,11 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             ),
         ),
         answer_route="native",
-        trace=ObjectRef("skill_benchmark", "GEMINI_TRACE_DIALECT"),
+        trace=ObjectRef("trace_normalization", "GEMINI_TRACE_DIALECT"),
         answer_entrypoints=(_RUN_AGENT,),
         answer=_GEMINI_ANSWER,
         judge=_GEMINI_JUDGE,
-        workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
+        workspace_builder=ObjectRef("run_artifacts", "build_skill_workspace"),
         smoke=SmokeTarget(
             "gemini", "SMOKE_GEMINI_MODEL", "gemini-2.5-flash", "answer"),
         failure_marker="[GEMINI FAILURE",
@@ -683,7 +683,7 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             notes="Pi trigger support is shared by skill-pi-trigger-eval and skill-trigger-matrix; cost is parsed when the JSON stream reports it.",
         ),
         answer_route="none",
-        trace=ObjectRef("skill_benchmark", "PI_TRACE_DIALECT"),
+        trace=ObjectRef("trace_normalization", "PI_TRACE_DIALECT"),
         trigger=SurfaceBinding(ObjectRef("run_trigger_matrix", "PiAdapter")),
         smoke=SmokeTarget("pi", "SMOKE_PI_MODEL", "openai-codex/gpt-5.4-mini", "trigger"),
     ),
@@ -699,9 +699,9 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             notes="Jetty supports answer-path export/run/import; autonomous trigger and judge export/import remain separate Jetty TODOs.",
         ),
         answer_route="export_import",
-        trace=ObjectRef("skill_benchmark", "JETTY_TRACE_DIALECT"),
+        trace=ObjectRef("trace_normalization", "JETTY_TRACE_DIALECT"),
         answer_entrypoints=(_EXPORT_JETTY, _RUN_JETTY, _IMPORT_JETTY),
-        workspace_builder=ObjectRef("skill_benchmark", "jetty_upload_workspace"),
+        workspace_builder=ObjectRef("jetty_adapter", "jetty_upload_workspace"),
         smoke=DedicatedSmokeTarget(
             "jetty",
             ("python3", "-m", "unittest", "discover", "tests", "-k", "smoke_jetty", "-v"),
@@ -719,12 +719,12 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             notes="Mistral Vibe support uses isolated VIBE_HOME, programmatic JSON/streaming output, Agent Skills discovery from .agents/skills, and VIBE_ACTIVE_MODEL for model selection. Current Vibe JSON/streaming output does not export usage/cost telemetry, so both are explicit missing unless a future CLI adds fields.",
         ),
         answer_route="native",
-        trace=ObjectRef("skill_benchmark", "VIBE_TRACE_DIALECT"),
+        trace=ObjectRef("trace_normalization", "VIBE_TRACE_DIALECT"),
         answer_entrypoints=(_RUN_AGENT,),
         answer=_VIBE_ANSWER,
         trigger=_VIBE_TRIGGER,
         judge=_VIBE_JUDGE,
-        workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
+        workspace_builder=ObjectRef("run_artifacts", "build_skill_workspace"),
         smoke=SmokeTarget("vibe", "SMOKE_VIBE_MODEL", "devstral-small-latest", "answer"),
         failure_marker="[VIBE FAILURE",
     ),
@@ -739,9 +739,9 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             notes="Generic in-process/shell seam for answer runs and tool replay; not an autonomous discovery adapter.",
         ),
         answer_route="subagent",
-        trace=ObjectRef("skill_benchmark", "GENERIC_TRACE_DIALECT"),
+        trace=ObjectRef("trace_normalization", "GENERIC_TRACE_DIALECT"),
         answer_entrypoints=(_RUN_SUBAGENT,),
-        workspace_builder=ObjectRef("skill_benchmark", "build_skill_workspace"),
+        workspace_builder=ObjectRef("run_artifacts", "build_skill_workspace"),
         failure_marker="[CLAUDE FAILURE",
     ),
     BackendRegistration(
@@ -756,7 +756,7 @@ BACKENDS: Mapping[str, BackendRegistration] = backend_registry(
             notes="Offline deterministic demo/CI adapter; never spends model tokens.",
         ),
         answer_route="none",
-        trace=ObjectRef("skill_benchmark", "GENERIC_TRACE_DIALECT"),
+        trace=ObjectRef("trace_normalization", "GENERIC_TRACE_DIALECT"),
         trigger=SurfaceBinding(ObjectRef("run_trigger_matrix", "StubAdapter")),
     ),
 )

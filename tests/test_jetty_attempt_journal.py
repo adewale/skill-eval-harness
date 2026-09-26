@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import jetty_adapter
 import skill_benchmark as sb
 
 
@@ -139,7 +140,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
             runs=str(runs),
         )
         with (
-            mock.patch.object(sb, "validate_manifest"),
+            mock.patch.object(jetty_adapter, "validate_manifest"),
             self.assertRaises(SystemExit),
         ):
             sb.import_jetty_results(args)
@@ -347,7 +348,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=LocalTimeoutClient()),
+                    jetty_adapter, "JettyClient", return_value=LocalTimeoutClient()),
             ):
                 self.assertEqual(sb.run_jetty(args), 1)
             self.assertEqual(sb.load_jsonl(out)[0]["status"], "running")
@@ -478,7 +479,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
 
             with (
                 mock.patch.dict(os.environ, {"JETTY_API_TOKEN": "test-token"}),
-                mock.patch.object(sb, "JettyClient", return_value=client),
+                mock.patch.object(jetty_adapter, "JettyClient", return_value=client),
             ):
                 self.assertEqual(sb.run_jetty(args), 0)
 
@@ -491,7 +492,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
             restarted = RecordingClient()
             with (
                 mock.patch.dict(os.environ, {"JETTY_API_TOKEN": "test-token"}),
-                mock.patch.object(sb, "JettyClient", return_value=restarted),
+                mock.patch.object(jetty_adapter, "JettyClient", return_value=restarted),
             ):
                 self.assertEqual(sb.run_jetty(args), 0)
 
@@ -528,7 +529,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    jetty_adapter, "JettyClient", return_value=RecordingClient()),
             ):
                 self.assertEqual(sb.run_jetty(args), 0)
             committed = sb.load_jsonl(out)
@@ -540,7 +541,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    jetty_adapter, "JettyClient", return_value=RecordingClient()),
                 self.assertRaisesRegex(
                     RuntimeError, "omits previously durable"),
             ):
@@ -555,9 +556,9 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    jetty_adapter, "JettyClient", return_value=RecordingClient()),
                 mock.patch.object(
-                    sb, "execute_jetty_payloads",
+                    jetty_adapter, "execute_jetty_payloads",
                     side_effect=InjectedCrash("before replay"),
                 ),
                 self.assertRaises(InjectedCrash),
@@ -573,9 +574,9 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    jetty_adapter, "JettyClient", return_value=RecordingClient()),
                 mock.patch.object(
-                    sb, "execute_jetty_payloads",
+                    jetty_adapter, "execute_jetty_payloads",
                     side_effect=replay_one_then_crash,
                 ),
                 self.assertRaises(InjectedCrash),
@@ -616,7 +617,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    jetty_adapter, "JettyClient", return_value=RecordingClient()),
                 mock.patch.object(
                     sb.JettyAttemptJournal, "_persist",
                     fail_artifact_checkpoint_once,
@@ -634,7 +635,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
             with (
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
-                mock.patch.object(sb, "JettyClient", return_value=restarted),
+                mock.patch.object(jetty_adapter, "JettyClient", return_value=restarted),
             ):
                 self.assertEqual(sb.run_jetty(args), 0)
 
@@ -665,7 +666,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 sb.JettyAttemptJournalLock(journal_path),
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
-                mock.patch.object(sb, "JettyClient", return_value=client),
+                mock.patch.object(jetty_adapter, "JettyClient", return_value=client),
                 self.assertRaises(SystemExit),
             ):
                 sb.run_jetty(args)
@@ -763,7 +764,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
             with (
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
-                mock.patch.object(sb, "JettyClient", return_value=client),
+                mock.patch.object(jetty_adapter, "JettyClient", return_value=client),
                 self.assertRaises(SystemExit),
             ):
                 sb.run_jetty(args)
@@ -789,7 +790,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    jetty_adapter, "JettyClient", return_value=RecordingClient()),
             ):
                 self.assertEqual(sb.run_jetty(args), 0)
 
@@ -802,7 +803,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
             dry_run=False,
         )
         with (
-            mock.patch.object(sb, "load_jsonl", return_value=[]),
+            mock.patch.object(jetty_adapter, "load_jsonl", return_value=[]),
             self.assertRaises(SystemExit),
         ):
             sb.run_jetty(args)
