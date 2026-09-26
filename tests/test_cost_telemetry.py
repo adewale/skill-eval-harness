@@ -139,6 +139,31 @@ class RunnerStampTests(unittest.TestCase):
                     self.assertEqual(measurements[key]["availability"], "unavailable")
                     self.assertEqual(measurements[key]["reason"], "trace_observation_incomplete")
 
+    def test_retries_is_measured_only_where_the_trace_protocol_reports_it(self):
+        # Pi's stream marks every retried attempt, so a complete Pi run carries
+        # an available retry count; a runner whose protocol has no retry marker
+        # leaves the measurement unavailable rather than claiming zero retries.
+        complete = {"process_observation_complete": True, "provider_response_complete": True}
+        with tempfile.TemporaryDirectory() as td:
+            raw = (Path(__file__).parent / "fixtures" / "pi" /
+                   "retry-then-success.jsonl").read_text(encoding="utf-8")
+            pi_dir = Path(td) / "pi"
+            sb.write_trace_artifacts(pi_dir, raw, source="pi", **complete)
+            pi_metrics = json.loads((pi_dir / "metrics.json").read_text(encoding="utf-8"))
+            self.assertEqual(pi_metrics["retries"], 1)
+            pi_retries = pi_metrics["telemetry"]["measurements"]["retries"]
+            self.assertEqual((pi_retries["availability"], pi_retries["value"]), ("available", 1))
+
+            generic_dir = Path(td) / "generic"
+            sb.write_trace_artifacts(
+                generic_dir, json.dumps({"type": "command", "command": "ls", "status": "completed"}),
+                source="generic", **complete)
+            generic_metrics = json.loads((generic_dir / "metrics.json").read_text(encoding="utf-8"))
+            self.assertNotIn("retries", generic_metrics)
+            generic_retries = generic_metrics["telemetry"]["measurements"]["retries"]
+            self.assertEqual((generic_retries["availability"], generic_retries["reason"]),
+                             ("unavailable", "missing_retries"))
+
     def test_completeness_parameters_reject_truthy_non_booleans(self):
         with tempfile.TemporaryDirectory() as td:
             for field in ("process_observation_complete", "provider_response_complete",

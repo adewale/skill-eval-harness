@@ -181,7 +181,6 @@ Adapters may preserve additional fields under `raw` or `details`, but assertions
   "file_reads": 4,
   "file_writes": 2,
   "errors": 0,
-  "retries": 0,
   "repeated_command_max": 1,
   "skill_invoked": true,
   "skill_invocation_evidence": ["skills/good-readme/SKILL.md"]
@@ -189,6 +188,8 @@ Adapters may preserve additional fields under `raw` or `details`, but assertions
 ```
 
 If a runner does not expose a metric, omit the field or set it to `null`; do not invent values.
+
+`retries` illustrates the rule. An earlier version of this example showed `"retries": 0`, and the first implementation transcribed the example rather than the rule, so every runner reported a measured zero it never observed. The count now comes from the trace dialect: Pi's stream marks every retried attempt (`agent_end` with `willRetry: true`), so a Pi stream that reaches its final `agent_end` carries an exact count, including a genuine zero. No other registered runner's protocol marks retries, so they omit the field and the v3 envelope reports `retries` unavailable (`missing_retries`).
 
 ## Manifest taxonomy additions
 
