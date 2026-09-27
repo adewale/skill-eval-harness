@@ -27,12 +27,12 @@
     "cfdoctor": {
       "repo": "adewale/cfdoctor",
       "ref": "main",
-      "sha": "4a14f4df19dd83799e4168f538f2b16c0a5670ba",
-      "commit_date": "2026-07-07T08:01:33+01:00",
+      "sha": "39b1db6fff73918d79ec070b7ec71f000e673eeb",
+      "commit_date": "2026-06-15T18:01:51+01:00",
       "skill_paths": [
         "skills/cloudflare-doctor/SKILL.md"
       ],
-      "tree_hash": "092a119644309fb30ff18cf69bb7ea4657f962a42f1776963c8917a98f6bbf9a",
+      "tree_hash": "d285b437b7d83df62a2871a689eaaa39d22767d2814ecf027121216b2452b445",
       "verified": true
     },
     "good-pr": {
@@ -82,12 +82,12 @@
     "slide-maker": {
       "repo": "adewale/slide-maker",
       "ref": "main",
-      "sha": "a3f04815d046c0db7cef7e71f1cc4efba7ce70e2",
-      "commit_date": "2026-07-07T08:01:14+01:00",
+      "sha": "b144fb7391c15fee920fe29eb1d3b0fdb52ba640",
+      "commit_date": "2026-06-15T18:01:33+01:00",
       "skill_paths": [
         "skills/slide-maker/SKILL.md"
       ],
-      "tree_hash": "6f965aed70a8221efd36bfaea48dcccc2252398563b8b554fc70e0ad48d9ade7",
+      "tree_hash": "1743f508d6b71139039d6e52be34b67571816a344fb712eac12ba8616403ed79",
       "verified": true
     },
     "swiss-poster-skill": {
