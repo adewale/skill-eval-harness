@@ -1,0 +1,44 @@
+name: Downstream consumers
+
+# Consumer-driven contract check: run the model-free gate from THIS tree over
+# every manifest listed in examples/adewale-workspace/all-manifests.txt, so a
+# manifest-schema change that breaks a known consumer fails here, not after a
+# release. Consumers change independently, hence the weekly schedule too.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  consumer-manifests:
+    name: Validate known consumer manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install package
+        run: python -m pip install -e .
+
+      - name: Clone consumer repositories (read-only, public, no credentials)
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumers"
+          repos=$(grep -v -e '^#' -e '^$' examples/adewale-workspace/all-manifests.txt | cut -d/ -f1 | sort -u)
+          for repo in $repos; do
+            git clone --quiet --depth 1 "https://github.com/adewale/${repo}.git" "$RUNNER_TEMP/consumers/${repo}"
+            echo "${repo} @ $(git -C "$RUNNER_TEMP/consumers/${repo}" rev-parse HEAD)"
+          done
+
+      - name: Run validate and audit-manifest on every consumer manifest
+        run: python scripts/check_consumer_manifests.py --workspace-root "$RUNNER_TEMP/consumers"
