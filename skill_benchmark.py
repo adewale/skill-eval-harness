@@ -273,6 +273,8 @@ EFFICIENCY_ASSERTIONS = {
 }
 OBJECTIVE_ASSERTIONS = TEXT_ASSERTIONS | PROCESS_ASSERTIONS | EFFICIENCY_ASSERTIONS
 QUALITATIVE_ASSERTIONS = {"judge", "rubric", "factuality"}
+# Keyword/regex matching over the answer text: the `lexical` oracle tier.
+LEXICAL_ASSERTIONS = {"contains", "contains_any", "contains_all", "excludes_any", "regex", "not_regex"}
 SEVERITIES = {item.value for item in Severity}
 ORACLE_TIERS = {item.value for item in OracleTier}
 ASSERTION_COMMON_FIELDS = {
@@ -382,10 +384,14 @@ def assertion_severity(assertion: dict[str, Any], *, strict: bool = False) -> st
 
 def oracle_tier(assertion: dict[str, Any]) -> str:
     """Oracle-strength tier (roadmap 1.7), xampler's ladder made first-class:
-    `strong` (deterministic, no-lies — including a rendered-artifact script
-    oracle explicitly marked strong), `demo` (a marked stand-in; the default
-    for `script`, whose truthfulness the harness cannot see), `live` (judge or
-    other model-backed checks). Explicit `oracle` on the assertion wins."""
+    `strong` (deterministic, no-lies — process/efficiency/structured/golden
+    checks, or a rendered-artifact script oracle explicitly marked strong),
+    `lexical` (deterministic keyword/regex matching over the answer text —
+    reproducible, but its strength is only its ability to fail a wrong answer,
+    which a generic alternative such as "run" or "do not" does not have),
+    `demo` (a marked stand-in; the default for `script`, whose truthfulness the
+    harness cannot see), `live` (judge or other model-backed checks). Explicit
+    `oracle` on the assertion wins."""
     tier = assertion.get("oracle")
     if tier in ORACLE_TIERS:
         return str(tier)
@@ -394,6 +400,8 @@ def oracle_tier(assertion: dict[str, Any]) -> str:
         return "live"
     if atype == "script":
         return "demo"
+    if atype in LEXICAL_ASSERTIONS:
+        return "lexical"
     return "strong"
 
 
@@ -668,9 +676,75 @@ def case_prompt(case: dict[str, Any], manifest_path: Path, allow_missing: bool =
 
 
 def repo_root_for_manifest(manifest_path: Path) -> Path:
+    """The directory skill_paths/old_skill_paths/ablation skill_root resolve from.
+
+    Keyed to the file name: only a manifest literally at ``evals/shared-benchmark.json``
+    resolves from the repository root (the parent of ``evals/``); any other manifest
+    resolves from its own directory. The same manifest content therefore mounts
+    different files under another name. ``skill_path_resolution_problems`` names
+    this rule whenever a path fails to resolve."""
     if manifest_path.name == "shared-benchmark.json" and manifest_path.parent.name == "evals":
         return manifest_path.parent.parent.resolve()
     return manifest_path.parent.resolve()
+
+
+def skill_root_rule(manifest_path: Path) -> str:
+    """One sentence naming which resolution rule applies to this manifest."""
+    root = repo_root_for_manifest(manifest_path)
+    if manifest_path.name == "shared-benchmark.json" and manifest_path.parent.name == "evals":
+        return (f"skill paths in evals/shared-benchmark.json resolve from the repository "
+                f"root {root}, not from evals/")
+    return (f"skill paths in {manifest_path.name} resolve from the manifest's own directory "
+            f"{root} (only a file named evals/shared-benchmark.json resolves them from the "
+            "repository root)")
+
+
+def skill_path_resolution_problems(manifest_path: Path, manifest: dict[str, Any]) -> list[str]:
+    """Every skill path an arm would mount, resolved exactly as prepare resolves it,
+    must exist inside ``repo_root_for_manifest``. ``validate``, ``prepare`` and
+    ``audit-manifest`` share this one check so they cannot disagree about the same
+    manifest (a with_skill arm must never mount a nonexistent or out-of-repo path)."""
+    repo_root = repo_root_for_manifest(manifest_path)
+    declared: list[tuple[str, str]] = []
+    for field in ("skill_paths", "old_skill_paths"):
+        values = manifest.get(field) or []
+        if isinstance(values, list):
+            declared.extend((field, raw) for raw in values if isinstance(raw, str))
+    for ablation in manifest.get("ablations") or []:
+        if not isinstance(ablation, dict):
+            continue
+        for comp in ablation_components(ablation):
+            target = comp.get("target") if isinstance(comp, dict) else None
+            raw = target.get("skill_root") if isinstance(target, dict) else None
+            if isinstance(raw, str):
+                declared.append((f"ablation {ablation.get('id')!r} target.skill_root", raw))
+    fields_by_raw: dict[str, list[str]] = {}
+    for field, raw in declared:
+        if field not in fields_by_raw.setdefault(raw, []):
+            fields_by_raw[raw].append(field)
+    problems: list[str] = []
+    for raw, fields in fields_by_raw.items():
+        where = " and ".join(fields[:2]) + (f" (+{len(fields) - 2} more)" if len(fields) > 2 else "")
+        resolved = (repo_root / raw).resolve()
+        if resolved != repo_root and repo_root not in resolved.parents:
+            problem = f"{where} entry {raw!r} resolves to {resolved}, outside {repo_root}"
+        elif not resolved.exists():
+            problem = f"{where} entry {raw!r} does not exist: {resolved}"
+        else:
+            continue
+        problem += f"; {skill_root_rule(manifest_path)}"
+        manifest_relative = (manifest_path.parent / raw).resolve()
+        if (manifest_relative != resolved and manifest_relative.exists()
+                and (manifest_relative == repo_root or repo_root in manifest_relative.parents)):
+            problem += f". Did you mean {manifest_relative.relative_to(repo_root).as_posix()!r}?"
+        problems.append(problem)
+    return problems
+
+
+def require_resolvable_skill_paths(manifest_path: Path, manifest: dict[str, Any]) -> None:
+    problems = skill_path_resolution_problems(manifest_path, manifest)
+    if problems:
+        die("skill paths must exist inside the manifest's skill root:\n  - " + "\n  - ".join(problems))
 
 
 def script_command_list(assertion: dict[str, Any]) -> list[str]:
@@ -1261,7 +1335,11 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         trigger_case = case_kind.population is CasePopulation.TRIGGER
         if trigger_case:
             if not isinstance(case.get("should_trigger"), bool):
-                die(f"{cid}: trigger cases require an explicit boolean should_trigger")
+                suggested = "true" if legacy_inferred_should_trigger(case) else "false"
+                die(f"{cid}: trigger cases require an explicit boolean should_trigger; "
+                    f"add \"should_trigger\": {suggested} (the polarity harness <= 0.6.0 "
+                    "inferred from this case's expected_behavior/assertion text). "
+                    "See CHANGELOG.md 'Unreleased' and docs/upgrading.md")
         elif "should_trigger" in case:
             die(f"{cid}: should_trigger is only valid when kind is 'trigger'")
         eval_intent = case.get("eval_intent")
@@ -1379,9 +1457,18 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                     and assertion_severity(assertion) in {"gate", "critical"}
                 ]
                 if not applicable:
+                    soft_only = [
+                        assertion_label(assertion) for assertion in all_assertions
+                        if assertion_applies_to_variant(assertion, variant)]
+                    hint = (
+                        f"; its applicable assertions {soft_only} are all severity 'soft' "
+                        "(the default for judge/rubric/factuality/similarity), so mark the "
+                        "one that decides the case \"gate\": true"
+                        if soft_only else "; add an objective assertion or a \"gate\": true judge")
                     die(
                         f"{cid}: answer variant {variant!r} needs at least one "
-                        "applicable gate or critical grading oracle")
+                        f"applicable gate or critical grading oracle{hint}. "
+                        "See CHANGELOG.md 'Unreleased' and docs/upgrading.md")
         validate_judge_assertion_ids(cid, assertions, turns or [])
 
     seen_ablation_ids: set[str] = set()
@@ -1596,6 +1683,7 @@ def prepared_task_rows(
     trees: dict[str, Any] | None = None,
     models: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    require_resolvable_skill_paths(manifest_path, manifest)
     variants = task_variants(manifest, include_old_skill=include_old_skill, include_ablations=include_ablations)
     if (isinstance(runs_per_variant, bool) or not isinstance(runs_per_variant, int)
             or runs_per_variant < 1):
@@ -19418,6 +19506,23 @@ def profile_skill(args: argparse.Namespace) -> int:
     return 0
 
 
+_LEGACY_TRIGGER_NEGATION_RE = re.compile(r"NO_TRIGGER|not trigger|should not", re.IGNORECASE)
+
+
+def legacy_inferred_should_trigger(case: dict[str, Any]) -> bool:
+    """The polarity harness <= 0.6.0 inferred for a trigger case without an
+    explicit should_trigger: a negation marker (NO_TRIGGER, 'not trigger',
+    'should not') in expected_behavior or an assertion pattern/value meant
+    NO_TRIGGER, otherwise TRIGGER. Used ONLY to suggest the explicit value in
+    the validation error that replaced the inference; it never decides polarity
+    (expected_trigger_polarity reads the validated boolean alone)."""
+    text = " ".join(str(item) for item in case.get("expected_behavior", []) or [])
+    for assertion in case.get("assertions", []) or []:
+        if isinstance(assertion, dict):
+            text += " " + str(assertion.get("pattern", assertion.get("value", "")))
+    return not _LEGACY_TRIGGER_NEGATION_RE.search(text)
+
+
 def expected_trigger_polarity(case: dict[str, Any]) -> str:
     """Resolve discovery polarity only from the validated explicit boolean."""
     value = case.get("should_trigger")
@@ -19755,6 +19860,84 @@ def contamination_command(args: argparse.Namespace) -> int:
     return 1 if (getattr(args, "fail_on_contamination", False) and report["total_findings"]) else 0
 
 
+GENERIC_ALTERNATIVE_MAX_CHARS = 4
+# Common words that appear in most technical answers whether right or wrong; a
+# contains/contains_any value from this list rarely discriminates. Heuristic,
+# advisory only (audit-manifest recommendations), and deliberately short.
+GENERIC_ORACLE_WORDS = frozenset({
+    "do not", "don't", "never", "avoid", "should", "cannot", "instead",
+    "check", "verify", "review", "remove", "update", "change", "consider", "improve",
+    "validate", "validation", "assert", "tests", "issue", "problem", "error", "source",
+    "example", "steps", "summary", "score", "rubric", "evidence", "concrete",
+    "priority", "smallest",
+})
+
+
+def is_generic_lexical_value(value: str) -> bool:
+    folded = " ".join(value.split()).casefold()
+    return len(folded) <= GENERIC_ALTERNATIVE_MAX_CHARS or folded in GENERIC_ORACLE_WORDS
+
+
+def _literal_implies(stronger: LiteralTextAssertion, weaker: LiteralTextAssertion) -> bool:
+    """True when every text passing ``stronger`` (contains/contains_all) also
+    passes ``weaker`` (contains/contains_any/contains_all) under both operands'
+    own case sensitivity and comparison profile."""
+    if stronger.kind not in {LiteralKind.CONTAINS, LiteralKind.CONTAINS_ALL}:
+        return False
+    if stronger.profile is not weaker.profile:
+        return False
+    required = [item.value for item in stronger.comparison_values]
+
+    def covered(value: str) -> bool:
+        if weaker.case_insensitive:
+            return any(value.casefold() in req.casefold() for req in required)
+        return not stronger.case_insensitive and any(value in req for req in required)
+
+    values = [item.value for item in weaker.comparison_values]
+    if weaker.kind is LiteralKind.CONTAINS_ANY:
+        return any(covered(value) for value in values)
+    if weaker.kind in {LiteralKind.CONTAINS, LiteralKind.CONTAINS_ALL}:
+        return all(covered(value) for value in values)
+    return False
+
+
+def lexical_assertion_findings(cases: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Static weak-oracle signals over positive literal assertions: values generic
+    enough to match most answers, and assertions implied by another assertion in
+    the same case (duplicates included), which can never fail independently."""
+    generic: list[dict[str, Any]] = []
+    redundant: list[dict[str, Any]] = []
+    for case in cases:
+        parsed_rows: list[tuple[str, LiteralTextAssertion]] = []
+        for assertion in case.get("assertions", []) or []:
+            if not isinstance(assertion, dict) or assertion.get("type") not in {"contains", "contains_any", "contains_all"}:
+                continue
+            try:
+                parsed = parse_human_text_assertion(assertion)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(parsed, LiteralTextAssertion):
+                continue
+            label = assertion_label(assertion)
+            parsed_rows.append((label, parsed))
+            if parsed.kind in {LiteralKind.CONTAINS, LiteralKind.CONTAINS_ANY}:
+                weak = [value for value in parsed.values if is_generic_lexical_value(value)]
+                if weak:
+                    generic.append({"case_id": case.get("id"), "assertion": label,
+                                    "type": parsed.kind.value, "generic_values": weak})
+        for index, (label, weaker) in enumerate(parsed_rows):
+            for other_index, (other_label, stronger) in enumerate(parsed_rows):
+                if other_index == index or not _literal_implies(stronger, weaker):
+                    continue
+                # Mutual implication is a duplicate: report it once, on the later assertion.
+                if _literal_implies(weaker, stronger) and index < other_index:
+                    continue
+                redundant.append({"case_id": case.get("id"), "assertion": label,
+                                  "implied_by": other_label})
+                break
+    return generic, redundant
+
+
 def audit_manifest_report(
     manifest_path: Path,
     *,
@@ -19770,6 +19953,7 @@ def audit_manifest_report(
     expensive_case_usd: float = 1.0,
 ) -> dict[str, Any]:
     manifest = validate_manifest(manifest_path)
+    require_resolvable_skill_paths(manifest_path, manifest)
     cases = iter_cases(manifest, split)
     skill_text = read_skill_text(manifest_path, manifest, skill_path)
     counts = {
@@ -19882,12 +20066,26 @@ def audit_manifest_report(
     # 1.7: a case whose checks are all demo/live tiers can look solid while
     # resting on weak oracles — leakage lint extended from prompts to oracles.
     weak_only = []
+    lexical_only = []
     for case in cases:
         case_assertions = case.get("assertions", []) or []
-        if case_assertions and all(oracle_tier(a) != "strong" for a in case_assertions):
+        tiers = {oracle_tier(a) for a in case_assertions}
+        if case_assertions and tiers <= {"demo", "live"}:
             weak_only.append(case.get("id"))
+        elif case_assertions and "lexical" in tiers and "strong" not in tiers:
+            lexical_only.append(case.get("id"))
     if weak_only:
-        finding("weak-oracle-only", "recommended", f"{len(weak_only)} case(s) are graded only by demo/live oracles (no strong deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
+        finding("weak-oracle-only", "recommended", f"{len(weak_only)} case(s) are graded only by demo/live oracles (no deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
+    # Deterministic is not strong: a keyword/regex check is reproducible but only
+    # as strong as its ability to fail a wrong answer. Recommendations only, so
+    # --fail-on-blockers behaves exactly as before.
+    if lexical_only:
+        finding("lexical-oracle-only", "recommended", f"{len(lexical_only)} case(s) have no check stronger than keyword/regex matching: {lexical_only[:10]}. Add a structured/golden/process assertion or a verified script oracle, or scope the regexes to the output's structure.", lexical_only[:20])
+    generic_alternatives, redundant_assertions = lexical_assertion_findings(cases)
+    if generic_alternatives:
+        finding("generic-lexical-alternative", "recommended", f"{len(generic_alternatives)} contains/contains_any assertion(s) accept a generic value (<= {GENERIC_ALTERNATIVE_MAX_CHARS} characters or a common word) that most answers contain whether right or wrong. Replace it with a regex scoped to the specific claim, or drop the alternative.", generic_alternatives[:30])
+    if redundant_assertions:
+        finding("redundant-assertion", "recommended", f"{len(redundant_assertions)} assertion(s) can never fail on their own: every output that passes another assertion in the same case also passes them, so they add a green check without adding an oracle.", redundant_assertions[:30])
 
     # Cost-quality findings (issue #21): where money is being spent without
     # buying signal. Only computable when run data is supplied.
@@ -20945,6 +21143,11 @@ def validate_cli_command(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest)
     manifest = validate_manifest(
         manifest_path, allow_missing_holdback=not args.strict_holdback)
+    require_resolvable_skill_paths(manifest_path, manifest)
+    if manifest_path.parent.name == "evals" and manifest_path.name != "shared-benchmark.json":
+        # The filename-keyed root rule is the one place identical manifest content
+        # resolves differently, so say which rule applied.
+        print(f"note: {skill_root_rule(manifest_path)}", file=sys.stderr)
     leakage = prompt_assertion_leakage_findings(
         manifest, manifest_path, min_chars=args.leakage_min_chars)
     for finding in leakage:

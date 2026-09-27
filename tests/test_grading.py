@@ -580,8 +580,12 @@ class OracleTierTests(unittest.TestCase):
     """1.7 — oracle-strength labeling, report share, and the weak-only warning."""
 
     def test_tier_defaults_by_type(self):
-        self.assertEqual(sb.oracle_tier({"type": "contains"}), "strong")
+        # Deterministic is not strong: keyword/regex matching is its own tier.
+        for lexical in ("contains", "contains_any", "contains_all", "excludes_any", "regex", "not_regex"):
+            self.assertEqual(sb.oracle_tier({"type": lexical}), "lexical", lexical)
+        self.assertEqual(sb.oracle_tier({"type": "contains", "oracle": "strong"}), "strong")   # explicit wins
         self.assertEqual(sb.oracle_tier({"type": "command_ran"}), "strong")
+        self.assertEqual(sb.oracle_tier({"type": "json_field_equals"}), "strong")
         self.assertEqual(sb.oracle_tier({"type": "script"}), "demo")
         self.assertEqual(sb.oracle_tier({"type": "judge"}), "live")
         self.assertEqual(sb.oracle_tier({"type": "factuality"}), "live")
@@ -600,7 +604,8 @@ class OracleTierTests(unittest.TestCase):
             root = Path(td)
             manifest = base_manifest()
             manifest["cases"][0]["assertions"] = [
-                {"name": "strong-check", "type": "contains", "value": "alpha"},
+                {"name": "strong-check", "type": "contains", "value": "alpha", "oracle": "strong"},
+                {"name": "lexical-check", "type": "contains", "value": "alpha"},
                 {"name": "demo-check", "type": "script", "command": ["python3", "-c", "raise SystemExit(0)"]},
             ]
             path = write_manifest(root, manifest)
@@ -612,8 +617,8 @@ class OracleTierTests(unittest.TestCase):
             attest_answer_design(path, runs)
             report = sb.build_benchmark_report(path, runs, allow_scripts=True)
         strength = report["oracle_strength"]["case-1"]
-        self.assertEqual(strength["strong_pass_share"], 0.5)
-        self.assertEqual(strength["passed_by_tier"], {"demo": 2, "strong": 2})
+        self.assertEqual(strength["strong_pass_share"], 0.3333)
+        self.assertEqual(strength["passed_by_tier"], {"demo": 2, "lexical": 2, "strong": 2})
 
     def test_weak_oracle_only_audit_finding(self):
         with tempfile.TemporaryDirectory() as td:
@@ -629,6 +634,13 @@ class OracleTierTests(unittest.TestCase):
             report = sb.audit_manifest_report(path)
             kinds = [f["kind"] for f in report["findings"]]
             self.assertNotIn("weak-oracle-only", kinds)
+            # A keyword check is deterministic but not strong.
+            self.assertIn("lexical-oracle-only", kinds)
+            manifest["cases"][0]["assertions"].append({"type": "command_ran", "pattern": "pytest"})
+            path = write_manifest(Path(td), manifest)
+            report = sb.audit_manifest_report(path)
+            kinds = [f["kind"] for f in report["findings"]]
+            self.assertNotIn("lexical-oracle-only", kinds)
 
 
 class EmbeddingSimilarityTests(unittest.TestCase):
