@@ -28,7 +28,7 @@ ty check --error-on-warning
 python3 -m unittest discover tests -v
 ```
 
-(`pytest tests/` also works — `pyproject.toml` carries the pythonpath config — but CI runs `unittest discover`, so keep tests compatible with both.)
+(`pytest tests/` also works — `pyproject.toml` carries the pythonpath config — but CI runs `unittest discover`, so keep tests compatible with both. CI also runs `python3 scripts/check_test_collection_parity.py`, which fails when the two collectors see different tests: write tests as `unittest.TestCase` methods and use `subTest` rather than `pytest.mark.parametrize` for parameter matrices.)
 
 `ty check` automatically covers every packaged top-level Python module, repository script,
 shipped example, and the static contracts under `type_tests/`. A new runtime boundary module
