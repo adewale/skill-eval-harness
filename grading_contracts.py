@@ -21,6 +21,7 @@ class Severity(str, Enum):
 
 class OracleTier(str, Enum):
     DEMO = "demo"
+    LEXICAL = "lexical"
     LIVE = "live"
     STRONG = "strong"
 

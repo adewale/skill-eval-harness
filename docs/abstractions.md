@@ -105,7 +105,7 @@ An assertion is one check. The code-side registries are `TEXT_ASSERTIONS`,
 `assertion_result` returns `{name, type, passed, evidence, score}`. Every result carries a
 `score` (binary detectors mirror `passed` as `1.0`/`0.0`; `similarity`, `golden_output`, and a
 graded `script` oracle set a real value), and `grade_case_variant` stamps a `severity`
-(`critical`/`gate`/`soft`) and an `oracle` tier (`strong`/`demo`/`live`) on each.
+(`critical`/`gate`/`soft`) and an `oracle` tier (`strong`/`lexical`/`demo`/`live`) on each.
 
 Severity decides how a result counts: a `critical` failure vetoes the run and is excluded from
 every mean; a `gate` carries the pass rate; a `soft` result feeds only the graded score. The
@@ -190,10 +190,10 @@ Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | Lo
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10472`), Claude (`run_claude:10658`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10560`), Claude (`run_claude:10746`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13248`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:4028` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13336`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4116` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -290,7 +290,7 @@ those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplica
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:813`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:887`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 `report_contracts.report_cohort` classifies each attempted reporting population as

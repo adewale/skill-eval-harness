@@ -1078,6 +1078,28 @@ class DocSyncTests(unittest.TestCase):
         )
         self.assertFalse(duplicates, f"OTel command inventory assigns commands twice: {duplicates}")
 
+    def test_skill_pins_reproduce_the_walkthrough_trees(self):
+        # examples/skill-pins.json exists so a reader can fetch and re-run the exact
+        # skill trees docs/ablation-study-walkthrough.md says were evaluated. The
+        # 2026-07-07 pin refresh moved slide-maker and cfdoctor to later commits
+        # with different trees and nothing noticed; the tree hash is the identity.
+        pins = json.loads((ROOT / "examples" / "skill-pins.json").read_text(encoding="utf-8"))["skills"]
+        walkthrough = (ROOT / "docs" / "ablation-study-walkthrough.md").read_text(encoding="utf-8")
+        rows = {
+            m.group("skill"): (m.group("repo"), m.group("tree"))
+            for m in re.finditer(
+                r"(?m)^\| (?P<skill>[\w-]+) \| (?P<repo>adewale/[\w-]+) @ `[0-9a-f]{7,40}` \| `(?P<tree>[0-9a-f]{8,64})…`",
+                walkthrough)
+        }
+        self.assertEqual(set(rows), set(pins), "walkthrough table and skill-pins.json list different skills")
+        drift = {
+            skill: {"pinned": (pins[skill]["repo"], pins[skill]["tree_hash"][:len(tree)]),
+                    "walkthrough": (repo, tree)}
+            for skill, (repo, tree) in rows.items()
+            if pins[skill]["repo"] != repo or not pins[skill]["tree_hash"].startswith(tree)
+        }
+        self.assertFalse(drift, f"skill-pins.json no longer reproduces the evaluated trees: {drift}")
+
     def test_every_assertion_type_is_documented_in_readme(self):
         types = sorted(sb.OBJECTIVE_ASSERTIONS | sb.QUALITATIVE_ASSERTIONS)
         missing = [t for t in types if f"`{t}`" not in README]
