@@ -155,11 +155,9 @@ from grading_contracts import (
     assertion_observation_from_row,
 )
 from human_judgements import (
+    FeedbackStore,
     HumanJudgement,
-    feedback_document,
     is_feedback_document,
-    judgements_from_document,
-    upsert,
 )
 from invocation_contracts import (
     InvocationRequest,
@@ -5865,10 +5863,21 @@ def _jetty_record_preflight(
             raise ValueError("no unique answer-design identity")
         harness_metadata["answer_task_sha256"] = identity_matches[0]["task_sha256"]
         harness_metadata["answer_instruction_sha256"] = identity_matches[0]["instruction_sha256"]
+    # Jetty trajectories expose no stop reason or served model, so the import
+    # records that explicitly; a report then counts these runs as unobserved
+    # rather than as predating completion evidence.
+    completion = {
+        **StopObservation.unobserved("jetty trajectory exposes no stop signal").as_metadata(),
+        **ServedModel.observe(
+            normalized.get("model") if isinstance(normalized.get("model"), str) else None,
+            []).as_metadata(),
+        **EffortSetting.default().as_metadata(),
+    }
     metadata = merge_owned_json_objects([
         ("Jetty metadata artifact", artifact_metadata(artifacts)),
         ("normalized Jetty lifecycle", normalized),
         ("harness identity", harness_metadata),
+        ("completion evidence", completion),
     ])
     trace_records = jetty_trace_records(record, artifacts, success=success)
     return {
@@ -13796,11 +13805,9 @@ def load_human_labels(path: str) -> tuple[dict[str, dict[str, Any]], dict[str, A
         document = None
     if is_feedback_document(document):
         assert isinstance(document, dict)
-        try:
-            judgements = judgements_from_document(document)
-        except ValueError as exc:
-            die(str(exc))
-        labels, skipped = human_labels_from_judgements(judgements)
+        store = FeedbackStore.from_document(document)
+        labels, skipped = human_labels_from_judgements(list(store.judgements))
+        skipped["unparsed"] = len(store.unparsed)
         return labels, {"format": "feedback", "skipped": skipped}
     return load_judge_results(path), {"format": "judge_task_labels"}
 
@@ -18511,24 +18518,32 @@ def benchmark_report_diff(previous: dict[str, Any], current: dict[str, Any]) -> 
     return {"availability": "complete", **observed}
 
 
-def read_feedback(path: Path) -> list[HumanJudgement]:
-    """Every human judgement stored in one feedback.json (empty when absent)."""
+def read_feedback_store(path: Path) -> FeedbackStore:
+    """The feedback.json store (empty when absent). Legacy entries that no
+    longer validate are kept verbatim as unparsed, never silently dropped."""
     if not path.is_file():
-        return []
+        return FeedbackStore((), ())
     loaded = strict_json_loads(path.read_text(encoding="utf-8"))
     if not is_feedback_document(loaded):
         raise ValueError(f"{path} is not a feedback document with an entries list")
-    return judgements_from_document(loaded)
+    assert isinstance(loaded, dict)
+    return FeedbackStore.from_document(loaded)
+
+
+def read_feedback(path: Path) -> list[HumanJudgement]:
+    """Every usable human judgement stored in one feedback.json."""
+    return list(read_feedback_store(path).judgements)
 
 
 def persist_feedback(workspace: Path, entry: dict[str, Any]) -> Path:
     """Feedback capture (roadmap 2.8, eval-viewer's feedback.json): the ONE
-    store for human judgements. Each entry is validated as a HumanJudgement;
-    a re-submission for the same run and assertion replaces its prior entry.
-    judge-alignment reads this file directly, so a verdict is written once."""
+    store for human judgements. Each new entry is validated as a
+    HumanJudgement; a re-submission for the same run and assertion replaces
+    its prior entry. judge-alignment reads this file directly, so a verdict is
+    written once."""
     path = workspace / "feedback.json"
     judgement = HumanJudgement.parse(entry)
-    write_json(path, feedback_document(upsert(read_feedback(path), judgement)))
+    write_json(path, read_feedback_store(path).with_judgement(judgement).as_document())
     return path
 
 

@@ -196,9 +196,9 @@ def sign_flip_interval(deltas: Sequence[float], *, confidence: float = DEFAULT_C
     """Confidence interval for the mean per-case delta, by inverting the sign-flip test.
 
     Returns ``bounded: False`` with null endpoints when the test cannot reject
-    any shift at all, which happens when there are too few cases (six or fewer
-    at 95%): the data cannot rule anything out, and printing an interval would
-    claim a precision the eval does not have.
+    any shift at all, which happens when there are too few cases (five or fewer
+    at 95%, since 2 / 2**5 > 0.05): the data cannot rule anything out, and
+    printing an interval would claim a precision the eval does not have.
     """
     if not 0 < confidence < 1:
         raise ValueError("confidence must lie strictly between 0 and 1")

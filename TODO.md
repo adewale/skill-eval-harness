@@ -272,7 +272,7 @@ and the `/claude-api build-eval` and `/claude-api hillclimb` guides in the claud
 - [x] 5.2 Lift interval + noise check + `--min-lift`
 - [x] 5.3 Floor vs ceiling
 - [x] 5.4 One human-judgement store
-- [ ] 5.5 Judge prompt guards
+- [ ] 5.5 Judge prompt guards ([#98](https://github.com/adewale/skill-eval-harness/issues/98))
 - [ ] 5.6 Eval-health scorecard over the four marks
 - [ ] 5.7 Typed findings and one gate vocabulary
 - [ ] 5.8 Effort as a prepared-task axis (`prepare --efforts`)

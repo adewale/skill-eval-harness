@@ -36,17 +36,24 @@ skill-benchmark migrate evals/shared-benchmark.json           # rewrite JSON in 
 - bumps `version` 1 → 2;
 - stamps the default `severity` on every assertion that declares none;
 - stamps the default `oracle` tier on every assertion that declares none;
-- adds a `_migrate_todo: "graded? …"` marker beside every binary judge rubric;
+- adds a `_migrate_todo: "graded? …"` marker beside every binary judge rubric (the marker and
+  its checklist entry suggest anchored `graded_dimensions`; step 1 below says when not to);
 - prints a unified diff and the judgment-call checklist (`--out-checklist` saves it as JSON);
 - `--check` writes nothing. YAML manifests are never rewritten in place — apply the printed diff by hand.
 
 ### What is deliberately left to you (or your agent)
 
-1. **Graded dimensions** — for each checklist entry `[graded dimensions]`,
-   decide whether the binary judge rubric should become anchored
-   `graded_dimensions` (`{name, scale: "1-5", rubric: "5 = …observable…; 1 = …"}`).
-   Anchors must name observable behavior, not vibes. Leave binary deliberately
-   where pass/fail is the honest measurement. Spec 2.2.
+1. **Graded dimensions** — each checklist entry `[graded dimensions]` suggests
+   turning a binary judge rubric into anchored `graded_dimensions`. Before
+   taking that suggestion, split the rubric into checkable claims: several
+   yes/no judge assertions, each `severity: "soft"` and each checking one
+   property ("names the missing test", "cites file and line"). The run counts
+   the claims met in `soft_passed` / `soft_total`, and `graded_score` averages
+   the verdicts that return a `score` (have the judge return 1 or 0). Use
+   anchored `graded_dimensions` (`{name, scale: "1-5", rubric: "5 = …observable…; 1 = …"}`)
+   only where the property is ordinal, and make each anchor name observable
+   behavior, not vibes. Leave a single binary judge where pass/fail is the
+   honest measurement. Spec 2.2.
 2. **Reference floors** — for each `[reference floor]` entry, optionally set
    `reference_score`/`reference_graded_score` so a regression below your
    accepted exemplar is flagged. Spec 2.2.

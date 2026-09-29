@@ -28,6 +28,9 @@ Ruff-checked, byte-compiled, and executed on every supported Python version.
 | experimental result rows | `ExperimentalPairKey`, `ExperimentalPair`, blocked-pair reasons | `experimental_pairs.py` |
 | provider process inputs and completion | `InvocationRequest`, `ProcessInvocationPlan`, `InvocationResult` | `invocation_contracts.py` |
 | native answer backend completion | `Completed`, `TimedOut`, `SpawnFailed`, `ProviderFailed` | `runner_contracts.py` |
+| provider stop reason, reported model, requested effort | `StopObservation` (`StopClass`), `ServedModel` (`ServedModelCheck`), `EffortSetting` | `completion_contracts.py` |
+| paired per-case lift deltas | `DiscriminationFailure`, `NoiseVerdict`, sign-flip interval and noise-check blocks | `effect_estimates.py` |
+| `feedback.json` entries from the served review | `HumanJudgement`, `HumanVerdict` | `human_judgements.py` |
 | committed run directory | `ArtifactSetObservation` | `artifact_contracts.py` |
 | normalized event file | `EventLogObservation`, `EventState` | `trace_contracts.py` |
 | trigger process and evidence | `TriggerResult`, `TriggerObservation`, `TriggerCohort` | `trigger_contracts.py`, `trigger_reporting.py` |

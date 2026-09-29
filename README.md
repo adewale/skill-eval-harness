@@ -13,6 +13,7 @@ General eval frameworks (openai/evals, vitest-evals, viteval) score one output a
 |---|---|
 | Does this skill improve outputs compared with no skill at all? | `prepare` paired `with_skill` / `without_skill` rows, then `benchmark` paired lift and significance. |
 | Which prompts improved, regressed, saturated, or showed no lift? | `benchmark` `case_flags`, `render-viewer`, and `error-analysis`. |
+| Could this eval have shown the lift I care about? | `benchmark --min-lift`, then the paired lift's `interval` and `noise_check`. |
 | Is the skill worth its extra tokens or dollars? | `profile-skill`, `token-overhead`, `cost-summary`, and lift-per-dollar summaries. |
 | Did my latest skill edit introduce a regression? | Re-run the same manifest, inspect `ablation_regressions`, `trend`, and `render-viewer --previous-workspace`. |
 | Which instruction, checklist, reference, script, or asset is load-bearing? | Materialized `ablation:<id>` arms plus declared `expected_regressions`. |
@@ -104,7 +105,9 @@ benchmark -> benchmark.json with summary, results, and case_flags
 viewer    -> review.html with assertion evidence and output previews
 ```
 
-`benchmark.json` records one row per case/variant/run, plus aggregate pass rates, timing/token summaries, and flags for saturated, no-lift, flaky, or with-skill-failed cases. It also carries a `reliability` block — unbiased **pass@k** and **pass^k** per (case, variant) from the repeated runs — beside the paired lift's sign-flip `significance`, and a `trajectory_diff` block: per case, over validated experimental pairs, the commands exclusive to one arm across the case's complete repetition set, event-count deltas (steps/commands/tool calls/file reads/file writes), and per-arm skill-load rates — how the arms *behaved*, beside whether they passed. An arm without non-empty, readable trace evidence blocks its pair with a named reason instead of reading as an empty diff.
+`benchmark.json` records one row per case/variant/run, plus aggregate pass rates, timing/token summaries, and flags for saturated (both arms always pass), floor (`floor: fails in both arms`), no-lift, flaky, or with-skill-failed cases. It also carries a `reliability` block — unbiased **pass@k** and **pass^k** per (case, variant) from the repeated runs — beside the paired lift's sign-flip `significance`, and a `trajectory_diff` block: per case, over validated experimental pairs, the commands exclusive to one arm across the case's complete repetition set, event-count deltas (steps/commands/tool calls/file reads/file writes), and per-arm skill-load rates — how the arms *behaved*, beside whether they passed. An arm without non-empty, readable trace evidence blocks its pair with a named reason instead of reading as an empty diff.
+
+Each paired lift also carries an `interval` (the sign-flip test inverted into a 95% confidence interval, unbounded below six paired cases) and a `noise_check` whose `verdict` names what stops the eval from resolving a lift: too few cases moved, a noise floor above the `without_skill` headroom, or one above the `--min-lift` you would act on. A `run_endings` block counts, per variant, how runs stopped, whether the served model matched the request, and the effort each ran at, so a refusal is not read as a capability miss. The fields are in [`docs/commands.md`](docs/commands.md#lift-interval-and-noise-check).
 
 ## Installation
 
@@ -175,9 +178,10 @@ skill-benchmark --help
 | `docs/which-model-should-my-skill-target.md` | Ranking model tiers by lift: `prepare --models` fan-out, the `by_model` / `model_analysis` blocks, and reading real lift vs. base-model saturation per tier. |
 | `docs/why-did-this-run-fail.md` | Debugging one failing run: the `error-analysis` taxonomy + review queue, then the run dir (`output.md`/`metadata.json`), mapped to a failure class and a manifest-or-skill decision. |
 | `docs/can-i-trust-my-judge.md` | Calibrating a judge before believing its numbers: `judge-robustness` (order-flip + negative controls), `judge-alignment` (human labels, Cohen's kappa, precision/recall), and `compare-judges` (does the lift survive a judge swap?). |
-| `docs/eval-framework-roadmap-spec.md` | The implemented eval-framework roadmap: goals, abstractions, and tests per feature (CF.1–CF.4, buckets 1–4, migration). |
+| `docs/eval-framework-roadmap-spec.md` | The eval-framework roadmap: goals, abstractions, and tests per feature (CF.1–CF.4, buckets 1–4 implemented, migration, and bucket 5 eval health, partly shipped). |
 | `docs/migrating-evals.md` | Upgrading a manifest between versions (v1 → v2): what `migrate` stamps and the judgment calls it leaves. |
 | `docs/upgrading.md` | Version-by-version harness upgrades: saved-run backup, artifact migration, strict input repairs, expected report changes, and rollback. |
+| `docs/comparing-with-claude-api-evals.md` | Choosing between `/claude-api build-eval` / `/claude-api hillclimb` and this harness: what each does, where each goes further, why their noise floors and test sets differ, and which harness output answers each guide step. |
 | `docs/porting-existing-evals.md` | Arriving from another framework: `dataset_files` + a template case carry the rows across, then the paired baseline, splits, leakage lint, and the `audit-manifest` punch list supply what the old suite had no slot for. |
 | `docs/vocabulary.md` | Glossary of harness terms: variants, splits, models, ablations, assertions, severity/oracle tiers, graded scoring, cost telemetry, trace artifacts, agent/judge backends, judge calibration, reliability, contamination, and report flags. |
 | `docs/evals-are-not-tests.md` | Why a skill eval is not a unit test, and what that changes about reading results. |
@@ -373,7 +377,7 @@ Qualitative assertion types:
 | `rubric` | Same deferred, keyed qualitative flow. |
 | `factuality` | Preset: a judge assertion carrying a canned anchored factuality rubric (threshold 4). `preset: "factuality"` on a judge assertion does the same. |
 
-A judge assertion may carry **anchored graded dimensions** (`graded_dimensions: [{name, scale: "1-5", rubric: "5 = …observable…; 1 = …"}]` — the judge returns `dimension_scores`, normalized to 0-1, passing at `threshold` ≥ 4 by default), a **dynamic rubric** (`dynamic_rubric: {instruction, minimum_criteria}` — the judge drafts case-specific criteria and must meet the minimum), or a **per-step trajectory rubric** (`per_step: true`, or `per_step: {min_met_fraction: f}`). A per-step judge grades EACH completed trajectory step — one criterion per step, named step-1..step-N in trajectory order, with the untruncated invocation and result records resolved separately from `trace.jsonl` beside the normalized summaries — and passes when at least `ceil(f × steps)` steps are judged sound (default: every step). It is trace-evidence-backed and fails closed like a process assertion: a run with no completed steps fails the assertion at grade time and no judge task (no model spend) is emitted. Stored verdicts carry a hash of the exact step payload and are re-queued if the trajectory, criterion names, or derived minimum changes. Per-step assertions are case-level only; turn assertions do not have independent trace artifacts. A case may set a reference floor (`reference_score` 0-1 or `reference_graded_score` 1-5); scoring below it flags `below-reference-floor`. Paired reports carry a sign-flip permutation `significance` block beside every lift, and a `graded` channel when graded scores exist.
+A judge assertion may carry **anchored graded dimensions** (`graded_dimensions: [{name, scale: "1-5", rubric: "5 = …observable…; 1 = …"}]` — the judge returns `dimension_scores`, normalized to 0-1, passing at `threshold` ≥ 4 by default), a **dynamic rubric** (`dynamic_rubric: {instruction, minimum_criteria}` — the judge drafts case-specific criteria and must meet the minimum), or a **per-step trajectory rubric** (`per_step: true`, or `per_step: {min_met_fraction: f}`). A per-step judge grades EACH completed trajectory step — one criterion per step, named step-1..step-N in trajectory order, with the untruncated invocation and result records resolved separately from `trace.jsonl` beside the normalized summaries — and passes when at least `ceil(f × steps)` steps are judged sound (default: every step). It is trace-evidence-backed and fails closed like a process assertion: a run with no completed steps fails the assertion at grade time and no judge task (no model spend) is emitted. Stored verdicts carry a hash of the exact step payload and are re-queued if the trajectory, criterion names, or derived minimum changes. Per-step assertions are case-level only; turn assertions do not have independent trace artifacts. A case may set a reference floor (`reference_score` 0-1 or `reference_graded_score` 1-5); scoring below it flags `below-reference-floor`. Paired reports carry a sign-flip permutation `significance` block and the `interval` that inverts it beside every lift, and a `graded` channel (with its own `interval`) when graded scores exist.
 
 Judge results are keyed by `judge_task_id`:
 
@@ -429,6 +433,8 @@ partial and expose any surviving calculations only under explicitly labelled obs
 }
 ```
 
+The native runners also record how each run ended: `stop_class` (`completed`, `truncated`, `turn_limit`, `refused`, `other`, `unobserved`) beside the raw `stop_reason` and its `stop_source`; `requested_model`, `served_model`, and `served_model_check` (`match`, `mismatch`, `unverifiable`, `unobserved`, `not-requested`); and `effort`, which is `{"requested": null, "applied_by": "backend-default"}` unless `--effort` pinned it. A `truncated` or `turn_limit` stop, or a served-model `mismatch`, makes the run unscorable and blocks its pair; a refusal stays graded. A custom runner may write the same fields. Which backends observe what is in [`docs/commands.md`](docs/commands.md#effort-and-how-answer-runs-ended).
+
 ## Ablations
 
 Ablations are opt-in variants that remove part of a skill — by simulation, or by materializing a real altered skill (below). Add entries under `manifest.ablations`, then prepare with `--include-ablations`.
@@ -477,16 +483,16 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 | `skill-benchmark prepare` | Emit answer-key-safe task rows per case/variant/run (`--include-ablations` materializes ablated trees). |
 | `skill-benchmark materialize-ablations` | Write the declared ablated skill trees to disk without preparing tasks — inspect or diff an ablation before spending a run on it. |
 | `skill-benchmark grade` | Score saved outputs into per-run rows; emit pending judge tasks. |
-| `skill-benchmark benchmark` | Aggregate into variant summaries, paired lift + significance, by-model, cost, and case flags. |
-| `skill-benchmark render-viewer` | Static or `--serve`d review page with embedded artifacts and iteration diffs. |
+| `skill-benchmark benchmark` | Aggregate into variant summaries, paired lift + significance + `interval` + `noise_check` (`--min-lift`), by-model, cost, `run_endings`, and case flags. |
+| `skill-benchmark render-viewer` | Static or `--serve`d review page with embedded artifacts and iteration diffs; served mode stores pass/fail/unsure verdicts and notes in `feedback.json`. |
 
 **Runners** (the only model-touching commands)
 
 | Command | What it does |
 |---|---|
-| `skill-benchmark run-codex` | Drive prepared rows through isolated `codex exec --json --output-last-message`; save trace, events, metrics, answer. |
-| `skill-benchmark run-claude` | Drive `claude -p --output-format stream-json`, capturing real per-run cost + token usage AND the full tool-use stream as the run's trace (`trace.jsonl`/`events.json`), so process assertions have evidence on Claude answer runs. |
-| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, `--agent gemini`, or `--agent vibe`); compatibility wrappers delegate here. |
+| `skill-benchmark run-codex` | Drive prepared rows through isolated `codex exec --json --output-last-message`; save trace, events, metrics, answer. `--effort` sets `model_reasoning_effort`. |
+| `skill-benchmark run-claude` | Drive `claude -p --output-format stream-json`, capturing real per-run cost + token usage AND the full tool-use stream as the run's trace (`trace.jsonl`/`events.json`), so process assertions have evidence on Claude answer runs. Records the stop reason and served model; `--effort` passes `claude --effort`. |
+| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, `--agent gemini`, or `--agent vibe`); compatibility wrappers delegate here. `--effort` is refused for Gemini and Vibe. |
 | `skill-benchmark run-subagent` | In-process backend seam: any provider via `--agent-cmd`, tool replay, multi-turn `turns`. |
 | `skill-benchmark import-trace` | Normalize a raw JSONL trace into `events.json`/`metrics.json` for process/efficiency checks. |
 
@@ -497,9 +503,9 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 | `skill-benchmark audit-manifest` | Readiness verdict + blockers; `--fail-on-blockers` gates CI on "worth paying to run". |
 | `skill-benchmark report` | Serialize `benchmark.json` as JUnit XML or GitHub job-summary + annotations. |
 | `skill-benchmark contamination` | Output-side perimeter: canary tripwire, output↔answer n-gram overlap, released-at/cutoff gate. |
-| `skill-benchmark error-analysis` | Open-coding review queue + axial failure taxonomy over a `benchmark.json`. |
+| `skill-benchmark error-analysis` | Open-coding review queue + axial failure taxonomy over a `benchmark.json`; `--feedback feedback.json` fills each row's note from the served review. |
 | `skill-benchmark compare-judges` | Flag whether measured lift depends on which judge model graded. |
-| `skill-benchmark judge-alignment` | Score a judge against human labels: agreement, Cohen's kappa, precision/recall/F1. |
+| `skill-benchmark judge-alignment` | Score a judge against human labels (`--labels feedback.json`, or a legacy labels file): agreement, Cohen's kappa, precision/recall/F1. |
 | `skill-benchmark judge-robustness` | Order-flip self-consistency + negative controls a robust judge must reject (opt-in, model-touching). |
 | `skill-benchmark judge` | Run deferred `judge`/`rubric` assertions through `--judge-backend`/`--judge-model` or `--judge-cmd`. |
 
@@ -519,7 +525,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 | `skill-benchmark suite-run` | Allowlisted multi-skill preflight/tier with cost ceilings; writes `RUN_SCOPE.json`. |
 | `skill-benchmark aggregate` | Cross-skill report over many manifests. |
 | `skill-benchmark trend` | Append-only history: series, diffs, prevalence×severity failure ranking, prune candidates. |
-| `skill-benchmark suggest-cases` | Turn saturated/no-lift flags into harder-case seeds (generation opt-in, never edits a manifest). |
+| `skill-benchmark suggest-cases` | Turn saturated/no-lift flags into harder-case seeds, never from a floor case (generation opt-in, never edits a manifest). |
 | `skill-benchmark migrate` | Upgrade a v1 manifest to v2: stamp severity/oracle tiers, print the judgment-call checklist. |
 
 **Interop and export**
@@ -585,6 +591,9 @@ skill-eval-harness/
 ├── artifact_contracts.py       # closed persisted-artifact observations and integrity verification
 ├── cli_contracts.py            # validated command, path, model, variant, and numeric CLI values
 ├── experimental_pairs.py       # exact pair identities and blocked-pair construction
+├── completion_contracts.py     # stop class, served-model check, and effort per answer run
+├── effect_estimates.py         # sign-flip lift interval, noise check, floor vs ceiling
+├── human_judgements.py         # the one feedback.json human-judgement record
 ├── grading_contracts.py        # closed assertion observations and immutable judge tasks
 ├── report_contracts.py         # empty/complete/partial report coverage cohorts and rates
 ├── runner_contracts.py         # closed answer-runner outcome union

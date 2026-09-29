@@ -56,6 +56,25 @@ class SingleStoreTests(unittest.TestCase):
                 sb.persist_feedback(ws, {"variant": "with_skill", "verdict": "pass"})
             self.assertEqual((ws / "feedback.json").read_text(encoding="utf-8"), before)
 
+    def test_a_legacy_entry_that_no_longer_validates_is_kept_not_fatal(self):
+        # The first served form accepted blank fields; one such entry must not
+        # block every later save or the readers.
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "feedback.json").write_text(json.dumps({"entries": [
+                {"case_id": "", "variant": "with_skill", "verdict": "good"},
+                {"case_id": "c", "variant": "with_skill", "verdict": "bad", "note": "kept"},
+            ]}), encoding="utf-8")
+            sb.persist_feedback(ws, {"case_id": "d", "variant": "with_skill", "note": "new"})
+            doc = json.loads((ws / "feedback.json").read_text(encoding="utf-8"))
+            judgements = sb.read_feedback(ws / "feedback.json")
+            labels, source = sb.load_human_labels(str(ws / "feedback.json"))
+        self.assertEqual(doc["unparsed_entries"],
+                         [{"case_id": "", "variant": "with_skill", "verdict": "good"}])
+        self.assertEqual({item.case_id for item in judgements}, {"c", "d"})
+        self.assertEqual(labels, {})
+        self.assertEqual(source["skipped"]["unparsed"], 1)
+
     def test_judge_alignment_reads_labels_straight_from_feedback(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
@@ -80,7 +99,7 @@ class SingleStoreTests(unittest.TestCase):
             report = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(report["label_source"]["format"], "feedback")
         self.assertEqual(report["label_source"]["skipped"],
-                         {"run_level": 1, "unsure_or_note_only": 1})
+                         {"run_level": 1, "unsure_or_note_only": 1, "unparsed": 0})
         self.assertEqual(report["n"], 2)
         # Run 2: the human failed what the judge passed.
         self.assertEqual(report["confusion"], {"tp": 1, "fp": 1, "fn": 0, "tn": 0})

@@ -55,6 +55,8 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
         self.assertFalse(interval["bounded"])
         self.assertIsNone(interval["lower"])
         self.assertIn("at least 6", interval["reason"])
+        # 2 / 2**6 = 0.03125 <= 0.05: the sixth case makes a bound possible.
+        self.assertTrue(ee.sign_flip_interval([0.5] * 6)["bounded"])
 
     def test_sampled_path_is_deterministic_and_order_invariant(self):
         rng = random.Random(3)

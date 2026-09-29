@@ -190,6 +190,13 @@ Adapters may preserve additional fields under `raw` or `details`, but assertions
 
 If a runner does not expose a metric, omit the field or set it to `null`; do not invent values.
 
+Stop evidence is not a metric and does not live here. `stop_class`, `stop_reason`, and
+`stop_source` are written to the run's `metadata.json` beside the served-model and effort fields,
+because `execution_valid` reads metadata when it decides whether a truncated or turn-limited run is
+scorable. Claude answer runs fill them from the stream-json terminal `result` event; Gemini, Codex,
+Vibe, `run-subagent`, and Jetty imports record `stop_class: "unobserved"`. The field
+table is in [`commands.md`](commands.md#effort-and-how-answer-runs-ended).
+
 ## Manifest taxonomy additions
 
 These fields are optional and backward-compatible:

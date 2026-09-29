@@ -1,6 +1,10 @@
 # Eval-framework roadmap spec
 
-Status: implemented. [`TODO.md`](../TODO.md) tracks per-item status; the tests live in
+Status: CF.1–CF.4, buckets 1–4, and migration are implemented; [bucket 5](#bucket-5--eval-health-from-the-claude-api-build-eval-and-hillclimb-comparison)
+is partly open and marks each item. One design choice changed in shipping: 2.2 proposed a paired
+bootstrap or a sign-flip test, and only the sign-flip test shipped. Its p-value is `significance`,
+and the `interval` beside it inverts the same test rather than resampling (see 2.2).
+[`TODO.md`](../TODO.md) tracks per-item status; the tests live in
 `tests/test_confidence_floor.py` and the subject files (`tests/test_grading.py`,
 `tests/test_reporting.py`, `tests/test_runners.py`, `tests/test_manifest.py`,
 `tests/test_judging.py`, `tests/test_stats.py`), and the migration
@@ -277,6 +281,11 @@ assumed.
     `{name, scale: "1-5", rubric: "5 = …observable…; 1 = …observable…"}`. Anchors name what each
     score level looks like, so a judge scores against criteria, not a vibe. `judge_prompt`
     (`:11842`) renders the dimensions; the result carries per-dimension scores in `evidence`.
+    Prefer checkable yes/no claims ("cites at least one source from the context") as the
+    criteria, one per `judge` assertion or `dynamic_rubric` criterion; the
+    `/claude-api build-eval` guide in the claude-api skill recommends them over "rate helpfulness
+    1-5". Keep a 1-5 dimension for a property that is ordinal by nature, where the anchors can
+    name what each level looks like.
   - **`dynamic_rubric`** as a second `judge` shape: `{instruction, minimum_criteria}`. The judge
     drafts 3-5 case-specific criteria before grading and must meet at least `minimum_criteria`.
   - `grade_case_variant` (`:14047`) splits totals into critical, gated, and soft. A `critical`
@@ -285,6 +294,14 @@ assumed.
   - **Statistical lift** in `build_paired_summary` (`:15603`): alongside the raw delta, compute a
     significance test over the per-case graded scores (paired bootstrap or sign-flip
     permutation, mirroring `score_delta.py`), so lift is tested, not eyeballed.
+    **As shipped:** the sign-flip permutation test only, as `significance` on every paired block
+    and on the `graded` channel; no bootstrap. The confidence `interval` beside it
+    (`effect_estimates.sign_flip_interval`) is that test inverted: every shift the test would not
+    reject. It therefore excludes zero exactly when the exact test rejects "no lift" (exact up to
+    14 paired units, seeded sampling above), and with five or fewer units it is reported
+    `bounded: false` because no shift can be excluded at 95%. `noise_check` sits beside both and
+    names what limits the eval: too few cases moved to reach p ≤ 0.05, or a noise floor (the
+    interval half-width) above the `without_skill` headroom or above `benchmark --min-lift`.
   - **Reference-anchor floor:** an optional `reference_score` / `reference_graded_score` on a
     case sets a floor; scoring below it on any dimension is flagged as a regression.
 - **Design:** default severity keeps current behavior (objective is a gate; `judge`,
@@ -411,6 +428,13 @@ assumed.
   rule holds — do not add a case for every failure unless it represents a real pattern. The loop
   runs both directions: 2.10 proposes hard cases, 1.9 prunes flat ones, so the suite tracks the
   failure surface instead of growing without bound.
+- **Floor cases are never seeds.** A case where both arms fail every scored run carries the
+  `floor: fails in both arms` flag, and `suggest-cases` skips it. Hardening it cannot restore
+  signal, and a task that fails every run regardless of replicates more often has an ambiguous
+  prompt or a broken assertion than a hard one, so it goes to `audit-manifest` as `floor-eval`
+  instead. The generation instruction also asks for a case that is hard for a reason a domain
+  expert would name, not one today's model happens to fail, because selecting cases by one model's
+  failures measures that model's weak spots rather than the skill.
 - **Testing:** the flag-to-candidate selection is tested deterministically; generation is mocked,
   and a generated case never enters a manifest on its own.
 
@@ -461,6 +485,68 @@ These need a model, so they stay out of core grading.
 - The generation step behind 2.10. A separate opt-in command whose output is candidate prompts a
   person reviews before they enter a manifest.
 - **Testing:** a mocked generator, asserting no manifest is mutated automatically.
+
+---
+
+## Bucket 5 — eval health (from the /claude-api build-eval and hillclimb comparison)
+
+Buckets 1–4 extend what the harness can measure; bucket 5 checks whether a measurement means what
+it says. It comes from comparing the harness with the `/claude-api build-eval` and
+`/claude-api hillclimb` guides in the claude-api skill, which
+[Automating eval design and hillclimbing with Claude](https://claude.dev/blog/automating-eval-design-and-hillclimbing/)
+describes. Those guides audit an eval before trusting its number: they look for cut-off answers,
+effort applied inconsistently, a noise floor wider than the smallest change worth acting on, and
+tasks that fail every run. Although the harness already had split discipline and a paired
+significance test, it did not record how a run ended, check that both arms ran at one effort,
+compare its noise with the smallest lift worth acting on, or tell a case nothing passes from a
+hard one. The first four items below shipped; the rest are open and tracked in
+[#99](https://github.com/adewale/skill-eval-harness/issues/99). The governing invariant still holds: each item is model-free or opt-in, and none picks a
+model.
+
+The post's own cost example shows the gap the noise check names. Its held-out result is 38/42
+against 33/42 (14 tickets, 3 repeats each), five more passing runs. Wherever those five runs fall
+among the tickets, a paired sign-flip test over tickets cannot reach p ≤ 0.05: the smallest
+reachable p is 0.0625 (`2 / 2**5`), and reaching 0.05 takes six cases moving the same way
+(`2 / 2**6 = 0.03125`).
+
+- [x] **5.1 Completion evidence.** Goal: never grade a cut-off, turn-limited, or wrong-model answer as
+  the requested model's answer. `completion_contracts.py` records `stop_class`,
+  `served_model_check`, and `effort` on every answer run; truncated, turn-limited, and mismatched
+  runs are unscorable, refusals stay graded and are counted in `run_endings`, and a pair whose arms
+  ran at different effort is blocked.
+- [x] **5.2 Lift interval, noise check, and `--min-lift`.** Goal: report whether the eval could have
+  shown a lift, beside whether it did. `effect_estimates.py` adds the sign-flip `interval` and
+  `noise_check` to every paired block (2.2).
+- [x] **5.3 Floor vs ceiling.** Goal: keep a case nothing passes (suspect the case) apart from one
+  everything passes (too easy). Shipped as the `floor: fails in both arms` flag, the `floor-eval`
+  audit finding, readiness `floor_cases`, and the `suggest-cases` exclusion (2.10).
+- [x] **5.4 One human-judgement store.** Goal: a reviewer writes a verdict once, so the calibration
+  label and the review note cannot disagree. `human_judgements.py` makes `feedback.json`
+  (schema v2) the input to both `judge-alignment --labels` and `error-analysis --feedback`.
+- [ ] **5.5 Judge prompt guards** ([#98](https://github.com/adewale/skill-eval-harness/issues/98)). Goal: cover the LLM-judge biases the guides list that the judge
+  prompt and `judge-robustness` do not: an instruction not to reward length, an instruction to
+  treat the candidate output as untrusted data, a same-order flip rate (the same input graded
+  twice), and "I don't know" and wrong-question negative controls beside the existing empty-output
+  and master-key controls.
+- [ ] **5.6 Eval-health scorecard.** Goal: one report that rates an eval against the post's four marks
+  (tasks mirror production, scores rise with stronger models and more effort, passable headroom at
+  the frontier, low run-to-run variance), read before any lift.
+- [ ] **5.7 Typed findings and one gate vocabulary.** Goal: audit, readiness, contamination, and judge
+  findings share one typed shape and one severity scale, so `--fail-on-blockers`,
+  `--fail-on-contamination`, and `--fail-on-findings` gate on the same field.
+- [ ] **5.8 Effort as a prepared-task axis (`prepare --efforts`).** Goal: fan rows over effort levels
+  the way `--models` fans over models, so effort becomes a report axis rather than one run tree per
+  `--effort` value.
+- [ ] **5.9 Random stratified split helper and a holdback-read ledger.** Goal: draw `tune`/`holdout`
+  at random within strata, never by baseline score, and log each time a hidden split is scored,
+  because, in the words of the `/claude-api hillclimb` cost guide, "The split whose score picks
+  winners each round is a selection set, even if the guide calls it 'test'."
+- [ ] **5.10 Model-free keep/revert referee.** Goal: given the previous and candidate
+  `benchmark.json`, apply the hillclimb rule deterministically: keep when tune and held-out both
+  improve beyond noise, revert on a regression or when tune improves while held-out stays flat.
+- [ ] **5.11 Export to the hillclimb on-disk format (`export-hillclimb`).** Goal: write a harness run
+  tree as the hillclimb guide's layout (`_state.json` with split ids, per-round `results.jsonl`,
+  `traces/<id>_rep<k>.json`), so that loop can start from a harness baseline and split.
 
 ---
 

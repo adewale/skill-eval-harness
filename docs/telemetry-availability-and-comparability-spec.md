@@ -116,6 +116,14 @@ experiment may intentionally differ in variant and materialized skill tree, but 
 case, repetition, model configuration, billing scope, or population. This avoids both
 false matches and an overly rigid raw-dictionary equality check.
 
+Effort is part of that model configuration. Each answer run records
+`effort: {requested, applied_by}`, where an unpinned run records the `backend-default`
+marker because defaults differ by model and CLI version. Pair construction from result
+rows (`experimental_pairs.pairs_from_rows`) blocks a with/without pair whose arms ran at
+different effort as `effort_mismatch`, and a pair where only one arm recorded effort as
+`effort_unrecorded_on_one_arm`, since that arm cannot be shown to share the other's level.
+Two runs that both predate effort recording still pair.
+
 ## Scope
 
 | Surface | Required treatment |

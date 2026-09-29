@@ -220,3 +220,54 @@ uv tool install --force skill-eval-harness==0.5.1
 Do not convert a migrated tree back by deleting selected telemetry keys. Restore the
 saved 0.5.1 tree instead; that preserves the artifact pair exactly as the old report read
 it.
+
+## 0.6.0 → unreleased `main`
+
+These notes cover the run-ending, lift-interval, and feedback-store changes on `main` after
+0.6.0; the changelog's [Unreleased](../CHANGELOG.md#unreleased) section lists the rest. No
+manifest or telemetry migration is needed and saved runs stay readable. What changes is which
+runs count, which pairs form, and how a few report and audit fields read.
+
+### Run metadata and scoring
+
+- Native answer runs now record `stop_class`, `stop_reason`, `stop_source`, `requested_model`,
+  `served_model`, `served_models`, `served_model_check`, and `effort` in `metadata.json`. Runs
+  recorded earlier carry none of them, grade as before, and appear as `unrecorded` in the new
+  `run_endings` report block.
+- A run whose `stop_class` is `truncated` or `turn_limit`, or whose `served_model_check` is
+  `mismatch`, is unscorable (`unscorable_reason`: `stopped:truncated`, `stopped:turn_limit`,
+  `served_model_mismatch`) and blocks its pair. A new Claude run tree can therefore have fewer
+  scorable pairs than an older tree of the same cases; read `unscorable_reason` before reading the
+  smaller denominator as a skill change. A refusal is still graded.
+- A pair whose arms ran at different effort is blocked as `effort_mismatch`, and a pair where only
+  one arm recorded effort as `effort_unrecorded_on_one_arm`. Re-run an old arm rather than pairing
+  it with a new one. `run-agent --agent gemini|vibe --effort …` now exits before any run.
+
+### Human feedback
+
+- `feedback.json` is `{"schema_version": 2, "entries": [...]}` and every entry is validated on
+  load. A file from the first served form still loads, and its `good`/`bad` verdicts are read as
+  `pass`/`fail`; the next save rewrites the whole file as schema 2 with `pass`/`fail`. Keep a copy
+  if another tool reads the old verdict words.
+- An old entry that no longer validates, such as one saved with an empty case id, is moved
+  verbatim to `unparsed_entries` on the next save instead of blocking it. `judge-alignment` and
+  `error-analysis` ignore those entries, and `judge-alignment` counts them in
+  `label_source.skipped.unparsed`. Fix an entry there and move it back to `entries` if it
+  should count.
+- An entry that names a judge `assertion` with a pass/fail verdict is a `judge-alignment` label,
+  so `--labels feedback.json` can replace a separately kept labels file. The legacy
+  `{judge_task_id, passed}` file still loads.
+
+### Expected report and audit changes
+
+- Every paired block gains `interval` and `noise_check` (under `observed_*` when pairing is
+  incomplete). `benchmark --min-lift` adds `min_lift` to the noise check.
+- A case whose arms both score 0 on every scored pair gains the `floor: fails in both arms` flag
+  beside `no objective lift`. `saturated/non-discriminating` still marks only the ceiling.
+- `audit-manifest --runs` reports such a case as `floor-eval` instead of `no-lift-eval`, now
+  including regression-intent cases, and `suggest-cases` no longer seeds it.
+- Readiness moves a case whose combined score is 0 in both arms out of `base_saturated_cases` into
+  `floor_cases`, which carries its own blocker. A regression-intent case at the floor used to count in
+  `regression_guards_holding`, which never blocks; it now blocks, so
+  `audit-manifest --fail-on-blockers` can start failing on a suite that passed under 0.6.0.
+  Audit the case and its assertions rather than removing the regression intent.

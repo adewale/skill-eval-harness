@@ -41,7 +41,7 @@ rest of this page is the map between the bottom two rows.
 | **Leakage** (`prompt_assertion_leakage_findings`) | Annotation artifacts (Gururangan et al. 2018); shortcut learning (Geirhos et al. 2020); right-for-the-wrong-reasons heuristics (McCoy et al. 2019) | An artifact in eval clothing: a surface cue that lets a weak answer pass without the capability. |
 | **Holdout / holdback** | Data contamination and memorization controls (Shi et al. 2023; survey arXiv:2406.04244) | A case withheld from skill, docs, and eval text cannot have been memorized, so a high score is evidence, not leakage. |
 | **Repeated runs / flaky** | `pass@k` with the unbiased estimator (Chen et al. 2021); `pass^k` / consistency (G-Pass@k, arXiv:2412.13147) | The reliability block now reports the unbiased `pass@k` and `pass^k`; flakiness is the `pass@k − pass^k` gap. |
-| **Judge / rubric** | LLM-as-judge and its bias taxonomy: position, verbosity, self-enhancement (Zheng et al. 2023) | The biases name the justification for the judge guards below. |
+| **Judge / rubric** | LLM-as-judge and its bias taxonomy: position, verbosity, self-enhancement (Zheng et al. 2023) | Position and self-enhancement bias justify the judge guards below; verbosity bias has no guard yet (see open items). |
 | **Process assertions** (`skill_invoked`) | Path as evidence of shortcut use vs. genuine behavior (McCoy et al. 2019) | Legitimate for *attribution*, brittle for *capability* — see the conflict section. |
 
 ## Where the explanations conflict
@@ -59,6 +59,15 @@ label," which the authors describe as explicitly *not adversarial*. The academic
 by trying to break a model (ANLI; Nie et al. 2020), and it carries a warning the harness would
 inherit by adopting it: "absolute performance numbers on adversarially-collected test sets are
 meaningless as measures of model capabilities" (Phang et al. 2021; Bowman 2021).
+
+Practitioner guidance reaches the same point from case selection.
+[Automating eval design and hillclimbing with Claude](https://claude.dev/blog/automating-eval-design-and-hillclimbing/)
+(Martin 2026, section "Adversarial sampling") warns that picking cases because today's model
+fails them samples the valleys of one model's jagged capability surface, so the eval ends up
+measuring that model's failure fingerprint rather than what is hard for the application. Its
+test for inclusion is being able to say why a case is hard before adding it. A contrast set
+meets that test by construction, because each case is defined by its perturbation relative to
+a positive case rather than by which model fails it.
 
 Resolution: keep the `kind` value for continuity, but document it as a contrast/near-miss
 negative, and read its pass rate as a **discrimination** signal, not a capability score.
@@ -115,8 +124,12 @@ lint the leakage — are named and justified rather than asserted.
 - [ ] Gloss `kind: "adversarial"` in audit output and authoring guidance as a contrast set, per the
   conflict above.
 - [x] Cite the judge-bias taxonomy in the judge guards — the order-flip and negative-control
-  probes shipped as `judge-robustness`; position/verbosity/self-enhancement biases are the
+  probes shipped as `judge-robustness`, with position and self-enhancement bias as the
   documented rationale.
+- [ ] Guard against verbosity bias (Zheng et al. 2023): `judge_prompt` says nothing about
+  answer length, and no probe measures a preference for longer answers. The order-flip probe
+  also needs a same-order repeat flip rate before it can separate position bias from a judge
+  that varies at random. Both belong to the judge prompt guards issue being filed.
 
 ## Sources
 
@@ -143,3 +156,5 @@ lint the leakage — are named and justified rather than asserted.
 - Shi et al. (2023), *Detecting Pretraining Data from Large Language Models* (Min-K% Prob); *A
   Survey on Benchmark Data Contamination* — https://arxiv.org/abs/2406.04244
 - *Are Your LLMs Capable of Stable Reasoning?* (G-Pass@k) — https://arxiv.org/abs/2412.13147
+- Martin (2026), *Automating eval design and hillclimbing with Claude*, claude.dev —
+  https://claude.dev/blog/automating-eval-design-and-hillclimbing/

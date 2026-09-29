@@ -156,6 +156,41 @@ def judgements_from_document(document: Mapping[str, Any]) -> list[HumanJudgement
     return judgements
 
 
+@dataclass(frozen=True)
+class FeedbackStore:
+    """A feedback file split into usable judgements and entries kept as written.
+
+    The first served form accepted blank fields, so an older file can hold an
+    entry with no case id. Refusing the whole file would block every later
+    save and lose the reviewer's other notes; dropping the entry would lose
+    what they typed. The store keeps it verbatim under ``unparsed_entries``,
+    and readers use only the judgements.
+    """
+
+    judgements: tuple[HumanJudgement, ...]
+    unparsed: tuple[Any, ...]
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> FeedbackStore:
+        judgements: list[HumanJudgement] = []
+        unparsed: list[Any] = list(document.get("unparsed_entries") or [])
+        for entry in document.get("entries", []):
+            try:
+                judgements.append(HumanJudgement.parse(entry))
+            except ValueError:
+                unparsed.append(entry)
+        return cls(tuple(judgements), tuple(unparsed))
+
+    def with_judgement(self, judgement: HumanJudgement) -> FeedbackStore:
+        return FeedbackStore(tuple(upsert(self.judgements, judgement)), self.unparsed)
+
+    def as_document(self) -> dict[str, Any]:
+        document = feedback_document(self.judgements)
+        if self.unparsed:
+            document["unparsed_entries"] = list(self.unparsed)
+        return document
+
+
 def upsert(existing: Iterable[HumanJudgement], judgement: HumanJudgement) -> list[HumanJudgement]:
     kept = [item for item in existing if item.key != judgement.key]
     kept.append(judgement)
