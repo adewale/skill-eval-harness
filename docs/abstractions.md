@@ -190,10 +190,10 @@ Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | Lo
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10472`), Claude (`run_claude:10658`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10542`), Claude (`run_claude:10741`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13248`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:4028` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13335`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4054` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -214,7 +214,20 @@ model and timeout are also precise values. Provider adapters can choose wire for
 cannot omit or disagree about process inputs after the plan boundary. The same module owns the
 shared `InvocationState` vocabulary: `InvocationResult` admits only process-boundary states, while
 provider or harness failures remain semantic classifications and never rewrite the observed return
-code.
+code. `InvocationRequest.effort` carries a requested effort level; `run_agent_tasks` refuses it
+before any spend when the backend declares no `effort_control`.
+
+`completion_contracts.py` records how each answer run ended. `StopObservation` normalizes a
+provider's stop reason into the closed `StopClass` (`completed`, `truncated`, `turn_limit`,
+`refused`, `other`, `unobserved`) and keeps the raw value beside it. `ServedModel` compares the
+model the provider reported with the one requested, allowing a dated snapshot suffix or a family
+alias, and names the result `match`, `mismatch`, `unverifiable`, `unobserved` or
+`not-requested`. `EffortSetting` records the requested level and how the backend applied it, or
+`backend-default`. The shared writer fills `unobserved` and `backend-default` for any runner that
+reports nothing, so an old run and a run with no evidence are distinguishable. `execution_valid`
+treats a truncated, turn-limited or wrong-model run as unscorable, because grading it would blame
+the requested model for the eval's limits or for another model's answer; a refusal stays graded and
+is counted in the report's `run_endings` block.
 
 ## Trace normalization
 
@@ -258,6 +271,13 @@ row still carries `{judge_task_id, verdict_kind, passed, score, evidence}` — p
 exact rendered prompt, candidate output, and evidence. A stale or mismatched result is rejected
 or re-queued even when its `judge_task_id` still matches.
 
+Human verdicts have one shape, `human_judgements.HumanJudgement`: a run coordinate, an optional
+judge assertion, a `pass | fail | unsure` verdict and a note. `render-viewer --serve` writes them
+to `feedback.json`; `judge-alignment --labels feedback.json` turns each pass/fail verdict on a named
+assertion into a label for that assertion's `judge_task_id`; `error-analysis --feedback` puts the
+run-level notes into its review queue. A reviewer writes a verdict once, and the calibration label
+and the review note cannot disagree.
+
 ## Grade result row
 
 `grade_case_variant` produces one row per case/variant/run. It separates objective, process,
@@ -287,10 +307,18 @@ cannot collide or lose their causal question at a persistence boundary.
 `build_paired_summary` computes per-case lift
 (`with_skill` minus `without_skill`, normalized gain, and a flag when the skill hurts) only from
 those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplicate arms fail.
+Each paired block also carries `effect_estimates.sign_flip_interval`, the sign-flip test inverted
+into a confidence interval, so the interval excludes zero exactly when the exact test rejects "no
+lift", and `noise_check`, which reports the cases that moved, the smallest p-value those cases can
+reach (`2 / 2**k` for `k` moved cases), the interval half-width and the headroom left in
+`without_skill`. `construct_pairs` blocks a pair whose arms ran at different effort
+(`effort_mismatch`) or where only one arm recorded effort.
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
-flaky, and with-skill-failed cases. These flags, the leakage lint
-(`prompt_assertion_leakage_findings:813`), and the split discipline are the part of the tool
+flaky, and with-skill-failed cases, and `effect_estimates.ceiling_or_floor` separates the two
+ways a case stops discriminating: both arms always pass (ceiling) or both always fail (floor, which
+`suggest-cases` never offers for hardening). These flags, the leakage lint
+(`prompt_assertion_leakage_findings:839`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 `report_contracts.report_cohort` classifies each attempted reporting population as

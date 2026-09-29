@@ -369,7 +369,11 @@ class ServedReportArtifactTests(unittest.TestCase):
             doc = json.loads((ws / "feedback.json").read_text(encoding="utf-8"))
         self.assertEqual(len(doc["entries"]), 2)
         c1 = next(e for e in doc["entries"] if e["case_id"] == "c1")
-        self.assertEqual(c1["verdict"], "good")
+        # The first form's good/bad are stored as pass/fail, the one vocabulary
+        # judge-alignment reads.
+        self.assertEqual(c1["verdict"], "pass")
+        self.assertEqual(c1["note"], "fixed")
+        self.assertEqual(doc["schema_version"], 2)
 
 
 class IterationWorkflowTests(unittest.TestCase):

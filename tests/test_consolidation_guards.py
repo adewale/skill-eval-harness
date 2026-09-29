@@ -196,7 +196,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
 
     def test_invocation_request_is_answer_runner_only(self):
         fields = set(sb.InvocationRequest.__dataclass_fields__)
-        self.assertEqual(fields, {"prompt", "workspace", "model", "timeout_s"})
+        self.assertEqual(fields, {"prompt", "workspace", "model", "timeout_s", "effort"})
 
     def test_agent_capability_registry_matches_registered_surfaces(self):
         self.assertEqual(

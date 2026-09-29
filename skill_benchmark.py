@@ -128,6 +128,21 @@ from artifact_contracts import (
     observe_artifact_set,
 )
 from cli_contracts import CLICommand, CLIInvocation
+from completion_contracts import (
+    EFFORT_LEVELS,
+    EffortSetting,
+    ServedModel,
+    StopObservation,
+    claude_result_stop,
+    completion_unscorable_reason,
+    effort_identity,
+)
+from effect_estimates import (
+    DiscriminationFailure,
+    ceiling_or_floor,
+    noise_check,
+    sign_flip_interval,
+)
 from gemini_contracts import GeminiJsonResponse, GeminiStream
 from grading_contracts import (
     FailedAssertion,
@@ -138,6 +153,13 @@ from grading_contracts import (
     SkippedAssertion,
     UnavailableAssertion,
     assertion_observation_from_row,
+)
+from human_judgements import (
+    HumanJudgement,
+    feedback_document,
+    is_feedback_document,
+    judgements_from_document,
+    upsert,
 )
 from invocation_contracts import (
     InvocationRequest,
@@ -216,6 +238,7 @@ TRIGGER_HARNESS_IDENTITY_VERSION = 2
 TRIGGER_IDENTITY_MODULES = (
     "ablation_model.py",
     "agent_capabilities.py",
+    "completion_contracts.py",
     "experimental_pairs.py",
     "invocation_contracts.py",
     "json_contracts.py",
@@ -350,6 +373,9 @@ def expand_judge_preset(assertion: dict[str, Any]) -> dict[str, Any]:
 # Below this graded mean, an objectively saturated case is flagged
 # structurally-pass-but-forgettable (roadmap 2.2): competent, but low-scoring.
 FORGETTABLE_GRADED_THRESHOLD = 0.75
+# Both arms fail every scored run: flagged apart from the ceiling because the
+# likelier cause is a broken case or assertion, not a hard task.
+FLOOR_FLAG = "floor: fails in both arms"
 
 # Native agents run in their own process group. A successful CLI parent can
 # still leave plugin/git group members alive, so the group is force-killed
@@ -8623,7 +8649,17 @@ def _write_runner_outcome_files(run_dir: Path, outcome: AnswerOutcome,
     usage_block = normalize_usage(dict(context.usage) if context.usage is not None else None, source="provider_reported")
     cost_block = normalize_cost(context.cost_usd, source="provider_reported", pricing_model=context.model)
     elapsed = context.elapsed_ms
+    # Completion evidence every answer run records. A runner that observed a
+    # stop reason, a served model or an effort setting overrides these through
+    # metadata_extra; one that observed nothing says so instead of guessing.
+    completion_defaults = {
+        **StopObservation.unobserved(
+            f"{context.provider.value} runner exposes no stop signal").as_metadata(),
+        **ServedModel.observe(context.model, []).as_metadata(),
+        **EffortSetting.default().as_metadata(),
+    }
     metadata = {
+        **completion_defaults,
         **dict(context.metadata_extra),
         "provider": context.provider.value,
         "model": context.model,
@@ -10216,6 +10252,10 @@ def vibe_cli_invoke(prompt: str, *, model: str | None = None, vibe_cmd: str | No
 
 class AgentBackend:
     name = "agent"
+    # How this backend applies a requested effort, or None when it has no
+    # known control. A request for effort on such a backend is refused before
+    # any run, rather than recorded as a setting that was never applied.
+    effort_control: str | None = None
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         raise NotImplementedError
@@ -10223,6 +10263,7 @@ class AgentBackend:
 
 class CodexBackend(AgentBackend):
     name = "codex"
+    effort_control = "codex -c model_reasoning_effort"
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         result = codex_cli_invoke(
@@ -10234,6 +10275,8 @@ class CodexBackend(AgentBackend):
             output_schema=None,
             sandbox="read-only",
             json_events=True,
+            config_overrides=(
+                [f"model_reasoning_effort={request.effort}"] if request.effort else None),
         )
         return RunnerOutcome(
             provider="codex", answer=result.get("answer"),
@@ -10249,6 +10292,7 @@ class CodexBackend(AgentBackend):
 
 class ClaudeBackend(AgentBackend):
     name = "claude"
+    effort_control = "claude --effort"
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         # stream-json, not the single envelope: the stream is the run's raw
@@ -10256,8 +10300,16 @@ class ClaudeBackend(AgentBackend):
         # evidence the trigger matrix already observes — without it every
         # process assertion on a Claude run fails closed for missing evidence.
         result = claude_cli_invoke(request.prompt, model=request.model, claude_bin=str(options.get("claude_bin") or "claude"),
-                                   timeout=request.timeout_s, cwd=str(request.workspace), output_format="stream-json")
+                                   timeout=request.timeout_s, cwd=str(request.workspace), output_format="stream-json",
+                                   extra_args=["--effort", request.effort] if request.effort else None)
+        stop = result.get("stop")
+        completion = {
+            **(stop.as_metadata() if isinstance(stop, StopObservation)
+               else StopObservation.unobserved("claude stream has no result event").as_metadata()),
+            **ServedModel.observe(request.model, result.get("served_models") or []).as_metadata(),
+        }
         return RunnerOutcome(
+            metadata_extra=completion,
             provider="claude", answer=result.get("answer") or "",
             returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
             invocation_state=result.get("invocation_state"),
@@ -10301,6 +10353,14 @@ class GeminiBackend(AgentBackend):
         raw_metadata = result.get("metadata")
         metadata = (dict(raw_metadata)
                     if isinstance(raw_metadata, Mapping) else {})
+        reported = metadata.get("reported_models")
+        resolved = metadata.get("resolved_model")
+        metadata.update(ServedModel(
+            request.model,
+            resolved if isinstance(resolved, str) and resolved.strip() else None,
+            tuple(item for item in reported if isinstance(item, str) and item.strip())
+            if isinstance(reported, list) else (),
+        ).as_metadata())
         return RunnerOutcome(
             provider="gemini",
             answer=result.get("answer") or "",
@@ -10373,13 +10433,20 @@ def registered_agent_backend(name: str) -> AgentBackend:
     return backend
 
 
-def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, **options: Any) -> int:
+def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBackend, *, model: str | None = None, timeout: int = DEFAULT_RUNNER_TIMEOUT_S, effort: str | None = None, **options: Any) -> int:
     """Shared answer-runner loop for native CLI backends.
 
     Existing `run-claude` and `run-codex` now use this path, and the new
     `run-agent` command exposes it directly. Provider-specific code returns a
     RunnerOutcome; this loop owns PreparedTask handling, workspace construction,
-    provenance, and the run-output contract."""
+    provenance, and the run-output contract. Every run records the effort it
+    asked for; a backend with no known effort control refuses a request before
+    any spend instead of recording a level it never applied."""
+    if effort is not None and backend.effort_control is None:
+        die(f"{backend.name} backend has no known effort control; omit --effort "
+            "(runs then record effort as the backend default)")
+    effort_setting = (EffortSetting(effort, str(backend.effort_control))
+                      if effort is not None else EffortSetting.default())
     workspace_builder = registered_workspace_builder(backend.name)
     validated: list[tuple[dict[str, Any], PreparedTask, str | None, Path]] = []
     seen_identities: set[tuple[str, str | None, str, int, str]] = set()
@@ -10420,6 +10487,7 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
             "answer_instruction_sha256": answer_design_identity(
                 design, pt, row_model)["instruction_sha256"],
             **({"ablation": pt.ablation.as_dict()} if pt.ablation else {}),
+            **effort_setting.as_metadata(),
         }
         with tempfile.TemporaryDirectory(prefix=f"{backend.name}-ws-") as wd:
             ws = Path(wd)
@@ -10435,6 +10503,7 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
                 workspace=ws,
                 model=row_model,
                 timeout_s=timeout,
+                effort=effort,
             ), **options)
         context = outcome_context(outcome)
         env = dict(context.environment or {})
@@ -10457,6 +10526,7 @@ def run_agent(args: argparse.Namespace) -> int:
         surface_option_values(args, "answer"))
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), backend,
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
+                           effort=getattr(args, "effort", None),
                            **provider_options)
 
 
@@ -10472,6 +10542,7 @@ def agent_capabilities_command(args: argparse.Namespace) -> int:
 def run_codex(args: argparse.Namespace) -> int:
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("codex"),
                            timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
+                           effort=getattr(args, "effort", None),
                            codex_cmd=getattr(args, "codex_cmd", None) or CODEX_ANSWER_DEFAULT_CMD)
 
 
@@ -10508,11 +10579,13 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     """
     text = stdout if isinstance(stdout, str) else ""
     env: dict[str, Any] | None = None
+    stream_records: list[dict[str, Any]] = []
     stripped = text.strip()
     try:
         single = strict_json_loads(stripped)
     except json.JSONDecodeError:
         records, errors = parse_trace_jsonl_text(text)
+        stream_records = records
         results = [record for record in records if record.get("type") == "result"]
         if errors:
             return {"answer": "", "raw_response": text, "cost_usd": None,
@@ -10554,6 +10627,14 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     result_error = None if isinstance(result, str) else "claude result must be a string"
     if cost is not None and (normalized_cost is None or normalized_cost < 0):
         result_error = "claude total_cost_usd must be a finite nonnegative number"
+    # The model on each assistant message is the one that served that turn;
+    # the last one wrote the final answer. The envelope-only `json` format has
+    # no assistant messages, so its served model stays unobserved.
+    served_models = [
+        record["message"].get("model")
+        for record in stream_records
+        if record.get("type") == "assistant" and isinstance(record.get("message"), dict)
+    ]
     return {
         "answer": result if isinstance(result, str) else "",
         "cost_usd": (normalized_cost
@@ -10563,6 +10644,8 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
         "parse_error": result_error,
         "is_error": env.get("is_error", False),
         "api_error_status": api_error_status,
+        "stop": claude_result_stop(env),
+        "served_models": served_models,
     }
 
 
@@ -10658,6 +10741,7 @@ def claude_run_metrics(result: dict[str, Any]) -> dict[str, Any]:
 def run_claude(args: argparse.Namespace) -> int:
     return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("claude"),
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
+                           effort=getattr(args, "effort", None),
                            claude_bin=getattr(args, "claude_bin", None) or "claude")
 
 
@@ -10876,7 +10960,8 @@ def codex_structured_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = "codex exec", timeout: int = DEFAULT_RUNNER_TIMEOUT_S,
                       output_schema: dict[str, Any] | None = None, cwd: str | Path | None = None,
-                      sandbox: str = "read-only", json_events: bool = True) -> dict[str, Any]:
+                      sandbox: str = "read-only", json_events: bool = True,
+                      config_overrides: list[str] | None = None) -> dict[str, Any]:
     """Native Codex invocation for judge-style calls.
 
     Codex's event stream is useful for telemetry, but the verdict/answer should
@@ -10906,6 +10991,8 @@ def codex_cli_invoke(prompt: str, *, model: str | None = None, codex_cmd: str = 
         argv.append("--ignore-rules")
     if sandbox and "--sandbox" not in argv:
         argv += ["--sandbox", sandbox]
+    for override in config_overrides or []:
+        argv += ["-c", override]
     tmp = Path(tempfile.mkdtemp(prefix="codex-invoke-"))
     cleanup_meta: dict[str, Any]
     try:
@@ -13678,12 +13765,53 @@ def judge_alignment_report(human: dict[str, dict[str, Any]], judge: dict[str, di
     }
 
 
+def human_labels_from_judgements(judgements: list[HumanJudgement]) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+    """Judge-calibration labels from stored human judgements.
+
+    Only a pass/fail verdict on a named judge assertion is a label: a run-level
+    note grades no particular judge task, and "unsure" is not ground truth."""
+    labels: dict[str, dict[str, Any]] = {}
+    skipped = {"run_level": 0, "unsure_or_note_only": 0}
+    for judgement in judgements:
+        if judgement.assertion is None:
+            skipped["run_level"] += 1
+            continue
+        if judgement.label is None:
+            skipped["unsure_or_note_only"] += 1
+            continue
+        jid = judge_task_id(judgement.case_id, judgement.variant, judgement.run_number,
+                            {"name": judgement.assertion}, judgement.model)
+        if jid in labels:
+            die(f"feedback labels {jid!r} twice")
+        labels[jid] = {"judge_task_id": jid, "passed": judgement.label}
+    return labels, skipped
+
+
+def load_human_labels(path: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Read human labels from the served review's feedback.json, or from the
+    legacy {judge_task_id, passed} file that predates the single store."""
+    try:
+        document = strict_json_loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        document = None
+    if is_feedback_document(document):
+        assert isinstance(document, dict)
+        try:
+            judgements = judgements_from_document(document)
+        except ValueError as exc:
+            die(str(exc))
+        labels, skipped = human_labels_from_judgements(judgements)
+        return labels, {"format": "feedback", "skipped": skipped}
+    return load_judge_results(path), {"format": "judge_task_labels"}
+
+
 def judge_alignment_command(args: argparse.Namespace) -> int:
-    human = load_judge_results(args.labels)
+    human, source = load_human_labels(args.labels)
     judge = load_judge_results(args.judge_results)
     if not human:
         die(f"no human labels loaded from {args.labels}")
     report = judge_alignment_report(human, judge, min_labels=int(getattr(args, "min_labels", 50)))
+    report["label_source"] = source
     emit_report(report, getattr(args, "out", None))
     return 0
 
@@ -13710,13 +13838,15 @@ def first_failure(result: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[str, Any]:
+def error_analysis_report(report: dict[str, Any], *, limit: int = 100,
+                          feedback: list[HumanJudgement] | None = None) -> dict[str, Any]:
     """Feature 8: open-coding review queue + axial failure taxonomy over a
     benchmark report (model-free). The queue is one row per failing/errored run
     anchored on its first failure (the 'look at your data' substrate); the
     taxonomy counts those first-failures by category so the >60%-in-a-few-buckets
     pattern is visible. Reuses the report's own case_flags as a second histogram."""
     results = report.get("results", [])
+    run_notes = {item.run_key: item for item in (feedback or []) if item.assertion is None}
     queue: list[dict[str, Any]] = []
     blocked = [
         {"case_id": row.get("case_id"), "model": row.get("model"),
@@ -13741,10 +13871,19 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
             category = f"{ff['klass']}:{ff.get('name') or ff.get('type') or 'unnamed'}"
         entry = {
             "case_id": r.get("case_id"), "variant": r.get("variant"), "model": r.get("model"),
+            "run_number": r.get("run_number", 1),
             "run_base": r.get("run_base"), "category": category,
             "objective_pass_rate": r.get("objective_pass_rate"), "combined_pass_rate": r.get("combined_pass_rate"),
             "first_failure": ff, "note": "",   # open-text slot for a human annotation
         }
+        human = run_notes.get((str(r.get("case_id")), str(r.get("model") or ""),
+                               str(r.get("variant")), int(r.get("run_number", 1) or 1)))
+        if human is not None:
+            # The review page's run-level judgement fills the slot, so a note
+            # written while reading the run is not typed a second time here.
+            entry["note"] = human.note or ""
+            if human.verdict is not None:
+                entry["human_verdict"] = human.verdict.value
         queue.append(entry)
         bucket = taxonomy.setdefault(category, {"category": category, "count": 0, "example_case": r.get("case_id"), "example_evidence": (ff or {}).get("evidence", "")})
         bucket["count"] += 1
@@ -13781,7 +13920,12 @@ def error_analysis_report(report: dict[str, Any], *, limit: int = 100) -> dict[s
 
 def error_analysis_command(args: argparse.Namespace) -> int:
     report = load_json(Path(args.benchmark))
-    out = error_analysis_report(report, limit=int(getattr(args, "limit", 100)))
+    feedback_path = getattr(args, "feedback", None)
+    try:
+        feedback = read_feedback(Path(feedback_path)) if feedback_path else None
+    except ValueError as exc:
+        die(str(exc))
+    out = error_analysis_report(report, limit=int(getattr(args, "limit", 100)), feedback=feedback)
     emit_report(out, getattr(args, "out", None))
     return 0
 
@@ -14269,6 +14413,7 @@ def grade_case_variant(
         "run_base": str(run_base or output_path.parent),
         "missing_output": missing_output,
         "execution_valid": exec_valid,
+        **completion_row_fields(metadata),
         "objective_passed": objective_passed,
         "objective_total": objective_total,
         "objective_pass_rate": (0.0 if vetoed else objective_passed / objective_total) if objective_total else (0.0 if vetoed else None),
@@ -14478,6 +14623,79 @@ def telemetry_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
             counts[key] += 1 if flags.get(key) else 0
     counts["runs"] = len(rows)
     return counts
+
+
+def completion_row_fields(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Carry a run's completion evidence onto its result row.
+
+    Runs recorded before this evidence existed carry none of these keys, and
+    the report counts them as unrecorded rather than as completed."""
+    fields: dict[str, Any] = {}
+    for key in ("stop_class", "stop_reason", "served_model", "served_model_check"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value:
+            fields[key] = value
+    effort = metadata.get("effort")
+    if isinstance(effort, Mapping):
+        fields["effort"] = {"requested": effort.get("requested"),
+                            "applied_by": effort.get("applied_by")}
+    reason = completion_unscorable_reason(metadata)
+    if reason is not None:
+        fields["unscorable_reason"] = reason
+    return fields
+
+
+def run_endings_block(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """How every graded run ended, per variant: stop class, served-model check
+    and effort. Counts cover all runs, scorable or not, because the question
+    is what the eval actually measured: a refused run is graded (so its zero
+    is a refusal, not a capability miss), while a truncated or wrong-model run
+    is excluded and blocks its pair."""
+    by_variant: dict[str, dict[str, Any]] = {}
+    models = set()
+    for row in results:
+        variant = str(row.get("variant"))
+        block = by_variant.setdefault(variant, {
+            "runs": 0,
+            "stop_class": collections.Counter(),
+            "served_model_check": collections.Counter(),
+            "effort": collections.Counter(),
+        })
+        block["runs"] += 1
+        block["stop_class"][row.get("stop_class") or "unrecorded"] += 1
+        block["served_model_check"][row.get("served_model_check") or "unrecorded"] += 1
+        block["effort"][effort_identity(row) or "unrecorded"] += 1
+        if row.get("model"):
+            models.add(str(row["model"]))
+    totals = collections.Counter()
+    efforts: set[str] = set()
+    for block in by_variant.values():
+        for key in ("stop_class", "served_model_check", "effort"):
+            block[key] = dict(sorted(block[key].items()))
+        totals.update({f"stop:{k}": v for k, v in block["stop_class"].items()})
+        totals.update({f"served:{k}": v for k, v in block["served_model_check"].items()})
+        efforts.update(block["effort"])
+    notes = []
+    if totals["stop:refused"]:
+        notes.append(f"{totals['stop:refused']} run(s) ended in a refusal; they are graded, "
+                     "so read those zeros as refusals rather than capability misses")
+    if totals["stop:truncated"] or totals["stop:turn_limit"]:
+        notes.append(f"{totals['stop:truncated'] + totals['stop:turn_limit']} run(s) were cut off "
+                     "by an output or turn limit and are excluded from scoring")
+    if totals["served:mismatch"]:
+        notes.append(f"{totals['served:mismatch']} run(s) were answered by a different model "
+                     "than requested and are excluded from scoring")
+    if len(models) > 1 and efforts == {"backend-default"}:
+        notes.append("every run used its backend's default effort; defaults differ by model, "
+                     "so pin --effort before reading a cross-model comparison")
+    return {
+        "by_variant": dict(sorted(by_variant.items())),
+        "refused_runs": totals["stop:refused"],
+        "cut_off_runs": totals["stop:truncated"] + totals["stop:turn_limit"],
+        "served_model_mismatches": totals["served:mismatch"],
+        "effort_levels": sorted(efforts),
+        "notes": notes,
+    }
 
 
 def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> float | None:
@@ -15321,7 +15539,8 @@ def paired_case_counts(results: list[dict[str, Any]]) -> list[tuple[str, tuple[i
     return pairs
 
 
-def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates: list[float], negative_cases: list[dict[str, Any]]) -> dict[str, Any]:
+def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates: list[float], negative_cases: list[dict[str, Any]],
+                            *, min_lift: float | None = None) -> dict[str, Any]:
     with_rate = statistics.mean(paired_with_rates) if paired_with_rates else None
     without_rate = statistics.mean(paired_without_rates) if paired_without_rates else None
     absolute_delta = None
@@ -15331,6 +15550,7 @@ def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates
         if with_rate >= without_rate and without_rate < 1:
             normalized_gain = (with_rate - without_rate) / (1 - without_rate)
     deltas = [w - n for w, n in zip(paired_with_rates, paired_without_rates)]
+    interval = sign_flip_interval(deltas)
     return {
         "with_skill_objective_pass_rate": with_rate,
         "without_skill_objective_pass_rate": without_rate,
@@ -15339,6 +15559,13 @@ def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates
         # Lift is tested, not eyeballed (roadmap 2.2): the sign-flip permutation
         # p-value over the per-(case, model) deltas rides beside the raw delta.
         "significance": sign_flip_significance(deltas),
+        # The same test inverted: every lift it would not reject. It excludes
+        # zero exactly when the exact test is significant.
+        "interval": interval,
+        # Could this eval have shown a lift at all? Cases moved, the smallest
+        # reachable p, the noise floor and the headroom left in without_skill.
+        "noise_check": noise_check(deltas, paired_without_rates, interval=interval,
+                                   min_lift=min_lift),
         "negative_delta_cases": negative_cases,
     }
 
@@ -15366,10 +15593,14 @@ def pairing_aware_block(block: dict[str, Any],
         "method": "unavailable", "n": 0, "p_value": None,
         "significant_at_0_05": False, "reason": "incomplete_pairing",
     }
+    for key in ("interval", "noise_check"):
+        if key in out:
+            out[f"observed_{key}"] = out[key]
+            out[key] = {"availability": "unavailable", "reason": "incomplete_pairing"}
     return out
 
 
-def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+def build_paired_summary(results: list[dict[str, Any]], *, min_lift: float | None = None) -> dict[str, Any]:
     # The pairing key is (case, model) — roadmap 2.1. Each model's rows pair
     # with_skill against without_skill within that model only; the headline
     # block pools the per-(case, model) pairs, and by_model carries each
@@ -15390,7 +15621,7 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         all_without.extend(n)
         all_negative.extend({**item, "model": model} for item in neg)
         by_model[model] = pairing_aware_block(
-            paired_block_from_rates(w, n, neg),
+            paired_block_from_rates(w, n, neg, min_lift=min_lift),
             _metric_pair_construction(rows, "objective_pass_rate"))
         gw, gn, _ = paired_case_rates(rows, key="graded_score")
         graded_with.extend(gw)
@@ -15405,7 +15636,7 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         graded_with.extend(gw)
         graded_without.extend(gn)
     out = pairing_aware_block(
-        paired_block_from_rates(all_with, all_without, all_negative),
+        paired_block_from_rates(all_with, all_without, all_negative, min_lift=min_lift),
         _metric_pair_construction(results, "objective_pass_rate"))
     if graded_with:
         # The graded channel (roadmap 2.2): how much better, after the binary
@@ -15417,6 +15648,7 @@ def build_paired_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
             "without_skill_mean_score": round(statistics.mean(graded_without), 4),
             "delta": round(statistics.mean(graded_deltas), 4),
             "significance": sign_flip_significance(graded_deltas),
+            "interval": sign_flip_interval(graded_deltas),
         }
         graded_construction = _metric_pair_construction(results, "graded_score")
         if graded_construction.blocked:
@@ -16941,6 +17173,7 @@ def build_benchmark_report(
     allow_scripts: bool = False,
     strict: bool = False,
     embed_cmd: str | None = None,
+    min_lift: float | None = None,
 ) -> dict[str, Any]:
     manifest = validate_manifest(path)
     variants = variants_arg or manifest.get("variants", DEFAULT_VARIANTS)
@@ -16998,7 +17231,13 @@ def build_benchmark_report(
         w_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ws_rows)
         n_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ns_rows)
         flags = []
-        if w_rate == 1 and n_rate == 1:
+        extreme = ceiling_or_floor(w_rate, n_rate)
+        if extreme is DiscriminationFailure.FLOOR:
+            # Both arms fail every scored run. That is more often a broken case
+            # or assertion than a hard task, so it is flagged apart from the
+            # ceiling and never offered to suggest-cases for hardening.
+            flags.append(FLOOR_FLAG)
+        if extreme is DiscriminationFailure.CEILING:
             flags.append("saturated/non-discriminating")
             # 2.2: saturation's next move. Objectively perfect but scoring low on
             # the graded channel is competent-but-forgettable work — the report
@@ -17053,7 +17292,7 @@ def build_benchmark_report(
     design_coverage = answer_design_coverage(
         runs, results, manifest=manifest, manifest_path=path,
         case_ids=answer_case_ids, variants=variants)
-    paired_summary = build_paired_summary(results)
+    paired_summary = build_paired_summary(results, min_lift=min_lift)
     unscorable_results = [row for row in results if not scorable_run(row)]
     grading_blocked_results = [
         row for row in results
@@ -17185,6 +17424,9 @@ def build_benchmark_report(
         # ALL runs (failures included), per-variant/case stats, paired cost
         # deltas, ablation marginal cost, and separated judge spend.
         "cost_summary": cost_surface,
+        # How runs ended: refusals, cut-off answers, served-model mismatches
+        # and effort levels, per variant, so a zero can be read correctly.
+        "run_endings": run_endings_block(results),
         "case_flags": case_flags_surface,
         "case_flags_availability": (
             "partial" if observed_case_flags is not None else "complete"),
@@ -17195,7 +17437,10 @@ def build_benchmark_report(
 
 
 def benchmark(args: argparse.Namespace) -> int:
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None))
+    min_lift = getattr(args, "min_lift", None)
+    if min_lift is not None and not 0 < min_lift <= 1:
+        die("--min-lift must be a pass-rate difference in (0, 1]")
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None), min_lift=min_lift)
     emit_report(report, args.out)
     return 0
 
@@ -18266,22 +18511,24 @@ def benchmark_report_diff(previous: dict[str, Any], current: dict[str, Any]) -> 
     return {"availability": "complete", **observed}
 
 
+def read_feedback(path: Path) -> list[HumanJudgement]:
+    """Every human judgement stored in one feedback.json (empty when absent)."""
+    if not path.is_file():
+        return []
+    loaded = strict_json_loads(path.read_text(encoding="utf-8"))
+    if not is_feedback_document(loaded):
+        raise ValueError(f"{path} is not a feedback document with an entries list")
+    return judgements_from_document(loaded)
+
+
 def persist_feedback(workspace: Path, entry: dict[str, Any]) -> Path:
-    """Feedback capture (roadmap 2.8, eval-viewer's feedback.json): entries are
-    keyed by case/model/variant/run — a re-submission replaces its prior entry."""
+    """Feedback capture (roadmap 2.8, eval-viewer's feedback.json): the ONE
+    store for human judgements. Each entry is validated as a HumanJudgement;
+    a re-submission for the same run and assertion replaces its prior entry.
+    judge-alignment reads this file directly, so a verdict is written once."""
     path = workspace / "feedback.json"
-    doc = {"entries": []}
-    if path.is_file():
-        loaded = strict_json_loads(path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict) and isinstance(loaded.get("entries"), list):
-            doc = loaded
-    key = (entry.get("case_id"), entry.get("model"), entry.get("variant"),
-           entry.get("run_number", 1))
-    doc["entries"] = [e for e in doc["entries"] if (
-        e.get("case_id"), e.get("model"), e.get("variant"),
-        e.get("run_number", 1)) != key]
-    doc["entries"].append(entry)
-    write_json(path, doc)
+    judgement = HumanJudgement.parse(entry)
+    write_json(path, feedback_document(upsert(read_feedback(path), judgement)))
     return path
 
 
@@ -18301,10 +18548,13 @@ def viewer_html(report: dict[str, Any], runs_root: Path | None = None, *, previo
         parts.append("<h2>Diff vs previous workspace</h2><pre>" + html.escape(json.dumps(diff, indent=2)) + "</pre>")
     if serve_mode:
         parts.append(
-            "<h2>Feedback</h2><form id='fb'>"
+            "<h2>Feedback</h2><p>Name a judge assertion to label it for <code>judge-alignment</code>; "
+            "leave it blank to annotate the whole run for <code>error-analysis</code>.</p><form id='fb'>"
             "<input name='case_id' placeholder='case id'> <input name='model' placeholder='model'> "
-            "<input name='variant' placeholder='variant'>"
-            " <select name='verdict'><option>good</option><option>bad</option><option>unsure</option></select>"
+            "<input name='variant' placeholder='variant'> <input name='run_number' placeholder='run' size='4'> "
+            "<input name='assertion' placeholder='judge assertion (optional)'>"
+            " <select name='verdict'><option value=''>no verdict</option><option>pass</option>"
+            "<option>fail</option><option>unsure</option></select>"
             " <input name='note' placeholder='note' size='40'> <button>save</button> <span id='fb-status'></span></form>"
             "<script>document.getElementById('fb').addEventListener('submit',async e=>{e.preventDefault();"
             "const data=Object.fromEntries(new FormData(e.target));"
@@ -18391,7 +18641,7 @@ def serve_viewer(html_text: str, workspace: Path, port: int) -> None:
                 entry = strict_json_loads(self.rfile.read(length).decode("utf-8"))
                 persist_feedback(workspace, entry)
                 self.send_response(204)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError, ValueError):
                 self.send_response(400)
             self.end_headers()
 
@@ -18842,11 +19092,18 @@ def suggest_case_candidates(report: dict[str, Any], manifest: dict[str, Any]) ->
     """The deterministic half of the living-eval loop (roadmap 2.10): saturated
     and no-lift flags select the cases that stopped discriminating; each yields
     a candidate SEED for a harder variant. Generation is a separate, opt-in,
-    model-backed step — and a candidate never enters a manifest on its own."""
+    model-backed step — and a candidate never enters a manifest on its own.
+
+    A floor case (both arms fail every run) is never a seed: making a case that
+    nothing passes harder cannot help, and the likelier cause is the case or
+    its assertion. Those cases go to `audit-manifest` as `floor-eval`."""
     cases = case_by_id(manifest)
     seeds = []
     for flag in report.get("case_flags", []):
-        reasons = [f for f in flag.get("flags", []) if "saturated" in f or "no objective lift" in f]
+        case_flag_list = flag.get("flags", [])
+        if FLOOR_FLAG in case_flag_list:
+            continue
+        reasons = [f for f in case_flag_list if "saturated" in f or "no objective lift" in f]
         if not reasons:
             continue
         case = cases.get(flag.get("case_id"), {})
@@ -18860,8 +19117,12 @@ def suggest_case_candidates(report: dict[str, Any], manifest: dict[str, Any]) ->
             "assertions": [assertion_label(a) for a in case.get("assertions", [])],
             "instruction": (
                 "Propose ONE harder variant of this case: same domain and oracle style, "
-                "solvable with the skill but likely to fail without it. Do not leak assertion "
-                "values into the prompt. Return JSON {\"prompt\": ..., \"rationale\": ...}."
+                "exercising what the skill teaches, and hard for a reason a domain expert "
+                "would name rather than because today's model happens to fail it. Do not "
+                "leak assertion values into the prompt. The "
+                "rationale must say why the case is hard. A new case belongs in the tune "
+                "split until it has been measured. Return JSON "
+                "{\"prompt\": ..., \"rationale\": ...}."
             ),
         })
     return seeds
@@ -19484,8 +19745,13 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
     static manifest audit CANNOT see — the ones where the *measured* numbers say
     the case can't discriminate the skill:
 
-      base_saturated   — combined with_skill == without_skill: the case measures
-                         nothing (the base model does it with or without the skill).
+      base_saturated   — combined with_skill == without_skill above zero: the case
+                         measures nothing (the base model does it with or without
+                         the skill).
+      floor            — both arms score 0: nothing passes, which points at a broken
+                         case or assertion before it points at a hard task. Kept
+                         apart from base_saturated, and a regression guard at the
+                         floor is not "holding".
       qualitative_only — objective with == without (the deterministic assertions
                          don't move) yet combined with > without: the whole signal
                          is carried by the judge. An objective-only eval would call
@@ -19513,7 +19779,7 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
     by_case: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in pairing.pairs:
         by_case[pair.key.case_id].append(pair)
-    base_saturated, base_saturated_expected, qualitative_only = [], [], []
+    base_saturated, base_saturated_expected, qualitative_only, floor = [], [], [], []
     for cid, pairs in by_case.items():
         combined = [(combined_value(pair.with_skill.payload), combined_value(pair.without_skill.payload))
                     for pair in pairs]
@@ -19522,6 +19788,9 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
             continue
         cw = statistics.mean(left for left, _ in combined)
         cn = statistics.mean(right for _, right in combined)
+        if cw <= eps and cn <= eps:
+            floor.append(cid)
+            continue
         if abs(cw - cn) <= eps:
             (base_saturated_expected if intent.get(cid) == "regression" else base_saturated).append(cid)
             continue
@@ -19541,6 +19810,7 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
         "base_saturated_cases": sorted(base_saturated, key=str),
         "base_saturated_expected_cases": sorted(base_saturated_expected, key=str),
         "qualitative_only_cases": sorted(qualitative_only, key=str),
+        "floor_cases": sorted(floor, key=str),
     }
     if benchmark_report.get("availability") != "complete":
         return {
@@ -19549,6 +19819,7 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
             "base_saturated_cases": [],
             "base_saturated_expected_cases": [],
             "qualitative_only_cases": [],
+            "floor_cases": [],
             "observed": observed,
         }
     return {"availability": "complete", **observed}
@@ -19608,9 +19879,11 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
     # blocker (a case that measures nothing is wasted budget); qualitative_only is a
     # warning that the case's signal lives entirely in the judge, so an
     # objective-only reading would miss it.
-    run = readiness_run_signals(benchmark_report) if benchmark_report else {"base_saturated_cases": [], "base_saturated_expected_cases": [], "qualitative_only_cases": []}
+    run = readiness_run_signals(benchmark_report) if benchmark_report else {"base_saturated_cases": [], "base_saturated_expected_cases": [], "qualitative_only_cases": [], "floor_cases": []}
     if run["base_saturated_cases"]:
         blockers.append(f"{len(run['base_saturated_cases'])} case(s) are base-saturated (measured with_skill == without_skill) — they cannot measure the skill; cut or harden them")
+    if run.get("floor_cases"):
+        blockers.append(f"{len(run['floor_cases'])} case(s) fail in both arms on every scored run — audit each case and its assertions before hardening or spending more on it")
     return {
         "ablations": {"total": len(ablations), "materialized": materialized, "instruction_simulated": instr_sim},
         "leak_saturated_cases": leak_saturated,
@@ -19618,6 +19891,7 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
         "adversarial_cases": adversarial,
         "judge_only_cases": judge_only,
         "base_saturated_cases": run["base_saturated_cases"],
+        "floor_cases": run.get("floor_cases", []),
         "qualitative_only_cases": run["qualitative_only_cases"],
         # G5: regression guards that saturated are the intended steady state —
         # surfaced, but never a blocker (so --fail-on-blockers stays green).
@@ -19856,10 +20130,17 @@ def audit_manifest_report(
         bench_report = report
         benchmark_summary = {"summary": report["summary"], "case_flags": report["case_flags"]}
         for flag in report["case_flags"]:
+            at_floor = FLOOR_FLAG in flag.get("flags", [])
             for f in flag.get("flags", []):
-                if "saturated" in f and flag.get("eval_intent") != "regression":
+                if f == FLOOR_FLAG:
+                    # Regression guards included: a guard nothing passes is not holding.
+                    finding("floor-eval", "recommended",
+                            f"Case {flag['case_id']} fails in both arms on every scored run; "
+                            "audit the case and its assertions before making it harder.", flag)
+                elif "saturated" in f and flag.get("eval_intent") != "regression":
                     finding("saturated-eval", "recommended", f"Case {flag['case_id']} is saturated/non-discriminating.", flag)
-                elif "no objective lift" in f and flag.get("eval_intent") != "regression":
+                elif ("no objective lift" in f and not at_floor
+                      and flag.get("eval_intent") != "regression"):
                     finding("no-lift-eval", "recommended", f"Case {flag['case_id']} shows no objective lift.", flag)
                 elif "flaky" in f:
                     finding("flaky-eval", "required", f"Case {flag['case_id']} has repeated-run variance.", flag)
@@ -20087,8 +20368,9 @@ def audit_manifest(args: argparse.Namespace) -> int:
                   f"- leak-saturated cases: {len(rd.get('leak_saturated_cases',[]))}",
                   f"- objective-only cases (no judge assertion): {len(rd.get('objective_only_cases',[]))}",
                   f"- adversarial cases: {rd.get('adversarial_cases',0)}   judge-only cases: {rd.get('judge_only_cases',0)}"]
-        if rd.get("base_saturated_cases") or rd.get("qualitative_only_cases"):
+        if rd.get("base_saturated_cases") or rd.get("qualitative_only_cases") or rd.get("floor_cases"):
             lines.append(f"- measured signals: base-saturated (with==without): {len(rd.get('base_saturated_cases',[]))}   "
+                         f"floor (both arms fail): {len(rd.get('floor_cases',[]))}   "
                          f"qualitative-only (judge carries the lift): {len(rd.get('qualitative_only_cases',[]))}")
         if rd.get("regression_guards_holding"):
             lines.append(f"- regression guards holding (expected steady-state green): {len(rd.get('regression_guards_holding',[]))}")
@@ -20676,6 +20958,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--codex-cmd", default=CODEX_ANSWER_DEFAULT_CMD, help="argv-style Codex command prefix that reads prompt on stdin and emits Codex JSONL; shell metacharacters are not interpreted")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
+    p.add_argument("--effort", choices=EFFORT_LEVELS, help="requested reasoning effort, recorded on every run; omit to run at the backend default (also recorded, since defaults differ by model and CLI)")
 
     p = sub.add_parser("run-claude", help="run prepared tasks through `claude -p --output-format json`, capturing cost/usage")
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
@@ -20683,6 +20966,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", help="claude model id (e.g. claude-haiku-4-5-20251001); omit for the CLI default")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable (a stub in tests)")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
+    p.add_argument("--effort", choices=EFFORT_LEVELS, help="requested reasoning effort, recorded on every run; omit to run at the backend default (also recorded, since defaults differ by model and CLI)")
 
     p = sub.add_parser("run-agent", help="run prepared tasks through a registered native agent backend")
     p.add_argument("--agent", required=True, choices=sorted(AGENT_BACKENDS), help="native backend to use")
@@ -20690,6 +20974,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
+    p.add_argument("--effort", choices=EFFORT_LEVELS, help="requested reasoning effort, recorded on every run; omit to run at the backend default (also recorded, since defaults differ by model and CLI)" + "; refused on backends with no known effort control")
     add_surface_cli_options(p, "answer")
 
     p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")
@@ -20741,6 +21026,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
     p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
     p.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in)")
+    p.add_argument("--min-lift", type=float, help="smallest pass-rate lift you would act on (e.g. 0.1); the noise check reports whether the eval can resolve it")
     p.add_argument("--out")
 
     p = sub.add_parser("report", help="serialize a benchmark.json for CI: JUnit XML or GitHub job-summary markdown + annotations")
@@ -20754,7 +21040,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--out")
 
     p = sub.add_parser("judge-alignment", help="validate a judge against HUMAN labels: agreement, Cohen's kappa, precision/recall/F1 (feature 2)")
-    p.add_argument("--labels", required=True, help="human labels keyed by judge_task_id ({judge_task_id, passed}); JSONL or JSON")
+    p.add_argument("--labels", required=True, help="the served review's feedback.json (entries naming a judge assertion with a pass/fail verdict), or a legacy {judge_task_id, passed} JSONL/JSON file")
     p.add_argument("--judge-results", required=True, help="judge verdicts keyed by judge_task_id (the judge output to validate)")
     p.add_argument("--min-labels", type=int, default=50, help="warn below this many matched labels (metrics unstable)")
     p.add_argument("--out")
@@ -20762,6 +21048,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("error-analysis", help="open-coding review queue + axial failure taxonomy over a benchmark.json (feature 8; model-free)")
     p.add_argument("--benchmark", required=True, help="benchmark.json produced by `skill-benchmark benchmark --out`")
     p.add_argument("--limit", type=int, default=100, help="max review-queue rows to emit")
+    p.add_argument("--feedback", help="the served review's feedback.json; run-level notes fill the queue's note slot")
     p.add_argument("--out")
 
     p = sub.add_parser("contamination", help="output-side contamination perimeter: canary tripwire, output<->answer n-gram overlap, released_at/cutoff gate (model-free)")

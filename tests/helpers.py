@@ -413,6 +413,9 @@ def claude_stream_records(
     out_tok: int = 22,
     result_event: bool = True,
     orphan_tool: bool = False,
+    served_model: str | None = None,
+    stop_reason: str | None = None,
+    subtype: str = "success",
 ) -> list[dict[str, Any]]:
     """The ONE canonical `claude -p --output-format stream-json` event sequence,
     shared by the parser/normalizer tests and the stream stub: init, a Bash
@@ -437,11 +440,21 @@ def claude_stream_records(
     if orphan_tool:
         records.append({"type": "assistant", "message": {"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_9", "name": "Grep", "input": {"pattern": "x"}}]}})
+    if served_model is not None:
+        # Claude Code 2.1.x stamps each assistant message with the model that
+        # served it (recorded in PR #85's plugin-eval fixture).
+        for record in records:
+            if record["type"] == "assistant":
+                record["message"]["model"] = served_model
     if result_event:
-        records.append({"type": "result", "subtype": "success", "result": answer,
-                        "total_cost_usd": cost, "duration_ms": 1200,
-                        "usage": {"input_tokens": in_tok, "output_tokens": out_tok,
-                                  "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5}})
+        result: dict[str, Any] = {
+            "type": "result", "subtype": subtype, "result": answer,
+            "total_cost_usd": cost, "duration_ms": 1200,
+            "usage": {"input_tokens": in_tok, "output_tokens": out_tok,
+                      "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5}}
+        if stop_reason is not None:
+            result["stop_reason"] = stop_reason
+        records.append(result)
     return records
 
 
@@ -453,20 +466,26 @@ def stub_claude_stream(
     in_tok: int = 11,
     out_tok: int = 22,
     returncode: int = 0,
+    served_model: str | None = None,
+    stop_reason: str | None = None,
+    probe_path: Path | None = None,
 ) -> Path:
     """A fake `claude` executable for the stream-json answer path: it emits the
     canonical claude_stream_records sequence verbatim, and ONLY when
     stream-json was actually requested — so a backend that silently falls back
     to the single-envelope format fails the protocol instead of passing by
-    accident."""
+    accident. With probe_path it records its argv."""
     stream_text = "\n".join(
         json.dumps(record)
-        for record in claude_stream_records(answer=answer, cost=cost, in_tok=in_tok, out_tok=out_tok)
+        for record in claude_stream_records(answer=answer, cost=cost, in_tok=in_tok, out_tok=out_tok,
+                                            served_model=served_model, stop_reason=stop_reason)
     ) + "\n"
+    probe = ("" if probe_path is None else
+             f"import json\nopen({json.dumps(str(probe_path))}, 'w').write(json.dumps(sys.argv[1:]))\n")
     body = f'''#!/usr/bin/env python3
 import sys
 _ = sys.stdin.read()
-if "stream-json" not in sys.argv:
+{probe}if "stream-json" not in sys.argv:
     sys.stdout.write("stream stub invoked without --output-format stream-json")
     sys.exit(1)
 sys.stdout.write({json.dumps(stream_text)})

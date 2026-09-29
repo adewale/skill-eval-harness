@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Generic, TypeVar
 
+from completion_contracts import effort_identity
 from manifest_contracts import CaseId, ModelId, RunNumber
 
 PayloadT = TypeVar("PayloadT")
@@ -307,8 +308,13 @@ def construct_pairs(
     arms: Iterable[ExperimentalArm[PayloadT]],
     *,
     contrast: ContrastSpec = SKILL_PRESENCE_CONTRAST,
+    comparable: Callable[[PayloadT, PayloadT], str | None] | None = None,
 ) -> PairConstruction[PayloadT]:
-    """Build matched pairs and reject duplicate observations for either arm."""
+    """Build matched pairs and reject duplicate observations for either arm.
+
+    ``comparable`` returns a block reason when two eligible arms share an
+    identity but ran under conditions that make their difference meaningless
+    (for example, different effort levels)."""
     indexed: dict[
         ExperimentalPairKey, dict[ExperimentalArmId, ExperimentalArm[PayloadT]]
     ] = {}
@@ -347,9 +353,26 @@ def construct_pairs(
         elif not right.eligible:
             blocked.append(BlockedExperimentalPair(
                 key, str(right.blocked_reason), contrast.contrast_id))
+        elif comparable is not None and (
+                reason := comparable(left.payload, right.payload)) is not None:
+            blocked.append(BlockedExperimentalPair(key, reason, contrast.contrast_id))
         else:
             pairs.append(ExperimentalPair(key, contrast, left, right))
     return PairConstruction(contrast, tuple(pairs), tuple(blocked))
+
+
+def effort_comparability(left: Mapping[str, Any], right: Mapping[str, Any]) -> str | None:
+    """Block a pair whose arms ran at different, or unprovably equal, effort.
+
+    Rows recorded before effort existed carry none, and two such rows still
+    pair as before. One recorded arm against one unrecorded arm cannot be
+    shown to share an effort level, so the pair is blocked rather than trusted."""
+    left_effort, right_effort = effort_identity(left), effort_identity(right)
+    if left_effort == right_effort:
+        return None
+    if left_effort is None or right_effort is None:
+        return "effort_unrecorded_on_one_arm"
+    return "effort_mismatch"
 
 
 def pairs_from_rows(
@@ -370,4 +393,4 @@ def pairs_from_rows(
         assert isinstance(arm, str)
         arms.append(ExperimentalArm(
             key, ExperimentalArmId(arm), row, eligible, reason))
-    return construct_pairs(arms, contrast=contrast)
+    return construct_pairs(arms, contrast=contrast, comparable=effort_comparability)

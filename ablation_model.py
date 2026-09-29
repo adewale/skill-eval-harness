@@ -39,6 +39,7 @@ from types import MappingProxyType
 from typing import Any
 
 from agent_capabilities import BACKENDS
+from completion_contracts import completion_unscorable_reason
 from json_contracts import freeze_json_value
 from manifest_contracts import (
     ABLATION_VARIANT_PREFIX,
@@ -122,10 +123,17 @@ def metadata_lifecycle_error(metadata: dict[str, Any] | None) -> str | None:
 
 def execution_valid(metadata: dict[str, Any] | None, text: str | None) -> bool:
     """False when a run is an INFRASTRUCTURE failure — a nonzero exit, a timeout,
-    or a synthetic failure body a runner wrote when it never got a real answer."""
+    or a synthetic failure body a runner wrote when it never got a real answer.
+
+    Recorded completion evidence also disqualifies a run: an answer cut off at
+    an output or turn limit the eval set, or an answer served by a different
+    model than the one requested. Both would otherwise be graded as the
+    requested model's genuine answer."""
     m = metadata or {}
     if (metadata_lifecycle_error(m) is not None
             or m.get("metadata_artifact_valid") is False or m.get("metadata_error")):
+        return False
+    if completion_unscorable_reason(m) is not None:
         return False
     rc = m.get("returncode")
     if rc not in (0, None):

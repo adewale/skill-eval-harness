@@ -108,6 +108,10 @@ class InvocationRequest:
     workspace: Path
     model: ModelId | None
     timeout_s: TimeoutSeconds
+    # Requested reasoning effort, or None for the backend's default. A backend
+    # applies it through its own control (a CLI flag or config override); the
+    # runner refuses the request before any spend when a backend has none.
+    effort: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.prompt, str):
@@ -125,6 +129,9 @@ class InvocationRequest:
         object.__setattr__(
             self, "timeout_s", TimeoutSeconds.parse(self.timeout_s)
         )
+        if self.effort is not None and (
+                not isinstance(self.effort, str) or not self.effort.strip()):
+            raise ValueError("invocation effort must be a non-empty string or None")
 
     @classmethod
     def parse(
@@ -134,16 +141,20 @@ class InvocationRequest:
         workspace: object,
         model: object,
         timeout_s: object,
+        effort: object = None,
     ) -> InvocationRequest:
         if not isinstance(prompt, str):
             raise ValueError("invocation prompt must be text")
         if not isinstance(workspace, Path):
             raise ValueError("invocation workspace must be a Path")
+        if effort is not None and not isinstance(effort, str):
+            raise ValueError("invocation effort must be a string or None")
         return cls(
             prompt=prompt,
             workspace=workspace,
             model=None if model is None else ModelId.parse(model),
             timeout_s=TimeoutSeconds.parse(timeout_s),
+            effort=effort,
         )
 
 
