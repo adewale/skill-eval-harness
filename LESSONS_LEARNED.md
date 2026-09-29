@@ -68,6 +68,8 @@ This file records durable lessons from building and using the shared skill evalu
 - Trigger saturation: every tune trigger/no-trigger case passes autonomous skill-discovery classification.
 - Do not weaken evals just to make flags disappear.
 
+**Update (2026-09-29):** aiming every `with_skill` row at 1.0 spends the headroom the next round needs. The [hillclimbing post](https://claude.dev/blog/automating-eval-design-and-hillclimbing/)'s third mark of a good eval, that the best model score well below 100%, becomes two conditions on a lift eval. `without_skill` must stay well below 1.0, because its pass rate caps the lift the eval can show (`noise_check.headroom` is 1 minus the `without_skill` rate). `with_skill` needs room below 1.0 while you are still iterating, or the next edit has nothing to move. Once `tune` saturates, change the objective to the same quality at lower cost (`token-overhead`, `cost-summary`). When a case does need hardening, pick one a person can say is hard and why: a case kept because today's model fails it samples that model's weak spots (the post calls this adversarial sampling), and `suggest-cases` now asks for the reason in each candidate's rationale.
+
 ## 2026-06-09 — Missing outputs are not failed/no-lift cases
 
 **Problem:** Unrun or missing outputs were initially counted like failed rows, creating false no-lift flags.
@@ -85,10 +87,12 @@ This file records durable lessons from building and using the shared skill evalu
 **Lesson:** Eval runners need stricter execution envelopes than normal agent work.
 
 **Rule:**
-- Use minimal thinking for smoke runs.
-- Add bounded-response instructions.
+- Use minimal thinking for plumbing smoke runs only (see the update below).
+- Add bounded-response instructions to plumbing smoke runs only.
 - Capture timeout output/metadata instead of aborting the whole round.
 - For underspecified project-deck tasks, require bounded/no-write mode rather than open-ended build loops.
+
+**Update (2026-09-29):** the first two rules hold only for plumbing smoke runs, whose job is to prove a runner writes a gradable artifact. A measurement run needs the effort and prompt the skill will meet in production, the same in both arms and pinned for every model compared: a lift measured at minimal thinking or under a length cap belongs to a configuration nobody ships, and the cap can cut a correct answer short. Runs now record effort (`metadata.json` `effort: {requested, applied_by}`, with `backend-default` when `--effort` is omitted), pairing blocks a pair whose arms ran at different effort (`effort_mismatch`), and a Claude run that hit its output or turn limit is recorded as `stop_class: truncated` or `turn_limit` and excluded from scoring instead of graded as a miss.
 
 ## 2026-06-09 — Fixture-backed cases are better than keyword-only prompts
 
@@ -122,6 +126,7 @@ This file records durable lessons from building and using the shared skill evalu
 - Include common positive trigger phrases in `description`.
 - Include explicit negative boundaries when adjacent skills exist.
 - Re-run autonomous trigger tests after every description change.
+- Validate description edits on held-out trigger queries (`skill-trigger-matrix --split holdout`); never paste failing query phrases into the description.
 
 Examples from saturation work:
 - `good-readme`: narrowed away full docs sites and launch-readiness audits.
@@ -130,6 +135,8 @@ Examples from saturation work:
 - `cfdoctor`: narrowed away generic Cloudflare status questions.
 - `guardrails`: narrowed away README/prose-only edits.
 - `anti-slop-writing`: added “tighten,” “talk intro,” and “generic launch copy.”
+
+**Update (2026-09-29):** the last rule is new. A description edit is a hillclimb on the trigger rate, so it overfits the way a prompt edit does, and the [hillclimbing post](https://claude.dev/blog/automating-eval-design-and-hillclimbing/) and the `/claude-api hillclimb` guide give prompts the same two defenses: score on cases the edit was not written from, and describe the failing behavior instead of pasting the failing content. The `anti-slop-writing` example shows the risk: “tighten,” “talk intro,” and “generic launch copy” are the words of its tune trigger query `trig-talk-intro` (“tighten this talk intro so it sounds less like generic launch copy”), so that query passing afterwards shows the description matches its own eval, not that it generalizes.
 
 ## 2026-06-09 — Ablations are not evidence until they are run
 
@@ -155,6 +162,8 @@ Examples from saturation work:
 - Holdout is for end-of-round scoring.
 - Holdback stays hidden from skill/docs/evals until after scoring to detect overfitting.
 - Do not claim release-quality proof until hidden prompts, private answer keys, and real fixtures are filled and scored.
+
+**Update (2026-09-29):** the claude-api skill's cost-hillclimb guide reaches the same conclusion: “The split whose score picks winners each round is a selection set, even if the guide calls it ‘test’.”
 
 ## 2026-06-09 — Jetty should be an adapter, not a rewrite
 
@@ -709,3 +718,42 @@ correctness protocol.
 - Treat inventories according to meaning: packaging, static-analysis coverage, and causal identity
   are different sets. A stack-wide guard should enforce their relationship, not collapse them into
   filesystem equality.
+
+## 2026-09-29 — Check that the eval could show a lift before reading one
+
+**Problem:** Comparing the harness with the [hillclimbing post](https://claude.dev/blog/automating-eval-design-and-hillclimbing/)
+and the `/claude-api build-eval` and `/claude-api hillclimb` guides in the claude-api skill
+([`docs/comparing-with-claude-api-evals.md`](docs/comparing-with-claude-api-evals.md)) found two
+gaps. The first was resolution. The post's held-out result is 38/42 (90.5%) against 33/42 (78.6%)
+on 14 tickets at 3 repeats, a gain of 5 runs, and however those 5 runs are spread across tickets,
+an exact paired sign-flip test cannot go below p = 0.0625 (2/2^5). The harness printed p-values
+for results that size without saying how low the test could ever go; `noise_check.smallest_achievable_p`
+and the lift `interval` now say it. The second was attribution:
+failures the harness recorded as model misses were sometimes the eval's limits. A cut-off answer
+was graded as wrong; a case that failed in both arms on every run was sent to `suggest-cases` for
+hardening, though a case nothing passes is more often broken; and a regression guard at 0/0 counted
+as holding. Separately, one human verdict could be written twice, in the served review's
+`feedback.json` and again in a `judge-alignment` labels file, with nothing keeping the copies in step.
+
+**Lesson:** The post's four marks of a good eval each translate into a check on a lift eval.
+Tasks mirror production: cases are requests the skill will actually get. A stronger model and more
+effort score higher: an arm whose pass rate falls as effort rises points at an ambiguous case or a
+miscalibrated assertion. There is headroom: `without_skill` stays well below 1.0 and no case fails
+in both arms on every run. Variance is low: both arms run at the same effort in fresh workspaces,
+and the noise floor sits below the smallest lift worth acting on. By that last mark the post's own
+14-ticket quality gain is inside the noise. The claim that eval can support is the cost one, about
+one fifth of the cost at parity, because parity needs quality to hold rather than to rise past the
+noise.
+
+**Rule:**
+- Read `paired_summary.noise_check` before the lift. `smallest_achievable_p` is 2/2^k for k moved
+  cases, so fewer than 6 cases moving the same way can never reach p ≤ 0.05
+  (`too-few-cases-moved`); `benchmark --min-lift` compares the noise floor with the lift you would act on.
+- Quote a lift with its `interval`, not the point estimate alone.
+- Score only runs that finished as asked: `stop_class` `truncated` or `turn_limit` and
+  `served_model_check: mismatch` are unscorable and block their pair; refusals stay graded and are
+  counted in `run_endings`.
+- Audit a `floor: fails in both arms` case (`floor-eval`) before hardening anything; `suggest-cases`
+  no longer seeds from it, and a floor case is not counted as a regression guard holding.
+- Keep human verdicts in one store: the `feedback.json` that `render-viewer --serve` writes feeds
+  `judge-alignment --labels` and `error-analysis --feedback` directly.
