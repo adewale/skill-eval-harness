@@ -987,6 +987,17 @@ class CrossJudgeConsensusTests(unittest.TestCase):
             sb.judge_task_id(
                 "a", "with_skill", 1, assertion, model="b::c")
 
+    def test_judge_task_identity_accepts_the_typed_run_number(self):
+        # paired_run_bases yields RunNumber (an int subclass); token-overhead
+        # crashed on it before judge_task_id accepted int subclasses.
+        from manifest_contracts import RunNumber
+        assertion = {"name": "j", "type": "judge"}
+        self.assertEqual(sb.judge_task_id("c", "with_skill", RunNumber(2), assertion),
+                         sb.judge_task_id("c", "with_skill", 2, assertion))
+        for bad in (True, 0, "1"):
+            with self.subTest(run_number=bad), self.assertRaises(ValueError):
+                sb.judge_task_id("c", "with_skill", bad, assertion)
+
     def test_consensus_row_joins_like_a_single_verdict(self):
         jassert = {"name": "j", "type": "judge", "severity": "gate"}
         jid = sb.judge_task_id("c", "with_skill", 1, sb.expand_judge_preset(jassert))

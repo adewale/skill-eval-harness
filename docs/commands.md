@@ -456,7 +456,7 @@ skill-benchmark profile-skill ../repo/evals/shared-benchmark.json \
 
 ## Token overhead
 
-`token-overhead` combines static skill profile data with paired runtime traces. It reports the static `SKILL.md`/reference footprint, `with_skill - without_skill` token deltas, objective lift, objective lift per 1k extra total tokens — and, when cost telemetry exists, `with - without` dollar deltas, objective lift per dollar, and the total spend on saturated/no-lift pairs.
+`token-overhead` combines static skill profile data with paired runtime traces. It reports the static `SKILL.md`/reference footprint, `with_skill - without_skill` token deltas, objective lift, objective lift per 1k extra total tokens — and, when cost telemetry exists, `with - without` dollar deltas, objective lift per dollar, and the total spend on saturated/no-lift pairs. It grades the runs through the same benchmark path, so a manifest with judge assertions needs `--judge-results <verdicts.jsonl>`; without the verdicts the grading stays incomplete and the lift is withheld as partial coverage.
 
 ```bash
 skill-benchmark token-overhead ../repo/evals/shared-benchmark.json \

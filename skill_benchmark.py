@@ -11575,10 +11575,11 @@ def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[s
         if "::" in segment:
             raise ValueError(
                 f"judge task {segment_name} cannot contain reserved delimiter '::'")
-    if type(run_number) is not int or run_number < 1:
+    # RunNumber (the typed pair key) is an int subclass; bool is not a run number.
+    if isinstance(run_number, bool) or not isinstance(run_number, int) or run_number < 1:
         raise ValueError("judge task run_number must be a positive integer")
     model_segment = f"{model}::" if model is not None else ""
-    return f"{case_id}::{model_segment}{variant}::run-{run_number}::{label}"
+    return f"{case_id}::{model_segment}{variant}::run-{int(run_number)}::{label}"
 
 
 JUDGE_EVIDENCE_MODES = {
@@ -19345,6 +19346,7 @@ def paired_token_overhead_report(
     runs: Path | None = None,
     split: str | None = None,
     variants: tuple[str, str] = ("with_skill", "without_skill"),
+    judge_results_path: str | None = None,
 ) -> dict[str, Any]:
     manifest = validate_manifest(manifest_path)
     profile = profile_skill_report(manifest_path)
@@ -19569,9 +19571,12 @@ def paired_token_overhead_report(
     report_pairs = pairs
     observed_pairs = None
     if runs is not None:
+        # A manifest with judge assertions grades completely only with its
+        # verdicts; without them the lift is withheld as partial coverage.
         benchmark_surface = build_benchmark_report(
             manifest_path, runs, split=split,
-            variants_arg=[with_variant, without_variant])
+            variants_arg=[with_variant, without_variant],
+            judge_results_path=judge_results_path)
         design_coverage = benchmark_surface["answer_design"]
         if benchmark_surface.get("availability") != "complete":
             observed_pairs = pairs
@@ -19599,7 +19604,9 @@ def token_overhead(args: argparse.Namespace) -> int:
         runs = Path(args.runs) if args.runs else None
         if runs is None and args.runs_subdir:
             runs = repo_root_for_manifest(manifest_path) / args.runs_subdir
-        reports.append(paired_token_overhead_report(manifest_path, runs=runs, split=args.split))
+        reports.append(paired_token_overhead_report(
+            manifest_path, runs=runs, split=args.split,
+            judge_results_path=getattr(args, "judge_results", None)))
     observed_summary = {
         "skills": len(reports),
         "skills_with_runtime_pairs": sum(
@@ -21173,6 +21180,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", help="single runs directory to use for every manifest")
     p.add_argument("--runs-subdir", default="eval-runs/latest", help="repo-relative runs directory when --runs is omitted")
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
+    p.add_argument("--judge-results", help="judge verdicts for manifests with judge assertions; without them their lift reads as partial coverage")
     p.add_argument("--format", choices=["json", "markdown"], default="json")
     p.add_argument("--out")
 

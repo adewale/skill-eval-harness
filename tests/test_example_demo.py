@@ -41,6 +41,7 @@ class DemoExampleTests(unittest.TestCase):
             "\n".join(json.dumps(verdict) for verdict in verdicts) + "\n",
             encoding="utf-8",
         )
+        self.runs_dir, self.judge_results = td / "runs", judge_results
         return sb.build_benchmark_report(
             mp, td / "runs", variants_arg=variants,
             judge_results_path=str(judge_results),
@@ -55,6 +56,19 @@ class DemoExampleTests(unittest.TestCase):
             self.assertTrue(entry["provenance_verified"], f"{aid} provenance must verify (materialized, same revision)")
             confirmed = [r for r in entry["regressions"] if r.get("expected_regression_confirmed")]
             self.assertTrue(confirmed, f"{aid} should confirm a regression")
+
+    def test_token_overhead_joins_lift_once_judge_verdicts_are_supplied(self):
+        # docs/is-my-skill-worth-its-tokens.md: before --judge-results existed the
+        # judged demo could only report partial coverage, and a RunNumber pair
+        # key crashed judge_task_id.
+        self._run()
+        mp = DEMO / "evals" / "shared-benchmark.json"
+        partial = sb.paired_token_overhead_report(mp, runs=self.runs_dir)
+        complete = sb.paired_token_overhead_report(
+            mp, runs=self.runs_dir, judge_results_path=str(self.judge_results))
+        self.assertEqual(partial["summary"]["availability"], "partial")
+        self.assertEqual(len(complete["pairs"]), 12)
+        self.assertEqual(complete["summary"]["objective_delta"]["mean"], 1.0)
 
     def test_with_skill_beats_without_on_the_demo(self):
         rep = self._run()

@@ -67,26 +67,31 @@ reference that has quietly grown past its keep shows up here before you pay for 
 ## Run the runtime half — and see why the demo can't fake it
 
 Now join footprint to lift. `token-overhead` reads the same paired runs the benchmark
-graded and reports lift-per-token and lift-per-dollar per skill:
+graded and reports lift-per-token and lift-per-dollar per skill. The demo's cases carry judge
+assertions, so pass the verdicts the demo README's `judge` step wrote; without them the lift
+is withheld as partial coverage:
 
 ```bash
 python3 ../../skill_benchmark.py token-overhead evals/shared-benchmark.json \
-  --runs /tmp/demo-runs --format markdown
+  --runs /tmp/demo-runs --judge-results /tmp/demo-judge.jsonl --format markdown
 ```
 
-Real output against the offline stub runs (2026-07-05):
+Real output against the offline stub runs (2026-09-29, six repeats per arm):
 
 ```text
 # Token overhead report
 
-| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | ... | Mean cost delta USD | Lift per $ | Saturated/no-lift cost USD |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| demo-reviewer | 144 | 51 | 0 | None | ... | None | None | 0 |
+| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | ... | Mean objective lift | Lift per 1k total tokens | Mean cost delta USD | Lift per $ | Saturated/no-lift cost USD |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| demo-reviewer | 144 | 51 | 12 | None | ... | 1.0 | None | None | None | 0.0 |
 ```
 
-**Runtime pairs 0, every delta `None`.** That is not a bug — it is the honest shape of
-the offline demo. The deterministic stub stands in for a model, so it writes no token
-or dollar telemetry. `cost-summary` says the same thing out loud:
+**Twelve runtime pairs and a lift of 1.0, but every token and cost delta is `None`.** The
+lift is real arithmetic over the stub's answers; the deltas are missing because the stub
+stands in for a model and has no tokens to report. Each run's trace-normalized usage block
+reads zero, and a zero-token basis cannot divide a lift, so each pair's token comparison
+is blocked with reason `basis_missing` and the lift-per-dollar status reads `missing_left`.
+`cost-summary` shows the same split:
 
 ```bash
 python3 ../../skill_benchmark.py cost-summary \
@@ -95,17 +100,19 @@ python3 ../../skill_benchmark.py cost-summary \
 
 ```json
 "coverage": {
-  "runs_seen": 8,
-  "runs_with_token_usage": 0,
+  "runs_seen": 48,
+  "runs_with_token_usage": 48,
   "runs_with_dollar_cost": 0,
-  "runs_missing_usage": 8,
-  "runs_missing_cost": 8
+  "runs_with_non_usd_cost": 0,
+  "runs_missing_usage": 0,
+  "runs_missing_cost": 48
 }
 ```
 
-Eight runs on disk, zero carrying usage or cost. The harness records this as `source:
-"missing"` in each run's `metadata.json` rather than silently reporting `0` — a missing
-number and a zero number are different claims, and the ledger keeps them apart.
+All 48 runs (two cases, four arms, six repeats) carry a usage block, and none carries a
+dollar cost. The harness records the missing cost as `source: "missing"` in each run's
+`metadata.json` rather than reporting `0`: a missing number and a zero number are
+different claims, and the ledger keeps them apart.
 
 To get real runtime numbers, run the same cases through a runner that captures
 telemetry. `run-claude` parses the `claude -p` JSON envelope and records
