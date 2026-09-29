@@ -5,9 +5,10 @@ per-case deltas. This module adds the two numbers that test cannot give:
 
 * ``sign_flip_interval`` inverts that same test. The interval is every shift
   ``delta`` the test would not reject at the chosen confidence, so the
-  interval excludes zero exactly when the exact test rejects "no lift". The
-  interval and the p-value are two views of one computation and cannot
-  disagree for exact enumeration.
+  interval excludes zero exactly when the test rejects "no lift". The test
+  (``sign_flip_test``) and the interval read one set of sign patterns and one
+  decision rule, including the conservative Monte Carlo bound once there are
+  too many cases to enumerate, so they cannot disagree.
 * ``noise_check`` says whether the eval could have seen a lift at all. It
   reports the smallest p-value the observed data could ever produce, the
   interval half-width (the noise floor), and the headroom left in the
@@ -133,25 +134,42 @@ def _exact_patterns(deltas: Sequence[float]) -> _SignPatterns:
 
 
 def _sampled_patterns(deltas: Sequence[float], samples: int, seed: int) -> _SignPatterns:
+    # Draw each sign against the magnitudes in ascending order, so the sampled
+    # patterns depend on the multiset of deltas, not their order. Flipping a
+    # magnitude |d| is flipping d with its sign folded in: A = sum(s * |d|) and
+    # B = sum(s * sign(d)), which is what a shift by delta needs.
+    ordered = sorted(deltas, key=lambda value: (abs(value), value))
     rng = random.Random(seed)
     grouped: dict[int, list[float]] = {}
     for _ in range(samples):
         a = 0.0
         b = 0
-        for value in deltas:
-            if rng.random() < 0.5:
-                a -= value
-                b -= 1
-            else:
-                a += value
-                b += 1
+        for value in ordered:
+            flip = -1 if rng.random() < 0.5 else 1
+            a += flip * abs(value)
+            b += flip if value >= 0 else -flip
         grouped.setdefault(b, []).append(a)
     groups = tuple((b, tuple(sorted(values))) for b, values in sorted(grouped.items()))
     return _SignPatterns(groups=groups, total=samples, exact=False)
 
 
-def _p_value_at(patterns: _SignPatterns, whole: float, n: int, delta: float) -> float:
-    """Two-sided p-value of the sign-flip test on ``d_i - delta``."""
+def monte_carlo_upper_bound(hits: int, samples: int, *, failure_probability: float = 0.001) -> float:
+    """Distribution-free upper confidence bound for a sampled tail probability."""
+    if samples < 1:
+        raise ValueError("Monte Carlo samples must be positive")
+    empirical = hits / samples
+    radius = math.sqrt(math.log(1.0 / failure_probability) / (2.0 * samples))
+    return min(1.0, empirical + radius)
+
+
+def _tail(patterns: _SignPatterns, whole: float, n: int, delta: float) -> tuple[float, float]:
+    """Two-sided p-value of the sign-flip test on ``d_i - delta``, and its upper bound.
+
+    Exact enumeration returns the p-value twice. A sampled p-value uses the
+    (b + 1) / (m + 1) estimator, because the observed pattern is always a valid
+    permutation under the null, and a distribution-free upper bound that the
+    decision uses: a point estimate just under alpha is not evidence.
+    """
     threshold = abs(whole - n * delta) - _TOLERANCE
     hits = 0
     for b, values in patterns.groups:
@@ -163,10 +181,51 @@ def _p_value_at(patterns: _SignPatterns, whole: float, n: int, delta: float) -> 
         hits += len(values) - bisect.bisect_left(values, centre + threshold)
         hits += bisect.bisect_right(values, centre - threshold)
     if patterns.exact:
-        return hits / patterns.total
-    # The observed pattern is always a valid permutation under the null, so a
-    # sampled p-value uses the (b + 1) / (m + 1) estimator and is never zero.
-    return (hits + 1) / (patterns.total + 1)
+        p = hits / patterns.total
+        return p, p
+    return ((hits + 1) / (patterns.total + 1),
+            monte_carlo_upper_bound(hits, patterns.total))
+
+
+def _rejects(patterns: _SignPatterns, whole: float, n: int, delta: float, alpha: float) -> bool:
+    return _tail(patterns, whole, n, delta)[1] <= alpha
+
+
+def _patterns(values: Sequence[float], max_exact_n: int, samples: int,
+              seed: int) -> _SignPatterns:
+    if len(values) <= max_exact_n:
+        return _exact_patterns(values)
+    return _sampled_patterns(values, samples, seed)
+
+
+def sign_flip_test(deltas: Sequence[float], *, max_exact_n: int = MAX_EXACT_CASES,
+                   samples: int = SAMPLED_PATTERNS, seed: int = 0,
+                   alpha: float = DEFAULT_ALPHA) -> dict[str, Any]:
+    """Two-sided sign-flip permutation test over per-case paired deltas.
+
+    Under the null (the skill does nothing) each case's delta is equally
+    likely to have either sign, so p is the share of sign patterns whose
+    |mean| reaches the observed |mean|. Exact enumeration up to
+    ``max_exact_n`` cases, then a seeded sample, so a re-grade stays
+    byte-identical (CF.3). The sampled decision uses the upper bound.
+    """
+    n = len(deltas)
+    if n == 0:
+        return {"method": "sign-flip", "n": 0, "observed_mean_delta": None,
+                "p_value": None, "p_value_upper_bound": None,
+                "significant_at_0_05": False}
+    observed = statistics.mean(deltas)
+    if all(abs(d) < _TOLERANCE for d in deltas):
+        return {"method": "sign-flip", "n": n, "observed_mean_delta": 0.0,
+                "p_value": 1.0, "p_value_upper_bound": 1.0,
+                "significant_at_0_05": False}
+    values = [float(value) for value in deltas]
+    patterns = _patterns(values, max_exact_n, samples, seed)
+    p, p_upper = _tail(patterns, math.fsum(values), n, 0.0)
+    return {"method": "sign-flip-exact" if patterns.exact else "sign-flip-sampled",
+            "n": n, "observed_mean_delta": observed,
+            "p_value": p, "p_value_upper_bound": p_upper,
+            "significant_at_0_05": p_upper <= alpha}
 
 
 def _bound(patterns: _SignPatterns, whole: float, n: int, centre: float,
@@ -178,12 +237,12 @@ def _bound(patterns: _SignPatterns, whole: float, n: int, centre: float,
     p-value never rises again once it falls. That makes the accepted region
     an interval and bisection exact.
     """
-    if _p_value_at(patterns, whole, n, far) > alpha:
+    if not _rejects(patterns, whole, n, far, alpha):
         return None
     accepted, rejected = centre, far
     for _ in range(_SEARCH_STEPS):
         middle = (accepted + rejected) / 2
-        if _p_value_at(patterns, whole, n, middle) > alpha:
+        if not _rejects(patterns, whole, n, middle, alpha):
             accepted = middle
         else:
             rejected = middle
@@ -214,10 +273,9 @@ def sign_flip_interval(deltas: Sequence[float], *, confidence: float = DEFAULT_C
         return {**base, "method": "unavailable", "lower": None, "upper": None,
                 "bounded": False, "reason": "no paired cases"}
     centre = math.fsum(values) / n
-    exact = n <= max_exact_n
-    patterns = (_exact_patterns(values) if exact
-                else _sampled_patterns(values, samples, seed))
-    method = "sign-flip-inversion-exact" if exact else "sign-flip-inversion-sampled"
+    patterns = _patterns(values, max_exact_n, samples, seed)
+    method = ("sign-flip-inversion-exact" if patterns.exact
+              else "sign-flip-inversion-sampled")
     whole = math.fsum(values)
     spread = max(values) - min(values)
     # Past every observed delta the shifted deltas all share one sign, which is

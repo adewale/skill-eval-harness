@@ -140,8 +140,10 @@ from completion_contracts import (
 from effect_estimates import (
     DiscriminationFailure,
     ceiling_or_floor,
+    monte_carlo_upper_bound,
     noise_check,
     sign_flip_interval,
+    sign_flip_test,
 )
 from gemini_contracts import GeminiJsonResponse, GeminiStream
 from grading_contracts import (
@@ -14711,15 +14713,6 @@ def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> f
     return ResultSet(rows).mean_rate(key)
 
 
-def _monte_carlo_upper_bound(hits: int, samples: int, *, failure_probability: float = 0.001) -> float:
-    """Distribution-free upper confidence bound for a sampled tail probability."""
-    if samples < 1:
-        raise ValueError("Monte Carlo samples must be positive")
-    empirical = hits / samples
-    radius = math.sqrt(math.log(1.0 / failure_probability) / (2.0 * samples))
-    return min(1.0, empirical + radius)
-
-
 def _exact_rate(successes: int, observations: int) -> float:
     """An inference-grade rate: never round before computing a delta/test."""
     if (isinstance(successes, bool) or not isinstance(successes, int)
@@ -14730,54 +14723,9 @@ def _exact_rate(successes: int, observations: int) -> float:
 
 
 def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, samples: int = 4096) -> dict[str, Any]:
-    """Two-sided sign-flip permutation test over per-case paired deltas
-    (roadmap 2.2): under H0 (the skill does nothing) each case's delta is a
-    coin-flip of sign, so p = share of sign patterns whose |mean| reaches the
-    observed |mean|. Exact enumeration up to max_exact_n cases, then a SEEDED
-    sample — deterministic, so re-grading stays byte-identical (CF.3)."""
-    n = len(deltas)
-    if n == 0:
-        return {"method": "sign-flip", "n": 0, "observed_mean_delta": None,
-                "p_value": None, "p_value_upper_bound": None,
-                "significant_at_0_05": False}
-    observed = statistics.mean(deltas)
-    if all(abs(d) < 1e-12 for d in deltas):
-        return {"method": "sign-flip", "n": n, "observed_mean_delta": 0.0,
-                "p_value": 1.0, "p_value_upper_bound": 1.0,
-                "significant_at_0_05": False}
-    target = abs(observed) - 1e-12
-    if n <= max_exact_n:
-        total = 1 << n
-        hits = 0
-        for mask in range(total):
-            s = sum(-d if (mask >> i) & 1 else d for i, d in enumerate(deltas))
-            if abs(s / n) >= target:
-                hits += 1
-        method = "sign-flip-exact"
-        # Exact enumeration counts the observed sign pattern itself, so p is never 0.
-        p = hits / total
-        p_upper = p
-    else:
-        rng = random.Random(0)
-        hits = 0
-        # The null distribution depends on magnitudes, not input ordering or
-        # original signs. Canonicalizing makes the seeded approximation
-        # permutation-invariant.
-        magnitudes = sorted(abs(float(delta)) for delta in deltas)
-        for _ in range(samples):
-            s = sum(-delta if rng.random() < 0.5 else delta
-                    for delta in magnitudes)
-            if abs(s / n) >= target:
-                hits += 1
-        method = "sign-flip-sampled"
-        # Monte-Carlo permutation p uses the (b+1)/(m+1) estimator: the observed
-        # pattern is one valid permutation under H0, so a sampled p is never a
-        # (statistically impossible) exact 0.
-        p = (hits + 1) / (samples + 1)
-        p_upper = _monte_carlo_upper_bound(hits, samples)
-    return {"method": method, "n": n, "observed_mean_delta": observed,
-            "p_value": p, "p_value_upper_bound": p_upper,
-            "significant_at_0_05": p_upper <= 0.05}
+    """The paired lift test (roadmap 2.2). ``effect_estimates`` owns it so the
+    lift interval inverts the very test reported here."""
+    return sign_flip_test(deltas, max_exact_n=max_exact_n, samples=samples)
 
 
 def two_sample_permutation_significance(a: list[float], b: list[float], *, max_exact_total: int = 18, samples: int = 4096) -> dict[str, Any]:
@@ -14831,7 +14779,7 @@ def two_sample_permutation_significance(a: list[float], b: list[float], *, max_e
         # (b+1)/(m+1) Monte-Carlo estimator: the observed labeling is itself a
         # valid permutation, so a sampled p is never an impossible exact 0.
         p = (hits + 1) / (samples + 1)
-        p_upper = _monte_carlo_upper_bound(hits, samples)
+        p_upper = monte_carlo_upper_bound(hits, samples)
     return {"method": method, "n_a": na, "n_b": nb,
             "observed_delta": observed, "p_value": p,
             "p_value_upper_bound": p_upper,

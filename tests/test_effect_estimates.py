@@ -41,6 +41,29 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
                     checked += 1
         self.assertGreater(checked, 100)
 
+    def test_sampled_interval_agrees_with_the_sampled_test(self):
+        # Past 14 cases both sample sign patterns. The test gates on a
+        # conservative upper bound, so an interval that gated on the point
+        # estimate excluded zero where the test reported no significance.
+        rng = random.Random(11)
+        choices = [-3, -2, -1, 0, 0, 1, 2, 3]
+        checked = 0
+        for n in (15, 18, 22, 30):
+            for _ in range(40):
+                deltas = thirds([rng.choice(choices) for _ in range(n)])
+                if all(abs(value) < 1e-12 for value in deltas):
+                    continue
+                interval = ee.sign_flip_interval(deltas)
+                significance = sb.sign_flip_significance(deltas)
+                self.assertEqual(interval["method"], "sign-flip-inversion-sampled")
+                if not interval["bounded"]:
+                    continue
+                with self.subTest(deltas=deltas):
+                    zero_inside = interval["lower"] <= 0 <= interval["upper"]
+                    self.assertEqual(zero_inside, not significance["significant_at_0_05"])
+                    checked += 1
+        self.assertGreater(checked, 100)
+
     def test_interval_contains_the_observed_mean(self):
         deltas = thirds([1, 2, 0, 3, 1, -1, 2, 1])
         interval = ee.sign_flip_interval(deltas)

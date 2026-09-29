@@ -190,10 +190,10 @@ Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | Lo
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10551`), Claude (`run_claude:10750`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10553`), Claude (`run_claude:10752`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13345`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:4052` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13347`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4054` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger
@@ -308,8 +308,9 @@ cannot collide or lose their causal question at a persistence boundary.
 (`with_skill` minus `without_skill`, normalized gain, and a flag when the skill hurts) only from
 those pairs; missing/ineligible arms remain in `pairing` diagnostics and duplicate arms fail.
 Each paired block also carries `effect_estimates.sign_flip_interval`, the sign-flip test inverted
-into a confidence interval, so the interval excludes zero exactly when the exact test rejects "no
-lift", and `noise_check`, which reports the cases that moved, the smallest p-value those cases can
+into a confidence interval. The test (`sign_flip_significance`) and the interval share one
+sign-flip core, so the interval excludes zero exactly when the test rejects "no lift", sampled
+path included, and `noise_check`, which reports the cases that moved, the smallest p-value those cases can
 reach (`2 / 2**k` for `k` moved cases), the interval half-width and the headroom left in
 `without_skill`. `construct_pairs` blocks a pair whose arms ran at different effort
 (`effort_mismatch`) or where only one arm recorded effort.
@@ -318,7 +319,7 @@ by domain, difficulty, trigger type, and success goal. Case flags mark saturated
 flaky, and with-skill-failed cases, and `effect_estimates.ceiling_or_floor` separates the two
 ways a case stops discriminating: both arms always pass (ceiling) or both always fail (floor, which
 `suggest-cases` never offers for hardening). These flags, the leakage lint
-(`prompt_assertion_leakage_findings:837`), and the split discipline are the part of the tool
+(`prompt_assertion_leakage_findings:839`), and the split discipline are the part of the tool
 no surveyed eval framework copies.
 
 `report_contracts.report_cohort` classifies each attempted reporting population as
