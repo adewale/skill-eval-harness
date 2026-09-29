@@ -42,6 +42,12 @@ branch.
     (which captures real per-run cost into `metrics.json`) instead of the
     `run-codex --codex-cmd "claude -p"` workaround, and `compare-judges` to check whether
     the noisy judge verdicts below are judge-sensitive across two judge models.
+  - The judge graded its own model's answers. Both the runner and the judge were
+    `claude -p` with no `--model`, so the CLI's default model wrote each answer and
+    then judged it. The blog post [Automating eval design and hillclimbing with
+    Claude](https://claude.dev/blog/automating-eval-design-and-hillclimbing/) says the
+    judge "should not be the model you are testing"; a rerun should pass a different
+    `--judge-model` to `judge` than the `--model` the answers ran on.
 - Arms per skill: `with_skill`, `without_skill`, and one **materialized** component
   ablation (the largest/most-central component).
 - **This is a spot check.** Single behavioral case (or 3 safety cases) per skill,

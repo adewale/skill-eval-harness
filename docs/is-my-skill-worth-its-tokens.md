@@ -1,23 +1,32 @@
 # Is my skill worth its tokens?
 
 Every skill you ship rides in the model's context on every request that loads it —
-the `SKILL.md`, its frontmatter, and whichever `references/` it pulls in. That is a
-standing cost paid on every run, forever. The naive version of the question wants one
-number ("my skill adds 9 KB, is that OK?"), but 9 KB is only the *bill*; whether it is
-*worth* it is the bill weighed against the **lift** those tokens buy — the with-skill
-minus without-skill pass-rate delta from the same paired cases the benchmark already
-runs. A skill that adds 4 KB and lifts nothing is worse than one that adds 12 KB and
-turns a 0.2 pass rate into 0.9. So the question is not "how big is it" but "what is the
+the `SKILL.md`, its frontmatter, and whichever `references/` it pulls in. That text is
+the visible cost and usually the smaller one. Once it sits in a cached prefix, later
+requests read it at about a tenth of the fresh-input price, and the cost-reduction
+guide that `/claude-api hillclimb` follows (in the claude-api skill) measured that
+"cost scales with extra actions triggered, not prompt length." The larger term is what
+the skill makes the model *do*: the extra tool calls, file reads, and output tokens a
+with-skill run spends beyond its without-skill pair. The naive version of the question
+wants one number ("my skill adds 9 KB, is that OK?"), but 9 KB is only part of the
+*bill*; whether it is *worth* it is the bill weighed against the **lift** those tokens
+buy — the with-skill minus without-skill pass-rate delta from the same paired cases
+the benchmark already runs. A skill that adds 4 KB and lifts nothing is worse than one
+that adds 12 KB and turns a 0.2 pass rate into 0.9. So the question is not "how big is it" but "what is the
 lift per token, and is any of that footprint buying nothing?"
 
 That splits into two measurements, and they need different evidence:
 
 - **Static footprint** is deterministic and free — no model, no run. `profile-skill`
-  counts it. This is the numerator's denominator: the tokens you pay unconditionally.
-- **Runtime lift and dollar cost** need real runs with telemetry. `token-overhead`
-  joins the static footprint to the measured objective lift and (when the runner
-  recorded it) the dollar delta; `cost-summary` rolls up spend across a whole suite.
-  These are only as real as the token/cost numbers your runner actually wrote.
+  counts it: the text every loading request carries, usually the smaller term once
+  cached.
+- **Runtime lift and dollar cost** need real runs with telemetry, and they hold the
+  larger term. `token-overhead` joins the static footprint to the measured objective
+  lift, the with-minus-without total-token delta, and (when the runner recorded it)
+  the dollar delta; `cost-summary` rolls up spend across a whole suite; the
+  benchmark's `trajectory_diff` shows where the extra spend went, as per-case
+  `tool_calls`, `file_reads`, and `commands` deltas. These are only as real as the
+  token/cost numbers and traces your runner actually wrote.
 
 ## Run the static half offline
 
@@ -118,9 +127,23 @@ Once the runtime pairs are real, read the row for the keep/trim/cut decision:
   USD` totals exactly the spend on cases that bought no lift — that column is the
   trim list.
 - **Large `Reference tokens`, small lift** → suspect a reference. `profile-skill`
-  tells you which module carries the bytes; drop it from the skill, re-run, and if the
-  lift holds, the reference was dead weight. (This is a footprint ablation you can do
-  by hand; the [ablation study](ablation-study-walkthrough.md) does the causal version.)
+  tells you which module carries the bytes. Before you drop it and re-run, write down
+  three gates, following the adoption gates in the `/claude-api hillclimb` cost
+  guide: a quality band (the trimmed skill's lift stays within a named distance of
+  the current lift), a cost margin (runtime tokens or dollars fall by more than a
+  named amount), and a mechanism (the saving shows up where you predicted, such as a
+  smaller `file_reads` or `tool_calls` delta in `trajectory_diff`). Cut the reference
+  only when all three pass. A lower bill with no visible mechanism is a confound, and
+  a reference the model rarely read was nearly free, so deleting it may not cut cost
+  at all. (This is a footprint ablation you can do by hand; the [ablation
+  study](ablation-study-walkthrough.md) does the causal version.)
+- **`with_skill` already passes every case** → quality has nowhere left to climb on
+  this suite, so make the objective the same quality at lower cost. The blog post
+  [Automating eval design and hillclimbing with
+  Claude](https://claude.dev/blog/automating-eval-design-and-hillclimbing/) calls cost
+  "one generally strong objective" because you can still pursue it "even if an
+  evaluation is saturated"; the gates above are how you hold quality at parity while
+  you cut.
 - **`audit-manifest --runs <dir>`** folds the same signal into review findings —
   expensive-but-saturated cases, high-cost judge-only cases with no deterministic
   oracle — so the cost view shows up next to the manifest hygiene view.

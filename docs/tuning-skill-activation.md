@@ -10,20 +10,54 @@ model, and because the model makes the routing decision, the author's only contr
 indirect: measure the rate per combination, edit the description, and re-measure until
 it holds everywhere you ship.
 
-That measured rate is the whole method. The loop:
+That measured rate is the whole method. Because the description is the one lever you
+hold and the trigger rate moves with it directly, a change in the rate traces back to
+the edit that caused it; [Automating eval design and hillclimbing with
+Claude](https://claude.dev/blog/automating-eval-design-and-hillclimbing/) uses skill
+triggering as its example of that kind of *attributable* hillclimbing surface. The
+loop:
 
-1. **Write trigger cases in both polarities.** Real user prompts — the words someone
-   actually types — not descriptions of prompts. Positive cases where the skill must
-   fire, negative cases where it must stay quiet. Both matter: a description broad
-   enough to always fire is one that also fires on your negatives.
-2. **Measure the matrix.** Run every (agent, model, query) cell several times, with
+1. **Write trigger cases in both polarities, and split them.** Real user prompts — the
+   words someone actually types — not descriptions of prompts. Positive cases where
+   the skill must fire, negative cases where it must stay quiet. Both matter: a
+   description broad enough to always fire is one that also fires on your negatives.
+   Give each case `"split": "tune"` or `"split": "holdout"` in the manifest. You read
+   failures and write edits from tune only; `skill-trigger-matrix --split holdout`
+   measures the queries no edit was written from.
+2. **Check the noise before the first edit.** Count queries, not runs. The harness's
+   trigger significance test (`skill-benchmark trigger-compare`) collapses every
+   agent, model, and repeat of one query into a single unit, so repeats sharpen each
+   query's rate without adding units. When all k queries move the same way, the exact
+   two-sided sign-flip test cannot report less than 2/2^k: 3 queries bottom out at
+   p = 0.25, and it takes 6 to reach p ≤ 0.05 (0.03125). The bundled demo's two
+   queries can never go below p = 0.5. If your holdout split is smaller than that,
+   add real queries before spending rounds, or treat each keep/revert call as a
+   judgment on rates rather than a test result.
+3. **Measure the matrix.** Run every (agent, model, query) cell several times, with
    the skill mounted where that agent discovers skills on its own — never named in
    the prompt, never force-loaded.
-3. **Read failures by polarity.** Positives failing → under-trigger. Negatives
+4. **Read failures by polarity.** Positives failing → under-trigger. Negatives
    failing → over-trigger. A cell can do both at once, which is why the report never
    folds the two into one number.
-4. **Edit the description, re-run, compare.** Stop when the rates hold across the
-   matrix at a repetition count you trust.
+5. **Edit the description, re-run both splits, keep or revert.** Keep the edit only
+   when holdout improves. When tune improves and holdout stays flat, the edit fit
+   the tune queries rather than the request class, so revert it; revert on any
+   regression in either split as well. Stop when the rates hold across the matrix at
+   a repetition count you trust.
+6. **When two or three rounds stall, sort the leftover failures before editing
+   again.** Put each remaining tune failure in one bucket, because another
+   description edit fixes only some of them:
+   - *description gap*: the query uses invocation language the description lacks.
+     Keep editing.
+   - *isolation or competing skills*: another skill won the routing. If the run's
+     metadata records `config_isolated: false`, a personal skill may have leaked
+     in, so fix the sandbox. A built-in winning is a real routing loss (see below),
+     so treat it as a description gap against that competitor.
+   - *ambiguous query*: a domain expert could argue either polarity. Rewrite or drop
+     the query, not the description.
+   - *variance*: the cell flips across identical re-runs by as much as the round
+     moved it. Raise `--runs-per-query`, or add queries if step 2 said the split is
+     too small.
 
 ## Run it on the bundled demo
 
@@ -92,9 +126,14 @@ any selected adapter, including Codex or Vibe.
 ## Reading the matrix
 
 - **Positives fail on some model** → the description omits the invocation language
-  those users type. Add the phrases from your failing queries. From the saturation
-  round: `anti-slop-writing` under-triggered until its description gained "tighten,"
-  "talk intro," and "generic launch copy" — the words its actual requests use.
+  that class of request uses. Add that language, taken from real requests of the same
+  kind rather than copied from the failing tune queries, and confirm the edit on
+  holdout queries it never saw. The `/claude-api hillclimb` guide in the claude-api
+  skill names the risk: "pasting specific nouns or phrases from train cases into the
+  prompt is the fastest route to an overfit change that helps train and does nothing
+  held-out." From the saturation round: `anti-slop-writing` under-triggered until its
+  description gained "tighten," "talk intro," and "generic launch copy" — the words
+  its actual requests use.
 - **Negatives fail** → the description claims territory adjacent skills or the base
   model should own. Name the exclusion explicitly: `good-readme` over-triggered on
   full docs sites and launch-readiness audits until its description said it was not
@@ -108,7 +147,9 @@ any selected adapter, including Codex or Vibe.
 Trigger cases are cheap to run compared to answer-quality cases, so repetition is
 affordable: one run per cell is a coin flip, and this repo's own ablation study saw
 two of three single-shot findings evaporate at n=5. `--runs-per-query 3` is the
-floor; raise it before trusting a marginal cell.
+floor; raise it before trusting a marginal cell. Repeats and queries fix different
+problems: `--runs-per-query` tightens one cell's rate, while only more queries lower
+the p-value floor from step 2 of the loop.
 
 ## What keeps the measurement honest
 

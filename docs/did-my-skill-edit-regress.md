@@ -18,6 +18,19 @@ Two honest ways to pin that baseline, carrying different evidence:
 - **Across iterations**, keep each run in its own `iteration-N/` workspace and diff
   report-to-report with `render-viewer --previous-workspace`: per-variant and per-case
   deltas plus flag churn between two `benchmark.json`, the descriptive localizer.
+  Because the two iterations ran on different days, that diff also carries whatever
+  changed between them besides your edit: the CLI version, the model snapshot behind
+  an alias, the agent's config. This repo's demo trigger cell shows how large that can
+  be. Haiku loaded the skill on 1 of 3 runs in July; [PR
+  #85](https://github.com/adewale/skill-eval-harness/pull/85) re-ran the July
+  description text twelve weeks later (as the `weaker-description` ablation, which
+  strips the `when_to_use` line added since) under a newer Claude Code CLI, a new
+  skill mount name, and an isolated config dir, and Haiku loaded it 3 of 3. The
+  `/claude-api hillclimb` guide in the claude-api skill reports the same effect:
+  "identical-code drift of a few points between measurement days is common". When
+  you need the edit's effect alone, grade an `old_skill` arm beside `with_skill` in
+  the same run ([set-up below](#where-this-stops)) and keep the iteration diff for
+  localizing.
 
 One command *sounds* like the tool for this and isn't: `compare-results`. It tallies a
 pairwise-preference judge (mapping a judge's `A`/`B`/`TIE` winners onto `primary`/`baseline`
@@ -32,16 +45,24 @@ Run every arm through the deterministic stub — no model, no key. From
 ```bash
 cd examples/demo-skill
 HARNESS=../../skill_benchmark.py
+V="--variant with_skill --variant without_skill \
+   --variant ablation:no-severity --variant ablation:no-checklist"
 python3 $HARNESS prepare evals/shared-benchmark.json --split tune \
   --include-ablations --ablation-dir /tmp/demo-abl --runs-per-variant 6 \
   --out /tmp/demo-tasks.jsonl
 python3 $HARNESS run-codex --tasks /tmp/demo-tasks.jsonl --runs /tmp/demo-runs \
   --codex-cmd "python3 $(pwd)/stub_runner.py"
-python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/demo-runs \
-  --variant with_skill --variant without_skill \
-  --variant ablation:no-severity --variant ablation:no-checklist \
-  --out /tmp/demo-bench.json
+python3 $HARNESS judge evals/shared-benchmark.json --runs /tmp/demo-runs $V \
+  --judge-cmd "python3 $(pwd)/stub_judge.py" --out /tmp/demo-judge.jsonl
+python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/demo-runs $V \
+  --judge-results /tmp/demo-judge.jsonl --out /tmp/demo-bench.json
 ```
+
+The `judge` step is not optional. `c-review` declares a judge assertion
+(`actionable-review`), and until its verdicts are merged the report is partial: every
+ablation regression reads `evidence_class: "indeterminate"` with the note `grading
+evidence is incomplete`, however many repeats you ran. `stub_judge.py` is the demo's
+offline judge.
 
 The `no-severity` ablation removes the `## Severity rules` section — the same regression a
 careless edit to `SKILL.md` would cause. Read `ablation_regressions` in the report
@@ -88,29 +109,39 @@ Now the loop as you actually run it in a repo: grade what you have, edit, re-gra
 ```bash
 WS=/tmp/demo-iter                 # holds iteration-1/, iteration-2/
 # iteration 1 — the skill you have today
+mkdir -p $WS/iteration-1
 python3 $HARNESS prepare evals/shared-benchmark.json --split tune \
   --runs-per-variant 4 --out $WS/iteration-1/tasks.jsonl
 python3 $HARNESS run-codex --tasks $WS/iteration-1/tasks.jsonl \
   --runs $WS/iteration-1/runs --codex-cmd "python3 $(pwd)/stub_runner.py"
+python3 $HARNESS judge evals/shared-benchmark.json --runs $WS/iteration-1/runs \
+  --variant with_skill --variant without_skill \
+  --judge-cmd "python3 $(pwd)/stub_judge.py" --out $WS/iteration-1/judge.jsonl
 python3 $HARNESS benchmark evals/shared-benchmark.json --runs $WS/iteration-1/runs \
-  --variant with_skill --variant without_skill --out $WS/iteration-1/benchmark.json
+  --variant with_skill --variant without_skill \
+  --judge-results $WS/iteration-1/judge.jsonl --out $WS/iteration-1/benchmark.json
 
 # THE EDIT: delete the "## Severity rules" section from skills/demo/SKILL.md
 #   (edit in place, then `git checkout` it when you are done to keep the demo pristine)
 
-# iteration 2 — same three commands into $WS/iteration-2, then diff:
+# iteration 2 — the same mkdir and four commands into $WS/iteration-2, then diff:
 python3 $HARNESS render-viewer --benchmark $WS/iteration-2/benchmark.json \
   --previous-workspace $WS/iteration-1 --out $WS/iteration-2/review.html
 ```
 
-The rendered review carries a **Diff vs previous workspace** panel. Its JSON (2026-07-06,
+Skip the `judge` step and both reports are partial, so the diff panel reads
+`"availability": "partial"` with every headline field `null`.
+
+The rendered review carries a **Diff vs previous workspace** panel. Its JSON (2026-09-29,
 offline stub; `without_skill` deltas, all 0.0, elided):
 
 ```json
 {
+  "availability": "complete",
   "variant_deltas": {
     "with_skill": {
-      "mean_objective_pass_rate": {"before": 1.0, "after": 0.25, "delta": -0.75}
+      "mean_objective_pass_rate": {"before": 1.0, "after": 0.25, "delta": -0.75},
+      "mean_combined_pass_rate": {"before": 1.0, "after": 0.16666666666666666, "delta": -0.8333}
     }
   },
   "case_deltas": [
@@ -118,6 +149,8 @@ offline stub; `without_skill` deltas, all 0.0, elided):
     {"case_id": "c-review",      "variant": "with_skill", "before": 1.0, "after": 0.5, "delta": -0.5}
   ],
   "new_flags": [
+    "c-adversarial::floor: fails in both arms",
+    "c-adversarial::no objective lift",
     "c-adversarial::with-skill failure",
     "c-review::with-skill failure"
   ],
@@ -128,7 +161,8 @@ offline stub; `without_skill` deltas, all 0.0, elided):
 The headline `variant_deltas.with_skill` fell 1.0 → 0.25, and `case_deltas` localizes it:
 `c-adversarial` collapsed (−1.0, its only assertion was `severity-label`) while `c-review`
 half-fell (−0.5, it lost `severity-label` but kept `cite-checklist`). `new_flags` names the
-newly-failing cases.
+newly-failing cases; `c-adversarial` also gains `floor: fails in both arms` because its
+`with_skill` arm now scores 0.0, the same as the baseline.
 
 A **safe** edit — reword the intro prose, touch no load-bearing section — produces the
 empty diff instead (real output, same command against a cosmetic-only iteration):
@@ -151,8 +185,14 @@ empty diff instead (real output, same command against a cosmetic-only iteration)
   shows it can. *Action:* read `case_deltas`, never the headline alone — a flat mean is not
   "no change," it is "no *net* change."
 - **No entries move** — `case_deltas: []`, `new_flags: []` — → the edit was safe *on the
-  cases you have*. *Action:* ship it, and remember the qualifier: the diff only guards the
-  cases in your suite (see the boundary below).
+  cases you have*, within the resolution your repeats allow. Each case's rate rests on
+  four runs here, so on a real model an edit that breaks 1 run in 10 can leave every
+  case at 1.0 in both iterations. Each report states its own resolution:
+  `paired_summary.interval` is the range of with-vs-without lift the data cannot rule
+  out, and `paired_summary.noise_check` names what limits it. On the demo's two cases the interval reads `"bounded": false` and the
+  verdict `too-few-cases-moved`. *Action:* ship it with both qualifiers in mind: the
+  diff guards only the cases in your suite (see the boundary below), and only at the
+  resolution those reports state.
 
 ## What keeps the measurement honest
 
