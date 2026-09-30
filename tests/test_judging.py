@@ -5,6 +5,7 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
+import contextlib
 import json
 import os
 import stat
@@ -1276,17 +1277,26 @@ class ToolUsingJudgeTests(unittest.TestCase):
                 "run_number": 1, "prompt": "p", "run_base": str(run),
                 "output_path": str(run / "output.md"), "assertion": {"type": "judge", "name": "j"}}
 
-    def _tmp_explore_dirs(self):
-        return {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("judge-explore-")}
+    @contextlib.contextmanager
+    def _private_tempdir(self):
+        """Point tempfile at a directory only this test uses. The cleanup check
+        lists the temp dir, and a snapshot of the shared one was flaky when
+        another process created judge-explore-* dirs concurrently."""
+        with tempfile.TemporaryDirectory() as private, \
+                mock.patch.object(tempfile, "tempdir", private):
+            yield Path(private).resolve()
+
+    @staticmethod
+    def _explore_dirs(tmp: Path) -> set[str]:
+        return {n for n in os.listdir(tmp) if n.startswith("judge-explore-")}
 
     def test_explore_end_to_end_sanitizes_and_arms_readonly_tools(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, self._private_tempdir() as private:
             run = self._run_dir(td)
             stub = self._stub_claude(td)
-            before = self._tmp_explore_dirs()
             row = sb.run_one_judge_task(self._task(run), judge_model="m", claude_bin=str(stub), explore=True)
             probe = json.loads((Path(td) / "probe.json").read_text(encoding="utf-8"))
-            after = self._tmp_explore_dirs()
+            leftover = self._explore_dirs(private)
         self.assertTrue(row["passed"])                                     # verdict flows back unchanged
         self.assertEqual(row["score"], 5)
         self.assertIn("--add-dir", probe["argv"])                          # tools were armed
@@ -1300,7 +1310,9 @@ class ToolUsingJudgeTests(unittest.TestCase):
         # the live oracle. Read/Grep with no path would otherwise range over the repo.
         self.assertIn("judge-explore-", probe["cwd"])
         self.assertNotEqual(probe["cwd"], os.getcwd())
-        self.assertEqual(after, before)                                    # the scratch copy was cleaned up
+        # The scratch copy was made in the temp dir, and cleaned up afterwards.
+        self.assertTrue(Path(probe["cwd"]).resolve().is_relative_to(private), probe["cwd"])
+        self.assertEqual(leftover, set())
 
     def test_explore_off_arms_no_tools_and_no_add_dir(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1362,19 +1374,18 @@ class ToolUsingJudgeTests(unittest.TestCase):
 
     def test_requested_explore_without_run_base_is_incomplete(self):
         # A task with no run_base must NOT resolve to '.' (repo root) and copy it.
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, self._private_tempdir() as private:
             stub = self._stub_claude(td)
             task = {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
                     "run_number": 1, "prompt": "p", "output_path": str(Path(td) / "missing.md"),
                     "assertion": {"type": "judge", "name": "j"}}   # NO run_base key
-            before = self._tmp_explore_dirs()
             row = sb.run_one_judge_task(task, judge_model="m", claude_bin=str(stub), explore=True)
-            after = self._tmp_explore_dirs()
+            leftover = self._explore_dirs(private)
         self.assertFalse(row["passed"])
         self.assertFalse(row["judge_observation_complete"])
         self.assertEqual(row["judge_evidence_mode"], "explore")
         self.assertFalse((Path(td) / "probe.json").exists())  # judge never invoked
-        self.assertEqual(after, before)
+        self.assertEqual(leftover, set())                      # and no scratch copy left behind
 
     def test_explore_is_inert_on_shell_judge_cmd(self):
         with tempfile.TemporaryDirectory() as td:
