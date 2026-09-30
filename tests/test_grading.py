@@ -5,6 +5,8 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
+import contextlib
+import io
 import json
 import os
 import sys
@@ -955,10 +957,12 @@ class ReviewFixRegressionTests(unittest.TestCase):
             "id": "conv", "split": "tune", "kind": "behavior",
             "turns": [{"prompt": "ask", "assertions": [{"type": "no_such_type", "value": "x"}]}],
         }]
+        stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as td:
             path = write_manifest(Path(td), manifest)
-            with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
                 sb.validate_manifest(path)
+        self.assertIn("conv: turn #1 assertion #0 has unsupported type 'no_such_type'", stderr.getvalue())
 
 
 class AssertionDependenciesTests(unittest.TestCase):
@@ -995,18 +999,19 @@ class AssertionDependenciesTests(unittest.TestCase):
         sb.validate_depends_on_scope("c", [A(name="pre"), A(name="dep", depends_on="pre")], p)   # valid graph
 
     def test_turn_depends_on_rejected_at_validate(self):
+        manifest = base_manifest()
+        manifest["cases"] = [{
+            "id": "c", "split": "tune", "kind": "behavior",
+            "turns": [{"prompt": "p", "assertions": [
+                {"name": "t", "type": "contains", "value": "x", "depends_on": "other"}]}],
+        }]
+        stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "repo" / "skill").mkdir(parents=True)
-            (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-            (root / "repo" / "evals").mkdir()
-            p = root / "repo" / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                "variants": ["with_skill", "without_skill"], "ablations": [],
-                "cases": [{"id": "c", "split": "tune", "kind": "behavior",
-                           "turns": [{"prompt": "p", "assertions": [{"name": "t", "type": "contains", "value": "x", "depends_on": "other"}]}]}]}), encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(p)
+            path = write_manifest(Path(td), manifest)
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+        self.assertIn("c: turn #1 assertion #0 depends_on is not supported in turn assertions",
+                      stderr.getvalue())
 
     # --- grading ---
     def test_dependent_counted_when_prereq_passes(self):
