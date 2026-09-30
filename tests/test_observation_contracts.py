@@ -4,6 +4,14 @@ import unittest
 
 import agent_capabilities as caps
 import observation_contracts as oc
+import skill_benchmark as sb
+import telemetry
+from trigger_contracts import (
+    InvocationOutcome,
+    TriggerDetection,
+    TriggerExpectation,
+    TriggerObservation,
+)
 
 
 class AvailabilityTests(unittest.TestCase):
@@ -48,6 +56,51 @@ class TelemetrySourceTests(unittest.TestCase):
         self.assertLessEqual(set(typing.get_args(caps.CostSupport)), known)
         self.assertLessEqual(set(typing.get_args(caps.TelemetryProvenance)),
                              set(oc.MEASUREMENT_PROVENANCE))
+
+
+class ProducersAndValidatorsAgreeTests(unittest.TestCase):
+    """Every block the answer path's normalizers emit, the trigger path accepts.
+
+    The two paths kept separate source lists and drifted: the trigger path
+    accepted a bare "estimated" cost and rejected the partial-component
+    missing block that normalize_cost emits."""
+
+    def observation(self, *, usage, cost):
+        return TriggerObservation(
+            agent="pi", model=None, query="q",
+            expectation=TriggerExpectation.DO_NOT_TRIGGER,
+            invocation=InvocationOutcome.from_process(stdout="", stderr="", returncode=0, elapsed_ms=0),
+            detection=TriggerDetection.absent(), usage=usage, cost=cost)
+
+    def test_every_normalized_cost_block_is_a_valid_trigger_cost(self):
+        blocks = [
+            sb.normalize_cost(0.25),
+            sb.normalize_cost({"total_cost": 1.5, "currency": "EUR"}, source="trace_normalized"),
+            sb.normalize_cost(None),
+            sb.normalize_cost({"input_cost": 0.1}),  # parts without a total stay missing
+            sb.normalize_cost(None, source="not_applicable"),
+            sb.normalize_cost(0.5, source="price_table_estimated", pricing_table_version="t1"),
+        ]
+        for block in blocks:
+            with self.subTest(block=block):
+                self.observation(usage={"source": "missing"}, cost=block)
+
+    def test_every_normalized_usage_block_is_a_valid_trigger_usage(self):
+        for source in sorted(oc.USAGE_SOURCES - oc.ABSENT_SOURCES):
+            with self.subTest(source=source):
+                self.observation(usage=sb.normalize_usage({"input_tokens": 3, "output_tokens": 4},
+                                                          source=source),
+                                 cost={"source": "missing"})
+
+    def test_a_bare_estimated_cost_is_rejected_by_both_paths(self):
+        with self.assertRaises(ValueError):
+            sb.normalize_cost(0.5, source="estimated")
+        with self.assertRaises(ValueError):
+            self.observation(usage={"source": "missing"},
+                             cost={"source": "estimated", "total_cost": 0.5, "currency": "USD"})
+
+    def test_the_telemetry_domain_reads_the_same_provenance_list(self):
+        self.assertIs(telemetry.PROVENANCE, oc.MEASUREMENT_PROVENANCE)
 
 
 if __name__ == "__main__":

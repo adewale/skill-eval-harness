@@ -15,25 +15,22 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Generic, TypeVar
 
 from json_contracts import freeze_json_mapping
+from observation_contracts import MEASUREMENT_PROVENANCE, Availability
 
 T = TypeVar("T")
 
 AVAILABLE = "available"
-UNAVAILABLE = "unavailable"
-NOT_APPLICABLE = "not_applicable"
-COMPLETE = "complete"
-PARTIAL = "partial"
+UNAVAILABLE = Availability.UNAVAILABLE.value
+NOT_APPLICABLE = Availability.NOT_APPLICABLE.value
+COMPLETE = Availability.COMPLETE.value
+PARTIAL = Availability.PARTIAL.value
+# Measurement and comparison states with no general availability counterpart.
 COMPARABLE = "comparable"
 BLOCKED = "blocked"
 
-PROVENANCE = {
-    "provider_reported",
-    "trace_normalized",
-    "process_measured",
-    "price_table_estimated",
-    "estimated",
-    "legacy_unverified",
-}
+# Provenance a measured number may carry; owned by observation_contracts so the
+# answer path, the trigger path and this domain read one list.
+PROVENANCE = MEASUREMENT_PROVENANCE
 MAX_ELAPSED_MS = 2**63 - 1
 CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 

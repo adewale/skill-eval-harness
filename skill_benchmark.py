@@ -211,6 +211,7 @@ from manifest_contracts import (
     RunNumber,
     Split,
 )
+from observation_contracts import COST_SOURCES, USAGE_SOURCES
 from text_contracts import (
     ComparisonProfile,
     ComparisonText,
@@ -6805,8 +6806,6 @@ def metric_number(metrics: dict[str, Any], *keys: str) -> int | float | None:
     return None
 
 
-USAGE_SOURCES = {"provider_reported", "trace_normalized", "estimated", "missing", "not_applicable"}
-COST_SOURCES = {"provider_reported", "trace_normalized", "price_table_estimated", "missing", "not_applicable"}
 # Every normalizer reads the leaf telemetry domain's token-usage alias table, so
 # provider payloads cannot be classified differently by two paths.
 USAGE_ALIASES = telemetry_domain.USAGE_ALIASES
