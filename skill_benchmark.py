@@ -129,6 +129,7 @@ from artifact_contracts import (
 )
 from cli_contracts import CLICommand, CLIInvocation
 from completion_contracts import (
+    BACKEND_DEFAULT,
     EFFORT_LEVELS,
     EffortSetting,
     ServedModel,
@@ -195,6 +196,7 @@ from manifest_contracts import (
     CasePopulation,
     ExecutionVariant,
     ModelId,
+    RunCoordinate,
     RunNumber,
     Split,
 )
@@ -243,6 +245,7 @@ TRIGGER_IDENTITY_MODULES = (
     "invocation_contracts.py",
     "json_contracts.py",
     "manifest_contracts.py",
+    "observation_contracts.py",
     "run_pi_trigger_eval.py",
     "run_trigger_matrix.py",
     "skill_benchmark.py",
@@ -5869,7 +5872,7 @@ def _jetty_record_preflight(
     # records that explicitly; a report then counts these runs as unobserved
     # rather than as predating completion evidence.
     completion = {
-        **StopObservation.unobserved("jetty trajectory exposes no stop signal").as_metadata(),
+        **StopObservation.unavailable("jetty trajectory exposes no stop signal").as_metadata(),
         **ServedModel.observe(
             normalized.get("model") if isinstance(normalized.get("model"), str) else None,
             []).as_metadata(),
@@ -8664,7 +8667,7 @@ def _write_runner_outcome_files(run_dir: Path, outcome: AnswerOutcome,
     # stop reason, a served model or an effort setting overrides these through
     # metadata_extra; one that observed nothing says so instead of guessing.
     completion_defaults = {
-        **StopObservation.unobserved(
+        **StopObservation.unavailable(
             f"{context.provider.value} runner exposes no stop signal").as_metadata(),
         **ServedModel.observe(context.model, []).as_metadata(),
         **EffortSetting.default().as_metadata(),
@@ -10316,7 +10319,7 @@ class ClaudeBackend(AgentBackend):
         stop = result.get("stop")
         completion = {
             **(stop.as_metadata() if isinstance(stop, StopObservation)
-               else StopObservation.unobserved("claude stream has no result event").as_metadata()),
+               else StopObservation.unavailable("claude stream has no result event").as_metadata()),
             **ServedModel.observe(request.model, result.get("served_models") or []).as_metadata(),
         }
         return RunnerOutcome(
@@ -10365,13 +10368,8 @@ class GeminiBackend(AgentBackend):
         metadata = (dict(raw_metadata)
                     if isinstance(raw_metadata, Mapping) else {})
         reported = metadata.get("reported_models")
-        resolved = metadata.get("resolved_model")
-        metadata.update(ServedModel(
-            request.model,
-            resolved if isinstance(resolved, str) and resolved.strip() else None,
-            tuple(item for item in reported if isinstance(item, str) and item.strip())
-            if isinstance(reported, list) else (),
-        ).as_metadata())
+        metadata.update(ServedModel.observe(
+            request.model, reported if isinstance(reported, list) else []).as_metadata())
         return RunnerOutcome(
             provider="gemini",
             answer=result.get("answer") or "",
@@ -10638,13 +10636,16 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     result_error = None if isinstance(result, str) else "claude result must be a string"
     if cost is not None and (normalized_cost is None or normalized_cost < 0):
         result_error = "claude total_cost_usd must be a finite nonnegative number"
-    # The model on each assistant message is the one that served that turn;
-    # the last one wrote the final answer. The envelope-only `json` format has
-    # no assistant messages, so its served model stays unobserved.
+    # The model on each main-thread assistant message served that turn. A
+    # subagent turn (it carries parent_tool_use_id) may use another model by
+    # design, so it is not evidence about the requested model. The envelope-only
+    # `json` format has no assistant messages, so its served model stays
+    # unavailable.
     served_models = [
         record["message"].get("model")
         for record in stream_records
         if record.get("type") == "assistant" and isinstance(record.get("message"), dict)
+        and record.get("parent_tool_use_id") is None
     ]
     return {
         "answer": result if isinstance(result, str) else "",
@@ -11562,26 +11563,14 @@ def validate_depends_on_scope(cid: str, assertions: list[Any], path: Path) -> No
 
 
 def judge_task_id(case_id: str, variant: str, run_number: int, assertion: dict[str, Any], model: str | None = None) -> str:
-    """One verdict key per (case, model, variant, run, assertion). The model
-    segment appears only on model-fanned runs (roadmap 2.1) — without it,
-    case-1/m1/with_skill and case-1/m2/with_skill would share an ID and the
-    last-loaded verdict would silently apply to both models. Single-model IDs
-    keep the historical shape."""
-    label = assertion_label(assertion)
-    segments = {"case_id": case_id, "variant": variant, "assertion": label}
-    if model is not None:
-        segments["model"] = model
-    for segment_name, segment in segments.items():
-        if not isinstance(segment, str) or not segment:
-            raise ValueError(f"judge task {segment_name} must be a non-empty string")
-        if "::" in segment:
-            raise ValueError(
-                f"judge task {segment_name} cannot contain reserved delimiter '::'")
-    # RunNumber (the typed pair key) is an int subclass; bool is not a run number.
-    if isinstance(run_number, bool) or not isinstance(run_number, int) or run_number < 1:
-        raise ValueError("judge task run_number must be a positive integer")
-    model_segment = f"{model}::" if model is not None else ""
-    return f"{case_id}::{model_segment}{variant}::run-{int(run_number)}::{label}"
+    """One verdict key per (case, model, variant, run, assertion). The run
+    coordinate owns the format and validation; the model segment appears only
+    on model-fanned runs (roadmap 2.1), so single-model ids keep their shape."""
+    try:
+        coordinate = RunCoordinate.of(case_id, variant, run_number, model)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"judge task: {exc}") from exc
+    return coordinate.judge_task_id(assertion_label(assertion))
 
 
 JUDGE_EVIDENCE_MODES = {
@@ -13791,8 +13780,7 @@ def human_labels_from_judgements(judgements: list[HumanJudgement]) -> tuple[dict
         if judgement.label is None:
             skipped["unsure_or_note_only"] += 1
             continue
-        jid = judge_task_id(judgement.case_id, judgement.variant, judgement.run_number,
-                            {"name": judgement.assertion}, judgement.model)
+        jid = judgement.run.judge_task_id(judgement.assertion)
         if jid in labels:
             die(f"feedback labels {jid!r} twice")
         labels[jid] = {"judge_task_id": jid, "passed": judgement.label}
@@ -14695,7 +14683,10 @@ def run_endings_block(results: list[dict[str, Any]]) -> dict[str, Any]:
     if totals["served:mismatch"]:
         notes.append(f"{totals['served:mismatch']} run(s) were answered by a different model "
                      "than requested and are excluded from scoring")
-    if len(models) > 1 and efforts == {"backend-default"}:
+    if totals["served:mixed"]:
+        notes.append(f"{totals['served:mixed']} run(s) reported the requested model and at least "
+                     "one other; they are scored, but no single model can be credited")
+    if len(models) > 1 and efforts == {BACKEND_DEFAULT}:
         notes.append("every run used its backend's default effort; defaults differ by model, "
                      "so pin --effort before reading a cross-model comparison")
     return {
@@ -14703,6 +14694,7 @@ def run_endings_block(results: list[dict[str, Any]]) -> dict[str, Any]:
         "refused_runs": totals["stop:refused"],
         "cut_off_runs": totals["stop:truncated"] + totals["stop:turn_limit"],
         "served_model_mismatches": totals["served:mismatch"],
+        "served_model_mixed": totals["served:mixed"],
         "effort_levels": sorted(efforts),
         "notes": notes,
     }

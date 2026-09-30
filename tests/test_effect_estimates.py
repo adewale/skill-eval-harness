@@ -219,5 +219,34 @@ class FloorEndToEndTests(unittest.TestCase):
         self.assertIn("noise_check", report["paired_summary"])
 
 
+class EstimateTests(unittest.TestCase):
+    def test_test_interval_and_noise_come_from_one_set_of_deltas(self):
+        deltas = thirds([1, 2, 1, 0, 1, 2, 1, 1])
+        estimate = ee.Estimate.from_deltas(deltas, unit=ee.InferenceUnit.CASE,
+                                           without_rates=[0.3] * 8, min_lift=0.2)
+        blocks = estimate.blocks()
+        self.assertEqual({k: v for k, v in blocks["significance"].items() if k != "unit"},
+                         sb.sign_flip_significance(deltas))
+        self.assertEqual({k: v for k, v in blocks["interval"].items() if k != "unit"},
+                         ee.sign_flip_interval(deltas))
+        self.assertEqual({blocks[name]["unit"] for name in blocks}, {"case"})
+        self.assertEqual(blocks["noise_check"]["min_lift"], 0.2)
+
+    def test_without_baseline_rates_there_is_no_noise_check(self):
+        estimate = ee.Estimate.from_deltas([1.0] * 6, unit=ee.InferenceUnit.QUERY)
+        self.assertNotIn("noise_check", estimate.blocks())
+        self.assertTrue(estimate.significant)
+
+    def test_the_sample_size_note_names_the_unit_and_what_repeats_cannot_do(self):
+        case_note = ee.minimum_units_note(ee.InferenceUnit.CASE)
+        self.assertIn("at least 6 cases", case_note)
+        self.assertIn("do not add cases", case_note)
+        replicate_note = ee.minimum_units_note(ee.InferenceUnit.REPLICATE_PAIR)
+        self.assertIn("at least 6 matched replicate pairs", replicate_note)
+        self.assertNotIn("do not add cases", replicate_note)
+        self.assertIn("at least 8 authored queries",
+                      ee.minimum_units_note(ee.InferenceUnit.QUERY, alpha=0.01))
+
+
 if __name__ == "__main__":
     unittest.main()

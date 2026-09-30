@@ -15,8 +15,9 @@ harness used to record none of them:
   records what was requested and how it was applied, and a with/without pair
   whose arms ran at different effort is blocked instead of compared.
 
-A backend that exposes none of these writes ``unobserved`` rather than a
-guess: missing evidence is recorded as missing, never as a default value.
+A backend that exposes none of these writes ``unavailable`` (the canonical
+spelling in ``observation_contracts``) rather than a guess: missing evidence is
+recorded as missing, never as a default value.
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ class StopClass(str, Enum):
     TURN_LIMIT = "turn_limit"
     REFUSED = "refused"
     OTHER = "other"
-    UNOBSERVED = "unobserved"
+    UNAVAILABLE = "unavailable"
 
 
 # A truncated answer or a run stopped by the eval's own step budget is cut off
@@ -54,12 +55,6 @@ _MESSAGES_API_STOP = {
     "max_tokens": StopClass.TRUNCATED,
     "model_context_window_exceeded": StopClass.TRUNCATED,
     "refusal": StopClass.REFUSED,
-}
-# OpenAI-style `finish_reason` (Jetty chat completions, some CLI streams).
-_FINISH_REASON_STOP = {
-    "stop": StopClass.COMPLETED,
-    "length": StopClass.TRUNCATED,
-    "content_filter": StopClass.REFUSED,
 }
 
 
@@ -79,12 +74,12 @@ class StopObservation:
             validate_json_text(self.raw, "raw stop reason")
         if not isinstance(self.source, str) or not self.source.strip():
             raise ValueError("stop observation requires a source")
-        if self.stop_class is StopClass.UNOBSERVED and self.raw is not None:
-            raise ValueError("an unobserved stop cannot carry a raw reason")
+        if self.stop_class is StopClass.UNAVAILABLE and self.raw is not None:
+            raise ValueError("an unavailable stop cannot carry a raw reason")
 
     @classmethod
-    def unobserved(cls, source: str) -> StopObservation:
-        return cls(StopClass.UNOBSERVED, None, source)
+    def unavailable(cls, source: str) -> StopObservation:
+        return cls(StopClass.UNAVAILABLE, None, source)
 
     @property
     def scorable(self) -> bool:
@@ -101,15 +96,8 @@ class StopObservation:
 def stop_from_messages_api(value: object, *, source: str) -> StopObservation:
     """Normalize a Messages-API-style ``stop_reason`` string."""
     if not isinstance(value, str) or not value.strip():
-        return StopObservation.unobserved(source)
+        return StopObservation.unavailable(source)
     return StopObservation(_MESSAGES_API_STOP.get(value, StopClass.OTHER), value, source)
-
-
-def stop_from_finish_reason(value: object, *, source: str) -> StopObservation:
-    """Normalize an OpenAI-style ``finish_reason`` string."""
-    if not isinstance(value, str) or not value.strip():
-        return StopObservation.unobserved(source)
-    return StopObservation(_FINISH_REASON_STOP.get(value, StopClass.OTHER), value, source)
 
 
 def claude_result_stop(result_event: Mapping[str, Any] | None) -> StopObservation:
@@ -123,7 +111,7 @@ def claude_result_stop(result_event: Mapping[str, Any] | None) -> StopObservatio
     """
     source = "claude-result-event"
     if not isinstance(result_event, Mapping):
-        return StopObservation.unobserved("claude stream has no result event")
+        return StopObservation.unavailable("claude stream has no result event")
     subtype = result_event.get("subtype")
     if isinstance(subtype, str) and subtype == "error_max_turns":
         return StopObservation(StopClass.TURN_LIMIT, f"subtype={subtype}", source)
@@ -135,9 +123,12 @@ class ServedModelCheck(str, Enum):
 
     MATCH = "match"
     MISMATCH = "mismatch"
+    # Several distinct models answered and one of them is the requested model:
+    # no single model can be credited with the answer.
+    MIXED = "mixed"
     UNVERIFIABLE = "unverifiable"
-    UNOBSERVED = "unobserved"
-    NOT_REQUESTED = "not-requested"
+    UNAVAILABLE = "unavailable"
+    NOT_REQUESTED = "not_requested"
 
 
 _FAMILY_ALIASES = frozenset({"haiku", "sonnet", "opus", "fable", "mythos"})
@@ -160,7 +151,7 @@ def served_model_check(requested: str | None, served: str | None) -> ServedModel
     scoring; only a clear mismatch does.
     """
     if served is None or not served.strip():
-        return ServedModelCheck.UNOBSERVED
+        return ServedModelCheck.UNAVAILABLE
     if requested is None or not requested.strip():
         return ServedModelCheck.NOT_REQUESTED
     want = _model_tail(requested)
@@ -180,38 +171,59 @@ def served_model_check(requested: str | None, served: str | None) -> ServedModel
 
 @dataclass(frozen=True)
 class ServedModel:
-    """The model(s) a run reported, and how they compare with the request."""
+    """The model(s) a run reported, and how they compare with the request.
+
+    One rule for every backend: with exactly one reported model, that model is
+    credited with the answer and checked against the request. With several,
+    no single model can be credited (``served`` is None); the run is
+    ``mixed`` when the requested model is among them and a ``mismatch`` when it
+    is not. Claude subagent turns are excluded before this point, because a
+    subagent may run on another model by design.
+    """
 
     requested: str | None
-    served: str | None
-    all_served: tuple[str, ...]
+    reported: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        for label, value in (("requested", self.requested), ("served", self.served)):
-            if value is not None:
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError(f"{label} model must be a non-empty string or None")
-                validate_json_text(value, f"{label} model")
-        if not isinstance(self.all_served, tuple) or not all(
-                isinstance(item, str) and item.strip() for item in self.all_served):
-            raise ValueError("all_served must be a tuple of non-empty strings")
+        if self.requested is not None:
+            if not isinstance(self.requested, str) or not self.requested.strip():
+                raise ValueError("requested model must be a non-empty string or None")
+            validate_json_text(self.requested, "requested model")
+        if not isinstance(self.reported, tuple) or not all(
+                isinstance(item, str) and item.strip() for item in self.reported):
+            raise ValueError("reported models must be a tuple of non-empty strings")
+        for item in self.reported:
+            validate_json_text(item, "served model")
+        if len(set(self.reported)) != len(self.reported):
+            raise ValueError("reported models must be distinct")
 
     @classmethod
-    def observe(cls, requested: str | None, served_in_order: Iterable[object]) -> ServedModel:
-        """The last reported model produced the final answer; keep the rest."""
-        reported = [item for item in served_in_order if isinstance(item, str) and item.strip()]
-        return cls(requested, reported[-1] if reported else None,
-                   tuple(dict.fromkeys(reported)))
+    def observe(cls, requested: str | None, reported_in_order: Iterable[object]) -> ServedModel:
+        """Keep each distinct non-empty reported model, in first-seen order."""
+        reported = [item.strip() for item in reported_in_order
+                    if isinstance(item, str) and item.strip()]
+        return cls(requested, tuple(dict.fromkeys(reported)))
+
+    @property
+    def served(self) -> str | None:
+        return self.reported[0] if len(self.reported) == 1 else None
 
     @property
     def check(self) -> ServedModelCheck:
-        return served_model_check(self.requested, self.served)
+        if len(self.reported) <= 1:
+            return served_model_check(self.requested, self.served)
+        if self.requested is None or not self.requested.strip():
+            return ServedModelCheck.NOT_REQUESTED
+        checks = {served_model_check(self.requested, item) for item in self.reported}
+        if ServedModelCheck.MATCH in checks or ServedModelCheck.UNVERIFIABLE in checks:
+            return ServedModelCheck.MIXED
+        return ServedModelCheck.MISMATCH
 
     def as_metadata(self) -> dict[str, Any]:
         return {
             "requested_model": self.requested,
             "served_model": self.served,
-            "served_models": list(self.all_served),
+            "served_models": list(self.reported),
             "served_model_check": self.check.value,
         }
 
@@ -219,7 +231,7 @@ class ServedModel:
 # Effort levels documented for Claude Code's `--effort`; Codex's
 # `model_reasoning_effort` also accepts `minimal`.
 EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
-BACKEND_DEFAULT = "backend-default"
+BACKEND_DEFAULT = "backend_default"
 
 
 @dataclass(frozen=True)

@@ -124,6 +124,74 @@ class ConsensusVerdict:
             object.__setattr__(self, "score", _number(self.score, "score"))
 
 
+@dataclass(frozen=True)
+class Consensus:
+    """Several verdicts on one judge task, folded by one rule.
+
+    Repeated runs of one judge and a panel of judge models used to fold ties
+    differently: repeats turned an even split into a silent fail, while the
+    panel reported it as unresolved. Both now use ``resolve_consensus``, and
+    both report ``agreement``, so a judge that disagrees with itself is
+    visible instead of averaged away.
+    """
+
+    passed: bool
+    unresolved: bool
+    concur: int
+    n: int
+    median_score: float | None = None
+
+    def __post_init__(self) -> None:
+        _passed(self.passed)
+        if not isinstance(self.unresolved, bool):
+            raise ValueError("unresolved must be a boolean")
+        for label, value in (("concur", self.concur), ("n", self.n)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{label} must be a non-negative integer")
+        if self.n < 1 or self.concur > self.n:
+            raise ValueError("consensus needs 1 <= n and concur <= n")
+        if self.unresolved and self.passed:
+            raise ValueError("an unresolved consensus cannot pass")
+        if self.median_score is not None:
+            object.__setattr__(self, "median_score", _number(self.median_score, "median_score"))
+
+    def agreement(self) -> dict[str, Any]:
+        return {"concur": self.concur, "n": self.n,
+                "concur_fraction": round(self.concur / self.n, 4),
+                "unanimous": self.concur in (0, self.n), "unresolved": self.unresolved}
+
+    def verdict(self) -> ConsensusVerdict:
+        return ConsensusVerdict(self.passed, self.median_score)
+
+
+def resolve_consensus(passed: list[bool], scores: list[float], *,
+                      threshold: float | None = None,
+                      quorum: int | None = None) -> Consensus:
+    """Strict majority passes; an explicit quorum overrides the majority.
+
+    An exact tie with no quorum is decided by the median score only against
+    an explicit threshold; otherwise it is ``unresolved`` and does not pass.
+    It is never a silent coin flip.
+    """
+    if not passed or not all(isinstance(item, bool) for item in passed):
+        raise ValueError("consensus needs at least one boolean verdict")
+    n, concur = len(passed), sum(passed)
+    median = statistics.median(scores) if scores else None
+    unresolved = False
+    if isinstance(quorum, int) and not isinstance(quorum, bool) and quorum > 0:
+        outcome = concur >= quorum
+    elif concur * 2 > n:
+        outcome = True
+    elif concur * 2 < n:
+        outcome = False
+    elif (median is not None and isinstance(threshold, (int, float))
+          and not isinstance(threshold, bool)):
+        outcome = median >= threshold
+    else:
+        outcome, unresolved = False, True
+    return Consensus(outcome, unresolved, concur, n, median)
+
+
 JudgeVerdict: TypeAlias = BooleanVerdict | ScoredVerdict | DimensionVerdict | DynamicVerdict | ConsensusVerdict
 
 

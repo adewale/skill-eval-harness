@@ -10,7 +10,9 @@ had to write the same verdict twice, and the two copies could disagree.
 alignment command reads it (an entry that names a judge assertion becomes a
 label for that assertion's judge task), and ``error-analysis`` attaches run
 notes to its review queue. The legacy labels file is still read, but nothing
-writes it.
+writes it. The run a judgement is about is a ``RunCoordinate``, the same key
+judge tasks and result rows use, so a label cannot name a run differently
+from the verdict it calibrates.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from enum import Enum
 from typing import Any
 
 from json_contracts import validate_json_text
+from manifest_contracts import RunCoordinate
 
 FEEDBACK_SCHEMA_VERSION = 2
 
@@ -54,20 +57,14 @@ class HumanJudgement:
     annotate a review queue but cannot calibrate a per-assertion judge.
     """
 
-    case_id: str
-    variant: str
-    run_number: int = 1
-    model: str | None = None
+    run: RunCoordinate
     assertion: str | None = None
     verdict: HumanVerdict | None = None
     note: str | None = None
 
     def __post_init__(self) -> None:
-        for label in ("case_id", "variant"):
-            if not isinstance(getattr(self, label), str) or not getattr(self, label).strip():
-                raise ValueError(f"human judgement {label} must be a non-empty string")
-        if isinstance(self.run_number, bool) or not isinstance(self.run_number, int) or self.run_number < 1:
-            raise ValueError("human judgement run_number must be a positive integer")
+        if not isinstance(self.run, RunCoordinate):
+            raise TypeError("human judgement run must be a RunCoordinate")
         if self.verdict is not None and not isinstance(self.verdict, HumanVerdict):
             raise TypeError("human judgement verdict must be a HumanVerdict")
         if self.verdict is None and self.note is None:
@@ -78,13 +75,6 @@ class HumanJudgement:
         """Validate one entry from the review page or a stored feedback file."""
         if not isinstance(entry, Mapping):
             raise ValueError("human judgement must be an object")
-        raw_run = entry.get("run_number", 1)
-        if isinstance(raw_run, str) and raw_run.strip().isdigit():
-            raw_run = int(raw_run)   # HTML forms submit numbers as text
-        if raw_run in (None, ""):
-            raw_run = 1
-        if isinstance(raw_run, bool) or not isinstance(raw_run, int):
-            raise ValueError("human judgement run_number must be a positive integer")
         raw_verdict = entry.get("verdict")
         verdict: HumanVerdict | None
         if raw_verdict in (None, ""):
@@ -99,12 +89,14 @@ class HumanJudgement:
                     "human judgement verdict must be pass, fail, or unsure") from exc
         case_id = _text(entry.get("case_id"), "case_id", required=True)
         variant = _text(entry.get("variant"), "variant", required=True)
-        assert case_id is not None and variant is not None
+        try:
+            run = RunCoordinate.parse(
+                case_id, variant, entry.get("run_number", 1),
+                _text(entry.get("model"), "model", required=False))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"human judgement run: {exc}") from exc
         return cls(
-            case_id=case_id,
-            variant=variant,
-            run_number=raw_run,
-            model=_text(entry.get("model"), "model", required=False),
+            run=run,
             assertion=_text(entry.get("assertion"), "assertion", required=False),
             verdict=verdict,
             note=_text(entry.get("note"), "note", required=False),
@@ -113,12 +105,11 @@ class HumanJudgement:
     @property
     def key(self) -> tuple[str, str, str, int, str]:
         """A later judgement of the same run and assertion replaces the earlier one."""
-        return (self.case_id, self.model or "", self.variant, self.run_number,
-                self.assertion or "")
+        return (*self.run.key, self.assertion or "")
 
     @property
     def run_key(self) -> tuple[str, str, str, int]:
-        return (self.case_id, self.model or "", self.variant, self.run_number)
+        return self.run.key
 
     @property
     def label(self) -> bool | None:
@@ -130,9 +121,8 @@ class HumanJudgement:
         return None
 
     def as_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"case_id": self.case_id, "variant": self.variant,
-                               "run_number": self.run_number}
-        for key in ("model", "assertion", "note"):
+        out: dict[str, Any] = self.run.as_dict()
+        for key in ("assertion", "note"):
             value = getattr(self, key)
             if value is not None:
                 out[key] = value
@@ -143,17 +133,6 @@ class HumanJudgement:
 
 def is_feedback_document(document: object) -> bool:
     return isinstance(document, Mapping) and isinstance(document.get("entries"), list)
-
-
-def judgements_from_document(document: Mapping[str, Any]) -> list[HumanJudgement]:
-    """Parse every entry, naming the first invalid one."""
-    judgements: list[HumanJudgement] = []
-    for position, entry in enumerate(document.get("entries", []), 1):
-        try:
-            judgements.append(HumanJudgement.parse(entry))
-        except ValueError as exc:
-            raise ValueError(f"feedback entry {position}: {exc}") from exc
-    return judgements
 
 
 @dataclass(frozen=True)

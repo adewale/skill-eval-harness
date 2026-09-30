@@ -12,6 +12,7 @@ from pathlib import Path
 
 import human_judgements as hj
 import skill_benchmark as sb
+from manifest_contracts import RunCoordinate
 
 
 class HumanJudgementRecordTests(unittest.TestCase):
@@ -19,10 +20,10 @@ class HumanJudgementRecordTests(unittest.TestCase):
         judgement = hj.HumanJudgement.parse(
             {"case_id": "c", "variant": "with_skill", "run_number": "2",
              "assertion": "quality", "verdict": "bad", "note": "", "model": ""})
-        self.assertEqual(judgement.run_number, 2)
+        self.assertEqual(judgement.run, RunCoordinate.parse("c", "with_skill", 2))
         self.assertIs(judgement.verdict, hj.HumanVerdict.FAIL)
         self.assertIsNone(judgement.note)
-        self.assertIsNone(judgement.model)
+        self.assertIsNone(judgement.run.model)
         self.assertFalse(judgement.label)
 
     def test_a_judgement_needs_a_verdict_or_a_note(self):
@@ -31,16 +32,22 @@ class HumanJudgementRecordTests(unittest.TestCase):
 
     def test_unknown_verdicts_are_rejected(self):
         with self.assertRaises(ValueError):
-            hj.HumanJudgement.parse({"case_id": "c", "variant": "v", "verdict": "meh"})
+            hj.HumanJudgement.parse({"case_id": "c", "variant": "with_skill", "verdict": "meh"})
+
+    def test_a_run_that_is_not_a_real_arm_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "execution variant"):
+            hj.HumanJudgement.parse({"case_id": "c", "variant": "v", "verdict": "pass"})
 
     def test_unsure_is_not_a_label(self):
-        judgement = hj.HumanJudgement.parse({"case_id": "c", "variant": "v", "verdict": "unsure"})
+        judgement = hj.HumanJudgement.parse(
+            {"case_id": "c", "variant": "with_skill", "verdict": "unsure"})
         self.assertIsNone(judgement.label)
 
     def test_upsert_replaces_the_same_run_and_assertion_only(self):
-        run_note = hj.HumanJudgement("c", "with_skill", note="odd output")
-        label = hj.HumanJudgement("c", "with_skill", assertion="q", verdict=hj.HumanVerdict.PASS)
-        relabel = hj.HumanJudgement("c", "with_skill", assertion="q", verdict=hj.HumanVerdict.FAIL)
+        run = RunCoordinate.parse("c", "with_skill")
+        run_note = hj.HumanJudgement(run, note="odd output")
+        label = hj.HumanJudgement(run, assertion="q", verdict=hj.HumanVerdict.PASS)
+        relabel = hj.HumanJudgement(run, assertion="q", verdict=hj.HumanVerdict.FAIL)
         stored = hj.upsert(hj.upsert(hj.upsert([], run_note), label), relabel)
         self.assertEqual(len(stored), 2)
         self.assertIs(stored[-1].verdict, hj.HumanVerdict.FAIL)
@@ -71,7 +78,7 @@ class SingleStoreTests(unittest.TestCase):
             labels, source = sb.load_human_labels(str(ws / "feedback.json"))
         self.assertEqual(doc["unparsed_entries"],
                          [{"case_id": "", "variant": "with_skill", "verdict": "good"}])
-        self.assertEqual({item.case_id for item in judgements}, {"c", "d"})
+        self.assertEqual({item.run.case_id for item in judgements}, {"c", "d"})
         self.assertEqual(labels, {})
         self.assertEqual(source["skipped"]["unparsed"], 1)
 
@@ -118,7 +125,8 @@ class SingleStoreTests(unittest.TestCase):
              "execution_valid": True, "grading_availability": "complete",
              "assertions": [{"name": "a", "type": "contains", "passed": False}],
              "qualitative_assertions": []}]}
-        feedback = [hj.HumanJudgement("c", "with_skill", note="answered a different question",
+        feedback = [hj.HumanJudgement(RunCoordinate.parse("c", "with_skill"),
+                                      note="answered a different question",
                                       verdict=hj.HumanVerdict.FAIL)]
         queue = sb.error_analysis_report(report, feedback=feedback)["review_queue"]
         self.assertEqual(queue[0]["note"], "answered a different question")

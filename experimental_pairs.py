@@ -13,7 +13,15 @@ from enum import Enum
 from typing import Any, Generic, TypeVar
 
 from completion_contracts import effort_identity
-from manifest_contracts import CaseId, ModelId, RunNumber
+from manifest_contracts import (
+    OLD_SKILL,
+    WITH_SKILL,
+    WITHOUT_SKILL,
+    CaseId,
+    ExecutionVariant,
+    ModelId,
+    RunNumber,
+)
 
 PayloadT = TypeVar("PayloadT")
 
@@ -64,15 +72,36 @@ class TreatmentCoordinate:
         object.__setattr__(self, "factors", ordered)
 
 
+class HeldFixedFactor(str, Enum):
+    """A condition both arms of a pair must share for their difference to be the skill's.
+
+    A contrast varies one ``ExperimentalFactor``; everything named here must be
+    equal between the two arms, or the pair is blocked. Each factor is read
+    from a result row or run metadata by one reader.
+    """
+
+    EFFORT = "effort"
+
+
+_HELD_FIXED_READERS: dict[HeldFixedFactor, Callable[[Mapping[str, Any]], str | None]] = {
+    HeldFixedFactor.EFFORT: effort_identity,
+}
+
+
 @dataclass(frozen=True)
 class ContrastSpec:
-    """One declared binary comparison and both of its treatment coordinates."""
+    """One declared binary comparison and both of its treatment coordinates.
+
+    ``held_fixed`` names the conditions that must match between the arms of a
+    pair, so an effort difference cannot pass as a skill effect.
+    """
 
     contrast_id: str
     treatment_arm: ExperimentalArmId
     control_arm: ExperimentalArmId
     treatment: TreatmentCoordinate
     control: TreatmentCoordinate
+    held_fixed: tuple[HeldFixedFactor, ...] = (HeldFixedFactor.EFFORT,)
 
     def __post_init__(self) -> None:
         if not isinstance(self.contrast_id, str) or not self.contrast_id.strip():
@@ -88,12 +117,33 @@ class ContrastSpec:
             raise TypeError("experimental contrast coordinates must be TreatmentCoordinate")
         if self.treatment == self.control:
             raise ValueError("experimental contrast coordinates must be distinct")
+        held = tuple(HeldFixedFactor(item) for item in self.held_fixed)
+        if len(set(held)) != len(held):
+            raise ValueError("a held-fixed factor can be named only once")
+        object.__setattr__(self, "held_fixed", held)
+
+    def comparability(self, left: Mapping[str, Any], right: Mapping[str, Any]) -> str | None:
+        """The block reason when two arms did not share a held-fixed condition.
+
+        Rows recorded before a factor existed carry none, and two such rows
+        still pair. One recorded arm against one unrecorded arm cannot be shown
+        to match, so that pair is blocked rather than trusted.
+        """
+        for factor in self.held_fixed:
+            reader = _HELD_FIXED_READERS[factor]
+            left_value, right_value = reader(left), reader(right)
+            if left_value == right_value:
+                continue
+            if left_value is None or right_value is None:
+                return f"{factor.value}_unrecorded_on_one_arm"
+            return f"{factor.value}_mismatch"
+        return None
 
 
 SKILL_PRESENCE_CONTRAST = ContrastSpec(
     contrast_id="skill_presence",
-    treatment_arm=ExperimentalArmId("with_skill"),
-    control_arm=ExperimentalArmId("without_skill"),
+    treatment_arm=ExperimentalArmId(WITH_SKILL),
+    control_arm=ExperimentalArmId(WITHOUT_SKILL),
     treatment=TreatmentCoordinate((
         FactorCoordinate(ExperimentalFactor.ACTIVATION, "forced"),
         FactorCoordinate(ExperimentalFactor.SKILL_SET, "all"),
@@ -105,6 +155,47 @@ SKILL_PRESENCE_CONTRAST = ContrastSpec(
         FactorCoordinate(ExperimentalFactor.CONTENT_REVISION, "current"),
     )),
 )
+
+
+# The current skill against the revision it replaces, in the same run.
+EDIT_CONTRAST = ContrastSpec(
+    contrast_id="skill_edit",
+    treatment_arm=ExperimentalArmId(WITH_SKILL),
+    control_arm=ExperimentalArmId(OLD_SKILL),
+    treatment=TreatmentCoordinate((
+        FactorCoordinate(ExperimentalFactor.ACTIVATION, "forced"),
+        FactorCoordinate(ExperimentalFactor.SKILL_SET, "all"),
+        FactorCoordinate(ExperimentalFactor.CONTENT_REVISION, "current"),
+    )),
+    control=TreatmentCoordinate((
+        FactorCoordinate(ExperimentalFactor.ACTIVATION, "forced"),
+        FactorCoordinate(ExperimentalFactor.SKILL_SET, "all"),
+        FactorCoordinate(ExperimentalFactor.CONTENT_REVISION, "previous"),
+    )),
+)
+
+
+def ablation_contrast(variant: object) -> ContrastSpec:
+    """The full skill against the same skill with one declared component removed."""
+    arm = ExecutionVariant.parse(variant)
+    ablation_id = arm.ablation_id
+    if ablation_id is None:
+        raise ValueError(f"{arm!r} is not an ablation arm")
+    return ContrastSpec(
+        contrast_id=f"ablation:{ablation_id}",
+        treatment_arm=ExperimentalArmId(WITH_SKILL),
+        control_arm=ExperimentalArmId(arm),
+        treatment=TreatmentCoordinate((
+            FactorCoordinate(ExperimentalFactor.ACTIVATION, "forced"),
+            FactorCoordinate(ExperimentalFactor.SKILL_SET, "all"),
+            FactorCoordinate(ExperimentalFactor.CONTENT_REVISION, "current"),
+        )),
+        control=TreatmentCoordinate((
+            FactorCoordinate(ExperimentalFactor.ACTIVATION, "forced"),
+            FactorCoordinate(ExperimentalFactor.SKILL_SET, f"without:{ablation_id}"),
+            FactorCoordinate(ExperimentalFactor.CONTENT_REVISION, "current"),
+        )),
+    )
 
 
 class ExperimentalPopulation(str, Enum):
@@ -361,20 +452,6 @@ def construct_pairs(
     return PairConstruction(contrast, tuple(pairs), tuple(blocked))
 
 
-def effort_comparability(left: Mapping[str, Any], right: Mapping[str, Any]) -> str | None:
-    """Block a pair whose arms ran at different, or unprovably equal, effort.
-
-    Rows recorded before effort existed carry none, and two such rows still
-    pair as before. One recorded arm against one unrecorded arm cannot be
-    shown to share an effort level, so the pair is blocked rather than trusted."""
-    left_effort, right_effort = effort_identity(left), effort_identity(right)
-    if left_effort == right_effort:
-        return None
-    if left_effort is None or right_effort is None:
-        return "effort_unrecorded_on_one_arm"
-    return "effort_mismatch"
-
-
 def pairs_from_rows(
     rows: Iterable[Mapping[str, Any]],
     *,
@@ -393,4 +470,4 @@ def pairs_from_rows(
         assert isinstance(arm, str)
         arms.append(ExperimentalArm(
             key, ExperimentalArmId(arm), row, eligible, reason))
-    return construct_pairs(arms, contrast=contrast, comparable=effort_comparability)
+    return construct_pairs(arms, contrast=contrast, comparable=contrast.comparability)

@@ -37,17 +37,11 @@ class StopClassificationTests(unittest.TestCase):
                 self.assertIs(observed.stop_class, expected)
                 self.assertEqual(observed.raw, raw)
 
-    def test_finish_reason_length_is_truncation(self):
-        self.assertIs(cc.stop_from_finish_reason("length", source="t").stop_class,
-                      cc.StopClass.TRUNCATED)
-        self.assertIs(cc.stop_from_finish_reason("stop", source="t").stop_class,
-                      cc.StopClass.COMPLETED)
-
-    def test_missing_reason_is_unobserved_not_completed(self):
+    def test_missing_reason_is_unavailable_not_completed(self):
         for value in (None, "", 3):
             with self.subTest(value=value):
                 observed = cc.stop_from_messages_api(value, source="t")
-                self.assertIs(observed.stop_class, cc.StopClass.UNOBSERVED)
+                self.assertIs(observed.stop_class, cc.StopClass.UNAVAILABLE)
                 self.assertIsNone(observed.raw)
 
     def test_max_turns_subtype_outranks_the_last_message(self):
@@ -55,12 +49,12 @@ class StopClassificationTests(unittest.TestCase):
         self.assertIs(observed.stop_class, cc.StopClass.TURN_LIMIT)
         self.assertFalse(observed.scorable)
 
-    def test_no_result_event_is_unobserved(self):
-        self.assertIs(cc.claude_result_stop(None).stop_class, cc.StopClass.UNOBSERVED)
+    def test_no_result_event_is_unavailable(self):
+        self.assertIs(cc.claude_result_stop(None).stop_class, cc.StopClass.UNAVAILABLE)
 
-    def test_unobserved_cannot_carry_a_raw_reason(self):
+    def test_unavailable_cannot_carry_a_raw_reason(self):
         with self.assertRaises(ValueError):
-            cc.StopObservation(cc.StopClass.UNOBSERVED, "end_turn", "t")
+            cc.StopObservation(cc.StopClass.UNAVAILABLE, "end_turn", "t")
 
 
 class ServedModelTests(unittest.TestCase):
@@ -95,28 +89,46 @@ class ServedModelTests(unittest.TestCase):
 
     def test_absent_evidence_is_named(self):
         self.assertIs(cc.served_model_check("claude-opus-5-5", None),
-                      cc.ServedModelCheck.UNOBSERVED)
+                      cc.ServedModelCheck.UNAVAILABLE)
         self.assertIs(cc.served_model_check(None, "claude-opus-5-5"),
                       cc.ServedModelCheck.NOT_REQUESTED)
 
-    def test_last_reported_model_wrote_the_answer(self):
-        served = cc.ServedModel.observe("claude-opus-5-5", ["claude-haiku-4-5", "claude-opus-5-5"])
-        self.assertEqual(served.served, "claude-opus-5-5")
-        self.assertEqual(served.all_served, ("claude-haiku-4-5", "claude-opus-5-5"))
-        self.assertIs(served.check, cc.ServedModelCheck.MATCH)
+    def test_one_rule_for_zero_one_and_many_reported_models(self):
+        cases = [
+            ([], None, cc.ServedModelCheck.UNAVAILABLE),
+            (["claude-opus-5-5", "claude-opus-5-5"], "claude-opus-5-5", cc.ServedModelCheck.MATCH),
+            (["claude-haiku-4-5"], "claude-haiku-4-5", cc.ServedModelCheck.MISMATCH),
+            # A fallback mid-run: the requested model answered some turns, so
+            # no single model can be credited, but the run is not a clean miss.
+            (["claude-opus-5-5", "claude-sonnet-5-5"], None, cc.ServedModelCheck.MIXED),
+            (["claude-haiku-4-5", "claude-sonnet-5-5"], None, cc.ServedModelCheck.MISMATCH),
+        ]
+        for reported, served, check in cases:
+            with self.subTest(reported=reported):
+                observed = cc.ServedModel.observe("claude-opus-5-5", reported)
+                self.assertEqual(observed.served, served)
+                self.assertEqual(observed.reported, tuple(dict.fromkeys(reported)))
+                self.assertIs(observed.check, check)
+
+    def test_only_a_clear_mismatch_is_unscorable(self):
+        mixed = cc.ServedModel.observe("claude-opus-5-5", ["claude-opus-5-5", "claude-sonnet-5-5"])
+        mismatch = cc.ServedModel.observe("claude-opus-5-5", ["claude-sonnet-5-5"])
+        self.assertIsNone(cc.completion_unscorable_reason(mixed.as_metadata()))
+        self.assertEqual(cc.completion_unscorable_reason(mismatch.as_metadata()),
+                         "served_model_mismatch")
 
 
 class EffortTests(unittest.TestCase):
     def test_default_effort_is_recorded_not_omitted(self):
         self.assertEqual(cc.EffortSetting.default().as_metadata(),
-                         {"effort": {"requested": None, "applied_by": "backend-default"}})
+                         {"effort": {"requested": None, "applied_by": "backend_default"}})
 
     def test_unknown_levels_are_rejected(self):
         with self.assertRaises(ValueError):
             cc.EffortSetting("ultra", "claude --effort")
 
     def test_effort_identity_distinguishes_default_from_unrecorded(self):
-        self.assertEqual(cc.effort_identity({"effort": {"requested": None}}), "backend-default")
+        self.assertEqual(cc.effort_identity({"effort": {"requested": None}}), "backend_default")
         self.assertEqual(cc.effort_identity({"effort": {"requested": "high"}}), "high")
         self.assertIsNone(cc.effort_identity({}))
 
@@ -205,7 +217,7 @@ class ClaudeRunnerCompletionTests(unittest.TestCase):
         self.assertEqual(meta["stop_reason"], "end_turn")
         self.assertEqual(meta["served_model"], "claude-haiku-4-5-20251001")
         self.assertEqual(meta["served_model_check"], "match")
-        self.assertEqual(meta["effort"], {"requested": None, "applied_by": "backend-default"})
+        self.assertEqual(meta["effort"], {"requested": None, "applied_by": "backend_default"})
         self.assertNotIn("--effort", argv)
 
     def test_requested_effort_reaches_the_cli_and_the_record(self):
@@ -214,11 +226,11 @@ class ClaudeRunnerCompletionTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--effort") + 1], "high")
         self.assertEqual(meta["effort"], {"requested": "high", "applied_by": "claude --effort"})
 
-    def test_stream_without_stop_fields_records_unobserved(self):
+    def test_stream_without_stop_fields_records_unavailable(self):
         with tempfile.TemporaryDirectory() as t:
             meta, _ = self.run_claude(Path(t))
-        self.assertEqual(meta["stop_class"], "unobserved")
-        self.assertEqual(meta["served_model_check"], "unobserved")
+        self.assertEqual(meta["stop_class"], "unavailable")
+        self.assertEqual(meta["served_model_check"], "unavailable")
 
     def test_truncated_run_is_excluded_from_scoring(self):
         with tempfile.TemporaryDirectory() as t:
@@ -246,7 +258,7 @@ class RunEndingsReportTests(unittest.TestCase):
         self.assertEqual(block["served_model_mismatches"], 1)
         self.assertEqual(block["by_variant"]["without_skill"]["stop_class"],
                          {"truncated": 1, "unrecorded": 1})
-        self.assertIn("backend-default", block["effort_levels"])
+        self.assertIn("backend_default", block["effort_levels"])
         self.assertTrue(any("refusal" in note for note in block["notes"]))
 
 

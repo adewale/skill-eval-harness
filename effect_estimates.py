@@ -61,6 +61,37 @@ class NoiseVerdict(str, Enum):
     RESOLVABLE = "resolvable"
 
 
+class InferenceUnit(str, Enum):
+    """What one delta in a paired test is a delta of.
+
+    The sign-flip test counts units, not runs. Which unit it counts depends on
+    the report: benchmark lift pairs per (case, model), ablation confirmation
+    pairs repetitions within one case, and trigger comparison pairs authored
+    queries. Extra repetitions sharpen a case's rate but never add a case, so
+    the advice for an underpowered eval depends on the unit.
+    """
+
+    CASE = "case"
+    REPLICATE_PAIR = "replicate_pair"
+    QUERY = "query"
+
+    @property
+    def plural(self) -> str:
+        return {InferenceUnit.CASE: "cases",
+                InferenceUnit.REPLICATE_PAIR: "matched replicate pairs",
+                InferenceUnit.QUERY: "authored queries"}[self]
+
+
+def minimum_units_note(unit: InferenceUnit, alpha: float = DEFAULT_ALPHA) -> str:
+    """How many units must move before the paired test can reach ``alpha``."""
+    needed = cases_needed_for_alpha(alpha)
+    note = (f"p <= {alpha:g} needs at least {needed} {unit.plural} that move the same way "
+            f"(the smallest reachable p with {needed} is {smallest_achievable_p(needed):g})")
+    if unit is InferenceUnit.CASE:
+        note += "; more repetitions sharpen each case's rate but do not add cases"
+    return note
+
+
 def ceiling_or_floor(with_rate: float | None, without_rate: float | None,
                      *, eps: float = 1e-9) -> DiscriminationFailure | None:
     """Classify a case whose two arms sit at the same extreme.
@@ -348,3 +379,48 @@ def noise_check(deltas: Sequence[float], without_rates: Sequence[float], *,
     if floor is not None and target is not None and target > 0 and floor >= target:
         out["projected_cases"] = math.ceil(n * (floor / target) ** 2)
     return out
+
+
+@dataclass(frozen=True)
+class Estimate:
+    """One paired effect: the test, its interval and the noise check, from one set of deltas.
+
+    Every lift the harness reports is built here, so the p-value, the interval
+    and the noise check can never be computed from different deltas or
+    described in different units.
+    """
+
+    unit: InferenceUnit
+    deltas: tuple[float, ...]
+    significance: dict[str, Any]
+    interval: dict[str, Any]
+    noise: dict[str, Any] | None
+
+    @classmethod
+    def from_deltas(cls, deltas: Sequence[float], *, unit: InferenceUnit,
+                    without_rates: Sequence[float] | None = None,
+                    min_lift: float | None = None,
+                    alpha: float = DEFAULT_ALPHA) -> Estimate:
+        values = tuple(float(value) for value in deltas)
+        interval = sign_flip_interval(values, confidence=1 - alpha)
+        noise = None
+        if without_rates is not None:
+            noise = noise_check(values, list(without_rates), interval=interval,
+                                alpha=alpha, min_lift=min_lift)
+        return cls(InferenceUnit(unit), values, sign_flip_test(values, alpha=alpha),
+                   interval, noise)
+
+    @property
+    def significant(self) -> bool:
+        return bool(self.significance.get("significant_at_0_05"))
+
+    def blocks(self) -> dict[str, Any]:
+        """The report fields: ``significance``, ``interval`` and, when the
+        baseline rates were given, ``noise_check``, each naming its unit."""
+        out: dict[str, Any] = {
+            "significance": {**self.significance, "unit": self.unit.value},
+            "interval": {**self.interval, "unit": self.unit.value},
+        }
+        if self.noise is not None:
+            out["noise_check"] = {**self.noise, "unit": self.unit.value}
+        return out
