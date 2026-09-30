@@ -8557,18 +8557,6 @@ def import_trace(args: argparse.Namespace) -> int:
     return 0
 
 
-def final_answer_from_events(events: dict[str, Any]) -> str:
-    messages = [e for e in events.get("events", []) if isinstance(e, dict) and e.get("type") == "message"]
-    for event in reversed(messages):
-        role = str(event.get("role", event.get("name", ""))).casefold()
-        if role and role not in {"assistant", "message", ""}:
-            continue
-        text = event.get("output_summary") or event.get("input_summary")
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-    return ""
-
-
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -18462,29 +18450,6 @@ def viewer_html(report: dict[str, Any], runs_root: Path | None = None, *, previo
             "</tr>")
     parts.append("</table>")
     return "\n".join(parts)
-
-
-def iteration_dirs(root: Path) -> list[Path]:
-    """The iteration-N convention (roadmap 2.9), sorted by iteration number."""
-    if not root.is_dir():
-        return []
-    found = []
-    for child in root.iterdir():
-        m = re.fullmatch(r"iteration-(\d+)", child.name)
-        if child.is_dir() and m:
-            found.append((int(m.group(1)), child))
-    return [p for _, p in sorted(found)]
-
-
-def next_iteration_dir(root: Path) -> Path:
-    existing = iteration_dirs(root)
-    if not existing:
-        return root / "iteration-1"
-    match = re.fullmatch(r"iteration-(\d+)", existing[-1].name)
-    if match is None:
-        raise AssertionError("iteration_dirs returned a non-iteration directory")
-    last = int(match.group(1))
-    return root / f"iteration-{last + 1}"
 
 
 def serve_viewer(html_text: str, workspace: Path, port: int) -> None:

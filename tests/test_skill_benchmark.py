@@ -399,7 +399,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 9, "reasoning_output_tokens": 0}},
         ]
         events, metrics = sb.normalize_trace_records(records, source="codex")
-        self.assertEqual(sb.final_answer_from_events(events), "codex-trace-ok")
+        messages = [e for e in events["events"] if e["type"] == "message"]
+        self.assertEqual([(m.get("role"), m.get("status"), m.get("input_summary")) for m in messages],
+                         [("assistant", "completed", "codex-trace-ok")])
         self.assertEqual(metrics["commands"], 1)
         self.assertTrue(metrics["skill_invoked"])
         self.assertEqual(metrics["input_tokens"], 100)

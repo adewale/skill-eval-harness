@@ -379,16 +379,6 @@ class ServedReportArtifactTests(unittest.TestCase):
 class IterationWorkflowTests(unittest.TestCase):
     """2.9 — iteration-N convention and the previous-workspace diff."""
 
-    def test_iteration_dir_helpers(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            self.assertEqual(sb.next_iteration_dir(root).name, "iteration-1")
-            (root / "iteration-1").mkdir()
-            (root / "iteration-3").mkdir()
-            (root / "not-an-iteration").mkdir()
-            self.assertEqual([p.name for p in sb.iteration_dirs(root)], ["iteration-1", "iteration-3"])
-            self.assertEqual(sb.next_iteration_dir(root).name, "iteration-4")
-
     def test_benchmark_report_diff(self):
         previous = {
             "availability": "complete",
