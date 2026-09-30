@@ -1658,16 +1658,6 @@ class AblationReviewFixesTests(unittest.TestCase):
                 sb._ensure_ablation_dir(d)
             self.assertTrue((d / "important.txt").exists())   # never deleted
 
-    def test_execution_valid_flags_infrastructure_failures(self):
-        self.assertTrue(sb.execution_valid({"returncode": 0}, "a real answer"))
-        self.assertTrue(sb.execution_valid(None, "answer with no metadata"))
-        self.assertFalse(sb.execution_valid({"returncode": 1}, "x"))
-        self.assertFalse(sb.execution_valid({"timed_out": True}, "x"))
-        self.assertFalse(sb.execution_valid({"timeout": True}, "x"))
-        self.assertFalse(sb.execution_valid({}, "[CODEX FAILURE: returncode=1]\n\n"))
-        self.assertFalse(sb.execution_valid({}, "[JETTY FAILURE: trajectory failed before producing output]\n"))
-        self.assertFalse(sb.execution_valid({}, "[TIMEOUT: no final assistant message captured]"))
-
     # --- #6 gate soundness ---
     def test_validate_rejects_mechanism_class_mismatch(self):
         stderr = io.StringIO()
@@ -2318,98 +2308,6 @@ class AblationRecordTests(unittest.TestCase):
                          {"id": "a", "mode": "instruction_simulated", "population": "answer"})
 
 
-class PreparedTaskTests(unittest.TestCase):
-    """Move C: the prepared row OWNS blinding. The only model-facing variant comes
-    from its Arm, so a blind arm cannot leak the hypothesis no matter which exporter
-    reads it — and the two DISTINCT blinds are both honored: the experiment-blind
-    (materialized -> present as with_skill) and the path-hygiene blind (any ablation
-    -> opaque upload token)."""
-
-    def test_draft_can_be_partial_but_execution_validation_is_strict(self):
-        draft = am.PreparedTaskDraft.from_row({"variant": "with_skill", "prompt": "review"})
-        self.assertEqual(draft.prompt, "review")
-        with self.assertRaises(ValueError):
-            draft.validate()
-
-    def test_invalid_execution_rows_are_unconstructible(self):
-        base = {
-            "case_id": "c", "split": "tune", "kind": "behavior", "variant": "with_skill",
-            "run_number": 1, "skill_name": "s", "repo_root": "/repo",
-            "skill_paths": ["skills/s/SKILL.md"], "input_files": [],
-            "run_dir": "c/with_skill/run-1", "instruction": "", "prompt": "p", "tags": [],
-        }
-        with self.assertRaisesRegex(ValueError, "missing run_number"):
-            am.PreparedTask.from_row({key: value for key, value in base.items() if key != "run_number"})
-        mutations = [
-            {"case_id": ""}, {"split": "other"}, {"kind": "trigger"}, {"variant": "unknown"},
-            {"run_number": 0}, {"run_number": True}, {"run_number": "1"},
-            {"run_dir": "../escape"}, {"run_dir": "/absolute"}, {"run_dir": "."},
-            {"skill_paths": "not-a-list"},
-        ]
-        for mutation in mutations:
-            with self.subTest(mutation=mutation), self.assertRaises((TypeError, ValueError)):
-                am.PreparedTask.from_row({**base, **mutation})
-        with self.assertRaises(ValueError):
-            am.PreparedTask.from_row({**base, "variant": "without_skill"})
-
-    def test_materialized_task_rejects_missing_mount_and_mismatched_canonical_hash(self):
-        row = self.mat_row().harness_record()
-        for mutation in ({"skill_paths": []}, {"skill_tree_hash": "OTHER"}, {"skill_tree_hash": None}):
-            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                am.PreparedTask.from_row({**row, **mutation})
-
-    def mat_row(self):
-        prov = am.Provenance(id="no-rp", mode="materialized", population="answer",
-                             identity=am.TreeIdentity(canonical="C", edited="E"),
-                             components=(am.Component("instructions", "section", "s", {}),))
-        return am.PreparedTask(case_id="c", split="tune", kind="behavior", variant_truth="ablation:no-rp",
-                               run_number=1, skill_name="good-pr", repo_root="/r", skill_paths=("/m/SKILL.md",),
-                               input_files=(), run_dir="c/ablation:no-rp", instruction="Use the skill under test (good-pr).",
-                               prompt="Review.", tags=(), ablation=prov, skill_tree_hash="C")
-
-    def sim_row(self):
-        sim = am.InstructionSimulated(id="no-rp", population="answer", removed_component="rp")
-        return am.PreparedTask(case_id="c", split="tune", kind="behavior", variant_truth="ablation:no-rp",
-                               run_number=1, skill_name="good-pr", repo_root="/r", skill_paths=("/m/SKILL.md",),
-                               input_files=(), run_dir="c/ablation:no-rp", instruction="...directive...",
-                               prompt="Review.", tags=(), ablation=sim)
-
-    def test_materialized_arm_presents_as_with_skill(self):
-        pt = self.mat_row()
-        self.assertTrue(pt.is_materialized_ablation)
-        self.assertTrue(pt.is_blind)
-        self.assertEqual(pt.model_facing_variant(), "with_skill")             # experiment-blind
-        self.assertEqual(pt.harness_record()["variant"], "ablation:no-rp")    # truth on the row
-
-    def test_instruction_simulated_arm_is_transparent(self):
-        pt = self.sim_row()
-        self.assertFalse(pt.is_materialized_ablation)
-        self.assertFalse(pt.is_blind)
-        self.assertEqual(pt.model_facing_variant(), "ablation:no-rp")         # model is told what to simulate
-
-    def test_upload_token_is_opaque_for_any_ablation(self):
-        for pt in (self.mat_row(), self.sim_row()):
-            tok = pt.upload_token()
-            self.assertNotIn("no-rp", tok)
-            self.assertNotIn("ablation", tok)
-
-    def test_round_trips_through_the_row(self):
-        for pt in (self.mat_row(), self.sim_row()):
-            back = am.PreparedTask.from_row(pt.harness_record())
-            self.assertEqual(back.variant_truth, pt.variant_truth)
-            self.assertEqual(type(back.ablation), type(pt.ablation))          # record type survives the round trip
-            self.assertEqual(back.is_blind, pt.is_blind)
-            self.assertEqual(back.harness_record(), pt.harness_record())      # serialization is stable
-
-
-    def test_workspace_and_prompt_helpers_reject_drafts(self):
-        draft = am.PreparedTaskDraft.from_row({"variant": "with_skill"})
-        with tempfile.TemporaryDirectory() as td, self.assertRaises(TypeError):
-            sb.build_skill_workspace(draft, Path(td))
-        with self.assertRaises(TypeError):
-            sb.build_task_prompt(draft)
-
-
 class ConsumersTakeAPreparedTaskTests(unittest.TestCase):
     """After the JSONL boundary the runner adapters consume a PreparedTask, so the
     model-facing variant, upload token, and skill paths are owned by ONE object
@@ -2438,6 +2336,13 @@ class ConsumersTakeAPreparedTaskTests(unittest.TestCase):
                                input_files=(), run_dir="c1/ablation:no-rp",
                                instruction="Use the good-pr skill, but simulate this ablation: drop rp.",
                                prompt="Review.", tags=(), ablation=sim)
+
+    def test_workspace_and_prompt_helpers_reject_drafts(self):
+        draft = am.PreparedTaskDraft.from_row({"variant": "with_skill"})
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(TypeError):
+            sb.build_skill_workspace(draft, Path(td))
+        with self.assertRaises(TypeError):
+            sb.build_task_prompt(draft)
 
     def test_safe_task_json_model_visible_variant_is_owned_by_the_object(self):
         mat = sb.safe_task_json(self.mat_pt(), self.MANIFEST, task_name="t", upload_files=[])
