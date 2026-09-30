@@ -205,7 +205,7 @@ class ClaudeRunnerCompletionTests(unittest.TestCase):
         sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(runs),
                                          model="claude-haiku-4-5", claude_bin=str(stub),
                                          timeout=60, effort=effort))
-        meta = sb.read_metadata_base(runs / rows[0]["run_dir"])
+        meta = sb.read_metrics_base(runs / rows[0]["run_dir"])
         argv = json.loads(probe.read_text()) if probe.exists() else None
         return meta, argv
 

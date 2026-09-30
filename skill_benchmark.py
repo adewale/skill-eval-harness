@@ -511,13 +511,7 @@ def write_json(path: Path, data: Any) -> None:
         data, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def _atomic_write_text(
-    path: Path,
-    text: str,
-    *,
-    before_replace: Callable[[], None] | None = None,
-    after_replace: Callable[[], None] | None = None,
-) -> None:
+def _atomic_write_text(path: Path, text: str) -> None:
     """Durably replace one text file without exposing a partial new value."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, raw_tmp = tempfile.mkstemp(
@@ -528,8 +522,6 @@ def _atomic_write_text(
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        if before_replace is not None:
-            before_replace()
         os.replace(tmp, path)
         try:
             parent_fd = os.open(path.parent, os.O_RDONLY)
@@ -543,8 +535,6 @@ def _atomic_write_text(
                 pass
             finally:
                 os.close(parent_fd)
-        if after_replace is not None:
-            after_replace()
     finally:
         try:
             tmp.unlink()
@@ -552,29 +542,12 @@ def _atomic_write_text(
             pass
 
 
-def atomic_write_jsonl(
-    path: Path,
-    records: Iterable[dict[str, Any]],
-    *,
-    fault_inject: Callable[[str], None] | None = None,
-) -> None:
+def atomic_write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
     """Atomically publish a complete JSONL prefix for resumable producers."""
-    text = "".join(
+    _atomic_write_text(path, "".join(
         json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
         for record in records
-    )
-    _atomic_write_text(
-        path,
-        text,
-        before_replace=(
-            (lambda: fault_inject("before_result_commit"))
-            if fault_inject is not None else None
-        ),
-        after_replace=(
-            (lambda: fault_inject("after_result_commit"))
-            if fault_inject is not None else None
-        ),
-    )
+    ))
 
 
 def emit_report(report: Any, out: str | Path | None) -> None:
@@ -2164,19 +2137,6 @@ def persist_answer_design(runs: Path, tasks: list[dict[str, Any]], *,
     return design
 
 
-def persist_answer_design_value(runs: Path, value: Any) -> dict[str, Any]:
-    design = validate_answer_design(value)
-    runs.mkdir(parents=True, exist_ok=True)
-    path = runs / ANSWER_DESIGN_NAME
-    if path.exists():
-        existing = validate_answer_design(strict_json_loads(path.read_text(encoding="utf-8")))
-        if existing != design:
-            die("runs directory already carries a different answer design")
-    else:
-        write_json(path, design)
-    return design
-
-
 def answer_design_identity(design: dict[str, Any], pt: PreparedTask,
                            model: str | None) -> dict[str, Any]:
     matches = [row for row in design["identities"]
@@ -2211,16 +2171,12 @@ JETTY_SUBMIT_TIMEOUT_HINT_S = 60
 # Python-urllib/x.y agent signature outright (403, error code 1010) — every
 # request must carry a real User-Agent.
 JETTY_USER_AGENT = "skill-eval-harness"
-JETTY_TERMINAL_SUCCESS = {"completed", "complete", "succeeded", "success"}
-JETTY_TERMINAL_FAILURE = {"failed", "failure", "error", "errored", "canceled", "cancelled", "timeout", "timed_out"}
-JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
 
 CODEX_HOME_FILES = ("auth.json", "config.toml")
 
 VIBE_READ_ONLY_TOOLS = ("skill", "read_file", "grep")
 VIBE_NO_TOOLS = ("re:^$",)
 
-GEMINI_AUTH_FILES = ("oauth_creds.json", "gemini-credentials.json")
 GEMINI_AUTH_ENV = (
     "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
     "GEMINI_API_KEY_AUTH_MECHANISM",
@@ -3967,27 +3923,6 @@ def replace_placeholders(value: Any, mapping: dict[str, str]) -> Any:
     if isinstance(value, dict):
         return {k: replace_placeholders(v, mapping) for k, v in value.items()}
     return value
-
-
-def resolved_task_upload_bytes(content: bytes, mapping: dict[str, str]) -> bytes:
-    """Resolve upload tokens in an immutable JSON task snapshot.
-
-    Remote paths are JSON-escaped before textual substitution, preserving the
-    exported task's exact formatting while keeping arbitrary provider paths
-    valid inside JSON strings.
-    """
-    try:
-        source = content.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError("Jetty task upload must be UTF-8 JSON") from exc
-    strict_json_loads(source)
-    escaped_mapping = {
-        token: json.dumps(remote, ensure_ascii=False)[1:-1]
-        for token, remote in mapping.items()
-    }
-    resolved = replace_placeholders(source, escaped_mapping)
-    strict_json_loads(resolved)
-    return resolved.encode("utf-8")
 
 
 def extract_trajectory_id(response: dict[str, Any]) -> str | None:
@@ -6202,7 +6137,7 @@ def discovered_run_units(runs: Path, case: dict[str, Any], variants: list[str]):
         for variant in variants:
             for run_number, base in discover_run_bases_under(model_root / variant):
                 text, output_path = read_output_base(base)
-                meta = read_metadata_base(base)
+                meta = read_metrics_base(base)
                 yield model_name, variant, run_number, base, text, output_path, meta
 
 
@@ -6257,15 +6192,6 @@ def discover_on_disk_run_rows(manifest: dict[str, Any], runs: Path) -> list[dict
     return rows
 
 
-def discover_run_bases(runs: Path, case_id: str, variant: str) -> list[tuple[int, Path]]:
-    """Return run instances for a case/variant in the legacy (model-less) layout:
-      runs/<case>/<variant>/output.md
-      runs/<case>/<variant>/run-<n>/output.md
-    Model-aware callers combine discover_case_model_roots with
-    discover_run_bases_under instead."""
-    return discover_run_bases_under(runs / case_id / variant)
-
-
 def discover_turn_bases(base: Path) -> list[tuple[int, Path]]:
     """Turn-indexed transcript layout for multi-turn cases (roadmap 3.1):
     <run base>/turn-<n>/output.md. A single-shot run has no turn dirs."""
@@ -6286,14 +6212,6 @@ def discover_turn_bases(base: Path) -> list[tuple[int, Path]]:
     if seen and seen != set(range(1, max(seen) + 1)):
         raise ValueError(f"non-contiguous turn identities under {base}")
     return sorted(found)
-
-
-def text_files_under(directory: Path) -> list[Path]:
-    if not directory.exists() or not directory.is_dir():
-        return []
-    exts = {".md", ".txt", ".json", ".jsonl", ".html", ".css", ".js", ".ts", ".py", ".vue", ".yml", ".yaml"}
-    files = [p for p in sorted(directory.rglob("*")) if p.is_file() and p.suffix.lower() in exts]
-    return files[:100]
 
 
 OUTPUT_FILE_ALIASES = (
@@ -6363,11 +6281,6 @@ def read_output_base(base: Path) -> tuple[str | None, Path]:
     return None, base / "output.md"
 
 
-def read_output(runs: Path, case_id: str, variant: str) -> tuple[str | None, Path]:
-    base = runs / case_id / variant
-    return read_output_base(base)
-
-
 def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str, Any]:
     declared_version = data.get("artifact_contract_version")
     observation = observe_artifact_set(
@@ -6398,17 +6311,6 @@ def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str
         enriched["metadata_error"] = error
         enriched["metadata_artifact_valid"] = False
     return enriched
-
-
-def read_metadata_base(base: Path) -> dict[str, Any]:
-    merged, error = read_run_sidecar_contract(base)
-    if error is not None:
-        return {"metadata_error": error, "metadata_artifact_valid": False}
-    return _with_committed_artifact_state(base, merged)
-
-
-def read_metadata(runs: Path, case_id: str, variant: str) -> dict[str, Any]:
-    return read_metadata_base(runs / case_id / variant)
 
 
 def read_json_dict_or_list(path: Path) -> Any:
@@ -7089,10 +6991,6 @@ def run_cost_facts(merged: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def missing_evidence(name: str) -> dict[str, Any]:
-    return {"passed": False, "evidence": f"missing {name} evidence"}
-
-
 def process_or_efficiency_assertion_result(assertion: dict[str, Any], run_base: Path | None, metadata: dict[str, Any]) -> tuple[bool | None, str]:
     if run_base is None:
         return None, "missing run directory for trace assertion"
@@ -7410,10 +7308,6 @@ def parse_trace_jsonl_text_with_lines(
 def parse_trace_jsonl_text(text: str) -> tuple[list[dict[str, Any]], list[str]]:
     records, errors, _ = parse_trace_jsonl_text_with_lines(text)
     return records, errors
-
-
-def load_trace_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    return parse_trace_jsonl_text(path.read_text(encoding="utf-8", errors="replace"))
 
 
 def nested_item_type(record: dict[str, Any]) -> str:
@@ -8565,7 +8459,7 @@ def import_trace(args: argparse.Namespace) -> int:
     except UnicodeDecodeError:
         trace_text = trace_bytes.decode("utf-8", errors="backslashreplace")
         trace_utf8_valid = False
-    existing = read_metadata_base(run_dir)
+    existing = read_metrics_base(run_dir)
     output_text, _ = read_output_base(run_dir)
     provider_complete = output_text is not None and execution_valid(existing, output_text)
     returncode = existing.get("returncode")
@@ -10184,16 +10078,6 @@ def vibe_final_answer(messages: list[dict[str, Any]]) -> str:
         if text:
             return text
     return ""
-
-
-def _walk_dicts(value: Any) -> Iterable[dict[str, Any]]:
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from _walk_dicts(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _walk_dicts(child)
 
 
 def vibe_usage_and_cost(messages: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, float | None]:
@@ -15492,23 +15376,6 @@ def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pa
     return paired_with_rates, paired_without_rates, negative_cases
 
 
-def _reliability_counts(rows: list[dict[str, Any]]) -> tuple[int, int]:
-    """(n, c) for one arm: n = scorable runs carrying an objective pass rate,
-    c = runs where every objective assertion passed. Identical predicate to
-    build_reliability (:build_reliability) so the paired counts line up with the
-    per-arm block above them."""
-    rates: list[float] = []
-    for row in rows:
-        value = row.get("objective_pass_rate")
-        if value is None:
-            continue
-        if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(float(value)) or not 0 <= float(value) <= 1):
-            raise ValueError("objective_pass_rate must be a finite number in [0, 1]")
-        rates.append(float(value))
-    return len(rates), sum(1 for x in rates if x >= 1.0 - 1e-12)
-
-
 def paired_case_counts(results: list[dict[str, Any]]) -> list[tuple[str, tuple[int, int], tuple[int, int]]]:
     """Per-case success counts over the same validated repetition-level pairs."""
     construction = _metric_pair_construction(results, "objective_pass_rate")
@@ -16594,24 +16461,6 @@ def build_cost_summary(results: list[dict[str, Any]], *, judge_results: dict[str
         # into the model-under-test totals.
         out["judge"] = judge_cost_block(judge_results)
     return out
-
-
-def judge_cost_usd(row: dict[str, Any]) -> float | None:
-    """One reading of a judge verdict's dollar cost, preferring the normalized
-    block. Both cost ledgers (build_cost_summary and suite_cost_ledger) route
-    through here — they previously read different fields, so a verdict whose
-    spend lived only in cost_normalized counted in one ledger and not the other."""
-    block = row.get("cost_normalized")
-    if isinstance(block, dict) and isinstance(block.get("total_cost"), (int, float)):
-        return float(block["total_cost"])
-    if isinstance(row.get("cost_usd"), (int, float)):
-        return float(row["cost_usd"])
-    aggregate = row.get("cost_aggregate")
-    usd = aggregate.get("USD") if isinstance(aggregate, dict) else None
-    if (isinstance(usd, dict) and usd.get("availability") == telemetry_domain.COMPLETE
-            and isinstance(usd.get("value"), (int, float))):
-        return float(usd["value"])
-    return None
 
 
 def judge_cost_block(judge_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -17868,7 +17717,7 @@ def index_comparison_runs(case_id: str, role: str,
 def comparison_run_artifact(base: Path) -> tuple[str | None, Path, dict[str, Any]]:
     """Read one candidate and enforce the shared scorable-run boundary."""
     text, output_path = read_output_base(base)
-    metadata = read_metadata_base(base)
+    metadata = read_metrics_base(base)
     missing_output = not output_path.is_file() or text is None or not text.strip()
     exec_valid = execution_valid(metadata, None if missing_output else text)
     if not scorable_run({
@@ -19354,8 +19203,8 @@ def paired_token_overhead_report(
                 without_metrics = read_metrics_base(without_base)
                 with_text, with_output_path = read_output_base(with_base)
                 without_text, without_output_path = read_output_base(without_base)
-                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, read_metadata_base(with_base), run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
-                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, read_metadata_base(without_base), run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
+                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, read_metrics_base(with_base), run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
+                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, read_metrics_base(without_base), run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
                 # A crashed/timed-out or output-less arm is an infrastructure failure,
                 # not evidence of token cost or accuracy; exclude the pair via the same
                 # scorable predicate every report view uses (was: graded raw, so a
@@ -19732,11 +19581,6 @@ def fixture_recommendations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 POSITIVE_OBJECTIVE_TYPES = {"contains", "contains_any", "contains_all", "regex"}
-
-
-def _mean_or_none(xs: list[float] | None) -> float | None:
-    xs = [x for x in (xs or []) if isinstance(x, (int, float))]
-    return statistics.mean(xs) if xs else None
 
 
 def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9) -> dict[str, Any]:

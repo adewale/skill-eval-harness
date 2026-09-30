@@ -1700,7 +1700,7 @@ class GeminiLiveSmokeTests(unittest.TestCase):
 
             base = runs / row["run_dir"]
             output = (base / "output.md").read_text(encoding="utf-8")
-            metadata = sb.read_metadata_base(base)
+            metadata = sb.read_metrics_base(base)
             self.assertTrue(am.execution_valid(metadata, output), metadata)
             self.assertEqual(metadata["provider"], "gemini")
             metrics = json.loads((base / "metrics.json").read_text())

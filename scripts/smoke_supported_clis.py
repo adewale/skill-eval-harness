@@ -30,7 +30,6 @@ from telemetry import ObservationEvidence
 from trigger_contracts import CompleteTriggerResult, TriggerObservation
 
 DEFAULT_MODELS = {name: target.resolved_model(os.environ) for name, target in SMOKE_TARGETS.items()}
-ANSWER_AGENTS = tuple(name for name, target in SMOKE_TARGETS.items() if target.population == "answer")
 SMOKE_TRIGGER_EXPECTATIONS = (
     ("Review this code change and label the severity of each finding.", True),
     ("What is the capital of France?", False),

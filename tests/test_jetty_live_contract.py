@@ -62,6 +62,12 @@ class JettyLiveContractTests(unittest.TestCase):
         # The 202 workflow_id is <collection>-<task>--<id>; the DB poll route
         # keys on the bare suffix and 404s on the full workflow id.
         self.assertEqual(sb.extract_trajectory_id(fixture("chat-completion-202-running.json")), "37c37963")
+        # Fallbacks: a workflow_id without the collection-task prefix is the id
+        # itself, the chatcmpl- response id is the last resort, and a response
+        # with neither carries no trajectory at all.
+        self.assertEqual(sb.extract_trajectory_id({"jetty_metadata": {"status": "running", "workflow_id": "traj_8"}}), "traj_8")
+        self.assertEqual(sb.extract_trajectory_id({"id": "chatcmpl-traj_7"}), "traj_7")
+        self.assertIsNone(sb.extract_trajectory_id({"object": "chat.completion"}))
 
     def test_db_trajectory_records_parse_into_lifecycles(self):
         completed = fixture("db-trajectory-completed.json")
