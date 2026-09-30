@@ -460,25 +460,31 @@ class SkillBenchmarkTests(unittest.TestCase):
                 "status": "failed", "jetty": {"model": "m"}, "artifacts": [],
             }
             attach_jetty_task_contract(base)
+            # Re-attested at a safe run_dir, so a duplicate reaches the identity
+            # guard instead of dying on the changed-after-attestation check.
+            safe = attach_jetty_task_contract(
+                {**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}})
             path = root / "jetty.jsonl"
             cases = [
-                [base],
-                [{**base, "harness": {k: v for k, v in base["harness"].items() if k != "run_number"}}],
-                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}},
-                 {**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}}],
-                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"},
-                  "status": "completed",
-                  "artifacts": [{"path": "output.md", "content": "answer"}]}],
-                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"},
-                  "status": "completed", "trajectory_id": "   ",
-                  "artifacts": [{"path": "output.md", "content": "answer"}]}],
+                ([base], "unsafe run_dir escapes runs directory"),
+                ([{**base, "harness": {k: v for k, v in base["harness"].items() if k != "run_number"}}],
+                 "harness.run_number must be a positive integer"),
+                ([safe, safe], "duplicate Jetty result identity"),
+                ([{**safe, "status": "completed",
+                   "artifacts": [{"path": "output.md", "content": "answer"}]}],
+                 "successful trajectory requires non-blank trajectory_id"),
+                ([{**safe, "status": "completed", "trajectory_id": "   ",
+                   "artifacts": [{"path": "output.md", "content": "answer"}]}],
+                 "successful trajectory requires non-blank trajectory_id"),
             ]
-            for records in cases:
-                with self.subTest(records=records):
+            for records, message in cases:
+                stderr = io.StringIO()
+                with self.subTest(message=message, records=records), contextlib.redirect_stderr(stderr):
                     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
                     with self.assertRaises(SystemExit):
                         sb.import_jetty_results(SimpleNamespace(
                             manifest=str(manifest), jetty_runs=str(path), runs=str(root / "runs")))
+                    self.assertIn(message, stderr.getvalue())
             self.assertFalse((root / "escape").exists())
 
     def test_import_jetty_persists_ablation_provenance_into_metadata(self):
