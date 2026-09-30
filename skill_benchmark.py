@@ -126,6 +126,7 @@ from artifact_contracts import (
     CompleteArtifactSet,
     LegacyArtifactSet,
     artifact_commit_valid,
+    file_sha256,
     observe_artifact_set,
 )
 from cli_contracts import CLICommand, CLIInvocation
@@ -8505,21 +8506,13 @@ def import_trace(args: argparse.Namespace) -> int:
     return 0
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def write_artifact_commit(run_dir: Path) -> None:
     """Write the commit marker last; absence means an interrupted artifact set."""
     missing = [name for name in ARTIFACT_REQUIRED_FILES if not (run_dir / name).is_file()]
     if missing:
         raise ValueError(f"cannot commit incomplete artifact set: {', '.join(missing)}")
     inventory = {
-        path.relative_to(run_dir).as_posix(): _file_sha256(path)
+        path.relative_to(run_dir).as_posix(): file_sha256(path)
         for path in sorted(run_dir.rglob("*"))
         if path.is_file() and path.name != ARTIFACT_COMMIT_NAME
     }

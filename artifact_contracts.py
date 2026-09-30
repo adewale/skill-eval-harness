@@ -110,7 +110,9 @@ def _invalid_inventory_entries(inventory: Mapping[Any, Any]) -> bool:
     )
 
 
-def _file_sha256(path: Path) -> str:
+def file_sha256(path: Path) -> str:
+    """The digest an artifact commit records for each file; the writer in
+    skill_benchmark and the validator here must hash identically."""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -187,7 +189,7 @@ def observe_artifact_set(
                 "artifact inventory does not match the files on disk")
         for name, digest in inventory.items():
             path = run_dir / name
-            if not path.is_file() or _file_sha256(path) != digest:
+            if not path.is_file() or file_sha256(path) != digest:
                 return IncompleteArtifactSet(
                     f"artifact content does not match the committed digest: {name}")
     except OSError as exc:
