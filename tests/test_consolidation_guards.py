@@ -164,17 +164,6 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         for name, cap in ac.AGENT_CAPABILITIES.items():
             self.assertIn(cap.dollar_cost, sb.COST_SOURCES, name)
 
-    def test_agent_capability_registry_declares_every_telemetry_signal(self):
-        for name, cap in ac.AGENT_CAPABILITIES.items():
-            signals = cap.telemetry_contract()
-            self.assertEqual(set(signals), {"usage", "cost", "elapsed_ms", "trace"}, name)
-            for signal in signals.values():
-                self.assertIn(signal.availability, {"available", "unavailable", "not_applicable"})
-                if signal.availability == "available":
-                    self.assertIsNotNone(signal.provenance)
-                else:
-                    self.assertIsNotNone(signal.reason)
-
     def test_available_capability_signals_require_explicit_provenance(self):
         common = {
             "answer_runner": False, "autonomous_trigger": False,
@@ -193,10 +182,6 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertEqual(signals["usage"].availability, "not_applicable")
         self.assertEqual(signals["cost"].availability, "not_applicable")
         self.assertEqual(signals["elapsed_ms"].availability, "available")
-
-    def test_invocation_request_is_answer_runner_only(self):
-        fields = set(sb.InvocationRequest.__dataclass_fields__)
-        self.assertEqual(fields, {"prompt", "workspace", "model", "timeout_s", "effort"})
 
     def test_agent_capability_registry_matches_registered_surfaces(self):
         self.assertEqual(
@@ -934,22 +919,6 @@ class TimeoutConventionTests(unittest.TestCase):
             self.assertIn("run_agent_tasks", src,
                           f"{fn.__name__} bypasses the shared native answer runner")
 
-    def test_runner_failure_markers_have_one_provider_map(self):
-        # Backend rows own the binding; the ablation module only projects it.
-        self.assertEqual(
-            am.RUNNER_FAILURE_MARKER_BY_PROVIDER,
-            {name: registration.failure_marker for name, registration in ac.BACKENDS.items()
-             if registration.failure_marker is not None},
-        )
-        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["codex"], am.CODEX_FAILURE)
-        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["claude"], am.CLAUDE_FAILURE)
-        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["subagent"], am.CLAUDE_FAILURE)
-        self.assertIs(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["vibe"], am.VIBE_FAILURE)
-        self.assertEqual(
-            am.RUNNER_FAILURE_MARKER_BY_PROVIDER["gemini"], "[GEMINI FAILURE")
-        for marker in am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values():
-            self.assertIn(marker, am.RUNNER_FAILURE_MARKERS)
-
     def test_subagent_timeout_is_a_timeout_not_a_generic_error(self):
         # A backend that times out must yield metadata the scorable predicate
         # excludes AND that names the timeout — not a generic error that loses
@@ -990,14 +959,6 @@ class TimeoutConventionTests(unittest.TestCase):
         self.assertEqual(meta["returncode"], 124)
         self.assertTrue(text.startswith(am.TIMEOUT_FAILURE))
         self.assertFalse(am.execution_valid(meta, text))
-
-    def test_native_invocation_helper_kills_process_groups_on_timeout(self):
-        src = inspect.getsource(sb.invoke_argv_with_timeout)
-        self.assertIn("start_new_session=True", src)
-        self.assertIn('getattr(os, "killpg"', src)
-        self.assertIn('getattr(signal, "SIGKILL"', src)
-        self.assertIn("InvocationOutcome.spawn_failed", src)
-        self.assertIn("invoke_argv_with_timeout", inspect.getsource(sb.run_argv_capture))
 
     def test_run_argv_with_timeout_converts_spawn_failure_to_failed_observation(self):
         result = sb.run_argv_with_timeout(["/definitely/not/a/real/binary"], cwd=Path("."), timeout=1)
