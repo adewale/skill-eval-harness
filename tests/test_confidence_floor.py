@@ -20,7 +20,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import attest_answer_design, load_example_module, make_eval_repo, write_run
+from helpers import (
+    attest_answer_design,
+    load_example_module,
+    make_eval_repo,
+    skill_markdown,
+    write_run,
+)
 
 import skill_benchmark as sb
 
@@ -106,32 +112,22 @@ class CF2BaselineIsolation(unittest.TestCase):
     MARKER = "SKILL-MARKER-8f2c41d7"
 
     def make_repo(self, root: Path) -> tuple[Path, dict]:
-        repo = root / "repo"
-        skill = repo / "skill"
-        (skill / "references").mkdir(parents=True)
-        (skill / "SKILL.md").write_text(f"---\nname: demo\ndescription: Demo skill\n---\n\n# Demo\n\n{self.MARKER}\n", encoding="utf-8")
-        (skill / "references" / "checklist.md").write_text(f"- {self.MARKER}\n", encoding="utf-8")
-        fixtures = repo / "evals" / "fixtures"
-        fixtures.mkdir(parents=True)
-        (fixtures / "input.txt").write_text("fixture input, no skill content\n", encoding="utf-8")
-        manifest = {
-            "version": 1,
-            "skill_name": "demo",
-            "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [{
+        path = make_eval_repo(
+            root,
+            skill_text=skill_markdown(body=f"# Demo\n\n{self.MARKER}\n"),
+            references={"references/checklist.md": f"- {self.MARKER}\n"},
+            cases=[{
                 "id": "case-1",
                 "split": "tune",
                 "kind": "behavior",
                 "prompt": "Do the task.",
                 "files": ["fixtures/input.txt"],
                 "assertions": [{"type": "contains", "value": "alpha"}],
-            }],
-            "ablations": [],
-        }
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        return path, manifest
+            }])
+        fixture = path.parent / "fixtures" / "input.txt"
+        fixture.parent.mkdir()
+        fixture.write_text("fixture input, no skill content\n", encoding="utf-8")
+        return path, json.loads(path.read_text(encoding="utf-8"))
 
     def workspace_files(self, ws: Path) -> list[Path]:
         return [p for p in sorted(ws.rglob("*")) if p.is_file()]

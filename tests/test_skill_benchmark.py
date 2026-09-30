@@ -11,7 +11,9 @@ from types import SimpleNamespace
 from helpers import (
     attach_jetty_task_contract,
     attest_answer_design,
+    demo_manifest,
     load_example_module,
+    write_demo_manifest,
     write_run,
 )
 
@@ -65,33 +67,17 @@ class SkillBenchmarkTests(unittest.TestCase):
         self.assertEqual(sb.mean_rate([good, crashed]), 1.0)   # the crash did not drag it to 0.5
 
     def make_manifest(self, root: Path) -> Path:
-        repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo skill\n---\n", encoding="utf-8")
-        (repo / "evals").mkdir()
-        manifest = {
-            "version": 1,
-            "skill_name": "demo",
-            "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [
-                {
-                    "id": "case-1",
-                    "split": "tune",
-                    "kind": "behavior",
-                    "prompt": "Say alpha and beta.",
-                    "expected_behavior": ["Say alpha and beta"],
-                    "assertions": [
-                        {"name": "has-alpha", "type": "contains", "value": "alpha"},
-                        {"name": "has-beta", "type": "contains", "value": "beta"},
-                    ],
-                }
+        return write_demo_manifest(root, demo_manifest(cases=[{
+            "id": "case-1",
+            "split": "tune",
+            "kind": "behavior",
+            "prompt": "Say alpha and beta.",
+            "expected_behavior": ["Say alpha and beta"],
+            "assertions": [
+                {"name": "has-alpha", "type": "contains", "value": "alpha"},
+                {"name": "has-beta", "type": "contains", "value": "beta"},
             ],
-            "ablations": [],
-        }
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        return path
+        }]))
 
     def test_repeated_runs_artifact_outputs_and_flaky_flag(self):
         with tempfile.TemporaryDirectory() as td:

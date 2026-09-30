@@ -6,6 +6,7 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import contextlib
+import io
 import json
 import os
 import stat
@@ -20,6 +21,7 @@ from helpers import (
     demo_manifest as base_manifest,
 )
 from helpers import (
+    make_eval_repo,
     trace_event,
     write_run,
 )
@@ -1142,19 +1144,13 @@ class JudgeRobustnessTests(unittest.TestCase):
 
     def _cli_manifest(self, td):
         root = Path(td)
-        (root / "repo" / "skill").mkdir(parents=True)
-        (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-        (root / "repo" / "evals").mkdir()
-        p = root / "repo" / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"], "ablations": [],
-            "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
-                       "assertions": [{"name": "j", "type": "judge", "severity": "gate", "review_rubric": ["is it good"]}]}]}), encoding="utf-8")
+        p = make_eval_repo(root, cases=[{
+            "id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
+            "assertions": [{"name": "j", "type": "judge", "severity": "gate",
+                            "review_rubric": ["is it good"]}]}])
         runs = root / "runs"
-        (runs / "c" / "with_skill").mkdir(parents=True)
-        (runs / "c" / "with_skill" / "output.md").write_text("GOODANSWER is present", encoding="utf-8")
-        (runs / "c" / "without_skill").mkdir(parents=True)
-        (runs / "c" / "without_skill" / "output.md").write_text("GOODANSWER is present", encoding="utf-8")
+        for variant in ("with_skill", "without_skill"):
+            write_run(runs / "c" / variant, "GOODANSWER is present")
         return p, runs
 
     def _args(self, td, p, runs, name, body, *, fail_on_findings=False):
@@ -1397,22 +1393,17 @@ class ToolUsingJudgeTests(unittest.TestCase):
         self.assertTrue(row["passed"])
 
     def test_command_rejects_explore_with_shell_judge_cmd(self):
-        from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "skill").mkdir(parents=True)
-            (root / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-            p = root / "shared-benchmark.json"
-            p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                "variants": ["with_skill", "without_skill"], "ablations": [],
-                "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
-                           "assertions": [{"name": "a", "type": "contains", "value": "y"}]}]}), encoding="utf-8")
-            args = SimpleNamespace(manifest=str(p), runs=str(root / "runs"), split=None, variant=None,
+            args = SimpleNamespace(manifest=str(make_eval_repo(root)), runs=str(root / "runs"),
+                                   split=None, variant=None,
                                    judge_cmd="cat x", judge_model=None, judge_panel=None, claude_bin="claude",
                                    judge_runs=1, strict_judge_schema=False, judge_trajectory=False,
                                    judge_explore=True, quorum=None, transcripts=None, out=None)
-            with self.assertRaises(SystemExit):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
                 sb.judge_command(args)
+        self.assertIn("--judge-explore is for the native claude judge backend only", stderr.getvalue())
 
 
 class StrictJudgeVerdictTests(unittest.TestCase):

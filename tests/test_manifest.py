@@ -20,6 +20,7 @@ from helpers import (
 from helpers import (
     attest_answer_design,
     make_eval_repo,
+    write_run,
 )
 from helpers import (
     demo_manifest as base_manifest,
@@ -705,36 +706,28 @@ class ContaminationPerimeterTests(unittest.TestCase):
 
     def _manifest(self, td, case_extra):
         root = Path(td)
-        (root / "repo" / "skill").mkdir(parents=True)
-        (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-        (root / "repo" / "evals").mkdir()
-        p = root / "repo" / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"], "ablations": [],
-            "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
-                       "assertions": [{"name": "a", "type": "contains", "value": "y"}], **case_extra}]}), encoding="utf-8")
+        p = make_eval_repo(root, cases=[{
+            "id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
+            "assertions": [{"name": "a", "type": "contains", "value": "y"}], **case_extra}])
         return root, p
 
-    def test_validate_rejects_non_string_canary(self):
-        with tempfile.TemporaryDirectory() as td:
-            _, p = self._manifest(td, {"canary": 123})
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(p)
-
-    def test_validate_rejects_non_string_released_at(self):
-        with tempfile.TemporaryDirectory() as td:
-            _, p = self._manifest(td, {"released_at": 123})
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(p)
+    def test_validate_rejects_non_string_canary_and_released_at(self):
+        for extra, message in (({"canary": 123}, "c: canary must be a non-empty string"),
+                               ({"released_at": 123}, "c: released_at must be a string")):
+            stderr = io.StringIO()
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as td, \
+                    contextlib.redirect_stderr(stderr):
+                _, p = self._manifest(td, extra)
+                with self.assertRaises(SystemExit):
+                    sb.validate_manifest(p)
+                self.assertIn(message, stderr.getvalue())
 
     def test_report_flags_canary_in_output_end_to_end(self):
         with tempfile.TemporaryDirectory() as td:
             root, p = self._manifest(td, {"canary": "ZZ-CANARY-99"})
             runs = root / "runs"
-            (runs / "c" / "with_skill").mkdir(parents=True)
-            (runs / "c" / "with_skill" / "output.md").write_text("here is the ZZ-CANARY-99 leaking", encoding="utf-8")
-            (runs / "c" / "without_skill").mkdir(parents=True)
-            (runs / "c" / "without_skill" / "output.md").write_text("clean output", encoding="utf-8")
+            write_run(runs / "c" / "with_skill", "here is the ZZ-CANARY-99 leaking")
+            write_run(runs / "c" / "without_skill", "clean output")
             report = sb.contamination_report(p, runs, split="tune")
         self.assertEqual(report["total_findings"], 1)
         self.assertEqual(report["cases"][0]["case_id"], "c")

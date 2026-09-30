@@ -6,38 +6,12 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from helpers import attest_answer_design
+from helpers import attest_answer_design, demo_manifest, write_demo_manifest
 
 import skill_benchmark as sb
 
 
 class BlindComparisonIntegrityTests(unittest.TestCase):
-    def make_manifest(self, root: Path) -> Path:
-        repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text(
-            "---\nname: demo\ndescription: Demo skill\n---\n", encoding="utf-8"
-        )
-        (repo / "evals").mkdir()
-        manifest = {
-            "version": 1,
-            "skill_name": "demo",
-            "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [{
-                "id": "case-1",
-                "split": "tune",
-                "kind": "behavior",
-                "prompt": "Say alpha.",
-                "expected_behavior": ["Say alpha"],
-                "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}],
-            }],
-            "ablations": [],
-        }
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        return path
-
     def compare_task_args(self, manifest: Path, runs: Path, root: Path) -> SimpleNamespace:
         attest_answer_design(
             manifest, runs, variants=["with_skill", "without_skill"])
@@ -144,7 +118,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
     def test_compare_tasks_rejects_zip_truncation_when_run_populations_differ(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             self.write_output(runs, "with_skill", 1)
             self.write_output(runs, "with_skill", 2)
@@ -158,7 +132,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
     def test_compare_tasks_rejects_missing_output_instead_of_skipping_pair(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             self.write_output(runs, "with_skill", 1)
             (runs / "case-1" / "without_skill" / "run-1").mkdir(parents=True)
@@ -170,7 +144,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
     def test_compare_tasks_rejects_execution_invalid_arm_with_output_file(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             primary = self.write_output(runs, "with_skill", 1)
             self.write_output(runs, "without_skill", 1)
@@ -188,7 +162,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
     def test_compare_tasks_pairs_every_exact_run_identity(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             for variant in ("with_skill", "without_skill"):
                 self.write_output(runs, variant, 1)
@@ -227,7 +201,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
     def test_compare_tasks_excludes_trigger_population(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             data = json.loads(manifest.read_text(encoding="utf-8"))
             data["cases"].append({
                 "id": "trigger-1",
@@ -253,7 +227,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
     def test_compare_tasks_preserves_fanned_model_axis(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             for model in ("model-a", "model-b"):
                 for variant in ("with_skill", "without_skill"):
@@ -419,7 +393,7 @@ class BlindComparisonIntegrityTests(unittest.TestCase):
     def test_compare_results_rejects_verdict_replayed_after_candidate_changes(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            manifest = self.make_manifest(root)
+            manifest = write_demo_manifest(root, demo_manifest())
             runs = root / "runs"
             self.write_output(runs, "with_skill", 1, "original primary")
             self.write_output(runs, "without_skill", 1, "baseline")
