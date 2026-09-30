@@ -564,6 +564,18 @@ def emit_report(report: Any, out: str | Path | None) -> None:
         print(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
 
 
+def emit_text(text: str, out: str | Path | None) -> None:
+    """The text twin of ``emit_report`` for markdown, HTML and JSONL output:
+    parent directories are created, so ``--out new-dir/x.md`` works for every
+    format, not only JSON."""
+    if out:
+        target = Path(out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    else:
+        print(text)
+
+
 def iter_json_objects(text: str):
     """Yield each parseable JSON value found line-by-line in a runner's stream,
     silently skipping non-JSON lines. The one scanning loop shared by trigger
@@ -17316,9 +17328,7 @@ def report_command(args: argparse.Namespace) -> int:
     else:
         rendered = github_summary_from_report(report)
     if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(rendered, encoding="utf-8")
+        emit_text(rendered, args.out)
     else:
         print(rendered, end="")
     return 0
@@ -17844,9 +17854,7 @@ def compare_tasks(args: argparse.Namespace) -> int:
     for task in tasks:
         task["comparison_design_sha256"] = design_sha256
     if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text("".join(json.dumps(t, ensure_ascii=False) + "\n" for t in tasks), encoding="utf-8")
+        emit_text("".join(json.dumps(t, ensure_ascii=False) + "\n" for t in tasks), args.out)
     else:
         for t in tasks:
             print(json.dumps(t, ensure_ascii=False))
@@ -18887,7 +18895,7 @@ def render_viewer(args: argparse.Namespace) -> int:
     serve_mode = bool(getattr(args, "serve", False))
     text = viewer_html(report, runs_root, previous_report=previous_report, serve_mode=serve_mode)
     if args.out:
-        Path(args.out).write_text(text, encoding="utf-8")
+        emit_text(text, args.out)
     if serve_mode:
         workspace = Path(getattr(args, "workspace", None) or Path(args.benchmark).parent)
         serve_viewer(text, workspace, int(getattr(args, "port", 8642)))
@@ -19360,10 +19368,7 @@ def token_overhead(args: argparse.Namespace) -> int:
                     lines.append(f"- `{pair.get('case_id')}` / `{pair.get('model')}` / run {pair.get('run_number')}: {pair.get('pair_status', {}).get('reason')}")
             lines.append("")
         text = "\n".join(lines) + "\n"
-        if args.out:
-            Path(args.out).write_text(text, encoding="utf-8")
-        else:
-            print(text)
+        emit_text(text, args.out)
     else:
         emit_report(output, args.out)
     return 0
@@ -19389,10 +19394,7 @@ def profile_skill(args: argparse.Namespace) -> int:
         else:
             lines.append("- No profile findings.")
         text = "\n".join(lines) + "\n"
-        if args.out:
-            Path(args.out).write_text(text, encoding="utf-8")
-        else:
-            print(text)
+        emit_text(text, args.out)
     else:
         emit_report(report, args.out)
     return 0
@@ -20286,10 +20288,7 @@ def audit_manifest(args: argparse.Namespace) -> int:
                 lines.append("  " + json.dumps(r["example"], indent=2, ensure_ascii=False).replace("\n", "\n  "))
                 lines.append("  ```")
         text = "\n".join(lines) + "\n"
-        if args.out:
-            Path(args.out).write_text(text, encoding="utf-8")
-        else:
-            print(text)
+        emit_text(text, args.out)
     else:
         emit_report(report, args.out)
     # CI gate: non-zero exit when the readiness blockers are non-empty, so a skill
