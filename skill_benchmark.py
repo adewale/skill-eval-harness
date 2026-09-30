@@ -141,9 +141,11 @@ from completion_contracts import (
 )
 from effect_estimates import (
     DiscriminationFailure,
+    Estimate,
+    InferenceUnit,
     ceiling_or_floor,
+    minimum_units_note,
     monte_carlo_upper_bound,
-    noise_check,
     sign_flip_interval,
     sign_flip_test,
 )
@@ -193,7 +195,9 @@ from json_contracts import (
 from judge_contracts import JudgeInvocation
 from judge_verdict import (
     BooleanVerdict,
+    Consensus,
     ConsensusVerdict,
+    resolve_consensus,
     validated_result_row,
     verdict_fields,
     verdict_from_dict,
@@ -12568,6 +12572,23 @@ def _incomplete_judge_consensus(
     return validated_result_row(out)
 
 
+def _judge_consensus(rows: list[dict[str, Any]], *, quorum: int | None = None) -> Consensus:
+    """Fold member verdicts with the one rule both merges share. An exact tie is
+    decided by the median score only against an explicit threshold; a raw-score
+    verdict with no calibrated threshold must not pass on a default, so the tie
+    is unresolved instead."""
+    scores = [
+        float(score) for row in rows
+        if isinstance((score := row.get("score")), (int, float))
+        and not isinstance(score, bool) and math.isfinite(float(score))
+    ]
+    threshold = rows[0].get("threshold")
+    return resolve_consensus(
+        [bool(row.get("passed")) for row in rows], scores,
+        threshold=threshold if isinstance(threshold, (int, float)) and not isinstance(threshold, bool) else None,
+        quorum=quorum)
+
+
 def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if len(rows) == 1:
         return rows[0]
@@ -12579,26 +12600,23 @@ def merge_repeated_judge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if member_errors:
         return _incomplete_judge_consensus(
             rows, member_errors, members_key="judge_runs")
-    scores = [
-        score for row in rows
-        if isinstance((score := row.get("score")), (int, float))
-        and not isinstance(score, bool) and math.isfinite(float(score))
-    ]
-    passed_count = sum(1 for r in rows if r.get("passed"))
+    consensus = _judge_consensus(rows)
     first = dict(rows[0])
-    first["passed"] = passed_count > len(rows) / 2
-    if scores:
-        first["score"] = statistics.median(scores)
+    first["passed"] = consensus.passed
+    if consensus.median_score is not None:
+        first["score"] = consensus.median_score
     first["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
+    # A judge that disagrees with itself on identical input is grader noise;
+    # the agreement block makes it visible instead of averaging it away.
+    first["agreement"] = consensus.agreement()
     first["judge_runs"] = rows
     first["judge_observation_complete"] = True
     first["availability"] = "complete"
     first["returncode"] = 0
     aggregate_judge_member_telemetry(rows, first)
-    consensus = ConsensusVerdict(bool(first["passed"]), first.get("score"))
     for key in ("threshold", "dimension_scores", "criteria", "minimum_criteria"):
         first.pop(key, None)
-    first.update(verdict_fields(consensus))
+    first.update(verdict_fields(consensus.verdict()))
     return validated_result_row(first)
 
 
@@ -12633,40 +12651,15 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
         out["judge_model"] = "consensus"
         out["judge_models"] = models
         return validated_result_row(out)
-    n = len(rows)
-    concur = sum(1 for r in rows if r.get("passed"))
-    scores = [
-        score for row in rows
-        if isinstance((score := row.get("score")), (int, float))
-        and not isinstance(score, bool) and math.isfinite(float(score))
-    ]
-    median_score = statistics.median(scores) if scores else None
-    unresolved = False
-    if isinstance(quorum, int) and quorum > 0:
-        passed = concur >= quorum
-    elif concur * 2 > n:
-        passed = True
-    elif concur * 2 < n:
-        passed = False
-    else:
-        # Exact tie, no quorum: let the score median decide ONLY against an EXPLICIT
-        # threshold. A bare raw-score panel with no calibrated threshold must not pass
-        # on the default-1 fallback (median >= 1 is ~always true — a silent coin-flip
-        # toward PASS); it resolves to `unresolved` instead.
-        thr = rows[0].get("threshold")
-        if median_score is not None and isinstance(thr, (int, float)):
-            passed = median_score >= thr
-        else:
-            passed, unresolved = False, True
+    consensus = _judge_consensus(rows, quorum=quorum)
     out = dict(rows[0])
     out["judge_model"] = "consensus"
     out["judge_models"] = [r.get("judge_model") for r in rows]
-    out["passed"] = passed
-    if median_score is not None:
-        out["score"] = median_score
+    out["passed"] = consensus.passed
+    if consensus.median_score is not None:
+        out["score"] = consensus.median_score
     out["evidence"] = " | ".join(str(r.get("evidence", "")) for r in rows if r.get("evidence"))[:4000]
-    out["agreement"] = {"concur": concur, "n": n, "concur_fraction": round(concur / n, 4),
-                        "unanimous": concur in (0, n), "unresolved": unresolved}
+    out["agreement"] = consensus.agreement()
     aggregate_judge_member_telemetry(rows, out)
     out["judge_panel"] = rows
     out["judge_observation_complete"] = True
@@ -12674,7 +12667,7 @@ def merge_cross_judge_rows(rows: list[dict[str, Any]], *, quorum: int | None = N
     out["returncode"] = 0
     for key in ("threshold", "dimension_scores", "criteria", "minimum_criteria"):
         out.pop(key, None)
-    out.update(verdict_fields(ConsensusVerdict(bool(passed), median_score)))
+    out.update(verdict_fields(consensus.verdict()))
     return validated_result_row(out)
 
 
@@ -15188,7 +15181,7 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
     elif query_units and aggregate_regression and not significant_drop:
         note = (f"regression observed but not significant across queries "
                 f"(p={significance.get('p_value')}, mean delta={significance.get('observed_mean_delta')}); "
-                f">= 6 consistently regressed queries are needed to confirm")
+                f"{minimum_units_note(InferenceUnit.QUERY)}")
     elif not query_units:
         note = "no comparable (agent, model, query) pair has complete observations on both sides"
     elif regressed and not aggregate_regression:
@@ -15402,22 +15395,18 @@ def paired_block_from_rates(paired_with_rates: list[float], paired_without_rates
         if with_rate >= without_rate and without_rate < 1:
             normalized_gain = (with_rate - without_rate) / (1 - without_rate)
     deltas = [w - n for w, n in zip(paired_with_rates, paired_without_rates)]
-    interval = sign_flip_interval(deltas)
+    # Lift is tested, not eyeballed (roadmap 2.2). One Estimate yields the
+    # sign-flip test over the per-(case, model) deltas, the interval that
+    # inverts it, and the noise check (could this eval have shown a lift at
+    # all?), each labelled with the unit the test counts.
+    estimate = Estimate.from_deltas(deltas, unit=InferenceUnit.CASE,
+                                    without_rates=paired_without_rates, min_lift=min_lift)
     return {
         "with_skill_objective_pass_rate": with_rate,
         "without_skill_objective_pass_rate": without_rate,
         "absolute_delta": absolute_delta,
         "normalized_gain": normalized_gain,
-        # Lift is tested, not eyeballed (roadmap 2.2): the sign-flip permutation
-        # p-value over the per-(case, model) deltas rides beside the raw delta.
-        "significance": sign_flip_significance(deltas),
-        # The same test inverted: every lift it would not reject. It excludes
-        # zero exactly when the exact test is significant.
-        "interval": interval,
-        # Could this eval have shown a lift at all? Cases moved, the smallest
-        # reachable p, the noise floor and the headroom left in without_skill.
-        "noise_check": noise_check(deltas, paired_without_rates, interval=interval,
-                                   min_lift=min_lift),
+        **estimate.blocks(),
         "negative_delta_cases": negative_cases,
     }
 
@@ -15499,8 +15488,7 @@ def build_paired_summary(results: list[dict[str, Any]], *, min_lift: float | Non
             "with_skill_mean_score": round(statistics.mean(graded_with), 4),
             "without_skill_mean_score": round(statistics.mean(graded_without), 4),
             "delta": round(statistics.mean(graded_deltas), 4),
-            "significance": sign_flip_significance(graded_deltas),
-            "interval": sign_flip_interval(graded_deltas),
+            **Estimate.from_deltas(graded_deltas, unit=InferenceUnit.CASE).blocks(),
         }
         graded_construction = _metric_pair_construction(results, "graded_score")
         if graded_construction.blocked:
@@ -15555,7 +15543,8 @@ def paired_reliability_block(pairs: list[tuple[str, tuple[int, int], tuple[int, 
         # so each k averages only over the cases that support it.
         "mean_pass_at_k_delta": {str(k): round(statistics.mean(v), 6) for k, v in sorted(at_k_pool.items())},
         "mean_pass_hat_k_delta": {str(k): round(statistics.mean(v), 6) for k, v in sorted(hat_k_pool.items())},
-        "significance": sign_flip_significance(pass_at_1_deltas),
+        "significance": Estimate.from_deltas(
+            pass_at_1_deltas, unit=InferenceUnit.CASE).blocks()["significance"],
     }
     return {"by_case": by_case, "pooled": pooled}
 
@@ -16074,7 +16063,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
                 )
                 if prov_ok and has_coverage and regression_observed and not significant:
                     p = (significance or {}).get("min_p_value")
-                    reg["note"] = f"regression observed but not significant per case across replicates (min p={p}); a case needs >= 6 matched pairs to confirm"
+                    reg["note"] = f"regression observed but not significant per case across replicates (min p={p}); {minimum_units_note(InferenceUnit.REPLICATE_PAIR)}"
                 elif not prov_ok:
                     reg["note"] = f"provenance unverified: {prov_note}"
                 elif assertion_coverage_gaps:

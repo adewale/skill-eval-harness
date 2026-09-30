@@ -188,7 +188,9 @@ class PairedReliabilityLiftTests(unittest.TestCase):
             results += self._arm(f"c{i}", "with_skill", 3, 3) + self._arm(f"c{i}", "without_skill", 3, 0)
         block = sb.paired_reliability_block(sb.paired_case_counts(results))
         deltas = [block["by_case"][cid]["pass_at_1_delta"] for cid in sorted(block["by_case"])]
-        self.assertEqual(block["pooled"]["significance"], sb.sign_flip_significance(deltas))
+        significance = dict(block["pooled"]["significance"])
+        self.assertEqual(significance.pop("unit"), "case")
+        self.assertEqual(significance, sb.sign_flip_significance(deltas))
         self.assertTrue(block["pooled"]["significance"]["significant_at_0_05"])   # 6 unanimous cases
 
     def test_zero_delta_not_significant(self):
