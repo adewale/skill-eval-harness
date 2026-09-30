@@ -330,8 +330,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             "type": "agent_end", "willRetry": False,
             "messages": [{"stopReason": "error", "errorMessage": "provider rejected model"}],
         })
-        run = {"stdout": provider_error, "stderr": "", "returncode": 0, "timed_out": False,
-               "elapsed_ms": 1, "observation_complete": True}
+        run = completed_invocation(provider_error)
         with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.PiAdapter, "_run_argv", staticmethod(lambda *args, **kwargs: run)):
             workspace = Path(td) / "workspace"
             workspace.mkdir()
@@ -717,9 +716,7 @@ class ClaudeDetectionTests(unittest.TestCase):
             config_dir = Path(env["CLAUDE_CONFIG_DIR"])
             seen["config_dir"] = config_dir
             seen["credentials"] = (config_dir / ".credentials.json").read_text(encoding="utf-8")
-            return {"stdout": json.dumps({"type": "result", "subtype": "success"}) + "\n",
-                    "stderr": "", "returncode": 0, "timed_out": False,
-                    "elapsed_ms": 1, "observation_complete": True}
+            return completed_invocation(json.dumps({"type": "result", "subtype": "success"}) + "\n")
 
         with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)):
             root = Path(td)
@@ -739,9 +736,7 @@ class ClaudeDetectionTests(unittest.TestCase):
         def fake_run(plan):
             env = dict(plan.environment or {})
             seen["config_dir"] = env.get("CLAUDE_CONFIG_DIR")
-            return {"stdout": json.dumps({"type": "result", "subtype": "success"}) + "\n",
-                    "stderr": "", "returncode": 0, "timed_out": False,
-                    "elapsed_ms": 1, "observation_complete": True}
+            return completed_invocation(json.dumps({"type": "result", "subtype": "success"}) + "\n")
 
         with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)):
             root = Path(td)
@@ -852,8 +847,7 @@ class CodexAdapterTests(unittest.TestCase):
             argv, cwd = list(plan.argv), plan.cwd
             env, timeout = dict(plan.environment or {}), int(plan.timeout_s)
             seen.update({"argv": argv, "cwd": cwd, "env": env, "timeout": timeout})
-            return {"stdout": '{"type":"turn.completed"}\n', "stderr": "", "returncode": 0, "timed_out": False,
-                    "elapsed_ms": 1, "observation_complete": True}
+            return completed_invocation('{"type":"turn.completed"}\n')
 
         with mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
             with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"CODEX_HOME": str(Path(td) / "source-codex")}):
@@ -882,8 +876,7 @@ class CodexAdapterTests(unittest.TestCase):
             seen["user_skills_not_copied"] = not (codex_home / "skills" / "personal").exists()
             seen["workspace_auth_present"] = (Path(cwd) / ".codex" / "auth.json").exists()
             seen["workspace_config_present"] = (Path(cwd) / ".codex" / "config.toml").exists()
-            return {"stdout": '{"type":"turn.completed"}\n', "stderr": "", "returncode": 0, "timed_out": False,
-                    "elapsed_ms": 1, "observation_complete": True}
+            return completed_invocation('{"type":"turn.completed"}\n')
 
         with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
             root = Path(td)
@@ -1062,8 +1055,7 @@ class VibeAdapterTests(unittest.TestCase):
             seen.update({"argv": argv, "cwd": cwd, "env": env, "timeout": timeout, "input_text": input_text})
             seen["vibe_home_inside_workdir"] = Path(env["VIBE_HOME"]).is_relative_to(Path(cwd))
             seen["workspace_vibe_env_present"] = (Path(cwd) / ".vibe-home" / ".env").exists()
-            return {"stdout": json.dumps({"role": "assistant", "content": "ok"}) + "\n", "stderr": "", "returncode": 0,
-                    "timed_out": False, "elapsed_ms": 1, "observation_complete": True}
+            return completed_invocation(json.dumps({"role": "assistant", "content": "ok"}) + "\n")
 
         with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.VibeAdapter, "_run_argv", staticmethod(fake_run)):
             workspace = Path(td) / "workspace"
