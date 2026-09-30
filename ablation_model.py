@@ -717,6 +717,10 @@ class PreparedTask:
                 raise ValueError("PreparedTask.skill_root_keys must be unique safe path segments")
         if self.variant_truth == "without_skill" and self.skill_paths:
             raise ValueError("without_skill task cannot carry skill paths")
+        if self.variant_truth in {"without_skill", "old_skill"} and self.skill_tree_hash is not None:
+            # The hash names the current canonical skill tree; an arm that mounts
+            # no skill, or the previous one, cannot truthfully record it.
+            raise ValueError(f"{self.variant_truth} task cannot carry the current skill_tree_hash")
         if self.is_ablation:
             if self.ablation is None or self.ablation.id != ablation_id_of(self.variant_truth):
                 raise ValueError("ablation task requires a matching typed ablation record")
