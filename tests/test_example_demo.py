@@ -77,6 +77,25 @@ class DemoExampleTests(unittest.TestCase):
         self.assertEqual(s["with_skill"]["objective_pass_rate"]["mean"], 1.0)      # skill present -> both assertions pass
         self.assertEqual(s["without_skill"]["objective_pass_rate"]["mean"], 0.0)   # no skill -> both fail
 
+    def test_audit_rates_the_marks_on_runs_only_with_the_judge_verdicts(self):
+        # The demo declares a judge assertion. Without its verdicts the audit's
+        # benchmark is partial: readiness names that as a blocker and the marks
+        # measured on runs read unavailable, instead of passing on empty lists.
+        partial = sb.audit_manifest_report(self.MANIFEST, runs=str(self.runs_dir))
+        complete = sb.audit_manifest_report(
+            self.MANIFEST, runs=str(self.runs_dir), judge_results_path=str(self.judge_results))
+        self.assertEqual([b["kind"] for b in partial["readiness"]["blocker_findings"]],
+                         ["benchmark-incomplete"])
+        self.assertEqual(complete["readiness"]["blocker_findings"], [])
+        status = {mark["id"]: mark["status"] for mark in complete["eval_health"]["marks"]}
+        partial_status = {mark["id"]: mark["status"] for mark in partial["eval_health"]["marks"]}
+        for mark in ("baseline-headroom", "noise-below-min-lift", "arms-differ-only-in-skill"):
+            with self.subTest(mark=mark):
+                self.assertEqual(partial_status[mark], "unavailable")
+                self.assertNotEqual(status[mark], "unavailable")
+        # Two cases cannot move six the same way: the noise mark says so.
+        self.assertEqual(status["noise-below-min-lift"], "concern")
+
 
 class DemoJudgeTests(unittest.TestCase):
     """Pins the stub-judge pair's calibration signature that
@@ -139,6 +158,7 @@ class DemoJudgeTests(unittest.TestCase):
         self.assertEqual(robust["summary"]["control_leak_rate"], 1.0)
         kinds = {f["kind"] for f in robust["findings"]}
         self.assertEqual(kinds, {"passes-empty-control", "passes-master-key-control"})
+
 
 
 if __name__ == "__main__":

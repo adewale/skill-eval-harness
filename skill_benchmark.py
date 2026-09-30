@@ -19872,6 +19872,8 @@ def audit_manifest_report(
     leakage_min_chars: int = 4,
     expensive_case_usd: float = 1.0,
     min_lift: float | None = None,
+    judge_results_path: str | None = None,
+    grading: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = validate_manifest(manifest_path)
     cases = iter_cases(manifest, split)
@@ -19956,7 +19958,11 @@ def audit_manifest_report(
     benchmark_summary = None
     bench_report = None
     if runs:
-        report = build_benchmark_report(manifest_path, Path(runs), split, min_lift=min_lift)
+        # The audit's benchmark is graded exactly as `benchmark` would grade it:
+        # without the judge verdicts a judged suite is partial, which readiness
+        # reports as a blocker rather than reading empty lists as all clear.
+        report = build_benchmark_report(manifest_path, Path(runs), split, None, judge_results_path,
+                                        **(grading or {}), min_lift=min_lift)
         bench_report = report
         benchmark_summary = {"summary": report["summary"], "case_flags": report["case_flags"]}
         for flag in report["case_flags"]:
@@ -20249,6 +20255,8 @@ def audit_manifest(args: argparse.Namespace) -> int:
         leakage_min_chars=args.leakage_min_chars,
         expensive_case_usd=getattr(args, "expensive_case_usd", 1.0),
         min_lift=getattr(args, "min_lift", None),
+        judge_results_path=getattr(args, "judge_results", None),
+        grading=grading_options(args),
     )
     if args.format == "markdown":
         lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "", "| Metric | Value |", "|---|---:|"]
@@ -21079,6 +21087,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--strict-judge", action="store_true", help="exit non-zero when the declared judge model is also a model under test")
     p.add_argument("--fail-on", action="append", metavar="KINDS", help="exit non-zero on these finding kinds, severities (required, recommended) or presets (blockers, strict-judge); comma-separated, repeatable; fails closed on an incomplete benchmark")
     p.add_argument("--min-lift", type=float, help="smallest lift worth acting on, for the noise check behind eval-health mark 4 (with --runs)")
+    add_grading_options(p)
     p.add_argument("--expensive-case-usd", type=float, default=1.0, help="dollar threshold above which cost-quality findings fire for saturated/no-lift/judge-only cases and unstructured ablation arms (issue #21)")
 
     p = sub.add_parser("materialize-ablations", help="Write real, ablated skill trees for declared materialized ablations")
