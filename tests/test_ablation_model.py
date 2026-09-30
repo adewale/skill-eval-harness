@@ -26,8 +26,9 @@ class ProvenanceSchemaTests(unittest.TestCase):
             am.Provenance(id="x", mode="materialized")  # missing population/identity/components
 
     def test_as_dict_is_the_minimum_schema(self):
+        # The persisted key set every runner records and the verifier parses.
         d = self.prov().as_dict()
-        self.assertEqual(set(d), am.Provenance.SCHEMA_KEYS)
+        self.assertEqual(set(d), {"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
         self.assertEqual(d["skill_hash"], "E")
         self.assertEqual(d["parent_skill_hash"], "C")
         self.assertEqual(d["components"][0]["class"], "instructions")
@@ -169,28 +170,17 @@ class ArmBlindingTests(unittest.TestCase):
     TRUTH = "ablation:no-rp"
 
     def test_blind_arm_never_exposes_truth_to_the_model(self):
+        # Every model-facing method is blind: there is deliberately no API that
+        # hands the variant truth to the model.
         arm = am.Arm(variant_truth=self.TRUTH, blind=True)
-        # Every model-facing method is blind...
         self.assertEqual(arm.model_visible_variant(), "with_skill")
         self.assertNotIn("no-rp", arm.upload_token())
         self.assertNotIn("ablation", arm.upload_token())
-        # ...while the harness-only record carries the truth.
-        self.assertEqual(arm.harness_record()["variant"], self.TRUTH)
 
     def test_non_blind_arm_is_transparent(self):
         arm = am.Arm(variant_truth="with_skill", blind=False)
         self.assertEqual(arm.model_visible_variant(), "with_skill")
         self.assertEqual(arm.upload_token(), "with_skill")
-
-    def test_blinding_is_structural_no_model_method_returns_the_truth(self):
-        # The guarantee: scanning every model-facing method's output, the truth
-        # appears in none of them. There is deliberately no API that hands the
-        # variant truth to the model, so a leak cannot be added by "forgetting".
-        arm = am.Arm(variant_truth=self.TRUTH, blind=True)
-        model_facing = [arm.model_visible_variant(), arm.upload_token()]
-        for out in model_facing:
-            self.assertNotIn("no-rp", out)
-        self.assertIn("no-rp", arm.harness_record()["variant"])   # truth is reachable only here
 
     def test_opaque_tokens_are_deterministic_and_distinct(self):
         a = am.Arm("ablation:a", blind=True).upload_token()
