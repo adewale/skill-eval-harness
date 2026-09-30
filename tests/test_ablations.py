@@ -6,7 +6,9 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import tempfile
@@ -420,11 +422,6 @@ class SkillAblationTests(unittest.TestCase):
                     {"mechanism": "list_item", "class": "instructions", "target": {"section": "## Review checklist", "contains": ["Naming"]}},
                 ]})
 
-    def test_required_field_preservation_blocks_description_removal(self):
-        with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(sb.AblationError):
-                self.materialize_one(Path(td), {"id": "no-desc", "removed_component": "desc", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}})
-
     def test_layer_cohesion_refuses_discovery_plus_answer(self):
         with self.assertRaises(sb.AblationError):
             sb.derived_population([
@@ -518,34 +515,23 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
                 self.assertIn("simulate this ablation", instr)   # the directive from variant_instruction (the owner)
                 self.assertIn("Regression-proof requirement", Path(skill_args[skill_args.index("--skill") + 1]).read_text(encoding="utf-8"))
 
-    def test_pi_smoke_materialized_arm_is_blind_no_path_leak(self):
-        # The materialized arm must be indistinguishable from with_skill: same
-        # mount paths, same instruction, and NOTHING in the model-visible
-        # workspace, mount path, or prompt that names the ablation id.
+    def test_pi_smoke_arms_mount_neutral_roots_and_differ_only_by_the_edit(self):
+        # Blinding of every model-visible channel is owned by
+        # test_materialized_ablation_is_blind_across_every_runner. This pins the
+        # Pi smoke mount itself: both arms mount under neutral skills/root-N
+        # names, only the ablation arm's mounted bytes lack the removed section,
+        # and the harness still receives the materialized provenance.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            p = self.repo(root, [self.SECTION_ABL])   # id "no-rp"
+            p = self.repo(root, [self.SECTION_ABL])
             manifest = sb.validate_manifest(p)
             repo_root = sb.repo_root_for_manifest(p)
             with tempfile.TemporaryDirectory() as wd_w, tempfile.TemporaryDirectory() as wd_a:
-                instr_w, args_w, _, paths_w, _ = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "with_skill", Path(wd_w))
-                instr_a, args_a, _, paths_a, prov = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:no-rp", Path(wd_a))
-                # identical workspace-relative mount names
-                rel_w = [str(Path(x).relative_to(wd_w)) for x in paths_w]
-                rel_a = [str(Path(x).relative_to(wd_a)) for x in paths_a]
-                self.assertEqual(rel_w, rel_a)
-                self.assertTrue(all(r.startswith("skills/root-") for r in rel_a))
-                # ablated content actually reaches the runner
-                self.assertNotIn("Regression-proof requirement", Path(args_a[args_a.index("--skill") + 1]).read_text(encoding="utf-8"))
+                _, args_w, _, _, _ = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "with_skill", Path(wd_w))
+                _, args_a, _, paths_a, prov = smoke.materialize_runtime_workspace(manifest, repo_root, manifest["cases"][0], "ablation:no-rp", Path(wd_a))
+                self.assertTrue(all(str(Path(x).relative_to(wd_a)).startswith("skills/root-") for x in paths_a))
                 self.assertIn("Regression-proof requirement", Path(args_w[args_w.index("--skill") + 1]).read_text(encoding="utf-8"))
-                # the model-visible instruction is byte-identical (blinding)
-                self.assertEqual(instr_w, instr_a)
-                # no ablation id leaks into the prompt, mount path, or workspace tree
-                self.assertNotIn("no-rp", instr_a)
-                self.assertNotIn("no-rp", " ".join(rel_a))
-                tree = [str(q.relative_to(wd_a)) for q in Path(wd_a).rglob("*")]
-                self.assertFalse(any("no-rp" in entry for entry in tree), f"ablation id leaked into workspace: {tree}")
-                # provenance is still returned for the harness-only record
+                self.assertNotIn("Regression-proof requirement", Path(args_a[args_a.index("--skill") + 1]).read_text(encoding="utf-8"))
                 self.assertEqual(prov["mode"], "materialized")
 
     def test_pi_trigger_mounts_materialized_discovery_skill(self):
@@ -661,9 +647,11 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             leaks["jetty_request"] = json.dumps(payload["jetty_request"])
             leaks["jetty_upload_names"] = json.dumps([{"p": f.get("placeholder"), "h": f.get("remote_path_hint")} for f in payload["upload_plan"]["files"]])
 
-            # The ablation id leaks into NONE of the model-visible channels.
+            # Neither the ablation id nor the word "ablation" leaks into ANY of the
+            # model-visible channels.
             for channel, blob in leaks.items():
                 self.assertNotIn(ID, blob, f"ablation id leaked via {channel}: {blob[:200]}")
+                self.assertNotIn("ablation", blob.lower(), f"ablation named via {channel}: {blob[:200]}")
             # And the harness still records the truth out of the model's sight.
             self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")
 
@@ -788,24 +776,6 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             self.assertEqual(task_json["variant"], "with_skill")              # blinded: model sees with_skill
             self.assertNotIn("ablation", task_json)                          # no hypothesis leaked to the model
             self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")           # truth in harness-only record
-            self.assertEqual(payload["harness"]["ablation"]["mode"], "materialized")
-
-    def test_jetty_blinds_ablation_id_from_model_visible_names(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            p = self.repo(root, [self.SECTION_ABL])
-            manifest = sb.validate_manifest(p)
-            row = next(r for r in sb.prepared_task_rows(p, manifest, include_ablations=True, ablation_dir=root / "abl") if r["variant"] == "ablation:no-rp")
-            trees = {"no-rp": sb.materialize(sb.ValidatedAblation.validate(sb.repo_root_for_manifest(p), manifest, self.SECTION_ABL), root / "jabl")}
-            payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", ablation_trees=trees)
-            # What the model actually sees: the jetty request (runbook + jetty block,
-            # incl. file_paths and template_variables) and each upload's remote path.
-            model_visible = json.dumps(payload["jetty_request"]) + json.dumps(
-                [{"placeholder": f.get("placeholder"), "remote_path_hint": f.get("remote_path_hint")} for f in payload["upload_plan"]["files"]])
-            self.assertNotIn("no-rp", model_visible)
-            self.assertNotIn("ablation", model_visible.lower())
-            # the harness-only record still carries the truth
-            self.assertEqual(payload["harness"]["variant"], "ablation:no-rp")
             self.assertEqual(payload["harness"]["ablation"]["mode"], "materialized")
 
     def test_export_jetty_command_materializes_declared_ablation(self):
@@ -1029,30 +999,31 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertEqual(reg["assertion_coverage_gaps"][0]["observed_pairs"], 1)
         self.assertEqual(reg["assertion_coverage_gaps"][0]["expected_pairs"], 6)
 
-    def test_four_matched_pairs_are_below_paired_significance_floor(self):
-        results = ([{"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0,
-                     "assertions": [{"name": "detect-weak", "passed": True}],
-                     "qualitative_assertions": [], **self.ws()} for _ in range(4)]
-                   + [{"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0,
-                       "assertions": [{"name": "detect-weak", "passed": False}],
-                       "qualitative_assertions": [], **self.prov()} for _ in range(4)])
-        reg = self.report(self.MANIFEST, results)[0]["regressions"][0]
-        self.assertIsNone(reg["expected_regression_confirmed"])
-        self.assertEqual(reg["significance"]["min_p_value"], 0.125)
-
-    def test_single_shot_regression_is_indeterminate_not_confirmed(self):
-        # Feature 1: one run per arm shows the drop but cannot rule out noise, so the
-        # verdict is INDETERMINATE (None), never confirmed — the n=5 walkthrough lesson.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov()},
-        ]
-        reg = self.report(self.MANIFEST, results)[0]["regressions"][0]
-        self.assertIsNone(reg["expected_regression_confirmed"])
-        self.assertEqual(reg["evidence_class"], "indeterminate")
-        self.assertTrue(reg["confirmed_cases"])                        # the drop WAS observed
-        self.assertFalse(reg["significance"]["significant_at_0_05"])   # just not significant yet
-        self.assertIn("not significant", reg["note"])
+    def test_regressions_below_the_paired_significance_floor_stay_indeterminate(self):
+        # Feature 1: an observed drop confirms only once it clears the paired
+        # sign-flip floor (6 perfect pairs, p=2/2^6; see
+        # test_expected_regression_confirmed_when_named_assertion_flips). Below it
+        # the drop is seen but noise cannot be ruled out, so the verdict is
+        # INDETERMINATE, never confirmed and never REFUTED.
+        floor_rows = {
+            # label: (with_skill passes, ablation passes, min paired p)
+            "single shot": ([True], [False], 1.0),
+            "four perfect pairs": ([True] * 4, [False] * 4, 0.125),
+            "five perfect pairs": ([True] * 5, [False] * 5, 0.0625),
+            "six pairs, one contradictory each arm": (
+                [True] * 5 + [False], [False] * 5 + [True], 0.21875),
+        }
+        for label, (with_passes, ablation_passes, min_p) in floor_rows.items():
+            with self.subTest(label):
+                results = ([self._wrow(passed) for passed in with_passes]
+                           + [self._arow(passed) for passed in ablation_passes])
+                reg = self.report(self.MANIFEST, results)[0]["regressions"][0]
+                self.assertEqual(reg["confirmed_cases"], ["c1"])          # the drop WAS observed
+                self.assertIsNone(reg["expected_regression_confirmed"])
+                self.assertEqual(reg["evidence_class"], "indeterminate")
+                self.assertFalse(reg["significance"]["significant_at_0_05"])
+                self.assertEqual(reg["significance"]["min_p_value"], min_p)
+                self.assertIn("not significant", reg["note"])
 
     def test_multi_case_single_shot_does_not_confirm(self):
         # Soundness (audit fix): significance is per CASE, not pooled across cases.
@@ -1138,18 +1109,6 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertTrue(reg["expected_regression_confirmed"])
         self.assertTrue(reg["significance"]["significant_at_0_05"])
         self.assertLess(reg["significance"]["min_p_value"], 0.05)
-
-    def test_noisy_replicates_below_significance_are_indeterminate(self):
-        # Same shape but 6 runs/arm 5-1 vs 1-5: the drop is observed on every net
-        # measure yet the per-case permutation gives p~=0.078 -> INDETERMINATE, not
-        # confirmed. The gate refuses moderately-noisy, underpowered evidence.
-        results = ([self._wrow(True) for _ in range(5)] + [self._wrow(False)]
-                   + [self._arow(False) for _ in range(5)] + [self._arow(True)])
-        reg = self.report(self.MANIFEST, results)[0]["regressions"][0]
-        self.assertTrue(reg["confirmed_cases"])                       # the drop WAS observed
-        self.assertIsNone(reg["expected_regression_confirmed"])       # but not significant
-        self.assertEqual(reg["evidence_class"], "indeterminate")
-        self.assertFalse(reg["significance"]["significant_at_0_05"])
 
     def test_score_drop_without_named_flip_is_not_confirmed(self):
         # The named assertion still passes; an unrelated assertion fails and drags
@@ -1518,7 +1477,7 @@ class AblationSpecCompletenessTests(unittest.TestCase):
             root = Path(td)
             ab = {"id": "no-desc", "removed_component": "desc", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}}
             p = self.repo(root, [ab])
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "required frontmatter field"):
                 sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
 
     def test_isolation_warning_on_oversized_removal(self):
@@ -1705,9 +1664,10 @@ class AblationReviewFixesTests(unittest.TestCase):
 
     # --- #6 gate soundness ---
     def test_validate_rejects_mechanism_class_mismatch(self):
-        with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.manifest(Path(td), [{"id": "x", "removed_component": "x", "mechanism": "section", "class": "discovery", "target": {"heading": "## A"}}]))
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as td, contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            sb.validate_manifest(self.manifest(Path(td), [{"id": "x", "removed_component": "x", "mechanism": "section", "class": "discovery", "target": {"heading": "## A"}}]))
+        self.assertIn("mechanism 'section' is incompatible with declared class 'discovery'", stderr.getvalue())
 
     def test_validate_rejects_resource_targeting_skill_md(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2010,15 +1970,6 @@ class AblationParserExactnessTests(unittest.TestCase):
         s, e = sb.section_span(text, "Foo")   # no '#': first 'Foo' at any level
         self.assertTrue(text[s:e].startswith("### Foo"))
 
-    def test_reference_pointer_ignores_inline_code_sample(self):
-        # The real link is unlinked; a link literal shown inside inline code is not.
-        text = "See [guide](references/g.md) now.\n\nSyntax: `[guide](references/g.md)` shows a link.\n"
-        ops = sb.reference_pointer_ops(text, "references/g.md")
-        self.assertEqual(len(ops), 1)
-        s, _e, rep = ops[0]
-        self.assertEqual(rep, "guide")
-        self.assertLess(s, text.index("`"))    # the matched link precedes the inline-code span
-
     def test_list_item_continuation_includes_indented_code_block(self):
         # The targeted item contains an indented fenced code block; removing the
         # item must take the whole block, not stop at the fence.
@@ -2044,14 +1995,6 @@ class AblationParserExactnessTests(unittest.TestCase):
         s, e, _ = ops[0]
         self.assertIn("real item", text[s:e])
         self.assertNotIn("decoy", text[s:e])
-
-    def test_preprocess_skips_inline_code_example(self):
-        # A real preprocess command is removed; one shown inside inline code is not.
-        text = "Run !`deploy --prod` now.\n\nExample shown as code: `!`deploy --prod`` stays.\n"
-        ops = sb.preprocess_ops(text, ["deploy"])
-        self.assertEqual(len(ops), 1)
-        s, _e, _ = ops[0]
-        self.assertLess(s, text.index("Example"))   # only the first (real) command line
 
     def test_every_text_mechanism_ignores_code_and_layer_decoys(self):
         # The RULE behind the R3/R4 parser findings, applied to EVERY text-searching
@@ -2322,18 +2265,6 @@ class MaterializedArmTests(unittest.TestCase):
 
 
 class ValidatedAblationTests(unittest.TestCase):
-    def test_gate_pile_is_a_constructor(self):
-        # An invalid ablation cannot be validated — the gates are the constructor.
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            bad = {"id": "bad", "removed_component": "x", "mechanism": "section", "class": "discovery",
-                   "target": {"heading": "## Severity"}}   # section cannot be class discovery
-            p = repo(root, [])   # valid manifest; the bad ablation is validated directly below
-            manifest = sb.validate_manifest(p)
-            repo_root = sb.repo_root_for_manifest(p)
-            with self.assertRaises(sb.AblationError):
-                sb.ValidatedAblation.validate(repo_root, manifest, bad)
-
     def test_materialize_only_takes_a_validated_ablation_and_yields_an_arm(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2346,18 +2277,6 @@ class ValidatedAblationTests(unittest.TestCase):
             self.assertIsInstance(ma, am.MaterializedArm)
             self.assertTrue(ma.arm.identity.is_edited)             # a real edit happened
             self.assertEqual(ma.arm.provenance.mode, "materialized")
-
-    def test_typed_path_and_legacy_facade_agree(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            p = repo(root, [SECTION_ABL])
-            manifest = sb.validate_manifest(p)
-            repo_root = sb.repo_root_for_manifest(p)
-            typed = sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, SECTION_ABL), root / "a").as_legacy_dict()
-            legacy = sb.materialize_ablation(repo_root, manifest, SECTION_ABL, root / "b")
-            keys = ("id", "mode", "population", "skill_hash", "parent_skill_hash", "components")
-            self.assertEqual({k: typed[k] for k in keys}, {k: legacy[k] for k in keys})
-
 
 class AblationRecordTests(unittest.TestCase):
     """Move B: 'an ablation record on a row' is a CLOSED set of typed shapes, not an
@@ -2519,12 +2438,6 @@ class ConsumersTakeAPreparedTaskTests(unittest.TestCase):
                                input_files=(), run_dir="c1/ablation:no-rp",
                                instruction="Use the good-pr skill, but simulate this ablation: drop rp.",
                                prompt="Review.", tags=(), ablation=sim)
-
-    def test_codex_prompt_consumes_preparedtask_and_blinds_materialized(self):
-        mat = sb.build_task_prompt(self.mat_pt(), ["skills/root-0/SKILL.md"], [])
-        self.assertNotIn("simulate", mat)                  # materialized arm is blind: no hypothesis text
-        sim = sb.build_task_prompt(self.sim_pt(), ["skills/root-0/SKILL.md"], [])
-        self.assertIn("simulate this ablation", sim)       # instruction-simulated is told what to do
 
     def test_safe_task_json_model_visible_variant_is_owned_by_the_object(self):
         mat = sb.safe_task_json(self.mat_pt(), self.MANIFEST, task_name="t", upload_files=[])
