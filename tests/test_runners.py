@@ -514,6 +514,23 @@ class TraceEventStateTests(unittest.TestCase):
         self.assertEqual(event["state_source"], "provider_event_kind")
         self.assertEqual(len(sb.command_events([event])), 1)
 
+    def test_event_kinds_are_read_by_word_not_by_substring(self):
+        # Codex opens every stream with thread.started; "th-read" once made it
+        # a file read, inflating file_reads on every Codex run.
+        cases = {
+            "thread.started": "event",
+            "file_read": "file_read",
+            "read": "file_read",
+            "file_write": "file_write",
+            "edit": "file_write",
+            "skill_load": "skill_load",
+            "already.done": "event",
+        }
+        for raw_type, expected in cases.items():
+            with self.subTest(raw_type=raw_type):
+                event = sb.normalize_trace_record({"type": raw_type}, source="codex", index=0, line=1)
+                self.assertEqual(event["type"], expected)
+
     def test_statusless_or_unknown_terminal_looking_kinds_do_not_count(self):
         records = [
             {"type": "command", "command": "echo no"},

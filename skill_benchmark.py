@@ -7368,12 +7368,14 @@ def normalize_trace_record(record: dict[str, Any], *, source: str, index: int, l
     name = stringify_trace_value(raw_trace_value(
         record, "tool", "tool_name", "toolName", "name"))
     tool_name = name.casefold()
-    is_write = ("file_write" in raw_type or "write" in raw_type or "edit" in raw_type
+    # Event types are matched by word, not substring: "thread.started" is not a
+    # read, and "overwrite_warning" is not a write.
+    type_words = set(re.split(r"[^a-z0-9]+", raw_type))
+    is_write = (bool(type_words & {"write", "edit"})
                 or tool_name in {"write", "edit", "multiedit", "notebookedit", "write_file"})
-    is_read = ("file_read" in raw_type or "read" in raw_type
-               or tool_name in {"read", "read_file"})
+    is_read = "read" in type_words or tool_name in {"read", "read_file"}
     skill_path = path.endswith("SKILL.md") or "/SKILL.md" in path or "\\SKILL.md" in path
-    explicit_skill_load = "skill" in raw_type and ("load" in raw_type or "read" in raw_type)
+    explicit_skill_load = "skill" in type_words and bool(type_words & {"load", "read"})
     if is_write:
         event_type = TraceEventKind.FILE_WRITE
     elif explicit_skill_load or (is_read and skill_path):
