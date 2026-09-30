@@ -36,18 +36,6 @@ ROOT = Path(__file__).resolve().parents[1]
 class JudgeConfigSlotTests(unittest.TestCase):
     """1.3 — judge config slot and the judge-is-not-the-model-under-test guard."""
 
-    def test_manifest_judge_block_validates(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = write_manifest(Path(td), base_manifest(judge={"model": "judge-model-x"}))
-            manifest = sb.validate_manifest(path)
-            self.assertEqual(manifest["judge"]["model"], "judge-model-x")
-
-    def test_bad_judge_block_dies(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = write_manifest(Path(td), base_manifest(judge={"model": 7}))
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(path)
-
     def test_effective_judge_model_prefers_cli_then_manifest(self):
         manifest = base_manifest(judge={"model": "manifest-judge"})
         self.assertEqual(sb.effective_judge_model(manifest, "cli-judge"), "cli-judge")
@@ -584,37 +572,6 @@ class VerdictSchemaTests(unittest.TestCase):
         task = {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
                 "run_number": 1, "prompt": "p", "assertion": self.PLAIN}
         self.assertIn(json.dumps(sb.verdict_schema_for(self.PLAIN)), sb.judge_prompt(task, "output"))
-
-    def test_manifest_schema_enforcement_validated(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "repo" / "skill").mkdir(parents=True)
-            (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-            (root / "repo" / "evals").mkdir()
-            p = root / "repo" / "evals" / "shared-benchmark.json"
-            base = {"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                    "variants": ["with_skill", "without_skill"],
-                    "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
-                               "assertions": [{"name": "a", "type": "contains", "value": "y"}]}],
-                    "ablations": []}
-
-            def write(judge_cfg):
-                m = dict(base)
-                if judge_cfg is not None:
-                    m["judge"] = judge_cfg
-                p.write_text(json.dumps(m), encoding="utf-8")
-                return p
-
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(write({"schema_enforcement": "loose"}))   # invalid enum rejected
-            sb.validate_manifest(write({"schema_enforcement": "strict"}))       # valid accepted
-            sb.validate_manifest(write({"schema_enforcement": "report"}))       # the documented default, also accepted
-            sb.validate_manifest(write(None))                                   # absent is fine
-            # G3 panel activation surface (judge.panel / judge.models) is validated too.
-            sb.validate_manifest(write({"panel": ["m1", "m2"]}))                # good panel accepted
-            for bad in ({"panel": []}, {"panel": ["m1", 2]}, {"models": "solo"}, {"models": [""]}):
-                with self.assertRaises(SystemExit):
-                    sb.validate_manifest(write(bad))
 
 
 class TrajectoryJudgeTests(unittest.TestCase):

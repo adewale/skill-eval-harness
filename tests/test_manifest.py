@@ -742,14 +742,19 @@ class ContaminationPerimeterTests(unittest.TestCase):
 
 
 class ClosedManifestBoundaryTests(unittest.TestCase):
-    def _validate(self, case: dict, *, judge: dict | None = None):
+    def _validate(self, case: dict):
         manifest = base_manifest()
         manifest["cases"] = [case]
-        if judge is not None:
-            manifest["judge"] = judge
         with tempfile.TemporaryDirectory() as td:
             path = write_manifest(Path(td), manifest)
             return sb.validate_manifest(path)
+
+    def _dies(self, case: dict, message: str):
+        stderr = io.StringIO()
+        with self.subTest(case=case), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                self._validate(case)
+            self.assertIn(message, stderr.getvalue())
 
     def test_prompt_sources_are_mutually_exclusive(self):
         base = {
@@ -760,8 +765,7 @@ class ClosedManifestBoundaryTests(unittest.TestCase):
             {"prompt_ref": "private.txt"},
             {"turns": [{"prompt": "turn one"}]},
         ):
-            with self.assertRaises(SystemExit):
-                self._validate({**base, **second})
+            self._dies({**base, **second}, "prompt, prompt_ref, and turns are mutually exclusive")
 
     def test_turns_are_a_complete_prompt_source(self):
         case = {
@@ -773,37 +777,56 @@ class ClosedManifestBoundaryTests(unittest.TestCase):
         self.assertEqual(len(loaded["cases"][0]["turns"]), 2)
 
     def test_nested_qualitative_objects_are_closed(self):
-        assertions = [
-            {"name": "q", "type": "judge", "graded_dimensions": [
-                {"name": "quality", "rubric": "5 = good; 1 = bad", "rubirc": "typo"}
-            ]},
-            {"name": "q", "type": "judge", "dynamic_rubric": {
-                "instruction": "draft criteria", "minimum_criterai": 5,
-            }},
-        ]
-        for assertion in assertions:
-            case = {
-                "id": "case-1", "split": "tune", "prompt": "do it",
-                "assertions": [assertion],
-            }
-            with self.assertRaises(SystemExit):
-                self._validate(case)
+        for assertion, message in (
+            ({"name": "q", "type": "judge", "graded_dimensions": [
+                {"name": "quality", "rubric": "5 = good; 1 = bad", "rubirc": "typo"}]},
+             "graded_dimensions[0] has unknown field(s): rubirc"),
+            ({"name": "q", "type": "judge", "dynamic_rubric": {
+                "instruction": "draft criteria", "minimum_criterai": 5}},
+             "dynamic_rubric has unknown field(s): minimum_criterai"),
+        ):
+            self._dies({"id": "case-1", "split": "tune", "prompt": "do it",
+                        "assertions": [assertion]}, message)
 
-    def test_judge_panel_aliases_cannot_both_be_set(self):
-        case = {
-            "id": "case-1", "split": "tune", "prompt": "do it",
-            "assertions": [{"name": "a", "type": "contains", "value": "x"}],
-        }
-        with self.assertRaises(SystemExit):
-            self._validate(case, judge={"panel": ["a"], "models": ["b"]})
 
-    def test_judge_panel_models_must_be_unique(self):
-        case = {
-            "id": "case-1", "split": "tune", "prompt": "do it",
-            "assertions": [{"name": "a", "type": "contains", "value": "x"}],
-        }
-        with self.assertRaises(SystemExit):
-            self._validate(case, judge={"panel": ["same", "same"]})
+class ManifestJudgeBlockTests(unittest.TestCase):
+    """manifest.judge: the judge config slot (1.3), schema enforcement, and the
+    G3 panel surface that activates consensus with no CLI flag. One table owns
+    what validate accepts and rejects."""
+
+    PANEL = "must be a non-empty list of unique non-empty model-name strings"
+
+    def _validate(self, judge):
+        manifest = base_manifest() if judge is None else base_manifest(judge=judge)
+        with tempfile.TemporaryDirectory() as td:
+            return sb.validate_manifest(write_manifest(Path(td), manifest))
+
+    def test_valid_judge_blocks_are_accepted_unchanged(self):
+        for judge in (None, {"model": "judge-model-x"}, {"schema_enforcement": "report"},
+                      {"schema_enforcement": "strict"}, {"panel": ["m1", "m2"]},
+                      {"models": ["m1"]}):
+            with self.subTest(judge=judge):
+                self.assertEqual(self._validate(judge).get("judge"), judge)
+
+    def test_invalid_judge_blocks_are_rejected_by_their_guard(self):
+        for judge, message in (
+            ("judge-model-x", "manifest.judge must be an object"),
+            ({"model": 7}, "manifest.judge.model must be a non-empty string"),
+            ({"model": ""}, "manifest.judge.model must be a non-empty string"),
+            ({"schema_enforcement": "loose"},
+             'manifest.judge.schema_enforcement must be "report" or "strict"'),
+            ({"panel": []}, f"manifest.judge.panel {self.PANEL}"),
+            ({"panel": ["m1", 2]}, f"manifest.judge.panel {self.PANEL}"),
+            ({"panel": ["same", "same"]}, f"manifest.judge.panel {self.PANEL}"),
+            ({"models": "solo"}, f"manifest.judge.models {self.PANEL}"),
+            ({"models": [""]}, f"manifest.judge.models {self.PANEL}"),
+            ({"panel": ["a"], "models": ["b"]}, "manifest.judge may set panel or models, not both"),
+        ):
+            stderr = io.StringIO()
+            with self.subTest(judge=judge), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit):
+                    self._validate(judge)
+                self.assertIn(message, stderr.getvalue())
 
 
 class PerStepValidationTests(unittest.TestCase):
