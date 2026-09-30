@@ -17550,6 +17550,14 @@ def comparison_output_sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def comparison_task_id(case_id: str, run_number: int, primary: str, baseline: str,
+                       model: str | None = None) -> str:
+    """The blind comparison's task key; compare-tasks writes it and the truth
+    check recomputes it, so both read this one spelling."""
+    model_segment = f"{model}::" if model else ""
+    return f"{case_id}::{model_segment}run-{run_number}::blind-{primary}-vs-{baseline}"
+
+
 def comparison_task_identity(task: dict[str, Any]) -> dict[str, Any]:
     """The complete judge-visible comparison input, excluding local paths."""
     return {
@@ -17771,10 +17779,8 @@ def compare_tasks(args: argparse.Namespace) -> int:
                     ("baseline", args.baseline, model, run_number, b_out),
                 ]
                 rng.shuffle(sides)
-                model_segment = f"{model}::" if model else ""
-                task_id = (
-                    f"{case['id']}::{model_segment}run-{run_number}::"
-                    f"blind-{args.primary}-vs-{args.baseline}")
+                task_id = comparison_task_id(
+                    case["id"], run_number, args.primary, args.baseline, model)
                 if task_id in task_ids:
                     die(f"duplicate comparison task identity {task_id!r}")
                 result_schema = {
@@ -18065,10 +18071,9 @@ def load_comparison_truth(path: Path) -> dict[str, dict[str, Any]]:
         if sides["A"]["run_number"] != run_number:
             die(f"comparison truth row {position} ({task_id}): side run identity disagrees with task")
         by_role = {sides[label]["role"]: sides[label] for label in ("A", "B")}
-        model_segment = f"{model}::" if model else ""
-        expected_task_id = (
-            f"{case_id}::{model_segment}run-{run_number}::"
-            f"blind-{by_role['primary']['variant']}-vs-{by_role['baseline']['variant']}")
+        expected_task_id = comparison_task_id(
+            case_id, run_number, by_role["primary"]["variant"],
+            by_role["baseline"]["variant"], model)
         if task_id != expected_task_id:
             die(f"comparison truth row {position} ({task_id}): task id disagrees with its identity")
         truth_sha256 = row.get("comparison_truth_sha256")
