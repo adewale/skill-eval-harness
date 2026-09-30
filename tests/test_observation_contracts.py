@@ -3,9 +3,12 @@ import typing
 import unittest
 
 import agent_capabilities as caps
+import judge_contracts as jc
 import observation_contracts as oc
+import runner_contracts as rc
 import skill_benchmark as sb
 import telemetry
+from invocation_contracts import InvocationState
 from trigger_contracts import (
     InvocationOutcome,
     TriggerDetection,
@@ -101,6 +104,40 @@ class ProducersAndValidatorsAgreeTests(unittest.TestCase):
 
     def test_the_telemetry_domain_reads_the_same_provenance_list(self):
         self.assertIs(telemetry.PROVENANCE, oc.MEASUREMENT_PROVENANCE)
+
+
+class RawUsageBoundariesAgreeTests(unittest.TestCase):
+    """The runner and the judge accept exactly the same raw usage.
+
+    Each kept its own validator: only the judge rejected non-string keys, and
+    only the runner rejected an amount too large to be a float."""
+
+    def accepted_by(self, usage):
+        verdicts = []
+        for build in (
+                lambda: rc.RunnerOutcome(provider="gemini", answer="ok", returncode=0, usage=usage),
+                lambda: jc.JudgeInvocation(stdout="{}", stderr="", returncode=0,
+                                           invocation_state=InvocationState.COMPLETE, usage=usage)):
+            try:
+                build()
+            except (TypeError, ValueError):
+                verdicts.append(False)
+            else:
+                verdicts.append(True)
+        return verdicts
+
+    def test_both_boundaries_give_the_same_answer(self):
+        cases = [
+            ({"input_tokens": 10 ** 400}, True),         # exact integer counts at any size
+            ({"input_tokens": 1.5}, False),              # a token count is an integer
+            ({"cost": 10 ** 400}, False),                # an amount must fit a float
+            ({"nested": {"output_tokens": -1}}, False),
+            ({1: 2}, False),                             # keys are strings
+            ({"input_tokens": True}, False),
+        ]
+        for usage, expected in cases:
+            with self.subTest(usage=usage):
+                self.assertEqual(self.accepted_by(usage), [expected, expected])
 
 
 if __name__ == "__main__":

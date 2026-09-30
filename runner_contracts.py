@@ -5,7 +5,6 @@ states. Artifact writers consume the union exhaustively and never repair boolean
 """
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -13,6 +12,7 @@ from typing import Any, TypeAlias
 
 from invocation_contracts import InvocationState
 from json_contracts import freeze_json_mapping, validate_json_text
+from telemetry import finite_nonnegative, validate_raw_usage
 
 
 class Provider(str, Enum):
@@ -22,23 +22,6 @@ class Provider(str, Enum):
     VIBE = "vibe"
     SUBAGENT = "subagent"
     JETTY = "jetty"
-
-
-def _finite_nonnegative(value: Any, label: str, *, integer: bool = False) -> int | float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-        raise ValueError(f"{label} must be finite and non-negative")
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"{label} must be finite and non-negative")
-    if not integer:
-        try:
-            converted = float(value)
-        except OverflowError as exc:
-            raise ValueError(f"{label} must be finite and non-negative") from exc
-        if not math.isfinite(converted):
-            raise ValueError(f"{label} must be finite and non-negative")
-    if integer and (not isinstance(value, int) or isinstance(value, bool)):
-        raise ValueError(f"{label} must be a non-negative integer")
-    return value
 
 
 _RESERVED_EVIDENCE_KEYS = frozenset({
@@ -54,16 +37,6 @@ _RESERVED_EVIDENCE_KEYS = frozenset({
     "operation_observation_complete", "artifact_set_complete",
     "observation_evidence", "telemetry", "telemetry_schema_version",
 })
-
-
-def _validate_usage(value: Any, label: str) -> None:
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            _validate_usage(item, f"{label}.{key}")
-        return
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{label} must contain only numeric measurements")
-    _finite_nonnegative(value, label, integer=label.casefold().endswith("tokens"))
 
 
 @dataclass(frozen=True)
@@ -91,7 +64,7 @@ class OutcomeContext:
         if self.model is not None:
             validate_json_text(self.model, "runner model")
         if self.elapsed_ms is not None:
-            _finite_nonnegative(self.elapsed_ms, "elapsed_ms", integer=True)
+            finite_nonnegative(self.elapsed_ms, "elapsed_ms", integer=True)
             if self.elapsed_ms > 2**63 - 1:
                 raise ValueError("elapsed_ms exceeds the supported duration range")
         if not isinstance(self.stderr, str) or not isinstance(self.trace_text, str):
@@ -101,11 +74,11 @@ class OutcomeContext:
         if not isinstance(self.trace_utf8_valid, bool):
             raise TypeError("trace_utf8_valid must be boolean")
         if self.cost_usd is not None:
-            _finite_nonnegative(self.cost_usd, "cost_usd")
+            finite_nonnegative(self.cost_usd, "cost_usd")
         if self.usage is not None:
             if not isinstance(self.usage, Mapping):
                 raise TypeError("usage must be a mapping or None")
-            _validate_usage(self.usage, "usage")
+            validate_raw_usage(self.usage, "usage")
             object.__setattr__(self, "usage", freeze_json_mapping(self.usage, "usage"))
         for label, values in (("metadata_extra", self.metadata_extra),
                               ("metrics_extra", self.metrics_extra)):
