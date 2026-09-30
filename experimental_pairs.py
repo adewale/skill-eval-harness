@@ -198,6 +198,24 @@ def ablation_contrast(variant: object) -> ContrastSpec:
     )
 
 
+def contrast_for(treatment: object, control: object) -> ContrastSpec:
+    """The declared contrast between two execution arms, or an error.
+
+    Every comparison names a contrast, so an arm is never relabelled into
+    another arm's slot to reuse a pair constructor.
+    """
+    treatment_arm = ExecutionVariant.parse(treatment)
+    control_arm = ExecutionVariant.parse(control)
+    if treatment_arm == WITH_SKILL:
+        if control_arm == WITHOUT_SKILL:
+            return SKILL_PRESENCE_CONTRAST
+        if control_arm == OLD_SKILL:
+            return EDIT_CONTRAST
+        if control_arm.is_ablation:
+            return ablation_contrast(control_arm)
+    raise ValueError(f"no declared contrast compares {treatment_arm!r} with {control_arm!r}")
+
+
 class ExperimentalPopulation(str, Enum):
     ANSWER = "answer"
     TRIGGER = "trigger"

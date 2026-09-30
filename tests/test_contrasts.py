@@ -1,7 +1,13 @@
 """A contrast varies one factor; everything it holds fixed must match between arms."""
+import json
+import tempfile
 import unittest
+from pathlib import Path
+
+from helpers import attest_answer_design, demo_manifest, write_demo_manifest
 
 import experimental_pairs as ep
+import skill_benchmark as sb
 
 
 def row(case, variant, *, effort=None, run=1):
@@ -64,6 +70,36 @@ class ArmContrastTests(unittest.TestCase):
         self.assertEqual(construction.pairs[0].control.arm, "old_skill")
         with self.assertRaises(AttributeError):
             _ = construction.pairs[0].without_skill
+
+
+class TokenOverheadPairingTests(unittest.TestCase):
+    def test_token_overhead_blocks_a_pair_run_at_different_effort(self):
+        # token-overhead paired runs with its own loop and never applied the
+        # effort check the benchmark applies; both now use one contrast.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_demo_manifest(root, demo_manifest())
+            runs = root / "runs"
+            for variant, effort in (("with_skill", "high"), ("without_skill", "low")):
+                base = runs / "case-1" / variant
+                base.mkdir(parents=True)
+                (base / "output.md").write_text("alpha", encoding="utf-8")
+                (base / "metadata.json").write_text(json.dumps({
+                    "effort": {"requested": effort, "applied_by": "claude --effort"},
+                    "usage_normalized": {"total_tokens": 10, "source": "provider_reported"},
+                }), encoding="utf-8")
+            attest_answer_design(path, runs)
+            report = sb.paired_token_overhead_report(path, runs=runs)
+        self.assertEqual(report["pairs"], [])
+        self.assertEqual([pair["pair_status"]["reason"] for pair in report["blocked_pairs"]],
+                         ["effort_mismatch"])
+
+    def test_every_comparison_names_a_declared_contrast(self):
+        self.assertIs(ep.contrast_for("with_skill", "without_skill"), ep.SKILL_PRESENCE_CONTRAST)
+        self.assertIs(ep.contrast_for("with_skill", "old_skill"), ep.EDIT_CONTRAST)
+        self.assertEqual(ep.contrast_for("with_skill", "ablation:x").contrast_id, "ablation:x")
+        with self.assertRaisesRegex(ValueError, "no declared contrast"):
+            ep.contrast_for("without_skill", "with_skill")
 
 
 if __name__ == "__main__":

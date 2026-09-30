@@ -15907,13 +15907,12 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         if not prov_ok:
             entry["provenance_note"] = prov_note
 
-        # Causal ablation evidence uses exact case/model/repetition pairs. The
-        # ablation arm is adapted to the pair constructor's treatment slot only
-        # for identity construction; payloads retain their original variant.
-        ablation_pair_rows = [r for r in results if r.get("variant") == "with_skill"] + [
-            {**r, "variant": "without_skill", "_ablation_variant": variant}
-            for r in results if r.get("variant") == variant
-        ]
+        # Causal ablation evidence uses exact case/model/repetition pairs under
+        # the ablation's own contrast: the full skill against the skill with
+        # this component removed, holding effort fixed. A missing arm is named
+        # as the ablation arm, not as a missing without_skill arm.
+        contrast = pair_domain.ablation_contrast(variant)
+        ablation_pair_rows = [r for r in results if r.get("variant") in {"with_skill", variant}]
         def ablation_eligibility(row: Mapping[str, Any]) -> tuple[bool, str | None]:
             if not scorable_run(row):
                 return False, "unscorable_arm"
@@ -15928,6 +15927,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         ablation_pairing = pair_domain.pairs_from_rows(
             ablation_pair_rows,
             population=pair_domain.ExperimentalPopulation.ANSWER,
+            contrast=contrast,
             eligibility=ablation_eligibility,
         )
         pairs_by_case_model: dict[tuple[str, str | None], list[_ResultPair]] = collections.defaultdict(list)
@@ -15943,8 +15943,8 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         def paired_assertion_rates(pairs: list[_ResultPair], name: str) -> tuple[float | None, float | None, int]:
             observations = []
             for pair in pairs:
-                left = assertion_value(pair.with_skill.payload, name)
-                right = assertion_value(pair.without_skill.payload, name)
+                left = assertion_value(pair.treatment.payload, name)
+                right = assertion_value(pair.control.payload, name)
                 if left is not None and right is not None:
                     observations.append((left, right))
             if not observations:
@@ -15956,8 +15956,8 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         def paired_combined_deltas(pairs: list[_ResultPair]) -> list[float]:
             deltas = []
             for pair in pairs:
-                left = pair.with_skill.payload.get("combined_pass_rate", pair.with_skill.payload.get("objective_pass_rate"))
-                right = pair.without_skill.payload.get("combined_pass_rate", pair.without_skill.payload.get("objective_pass_rate"))
+                left = pair.treatment.payload.get("combined_pass_rate", pair.treatment.payload.get("objective_pass_rate"))
+                right = pair.control.payload.get("combined_pass_rate", pair.control.payload.get("objective_pass_rate"))
                 if (isinstance(left, (int, float)) and not isinstance(left, bool)
                         and isinstance(right, (int, float)) and not isinstance(right, bool)
                         and math.isfinite(float(left)) and math.isfinite(float(right))
@@ -19127,7 +19127,12 @@ def profile_skill_report(
 
 
 def paired_run_bases(runs: Path, case_id: str, with_variant: str, without_variant: str):
-    """Yield run bases through the same validated identity constructor as reports."""
+    """Yield ``(model, run_number, treatment_base, control_base, blocked_reason)``.
+
+    Pairs come from the same constructor and declared contrast as the
+    benchmark, so a pair whose arms ran at different effort is blocked here
+    too; ``blocked_reason`` is None for a usable pair."""
+    contrast = pair_domain.contrast_for(with_variant, without_variant)
     for model, model_root in discover_case_model_roots(runs, case_id, [with_variant, without_variant]):
         with_dir = model_root / with_variant
         without_dir = model_root / without_variant
@@ -19135,7 +19140,7 @@ def paired_run_bases(runs: Path, case_id: str, with_variant: str, without_varian
         without_runs = discover_run_bases_under(without_dir) if without_dir.exists() else []
         arms = []
         bases: dict[tuple[int, str], Path] = {}
-        for arm, discovered in (("with_skill", with_runs), ("without_skill", without_runs)):
+        for arm, discovered in ((with_variant, with_runs), (without_variant, without_runs)):
             for run_number, base in discovered:
                 key = pair_domain.ExperimentalPairKey.parse(
                     case_id,
@@ -19146,13 +19151,18 @@ def paired_run_bases(runs: Path, case_id: str, with_variant: str, without_varian
                 bases[(run_number, arm)] = base
                 arms.append(pair_domain.ExperimentalArm(
                     key, pair_domain.ExperimentalArmId(arm), base))
-        construction = pair_domain.construct_pairs(arms)
+        construction = pair_domain.construct_pairs(
+            arms, contrast=contrast,
+            comparable=lambda left, right: contrast.comparability(
+                read_metrics_base(left), read_metrics_base(right)))
         for pair in construction.pairs:
-            yield model, pair.key.run_number, pair.with_skill.payload, pair.without_skill.payload
+            yield model, pair.key.run_number, pair.treatment.payload, pair.control.payload, None
         for blocked in construction.blocked:
+            reason = {f"missing_{with_variant}": "missing_left",
+                      f"missing_{without_variant}": "missing_right"}.get(blocked.reason, blocked.reason)
             yield (model, blocked.key.run_number,
-                   bases.get((blocked.key.run_number, "with_skill")),
-                   bases.get((blocked.key.run_number, "without_skill")))
+                   bases.get((blocked.key.run_number, with_variant)),
+                   bases.get((blocked.key.run_number, without_variant)), reason)
 
 
 def paired_token_overhead_report(
@@ -19170,10 +19180,11 @@ def paired_token_overhead_report(
     blocked_pairs: list[dict[str, Any]] = []
     if runs is not None:
         for case in iter_cases(manifest, split):
-            for model_name, run_number, with_base, without_base in paired_run_bases(
+            for model_name, run_number, with_base, without_base, blocked_reason in paired_run_bases(
                 runs, case["id"], with_variant, without_variant):
-                if with_base is None or without_base is None:
-                    missing_reason = "missing_left" if with_base is None else "missing_right"
+                if blocked_reason is not None or with_base is None or without_base is None:
+                    missing_reason = blocked_reason or (
+                        "missing_left" if with_base is None else "missing_right")
                     blocked_pairs.append({
                         "case_id": case["id"], "model": model_name, "run_number": run_number,
                         "with_run_base": str(with_base) if with_base else None,
