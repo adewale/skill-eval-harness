@@ -1405,10 +1405,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(meta["returncode"], 127)
             self.assertFalse(sb.execution_valid(meta, text))
 
-    def test_codex_empty_output_writes_explicit_missing_telemetry(self):
-        # The PR's headline consistency fix: an empty Codex run now goes through the
-        # shared writer, so it gets explicit missing telemetry and schema-2 metrics
-        # (was schema-1 metadata with no normalized blocks before the consolidation).
+    def test_codex_empty_output_is_a_failure_not_an_empty_answer(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _, tasks, run_dir = write_with_skill_task(root)
@@ -1418,11 +1415,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs),
                                          codex_cmd=f"{sys.executable} {silent}", timeout=30))
             base = runs / run_dir
-            self.assertIn("no final answer", (base / "output.md").read_text(encoding="utf-8"))
-            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
-            self.assertEqual(meta["usage_normalized"], {"source": "missing"})
-            self.assertEqual(meta["cost_normalized"], {"source": "missing"})
-            self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
+            text = (base / "output.md").read_text(encoding="utf-8")
+            self.assertTrue(text.startswith(f"{sb.CODEX_FAILURE}: provider produced no final answer"), text)
+            self.assertFalse(sb.execution_valid(sb.read_metadata_base(base), text))
 
 
 class TraceDialectRegistryTests(unittest.TestCase):

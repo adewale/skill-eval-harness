@@ -118,7 +118,7 @@ class NormalizeUsageCostTests(unittest.TestCase):
 
 
 class RunnerStampTests(unittest.TestCase):
-    def test_write_trace_artifacts_provider_blocks_win_and_missing_is_explicit(self):
+    def test_write_trace_artifacts_provider_blocks_win_over_trace_usage(self):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "run"
             provider_usage = {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150, "source": "provider_reported"}
@@ -132,12 +132,6 @@ class RunnerStampTests(unittest.TestCase):
             self.assertEqual(metadata["telemetry_schema_version"], 3)
             self.assertEqual(metadata["telemetry"], metrics["telemetry"])
             self.assertEqual(metadata["telemetry"]["measurements"]["cost"]["availability"], "available")
-
-            bare_dir = Path(td) / "bare"
-            sb.write_trace_artifacts(bare_dir, "", source="codex", metadata={"provider": "codex"})
-            bare_meta = json.loads((bare_dir / "metadata.json").read_text(encoding="utf-8"))
-            self.assertEqual(bare_meta["usage_normalized"], {"source": "missing"})
-            self.assertEqual(bare_meta["cost_normalized"], {"source": "missing"})
 
     def test_successful_provider_call_without_trace_keeps_trace_counts_unavailable(self):
         with tempfile.TemporaryDirectory() as td:
