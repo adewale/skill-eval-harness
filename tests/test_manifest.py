@@ -6,6 +6,8 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -804,18 +806,28 @@ class PerStepValidationTests(unittest.TestCase):
     """per_step is a judge-only assertion field: true, or an object whose only
     key is min_met_fraction in (0, 1]."""
 
-    def _validate(self, assertion):
+    def _validate(self, assertion, *, in_turn=False):
         if assertion.get("type") in sb.QUALITATIVE_ASSERTIONS and "severity" not in assertion:
             assertion = {**assertion, "severity": "gate"}
         manifest = base_manifest()
-        manifest["cases"][0]["assertions"] = [assertion]
+        case = manifest["cases"][0]
+        if in_turn:
+            # A turns case carries no case-level prompt: prompt and turns are
+            # mutually exclusive, and that guard would fire first.
+            case.pop("prompt")
+            case["turns"] = [{"prompt": "first", "assertions": [assertion]}]
+        else:
+            case["assertions"] = [assertion]
         with tempfile.TemporaryDirectory() as td:
             path = write_manifest(Path(td), manifest)
             return sb.validate_manifest(path)
 
-    def _dies(self, assertion):
-        with self.assertRaises(SystemExit):
-            self._validate(assertion)
+    def _dies(self, assertion, message, *, in_turn=False):
+        stderr = io.StringIO()
+        with self.subTest(assertion=assertion), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                self._validate(assertion, in_turn=in_turn)
+            self.assertIn(message, stderr.getvalue())
 
     def test_per_step_true_on_judge_validates(self):
         manifest = self._validate({"name": "steps", "type": "judge", "per_step": True})
@@ -826,30 +838,33 @@ class PerStepValidationTests(unittest.TestCase):
                         "per_step": {"min_met_fraction": 0.8}})
 
     def test_per_step_rejects_non_judge_assertions(self):
-        self._dies({"name": "a", "type": "contains", "value": "x", "per_step": True})
+        # Objective types reject it as an unknown field; the other qualitative
+        # types accept the field name and reach the judge-only guard.
+        self._dies({"name": "a", "type": "contains", "value": "x", "per_step": True},
+                   "assertion #0 has unknown field(s): per_step")
+        self._dies({"name": "r", "type": "rubric", "rubric": ["x"], "per_step": True},
+                   "assertion #0 per_step is only valid on judge assertions")
 
     def test_per_step_rejects_other_judge_shapes(self):
-        self._dies({"name": "steps", "type": "judge", "per_step": True,
-                    "dynamic_rubric": {"instruction": "draft criteria"}})
-        self._dies({"name": "steps", "type": "judge", "per_step": True,
-                    "graded_dimensions": [{"name": "d", "rubric": "anchored"}]})
+        for other in ({"dynamic_rubric": {"instruction": "draft criteria"}},
+                      {"graded_dimensions": [{"name": "d", "rubric": "anchored"}]}):
+            self._dies({"name": "steps", "type": "judge", "per_step": True, **other},
+                       "per_step cannot combine with graded_dimensions or dynamic_rubric")
 
     def test_per_step_rejects_malformed_shapes(self):
-        self._dies({"name": "steps", "type": "judge", "per_step": "yes"})
-        self._dies({"name": "steps", "type": "judge", "per_step": {}})
-        self._dies({"name": "steps", "type": "judge", "per_step": {"min_met_fraction": 0}})
-        self._dies({"name": "steps", "type": "judge", "per_step": {"min_met_fraction": 1.5}})
-        self._dies({"name": "steps", "type": "judge", "per_step": {"unknown": 1}})
+        for per_step, message in (
+            ("yes", "per_step must be true or an object with min_met_fraction"),
+            ({}, "per_step object must contain min_met_fraction"),
+            ({"min_met_fraction": 0}, "per_step.min_met_fraction must be a number in (0, 1]"),
+            ({"min_met_fraction": 1.5}, "per_step.min_met_fraction must be a number in (0, 1]"),
+            ({"unknown": 1}, "per_step has unknown field(s): unknown"),
+        ):
+            self._dies({"name": "steps", "type": "judge", "per_step": per_step}, message)
 
     def test_per_step_rejected_on_turn_assertion(self):
-        manifest = base_manifest()
-        manifest["cases"][0]["turns"] = [{
-            "prompt": "first", "assertions": [
-                {"name": "steps", "type": "judge", "per_step": True}]}]
-        with tempfile.TemporaryDirectory() as td:
-            path = write_manifest(Path(td), manifest)
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(path)
+        self._dies({"name": "steps", "type": "judge", "per_step": True},
+                   "turn #1 assertion #0 per_step is not supported in turn assertions",
+                   in_turn=True)
 
 
 if __name__ == "__main__":
