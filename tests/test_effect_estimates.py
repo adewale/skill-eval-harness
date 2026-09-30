@@ -13,6 +13,7 @@ from helpers import attest_answer_design, demo_manifest, result_row, write_demo_
 
 import effect_estimates as ee
 import skill_benchmark as sb
+from findings import CaseFlag
 
 
 def thirds(values: list[int]) -> list[float]:
@@ -169,7 +170,7 @@ class FloorCeilingTests(unittest.TestCase):
 
     def test_suggest_cases_never_hardens_a_floor_case(self):
         report = {"case_flags": [
-            {"case_id": "floor", "flags": [sb.FLOOR_FLAG, "no objective lift", "with-skill failure"]},
+            {"case_id": "floor", "flags": [CaseFlag.FLOOR.value, "no objective lift", "with-skill failure"]},
             {"case_id": "ceiling", "flags": ["saturated/non-discriminating", "no objective lift"]},
         ]}
         manifest = {"cases": [{"id": "floor", "prompt": "p", "assertions": []},
@@ -211,7 +212,7 @@ class FloorEndToEndTests(unittest.TestCase):
             report = sb.build_benchmark_report(path, runs)
             audit = sb.audit_manifest_report(path, runs=str(runs))
         flags = report["case_flags"][0]["flags"]
-        self.assertIn(sb.FLOOR_FLAG, flags)
+        self.assertIn(CaseFlag.FLOOR.value, flags)
         self.assertNotIn("saturated/non-discriminating", flags)
         kinds = {finding["kind"] for finding in audit["findings"]}
         self.assertIn("floor-eval", kinds)

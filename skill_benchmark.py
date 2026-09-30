@@ -58,6 +58,7 @@ from yaml.constructor import ConstructorError
 from yaml.resolver import BaseResolver
 
 import experimental_pairs as pair_domain
+import gate_policy
 import report_contracts as report_domain
 import telemetry as telemetry_domain
 from ablation_model import (
@@ -146,6 +147,14 @@ from effect_estimates import (
     sign_flip_interval,
     sign_flip_test,
 )
+from findings import (
+    NON_DISCRIMINATING_FLAGS,
+    CaseFlag,
+    EvalMark,
+    Finding,
+    FindingKind,
+    eval_health,
+)
 from gemini_contracts import GeminiJsonResponse, GeminiStream
 from grading_contracts import (
     FailedAssertion,
@@ -233,6 +242,15 @@ from trigger_contracts import (
 from trigger_reporting import CompleteTriggerCohort, summarize_trigger_cohort
 
 VALID_SPLITS = frozenset(Split.values())
+# Where a case came from (eval-health mark 1). Sources other than real use are
+# fine to have; an eval built only from synthesized cases is the risk.
+CASE_SOURCES = frozenset({"production", "bug-report", "hand-written", "synthesized", "imported"})
+# Deterministic text checks the known-answer self-test can run on a string alone.
+KNOWN_ANSWER_ASSERTIONS = frozenset({
+    "contains", "contains_any", "contains_all", "excludes_any", "regex", "not_regex"})
+# A capability suite whose without_skill arm already passes this share of runs
+# has little room to show lift; quality at lower cost is the better objective.
+SUITE_HEADROOM_CEILING = 0.95
 TRIGGER_HARNESS_IDENTITY_VERSION = 2
 # Conservative at module granularity: skill_benchmark.py still combines trigger
 # and non-trigger orchestration, so every edit to that monolith invalidates the
@@ -376,9 +394,6 @@ def expand_judge_preset(assertion: dict[str, Any]) -> dict[str, Any]:
 # Below this graded mean, an objectively saturated case is flagged
 # structurally-pass-but-forgettable (roadmap 2.2): competent, but low-scoring.
 FORGETTABLE_GRADED_THRESHOLD = 0.75
-# Both arms fail every scored run: flagged apart from the ceiling because the
-# likelier cause is a broken case or assertion, not a hard task.
-FLOOR_FLAG = "floor: fails in both arms"
 
 # Native agents run in their own process group. A successful CLI parent can
 # still leave plugin/git group members alive, so the group is force-killed
@@ -1329,6 +1344,28 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
                     or not all(isinstance(item, str) and item
                                for item in case[field])):
                 die(f"{cid}: {field} must be a list of non-empty strings")
+        source = case.get("source")
+        if source is not None and source not in CASE_SOURCES:
+            die(f"{cid}: source must be one of {sorted(CASE_SOURCES)}")
+        known_answers = [key for key in ("reference_answer", "reference_answer_ref") if key in case]
+        if len(known_answers) > 1:
+            die(f"{cid}: reference_answer and reference_answer_ref are mutually exclusive")
+        if known_answers and trigger_case:
+            die(f"{cid}: a trigger case has no answer to check; drop {known_answers[0]}")
+        if "reference_answer" in case:
+            if not isinstance(case["reference_answer"], str) or not case["reference_answer"].strip():
+                die(f"{cid}: reference_answer must be a non-empty string")
+            if split in {"holdout", "holdback"}:
+                # A known-good answer is an answer key: keep it out of public files
+                # for held-out cases, the same way prompt_ref keeps their prompts out.
+                die(f"{cid}: a {split} case must keep its known answer private; use reference_answer_ref")
+        if "reference_answer_ref" in case:
+            ref_value = case["reference_answer_ref"]
+            if not isinstance(ref_value, str) or not ref_value.strip():
+                die(f"{cid}: reference_answer_ref must be a non-empty relative path")
+            ref = path.parent / ref_value
+            if not ref.exists() and not (allow_missing_holdback and split in {"holdout", "holdback"}):
+                die(f"{cid}: reference_answer_ref does not exist: {ref}")
         files = case.get("files", [])
         if files and (not isinstance(files, list) or not all(isinstance(f, str) for f in files)):
             die(f"{cid}: files must be a list of strings")
@@ -13443,7 +13480,7 @@ def judge_robustness_report(tasks: list[dict[str, Any]], *, tmp_dir: Path, judge
                 call_errors.append({"probe": probe, "reason": problem})
                 findings.append({
                     "judge_task_id": task.get("judge_task_id"),
-                    "kind": "judge-call-incomplete", "probe": probe,
+                    "kind": FindingKind.JUDGE_CALL_INCOMPLETE.value, "probe": probe,
                     "detail": problem,
                 })
         controls: dict[str, bool | None] = {}
@@ -13460,14 +13497,14 @@ def judge_robustness_report(tasks: list[dict[str, Any]], *, tmp_dir: Path, judge
                 call_errors.append({"probe": f"control:{name}", "reason": problem})
                 findings.append({
                     "judge_task_id": task.get("judge_task_id"),
-                    "kind": "judge-call-incomplete", "probe": f"control:{name}",
+                    "kind": FindingKind.JUDGE_CALL_INCOMPLETE.value, "probe": f"control:{name}",
                     "detail": problem,
                 })
             elif passed:
-                findings.append({"judge_task_id": task.get("judge_task_id"), "kind": f"passes-{name}-control",
+                findings.append({"judge_task_id": task.get("judge_task_id"), "kind": FindingKind(f"passes-{name}-control").value,
                                  "detail": f"judge PASSED a {name} negative control it should reject"})
         if consistent is False:
-            findings.append({"judge_task_id": task.get("judge_task_id"), "kind": "order-flip-inconsistent",
+            findings.append({"judge_task_id": task.get("judge_task_id"), "kind": FindingKind.ORDER_FLIP_INCONSISTENT.value,
                              "detail": "verdict flipped when the rubric / expected-behavior order was reversed"})
         results.append({
             "judge_task_id": task.get("judge_task_id"),
@@ -17184,31 +17221,31 @@ def build_benchmark_report(
             # Both arms fail every scored run. That is more often a broken case
             # or assertion than a hard task, so it is flagged apart from the
             # ceiling and never offered to suggest-cases for hardening.
-            flags.append(FLOOR_FLAG)
+            flags.append(CaseFlag.FLOOR.render())
         if extreme is DiscriminationFailure.CEILING:
-            flags.append("saturated/non-discriminating")
+            flags.append(CaseFlag.SATURATED.render())
             # 2.2: saturation's next move. Objectively perfect but scoring low on
             # the graded channel is competent-but-forgettable work — the report
             # points at graded dimensions instead of stopping at the flag.
             graded_ws = [r["graded_score"] for r in ws_rows if isinstance(r.get("graded_score"), (int, float))]
             if graded_ws and statistics.mean(graded_ws) < FORGETTABLE_GRADED_THRESHOLD:
-                flags.append("structurally-pass-but-forgettable")
+                flags.append(CaseFlag.FORGETTABLE.render())
         if w_rate is not None and n_rate is not None and w_rate <= n_rate:
-            flags.append("no objective lift")
+            flags.append(CaseFlag.NO_OBJECTIVE_LIFT.render())
         if w_rate is not None and w_rate < 1:
-            flags.append("with-skill failure")
+            flags.append(CaseFlag.WITH_SKILL_FAILURE.render())
         for variant, vrows in by_var_case.items():
             rr = [r["objective_pass_rate"] for r in vrows if r["objective_pass_rate"] is not None]
             if len(rr) > 1 and len(set(rr)) > 1:
-                flags.append(f"flaky repeated pass rates: {variant}")
+                flags.append(CaseFlag.FLAKY.render(variant))
             # A critical (absorbing-barrier) failure is surfaced on its own,
             # never only inside an averaged rate.
             veto_names = sorted({name for r in vrows if r.get("vetoed") for name in r.get("critical_failures", [])})
             if veto_names:
-                flags.append(f"critical-failure: {variant} ({', '.join(veto_names)})")
+                flags.append(CaseFlag.CRITICAL_FAILURE.render(f"{variant} ({', '.join(veto_names)})"))
         floor_hits = sorted({name for r in ws_rows for name in r.get("below_reference_floor", [])})
         if floor_hits:
-            flags.append(f"below-reference-floor: {', '.join(floor_hits)}")
+            flags.append(CaseFlag.BELOW_REFERENCE_FLOOR.render(', '.join(floor_hits)))
         if flags:
             case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate,
                                "without_skill": n_rate, "pairing": pairing.diagnostics(),
@@ -18816,10 +18853,10 @@ def suite_cost_ledger(manifest_path: Path, runs: Path, *, benchmark_report: dict
             spend = by_case.get(case_id)
             if not spend:
                 continue
-            waste_flags = [f for f in flags if "saturated" in f or "no objective lift" in f]
+            waste_flags = [f for f in flags if CaseFlag.parse(f) in NON_DISCRIMINATING_FLAGS]
             if waste_flags:
                 findings.append({
-                    "kind": "spend-on-non-discriminating-case",
+                    "kind": FindingKind.SPEND_ON_NON_DISCRIMINATING_CASE.value,
                     "case_id": case_id,
                     "flags": waste_flags,
                     "total_tokens": spend["total_tokens"],
@@ -18936,7 +18973,7 @@ def trend_entry(label: str, report: dict[str, Any]) -> dict[str, Any]:
         "with_skill": paired.get("with_skill_objective_pass_rate"),
         "without_skill": paired.get("without_skill_objective_pass_rate"),
         "lift": paired.get("absolute_delta"),
-        "saturated_cases": sum(1 for f in flags for x in f.get("flags", []) if "saturated" in x),
+        "saturated_cases": sum(1 for f in flags if CaseFlag.SATURATED in CaseFlag.in_row(f.get("flags"))),
         "flagged_cases": len(flags),
         "median_total_tokens": {v: block.get("median_total_tokens") for v, block in (report.get("summary") or {}).items()},
     }
@@ -19057,9 +19094,9 @@ def suggest_case_candidates(report: dict[str, Any], manifest: dict[str, Any]) ->
     seeds = []
     for flag in report.get("case_flags", []):
         case_flag_list = flag.get("flags", [])
-        if FLOOR_FLAG in case_flag_list:
+        if CaseFlag.FLOOR in CaseFlag.in_row(case_flag_list):
             continue
-        reasons = [f for f in case_flag_list if "saturated" in f or "no objective lift" in f]
+        reasons = [f for f in case_flag_list if CaseFlag.parse(f) in NON_DISCRIMINATING_FLAGS]
         if not reasons:
             continue
         case = cases.get(flag.get("case_id"), {})
@@ -19206,7 +19243,7 @@ def profile_skill_report(
     findings: list[dict[str, Any]] = []
     for path in skill_files:
         if not path.exists():
-            findings.append({"kind": "missing-skill-file", "severity": "required", "message": f"Skill path does not exist: {path}"})
+            findings.append(Finding(FindingKind.MISSING_SKILL_FILE, f"Skill path does not exist: {path}").as_dict())
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         tokens = approximate_tokens(text)
@@ -19227,13 +19264,13 @@ def profile_skill_report(
                 reference_files.append({"path": str(ref), "tokens": ref_tokens, "bytes": ref.stat().st_size})
     reference_tokens = sum(r["tokens"] for r in reference_files)
     if total_tokens > max_skill_tokens:
-        findings.append({"kind": "skill-too-large", "severity": "recommended", "message": f"SKILL.md token count {total_tokens} exceeds {max_skill_tokens}; consider moving rare details to conditional references."})
+        findings.append(Finding(FindingKind.SKILL_TOO_LARGE, f"SKILL.md token count {total_tokens} exceeds {max_skill_tokens}; consider moving rare details to conditional references.").as_dict())
     if len(reference_files) > max_references:
-        findings.append({"kind": "many-references", "severity": "recommended", "message": f"{len(reference_files)} reference files exceeds {max_references}; check that navigation is conditional and focused."})
+        findings.append(Finding(FindingKind.MANY_REFERENCES, f"{len(reference_files)} reference files exceeds {max_references}; check that navigation is conditional and focused.").as_dict())
     if reference_tokens > max_reference_tokens:
-        findings.append({"kind": "references-too-large", "severity": "recommended", "message": f"Reference token count {reference_tokens} exceeds {max_reference_tokens}; consider pruning or splitting by trigger."})
+        findings.append(Finding(FindingKind.REFERENCES_TOO_LARGE, f"Reference token count {reference_tokens} exceeds {max_reference_tokens}; consider pruning or splitting by trigger.").as_dict())
     if module_count > max_modules:
-        findings.append({"kind": "many-modules", "severity": "recommended", "message": f"{module_count} skill headings/modules exceeds {max_modules}; focused 2–3-module skills are often easier for agents to apply."})
+        findings.append(Finding(FindingKind.MANY_MODULES, f"{module_count} skill headings/modules exceeds {max_modules}; focused 2–3-module skills are often easier for agents to apply.").as_dict())
     return {
         "generated_at": int(time.time()),
         "manifest": str(manifest_path),
@@ -19829,23 +19866,30 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
             for a in positive
         ):
             leak_saturated.append(case.get("id"))
-    blockers: list[str] = []
+    blockers: list[Finding] = []
     if instr_sim:
-        blockers.append(f"{instr_sim}/{len(ablations)} ablation(s) are instruction-simulated (not blind / confirmation-gradeable) — materialize them")
+        blockers.append(Finding(FindingKind.ABLATION_INSTRUCTION_SIMULATED, f"{instr_sim}/{len(ablations)} ablation(s) are instruction-simulated (not blind / confirmation-gradeable) — materialize them"))
     if leak_saturated:
-        blockers.append(f"{len(leak_saturated)} case(s) are leak-saturated (every positive assertion value appears in the prompt) — they cannot discriminate skill from no-skill")
+        blockers.append(Finding(FindingKind.LEAK_SATURATED_CASE, f"{len(leak_saturated)} case(s) are leak-saturated (every positive assertion value appears in the prompt) — they cannot discriminate skill from no-skill", leak_saturated))
     if adversarial == 0:
-        blockers.append("no adversarial cases (kind: adversarial) — add the near-miss/under-pressure cases where the skill must hold")
+        blockers.append(Finding(FindingKind.NO_ADVERSARIAL_CASES, "no adversarial cases (kind: adversarial) — add the near-miss/under-pressure cases where the skill must hold"))
     # Run-measured signals (only when a benchmark report is supplied): cases whose
     # MEASURED numbers say they can't discriminate the skill. base_saturated is a
     # blocker (a case that measures nothing is wasted budget); qualitative_only is a
     # warning that the case's signal lives entirely in the judge, so an
     # objective-only reading would miss it.
     run = readiness_run_signals(benchmark_report) if benchmark_report else {"base_saturated_cases": [], "base_saturated_expected_cases": [], "qualitative_only_cases": [], "floor_cases": []}
+    if run.get("availability") == "partial":
+        # An incomplete benchmark yields empty signal lists; reading those as
+        # "no base-saturated or floor cases" would pass a gate on evidence it
+        # never saw.
+        blockers.append(Finding(FindingKind.BENCHMARK_INCOMPLETE, "the benchmark report is incomplete, so run-measured readiness signals are unknown — finish or re-grade the runs before relying on readiness"))
     if run["base_saturated_cases"]:
-        blockers.append(f"{len(run['base_saturated_cases'])} case(s) are base-saturated (measured with_skill == without_skill) — they cannot measure the skill; cut or harden them")
+        blockers.append(Finding(FindingKind.BASE_SATURATED_CASE, f"{len(run['base_saturated_cases'])} case(s) are base-saturated (measured with_skill == without_skill) — they cannot measure the skill; cut or harden them", run["base_saturated_cases"]))
     if run.get("floor_cases"):
-        blockers.append(f"{len(run['floor_cases'])} case(s) fail in both arms on every scored run — audit each case and its assertions before hardening or spending more on it")
+        blockers.append(Finding(FindingKind.FLOOR_EVAL, f"{len(run['floor_cases'])} case(s) fail in both arms on every scored run — audit each case and its assertions before hardening or spending more on it", run["floor_cases"]))
+    if not all(gate_policy.READINESS.matches(item) for item in blockers):
+        raise AssertionError("every readiness blocker must be a kind the readiness gate blocks on")
     return {
         "ablations": {"total": len(ablations), "materialized": materialized, "instruction_simulated": instr_sim},
         "leak_saturated_cases": leak_saturated,
@@ -19858,7 +19902,8 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
         # G5: regression guards that saturated are the intended steady state —
         # surfaced, but never a blocker (so --fail-on-blockers stays green).
         "regression_guards_holding": run["base_saturated_expected_cases"],
-        "blockers": blockers,
+        "blockers": [item.message for item in blockers],
+        "blocker_findings": [item.as_dict() for item in blockers],
     }
 
 
@@ -19936,7 +19981,7 @@ def contamination_check(case: dict[str, Any], output_text: str, *, manifest_dir:
         ).evaluate(output_text or "")
         if canary_observation.passed:
             finding: dict[str, Any] = {
-                "kind": "canary-hit",
+                "kind": FindingKind.CANARY_HIT.value,
                 "detail": f"canary {str(canary)!r} appeared in the output — the model has seen this held-out eval",
             }
             if canary_observation.changed:
@@ -19945,12 +19990,12 @@ def contamination_check(case: dict[str, Any], output_text: str, *, manifest_dir:
     answer = case_answer_material(case, manifest_dir)
     overlap = ngram_containment(output_text or "", answer, n) if answer else 0.0
     if answer and overlap >= overlap_threshold:
-        findings.append({"kind": "output-answer-overlap", "detail": f"{overlap:.2f} of the answer key's {n}-grams appear verbatim in the output"})
+        findings.append({"kind": FindingKind.OUTPUT_ANSWER_OVERLAP.value, "detail": f"{overlap:.2f} of the answer key's {n}-grams appear verbatim in the output"})
     released_at = case.get("released_at")
     rel_key = cutoff_key(released_at, end=False) if released_at else None
     cut_key = cutoff_key(model_cutoff, end=True) if model_cutoff else None
     if rel_key and cut_key and rel_key <= cut_key:
-        findings.append({"kind": "released-before-cutoff", "detail": f"case released_at {released_at} is at/before the model cutoff {model_cutoff} — the model may have trained on it"})
+        findings.append({"kind": FindingKind.RELEASED_BEFORE_CUTOFF.value, "detail": f"case released_at {released_at} is at/before the model cutoff {model_cutoff} — the model may have trained on it"})
     return {
         "case_id": case.get("id"),
         "comparison": ComparisonProfile.RENDERED_V1.value,
@@ -19991,6 +20036,105 @@ def contamination_command(args: argparse.Namespace) -> int:
     return 1 if (getattr(args, "fail_on_contamination", False) and report["total_findings"]) else 0
 
 
+def reference_answer_text(case: dict[str, Any], manifest_dir: Path) -> str | None:
+    """A case's declared known-good answer, or None (also when a private ref is absent)."""
+    if isinstance(case.get("reference_answer"), str):
+        return str(case["reference_answer"])
+    ref = case.get("reference_answer_ref")
+    if isinstance(ref, str) and ref:
+        path = manifest_dir / ref
+        return path.read_text(encoding="utf-8") if path.is_file() else None
+    return None
+
+
+def known_answer_check(manifest: dict[str, Any], manifest_path: Path, *,
+                       split: str | None = None) -> dict[str, Any]:
+    """Grade known answers through each case's own deterministic checks (mark 2).
+
+    A declared reference answer must pass every gate text check. The null
+    answer, the prompt echoed back, must fail at least one: a grader that passes
+    an answer which only repeats the question cannot tell a good answer from no
+    answer. Only text checks that need nothing but the answer string run here;
+    a case with other gate checks is not null-checked, because those checks
+    fail an echo for reasons unrelated to the grader. Model-free.
+    """
+    output_path = manifest_path.parent / "known-answer-check.md"
+    reference_failures: list[dict[str, Any]] = []
+    null_passes: list[Any] = []
+    references_checked = nulls_checked = 0
+    for case in iter_cases(manifest, split):
+        if CaseKind.parse(case.get("kind", "behavior")).population is CasePopulation.TRIGGER:
+            continue
+        gates = [a for a in case.get("assertions", []) or []
+                 if a.get("type") in OBJECTIVE_ASSERTIONS
+                 and assertion_severity(a) in {"gate", "critical"}]
+        checkable = [a for a in gates if a.get("type") in KNOWN_ANSWER_ASSERTIONS]
+        if not checkable:
+            continue
+        reference = reference_answer_text(case, manifest_path.parent)
+        if reference is not None:
+            references_checked += 1
+            failed = [assertion_label(a) for a in checkable
+                      if assertion_result(a, reference, output_path)["passed"] is not True]
+            if failed:
+                reference_failures.append({"case_id": case.get("id"), "failed_assertions": failed})
+        if len(checkable) != len(gates) or not (case.get("prompt") or case.get("turns")):
+            continue
+        prompt = case_prompt(case, manifest_path)
+        nulls_checked += 1
+        if all(assertion_result(a, prompt, output_path)["passed"] is True for a in checkable):
+            null_passes.append(case.get("id"))
+    return {
+        "references_checked": references_checked,
+        "reference_failures": reference_failures,
+        "null_answers_checked": nulls_checked,
+        "null_answer_passes": null_passes,
+    }
+
+
+def run_measured_findings(report: dict[str, Any]) -> list[Finding]:
+    """Findings only a complete benchmark can support (marks 3, 4 and 5)."""
+    out: list[Finding] = []
+    paired = report.get("paired_summary") or {}
+    capability = [
+        float(row["objective_pass_rate"]) for row in report.get("results", [])
+        if row.get("variant") == "without_skill" and scorable_run(row)
+        and row.get("eval_intent") != "regression"
+        and isinstance(row.get("objective_pass_rate"), (int, float))]
+    if capability and statistics.fmean(capability) >= SUITE_HEADROOM_CEILING:
+        rate = round(statistics.fmean(capability), 4)
+        out.append(Finding(
+            FindingKind.SUITE_HEADROOM_EXHAUSTED,
+            f"without_skill already passes {rate:.0%} of capability runs; there is little "
+            "room to show lift, so hold quality and optimise cost or latency instead",
+            {"without_skill_capability_rate": rate}))
+    noise = paired.get("noise_check") or {}
+    if noise.get("verdict") not in (None, "no-data", "resolvable"):
+        out.append(Finding(
+            FindingKind.UNDERPOWERED_EVAL,
+            f"the eval cannot resolve the lift it is meant to measure ({noise['verdict']})",
+            noise))
+    blocked = (paired.get("pairing") or {}).get("blocked_reason_counts") or {}
+    held_fixed = {reason: count for reason, count in blocked.items()
+                  if reason.endswith(("_mismatch", "_unrecorded_on_one_arm"))}
+    if held_fixed:
+        out.append(Finding(
+            FindingKind.ARM_CONDITIONS_DIFFER,
+            f"{sum(held_fixed.values())} pair(s) were blocked because their arms ran under "
+            "different conditions", held_fixed))
+    endings = report.get("run_endings") or {}
+    if endings.get("served_model_mismatches"):
+        out.append(Finding(
+            FindingKind.SERVED_MODEL_MISMATCH,
+            f"{endings['served_model_mismatches']} run(s) were answered by a model other than "
+            "the one requested"))
+    if endings.get("served_model_mixed"):
+        out.append(Finding(
+            FindingKind.SERVED_MODEL_MIXED,
+            f"{endings['served_model_mixed']} run(s) reported the requested model and another"))
+    return out
+
+
 def audit_manifest_report(
     manifest_path: Path,
     *,
@@ -20004,6 +20148,7 @@ def audit_manifest_report(
     min_trigger_neg: int = 2,
     leakage_min_chars: int = 4,
     expensive_case_usd: float = 1.0,
+    min_lift: float | None = None,
 ) -> dict[str, Any]:
     manifest = validate_manifest(manifest_path)
     cases = iter_cases(manifest, split)
@@ -20032,8 +20177,8 @@ def audit_manifest_report(
     }
     findings: list[dict[str, Any]] = []
     recommendations: list[dict[str, Any]] = []
-    def finding(kind: str, severity: str, message: str, evidence: Any = None) -> None:
-        findings.append({"kind": kind, "severity": severity, "message": message, **({"evidence": evidence} if evidence is not None else {})})
+    def finding(kind: FindingKind, message: str, evidence: Any = None) -> None:
+        findings.append(Finding(kind, message, evidence).as_dict())
     def rec(kind: str, message: str, example: Any = None) -> None:
         recommendations.append({"kind": kind, "message": message, **({"example": example} if example is not None else {})})
 
@@ -20046,33 +20191,33 @@ def audit_manifest_report(
 
     leakage = prompt_assertion_leakage_findings(manifest, manifest_path, min_chars=leakage_min_chars, split=split)
     if leakage:
-        finding("prompt-assertion-leakage", "recommended", f"{len(leakage)} contains-style assertion values appear literally in their prompts.", leakage[:30])
+        finding(FindingKind.PROMPT_ASSERTION_LEAKAGE, f"{len(leakage)} contains-style assertion values appear literally in their prompts.", leakage[:30])
         rec("assertion-leakage", "Replace leaked literal keyword assertions with non-leaked wording, regex scoped to output structure, fixture/script oracles, or stricter artifact checks.")
 
     if cases and counts["domain_tagged"] < len(cases):
-        finding("missing-domain-taxonomy", "recommended", f"{len(cases) - counts['domain_tagged']} cases lack domain tags used for slice summaries.")
+        finding(FindingKind.MISSING_DOMAIN_TAXONOMY, f"{len(cases) - counts['domain_tagged']} cases lack domain tags used for slice summaries.")
         rec("taxonomy-domain", "Add a stable domain to each case, for example docs, testing, repo-quality, design, audit, or cloudflare.")
     if cases and counts["difficulty_tagged"] < len(cases):
-        finding("missing-difficulty-taxonomy", "recommended", f"{len(cases) - counts['difficulty_tagged']} cases lack difficulty tags used for slice summaries.")
+        finding(FindingKind.MISSING_DIFFICULTY_TAXONOMY, f"{len(cases) - counts['difficulty_tagged']} cases lack difficulty tags used for slice summaries.")
         rec("taxonomy-difficulty", "Tag cases as core, extended, or extreme so regressions are visible by difficulty.")
     if cases and counts["success_goal_tagged"] < len(cases):
-        finding("missing-success-goals", "recommended", f"{len(cases) - counts['success_goal_tagged']} cases lack success_goals such as outcome, style, process, efficiency, or trigger.")
+        finding(FindingKind.MISSING_SUCCESS_GOALS, f"{len(cases) - counts['success_goal_tagged']} cases lack success_goals such as outcome, style, process, efficiency, or trigger.")
         rec("taxonomy-success-goals", "Add success_goals so benchmark reports can separate outcome, style, process, trigger, and efficiency evidence.")
 
     if counts["positive"] < min_positive:
-        finding("missing-positive-evals", "required", f"Only {counts['positive']} positive cases; target at least {min_positive}.")
+        finding(FindingKind.MISSING_POSITIVE_EVALS, f"Only {counts['positive']} positive cases; target at least {min_positive}.")
         rec("positive-eval", "Add task-success cases that require the skill's core workflow to produce verifiable evidence.")
     if counts["negative"] < min_negative:
-        finding("missing-negative-evals", "required", f"Only {counts['negative']} negative/adversarial cases; target at least {min_negative}.")
+        finding(FindingKind.MISSING_NEGATIVE_EVALS, f"Only {counts['negative']} negative/adversarial cases; target at least {min_negative}.")
         rec("negative-eval", "Add no-op/false-positive cases where a general checklist would overreach.")
     if counts["adversarial"] < min_adversarial:
-        finding("missing-adversarial-evals", "recommended", f"Only {counts['adversarial']} adversarial cases; target at least {min_adversarial}.")
+        finding(FindingKind.MISSING_ADVERSARIAL_EVALS, f"Only {counts['adversarial']} adversarial cases; target at least {min_adversarial}.")
         rec("adversarial-eval", "Add near-miss prompts that look like they need the skill but should be refused, scoped down, or handled cautiously.")
     if counts["holdout"] == 0 or counts["holdback"] == 0:
-        finding("missing-hidden-splits", "required", f"holdout={counts['holdout']}, holdback={counts['holdback']}; both should be present.")
+        finding(FindingKind.MISSING_HIDDEN_SPLITS, f"holdout={counts['holdout']}, holdback={counts['holdback']}; both should be present.")
         rec("holdout-holdback", "Add private prompt_ref cases under evals/holdout and evals/holdback with ignored answer keys.")
     if counts["ablations"] == 0:
-        finding("missing-ablation-plan", "recommended", "No ablations declared.")
+        finding(FindingKind.MISSING_ABLATION_PLAN, "No ablations declared.")
     components = skill_heading_components(skill_text)
     suggested_ablations = []
     existing_ab = {str(a.get("removed_component", "")).lower() for a in manifest.get("ablations", [])}
@@ -20082,30 +20227,30 @@ def audit_manifest_report(
     if suggested_ablations:
         rec("ablation-plan", "Consider ablations for major skill sections not yet represented exactly by removed_component.", suggested_ablations[:5])
     if counts["trigger_positive"] < min_trigger_pos or counts["trigger_negative"] < min_trigger_neg:
-        finding("missing-trigger-no-trigger-cases", "required", f"trigger positives={counts['trigger_positive']}, trigger negatives={counts['trigger_negative']}; targets {min_trigger_pos}/{min_trigger_neg}.")
+        finding(FindingKind.MISSING_TRIGGER_CASES, f"trigger positives={counts['trigger_positive']}, trigger negatives={counts['trigger_negative']}; targets {min_trigger_pos}/{min_trigger_neg}.")
         rec("trigger-cases", "Add both TRIGGER and NO_TRIGGER cases with anchored expected-trigger-label regex assertions.")
 
     benchmark_summary = None
     bench_report = None
     if runs:
-        report = build_benchmark_report(manifest_path, Path(runs), split)
+        report = build_benchmark_report(manifest_path, Path(runs), split, min_lift=min_lift)
         bench_report = report
         benchmark_summary = {"summary": report["summary"], "case_flags": report["case_flags"]}
         for flag in report["case_flags"]:
-            at_floor = FLOOR_FLAG in flag.get("flags", [])
-            for f in flag.get("flags", []):
-                if f == FLOOR_FLAG:
-                    # Regression guards included: a guard nothing passes is not holding.
-                    finding("floor-eval", "recommended",
-                            f"Case {flag['case_id']} fails in both arms on every scored run; "
-                            "audit the case and its assertions before making it harder.", flag)
-                elif "saturated" in f and flag.get("eval_intent") != "regression":
-                    finding("saturated-eval", "recommended", f"Case {flag['case_id']} is saturated/non-discriminating.", flag)
-                elif ("no objective lift" in f and not at_floor
-                      and flag.get("eval_intent") != "regression"):
-                    finding("no-lift-eval", "recommended", f"Case {flag['case_id']} shows no objective lift.", flag)
-                elif "flaky" in f:
-                    finding("flaky-eval", "required", f"Case {flag['case_id']} has repeated-run variance.", flag)
+            present = CaseFlag.in_row(flag.get("flags"))
+            guard = flag.get("eval_intent") == "regression"
+            if CaseFlag.FLOOR in present:
+                # Regression guards included: a guard nothing passes is not holding.
+                finding(FindingKind.FLOOR_EVAL,
+                        f"Case {flag['case_id']} fails in both arms on every scored run; "
+                        "audit the case and its assertions before making it harder.", flag)
+            if CaseFlag.SATURATED in present and not guard:
+                finding(FindingKind.SATURATED_EVAL, f"Case {flag['case_id']} is saturated/non-discriminating.", flag)
+            if (CaseFlag.NO_OBJECTIVE_LIFT in present and CaseFlag.FLOOR not in present
+                    and not guard):
+                finding(FindingKind.NO_LIFT_EVAL, f"Case {flag['case_id']} shows no objective lift.", flag)
+            if CaseFlag.FLAKY in present:
+                finding(FindingKind.FLAKY_EVAL, f"Case {flag['case_id']} has repeated-run variance.", flag)
         assertion_rows = []
         by_case = ResultSet(report["results"]).by_case_variant()   # scorable + grouped, once
         for case_id, by_variant in by_case.items():
@@ -20119,7 +20264,7 @@ def audit_manifest_report(
                 if "with_skill" in rates and "without_skill" in rates and rates["with_skill"] == rates["without_skill"]:
                     assertion_rows.append({"case_id": case_id, "assertion": name, "rates": rates})
         if assertion_rows:
-            finding("non-discriminating-assertions", "recommended", f"{len(assertion_rows)} assertions have identical with/without pass rates.", assertion_rows[:20])
+            finding(FindingKind.NON_DISCRIMINATING_ASSERTIONS, f"{len(assertion_rows)} assertions have identical with/without pass rates.", assertion_rows[:20])
             rec("assertion-design", "Replace keyword-only checks with source/artifact-backed assertions or stricter behavioral regexes for identical-rate assertions.")
 
     # 1.7: a case whose checks are all demo/live tiers can look solid while
@@ -20130,7 +20275,7 @@ def audit_manifest_report(
         if case_assertions and all(oracle_tier(a) != "strong" for a in case_assertions):
             weak_only.append(case.get("id"))
     if weak_only:
-        finding("weak-oracle-only", "recommended", f"{len(weak_only)} case(s) are graded only by demo/live oracles (no strong deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
+        finding(FindingKind.WEAK_ORACLE_ONLY, f"{len(weak_only)} case(s) are graded only by demo/live oracles (no strong deterministic check): {weak_only[:10]}. Add a strong-tier assertion, or mark a verified script oracle oracle:\"strong\".", weak_only[:20])
 
     # Cost-quality findings (issue #21): where money is being spent without
     # buying signal. Only computable when run data is supplied.
@@ -20166,11 +20311,11 @@ def audit_manifest_report(
             # cheap or expensive, so it must not drive a dollar finding.
             if cost is None or cost < expensive_case_usd:
                 continue
-            case_flag_list = flags_by_case.get(case_id, [])
-            if any("saturated" in f for f in case_flag_list):
-                finding("expensive-saturated-case", "recommended", f"Case {case_id} cost ${cost} but is saturated/non-discriminating — spend without signal.", spend)
-            elif any("no objective lift" in f for f in case_flag_list):
-                finding("expensive-no-lift-case", "recommended", f"Case {case_id} cost ${cost} with no objective lift — spend without signal.", spend)
+            present = CaseFlag.in_row(flags_by_case.get(case_id, []))
+            if CaseFlag.SATURATED in present:
+                finding(FindingKind.EXPENSIVE_SATURATED_CASE, f"Case {case_id} cost ${cost} but is saturated/non-discriminating — spend without signal.", spend)
+            elif CaseFlag.NO_OBJECTIVE_LIFT in present:
+                finding(FindingKind.EXPENSIVE_NO_LIFT_CASE, f"Case {case_id} cost ${cost} with no objective lift — spend without signal.", spend)
         judge_only_ids = {
             case_id for case in cases if is_judge_only_case(case)
             if isinstance((case_id := case.get("id")), str)
@@ -20178,7 +20323,7 @@ def audit_manifest_report(
         for case_id in sorted(judge_only_ids):
             cost = (cost_by_case.get(case_id) or {}).get("total_cost_usd")
             if cost is not None and cost >= expensive_case_usd:
-                finding("high-cost-judge-only-case", "recommended", f"Case {case_id} cost ${cost} and is graded only by judge assertions; a deterministic/script oracle would make the spend verifiable.", cost_by_case.get(case_id))
+                finding(FindingKind.HIGH_COST_JUDGE_ONLY_CASE, f"Case {case_id} cost ${cost} and is graded only by judge assertions; a deterministic/script oracle would make the spend verifiable.", cost_by_case.get(case_id))
         ablation_rows = [{**result_cost_facts(r), "variant": str(r.get("variant", ""))}
                          for r in bench_report.get("results", []) if is_ablation_variant(r.get("variant", ""))]
         ablation_spend = {variant: slot["total_cost_usd"] for variant, slot in group_spend(ablation_rows, lambda r: r["variant"]).items()
@@ -20186,11 +20331,11 @@ def audit_manifest_report(
         structured = {f"ablation:{a.get('id')}" for a in manifest.get("ablations", []) if any(isinstance(spec, dict) and spec.get("cases") and spec.get("assertions") for spec in a.get("expected_regressions", []))}
         for variant, spend_usd in sorted(ablation_spend.items()):
             if spend_usd >= expensive_case_usd and variant not in structured:
-                finding("ablation-high-spend-no-structured-regression", "recommended", f"Ablation arm {variant} cost ${spend_usd} but declares no structured expected_regressions (cases+assertions) to confirm — the spend cannot become causal evidence.", {"variant": variant, "total_cost_usd": spend_usd})
+                finding(FindingKind.ABLATION_HIGH_SPEND_NO_REGRESSION, f"Ablation arm {variant} cost ${spend_usd} but declares no structured expected_regressions (cases+assertions) to confirm — the spend cannot become causal evidence.", {"variant": variant, "total_cost_usd": spend_usd})
         overall_lift = (bench_report.get("paired_summary", {}) or {}).get("absolute_delta")
         static_tokens = approximate_tokens(skill_text)
         if static_tokens >= 3000 and isinstance(overall_lift, (int, float)) and overall_lift <= 0.05:
-            finding("high-footprint-low-lift-skill", "recommended", f"Skill carries ~{static_tokens} static tokens into every run but measured lift is {overall_lift:.3f}; the footprint is not buying signal.", {"static_tokens": static_tokens, "lift": overall_lift})
+            finding(FindingKind.HIGH_FOOTPRINT_LOW_LIFT_SKILL, f"Skill carries ~{static_tokens} static tokens into every run but measured lift is {overall_lift:.3f}; the footprint is not buying signal.", {"static_tokens": static_tokens, "lift": overall_lift})
 
     # 2.7b: a held-out case's grading criteria must stay out of the skill and
     # the public eval text — a skill must not teach to the rubric it will be
@@ -20234,7 +20379,7 @@ def audit_manifest_report(
                         leak["normalization"] = prompt_match.normalization_dict()
                     held_out_leaks.append(leak)
     if held_out_leaks:
-        finding("held-out-rubric-leak", "required", f"{len(held_out_leaks)} held-out rubric string(s) appear in the skill or public eval text; held-out grading criteria must stay invisible to generation.", held_out_leaks[:10])
+        finding(FindingKind.HELD_OUT_RUBRIC_LEAK, f"{len(held_out_leaks)} held-out rubric string(s) appear in the skill or public eval text; held-out grading criteria must stay invisible to generation.", held_out_leaks[:10])
 
     # 1.3: the judge must not be the model under test. Compare the declared
     # judge model against the manifest's jetty.model and, when run data is
@@ -20255,10 +20400,7 @@ def audit_manifest_report(
                     under_test.add(meta_model)
         for jm in judge_models:
             if jm in under_test:
-                finding(
-                    "judge-is-model-under-test",
-                    "required",
-                    f"judge model {jm!r} is also a model under test; a model grading its own output inflates qualitative scores. Use a different judge model (or pass --strict-judge in CI to make this fatal).",
+                finding(FindingKind.JUDGE_IS_MODEL_UNDER_TEST, f"judge model {jm!r} is also a model under test; a model grading its own output inflates qualitative scores. Use a different judge model (or pass --strict-judge in CI to make this fatal).",
                     sorted(under_test),
                 )
 
@@ -20272,24 +20414,79 @@ def audit_manifest_report(
     for ablation in manifest.get("ablations", []):
         aid = ablation.get("id")
         if not ablation_components(ablation):
-            finding("ablation-instruction-simulated", "recommended", f"ablation {aid!r} is instruction-simulated (label-only): the full skill is mounted with a prompt directive to ignore the component, so the arm is non-blind and yields a raw measurement only (it cannot be confirmation-graded). Declare a mechanism+target (section/list_item/frontmatter_field/reference/patch) to materialize it as a blind, removal-based ablation.")
+            finding(FindingKind.ABLATION_INSTRUCTION_SIMULATED, f"ablation {aid!r} is instruction-simulated (label-only): the full skill is mounted with a prompt directive to ignore the component, so the arm is non-blind and yields a raw measurement only (it cannot be confirmation-graded). Declare a mechanism+target (section/list_item/frontmatter_field/reference/patch) to materialize it as a blind, removal-based ablation.")
             continue
         if not ablation.get("expected_regressions"):
-            finding("ablation-no-expected-regression", "recommended", f"ablation {aid!r} declares a removal but no expected_regressions; without a discriminating case it cannot become evidence.")
+            finding(FindingKind.ABLATION_NO_EXPECTED_REGRESSION, f"ablation {aid!r} declares a removal but no expected_regressions; without a discriminating case it cannot become evidence.")
         for comp in ablation_components(ablation):
             if comp.get("mechanism") == "reference":
                 rpath = comp.get("target", {}).get("path")
                 if rpath and f"]({rpath})" not in skill_text:
-                    finding("ablation-dangling-reference", "recommended", f"ablation {aid!r}: reference {rpath!r} is not linked from the skill body; its pointer removal may be a no-op.")
+                    finding(FindingKind.ABLATION_DANGLING_REFERENCE, f"ablation {aid!r}: reference {rpath!r} is not linked from the skill body; its pointer removal may be a no-op.")
         for spec in ablation.get("expected_regressions", []):
             if not isinstance(spec, dict):
                 continue
             for cid in spec.get("cases", []):
                 if cid not in ablation_case_ids:
-                    finding("ablation-unknown-case", "recommended", f"ablation {aid!r}: expected_regression names unknown case {cid!r}.")
+                    finding(FindingKind.ABLATION_UNKNOWN_CASE, f"ablation {aid!r}: expected_regression names unknown case {cid!r}.")
             for an in spec.get("assertions", []):
                 if an not in ablation_assertion_names:
-                    finding("ablation-unknown-assertion", "recommended", f"ablation {aid!r}: expected_regression names unknown assertion {an!r}.")
+                    finding(FindingKind.ABLATION_UNKNOWN_ASSERTION, f"ablation {aid!r}: expected_regression names unknown assertion {an!r}.")
+
+    readiness = eval_readiness(manifest, manifest_path, split=split, leakage_min_chars=leakage_min_chars, benchmark_report=bench_report)
+
+    # Mark 1: where the cases came from.
+    answer_cases = [c for c in cases if c.get("kind") != "trigger"]
+    sources = collections.Counter(str(c["source"]) for c in cases if c.get("source"))
+    unsourced = [c.get("id") for c in cases if not c.get("source")]
+    if cases and unsourced:
+        finding(FindingKind.CASE_SOURCE_UNRECORDED,
+                f"{len(unsourced)} of {len(cases)} case(s) record no source (production, bug-report, "
+                "hand-written, synthesized or imported), so nothing shows the cases mirror real use.",
+                unsourced[:30])
+    elif cases and set(sources) == {"synthesized"}:
+        finding(FindingKind.SYNTHESIZED_CASES_ONLY,
+                "every case is synthesized; add cases drawn from real requests or bug reports.")
+
+    # Mark 2: the grader on known answers.
+    known = known_answer_check(manifest, manifest_path, split=split)
+    if known["reference_failures"]:
+        finding(FindingKind.REFERENCE_ANSWER_FAILS,
+                f"{len(known['reference_failures'])} case(s) fail their own reference answer; "
+                "fix the check or the answer before trusting a score.", known["reference_failures"])
+    null_passes = [cid for cid in known["null_answer_passes"]
+                   if cid not in set(readiness["leak_saturated_cases"])]
+    if null_passes:
+        finding(FindingKind.NULL_ANSWER_PASSES,
+                f"{len(null_passes)} case(s) pass every gate check when the answer only echoes the "
+                "prompt; the checks cannot tell an answer from no answer.", null_passes)
+
+    # Marks 3-5 on runs: only a complete benchmark can support them.
+    bench_complete = bool(bench_report) and bench_report.get("availability") == "complete"
+    if bench_report and bench_complete:
+        for item in run_measured_findings(bench_report):
+            findings.append(item.as_dict())
+
+    health = eval_health(
+        [*findings, *readiness["blocker_findings"]],
+        observed={
+            EvalMark.REALISTIC: bool(sources),
+            EvalMark.GRADER: bool(known["references_checked"] or known["null_answers_checked"]),
+            EvalMark.HEADROOM: bench_complete,
+            EvalMark.NOISE: bench_complete,
+            EvalMark.ISOLATION: bench_complete,
+        },
+        notes={
+            EvalMark.REALISTIC: ([(
+                "activation is forced: the task tells the agent to use the skill, while real use "
+                "relies on discovery (issue #48)")] if answer_cases else []),
+            EvalMark.GRADER: ([] if known["references_checked"] else [
+                "no case declares reference_answer, so no known-good answer was graded"]),
+            EvalMark.HEADROOM: ([] if bench_complete else ["measured on runs: pass --runs"]),
+            EvalMark.NOISE: ([] if bench_complete else ["measured on runs: pass --runs"]),
+            EvalMark.ISOLATION: ([] if bench_complete else [
+                "effort and served-model checks need --runs; the leakage lint ran on the manifest"]),
+        })
 
     return {
         "generated_at": int(time.time()),
@@ -20300,12 +20497,22 @@ def audit_manifest_report(
         "findings": findings,
         "recommendations": recommendations,
         "recommended_fixture_repos_files": fixtures,
-        "readiness": eval_readiness(manifest, manifest_path, split=split, leakage_min_chars=leakage_min_chars, benchmark_report=bench_report),
+        "readiness": readiness,
+        "known_answer_check": known,
+        "case_sources": dict(sorted(sources.items())),
+        "eval_health": health,
         "benchmark": benchmark_summary,
+        "benchmark_availability": bench_report.get("availability") if bench_report else None,
     }
 
 
 def audit_manifest(args: argparse.Namespace) -> int:
+    fail_on = None
+    if getattr(args, "fail_on", None):
+        try:
+            fail_on = gate_policy.parse_fail_on(args.fail_on)
+        except ValueError as exc:
+            die(str(exc))
     report = audit_manifest_report(
         Path(args.manifest),
         skill_path=args.skill_path,
@@ -20318,6 +20525,7 @@ def audit_manifest(args: argparse.Namespace) -> int:
         min_trigger_neg=args.min_trigger_neg,
         leakage_min_chars=args.leakage_min_chars,
         expensive_case_usd=getattr(args, "expensive_case_usd", 1.0),
+        min_lift=getattr(args, "min_lift", None),
     )
     if args.format == "markdown":
         lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "", "| Metric | Value |", "|---|---:|"]
@@ -20342,6 +20550,13 @@ def audit_manifest(args: argparse.Namespace) -> int:
                 lines.append(f"    - {b}")
         else:
             lines.append("- **ready**: no blockers ✓")
+        lines += ["", "## Eval health", "", "| Mark | Question | Status | Findings |", "|---:|---|---|---|"]
+        for mark in report["eval_health"]["marks"]:
+            lines.append(f"| {mark['mark']} | {mark['question']} | {mark['status']} | "
+                         f"{', '.join(mark['finding_kinds']) or '—'} |")
+        for mark in report["eval_health"]["marks"]:
+            for note in mark.get("notes", []):
+                lines.append(f"- mark {mark['mark']}: {note}")
         lines += ["", "## Findings", ""]
         if report["findings"]:
             for f in report["findings"]:
@@ -20365,19 +20580,29 @@ def audit_manifest(args: argparse.Namespace) -> int:
     # CI gate: non-zero exit when the readiness blockers are non-empty, so a skill
     # repo can keep its eval suite at "worth paying to run" the same way it keeps
     # tests green. Off by default — the audit stays a report unless asked to gate.
-    blockers = report.get("readiness", {}).get("blockers", [])
-    if getattr(args, "fail_on_blockers", False) and blockers:
-        for b in blockers:
+    readiness = report.get("readiness", {})
+    blocker_findings = readiness.get("blocker_findings", [])
+    if getattr(args, "fail_on_blockers", False) and gate_policy.READINESS.decide(blocker_findings).failed:
+        for b in readiness.get("blockers", []):
             print(f"readiness blocker: {b}", file=sys.stderr)
-        print(f"audit-manifest: {len(blockers)} readiness blocker(s) for {report.get('skill_name')!r}", file=sys.stderr)
+        print(f"audit-manifest: {len(blocker_findings)} readiness blocker(s) for {report.get('skill_name')!r}", file=sys.stderr)
         return 1
     # 1.3 guard: warn by default (the finding is in the report), error under
     # --strict-judge so CI can refuse a self-judging eval suite.
     if getattr(args, "strict_judge", False):
-        offenders = [f for f in report.get("findings", []) if f.get("kind") == "judge-is-model-under-test"]
+        offenders = [f for f in report.get("findings", []) if gate_policy.SELF_JUDGING.matches(f)]
         if offenders:
             for f in offenders:
                 print(f"strict-judge: {f['message']}", file=sys.stderr)
+            return 1
+    if fail_on is not None:
+        decision = fail_on.decide(
+            [*report.get("findings", []), *blocker_findings],
+            complete=report.get("benchmark_availability") in (None, "complete"),
+            incomplete_reason="the benchmark report is incomplete, so run-measured findings are unknown")
+        if decision.failed:
+            for reason in decision.reasons:
+                print(f"fail-on: {reason}", file=sys.stderr)
             return 1
     return 0
 
@@ -21139,6 +21364,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--leakage-min-chars", type=int, default=4)
     p.add_argument("--fail-on-blockers", action="store_true", help="exit non-zero if the readiness block has any blockers (for CI gating of an eval suite)")
     p.add_argument("--strict-judge", action="store_true", help="exit non-zero when the declared judge model is also a model under test")
+    p.add_argument("--fail-on", action="append", metavar="KINDS", help="exit non-zero on these finding kinds, severities (required, recommended) or presets (blockers, strict-judge); comma-separated, repeatable; fails closed on an incomplete benchmark")
+    p.add_argument("--min-lift", type=float, help="smallest lift worth acting on, for the noise check behind eval-health mark 4 (with --runs)")
     p.add_argument("--expensive-case-usd", type=float, default=1.0, help="dollar threshold above which cost-quality findings fire for saturated/no-lift/judge-only cases and unstructured ablation arms (issue #21)")
 
     p = sub.add_parser("materialize-ablations", help="Write real, ablated skill trees for declared materialized ablations")

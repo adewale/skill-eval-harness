@@ -1,0 +1,221 @@
+"""The five marks, as audit-manifest reports them, and the gates built on findings.
+
+Each test drives the real report builders from run files on disk, so a flag or
+finding renamed at its producer breaks the consumer test that reads it."""
+import argparse
+import contextlib
+import io
+import tempfile
+import unittest
+from pathlib import Path
+
+from helpers import attest_answer_design, demo_manifest, write_demo_manifest
+
+import skill_benchmark as sb
+from findings import CaseFlag, FindingKind
+
+
+def case(case_id, *, prompt="Do the task.", value="alpha", **extra):
+    return {"id": case_id, "split": "tune", "kind": "behavior", "prompt": prompt,
+            "assertions": [{"name": f"has-{value}", "type": "contains", "value": value}], **extra}
+
+
+def write_outputs(runs: Path, outputs: dict[str, dict[str, str | None]]) -> None:
+    for case_id, by_variant in outputs.items():
+        for variant, text in by_variant.items():
+            base = runs / case_id / variant
+            base.mkdir(parents=True, exist_ok=True)
+            if text is not None:
+                (base / "output.md").write_text(text, encoding="utf-8")
+
+
+class Fixture:
+    def __init__(self, root: Path, cases, outputs=None):
+        self.path = write_demo_manifest(root, demo_manifest(cases=cases))
+        self.runs = root / "runs"
+        if outputs is not None:
+            write_outputs(self.runs, outputs)
+            attest_answer_design(self.path, self.runs)
+
+    def audit(self, **options):
+        return sb.audit_manifest_report(
+            self.path, runs=str(self.runs) if self.runs.exists() else None, **options)
+
+    def cli(self, *flags):
+        args = argparse.Namespace(
+            manifest=str(self.path), skill_path=None,
+            runs=str(self.runs) if self.runs.exists() else None, split=None,
+            format="json", out=str(self.path.parent / "audit.json"), min_positive=0,
+            min_negative=0, min_adversarial=0, min_trigger_pos=0, min_trigger_neg=0,
+            leakage_min_chars=4, fail_on_blockers="--fail-on-blockers" in flags,
+            strict_judge=False, expensive_case_usd=1.0, min_lift=None,
+            fail_on=[flag.split("=", 1)[1] for flag in flags if flag.startswith("--fail-on=")] or None)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            try:
+                code = sb.audit_manifest(args)
+            except SystemExit as exc:
+                code = exc.code
+        return code, stderr.getvalue()
+
+
+def kinds(report):
+    return {finding["kind"] for finding in report["findings"]}
+
+
+def marks(report):
+    return {entry["id"]: entry for entry in report["eval_health"]["marks"]}
+
+
+class FlagsReachTheirConsumersTests(unittest.TestCase):
+    def test_every_flag_a_real_report_emits_is_a_registered_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), [case("ceiling"), case("floor"), case("lift")], {
+                "ceiling": {"with_skill": "alpha", "without_skill": "alpha"},
+                "floor": {"with_skill": "none", "without_skill": "none"},
+                "lift": {"with_skill": "alpha", "without_skill": "none"},
+            })
+            report = sb.build_benchmark_report(fx.path, fx.runs)
+            audit = fx.audit()
+            seeds = sb.suggest_case_candidates(report, sb.validate_manifest(fx.path))
+        emitted = [flag for row in report["case_flags"] for flag in row["flags"]]
+        self.assertTrue(emitted)
+        for flag in emitted:
+            with self.subTest(flag=flag):
+                self.assertIsNotNone(CaseFlag.parse(flag))
+        by_case = {row["case_id"]: CaseFlag.in_row(row["flags"]) for row in report["case_flags"]}
+        self.assertIn(CaseFlag.SATURATED, by_case["ceiling"])
+        self.assertIn(CaseFlag.FLOOR, by_case["floor"])
+        # The consumers read the producer's own output, not a hand-written flag.
+        self.assertEqual([seed["case_id"] for seed in seeds], ["ceiling"])
+        self.assertTrue({"saturated-eval", "floor-eval"} <= kinds(audit))
+        self.assertEqual(marks(audit)["baseline-headroom"]["status"], "concern")
+
+
+class ReadinessGateTests(unittest.TestCase):
+    def test_an_incomplete_benchmark_is_a_blocker_not_an_empty_list(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), [case("a"), case("b", kind="adversarial")], {
+                "a": {"with_skill": "alpha", "without_skill": None},
+                "b": {"with_skill": "alpha", "without_skill": "none"},
+            })
+            report = fx.audit()
+            code, stderr = fx.cli("--fail-on-blockers")
+        blockers = {item["kind"] for item in report["readiness"]["blocker_findings"]}
+        self.assertIn("benchmark-incomplete", blockers)
+        self.assertEqual(code, 1)
+        self.assertIn("benchmark report is incomplete", stderr)
+        # Marks measured on runs are unobserved, not ok, on partial evidence.
+        self.assertEqual(marks(report)["noise-below-min-lift"]["status"], "unobserved")
+
+    def test_fail_on_names_kinds_and_fails_closed_on_partial_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), [case("a", kind="adversarial")], {
+                "a": {"with_skill": "alpha", "without_skill": None}})
+            code, stderr = fx.cli("--fail-on=missing-hidden-splits")
+        self.assertEqual(code, 1)
+        self.assertIn("fail-on: missing-hidden-splits", stderr)
+        self.assertIn("incomplete", stderr)
+
+    def test_an_unknown_fail_on_token_stops_before_any_work(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), [case("a")])
+            code, stderr = fx.cli("--fail-on=florr-eval")
+            self.assertFalse((fx.path.parent / "audit.json").exists())
+        self.assertNotEqual(code, 0)
+        self.assertIn("unknown --fail-on token", stderr)
+
+
+class KnownAnswerTests(unittest.TestCase):
+    def test_a_reference_answer_that_fails_its_own_checks_is_a_grader_finding(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), [
+                case("ok", reference_answer="alpha is here"),
+                case("broken", reference_answer="the word is missing"),
+            ])
+            report = fx.audit()
+        self.assertEqual(report["known_answer_check"]["references_checked"], 2)
+        self.assertEqual(report["known_answer_check"]["reference_failures"],
+                         [{"case_id": "broken", "failed_assertions": ["has-alpha"]}])
+        self.assertIn("reference-answer-fails", kinds(report))
+        self.assertEqual(marks(report)["grader-correct"]["status"], "concern")
+
+    def test_an_echoed_prompt_that_passes_every_check_is_flagged(self):
+        # A regex the literal leakage lint cannot see through.
+        leaky = {"id": "echo", "split": "tune", "kind": "behavior",
+                 "prompt": "Reply with the code ZX-42 and explain.",
+                 "assertions": [{"name": "code", "type": "regex", "pattern": "ZX-\\d+"}]}
+        with tempfile.TemporaryDirectory() as td:
+            report = Fixture(Path(td), [leaky, case("fine")]).audit()
+        self.assertEqual(report["known_answer_check"]["null_answer_passes"], ["echo"])
+        self.assertIn("null-answer-passes", kinds(report))
+
+    def test_a_case_the_leakage_lint_already_names_is_not_reported_twice(self):
+        leaked = case("leaked", prompt="Mention alpha.")
+        with tempfile.TemporaryDirectory() as td:
+            report = Fixture(Path(td), [leaked]).audit()
+        self.assertIn("leaked", report["readiness"]["leak_saturated_cases"])
+        self.assertNotIn("null-answer-passes", kinds(report))
+
+    def test_known_answers_stay_private_on_held_out_cases(self):
+        rows = [
+            (case("h", split="holdout", reference_answer="alpha"), "keep its known answer private"),
+            (case("t", kind="trigger", should_trigger=True, reference_answer="alpha"), "trigger case"),
+            (case("s", source="vibes"), "source must be one of"),
+            (case("r", reference_answer="alpha", reference_answer_ref="a.md"), "mutually exclusive"),
+        ]
+        for bad, message in rows:
+            with self.subTest(case=bad["id"]), tempfile.TemporaryDirectory() as td:
+                path = write_demo_manifest(Path(td), demo_manifest(cases=[bad]))
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+                    sb.validate_manifest(path)
+                self.assertIn(message, err.getvalue())
+
+
+class RealismTests(unittest.TestCase):
+    def test_sources_make_mark_one_observable(self):
+        with tempfile.TemporaryDirectory() as td:
+            unsourced = Fixture(Path(td) / "a", [case("a")]).audit()
+            sourced = Fixture(Path(td) / "b", [case("a", source="production"),
+                                               case("b", source="synthesized")]).audit()
+            synthetic = Fixture(Path(td) / "c", [case("a", source="synthesized")]).audit()
+        self.assertIn("case-source-unrecorded", kinds(unsourced))
+        self.assertEqual(sourced["case_sources"], {"production": 1, "synthesized": 1})
+        self.assertNotIn("case-source-unrecorded", kinds(sourced))
+        self.assertIn("synthesized-cases-only", kinds(synthetic))
+
+
+class RunMeasuredFindingTests(unittest.TestCase):
+    def report(self, **overrides):
+        base = {"results": [], "paired_summary": {}, "run_endings": {}}
+        base.update(overrides)
+        return base
+
+    def test_each_run_signal_maps_to_its_finding(self):
+        rows = [{"variant": "without_skill", "objective_pass_rate": 1.0, "missing_output": False,
+                 "execution_valid": True, "eval_intent": "capability"}] * 3
+        report = self.report(
+            results=rows,
+            paired_summary={"noise_check": {"verdict": "too-few-cases-moved"},
+                            "pairing": {"blocked_reason_counts": {
+                                "effort_mismatch": 2, "missing_without_skill": 1}}},
+            run_endings={"served_model_mismatches": 1, "served_model_mixed": 2})
+        found = {item.kind: item for item in sb.run_measured_findings(report)}
+        self.assertEqual(set(found), {
+            FindingKind.SUITE_HEADROOM_EXHAUSTED, FindingKind.UNDERPOWERED_EVAL,
+            FindingKind.ARM_CONDITIONS_DIFFER, FindingKind.SERVED_MODEL_MISMATCH,
+            FindingKind.SERVED_MODEL_MIXED})
+        self.assertEqual(found[FindingKind.ARM_CONDITIONS_DIFFER].evidence, {"effort_mismatch": 2})
+
+    def test_regression_guards_do_not_count_against_headroom(self):
+        guards = [{"variant": "without_skill", "objective_pass_rate": 1.0, "missing_output": False,
+                   "execution_valid": True, "eval_intent": "regression"}] * 3
+        self.assertEqual(sb.run_measured_findings(self.report(results=guards)), [])
+
+    def test_a_resolvable_eval_raises_nothing(self):
+        report = self.report(paired_summary={"noise_check": {"verdict": "resolvable"}})
+        self.assertEqual(sb.run_measured_findings(report), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
