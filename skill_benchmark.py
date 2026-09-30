@@ -2124,19 +2124,6 @@ def persist_answer_design(runs: Path, tasks: list[dict[str, Any]], *,
     return design
 
 
-def persist_answer_design_value(runs: Path, value: Any) -> dict[str, Any]:
-    design = validate_answer_design(value)
-    runs.mkdir(parents=True, exist_ok=True)
-    path = runs / ANSWER_DESIGN_NAME
-    if path.exists():
-        existing = validate_answer_design(strict_json_loads(path.read_text(encoding="utf-8")))
-        if existing != design:
-            die("runs directory already carries a different answer design")
-    else:
-        write_json(path, design)
-    return design
-
-
 def answer_design_identity(design: dict[str, Any], pt: PreparedTask,
                            model: str | None) -> dict[str, Any]:
     matches = [row for row in design["identities"]

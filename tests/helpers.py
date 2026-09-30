@@ -302,7 +302,15 @@ def attest_answer_design(
         "identities": identities,
     }
     design = {**payload, "design_sha256": sb.canonical_json_sha256(payload)}
-    sb.persist_answer_design_value(runs, design)
+    validated = sb.validate_answer_design(design)
+    runs.mkdir(parents=True, exist_ok=True)
+    design_path = runs / sb.ANSWER_DESIGN_NAME
+    if design_path.exists():
+        existing = sb.validate_answer_design(json.loads(design_path.read_text(encoding="utf-8")))
+        if existing != validated:
+            sb.die("runs directory already carries a different answer design")
+    else:
+        sb.write_json(design_path, validated)
     for identity in identities:
         base = runs / identity["run_dir"]
         if not base.exists():
