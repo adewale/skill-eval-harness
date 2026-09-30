@@ -17313,8 +17313,40 @@ def junit_xml_from_report(report: dict[str, Any]) -> str:
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(suite, encoding="unicode")
 
 
+MISSING_CELL = "—"
+
+
 def fmt_rate(value: Any) -> str:
-    return "—" if value is None else f"{float(value):.2f}"
+    return MISSING_CELL if value is None else f"{float(value):.2f}"
+
+
+def md_cell(value: Any) -> str:
+    """One markdown table cell. A missing value reads as MISSING_CELL, a list
+    joins with commas, and a pipe or newline in the value cannot break the row."""
+    if value is None:
+        text = MISSING_CELL
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        text = ", ".join(str(item) for item in value) or MISSING_CELL
+    elif isinstance(value, dict):
+        text = json.dumps(value, sort_keys=True, ensure_ascii=False)
+    else:
+        text = str(value)
+    return " ".join(text.splitlines()).replace("|", "\\|")
+
+
+def md_table(headers: Sequence[str], rows: Iterable[Sequence[Any]], *, align: str = "") -> list[str]:
+    """Markdown table lines. ``align`` gives one letter per column, ``l`` or
+    ``r``; an empty string left-aligns every column."""
+    if align and len(align) != len(headers):
+        raise ValueError(f"align names {len(align)} columns for {len(headers)} headers")
+    rule = "|" + "|".join("---:" if letter == "r" else "---"
+                          for letter in (align or "l" * len(headers))) + "|"
+    lines = ["| " + " | ".join(md_cell(header) for header in headers) + " |", rule]
+    for row in rows:
+        if len(row) != len(headers):
+            raise ValueError(f"table row has {len(row)} cells for {len(headers)} columns")
+        lines.append("| " + " | ".join(md_cell(cell) for cell in row) + " |")
+    return lines
 
 
 def github_summary_from_report(report: dict[str, Any]) -> str:
@@ -17345,13 +17377,14 @@ def github_summary_from_report(report: dict[str, Any]) -> str:
         f"**Lift (with − without, objective):** {fmt_rate(paired.get('with_skill_objective_pass_rate'))} − "
         f"{fmt_rate(paired.get('without_skill_objective_pass_rate'))} = **{fmt_rate(delta)}**"
     )
-    lines.extend(["", "| variant | cases | runs | mean objective | mean combined | missing | exec errors |", "|---|---|---|---|---|---|---|"])
-    for variant, block in summary.items():
-        lines.append(
-            f"| {variant} | {block.get('cases', 0)} | {block.get('runs', 0)} | "
-            f"{fmt_rate(block.get('mean_objective_pass_rate'))} | {fmt_rate(block.get('mean_combined_pass_rate'))} | "
-            f"{block.get('missing_outputs', 0)} | {block.get('execution_errors', 0)} |"
-        )
+    lines.append("")
+    lines.extend(md_table(
+        ["variant", "cases", "runs", "mean objective", "mean combined", "missing", "exec errors"],
+        [[variant, block.get("cases", 0), block.get("runs", 0),
+          fmt_rate(block.get("mean_objective_pass_rate")),
+          fmt_rate(block.get("mean_combined_pass_rate")),
+          block.get("missing_outputs", 0), block.get("execution_errors", 0)]
+         for variant, block in summary.items()]))
     flags = report.get("case_flags", []) or []
     if not isinstance(flags, list):
         flags = []
@@ -18671,7 +18704,7 @@ def cost_ledger_markdown(ledger: dict[str, Any]) -> str:
         if isinstance(aggregate, dict):
             return telemetry_domain.display_aggregate(aggregate, prefix=prefix)
         value = slot.get(name)
-        return f"{prefix}{value}" if value is not None else "— unavailable"
+        return f"{prefix}{value}" if value is not None else MISSING_CELL
 
     lines = [
         f"# Cost summary — {ledger.get('skill_name')}",
@@ -18680,15 +18713,18 @@ def cost_ledger_markdown(ledger: dict[str, Any]) -> str:
         "",
         f"**Totals:** {show(totals, 'total_tokens')} tokens (in {show(totals, 'input_tokens')} / out {show(totals, 'output_tokens')}), {show(totals, 'total_cost_usd', '$')}, {show(totals, 'elapsed_ms_sum')} ms summed",
         "",
-        "| Variant | Runs | Tokens | Cost USD |",
-        "|---|---:|---:|---:|",
+        *md_table(["Variant", "Runs", "Tokens", "Cost USD"],
+                  [[variant, slot["runs"], show(slot, "total_tokens"), show(slot, "total_cost_usd", "$")]
+                   for variant, slot in ledger.get("by_variant", {}).items()],
+                  align="lrrr"),
     ]
-    for variant, slot in ledger.get("by_variant", {}).items():
-        lines.append(f"| {variant} | {slot['runs']} | {show(slot, 'total_tokens')} | {show(slot, 'total_cost_usd', '$')} |")
     if ledger.get("top_expensive_cases"):
-        lines += ["", "## Top expensive cases", "", "| Case | Runs | Tokens | Cost USD |", "|---|---:|---:|---:|"]
-        for row in ledger["top_expensive_cases"]:
-            lines.append(f"| {row['case_id']} | {row['runs']} | {show(row, 'total_tokens')} | {show(row, 'total_cost_usd', '$')} |")
+        lines += ["", "## Top expensive cases", ""]
+        lines += md_table(["Case", "Runs", "Tokens", "Cost USD"],
+                          [[row["case_id"], row["runs"], show(row, "total_tokens"),
+                            show(row, "total_cost_usd", "$")]
+                           for row in ledger["top_expensive_cases"]],
+                          align="lrrr")
     if ledger.get("cost_quality_findings"):
         lines += ["", "## Cost-quality findings", ""]
         for f in ledger["cost_quality_findings"]:
@@ -19403,7 +19439,7 @@ def token_overhead(args: argparse.Namespace) -> int:
         "reports": reports,
     }
     if args.format == "markdown":
-        lines = ["# Token overhead report", "", "| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | Median total delta | Mean input delta | Mean objective lift | Lift per 1k total tokens | Mean cost delta USD | Lift per $ | Saturated/no-lift cost USD |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        summary_rows = []
         for r in reports:
             s = r["summary"]
             td = s.get("total_token_delta") or {}
@@ -19412,16 +19448,33 @@ def token_overhead(args: argparse.Namespace) -> int:
             lift = s.get("objective_lift_per_1k_total_tokens") or {}
             cd = s.get("cost_delta_usd") or {}
             lpd = s.get("objective_lift_per_dollar") or {}
-            lines.append(f"| {r['skill_name']} | {s.get('static_skill_tokens')} | {s.get('static_reference_tokens')} | {s.get('paired_runtime_rows')} | {td.get('mean')} | {td.get('median')} | {idelta.get('mean')} | {odelta.get('mean')} | {lift.get('mean')} | {cd.get('mean')} | {lpd.get('mean')} | {s.get('saturated_or_no_lift_cost_usd')} |")
+            summary_rows.append([
+                r["skill_name"], s.get("static_skill_tokens"), s.get("static_reference_tokens"),
+                s.get("paired_runtime_rows"), td.get("mean"), td.get("median"), idelta.get("mean"),
+                odelta.get("mean"), lift.get("mean"), cd.get("mean"), lpd.get("mean"),
+                s.get("saturated_or_no_lift_cost_usd")])
+        lines = ["# Token overhead report", "", *md_table(
+            ["Skill", "Static SKILL tokens", "Reference tokens", "Runtime pairs", "Mean total delta",
+             "Median total delta", "Mean input delta", "Mean objective lift", "Lift per 1k total tokens",
+             "Mean cost delta USD", "Lift per $", "Saturated/no-lift cost USD"],
+            summary_rows, align="l" + "r" * 11)]
         lines += ["", "## Per-case runtime pairs", ""]
         for r in reports:
             if not r.get("pairs") and not r.get("blocked_pairs"):
                 continue
-            lines += [f"### {r['skill_name']}", "", "| Case | Run | Total delta | Input delta | Objective delta | Lift/1k | With cost | Without cost | Cost delta | Lift/$ | Lift/$ status |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+            pair_rows = []
             for p in r["pairs"]:
                 status = p.get("objective_lift_per_dollar_comparison", {})
                 lift_status = status.get("reason") if status.get("availability") == telemetry_domain.BLOCKED else "comparable"
-                lines.append(f"| {p['case_id']} | {p['run_number']} | {p.get('total_token_delta')} | {p.get('input_token_delta')} | {p.get('objective_delta')} | {p.get('objective_lift_per_1k_total_tokens')} | {p.get('with_cost_usd')} | {p.get('without_cost_usd')} | {p.get('cost_delta_usd')} | {p.get('objective_lift_per_dollar')} | {lift_status} |")
+                pair_rows.append([
+                    p["case_id"], p["run_number"], p.get("total_token_delta"), p.get("input_token_delta"),
+                    p.get("objective_delta"), p.get("objective_lift_per_1k_total_tokens"),
+                    p.get("with_cost_usd"), p.get("without_cost_usd"), p.get("cost_delta_usd"),
+                    p.get("objective_lift_per_dollar"), lift_status])
+            lines += [f"### {r['skill_name']}", "", *md_table(
+                ["Case", "Run", "Total delta", "Input delta", "Objective delta", "Lift/1k", "With cost",
+                 "Without cost", "Cost delta", "Lift/$", "Lift/$ status"],
+                pair_rows, align="l" + "r" * 9 + "l")]
             if r.get("blocked_pairs"):
                 lines += ["", "Blocked pairs (not included in runtime statistics):"]
                 for pair in r["blocked_pairs"]:
@@ -19444,9 +19497,8 @@ def profile_skill(args: argparse.Namespace) -> int:
         max_modules=args.max_modules,
     )
     if args.format == "markdown":
-        lines = [f"# Skill profile — {report['skill_name']}", "", "## Summary", "", "| Metric | Value |", "|---|---:|"]
-        for k, v in report["summary"].items():
-            lines.append(f"| {k} | {v} |")
+        lines = [f"# Skill profile — {report['skill_name']}", "", "## Summary", "",
+                 *md_table(["Metric", "Value"], report["summary"].items(), align="lr")]
         lines += ["", "## Findings", ""]
         if report["findings"]:
             for f in report["findings"]:
@@ -20366,9 +20418,8 @@ def audit_manifest(args: argparse.Namespace) -> int:
         grading=grading_options(args),
     )
     if args.format == "markdown":
-        lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "", "| Metric | Value |", "|---|---:|"]
-        for k, v in report["counts"].items():
-            lines.append(f"| {k} | {v} |")
+        lines = [f"# Eval audit — {report['skill_name']}", "", "## Counts", "",
+                 *md_table(["Metric", "Value"], report["counts"].items(), align="lr")]
         rd = report.get("readiness", {})
         lines += ["", "## Readiness", "",
                   (f"- ablations materialized: {rd.get('ablations',{}).get('materialized',0)}/{rd.get('ablations',{}).get('total',0)} "
@@ -20388,10 +20439,11 @@ def audit_manifest(args: argparse.Namespace) -> int:
                 lines.append(f"    - {b}")
         else:
             lines.append("- **ready**: no blockers ✓")
-        lines += ["", "## Eval health", "", "| Mark | Question | Status | Findings |", "|---:|---|---|---|"]
-        for mark in report["eval_health"]["marks"]:
-            lines.append(f"| {mark['mark']} | {mark['question']} | {mark['status']} | "
-                         f"{', '.join(mark['finding_kinds']) or '—'} |")
+        lines += ["", "## Eval health", "", *md_table(
+            ["Mark", "Question", "Status", "Findings"],
+            [[mark["mark"], mark["question"], mark["status"], mark["finding_kinds"]]
+             for mark in report["eval_health"]["marks"]],
+            align="rlll")]
         for mark in report["eval_health"]["marks"]:
             for note in mark.get("notes", []):
                 lines.append(f"- mark {mark['mark']}: {note}")

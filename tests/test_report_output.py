@@ -7,6 +7,7 @@ aggregate and export-anthropic rebuilt the benchmark without --strict or
 import contextlib
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,8 +19,50 @@ from helpers import attest_answer_design, demo_manifest, write_demo_manifest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+
+
+def table_problems(text: str) -> list[str]:
+    """Rows whose cell count differs from their header's, and cells that print
+    Python's None instead of the missing-value mark."""
+    problems: list[str] = []
+    width = None
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            width = None
+            continue
+        cells = [cell.strip() for cell in UNESCAPED_PIPE.split(line)[1:-1]]
+        if width is None:
+            width = len(cells)
+        elif len(cells) != width:
+            problems.append(f"{len(cells)} cells, header has {width}: {line}")
+        if "None" in cells:
+            problems.append(f"None cell: {line}")
+    return problems
+
+
+class MarkdownTableTests(unittest.TestCase):
+    def test_a_cell_marks_missing_values_and_cannot_break_its_row(self):
+        import skill_benchmark as sb
+        self.assertEqual(sb.md_cell(None), sb.MISSING_CELL)
+        self.assertEqual(sb.md_cell([]), sb.MISSING_CELL)
+        self.assertEqual(sb.md_cell(["floor-eval", "flaky-eval"]), "floor-eval, flaky-eval")
+        self.assertEqual(sb.md_cell("a|b\nc"), "a\\|b c")
+        self.assertEqual(sb.md_cell(0), "0")
+
+    def test_a_table_aligns_columns_and_refuses_a_ragged_row(self):
+        import skill_benchmark as sb
+        self.assertEqual(sb.md_table(["Case", "Runs"], [["c|1", None]], align="lr"),
+                         ["| Case | Runs |", "|---|---:|", "| c\\|1 | — |"])
+        self.assertEqual(table_problems("\n".join(sb.md_table(["A", "B"], [["x|y", "z"]]))), [])
+        with self.assertRaisesRegex(ValueError, "1 cells for 2 columns"):
+            sb.md_table(["A", "B"], [["only"]])
+        with self.assertRaisesRegex(ValueError, "align"):
+            sb.md_table(["A", "B"], [], align="l")
+
+
 class TextOutputTests(unittest.TestCase):
-    def test_markdown_reports_create_their_output_directory(self):
+    def test_markdown_reports_create_their_output_directory_and_well_formed_tables(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = write_demo_manifest(root, demo_manifest())
@@ -35,7 +78,9 @@ class TextOutputTests(unittest.TestCase):
                         [sys.executable, str(ROOT / "skill_benchmark.py"), *argv, "--out", str(out)],
                         capture_output=True, text=True, check=False)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertTrue(out.read_text(encoding="utf-8").startswith("# "))
+                    text = out.read_text(encoding="utf-8")
+                    self.assertTrue(text.startswith("# "))
+                    self.assertEqual(table_problems(text), [])
 
     def test_without_out_the_text_goes_to_stdout(self):
         import skill_benchmark as sb
