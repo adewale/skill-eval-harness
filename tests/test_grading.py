@@ -437,6 +437,14 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertGreater(sampled["p_value_upper_bound"], 0.05)
         self.assertFalse(sampled["significant_at_0_05"])
 
+    def test_sampled_sign_flip_p_is_never_exact_zero(self):
+        # (b+1)/(m+1): the observed sign pattern is itself a valid permutation,
+        # so a sampled p can never be an impossible 0.0, even when no sampled
+        # pattern reaches the observed mean.
+        result = sb.sign_flip_significance([0.5] * 20)
+        self.assertEqual(result["method"], "sign-flip-sampled")
+        self.assertAlmostEqual(result["p_value"], 1 / 4097)
+
     def test_inference_rates_keep_sub_millionth_regressions(self):
         baseline = sb._exact_rate(3_000_000, 3_000_000)
         ablation = sb._exact_rate(2_999_999, 3_000_000)

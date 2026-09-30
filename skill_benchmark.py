@@ -140,7 +140,6 @@ from completion_contracts import (
 from effect_estimates import (
     DiscriminationFailure,
     ceiling_or_floor,
-    monte_carlo_upper_bound,
     noise_check,
     sign_flip_interval,
     sign_flip_test,
@@ -14724,64 +14723,6 @@ def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, sample
     return sign_flip_test(deltas, max_exact_n=max_exact_n, samples=samples)
 
 
-def two_sample_permutation_significance(a: list[float], b: list[float], *, max_exact_total: int = 18, samples: int = 4096) -> dict[str, Any]:
-    """Two-sided label-shuffle permutation test on the difference of means of two
-    UNPAIRED groups (roadmap: the ablation confirmation gate). `a` is the with_skill
-    per-run scores, `b` the ablation arm's; under H0 (removing the component does
-    nothing) the arm label is exchangeable, so p = share of relabelings whose
-    |mean(a')-mean(b')| reaches the observed gap. This is the right unit for the
-    n-per-arm replication the walkthrough leaned on: with one run per arm the only
-    two relabelings tie, so p=1.0 and a single-shot ablation can never confirm.
-    Exact enumeration while the combered space is small, else a SEEDED sample so a
-    re-grade stays byte-identical (CF.3)."""
-    na, nb = len(a), len(b)
-    if na == 0 or nb == 0:
-        return {"method": "two-sample-permutation", "n_a": na, "n_b": nb,
-                "observed_delta": None, "p_value": None,
-                "p_value_upper_bound": None, "significant_at_0_05": False}
-    observed = statistics.mean(a) - statistics.mean(b)
-    pool = sorted(float(value) for value in list(a) + list(b))
-    total_n = na + nb
-    if all(abs(x - pool[0]) < 1e-12 for x in pool):
-        return {"method": "two-sample-permutation", "n_a": na, "n_b": nb,
-                "observed_delta": 0.0, "p_value": 1.0,
-                "p_value_upper_bound": 1.0, "significant_at_0_05": False}
-    target = abs(observed) - 1e-12
-    total_sum = sum(pool)
-    def delta_for(idx_a: Iterable[int]) -> float:
-        sa = sum(pool[i] for i in idx_a)
-        mean_a = sa / na
-        mean_b = (total_sum - sa) / nb
-        return mean_a - mean_b
-    if math.comb(total_n, na) <= max(1, max_exact_total ** 2) and total_n <= max_exact_total:
-        hits = 0
-        combos = 0
-        for combo in _combinations(list(range(total_n)), na):
-            combos += 1
-            if abs(delta_for(combo)) >= target:
-                hits += 1
-        method = "two-sample-permutation-exact"
-        p = hits / combos
-        p_upper = p
-    else:
-        rng = random.Random(0)
-        idx = list(range(total_n))
-        hits = 0
-        for _ in range(samples):
-            rng.shuffle(idx)
-            if abs(delta_for(idx[:na])) >= target:
-                hits += 1
-        method = "two-sample-permutation-sampled"
-        # (b+1)/(m+1) Monte-Carlo estimator: the observed labeling is itself a
-        # valid permutation, so a sampled p is never an impossible exact 0.
-        p = (hits + 1) / (samples + 1)
-        p_upper = monte_carlo_upper_bound(hits, samples)
-    return {"method": method, "n_a": na, "n_b": nb,
-            "observed_delta": observed, "p_value": p,
-            "p_value_upper_bound": p_upper,
-            "significant_at_0_05": p_upper <= 0.05}
-
-
 @_dataclass(frozen=True)
 class _TriggerReportRows:
     runs_per_query: int
@@ -15306,26 +15247,6 @@ def trigger_compare(args: argparse.Namespace) -> int:
     report = build_trigger_comparison(load_json(Path(args.baseline)), load_json(Path(args.ablation)))
     emit_report(report, getattr(args, "out", None))
     return 0
-
-
-def _combinations(items: list[int], r: int) -> Iterable[tuple[int, ...]]:
-    # Local, dependency-free itertools.combinations (kept explicit so the grade
-    # path's imports stay the audited leaf set).
-    n = len(items)
-    if r > n:
-        return
-    idx = list(range(r))
-    yield tuple(items[i] for i in idx)
-    while True:
-        for i in reversed(range(r)):
-            if idx[i] != i + n - r:
-                break
-        else:
-            return
-        idx[i] += 1
-        for j in range(i + 1, r):
-            idx[j] = idx[j - 1] + 1
-        yield tuple(items[i] for i in idx)
 
 
 def pass_at_k(n: int, c: int, k: int) -> float | None:
