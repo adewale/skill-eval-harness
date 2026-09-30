@@ -39,7 +39,6 @@ from helpers import (
 )
 
 import ablation_model as am
-import run_pi_trigger_eval as tr
 import runner_contracts as rc
 import skill_benchmark as sb
 import trace_contracts as tc
@@ -636,9 +635,6 @@ class SharedSkillInvokedTests(unittest.TestCase):
                             "status": "completed",
                             "input": {"file_path": "/ws/inputs/data.csv"}})
         self.assertEqual(sb.detect_trigger(never, [sp]), (False, []))   # mounted but unread => False
-
-    def test_trigger_eval_uses_the_one_owner(self):
-        self.assertIs(tr.detect_trigger, sb.detect_trigger)
 
 
 class JettyReferencesUploadTests(unittest.TestCase):

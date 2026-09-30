@@ -31,7 +31,6 @@ from skill_benchmark import (
     build_canonical_skill_tree,
     canonical_json_sha256,
     canonical_trigger_query,
-    detect_trigger,
     detect_trigger_records,
     event_texts_for_tool_input,
     expected_trigger_polarity,
