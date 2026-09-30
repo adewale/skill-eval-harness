@@ -15,11 +15,16 @@ DEMO = ROOT / "examples" / "demo-skill"
 
 
 class DemoExampleTests(unittest.TestCase):
-    def _run(self):
-        mp = DEMO / "evals" / "shared-benchmark.json"
+    """One offline pipeline run shared by every assertion about its report."""
+
+    MANIFEST = DEMO / "evals" / "shared-benchmark.json"
+
+    @classmethod
+    def setUpClass(cls):
+        mp = cls.MANIFEST
         manifest = sb.validate_manifest(mp)
         tmp = tempfile.TemporaryDirectory(prefix="demo-eval-")
-        self.addCleanup(tmp.cleanup)
+        cls.addClassCleanup(tmp.cleanup)
         td = Path(tmp.name)
         # 6 matched runs per arm clear the two-sided paired sign-flip floor
         # (2/2^6 = 0.03125); fewer unanimous pairs stay INDETERMINATE.
@@ -41,15 +46,14 @@ class DemoExampleTests(unittest.TestCase):
             "\n".join(json.dumps(verdict) for verdict in verdicts) + "\n",
             encoding="utf-8",
         )
-        self.runs_dir, self.judge_results = td / "runs", judge_results
-        return sb.build_benchmark_report(
+        cls.runs_dir, cls.judge_results = td / "runs", judge_results
+        cls.report = sb.build_benchmark_report(
             mp, td / "runs", variants_arg=variants,
             judge_results_path=str(judge_results),
         )
 
     def test_materialized_ablations_confirm_offline(self):
-        rep = self._run()
-        regs = {e["id"]: e for e in rep["ablation_regressions"]}
+        regs = {e["id"]: e for e in self.report["ablation_regressions"]}
         for aid, assertion in (("no-severity", "severity-label"), ("no-checklist", "cite-checklist")):
             entry = regs[aid]
             self.assertEqual(entry["status"], "measured", f"{aid} should be measured")
@@ -61,18 +65,15 @@ class DemoExampleTests(unittest.TestCase):
         # docs/is-my-skill-worth-its-tokens.md: before --judge-results existed the
         # judged demo could only report partial coverage, and a RunNumber pair
         # key crashed judge_task_id.
-        self._run()
-        mp = DEMO / "evals" / "shared-benchmark.json"
-        partial = sb.paired_token_overhead_report(mp, runs=self.runs_dir)
+        partial = sb.paired_token_overhead_report(self.MANIFEST, runs=self.runs_dir)
         complete = sb.paired_token_overhead_report(
-            mp, runs=self.runs_dir, judge_results_path=str(self.judge_results))
+            self.MANIFEST, runs=self.runs_dir, judge_results_path=str(self.judge_results))
         self.assertEqual(partial["summary"]["availability"], "partial")
         self.assertEqual(len(complete["pairs"]), 12)
         self.assertEqual(complete["summary"]["objective_delta"]["mean"], 1.0)
 
     def test_with_skill_beats_without_on_the_demo(self):
-        rep = self._run()
-        s = rep["summary"]
+        s = self.report["summary"]
         self.assertEqual(s["with_skill"]["objective_pass_rate"]["mean"], 1.0)      # skill present -> both assertions pass
         self.assertEqual(s["without_skill"]["objective_pass_rate"]["mean"], 0.0)   # no skill -> both fail
 
