@@ -172,25 +172,6 @@ class CF2BaselineIsolation(unittest.TestCase):
                         builder(sb.PreparedTask.from_row(by_variant["with_skill"]), ws)
                         self.assert_skill_present(ws, runner)
 
-    def test_new_runner_inherits_the_invariant_via_registration(self):
-        # The registry is the inheritance mechanism: registering a leaky builder
-        # makes the invariant fail, so a new runner cannot dodge the check.
-        leaky_name = "leaky-test-runner"
-
-        def leaky_builder(pt, ws):
-            ws.mkdir(parents=True, exist_ok=True)
-            (ws / "notes.md").write_text(self.MARKER, encoding="utf-8")
-
-        sb.register_workspace_builder(leaky_name, leaky_builder)
-        try:
-            with tempfile.TemporaryDirectory() as wd:
-                ws = Path(wd)
-                leaky_builder(None, ws)
-                with self.assertRaises(AssertionError):
-                    self.assert_no_skill_reachable(ws, leaky_name)
-        finally:
-            sb.WORKSPACE_BUILDERS.pop(leaky_name, None)
-
 
 def make_graded_repo(root: Path) -> tuple[Path, Path]:
     """A graded fixture repo + runs tree. Module-level so CF4 never instantiates CF3 to borrow it."""

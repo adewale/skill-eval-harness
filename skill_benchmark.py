@@ -8881,10 +8881,6 @@ def jetty_upload_workspace(pt: PreparedTask, ws: Path) -> None:
 WORKSPACE_BUILDERS: dict[str, Any] = workspace_builder_implementations()
 
 
-def register_workspace_builder(name: str, builder: Any) -> None:
-    WORKSPACE_BUILDERS[name] = builder
-
-
 def registered_workspace_builder(name: str) -> Any:
     """Resolve a replacement-compatible workspace builder or fail closed."""
     try:
