@@ -42,7 +42,6 @@ from agent_capabilities import BACKENDS
 from completion_contracts import completion_unscorable_reason
 from json_contracts import freeze_json_value
 from manifest_contracts import (
-    ABLATION_VARIANT_PREFIX,
     CaseId,
     CaseKind,
     ExecutionVariant,
@@ -413,11 +412,6 @@ class Provenance:
             components=tuple(Component.from_dict(c) for c in comps),
         )
 
-    # The exact key set as_dict() emits / from_dict() requires. Tests and
-    # verifiers reference THIS instead of re-typing the literal set (six copies
-    # of it once drifted independently across three test files).
-    SCHEMA_KEYS = frozenset({"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
-
     def matches(self, expected: Provenance | ExpectedProvenance) -> bool:
         """Exact declared identity match; tree revision is checked separately."""
         return (
@@ -556,15 +550,6 @@ class Arm:
         if not self.blind:
             return self.variant_truth
         return OPAQUE_TOKEN_PREFIX + hashlib.sha256(self.variant_truth.encode("utf-8")).hexdigest()[:10]
-
-    # --- harness-only surface (truth) ---
-    def harness_record(self) -> dict[str, Any]:
-        rec: dict[str, Any] = {"variant": self.variant_truth}
-        if self.provenance is not None:
-            rec["ablation"] = self.provenance.as_dict()
-        if self.identity is not None:
-            rec["skill_tree_hash"] = self.identity.canonical
-        return rec
 
 
 @dataclass(frozen=True)

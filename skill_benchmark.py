@@ -278,9 +278,6 @@ TRIGGER_IDENTITY_MODULES = (
     "trigger_contracts.py",
     "trigger_reporting.py",
 )
-# Compatibility names for code that inspected earlier trigger identity owners.
-TRIGGER_SEMANTIC_MODULES = TRIGGER_IDENTITY_MODULES
-HARNESS_SEMANTIC_MODULES = TRIGGER_IDENTITY_MODULES
 DEFAULT_VARIANTS = list(DEFAULT_EXECUTION_VARIANTS)
 _ResultPair = pair_domain.ExperimentalPair[Mapping[str, Any]]
 _ResultPairConstruction = pair_domain.PairConstruction[Mapping[str, Any]]

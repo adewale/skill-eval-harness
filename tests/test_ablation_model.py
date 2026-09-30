@@ -6,6 +6,7 @@ fail) to reintroduce the corresponding class of bug.
 import unittest
 
 import ablation_model as am
+from manifest_contracts import CaseId, CaseKind, ExecutionVariant, RunNumber, Split
 
 
 class ProvenanceSchemaTests(unittest.TestCase):
@@ -26,8 +27,9 @@ class ProvenanceSchemaTests(unittest.TestCase):
             am.Provenance(id="x", mode="materialized")  # missing population/identity/components
 
     def test_as_dict_is_the_minimum_schema(self):
+        # The persisted key set every runner records and the verifier parses.
         d = self.prov().as_dict()
-        self.assertEqual(set(d), am.Provenance.SCHEMA_KEYS)
+        self.assertEqual(set(d), {"id", "mode", "population", "skill_hash", "parent_skill_hash", "components"})
         self.assertEqual(d["skill_hash"], "E")
         self.assertEqual(d["parent_skill_hash"], "C")
         self.assertEqual(d["components"][0]["class"], "instructions")
@@ -169,28 +171,17 @@ class ArmBlindingTests(unittest.TestCase):
     TRUTH = "ablation:no-rp"
 
     def test_blind_arm_never_exposes_truth_to_the_model(self):
+        # Every model-facing method is blind: there is deliberately no API that
+        # hands the variant truth to the model.
         arm = am.Arm(variant_truth=self.TRUTH, blind=True)
-        # Every model-facing method is blind...
         self.assertEqual(arm.model_visible_variant(), "with_skill")
         self.assertNotIn("no-rp", arm.upload_token())
         self.assertNotIn("ablation", arm.upload_token())
-        # ...while the harness-only record carries the truth.
-        self.assertEqual(arm.harness_record()["variant"], self.TRUTH)
 
     def test_non_blind_arm_is_transparent(self):
         arm = am.Arm(variant_truth="with_skill", blind=False)
         self.assertEqual(arm.model_visible_variant(), "with_skill")
         self.assertEqual(arm.upload_token(), "with_skill")
-
-    def test_blinding_is_structural_no_model_method_returns_the_truth(self):
-        # The guarantee: scanning every model-facing method's output, the truth
-        # appears in none of them. There is deliberately no API that hands the
-        # variant truth to the model, so a leak cannot be added by "forgetting".
-        arm = am.Arm(variant_truth=self.TRUTH, blind=True)
-        model_facing = [arm.model_visible_variant(), arm.upload_token()]
-        for out in model_facing:
-            self.assertNotIn("no-rp", out)
-        self.assertIn("no-rp", arm.harness_record()["variant"])   # truth is reachable only here
 
     def test_opaque_tokens_are_deterministic_and_distinct(self):
         a = am.Arm("ablation:a", blind=True).upload_token()
@@ -200,37 +191,46 @@ class ArmBlindingTests(unittest.TestCase):
 
 
 class EvidenceClassTests(unittest.TestCase):
-    def test_confirmed_causal_only_reachable_through_the_guard(self):
-        # CONFIRMED_CAUSAL requires verified provenance AND coverage AND the observed regression.
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=True, significant=True),
-                         am.EvidenceClass.CONFIRMED_CAUSAL)
-        # Missing any precondition cannot reach a confirmation.
-        self.assertEqual(am.causal_confirmation(provenance_verified=False, has_coverage=True,
-                                                regression_observed=True, significant=True),
-                         am.EvidenceClass.INDETERMINATE)
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=False,
-                                                regression_observed=True, significant=True),
-                         am.EvidenceClass.INDETERMINATE)
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=False, significant=True),
-                         am.EvidenceClass.REFUTED)
+    def test_causal_confirmation_truth_table(self):
+        # CONFIRMED_CAUSAL needs verified provenance AND coverage AND an observed,
+        # significant regression. Missing provenance or coverage is INDETERMINATE
+        # even for a significant drop; an unobserved regression is REFUTED whatever
+        # the significance machinery says; an observed but insignificant one is
+        # INDETERMINATE (seen, noise not ruled out), never REFUTED.
+        confirmed = am.EvidenceClass.CONFIRMED_CAUSAL
+        refuted = am.EvidenceClass.REFUTED
+        unsure = am.EvidenceClass.INDETERMINATE
+        table = [
+            # provenance, coverage, observed, significant -> verdict
+            (True, True, True, True, confirmed),
+            (True, True, True, False, unsure),
+            (True, True, False, True, refuted),
+            (True, True, False, False, refuted),
+            (True, False, True, True, unsure),
+            (True, False, True, False, unsure),
+            (True, False, False, True, unsure),
+            (True, False, False, False, unsure),
+            (False, True, True, True, unsure),
+            (False, True, True, False, unsure),
+            (False, True, False, True, unsure),
+            (False, True, False, False, unsure),
+            (False, False, True, True, unsure),
+            (False, False, True, False, unsure),
+            (False, False, False, True, unsure),
+            (False, False, False, False, unsure),
+        ]
+        for provenance, coverage, observed, significant, verdict in table:
+            with self.subTest(provenance=provenance, coverage=coverage,
+                              observed=observed, significant=significant):
+                self.assertIs(am.causal_confirmation(
+                    provenance_verified=provenance, has_coverage=coverage,
+                    regression_observed=observed, significant=significant), verdict)
 
     def test_raw_measurement_is_not_a_confirmation(self):
         # The trigger path is a different type; it cannot be read as confirmed.
         self.assertFalse(am.EvidenceClass.RAW_MEASUREMENT.is_confirmation)
         self.assertTrue(am.EvidenceClass.CONFIRMED_CAUSAL.is_confirmation)
 
-    def test_significance_gate_lives_inside_the_door(self):
-        # An observed-but-insignificant regression is INDETERMINATE — seen, but
-        # the noise floor cannot be ruled out. Never REFUTED, which would
-        # wrongly claim "no regression".
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=True, significant=False),
-                         am.EvidenceClass.INDETERMINATE)
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=True, significant=True),
-                         am.EvidenceClass.CONFIRMED_CAUSAL)
     def test_significance_must_be_explicit_and_strictly_typed(self):
         with self.assertRaises(TypeError):
             am.causal_confirmation(provenance_verified=True, has_coverage=True,
@@ -241,20 +241,6 @@ class EvidenceClassTests(unittest.TestCase):
             for invalid in (None, 0, 1, "false", [], {}):
                 with self.subTest(name=name, invalid=invalid), self.assertRaises(TypeError):
                     am.causal_confirmation(**{**valid, name: invalid})
-
-    def test_significance_never_rescues_or_flips_the_other_gates(self):
-        # A refutation is a refutation regardless of significance machinery,
-        # and failed provenance/coverage stay INDETERMINATE even when the
-        # observed drop is significant.
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=True,
-                                                regression_observed=False, significant=False),
-                         am.EvidenceClass.REFUTED)
-        self.assertEqual(am.causal_confirmation(provenance_verified=False, has_coverage=True,
-                                                regression_observed=True, significant=True),
-                         am.EvidenceClass.INDETERMINATE)
-        self.assertEqual(am.causal_confirmation(provenance_verified=True, has_coverage=False,
-                                                regression_observed=True, significant=True),
-                         am.EvidenceClass.INDETERMINATE)
 
 
 class ResultSetTests(unittest.TestCase):
@@ -289,6 +275,137 @@ class ResultSetTests(unittest.TestCase):
 
     def test_all_is_the_explicit_escape_hatch(self):
         self.assertEqual(len(am.ResultSet(self.rows()).all), 3)   # raw access is opt-in, not the default
+
+
+class ExecutionValidTests(unittest.TestCase):
+    """execution_valid reads what runners persist: metadata flags and the
+    synthetic-failure body a runner writes when it never got a real answer. The
+    marker strings are literal on-disk values; changing one would let old
+    failure runs grade as genuine answers."""
+
+    def test_infrastructure_failures_are_never_scorable(self):
+        rows = [
+            # (metadata, output body, valid)
+            ({"returncode": 0}, "a real answer", True),
+            (None, "answer with no metadata", True),
+            ({}, "An answer that quotes [CODEX FAILURE: x] mid-text.", True),
+            ({"artifact_contract_version": 1, "artifact_set_complete": True}, "x", True),
+            ({"returncode": 1}, "x", False),
+            ({"timed_out": True}, "x", False),
+            ({"timeout": True}, "x", False),
+            ({"timed_out": "yes"}, "x", False),
+            ({"provider_response_complete": False}, "x", False),
+            ({"artifact_set_complete": False}, "x", False),
+            ({"artifact_contract_version": 1}, "x", False),
+            ({}, "[CODEX FAILURE: returncode=1]\n\n", False),
+            ({}, "[JETTY FAILURE: trajectory failed before producing output]\n", False),
+            ({}, "[CLAUDE FAILURE: provider produced no final answer]", False),
+            ({}, "[VIBE FAILURE: returncode=127]", False),
+            ({}, "[GEMINI FAILURE: returncode=1]", False),
+            ({}, "[TIMEOUT: no final assistant message captured]", False),
+            ({}, "  \n[CODEX FAILURE: returncode=1]", False),
+        ]
+        for metadata, text, valid in rows:
+            with self.subTest(metadata=metadata, text=text):
+                self.assertIs(am.execution_valid(metadata, text), valid)
+
+
+class PreparedTaskTests(unittest.TestCase):
+    """The prepared row is parsed once at the JSONL boundary into typed identity
+    values, and it OWNS blinding: the only model-facing variant comes from its
+    Arm. Both distinct blinds are honored: the experiment-blind (materialized ->
+    present as with_skill) and the path-hygiene blind (any ablation -> opaque
+    upload token)."""
+
+    BASE_ROW = {
+        "case_id": "c", "split": "tune", "kind": "behavior", "variant": "with_skill",
+        "run_number": 1, "skill_name": "s", "repo_root": "/repo",
+        "skill_paths": ["skills/s/SKILL.md"], "input_files": [],
+        "run_dir": "c/with_skill/run-1", "instruction": "", "prompt": "p", "tags": [],
+    }
+
+    def mat_task(self):
+        prov = am.Provenance(id="no-rp", mode="materialized", population="answer",
+                             identity=am.TreeIdentity(canonical="C", edited="E"),
+                             components=(am.Component("instructions", "section", "s", {}),))
+        return am.PreparedTask(case_id="c", split="tune", kind="behavior", variant_truth="ablation:no-rp",
+                               run_number=1, skill_name="good-pr", repo_root="/r", skill_paths=("/m/SKILL.md",),
+                               input_files=(), run_dir="c/ablation:no-rp", instruction="Use the skill under test (good-pr).",
+                               prompt="Review.", tags=(), ablation=prov, skill_tree_hash="C")
+
+    def sim_task(self):
+        sim = am.InstructionSimulated(id="no-rp", population="answer", removed_component="rp")
+        return am.PreparedTask(case_id="c", split="tune", kind="behavior", variant_truth="ablation:no-rp",
+                               run_number=1, skill_name="good-pr", repo_root="/r", skill_paths=("/m/SKILL.md",),
+                               input_files=(), run_dir="c/ablation:no-rp", instruction="...directive...",
+                               prompt="Review.", tags=(), ablation=sim)
+
+    def test_draft_can_be_partial_but_execution_validation_is_strict(self):
+        draft = am.PreparedTaskDraft.from_row({"variant": "with_skill", "prompt": "review"})
+        self.assertEqual(draft.prompt, "review")
+        with self.assertRaises(ValueError):
+            draft.validate()
+
+    def test_row_boundary_parses_typed_identity_and_round_trips(self):
+        task = am.PreparedTask.from_row(self.BASE_ROW)
+        self.assertIsInstance(task.case_id, CaseId)
+        self.assertIsInstance(task.split, Split)
+        self.assertIsInstance(task.kind, CaseKind)
+        self.assertIsInstance(task.variant_truth, ExecutionVariant)
+        self.assertIsInstance(task.run_number, RunNumber)
+        self.assertEqual(task.harness_record(), self.BASE_ROW)             # wire shape unchanged
+        for pt in (self.mat_task(), self.sim_task()):
+            back = am.PreparedTask.from_row(pt.harness_record())
+            self.assertEqual(back.variant_truth, pt.variant_truth)
+            self.assertEqual(type(back.ablation), type(pt.ablation))       # record type survives the round trip
+            self.assertEqual(back.is_blind, pt.is_blind)
+            self.assertEqual(back.harness_record(), pt.harness_record())   # serialization is stable
+
+    def test_invalid_rows_are_rejected_by_the_guard_that_owns_them(self):
+        materialized = self.mat_task().harness_record()
+        rejected = [
+            (self.BASE_ROW, {"case_id": ""}, "case id must be a non-empty string"),
+            (self.BASE_ROW, {"split": "training"}, "split must be one of"),
+            (self.BASE_ROW, {"kind": "trigger"}, "answer-population only"),
+            (self.BASE_ROW, {"variant": "unknown"}, "not a supported arm"),
+            (self.BASE_ROW, {"run_number": 0}, "run number must be positive"),
+            (self.BASE_ROW, {"run_number": True}, "run number must be an integer"),
+            (self.BASE_ROW, {"run_number": "1"}, "'run_number' must be int"),
+            (self.BASE_ROW, {"run_dir": "../escape"}, "run_dir must be a safe non-root relative path"),
+            (self.BASE_ROW, {"run_dir": "/absolute"}, "run_dir must be a safe non-root relative path"),
+            (self.BASE_ROW, {"run_dir": "."}, "run_dir must be a safe non-root relative path"),
+            (self.BASE_ROW, {"skill_paths": "not-a-list"}, "'skill_paths' must be a list of strings"),
+            (self.BASE_ROW, {"variant": "without_skill"}, "run_dir arm disagrees with variant"),
+            (self.BASE_ROW, {"variant": "without_skill", "run_dir": "c/without_skill/run-1"},
+             "without_skill task cannot carry skill paths"),
+            (materialized, {"skill_paths": []}, "requires mounted skill paths"),
+            (materialized, {"skill_tree_hash": "OTHER"}, "canonical hash must match provenance parent"),
+            (materialized, {"skill_tree_hash": None}, "canonical hash must match provenance parent"),
+        ]
+        with self.assertRaisesRegex(ValueError, "missing run_number"):
+            am.PreparedTask.from_row({key: value for key, value in self.BASE_ROW.items() if key != "run_number"})
+        for row, mutation, message in rejected:
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(ValueError, message):
+                am.PreparedTask.from_row({**row, **mutation})
+
+    def test_materialized_arm_presents_as_with_skill(self):
+        pt = self.mat_task()
+        self.assertTrue(pt.is_materialized_ablation)
+        self.assertTrue(pt.is_blind)
+        self.assertEqual(pt.model_facing_variant(), "with_skill")             # experiment-blind
+        self.assertEqual(pt.harness_record()["variant"], "ablation:no-rp")    # truth on the row
+
+    def test_instruction_simulated_arm_is_transparent(self):
+        pt = self.sim_task()
+        self.assertFalse(pt.is_materialized_ablation)
+        self.assertFalse(pt.is_blind)
+        self.assertEqual(pt.model_facing_variant(), "ablation:no-rp")         # model is told what to simulate
+
+    def test_upload_token_is_opaque_for_any_ablation(self):
+        for pt in (self.mat_task(), self.sim_task()):
+            tok = pt.upload_token()
+            self.assertNotIn("no-rp", tok)
+            self.assertNotIn("ablation", tok)
 
 
 if __name__ == "__main__":

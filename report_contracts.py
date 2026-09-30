@@ -265,15 +265,6 @@ def observed_rates(cohort: ReportCohort, key: str) -> tuple[UnitRate, ...]:
     return tuple(rates)
 
 
-def diagnostic_rates(cohort: ReportCohort, key: str) -> tuple[UnitRate, ...]:
-    """Valid raw values, including blocked attempts, for named diagnostics only."""
-    return tuple(
-        UnitRate(value)
-        for attempt in cohort.attempts
-        if (value := attempt.row.get(key)) is not None
-    )
-
-
 def headline_value(cohort: ReportCohort, observed: Any) -> Any:
     """Publish a headline only for a complete metric denominator."""
     return observed if isinstance(cohort, CompleteReportCohort) else None
