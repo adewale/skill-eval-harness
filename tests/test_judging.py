@@ -5,6 +5,8 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
+import contextlib
+import io
 import json
 import os
 import stat
@@ -19,6 +21,7 @@ from helpers import (
     demo_manifest as base_manifest,
 )
 from helpers import (
+    make_eval_repo,
     trace_event,
     write_run,
 )
@@ -35,18 +38,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class JudgeConfigSlotTests(unittest.TestCase):
     """1.3 — judge config slot and the judge-is-not-the-model-under-test guard."""
-
-    def test_manifest_judge_block_validates(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = write_manifest(Path(td), base_manifest(judge={"model": "judge-model-x"}))
-            manifest = sb.validate_manifest(path)
-            self.assertEqual(manifest["judge"]["model"], "judge-model-x")
-
-    def test_bad_judge_block_dies(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = write_manifest(Path(td), base_manifest(judge={"model": 7}))
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(path)
 
     def test_effective_judge_model_prefers_cli_then_manifest(self):
         manifest = base_manifest(judge={"model": "manifest-judge"})
@@ -584,37 +575,6 @@ class VerdictSchemaTests(unittest.TestCase):
         task = {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
                 "run_number": 1, "prompt": "p", "assertion": self.PLAIN}
         self.assertIn(json.dumps(sb.verdict_schema_for(self.PLAIN)), sb.judge_prompt(task, "output"))
-
-    def test_manifest_schema_enforcement_validated(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "repo" / "skill").mkdir(parents=True)
-            (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-            (root / "repo" / "evals").mkdir()
-            p = root / "repo" / "evals" / "shared-benchmark.json"
-            base = {"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                    "variants": ["with_skill", "without_skill"],
-                    "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
-                               "assertions": [{"name": "a", "type": "contains", "value": "y"}]}],
-                    "ablations": []}
-
-            def write(judge_cfg):
-                m = dict(base)
-                if judge_cfg is not None:
-                    m["judge"] = judge_cfg
-                p.write_text(json.dumps(m), encoding="utf-8")
-                return p
-
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(write({"schema_enforcement": "loose"}))   # invalid enum rejected
-            sb.validate_manifest(write({"schema_enforcement": "strict"}))       # valid accepted
-            sb.validate_manifest(write({"schema_enforcement": "report"}))       # the documented default, also accepted
-            sb.validate_manifest(write(None))                                   # absent is fine
-            # G3 panel activation surface (judge.panel / judge.models) is validated too.
-            sb.validate_manifest(write({"panel": ["m1", "m2"]}))                # good panel accepted
-            for bad in ({"panel": []}, {"panel": ["m1", 2]}, {"models": "solo"}, {"models": [""]}):
-                with self.assertRaises(SystemExit):
-                    sb.validate_manifest(write(bad))
 
 
 class TrajectoryJudgeTests(unittest.TestCase):
@@ -1184,19 +1144,13 @@ class JudgeRobustnessTests(unittest.TestCase):
 
     def _cli_manifest(self, td):
         root = Path(td)
-        (root / "repo" / "skill").mkdir(parents=True)
-        (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-        (root / "repo" / "evals").mkdir()
-        p = root / "repo" / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"], "ablations": [],
-            "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
-                       "assertions": [{"name": "j", "type": "judge", "severity": "gate", "review_rubric": ["is it good"]}]}]}), encoding="utf-8")
+        p = make_eval_repo(root, cases=[{
+            "id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
+            "assertions": [{"name": "j", "type": "judge", "severity": "gate",
+                            "review_rubric": ["is it good"]}]}])
         runs = root / "runs"
-        (runs / "c" / "with_skill").mkdir(parents=True)
-        (runs / "c" / "with_skill" / "output.md").write_text("GOODANSWER is present", encoding="utf-8")
-        (runs / "c" / "without_skill").mkdir(parents=True)
-        (runs / "c" / "without_skill" / "output.md").write_text("GOODANSWER is present", encoding="utf-8")
+        for variant in ("with_skill", "without_skill"):
+            write_run(runs / "c" / variant, "GOODANSWER is present")
         return p, runs
 
     def _args(self, td, p, runs, name, body, *, fail_on_findings=False):
@@ -1319,17 +1273,26 @@ class ToolUsingJudgeTests(unittest.TestCase):
                 "run_number": 1, "prompt": "p", "run_base": str(run),
                 "output_path": str(run / "output.md"), "assertion": {"type": "judge", "name": "j"}}
 
-    def _tmp_explore_dirs(self):
-        return {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("judge-explore-")}
+    @contextlib.contextmanager
+    def _private_tempdir(self):
+        """Point tempfile at a directory only this test uses. The cleanup check
+        lists the temp dir, and a snapshot of the shared one was flaky when
+        another process created judge-explore-* dirs concurrently."""
+        with tempfile.TemporaryDirectory() as private, \
+                mock.patch.object(tempfile, "tempdir", private):
+            yield Path(private).resolve()
+
+    @staticmethod
+    def _explore_dirs(tmp: Path) -> set[str]:
+        return {n for n in os.listdir(tmp) if n.startswith("judge-explore-")}
 
     def test_explore_end_to_end_sanitizes_and_arms_readonly_tools(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, self._private_tempdir() as private:
             run = self._run_dir(td)
             stub = self._stub_claude(td)
-            before = self._tmp_explore_dirs()
             row = sb.run_one_judge_task(self._task(run), judge_model="m", claude_bin=str(stub), explore=True)
             probe = json.loads((Path(td) / "probe.json").read_text(encoding="utf-8"))
-            after = self._tmp_explore_dirs()
+            leftover = self._explore_dirs(private)
         self.assertTrue(row["passed"])                                     # verdict flows back unchanged
         self.assertEqual(row["score"], 5)
         self.assertIn("--add-dir", probe["argv"])                          # tools were armed
@@ -1343,7 +1306,9 @@ class ToolUsingJudgeTests(unittest.TestCase):
         # the live oracle. Read/Grep with no path would otherwise range over the repo.
         self.assertIn("judge-explore-", probe["cwd"])
         self.assertNotEqual(probe["cwd"], os.getcwd())
-        self.assertEqual(after, before)                                    # the scratch copy was cleaned up
+        # The scratch copy was made in the temp dir, and cleaned up afterwards.
+        self.assertTrue(Path(probe["cwd"]).resolve().is_relative_to(private), probe["cwd"])
+        self.assertEqual(leftover, set())
 
     def test_explore_off_arms_no_tools_and_no_add_dir(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1405,19 +1370,18 @@ class ToolUsingJudgeTests(unittest.TestCase):
 
     def test_requested_explore_without_run_base_is_incomplete(self):
         # A task with no run_base must NOT resolve to '.' (repo root) and copy it.
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, self._private_tempdir() as private:
             stub = self._stub_claude(td)
             task = {"judge_task_id": "c::with_skill::run-1::j", "case_id": "c", "variant": "with_skill",
                     "run_number": 1, "prompt": "p", "output_path": str(Path(td) / "missing.md"),
                     "assertion": {"type": "judge", "name": "j"}}   # NO run_base key
-            before = self._tmp_explore_dirs()
             row = sb.run_one_judge_task(task, judge_model="m", claude_bin=str(stub), explore=True)
-            after = self._tmp_explore_dirs()
+            leftover = self._explore_dirs(private)
         self.assertFalse(row["passed"])
         self.assertFalse(row["judge_observation_complete"])
         self.assertEqual(row["judge_evidence_mode"], "explore")
         self.assertFalse((Path(td) / "probe.json").exists())  # judge never invoked
-        self.assertEqual(after, before)
+        self.assertEqual(leftover, set())                      # and no scratch copy left behind
 
     def test_explore_is_inert_on_shell_judge_cmd(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1429,22 +1393,17 @@ class ToolUsingJudgeTests(unittest.TestCase):
         self.assertTrue(row["passed"])
 
     def test_command_rejects_explore_with_shell_judge_cmd(self):
-        from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "skill").mkdir(parents=True)
-            (root / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-            p = root / "shared-benchmark.json"
-            p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                "variants": ["with_skill", "without_skill"], "ablations": [],
-                "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
-                           "assertions": [{"name": "a", "type": "contains", "value": "y"}]}]}), encoding="utf-8")
-            args = SimpleNamespace(manifest=str(p), runs=str(root / "runs"), split=None, variant=None,
+            args = SimpleNamespace(manifest=str(make_eval_repo(root)), runs=str(root / "runs"),
+                                   split=None, variant=None,
                                    judge_cmd="cat x", judge_model=None, judge_panel=None, claude_bin="claude",
                                    judge_runs=1, strict_judge_schema=False, judge_trajectory=False,
                                    judge_explore=True, quorum=None, transcripts=None, out=None)
-            with self.assertRaises(SystemExit):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
                 sb.judge_command(args)
+        self.assertIn("--judge-explore is for the native claude judge backend only", stderr.getvalue())
 
 
 class StrictJudgeVerdictTests(unittest.TestCase):

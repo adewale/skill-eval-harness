@@ -11,7 +11,10 @@ from types import SimpleNamespace
 from helpers import (
     attach_jetty_task_contract,
     attest_answer_design,
+    demo_manifest,
     load_example_module,
+    write_demo_manifest,
+    write_run,
 )
 
 import run_pi_trigger_eval as tr
@@ -21,18 +24,10 @@ import run_pi_trigger_eval as tr
 # checks silently diverge between test files.
 import skill_benchmark as sb
 
-ROOT = Path(__file__).resolve().parents[1]
 smoke = load_example_module("run_pi_smoke", "examples/adewale-workspace/run_pi_smoke.py")
 
 
 class SkillBenchmarkTests(unittest.TestCase):
-    def test_central_cli_remains_in_the_project_ty_gate(self):
-        project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        ty_sources = project.split("[tool.ty.src]", 1)[1].split("\n[", 1)[0]
-        self.assertIn('"*.py"', ty_sources)
-        self.assertIn('"type_tests/*.py"', ty_sources)
-        self.assertNotIn("check_ty_regressions", project)
-
     def test_infra_failure_excluded_from_every_report_view(self):
         # Invariant: an infrastructure failure (execution_valid False) must not
         # affect ANY report view. Adding a crashed with_skill run (rate 0.0) must
@@ -72,33 +67,17 @@ class SkillBenchmarkTests(unittest.TestCase):
         self.assertEqual(sb.mean_rate([good, crashed]), 1.0)   # the crash did not drag it to 0.5
 
     def make_manifest(self, root: Path) -> Path:
-        repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo skill\n---\n", encoding="utf-8")
-        (repo / "evals").mkdir()
-        manifest = {
-            "version": 1,
-            "skill_name": "demo",
-            "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [
-                {
-                    "id": "case-1",
-                    "split": "tune",
-                    "kind": "behavior",
-                    "prompt": "Say alpha and beta.",
-                    "expected_behavior": ["Say alpha and beta"],
-                    "assertions": [
-                        {"name": "has-alpha", "type": "contains", "value": "alpha"},
-                        {"name": "has-beta", "type": "contains", "value": "beta"},
-                    ],
-                }
+        return write_demo_manifest(root, demo_manifest(cases=[{
+            "id": "case-1",
+            "split": "tune",
+            "kind": "behavior",
+            "prompt": "Say alpha and beta.",
+            "expected_behavior": ["Say alpha and beta"],
+            "assertions": [
+                {"name": "has-alpha", "type": "contains", "value": "alpha"},
+                {"name": "has-beta", "type": "contains", "value": "beta"},
             ],
-            "ablations": [],
-        }
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        return path
+        }]))
 
     def test_repeated_runs_artifact_outputs_and_flaky_flag(self):
         with tempfile.TemporaryDirectory() as td:
@@ -251,6 +230,10 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertIn("non-discriminating-assertions", kinds)
 
     def test_missing_outputs_do_not_create_no_lift_flags(self):
+        # A case with no outputs has no pairs, so it must not be flagged at all.
+        # Any missing output makes the report partial, which empties case_flags
+        # for every case; the per-case contract lives on observed_case_flags,
+        # which audit-manifest reads for a partial report.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = self.make_manifest(root)
@@ -265,13 +248,15 @@ class SkillBenchmarkTests(unittest.TestCase):
             manifest.write_text(json.dumps(data), encoding="utf-8")
             runs = root / "repo" / "eval-runs" / "latest"
             for variant in ["with_skill", "without_skill"]:
-                base = runs / "case-1" / variant
-                base.mkdir(parents=True)
-                (base / "output.md").write_text("alpha beta", encoding="utf-8")
+                write_run(runs / "case-1" / variant, "alpha beta")
             attest_answer_design(manifest, runs)
             report = sb.build_benchmark_report(manifest, runs)
-            flagged_ids = {f["case_id"] for f in report["case_flags"]}
-            self.assertNotIn("case-2", flagged_ids)
+        self.assertEqual(report["case_flags_availability"], "partial")
+        self.assertEqual(report["case_flags"], [])
+        observed = {row["case_id"]: row["flags"] for row in report["observed_case_flags"]}
+        # The paired case still gets its flags, so the view is not vacuously empty.
+        self.assertIn("no objective lift", observed["case-1"])
+        self.assertNotIn("case-2", observed)
 
     def test_trigger_eval_extracts_real_user_prompt(self):
         case = {
@@ -400,7 +385,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 9, "reasoning_output_tokens": 0}},
         ]
         events, metrics = sb.normalize_trace_records(records, source="codex")
-        self.assertEqual(sb.final_answer_from_events(events), "codex-trace-ok")
+        messages = [e for e in events["events"] if e["type"] == "message"]
+        self.assertEqual([(m.get("role"), m.get("status"), m.get("input_summary")) for m in messages],
+                         [("assistant", "completed", "codex-trace-ok")])
         self.assertEqual(metrics["commands"], 1)
         self.assertTrue(metrics["skill_invoked"])
         self.assertEqual(metrics["input_tokens"], 100)
@@ -473,25 +460,31 @@ class SkillBenchmarkTests(unittest.TestCase):
                 "status": "failed", "jetty": {"model": "m"}, "artifacts": [],
             }
             attach_jetty_task_contract(base)
+            # Re-attested at a safe run_dir, so a duplicate reaches the identity
+            # guard instead of dying on the changed-after-attestation check.
+            safe = attach_jetty_task_contract(
+                {**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}})
             path = root / "jetty.jsonl"
             cases = [
-                [base],
-                [{**base, "harness": {k: v for k, v in base["harness"].items() if k != "run_number"}}],
-                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}},
-                 {**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"}}],
-                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"},
-                  "status": "completed",
-                  "artifacts": [{"path": "output.md", "content": "answer"}]}],
-                [{**base, "harness": {**base["harness"], "run_dir": "case-1/with_skill"},
-                  "status": "completed", "trajectory_id": "   ",
-                  "artifacts": [{"path": "output.md", "content": "answer"}]}],
+                ([base], "unsafe run_dir escapes runs directory"),
+                ([{**base, "harness": {k: v for k, v in base["harness"].items() if k != "run_number"}}],
+                 "harness.run_number must be a positive integer"),
+                ([safe, safe], "duplicate Jetty result identity"),
+                ([{**safe, "status": "completed",
+                   "artifacts": [{"path": "output.md", "content": "answer"}]}],
+                 "successful trajectory requires non-blank trajectory_id"),
+                ([{**safe, "status": "completed", "trajectory_id": "   ",
+                   "artifacts": [{"path": "output.md", "content": "answer"}]}],
+                 "successful trajectory requires non-blank trajectory_id"),
             ]
-            for records in cases:
-                with self.subTest(records=records):
+            for records, message in cases:
+                stderr = io.StringIO()
+                with self.subTest(message=message, records=records), contextlib.redirect_stderr(stderr):
                     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
                     with self.assertRaises(SystemExit):
                         sb.import_jetty_results(SimpleNamespace(
                             manifest=str(manifest), jetty_runs=str(path), runs=str(root / "runs")))
+                    self.assertIn(message, stderr.getvalue())
             self.assertFalse((root / "escape").exists())
 
     def test_import_jetty_persists_ablation_provenance_into_metadata(self):
@@ -550,7 +543,10 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertEqual(records[0]["lifecycle"]["kind"], "protocol_invalid")
             self.assertIn("non-executable", records[0]["error"])
 
-    def test_pi_smoke_workspace_omits_skill_for_without_skill(self):
+    def test_pi_smoke_command_line_points_only_at_workspace_copies(self):
+        # CF.2 proves what each pi-smoke workspace holds; this owns what the pi
+        # invocation is handed: --no-skills without the skill, and --skill
+        # paths and input files that resolve inside the workspace, never the repo.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = self.make_manifest(root)
@@ -559,20 +555,20 @@ class SkillBenchmarkTests(unittest.TestCase):
             fixture.parent.mkdir()
             fixture.write_text("fixture", encoding="utf-8")
             data = json.loads(manifest.read_text(encoding="utf-8"))
-            data["cases"][0]["files"] = ["fixtures/input.txt"]
-            with tempfile.TemporaryDirectory() as wd:
-                instruction, skill_args, inputs, skill_paths, _ = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "without_skill", Path(wd))
-                self.assertEqual(skill_args, ["--no-skills"])
-                self.assertEqual(skill_paths, [])
-                self.assertEqual(len(inputs), 1)
-                self.assertTrue(str(inputs[0]).startswith(str(Path(wd).resolve())))
-                self.assertFalse((Path(wd) / "skills").exists())
-                self.assertIn("not present", instruction)
-            with tempfile.TemporaryDirectory() as wd:
-                _, skill_args, _, skill_paths, _ = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "with_skill", Path(wd))
-                self.assertTrue(skill_paths)
-                self.assertIn("--skill", skill_args)
-                self.assertTrue(all(str(p.resolve()).startswith(str(Path(wd).resolve())) for p in skill_paths))
+            case = {**data["cases"][0], "files": ["fixtures/input.txt"]}
+            for variant in ("without_skill", "with_skill"):
+                with self.subTest(variant=variant), tempfile.TemporaryDirectory() as wd:
+                    ws = Path(wd).resolve()
+                    _, skill_args, inputs, _, _ = smoke.materialize_runtime_workspace(
+                        data, repo, case, variant, ws)
+                    if variant == "without_skill":
+                        self.assertEqual(skill_args, ["--no-skills"])
+                    else:
+                        self.assertEqual(skill_args[0::2], ["--skill"] * len(data["skill_paths"]))
+                        for path in skill_args[1::2]:
+                            self.assertTrue(Path(path).resolve().is_relative_to(ws), path)
+                    self.assertEqual([Path(p).resolve() for p in inputs],
+                                     [ws / "inputs" / "fixtures" / "input.txt"])
 
     def test_pi_trigger_trace_artifact_writer_uses_detector_evidence(self):
         with tempfile.TemporaryDirectory() as td:
@@ -625,13 +621,6 @@ class SkillBenchmarkTests(unittest.TestCase):
             allowed = sb.build_benchmark_report(manifest, runs, variants_arg=["with_skill"], allow_scripts=True)
             self.assertEqual(allowed["results"][0]["objective_pass_rate"], 1.0)
             self.assertIn("checked output", allowed["results"][0]["assertions"][0]["evidence"])
-
-    def test_prompt_assertion_leakage_lint_finds_literal_contains_values(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            manifest = self.make_manifest(root)
-            findings = sb.prompt_assertion_leakage_findings(sb.load_json(manifest), manifest)
-            self.assertTrue(any(f["case_id"] == "case-1" and f["value"] == "alpha" for f in findings))
 
     def test_judge_command_backend_writes_loadable_results(self):
         with tempfile.TemporaryDirectory() as td:

@@ -5,6 +5,8 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
+import contextlib
+import io
 import json
 import os
 import sys
@@ -416,11 +418,11 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertTrue(significant["significant_at_0_05"])
         self.assertEqual(flat["p_value"], 1.0)
         self.assertGreater(mixed["p_value"], 0.05)
-
-    def test_sign_flip_sampled_is_deterministic(self):
-        deltas = [0.1 * (1 if i % 3 else -1) for i in range(20)]
-        self.assertEqual(sb.sign_flip_significance(deltas), sb.sign_flip_significance(deltas))
-        self.assertEqual(sb.sign_flip_significance(deltas)["method"], "sign-flip-sampled")
+        # A sub-millionth regression is still a regression: the zero-delta
+        # tolerance must not swallow it.
+        tiny = sb.sign_flip_significance([2_999_999 / 3_000_000 - 1.0] * 6)
+        self.assertLess(tiny["observed_mean_delta"], 0)
+        self.assertTrue(tiny["significant_at_0_05"])
 
     def test_sampled_sign_flip_is_order_invariant_and_conservative_at_gate(self):
         # The deterministic Monte-Carlo point estimate is below .05, while
@@ -431,20 +433,22 @@ class GradedScoringSeverityTests(unittest.TestCase):
         sampled = sb.sign_flip_significance(deltas)
         reversed_sampled = sb.sign_flip_significance(list(reversed(deltas)))
         exact = sb.sign_flip_significance(deltas, max_exact_n=20)
+        self.assertEqual(sampled["method"], "sign-flip-sampled")
+        # Equal across two calls on reordered input: the sample is seeded
+        # (a re-grade stays byte-identical) and independent of case order.
         self.assertEqual(sampled, reversed_sampled)
         self.assertAlmostEqual(exact["p_value"], 0.05010986328125)
         self.assertLess(sampled["p_value"], 0.05)  # point estimate alone is unsafe
         self.assertGreater(sampled["p_value_upper_bound"], 0.05)
         self.assertFalse(sampled["significant_at_0_05"])
 
-    def test_inference_rates_keep_sub_millionth_regressions(self):
-        baseline = sb._exact_rate(3_000_000, 3_000_000)
-        ablation = sb._exact_rate(2_999_999, 3_000_000)
-        delta = ablation - baseline
-        self.assertLess(delta, 0)
-        result = sb.sign_flip_significance([delta] * 6)
-        self.assertLess(result["observed_mean_delta"], 0)
-        self.assertTrue(result["significant_at_0_05"])
+    def test_sampled_sign_flip_p_is_never_exact_zero(self):
+        # (b+1)/(m+1): the observed sign pattern is itself a valid permutation,
+        # so a sampled p can never be an impossible 0.0, even when no sampled
+        # pattern reaches the observed mean.
+        result = sb.sign_flip_significance([0.5] * 20)
+        self.assertEqual(result["method"], "sign-flip-sampled")
+        self.assertAlmostEqual(result["p_value"], 1 / 4097)
 
     def test_paired_summary_carries_significance_and_graded_channel(self):
         results = []
@@ -947,30 +951,18 @@ class ReviewFixRegressionTests(unittest.TestCase):
         report = {"skill_name": "d", "summary": {}, "paired_summary": {}, "case_flags": [], "results": [result]}
         self.assertIn('failures="1"', sb.junit_xml_from_report(report))
 
-    def test_p2_tool_call_matches_normalized_tool_call_events(self):
-        events = {"schema_version": 2, "source": "subagent", "events": [
-            {"type": "tool_call", "name": "Read", "input_summary": "skills/demo/refs.md", "status": "completed"},
-            {"type": "tool_call", "name": "WebSearch", "input_summary": "query", "status": "in_progress"},
-        ]}
-        with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
-            (base / "output.md").write_text("t", encoding="utf-8")
-            (base / "events.json").write_text(json.dumps(events), encoding="utf-8")
-            hit = sb.assertion_result({"type": "tool_call", "tool": "Read"}, "t", base / "output.md", run_base=base)
-            in_progress_only = sb.assertion_result({"type": "tool_call", "tool": "WebSearch"}, "t", base / "output.md", run_base=base)
-        self.assertTrue(hit["passed"], hit["evidence"])
-        self.assertFalse(in_progress_only["passed"])   # a started-but-unfinished call is not a call that ran
-
     def test_p2_turn_assertions_are_validated(self):
         manifest = base_manifest()
         manifest["cases"] = [{
             "id": "conv", "split": "tune", "kind": "behavior",
             "turns": [{"prompt": "ask", "assertions": [{"type": "no_such_type", "value": "x"}]}],
         }]
+        stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as td:
             path = write_manifest(Path(td), manifest)
-            with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
                 sb.validate_manifest(path)
+        self.assertIn("conv: turn #1 assertion #0 has unsupported type 'no_such_type'", stderr.getvalue())
 
 
 class AssertionDependenciesTests(unittest.TestCase):
@@ -1007,18 +999,19 @@ class AssertionDependenciesTests(unittest.TestCase):
         sb.validate_depends_on_scope("c", [A(name="pre"), A(name="dep", depends_on="pre")], p)   # valid graph
 
     def test_turn_depends_on_rejected_at_validate(self):
+        manifest = base_manifest()
+        manifest["cases"] = [{
+            "id": "c", "split": "tune", "kind": "behavior",
+            "turns": [{"prompt": "p", "assertions": [
+                {"name": "t", "type": "contains", "value": "x", "depends_on": "other"}]}],
+        }]
+        stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "repo" / "skill").mkdir(parents=True)
-            (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-            (root / "repo" / "evals").mkdir()
-            p = root / "repo" / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                "variants": ["with_skill", "without_skill"], "ablations": [],
-                "cases": [{"id": "c", "split": "tune", "kind": "behavior",
-                           "turns": [{"prompt": "p", "assertions": [{"name": "t", "type": "contains", "value": "x", "depends_on": "other"}]}]}]}), encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(p)
+            path = write_manifest(Path(td), manifest)
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                sb.validate_manifest(path)
+        self.assertIn("c: turn #1 assertion #0 depends_on is not supported in turn assertions",
+                      stderr.getvalue())
 
     # --- grading ---
     def test_dependent_counted_when_prereq_passes(self):

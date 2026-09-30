@@ -6,6 +6,8 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -18,6 +20,7 @@ from helpers import (
 from helpers import (
     attest_answer_design,
     make_eval_repo,
+    write_run,
 )
 from helpers import (
     demo_manifest as base_manifest,
@@ -544,13 +547,17 @@ class MigrationTests(unittest.TestCase):
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 
-    def test_leakage_finding_points_at_the_guide(self):
+    def test_leakage_lint_names_the_echoed_value_and_points_at_the_guide(self):
+        # The one owner of the basic prompt/assertion leakage lint.
+        manifest = base_manifest()
         with tempfile.TemporaryDirectory() as td:
-            manifest = base_manifest()
-            manifest["cases"][0]["prompt"] = "Please mention alpha in your answer."
             path = write_manifest(Path(td), manifest)
+            quiet = sb.prompt_assertion_leakage_findings(manifest, path)   # "Do the task." echoes nothing
+            manifest["cases"][0]["prompt"] = "Please mention alpha in your answer."
             findings = sb.prompt_assertion_leakage_findings(manifest, path)
-        self.assertTrue(findings)
+        self.assertEqual(quiet, [])
+        self.assertEqual([(f["case_id"], f["assertion"], f["value"]) for f in findings],
+                         [("case-1", "has-alpha", "alpha")])
         self.assertIn("docs/authoring-evals.md", findings[0]["guide"])
 
     def test_fixture_recommendations_point_at_the_guide(self):
@@ -699,36 +706,28 @@ class ContaminationPerimeterTests(unittest.TestCase):
 
     def _manifest(self, td, case_extra):
         root = Path(td)
-        (root / "repo" / "skill").mkdir(parents=True)
-        (root / "repo" / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-        (root / "repo" / "evals").mkdir()
-        p = root / "repo" / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps({"version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"], "ablations": [],
-            "cases": [{"id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
-                       "assertions": [{"name": "a", "type": "contains", "value": "y"}], **case_extra}]}), encoding="utf-8")
+        p = make_eval_repo(root, cases=[{
+            "id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
+            "assertions": [{"name": "a", "type": "contains", "value": "y"}], **case_extra}])
         return root, p
 
-    def test_validate_rejects_non_string_canary(self):
-        with tempfile.TemporaryDirectory() as td:
-            _, p = self._manifest(td, {"canary": 123})
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(p)
-
-    def test_validate_rejects_non_string_released_at(self):
-        with tempfile.TemporaryDirectory() as td:
-            _, p = self._manifest(td, {"released_at": 123})
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(p)
+    def test_validate_rejects_non_string_canary_and_released_at(self):
+        for extra, message in (({"canary": 123}, "c: canary must be a non-empty string"),
+                               ({"released_at": 123}, "c: released_at must be a string")):
+            stderr = io.StringIO()
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as td, \
+                    contextlib.redirect_stderr(stderr):
+                _, p = self._manifest(td, extra)
+                with self.assertRaises(SystemExit):
+                    sb.validate_manifest(p)
+                self.assertIn(message, stderr.getvalue())
 
     def test_report_flags_canary_in_output_end_to_end(self):
         with tempfile.TemporaryDirectory() as td:
             root, p = self._manifest(td, {"canary": "ZZ-CANARY-99"})
             runs = root / "runs"
-            (runs / "c" / "with_skill").mkdir(parents=True)
-            (runs / "c" / "with_skill" / "output.md").write_text("here is the ZZ-CANARY-99 leaking", encoding="utf-8")
-            (runs / "c" / "without_skill").mkdir(parents=True)
-            (runs / "c" / "without_skill" / "output.md").write_text("clean output", encoding="utf-8")
+            write_run(runs / "c" / "with_skill", "here is the ZZ-CANARY-99 leaking")
+            write_run(runs / "c" / "without_skill", "clean output")
             report = sb.contamination_report(p, runs, split="tune")
         self.assertEqual(report["total_findings"], 1)
         self.assertEqual(report["cases"][0]["case_id"], "c")
@@ -736,14 +735,19 @@ class ContaminationPerimeterTests(unittest.TestCase):
 
 
 class ClosedManifestBoundaryTests(unittest.TestCase):
-    def _validate(self, case: dict, *, judge: dict | None = None):
+    def _validate(self, case: dict):
         manifest = base_manifest()
         manifest["cases"] = [case]
-        if judge is not None:
-            manifest["judge"] = judge
         with tempfile.TemporaryDirectory() as td:
             path = write_manifest(Path(td), manifest)
             return sb.validate_manifest(path)
+
+    def _dies(self, case: dict, message: str):
+        stderr = io.StringIO()
+        with self.subTest(case=case), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                self._validate(case)
+            self.assertIn(message, stderr.getvalue())
 
     def test_prompt_sources_are_mutually_exclusive(self):
         base = {
@@ -754,8 +758,7 @@ class ClosedManifestBoundaryTests(unittest.TestCase):
             {"prompt_ref": "private.txt"},
             {"turns": [{"prompt": "turn one"}]},
         ):
-            with self.assertRaises(SystemExit):
-                self._validate({**base, **second})
+            self._dies({**base, **second}, "prompt, prompt_ref, and turns are mutually exclusive")
 
     def test_turns_are_a_complete_prompt_source(self):
         case = {
@@ -767,55 +770,84 @@ class ClosedManifestBoundaryTests(unittest.TestCase):
         self.assertEqual(len(loaded["cases"][0]["turns"]), 2)
 
     def test_nested_qualitative_objects_are_closed(self):
-        assertions = [
-            {"name": "q", "type": "judge", "graded_dimensions": [
-                {"name": "quality", "rubric": "5 = good; 1 = bad", "rubirc": "typo"}
-            ]},
-            {"name": "q", "type": "judge", "dynamic_rubric": {
-                "instruction": "draft criteria", "minimum_criterai": 5,
-            }},
-        ]
-        for assertion in assertions:
-            case = {
-                "id": "case-1", "split": "tune", "prompt": "do it",
-                "assertions": [assertion],
-            }
-            with self.assertRaises(SystemExit):
-                self._validate(case)
+        for assertion, message in (
+            ({"name": "q", "type": "judge", "graded_dimensions": [
+                {"name": "quality", "rubric": "5 = good; 1 = bad", "rubirc": "typo"}]},
+             "graded_dimensions[0] has unknown field(s): rubirc"),
+            ({"name": "q", "type": "judge", "dynamic_rubric": {
+                "instruction": "draft criteria", "minimum_criterai": 5}},
+             "dynamic_rubric has unknown field(s): minimum_criterai"),
+        ):
+            self._dies({"id": "case-1", "split": "tune", "prompt": "do it",
+                        "assertions": [assertion]}, message)
 
-    def test_judge_panel_aliases_cannot_both_be_set(self):
-        case = {
-            "id": "case-1", "split": "tune", "prompt": "do it",
-            "assertions": [{"name": "a", "type": "contains", "value": "x"}],
-        }
-        with self.assertRaises(SystemExit):
-            self._validate(case, judge={"panel": ["a"], "models": ["b"]})
 
-    def test_judge_panel_models_must_be_unique(self):
-        case = {
-            "id": "case-1", "split": "tune", "prompt": "do it",
-            "assertions": [{"name": "a", "type": "contains", "value": "x"}],
-        }
-        with self.assertRaises(SystemExit):
-            self._validate(case, judge={"panel": ["same", "same"]})
+class ManifestJudgeBlockTests(unittest.TestCase):
+    """manifest.judge: the judge config slot (1.3), schema enforcement, and the
+    G3 panel surface that activates consensus with no CLI flag. One table owns
+    what validate accepts and rejects."""
+
+    PANEL = "must be a non-empty list of unique non-empty model-name strings"
+
+    def _validate(self, judge):
+        manifest = base_manifest() if judge is None else base_manifest(judge=judge)
+        with tempfile.TemporaryDirectory() as td:
+            return sb.validate_manifest(write_manifest(Path(td), manifest))
+
+    def test_valid_judge_blocks_are_accepted_unchanged(self):
+        for judge in (None, {"model": "judge-model-x"}, {"schema_enforcement": "report"},
+                      {"schema_enforcement": "strict"}, {"panel": ["m1", "m2"]},
+                      {"models": ["m1"]}):
+            with self.subTest(judge=judge):
+                self.assertEqual(self._validate(judge).get("judge"), judge)
+
+    def test_invalid_judge_blocks_are_rejected_by_their_guard(self):
+        for judge, message in (
+            ("judge-model-x", "manifest.judge must be an object"),
+            ({"model": 7}, "manifest.judge.model must be a non-empty string"),
+            ({"model": ""}, "manifest.judge.model must be a non-empty string"),
+            ({"schema_enforcement": "loose"},
+             'manifest.judge.schema_enforcement must be "report" or "strict"'),
+            ({"panel": []}, f"manifest.judge.panel {self.PANEL}"),
+            ({"panel": ["m1", 2]}, f"manifest.judge.panel {self.PANEL}"),
+            ({"panel": ["same", "same"]}, f"manifest.judge.panel {self.PANEL}"),
+            ({"models": "solo"}, f"manifest.judge.models {self.PANEL}"),
+            ({"models": [""]}, f"manifest.judge.models {self.PANEL}"),
+            ({"panel": ["a"], "models": ["b"]}, "manifest.judge may set panel or models, not both"),
+        ):
+            stderr = io.StringIO()
+            with self.subTest(judge=judge), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit):
+                    self._validate(judge)
+                self.assertIn(message, stderr.getvalue())
 
 
 class PerStepValidationTests(unittest.TestCase):
     """per_step is a judge-only assertion field: true, or an object whose only
     key is min_met_fraction in (0, 1]."""
 
-    def _validate(self, assertion):
+    def _validate(self, assertion, *, in_turn=False):
         if assertion.get("type") in sb.QUALITATIVE_ASSERTIONS and "severity" not in assertion:
             assertion = {**assertion, "severity": "gate"}
         manifest = base_manifest()
-        manifest["cases"][0]["assertions"] = [assertion]
+        case = manifest["cases"][0]
+        if in_turn:
+            # A turns case carries no case-level prompt: prompt and turns are
+            # mutually exclusive, and that guard would fire first.
+            case.pop("prompt")
+            case["turns"] = [{"prompt": "first", "assertions": [assertion]}]
+        else:
+            case["assertions"] = [assertion]
         with tempfile.TemporaryDirectory() as td:
             path = write_manifest(Path(td), manifest)
             return sb.validate_manifest(path)
 
-    def _dies(self, assertion):
-        with self.assertRaises(SystemExit):
-            self._validate(assertion)
+    def _dies(self, assertion, message, *, in_turn=False):
+        stderr = io.StringIO()
+        with self.subTest(assertion=assertion), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                self._validate(assertion, in_turn=in_turn)
+            self.assertIn(message, stderr.getvalue())
 
     def test_per_step_true_on_judge_validates(self):
         manifest = self._validate({"name": "steps", "type": "judge", "per_step": True})
@@ -826,30 +858,33 @@ class PerStepValidationTests(unittest.TestCase):
                         "per_step": {"min_met_fraction": 0.8}})
 
     def test_per_step_rejects_non_judge_assertions(self):
-        self._dies({"name": "a", "type": "contains", "value": "x", "per_step": True})
+        # Objective types reject it as an unknown field; the other qualitative
+        # types accept the field name and reach the judge-only guard.
+        self._dies({"name": "a", "type": "contains", "value": "x", "per_step": True},
+                   "assertion #0 has unknown field(s): per_step")
+        self._dies({"name": "r", "type": "rubric", "rubric": ["x"], "per_step": True},
+                   "assertion #0 per_step is only valid on judge assertions")
 
     def test_per_step_rejects_other_judge_shapes(self):
-        self._dies({"name": "steps", "type": "judge", "per_step": True,
-                    "dynamic_rubric": {"instruction": "draft criteria"}})
-        self._dies({"name": "steps", "type": "judge", "per_step": True,
-                    "graded_dimensions": [{"name": "d", "rubric": "anchored"}]})
+        for other in ({"dynamic_rubric": {"instruction": "draft criteria"}},
+                      {"graded_dimensions": [{"name": "d", "rubric": "anchored"}]}):
+            self._dies({"name": "steps", "type": "judge", "per_step": True, **other},
+                       "per_step cannot combine with graded_dimensions or dynamic_rubric")
 
     def test_per_step_rejects_malformed_shapes(self):
-        self._dies({"name": "steps", "type": "judge", "per_step": "yes"})
-        self._dies({"name": "steps", "type": "judge", "per_step": {}})
-        self._dies({"name": "steps", "type": "judge", "per_step": {"min_met_fraction": 0}})
-        self._dies({"name": "steps", "type": "judge", "per_step": {"min_met_fraction": 1.5}})
-        self._dies({"name": "steps", "type": "judge", "per_step": {"unknown": 1}})
+        for per_step, message in (
+            ("yes", "per_step must be true or an object with min_met_fraction"),
+            ({}, "per_step object must contain min_met_fraction"),
+            ({"min_met_fraction": 0}, "per_step.min_met_fraction must be a number in (0, 1]"),
+            ({"min_met_fraction": 1.5}, "per_step.min_met_fraction must be a number in (0, 1]"),
+            ({"unknown": 1}, "per_step has unknown field(s): unknown"),
+        ):
+            self._dies({"name": "steps", "type": "judge", "per_step": per_step}, message)
 
     def test_per_step_rejected_on_turn_assertion(self):
-        manifest = base_manifest()
-        manifest["cases"][0]["turns"] = [{
-            "prompt": "first", "assertions": [
-                {"name": "steps", "type": "judge", "per_step": True}]}]
-        with tempfile.TemporaryDirectory() as td:
-            path = write_manifest(Path(td), manifest)
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(path)
+        self._dies({"name": "steps", "type": "judge", "per_step": True},
+                   "turn #1 assertion #0 per_step is not supported in turn assertions",
+                   in_turn=True)
 
 
 if __name__ == "__main__":
