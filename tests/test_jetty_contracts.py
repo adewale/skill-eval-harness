@@ -387,26 +387,41 @@ class JettyBoundaryIntegrationTests(unittest.TestCase):
 
         self.assertEqual(replaced, {"one": "remote-I", "ten": "remote-J"})
 
-    def test_old_skill_variant_verifies_the_old_skill_upload_surface(self):
+    def test_mounted_skill_bytes_must_match_the_attested_skill_tree_hash(self):
+        # Each arm hashes the skill surface it mounts (old_skill mounts the old
+        # skill), and a harness hash that disagrees with those bytes is
+        # rejected before upload even when the task-contract digest agrees.
         with tempfile.TemporaryDirectory() as td:
             skill = Path(td) / "SKILL.md"
-            skill.write_text("old skill", encoding="utf-8")
-            files = [{
-                "role": "old_skill", "placeholder": "upload://old-skill",
-                "remote_path_hint": "skills/demo/SKILL.md",
-                "sandbox_path": "/app/assets/skills/demo/SKILL.md",
-                "local_path": str(skill),
-            }]
-            payload = jetty_payload(harness={
-                "variant": "old_skill", "skill_name": "demo",
-                "skill_tree_hash": sb.planned_file_surface_hash(
-                    files, role="old_skill", path_prefix="skills/demo/"),
-            }, files=files)
+            skill.write_text("skill bytes", encoding="utf-8")
+            for variant, role in (("with_skill", "skill"), ("old_skill", "old_skill")):
+                files = [{
+                    "role": role, "placeholder": f"upload://{role}",
+                    "remote_path_hint": "skills/demo/SKILL.md",
+                    "sandbox_path": "/app/assets/skills/demo/SKILL.md",
+                    "local_path": str(skill),
+                }]
+                mounted = sb.planned_file_surface_hash(
+                    files, role=role, path_prefix="skills/demo/")
+                for claimed, error in ((mounted, None), (
+                        "0" * 64, "Jetty skill bytes changed after payload attestation")):
+                    with self.subTest(variant=variant, matches=error is None):
+                        payload = jetty_payload(harness={
+                            "variant": variant, "skill_name": "demo",
+                            "skill_tree_hash": claimed,
+                        }, files=files)
+                        client = FakeJettyClient()
 
-            record = next(iter(
-                sb.execute_jetty_payloads([payload], client=FakeJettyClient())))
+                        record = next(iter(
+                            sb.execute_jetty_payloads([payload], client=client)))
 
-            self.assertEqual(record["status"], "completed")
+                        if error is None:
+                            self.assertEqual(record["status"], "completed")
+                            self.assertEqual(client.upload_calls, 1)
+                        else:
+                            self.assertEqual(record["status"], "failed")
+                            self.assertIn(error, record["error"])
+                            self.assertEqual(client.upload_calls, 0)
 
     def test_failed_trajectory_cannot_promote_partial_events_to_complete_operations(self):
         record = {
