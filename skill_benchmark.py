@@ -16877,6 +16877,23 @@ def build_trajectory_diff(results: list[dict[str, Any]]) -> dict[str, Any]:
     return observed
 
 
+def add_grading_options(parser: argparse.ArgumentParser) -> None:
+    """The options that change how runs are graded. Every command that grades
+    or rebuilds a benchmark takes the same set, so an aggregate or an export
+    can reproduce exactly the benchmark it summarizes."""
+    parser.add_argument("--judge-results", help="judge verdicts keyed by judge_task_id (JSONL/JSON); merges qualitative scoring")
+    parser.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
+    parser.add_argument("--strict", action="store_true", help="grading option, not a gate: promote soft-severity assertions to gates (roadmap 2.2)")
+    parser.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in; stdin {texts:[a,b]} -> stdout {embeddings:[[..],[..]]})")
+
+
+def grading_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The grading keyword arguments for build_benchmark_report from parsed options."""
+    return {"allow_scripts": bool(getattr(args, "allow_scripts", False)),
+            "strict": bool(getattr(args, "strict", False)),
+            "embed_cmd": getattr(args, "embed_cmd", None)}
+
+
 def build_benchmark_report(
     path: Path,
     runs: Path,
@@ -17153,7 +17170,7 @@ def benchmark(args: argparse.Namespace) -> int:
     min_lift = getattr(args, "min_lift", None)
     if min_lift is not None and not 0 < min_lift <= 1:
         die("--min-lift must be a pass-rate difference in (0, 1]")
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False), strict=getattr(args, "strict", False), embed_cmd=getattr(args, "embed_cmd", None), min_lift=min_lift)
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), **grading_options(args), min_lift=min_lift)
     emit_report(report, args.out)
     return 0
 
@@ -17326,7 +17343,7 @@ def aggregate(args: argparse.Namespace) -> int:
         runs = Path(args.runs_root) / repo_root.name / args.runs_subdir
         if args.runs:
             runs = Path(args.runs)
-        reports.append(build_benchmark_report(manifest_path, runs, args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False)))
+        reports.append(build_benchmark_report(manifest_path, runs, args.split, args.variant, getattr(args, "judge_results", None), **grading_options(args)))
 
     skill_names = [report.get("skill_name") for report in reports]
     if not all(isinstance(name, str) and name for name in skill_names):
@@ -17524,7 +17541,7 @@ def anthropic_benchmark_from_report(report: dict[str, Any], skill_path: str = ""
 
 
 def export_anthropic(args: argparse.Namespace) -> int:
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), allow_scripts=getattr(args, "allow_scripts", False))
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), **grading_options(args))
     benchmark = anthropic_benchmark_from_report(report, args.skill_path or "")
     emit_report(benchmark, args.out)
     return 0
@@ -20883,10 +20900,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--variant", action="append")
     p.add_argument("--out")
     p.add_argument("--judge-tasks")
-    p.add_argument("--judge-results", help="JSONL/JSON results keyed by judge_task_id; merges qualitative scoring")
-    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
-    p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
-    p.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in; stdin {texts:[a,b]} -> stdout {embeddings:[[..],[..]]})")
+    add_grading_options(p)
     p.add_argument("--write-grading-files", action="store_true", help="write Anthropic-compatible grading.json files into each run directory")
 
     p = sub.add_parser("judge")
@@ -20912,10 +20926,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True)
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
-    p.add_argument("--judge-results", help="merge qualitative judge scoring into combined pass rates")
-    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest")
-    p.add_argument("--strict", action="store_true", help="promote soft-severity assertions to gates (roadmap 2.2)")
-    p.add_argument("--embed-cmd", help="external embedding command enabling similarity mode=embedding (opt-in)")
+    add_grading_options(p)
     p.add_argument("--min-lift", type=float, help="smallest pass-rate lift you would act on (e.g. 0.1); the noise check reports whether the eval can resolve it")
     p.add_argument("--out")
 
@@ -20967,8 +20978,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True)
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
-    p.add_argument("--judge-results")
-    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from the manifest before exporting")
+    add_grading_options(p)
     p.add_argument("--skill-path", default="")
     p.add_argument("--out")
 
@@ -21083,8 +21093,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", help="Use one explicit runs dir for all manifests")
     p.add_argument("--split", choices=sorted(VALID_SPLITS))
     p.add_argument("--variant", action="append")
-    p.add_argument("--judge-results")
-    p.add_argument("--allow-scripts", action="store_true", help="execute script assertions from manifests while aggregating")
+    add_grading_options(p)
     p.add_argument("--out")
 
     p = sub.add_parser("suite-run", help="Run an explicit allowlisted suite preflight/tier and write RUN_SCOPE.json")
