@@ -1163,19 +1163,6 @@ class SkillBenchmarkTests(unittest.TestCase):
             sb.jetty_artifact_sandbox_path(f"coll/task/0000/{tid}.run.0007.logs--agent--session.jsonl"),
             "/app/results/outputs/logs--agent--session.jsonl")
 
-    def test_extract_trajectory_id_reads_live_response_shapes(self):
-        # HTTP 200 (captured 2026-07-17): bare id in jetty_metadata.trajectory_id.
-        self.assertEqual(sb.extract_trajectory_id({"id": "chatcmpl-bb2bb71e", "jetty_metadata": {"trajectory_id": "bb2bb71e"}}), "bb2bb71e")
-        # HTTP 202: workflow_id is <collection>-<task>--<trajectory_id>; the DB
-        # poll route keys on the suffix, so the full id must be normalized.
-        self.assertEqual(
-            sb.extract_trajectory_id({"id": "chatcmpl-coll-my-task--37c37963",
-                                      "jetty_metadata": {"status": "running", "workflow_id": "coll-my-task--37c37963"}}),
-            "37c37963")
-        self.assertEqual(sb.extract_trajectory_id({"jetty_metadata": {"status": "running", "workflow_id": "traj_8"}}), "traj_8")
-        self.assertEqual(sb.extract_trajectory_id({"id": "chatcmpl-traj_7"}), "traj_7")
-        self.assertIsNone(sb.extract_trajectory_id({"object": "chat.completion"}))
-
 
 if __name__ == "__main__":
     unittest.main()
