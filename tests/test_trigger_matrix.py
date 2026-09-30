@@ -636,8 +636,26 @@ class ClaudeDetectionTests(unittest.TestCase):
         self.assertTrue(detection.triggered)
 
     def test_max_turns_is_a_completed_observation_window(self):
-        self.assertEqual(tm.ClaudeAdapter._result_subtype(
-            json.dumps({"type": "result", "subtype": "error_max_turns"})), "error_max_turns")
+        # Hitting --max-turns exits 1, but the model had its whole window to
+        # load the skill, so a no-trigger here is a valid negative observation.
+        stdout = "\n".join([
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Still thinking."}]}}),
+            json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": True}),
+        ]) + "\n"
+
+        def fake_run(*args, **kwargs):
+            return InvocationOutcome.from_process(
+                stdout=stdout, stderr="", returncode=1, elapsed_ms=3)
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)), \
+             mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
+            result = tm.ClaudeAdapter().invoke("q", "haiku", Path(td), 1)
+        self.assertIs(result.state, InvocationState.COMPLETE)
+        self.assertTrue(result.observation_complete)
+        self.assertIsNone(result.provider_error)
+        self.assertEqual(result.returncode, 1)
 
     def test_max_turns_subtype_does_not_reclassify_timeout_or_spawn_failure(self):
         stdout = json.dumps({"type": "result", "subtype": "error_max_turns"})
@@ -733,21 +751,51 @@ class ClaudeDetectionTests(unittest.TestCase):
 class CodexAdapterTests(unittest.TestCase):
     """Codex trigger support without a live codex binary."""
 
-    def test_codex_is_registered_and_declares_matrix_capability(self):
-        self.assertIn("codex", tm.ADAPTERS)
-        cap = tm.matrix_capabilities()["codex"]
-        self.assertTrue(cap.autonomous_trigger)
-        self.assertTrue(cap.trigger_ablation)
-        parser = tm.build_arg_parser()
-        agent_action = next(a for a in parser._actions if "--agent" in getattr(a, "option_strings", ()))
-        self.assertIn("codex", agent_action.choices)
+    def test_codex_completed_read_of_the_mounted_skill_is_a_trigger(self):
+        # `codex exec --json` reports a finished shell command as an
+        # item.completed command_execution; reading the SKILL.md mounted under
+        # the isolated $CODEX_HOME/skills and then ending the turn is load evidence.
+        def fake_run(plan):
+            argv = list(plan.argv)
+            skills_dir = Path(argv[argv.index("--add-dir") + 1])
+            skill_md = next(skills_dir.glob("*/SKILL.md"))
+            command = f"bash -lc 'cat {skill_md}'"
+            stream = [
+                {"type": "thread.started", "thread_id": "t"},
+                {"type": "turn.started"},
+                {"type": "item.completed", "item": {
+                    "id": "item_0", "type": "command_execution", "command": command,
+                    "aggregated_output": skill_md.read_text(encoding="utf-8"),
+                    "exit_code": 0, "status": "completed"}},
+                {"type": "item.completed", "item": {
+                    "id": "item_1", "type": "agent_message", "text": "Reviewed."}},
+                {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}},
+            ]
+            return InvocationOutcome.from_process(
+                stdout="".join(json.dumps(record) + "\n" for record in stream),
+                stderr="", returncode=0, elapsed_ms=1)
 
-    def test_codex_uses_shared_path_evidence_detector(self):
+        should_fire = [row for row in demo_trigger_rows() if row["should_trigger"]]
+        with mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
+            report = tm.run_matrix(DEMO_MANIFEST, should_fire, agents=["codex"], models=[None],
+                                   runs_per_query=1, timeout=30, workers=1)
+        (row,) = report["results"]
+        self.assertTrue(row["observation_complete"])
+        self.assertTrue(row["triggered"])
+        self.assertTrue(row["pass"])
+        self.assertEqual(len(row["evidence"]), 1)
+        self.assertRegex(row["evidence"][0], r"^bash -lc 'cat .*-codex-home/skills/.*/SKILL\.md'$")
+
+    def test_codex_statusless_command_is_not_load_evidence(self):
+        # Without a completion status the command may never have run.
         mounted = Path("/tmp/trigger-x/.codex/skills/demo-reviewer/SKILL.md")
         stream = json.dumps({"type": "command", "command": ["bash", "-lc", f"cat {mounted}"]})
         detection = tm.CodexAdapter().detect(completed_invocation(stream), ["demo-reviewer"], [mounted])
         self.assertFalse(detection.triggered)
         self.assertFalse(detection.evidence)
+
+    def test_codex_skill_name_in_prose_is_not_load_evidence(self):
+        mounted = Path("/tmp/trigger-x/.codex/skills/demo-reviewer/SKILL.md")
         prose = json.dumps({"type": "message", "content": "I would use demo-reviewer."})
         self.assertFalse(tm.CodexAdapter().detect(completed_invocation(prose), ["demo-reviewer"], [mounted]).triggered)
 
