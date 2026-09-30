@@ -577,31 +577,34 @@ class OTelNormalizationTests(unittest.TestCase):
         self.assertTrue(r["passed"])
 
 
-class D1_FailureMarkerOwnerTests(unittest.TestCase):
-    """The failure-body prefixes that runners WRITE are the same constants the
-    detector READS — so a renamed marker can't slip a crashed run past scoring."""
+class FailureMarkerOwnerTests(unittest.TestCase):
+    """The failure bodies runners WRITE are rejected by the scorer on their text
+    alone, for every provider the backend registry binds a marker to — so a
+    marker the detector forgets can't slip a crashed run past scoring."""
 
-    def test_writer_constants_are_exactly_the_detector_markers(self):
-        import ablation_model as am
-        self.assertEqual(
-            am.RUNNER_FAILURE_MARKERS[:4],
-            (am.CODEX_FAILURE, am.JETTY_FAILURE, am.CLAUDE_FAILURE,
-             am.VIBE_FAILURE),
-        )
-        self.assertEqual(am.RUNNER_FAILURE_MARKERS[-1], am.TIMEOUT_FAILURE)
-        self.assertEqual(
-            set(am.RUNNER_FAILURE_MARKERS[:-1]),
-            set(am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values()),
-        )
-        self.assertEqual(
-            len(am.RUNNER_FAILURE_MARKERS[:-1]),
-            len(set(am.RUNNER_FAILURE_MARKERS[:-1])),
-        )
-
-    def test_each_formatted_failure_body_is_non_executable(self):
-        import ablation_model as am
-        for marker in am.RUNNER_FAILURE_MARKERS:
-            self.assertFalse(am.execution_valid({}, f"{marker}: something broke]\n"))
+    def test_every_provider_failure_body_is_non_executable(self):
+        for provider, marker in am.RUNNER_FAILURE_MARKER_BY_PROVIDER.items():
+            outcomes = {
+                "spawn": am.RunnerOutcome(provider=provider, returncode=127,
+                                          invocation_state="spawn_failed", error="not found"),
+                "returncode": am.RunnerOutcome(provider=provider, answer="partial answer",
+                                               returncode=2, stderr="boom"),
+            }
+            for shape, outcome in outcomes.items():
+                with self.subTest(provider=provider, shape=shape), tempfile.TemporaryDirectory() as td:
+                    base = Path(td) / "run"
+                    sb.write_runner_outcome(base, outcome)
+                    body = (base / "output.md").read_text(encoding="utf-8")
+                    self.assertTrue(body.startswith(f"{marker}: "), body)
+                    self.assertFalse(am.execution_valid({}, body))
+                    self.assertFalse(am.execution_valid({}, "\n  " + body))
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            sb.write_runner_outcome(base, am.RunnerOutcome(
+                provider="codex", timed_out=True, error="wall clock exceeded"))
+            body = (base / "output.md").read_text(encoding="utf-8")
+        self.assertTrue(body.startswith(f"{am.TIMEOUT_FAILURE}: "), body)
+        self.assertFalse(am.execution_valid({}, body))
 
 
 class R3_WithoutSkillCarriesNoSkillTests(unittest.TestCase):
