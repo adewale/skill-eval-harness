@@ -551,7 +551,10 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertEqual(records[0]["lifecycle"]["kind"], "protocol_invalid")
             self.assertIn("non-executable", records[0]["error"])
 
-    def test_pi_smoke_workspace_omits_skill_for_without_skill(self):
+    def test_pi_smoke_command_line_points_only_at_workspace_copies(self):
+        # CF.2 proves what each pi-smoke workspace holds; this owns what the pi
+        # invocation is handed: --no-skills without the skill, and --skill
+        # paths and input files that resolve inside the workspace, never the repo.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = self.make_manifest(root)
@@ -560,20 +563,20 @@ class SkillBenchmarkTests(unittest.TestCase):
             fixture.parent.mkdir()
             fixture.write_text("fixture", encoding="utf-8")
             data = json.loads(manifest.read_text(encoding="utf-8"))
-            data["cases"][0]["files"] = ["fixtures/input.txt"]
-            with tempfile.TemporaryDirectory() as wd:
-                instruction, skill_args, inputs, skill_paths, _ = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "without_skill", Path(wd))
-                self.assertEqual(skill_args, ["--no-skills"])
-                self.assertEqual(skill_paths, [])
-                self.assertEqual(len(inputs), 1)
-                self.assertTrue(str(inputs[0]).startswith(str(Path(wd).resolve())))
-                self.assertFalse((Path(wd) / "skills").exists())
-                self.assertIn("not present", instruction)
-            with tempfile.TemporaryDirectory() as wd:
-                _, skill_args, _, skill_paths, _ = smoke.materialize_runtime_workspace(data, repo, data["cases"][0], "with_skill", Path(wd))
-                self.assertTrue(skill_paths)
-                self.assertIn("--skill", skill_args)
-                self.assertTrue(all(str(p.resolve()).startswith(str(Path(wd).resolve())) for p in skill_paths))
+            case = {**data["cases"][0], "files": ["fixtures/input.txt"]}
+            for variant in ("without_skill", "with_skill"):
+                with self.subTest(variant=variant), tempfile.TemporaryDirectory() as wd:
+                    ws = Path(wd).resolve()
+                    _, skill_args, inputs, _, _ = smoke.materialize_runtime_workspace(
+                        data, repo, case, variant, ws)
+                    if variant == "without_skill":
+                        self.assertEqual(skill_args, ["--no-skills"])
+                    else:
+                        self.assertEqual(skill_args[0::2], ["--skill"] * len(data["skill_paths"]))
+                        for path in skill_args[1::2]:
+                            self.assertTrue(Path(path).resolve().is_relative_to(ws), path)
+                    self.assertEqual([Path(p).resolve() for p in inputs],
+                                     [ws / "inputs" / "fixtures" / "input.txt"])
 
     def test_pi_trigger_trace_artifact_writer_uses_detector_evidence(self):
         with tempfile.TemporaryDirectory() as td:
