@@ -44,6 +44,7 @@ from json_contracts import freeze_json_value
 from manifest_contracts import (
     CaseId,
     CaseKind,
+    CasePopulation,
     ExecutionVariant,
     RunNumber,
     Split,
@@ -260,9 +261,6 @@ class AblationMode(str, Enum):
     INSTRUCTION_SIMULATED = "instruction_simulated"
 
 
-class Population(str, Enum):
-    ANSWER = "answer"
-    TRIGGER = "trigger"
 
 
 class ComponentClass(str, Enum):
@@ -345,11 +343,11 @@ class Component:
                    removed_bytes=rb)
 
 
-def _component_population(components: tuple[Component, ...], label: str) -> Population:
+def _component_population(components: tuple[Component, ...], label: str) -> CasePopulation:
     classes = {component.cls for component in components}
     if ComponentClass.DISCOVERY in classes and classes != {ComponentClass.DISCOVERY}:
         raise ValueError(f"{label} cannot mix discovery and answer-population components")
-    return Population.TRIGGER if classes == {ComponentClass.DISCOVERY} else Population.ANSWER
+    return CasePopulation.TRIGGER if classes == {ComponentClass.DISCOVERY} else CasePopulation.ANSWER
 
 
 @dataclass(frozen=True)
@@ -361,7 +359,7 @@ class Provenance:
 
     id: str
     mode: AblationMode
-    population: Population
+    population: CasePopulation
     identity: TreeIdentity
     components: tuple[Component, ...]
 
@@ -369,7 +367,7 @@ class Provenance:
         object.__setattr__(self, "id", _nonempty_identifier(self.id, "Provenance.id", slug=True))
         try:
             mode = AblationMode(self.mode)
-            population = Population(self.population)
+            population = CasePopulation(self.population)
         except ValueError as exc:
             raise ValueError(f"Provenance has unknown mode/population: {exc}") from exc
         if mode not in {AblationMode.MATERIALIZED, AblationMode.INVALID_SKILL}:
@@ -428,14 +426,14 @@ class ExpectedProvenance:
 
     id: str
     mode: AblationMode
-    population: Population
+    population: CasePopulation
     components: tuple[Component, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _nonempty_identifier(self.id, "ExpectedProvenance.id", slug=True))
         try:
             mode = AblationMode(self.mode)
-            population = Population(self.population)
+            population = CasePopulation(self.population)
         except ValueError as exc:
             raise ValueError(f"ExpectedProvenance has unknown mode/population: {exc}") from exc
         if mode not in {AblationMode.MATERIALIZED, AblationMode.INVALID_SKILL}:
@@ -458,7 +456,7 @@ class InstructionSimulated:
     longer drift apart one hand-built key at a time."""
 
     id: str
-    population: Population
+    population: CasePopulation
     removed_component: str | None = None
     expected_regressions: tuple[str, ...] = ()
 
@@ -467,10 +465,10 @@ class InstructionSimulated:
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _nonempty_identifier(self.id, "InstructionSimulated.id", slug=True))
         try:
-            population = Population(self.population)
+            population = CasePopulation(self.population)
         except ValueError as exc:
             raise ValueError(f"InstructionSimulated has unknown population: {exc}") from exc
-        if population is not Population.ANSWER:
+        if population is not CasePopulation.ANSWER:
             raise ValueError("InstructionSimulated is only valid for the answer population")
         object.__setattr__(self, "population", population)
         if self.removed_component is not None and (
@@ -722,7 +720,7 @@ class PreparedTask:
         if self.is_ablation:
             if self.ablation is None or self.ablation.id != ablation_id_of(self.variant_truth):
                 raise ValueError("ablation task requires a matching typed ablation record")
-            if self.ablation.population is not Population.ANSWER:
+            if self.ablation.population is not CasePopulation.ANSWER:
                 raise ValueError("answer task cannot carry trigger-population ablation provenance")
             if isinstance(self.ablation, Provenance):
                 if not self.skill_paths:

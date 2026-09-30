@@ -82,7 +82,6 @@ from ablation_model import (
     MaterializedArm,
     Mechanism,
     OutcomeContext,
-    Population,
     PreparedTask,
     PreparedTaskDraft,
     Provenance,
@@ -1756,7 +1755,7 @@ def prepared_task_rows(
                     # Instruction-simulated: no tree, original skill mounted; its typed
                     # record is the sibling InstructionSimulated, not a Provenance.
                     record = InstructionSimulated(
-                        id=aid, population=Population(population))
+                        id=aid, population=CasePopulation(population))
             for run_number in range(1, runs_per_variant + 1):
                 for model in model_list:
                     prefix = f"{case['id']}/{model}" if (model and multi_model) else case["id"]
@@ -2948,7 +2947,7 @@ class ValidatedAblation:
     manifest: dict[str, Any]
     ablation: dict[str, Any]
     components: tuple[dict[str, Any], ...]
-    population: Population
+    population: CasePopulation
 
     @classmethod
     def validate(cls, repo_root: Path, manifest: dict[str, Any], ablation: dict[str, Any]) -> ValidatedAblation:
@@ -2957,7 +2956,7 @@ class ValidatedAblation:
             raise AblationError(f"ablation {ablation.get('id')!r} declares no removal (instruction-simulated)")
         validate_ablation_removal(ablation, manifest)
         _reject_overlapping_skill_roots(repo_root, manifest)
-        population = Population(derived_population(comps))   # runs the layer-cohesion gate
+        population = CasePopulation(derived_population(comps))   # runs the layer-cohesion gate
         return cls(repo_root=repo_root, manifest=manifest, ablation=ablation, components=tuple(comps), population=population)
 
 
@@ -3069,7 +3068,7 @@ def expected_provenance_for_ablation(
         id=ablation_id,
         mode=(AblationMode.INVALID_SKILL if ablation.get("invalid_skill")
               else AblationMode.MATERIALIZED),
-        population=Population(derived_population(components)),
+        population=CasePopulation(derived_population(components)),
         components=tuple(
             _expected_component(component, skill_paths)
             for component in components),
@@ -14950,7 +14949,7 @@ def build_trigger_comparison(baseline: dict[str, Any], ablation: dict[str, Any])
         if prov.id != ablation.get("ablation"):
             reasons.append(
                 f"ablation report id {ablation.get('ablation')!r} does not match provenance id {prov.id!r}")
-        if prov.population is not Population.TRIGGER:
+        if prov.population is not CasePopulation.TRIGGER:
             reasons.append("ablation provenance is not trigger-population")
         if base_hash and prov.identity.canonical != base_hash:
             reasons.append("ablation parent_skill_hash does not match the baseline skill_tree_hash: "
@@ -15789,7 +15788,7 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
         expected_prov = ExpectedProvenance(
             id=aid,
             mode=AblationMode.INVALID_SKILL if invalid else AblationMode.MATERIALIZED,
-            population=Population(expected_pop),
+            population=CasePopulation(expected_pop),
             components=tuple(_expected_component(c, manifest.get("skill_paths", [])) for c in ablation_components(ablation)),
         )
         prov_ok, prov_note = _verify_recorded_ablation_provenance(

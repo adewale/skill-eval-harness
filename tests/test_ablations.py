@@ -25,6 +25,7 @@ import ablation_model as am
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
 import skill_benchmark as sb
+from manifest_contracts import CasePopulation
 
 ROOT = Path(__file__).resolve().parents[1]
 smoke = load_example_module("run_pi_smoke", "examples/adewale-workspace/run_pi_smoke.py")
@@ -2268,7 +2269,7 @@ class ValidatedAblationTests(unittest.TestCase):
             manifest = sb.validate_manifest(p)
             repo_root = sb.repo_root_for_manifest(p)
             validated = sb.ValidatedAblation.validate(repo_root, manifest, SECTION_ABL)
-            self.assertIs(validated.population, am.Population.ANSWER)
+            self.assertIs(validated.population, CasePopulation.ANSWER)
             ma = sb.materialize(validated, root / "out")
             self.assertIsInstance(ma, am.MaterializedArm)
             self.assertTrue(ma.arm.identity.is_edited)             # a real edit happened
