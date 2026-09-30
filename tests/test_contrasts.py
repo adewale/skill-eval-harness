@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import attest_answer_design, demo_manifest, write_demo_manifest
+from helpers import (
+    attest_answer_design,
+    demo_manifest,
+    result_row,
+    write_demo_manifest,
+    write_run,
+)
 
 import experimental_pairs as ep
 import skill_benchmark as sb
@@ -100,6 +106,74 @@ class TokenOverheadPairingTests(unittest.TestCase):
         self.assertEqual(ep.contrast_for("with_skill", "ablation:x").contrast_id, "ablation:x")
         with self.assertRaisesRegex(ValueError, "no declared contrast"):
             ep.contrast_for("without_skill", "with_skill")
+
+
+class EditContrastTests(unittest.TestCase):
+    """did-my-skill-edit-regress: the edit's effect from one run, not two."""
+
+    def rows(self, rates):
+        out = []
+        for index, (current, previous) in enumerate(rates):
+            case = f"c{index}"
+            out.append(result_row(case, "with_skill", rate=current, run_number=1))
+            out.append(result_row(case, "old_skill", rate=previous, run_number=1))
+            out.append(result_row(case, "without_skill", rate=0.0, run_number=1))
+        return out
+
+    def test_the_edit_is_paired_against_the_previous_revision(self):
+        summary = sb.paired_edit_summary(self.rows([(0.0, 1.0)] * 6 + [(1.0, 1.0)]))
+        self.assertEqual(summary["contrast_id"], "skill_edit")
+        self.assertEqual(summary["availability"], "complete")
+        self.assertAlmostEqual(summary["delta"], -6 / 7)
+        self.assertTrue(summary["significance"]["significant_at_0_05"])
+        self.assertLess(summary["interval"]["upper"], 0)
+        self.assertEqual(len(summary["regressed_cases"]), 6)
+        self.assertEqual(summary["regressed_cases"][0]["previous"], 1.0)
+        # without_skill rows are not part of this contrast.
+        self.assertEqual(summary["pairing"]["eligible_pairs"], 7)
+
+    def test_no_old_skill_arm_means_no_edit_summary(self):
+        rows = [row for row in self.rows([(1.0, 0.0)]) if row["variant"] != "old_skill"]
+        self.assertIsNone(sb.paired_edit_summary(rows))
+
+    def test_a_missing_previous_arm_is_named(self):
+        rows = self.rows([(1.0, 1.0)] * 2)
+        rows = [row for row in rows if not (row["case_id"] == "c1" and row["variant"] == "old_skill")]
+        rows.append(result_row("c9", "old_skill", rate=1.0, run_number=1))
+        summary = sb.paired_edit_summary(rows)
+        self.assertEqual(summary["availability"], "partial")
+        self.assertEqual(summary["pairing"]["blocked_reason_counts"],
+                         {"missing_old_skill": 1, "missing_with_skill": 1})
+        # A partial comparison withholds its headline, as paired_summary does.
+        self.assertIsNone(summary["delta"])
+        self.assertEqual(summary["observed_delta"], 0.0)
+        self.assertEqual(summary["significance"]["reason"], "incomplete_pairing")
+
+    def test_benchmark_reports_the_edit_when_the_old_skill_arm_ran(self):
+        cases = [{"id": f"c{i}", "split": "tune", "kind": "behavior", "prompt": "Do it.",
+                  "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}]}
+                 for i in range(2)]
+        manifest = demo_manifest(cases=cases, old_skill_paths=["old/SKILL.md"],
+                                 optional_variants=["old_skill"])
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_demo_manifest(root, manifest)
+            (root / "repo" / "old").mkdir()
+            (root / "repo" / "old" / "SKILL.md").write_text(
+                "---\nname: demo\ndescription: Old\n---\n", encoding="utf-8")
+            runs = root / "runs"
+            for case, current in (("c0", "beta"), ("c1", "alpha")):
+                write_run(runs / case / "with_skill", current)
+                write_run(runs / case / "old_skill", "alpha")
+                write_run(runs / case / "without_skill", "none")
+            arms = ["with_skill", "without_skill", "old_skill"]
+            attest_answer_design(path, runs, variants=arms)
+            edit = sb.build_benchmark_report(path, runs, variants_arg=arms)["paired_edit_summary"]
+            plain = sb.build_benchmark_report(path, runs)
+        self.assertEqual(edit["delta"], -0.5)
+        self.assertEqual([case["case_id"] for case in edit["regressed_cases"]], ["c0"])
+        # Without the old arm selected, the report carries no edit block at all.
+        self.assertNotIn("paired_edit_summary", plain)
 
 
 if __name__ == "__main__":

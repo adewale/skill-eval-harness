@@ -354,8 +354,8 @@ of the `grade` command. Before arithmetic,
 requires one eligible treatment and control arm from an explicit `ContrastSpec`. The default
 skill-presence contrast maps to the existing `with_skill`/`without_skill` wire rows; ablation
 confirmation pairs `with_skill` with `ablation:<id>` under the contrast `ablation:<id>` (a missing
-arm blocks as `missing_ablation:<id>`), and `EDIT_CONTRAST` declares `with_skill` against
-`old_skill` for a same-run edit comparison. `contrast_for` returns the declared contrast for a pair
+arm blocks as `missing_ablation:<id>`), and `EDIT_CONTRAST` pairs `with_skill` against
+`old_skill` for `paired_edit_summary`, the same-run edit comparison. `contrast_for` returns the declared contrast for a pair
 of arms and refuses any other pairing, so an arm is never relabelled into another arm's slot. Each
 contrast names its `held_fixed` factors (today `HeldFixedFactor.EFFORT`), and
 `ContrastSpec.comparability` blocks a pair whose arms differ on one.

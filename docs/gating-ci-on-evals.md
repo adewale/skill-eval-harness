@@ -176,8 +176,9 @@ blow its budget — the operational half of the same gate.
   lift against zero, not against the last run's lift. To compare two versions of the
   skill, run the old one as an `old_skill` arm in the same run (`old_skill_paths` in
   the manifest, `prepare --include-old-skill`), so both versions answer the same cases
-  under the same conditions and sit side by side in the report's per-variant
-  `summary`; the harness runs no significance test between those two arms. To test a
+  under the same conditions. Grade with `--variant old_skill` beside the two default
+  arms and the report's `paired_edit_summary` pairs the versions case by case, with
+  the same significance test, interval, and noise check as the lift. To test a
   named component, read `ablation_regressions`, which compares each ablation arm with
   `with_skill` and confirms an expected regression only when a named assertion flips.
   Gate on *confirmed* regressions, not on a one-run dip; an ablation cohort needs at

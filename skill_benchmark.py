@@ -15223,7 +15223,9 @@ def build_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
     return {"by_case_variant": by_case_variant, "by_variant": by_variant_summary}
 
 
-def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> _ResultPairConstruction:
+def _metric_pair_construction(results: list[dict[str, Any]], key: str, *,
+                              contrast: pair_domain.ContrastSpec = pair_domain.SKILL_PRESENCE_CONTRAST,
+                              ) -> _ResultPairConstruction:
     def eligibility(row: Mapping[str, Any]) -> tuple[bool, str | None]:
         if not scorable_run(row):
             return False, "unscorable_arm"
@@ -15237,12 +15239,16 @@ def _metric_pair_construction(results: list[dict[str, Any]], key: str) -> _Resul
         results,
         population=pair_domain.ExperimentalPopulation.ANSWER,
         eligibility=eligibility,
+        contrast=contrast,
     )
 
 
-def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pass_rate") -> tuple[list[float], list[float], list[dict[str, Any]]]:
-    """Per-case rates computed only from validated repetition-level pairs."""
-    construction = _metric_pair_construction(results, key)
+def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pass_rate",
+                      contrast: pair_domain.ContrastSpec = pair_domain.SKILL_PRESENCE_CONTRAST,
+                      ) -> tuple[list[float], list[float], list[dict[str, Any]]]:
+    """Per-case treatment and control rates from validated repetition-level
+    pairs under ``contrast`` (skill presence unless another is named)."""
+    construction = _metric_pair_construction(results, key, contrast=contrast)
     grouped: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in construction.pairs:
         grouped[pair.key.case_id].append(pair)
@@ -15250,8 +15256,8 @@ def paired_case_rates(results: list[dict[str, Any]], *, key: str = "objective_pa
     paired_without_rates: list[float] = []
     negative_cases: list[dict[str, Any]] = []
     for case_id, pairs in sorted(grouped.items()):
-        w = statistics.mean(float(pair.with_skill.payload[key]) for pair in pairs)
-        n = statistics.mean(float(pair.without_skill.payload[key]) for pair in pairs)
+        w = statistics.mean(float(pair.treatment.payload[key]) for pair in pairs)
+        n = statistics.mean(float(pair.control.payload[key]) for pair in pairs)
         paired_with_rates.append(w)
         paired_without_rates.append(n)
         if w < n:
@@ -15307,8 +15313,14 @@ PAIR_HEADLINE_FIELDS = (
 )
 
 
+EDIT_HEADLINE_FIELDS = (
+    "current_objective_pass_rate", "previous_objective_pass_rate", "delta",
+)
+
+
 def pairing_aware_block(block: dict[str, Any],
-                        construction: _ResultPairConstruction) -> dict[str, Any]:
+                        construction: _ResultPairConstruction, *,
+                        headline_fields: tuple[str, ...] = PAIR_HEADLINE_FIELDS) -> dict[str, Any]:
     """Make subset-only lift explicitly diagnostic when any identity is blocked."""
     out = dict(block)
     out["pairing"] = construction.diagnostics()
@@ -15316,7 +15328,7 @@ def pairing_aware_block(block: dict[str, Any],
         out["availability"] = "complete"
         return out
     out["availability"] = "partial"
-    for key in PAIR_HEADLINE_FIELDS:
+    for key in headline_fields:
         out[f"observed_{key}"] = out.get(key)
         out[key] = None
     out["observed_significance"] = out.get("significance")
@@ -15329,6 +15341,51 @@ def pairing_aware_block(block: dict[str, Any],
             out[f"observed_{key}"] = out[key]
             out[key] = {"availability": "unavailable", "reason": "incomplete_pairing"}
     return out
+
+
+def paired_edit_summary(results: list[dict[str, Any]], *, min_lift: float | None = None) -> dict[str, Any] | None:
+    """The current skill against the revision it replaces, paired within one run.
+
+    Comparing iteration N with N+1 across two runs mixes the edit with
+    everything else that changed between them (CLI version, provider, cache).
+    An old_skill arm in the same run pairs case by case under EDIT_CONTRAST,
+    with effort held fixed, so the delta is the edit's. Pairs are per (case,
+    model), pooled as paired_summary pools them. Returns None when the run has
+    no old_skill arm.
+    """
+    contrast = pair_domain.EDIT_CONTRAST
+    if not any(row.get("variant") == contrast.control_arm for row in results):
+        return None
+    models = sorted({str(r.get("model")) for r in results if r.get("model")})
+    unlabeled = [r for r in results if not r.get("model")]
+    pools: list[tuple[str | None, list[dict[str, Any]]]] = [
+        (model, [r for r in results if str(r.get("model")) == model]) for model in models]
+    if unlabeled or not models:
+        pools.append((None, unlabeled if models else results))
+    current: list[float] = []
+    previous: list[float] = []
+    regressed: list[dict[str, Any]] = []
+    for model, rows in pools:
+        w, n, neg = paired_case_rates(rows, contrast=contrast)
+        current.extend(w)
+        previous.extend(n)
+        for item in neg:
+            entry = {"case_id": item["case_id"], "current": item["with_skill"],
+                     "previous": item["without_skill"], "delta": item["delta"]}
+            regressed.append({**entry, "model": model} if model else entry)
+    deltas = [w - n for w, n in zip(current, previous)]
+    block = {
+        "contrast_id": contrast.contrast_id,
+        "current_objective_pass_rate": statistics.mean(current) if current else None,
+        "previous_objective_pass_rate": statistics.mean(previous) if previous else None,
+        "delta": statistics.mean(deltas) if deltas else None,
+        **Estimate.from_deltas(deltas, unit=InferenceUnit.CASE,
+                               without_rates=previous, min_lift=min_lift).blocks(),
+        "regressed_cases": regressed,
+    }
+    return pairing_aware_block(
+        block, _metric_pair_construction(results, "objective_pass_rate", contrast=contrast),
+        headline_fields=EDIT_HEADLINE_FIELDS)
 
 
 def build_paired_summary(results: list[dict[str, Any]], *, min_lift: float | None = None) -> dict[str, Any]:
@@ -17141,6 +17198,9 @@ def build_benchmark_report(
         # so a rubric the skill could see never inflates the held-out number.
         "qualitative_by_visibility": qualitative_surface,
         "paired_summary": paired_summary,
+        # The edit's own effect when the run carries an old_skill arm.
+        **({"paired_edit_summary": edit_summary}
+           if (edit_summary := paired_edit_summary(results, min_lift=min_lift)) is not None else {}),
         # 5: pass@k / pass^k per (case, variant) from the repeated-run data, plus a
         # pooled per-variant reliability headline. Uses the unbiased estimator.
         "reliability": reliability,

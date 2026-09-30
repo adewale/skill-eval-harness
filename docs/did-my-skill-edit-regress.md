@@ -228,10 +228,12 @@ not have; if the edit broke a behavior no assertion covers, add the case first
 
 To formalize the same before/after in a real repo, the ablation stand-in becomes an explicit
 `old_skill` arm: populate `manifest.old_skill_paths` with the previous revision and pass
-`prepare --include-old-skill`, and the `old_skill` variant grades your last-shipped skill
-beside `with_skill` in one report (per the 2026-06-09 `old_skill` lesson in
-[`LESSONS_LEARNED.md`](../LESSONS_LEARNED.md), it is opt-in precisely so a benchmark never
-compares against a baseline that does not exist). The `iteration-N/` convention plus
+`prepare --include-old-skill`, then grade with `benchmark --variant with_skill --variant
+without_skill --variant old_skill`. The report's `paired_edit_summary` pairs the edit against
+your last-shipped skill case by case, with a significance test, an interval, a noise check,
+and the `regressed_cases` list ([report shape](commands.md#the-edit-against-the-previous-revision)).
+The arm is opt-in so a benchmark never compares against a baseline that does not exist
+(the 2026-06-09 `old_skill` lesson in [`LESSONS_LEARNED.md`](../LESSONS_LEARNED.md)). The `iteration-N/` convention plus
 `render-viewer --previous-workspace` keeps the report-to-report history across edits. Gate a
 PR on the result with [gating-ci-on-evals.md](gating-ci-on-evals.md); an eval is not a test
 ([evals-are-not-tests.md](evals-are-not-tests.md)), so gate on the confirmed named

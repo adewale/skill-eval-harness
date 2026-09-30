@@ -289,6 +289,10 @@ When the noise floor reaches the target (`min_lift`, else `headroom`), `projecte
 
 When pairing is incomplete, both fields move to `observed_interval` / `observed_noise_check` and the headline fields read `{"availability": "unavailable", "reason": "incomplete_pairing"}`, like the other headline fields.
 
+### The edit against the previous revision
+
+When `--variant` selects an `old_skill` arm beside `with_skill` (`benchmark --variant with_skill --variant without_skill --variant old_skill`), the report adds `paired_edit_summary`: the current skill against the revision it replaces, paired per (case, model) within this run under the `skill_edit` contrast. It carries `current_objective_pass_rate`, `previous_objective_pass_rate`, `delta`, the same `significance`, `interval`, and `noise_check` blocks as `paired_summary` (with `headroom` measured on the previous revision), `regressed_cases` (each `{case_id, current, previous, delta, model?}`), `availability`, and `pairing`. A missing arm blocks its pair as `missing_old_skill` or `missing_with_skill`, and a partial comparison withholds its headline under `observed_*`, as `paired_summary` does. Without an `old_skill` arm the key is absent.
+
 ### How runs ended
 
 `run_endings.by_variant` counts every graded run's `stop_class`, `served_model_check`, and effort level per variant; runs that predate these fields count as `unrecorded`, and a run recorded with an earlier spelling is counted under that spelling. The totals are `refused_runs`, `cut_off_runs` (truncated plus turn-limited), `served_model_mismatches`, `served_model_mixed`, and `effort_levels`. `notes` explains each non-zero total (a `mixed` run is scored, but no single model can be credited with it) and warns when a multi-model report ran every arm at `backend_default` effort. Counts include unscorable runs, because the block describes what the eval ran rather than what it scored; the fields are defined under [Effort and how answer runs ended](#effort-and-how-answer-runs-ended).
