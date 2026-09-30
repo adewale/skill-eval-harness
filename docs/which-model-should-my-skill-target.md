@@ -126,7 +126,7 @@ the weakest tier you support sets the bound, and a skill's value is a property o
   defaults differ by model and CLI version: per the claude-api skill, Claude Opus
   5.5's API default is `medium` while Claude Opus 5's is `high`. A tier comparison
   at defaults can then measure an effort gap as a model gap. Every run records
-  `effort.applied_by: "backend-default"` in that case, and a multi-model report whose
+  `effort.applied_by: "backend_default"` in that case, and a multi-model report whose
   runs all used defaults says so in `run_endings.notes` ("every run used its backend's
   default effort; defaults differ by model, so pin --effort before reading a
   cross-model comparison"); the offline fan-out above carries exactly that note. Gemini

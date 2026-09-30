@@ -114,7 +114,7 @@ the requested level or `backend-default`. The shared writer fills `unobserved` a
 `backend-default` when a backend reports nothing, so a run without evidence stays distinct from a
 run that predates the fields. `execution_valid` treats a `truncated` or `turn_limit` stop and a
 served-model `mismatch` as unscorable, so the run blocks its pair; a refusal stays graded and is
-counted in the report's `run_endings` block.
+counted in the report's `run_endings` block. *Update (2026-09-30): these values are now spelled `unavailable` (was `unobserved`), `not_requested` (was `not-requested`) and `backend_default` (was `backend-default`), and the served-model check gained `mixed`; [`vocabulary.md`](vocabulary.md#run-artifacts) owns the current values.*
 
 ## Judge invocation results
 
@@ -474,7 +474,7 @@ legacy artifact never recorded. In particular:
 - Jetty aliases and response shapes still need token-backed live validation before production claims;
 - completion evidence exists only where a backend exposes it. Claude records its stop reason and
   served model; Gemini records its served model but an `unobserved` stop; Codex, Vibe,
-  `run-subagent`, and Jetty imports record `unobserved` for both. On
+  `run-subagent`, and Jetty imports record `unobserved` for both (now spelled `unavailable`). On
   every path but Claude's, an answer cut off at an output or turn limit still grades as an
   ordinary miss;
 - `RunnerOutcome` is retained as a compatibility factory, so new code should construct the explicit

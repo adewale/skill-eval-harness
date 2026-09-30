@@ -111,7 +111,7 @@ with the wrong mechanism is a rejection.
 |---|---|---|
 | Human sign-off | Inputs and grading each need an explicit yes; the pilot asks whether you would have scored any case differently | No interview; `render-viewer --serve` collects verdicts after a run into `feedback.json` |
 | Pipeline oracle and null | Reference answers and an empty or constant output go through the suite's own runner and grader before the first paid run | Detector fixtures (CF.1) prove each assertion type fires and passes on known inputs; nothing pushes a suite's references or a null answer through end to end |
-| Failure classes | Every failed attempt, in whatever runner the guide builds: refusal, harness or serving error, timeout, genuine failure | `stop_class` and served model are read from Claude runs, served model only from Gemini; Codex, Vibe, subagent, and Jetty runs record `unobserved` |
+| Failure classes | Every failed attempt, in whatever runner the guide builds: refusal, harness or serving error, timeout, genuine failure | `stop_class` and served model are read from Claude runs, served model only from Gemini; Codex, Vibe, subagent, and Jetty runs record `unavailable` |
 | Per-case auditor | One cheap model call per case flags ambiguous, suspect gold, answerable from memory, grader too strict or too lenient, cheatable | `audit-manifest` lints the manifest; no per-case model audit |
 | Judge prompt | Tells the judge not to reward length, treats candidate text as untrusted data, and tests three known negatives | `judge-robustness` runs two negative controls (empty, master-key) and an order flip; the prompt guards are roadmap 5.5 ([#98](https://github.com/adewale/skill-eval-harness/issues/98)), not implemented |
 | Cache parity | Flags variants whose cache-read share differs, because warm against cold cache skews cost and latency | Records cache-read and cache-write tokens per run; no parity check across arms |
@@ -147,7 +147,7 @@ python3 $H benchmark evals/shared-benchmark.json --runs "$S/runs" \
 python3 -c 'import json,sys; p=json.load(open(sys.argv[1]))["paired_summary"]; print(json.dumps({k: p[k] for k in ("absolute_delta","significance","interval","noise_check")}, indent=1))' "$S/bench.json"
 ```
 
-Real output (2026-09-29, Python 3.11, harness 0.6.0 tree, offline stub):
+Real output (2026-09-30, Python 3.11, offline stub):
 
 ```json
 {
@@ -158,7 +158,8 @@ Real output (2026-09-29, Python 3.11, harness 0.6.0 tree, offline stub):
   "observed_mean_delta": 1.0,
   "p_value": 0.5,
   "p_value_upper_bound": 0.5,
-  "significant_at_0_05": false
+  "significant_at_0_05": false,
+  "unit": "case"
  },
  "interval": {
   "confidence": 0.95,
@@ -167,7 +168,8 @@ Real output (2026-09-29, Python 3.11, harness 0.6.0 tree, offline stub):
   "lower": null,
   "upper": null,
   "bounded": false,
-  "reason": "2 paired case(s) cannot exclude any lift at 95%; the test needs at least 6 cases that differ between arms"
+  "reason": "2 paired case(s) cannot exclude any lift at 95%; the test needs at least 6 cases that differ between arms",
+  "unit": "case"
  },
  "noise_check": {
   "verdict": "too-few-cases-moved",
@@ -178,13 +180,15 @@ Real output (2026-09-29, Python 3.11, harness 0.6.0 tree, offline stub):
   "smallest_achievable_p": 0.5,
   "noise_floor": null,
   "headroom": 1.0,
-  "min_lift": 0.1
+  "min_lift": 0.1,
+  "unit": "case"
  }
 }
 ```
 
 All 8 pairs (2 cases × 4 repeats) moved from fail to pass, and the report still declines
-the claim. Two cases allow four sign patterns, so p cannot go below 0.5, and
+the claim. Every block names its `unit`, `case`, because the test counts cases rather than
+runs. Two cases allow four sign patterns, so p cannot go below 0.5, and
 `noise_check.verdict` names that limit before any interval is drawn. The rule of thumb
 puts the noise floor at `1/sqrt(2 × 4)`, about ±35 points, and would call a 100-point lift
 resolved. The stub is deterministic, so its four repeats are four copies of one answer;
@@ -241,13 +245,13 @@ round yourself and read its outputs at the step that asks for them.
 | hillclimb Step 0.5: noise floor vs headroom vs smallest change | Can the eval show the win at all? | `paired_summary.noise_check`: `verdict`, `noise_floor`, `headroom`, and `min_lift` from `benchmark --min-lift`; `projected_cases`, when present, estimates the case count that would resolve it |
 | hillclimb Step 0.5: prove the mechanism is wired | Does the score drop without it? | `without_skill` is the skill-off run on every case; `ablation:<id>` with the `ablation_regressions` block for one component ([`ablation-study-walkthrough.md`](ablation-study-walkthrough.md)) |
 | eval-audit §2 and the Step 4.5 harness bucket: infra vs model failures | Which zeros are plumbing? | `run_endings` per variant: `stop_class` counts, `refused_runs`, `cut_off_runs`, `served_model_mismatches`, and `notes`; `unscorable_reason` on result rows |
-| eval-audit §2: the served model is the one requested | Did the right model answer? | `served_model_check` on every run (`match`, `mismatch`, `unverifiable`, `unobserved`, `not-requested`); a mismatch is excluded from scoring |
+| eval-audit §2: the served model is the one requested | Did the right model answer? | `served_model_check` on every run ([values](vocabulary.md#run-artifacts)); a `mismatch` is excluded from scoring, and a `mixed` run is scored but counted in `run_endings.served_model_mixed` |
 | eval-audit §1 difficulty headroom; the post's "fails every run" tell | Is a case too easy, or broken? | Case flags `saturated/non-discriminating` (ceiling: both arms 1.0) and `floor: fails in both arms`; `audit-manifest --runs` emits `floor-eval`, and readiness lists `floor_cases` |
 | build-eval pilot and eval-audit judge calibration | Does the judge agree with a person? | `render-viewer --serve` writes `feedback.json`; `judge-alignment --labels feedback.json` scores the judge against it |
 | eval-audit: judge tested on known negatives | Does the judge reject junk? | `judge-robustness` (empty and master-key controls, order flip) |
 | Step 4.5 stall bucketing | Why do the remaining cases fail? | `error-analysis --feedback feedback.json`: the review queue and failure taxonomy ([`why-did-this-run-fail.md`](why-did-this-run-fail.md)) |
 | Step 5 report with CIs | Is the delta outside noise? | `paired_summary.interval` (`bounded: false` means no shift can be excluded) and `significance` |
-| The post's low-variance mark: effort applied consistently | Did both arms run the same config? | `effort` on every run (`--effort` on `run-claude`, `run-codex`, `run-agent`); pairing blocks `effort_mismatch`, and `run_endings.notes` warns when a multi-model report ran every arm at backend-default effort |
+| The post's low-variance mark: effort applied consistently | Did both arms run the same config? | `effort` on every run (`--effort` on `run-claude`, `run-codex`, `run-agent`); pairing blocks `effort_mismatch`, and `run_endings.notes` warns when a multi-model report ran every arm at `backend_default` effort |
 
 ## What keeps the comparison honest
 

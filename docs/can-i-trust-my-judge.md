@@ -104,13 +104,14 @@ judge, expect `order_flip_consistency` below 1.0, and read it with one limit in
 mind: the probe compares one verdict in normal order against one in flipped
 order, so a judge that flips at random on identical input scores the same as a
 judge with a position bias. Telling them apart takes a same-order repeat flip
-rate, which the harness does not report yet (an issue for judge prompt guards is
-being filed). `--judge-runs` does not supply it either: it majority-merges the
-repeats into one verdict, and although the member verdicts stay in the row's
-`judge_runs` list, nothing counts how often they disagreed. For now, measure
-same-order agreement yourself by judging the same runs twice and pointing
-`judge-alignment` at the pair, since it accepts one judge-results file as the
-labels for another:
+rate. `judge --judge-runs N` shows it per task: each merged row carries an
+`agreement` block (`concur`, `n`, `concur_fraction`, `unanimous`, `unresolved`), so a
+task whose repeats split is visible, and an even split does not pass and reads
+`unresolved` unless the median score clears the verdict's threshold. No command
+rolls those blocks up into one rate across tasks yet (judge prompt guards are
+[#98](https://github.com/adewale/skill-eval-harness/issues/98)). For a single number,
+judge the same runs twice and point `judge-alignment` at the pair, since it accepts
+one judge-results file as the labels for another:
 
 ```bash
 python3 $H judge evals/shared-benchmark.json --runs "$S/runs" $V \
@@ -221,7 +222,7 @@ which judge produced which number is always recoverable.
 | Symptom | What it means | What to do |
 |---|---|---|
 | `control_leak_rate` > 0 | The judge can be talked into passing garbage — verdicts are injectable | Rewrite the judge prompt to grade output content against the rubric; re-probe before using any of its verdicts |
-| `order_flip_consistency` well below 1.0 | Verdicts change with order: position bias, or plain randomness the probe cannot tell apart from it | Measure same-order agreement first (judge twice, compare with `judge-alignment`); if repeats disagree too, split the rubric into one-property claims before raising `--judge-runs`, whose majority merge hides the disagreement |
+| `order_flip_consistency` well below 1.0 | Verdicts change with order: position bias, or plain randomness the probe cannot tell apart from it | Measure same-order agreement first (judge twice, compare with `judge-alignment`); if repeats disagree too, split the rubric into one-property claims before raising `--judge-runs`: its merged verdict still takes the majority, though each row's `agreement` block keeps the split visible |
 | High `agreement`, `cohen_kappa` near 0 | The judge tracks the label base rate, not quality (the rubber-stamp signature) | Distrust it; check `confusion` for whether it leaks passes (`fp`) or misses them (`fn`) |
 | `precision` low, `recall` high | Too lenient: passes human-fails | Tighten the rubric's fail conditions; the *baseline* is being inflated |
 | `recall` low, `precision` high | Too harsh: fails human-passes | Loosen wording that demands one phrasing; cf. the assertion-calibration lesson in [`why-did-this-run-fail.md`](why-did-this-run-fail.md) |
@@ -274,11 +275,11 @@ which judge produced which number is always recoverable.
   nearly doubled the suite's model interactions. Keep judge assertions for
   properties deterministic checks cannot express, and calibrate the judge
   *before* multiplying it across repeats and panels.
-- **Repetition and panels are first-class.** `--judge-runs N` majority-merges
-  repeated verdicts per task (without reporting how often they disagreed);
-  `--judge-panel` (repeatable) folds a multi-model panel into one consensus
-  verdict with an `agreement` block, `--quorum`, and ties reported as
-  `unresolved` rather than silently resolved.
+- **Repetition and panels are first-class.** `--judge-runs N` (repeats of one
+  judge) and `--judge-panel` (repeatable; several judge models) fold their member
+  verdicts with one rule: a strict majority passes, `--quorum` sets a panel's bar,
+  and a tie is `unresolved` rather than silently resolved. Both write an
+  `agreement` block per task ([commands.md](commands.md#repeated-judges-and-panels)).
 - **The evidence class:** robustness and sensitivity are exact over the probes
   run; alignment is exact over the labels given — and only as good as those
   labels. All three quantify the instrument, not the skill.
@@ -296,8 +297,8 @@ not sufficient — passing them rules out the grossest failure modes, it does no
 certify robustness against a motivated adversarial output. Nothing guards
 against verbosity bias either: `judge_prompt` says nothing about answer length,
 and no probe checks whether the judge prefers the longer of two otherwise equal
-answers. That gap, the same-order flip rate, and the extra controls above are
-the judge prompt guards the pending issue covers. When a single judge
+answers. That gap, a suite-level same-order flip rate, and the extra controls above are
+the judge prompt guards [#98](https://github.com/adewale/skill-eval-harness/issues/98) covers. When a single judge
 cannot be made trustworthy enough, the deeper tool is the consensus panel
 (`judge --judge-panel`, [`commands.md`](commands.md)): independent judges with
 an explicit quorum, disagreement surfaced as `unresolved` instead of averaged

@@ -196,6 +196,8 @@ because `execution_valid` reads metadata when it decides whether a truncated or 
 scorable. Claude answer runs fill them from the stream-json terminal `result` event; Gemini, Codex,
 Vibe, `run-subagent`, and Jetty imports record `stop_class: "unobserved"`. The field
 table is in [`commands.md`](commands.md#effort-and-how-answer-runs-ended).
+*Update (2026-09-30): that value is now spelled `unavailable`; [`vocabulary.md`](vocabulary.md#run-artifacts)
+owns the current stop classes.*
 
 ## Manifest taxonomy additions
 

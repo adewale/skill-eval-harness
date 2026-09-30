@@ -19,12 +19,12 @@ Run `skill-benchmark agent-capabilities` for the machine-readable registry view.
 
 Two answer-run surfaces are not registry capabilities yet: effort is an `effort_control` attribute on the answer backend class, and stop and served-model evidence comes from each backend's parser. Both are recorded in run metadata ([fields](commands.md#effort-and-how-answer-runs-ended)):
 
-- `claude`: `--effort` passes `claude --effort <level>`; the stop reason comes from the stream-json terminal `result` event and the served model from assistant messages.
-- `codex`: `--effort` passes `-c model_reasoning_effort=<level>`; stop reason and served model are `unobserved`.
-- `gemini`: no effort control, so `run-agent --agent gemini --effort …` is refused before any run; the served model is the stream's resolved model, and the stop reason is `unobserved`.
-- `vibe`: no effort control (refused the same way); stop reason and served model are `unobserved`.
-- `subagent`: no `--effort` flag, so runs record `backend-default`; stop reason and served model are `unobserved`.
-- `jetty`: imports record `unobserved` stop and served-model fields and `backend-default` effort; Jetty exposes no effort control.
+- `claude`: `--effort` passes `claude --effort <level>`; the stop reason comes from the stream-json terminal `result` event and the served model from assistant messages, skipping subagent turns.
+- `codex`: `--effort` passes `-c model_reasoning_effort=<level>`; stop reason and served model are `unavailable`.
+- `gemini`: no effort control, so `run-agent --agent gemini --effort …` is refused before any run; the served model is the stream's resolved model, and the stop reason is `unavailable`.
+- `vibe`: no effort control (refused the same way); stop reason and served model are `unavailable`.
+- `subagent`: no `--effort` flag, so runs record `backend_default`; stop reason and served model are `unavailable`.
+- `jetty`: imports record `unavailable` stop and served-model fields and `backend_default` effort; Jetty exposes no effort control.
 
 ## What changed for Gemini CLI
 

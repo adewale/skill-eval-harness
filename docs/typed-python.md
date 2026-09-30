@@ -24,19 +24,22 @@ Ruff-checked, byte-compiled, and executed on every supported Python version.
 | Incoming seam | Typed value leaving the seam | Owner |
 |---|---|---|
 | argparse namespace | `ValidatedLegacyCLIInvocation`, `CLICommand` | `cli_contracts.py` |
-| manifest and prepared-row identities | `CaseId`, `Split`, `CaseKind`, `ExecutionVariant`, `ModelId`, `RunNumber` | `manifest_contracts.py` |
-| experimental result rows | `ExperimentalPairKey`, `ExperimentalPair`, blocked-pair reasons | `experimental_pairs.py` |
+| manifest and prepared-row identities | `CaseId`, `Split`, `CaseKind`, `CasePopulation`, `ExecutionVariant`, `ModelId`, `RunNumber`, and the per-run key `RunCoordinate` | `manifest_contracts.py` |
+| experimental result rows | `ContrastSpec`, `HeldFixedFactor`, `ExperimentalPairKey`, `ExperimentalPair`, blocked-pair reasons | `experimental_pairs.py` |
 | provider process inputs and completion | `InvocationRequest`, `ProcessInvocationPlan`, `InvocationResult` | `invocation_contracts.py` |
 | native answer backend completion | `Completed`, `TimedOut`, `SpawnFailed`, `ProviderFailed` | `runner_contracts.py` |
 | provider stop reason, reported model, requested effort | `StopObservation` (`StopClass`), `ServedModel` (`ServedModelCheck`), `EffortSetting` | `completion_contracts.py` |
-| paired per-case lift deltas | `DiscriminationFailure`, `NoiseVerdict`, sign-flip interval and noise-check blocks | `effect_estimates.py` |
+| paired per-case lift deltas | `Estimate`, `InferenceUnit`, `DiscriminationFailure`, `NoiseVerdict`, sign-flip interval and noise-check blocks | `effect_estimates.py` |
 | `feedback.json` entries from the served review | `HumanJudgement`, `HumanVerdict` | `human_judgements.py` |
 | committed run directory | `ArtifactSetObservation` | `artifact_contracts.py` |
 | normalized event file | `EventLogObservation`, `EventState` | `trace_contracts.py` |
 | trigger process and evidence | `TriggerResult`, `TriggerObservation`, `TriggerCohort` | `trigger_contracts.py`, `trigger_reporting.py` |
-| judge subprocess and verdict JSON | `JudgeInvocation`, `JudgeVerdict` | `judge_contracts.py`, `judge_verdict.py` |
+| judge subprocess and verdict JSON, repeated or panel verdicts | `JudgeInvocation`, `JudgeVerdict`, `Consensus` | `judge_contracts.py`, `judge_verdict.py` |
 | assertion and deferred judge rows | `AssertionObservation`, `JudgeTask` | `grading_contracts.py` |
 | provider telemetry | availability/provenance/comparability domain values | `telemetry.py` |
+| stored availability spellings and telemetry sources | `Availability`, `TelemetrySource` | `observation_contracts.py` |
+| benchmark case flags and audit, readiness, profile, cost, contamination and robustness findings | `CaseFlag`, `FindingKind`, `Finding`, `EvalMark` | `findings.py` |
+| `--fail-on` tokens and the gate flags | `GatePolicy`, `GateDecision` | `gate_policy.py` |
 | report population and rates | `ReportCohort`, `UnitRate` | `report_contracts.py` |
 | rendered human text and matching | normalized text/assertion values | `text_contracts.py` |
 | Gemini JSON and stream JSONL | frozen provider response/event values | `gemini_contracts.py` |

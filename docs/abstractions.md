@@ -236,7 +236,8 @@ block.
 `observation_contracts.py` owns how the harness says whether it observed something.
 `Availability` (`complete`, `partial`, `unavailable`, `not_applicable`) is the canonical vocabulary;
 `Availability.parse` also reads the older spellings still persisted in run artifacts (`incomplete`,
-`unknown`, `unobserved`, `missing`), so code compares members instead of re-spelling strings.
+`unknown`, `unobserved`, `missing`, `not-applicable`), so code compares members instead of
+re-spelling strings, and a test fails if a production module writes a retired spelling again.
 `TelemetrySource` is the one list of where a usage or cost number came from, and the usage and cost
 source sets that the answer path and the trigger path both validate against are derived from it.
 
@@ -303,20 +304,23 @@ and the review note cannot disagree.
 `findings.py` is the one vocabulary for "this eval has a problem". `CaseFlag` is the closed set of
 per-case benchmark flags; each value is the exact wire text (three carry a `": detail"` suffix), and
 consumers compare members instead of matching substrings. `FindingKind` registers every finding
-kind the harness emits, from `audit-manifest`, readiness, `profile-skill`, `contamination` and
-`judge-robustness`; each kind declares its `Subject` (`skill`, `eval`, `grader`, `run`), its default
+kind the harness emits, from `audit-manifest`, readiness, `profile-skill`, `cost-summary`,
+`contamination` and `judge-robustness`; each kind declares its `Subject` (`skill`, `eval`, `grader`, `run`), its default
 `Severity` and the eval-health mark it is evidence against, if any. `Finding.as_dict` keeps the
 historical `{kind, severity, message, evidence}` shape. `eval_health` is a view over findings, not
 a second copy of them: it rates the five marks (realistic cases, grader correct on known answers,
 baseline headroom, noise below the smallest lift worth acting on, arms that differ only in the
-skill) as `ok`, `concern` or `unobserved`.
+skill) as `ok`, `concern` or `unavailable`.
 
-`gate_policy.py` decides what fails a command. A `GatePolicy` names finding kinds and severities
-and always fails closed on incomplete evidence. `--fail-on-blockers`, `--strict-judge`,
-`--fail-on-contamination` and `--fail-on-findings` are presets over it (`READINESS`,
-`SELF_JUDGING`, `CONTAMINATION`, `JUDGE_ROBUSTNESS`), and `parse_fail_on` reads the kinds,
-severities and preset names a user passes to `--fail-on`. Grading options such as `--strict` are
-not gates: they change how verdicts are scored, not whether a command fails.
+`gate_policy.py` decides what fails a command. A `GatePolicy` names finding kinds and severities,
+and `decide` fails on any matching finding and, when told the evidence is incomplete, fails closed.
+Four presets carry the older flags' meaning: `READINESS` (`blockers`), `SELF_JUDGING`
+(`strict-judge`), `CONTAMINATION` and `JUDGE_ROBUSTNESS`. `audit-manifest --fail-on-blockers` and
+`--strict-judge` evaluate through the first two; `contamination --fail-on-contamination` and
+`judge-robustness --fail-on-findings` still apply their own checks, which fail on exactly the
+kinds of the last two presets (the robustness check also fails on an incomplete report). `parse_fail_on` reads the kinds, severities and preset names a user
+passes to `audit-manifest --fail-on` and rejects an unknown token. Grading options such as
+`--strict` are not gates: they change how verdicts are scored, not whether a command fails.
 
 ## Grade result row
 
@@ -340,7 +344,13 @@ turns those in-memory result rows into the artifact you read. It does not consum
 of the `grade` command. Before arithmetic,
 `experimental_pairs.py` constructs exact `(case, model, repetition, population)` identities and
 requires one eligible treatment and control arm from an explicit `ContrastSpec`. The default
-skill-presence contrast maps to the existing `with_skill`/`without_skill` wire rows.
+skill-presence contrast maps to the existing `with_skill`/`without_skill` wire rows; ablation
+confirmation pairs `with_skill` with `ablation:<id>` under the contrast `ablation:<id>` (a missing
+arm blocks as `missing_ablation:<id>`), and `EDIT_CONTRAST` declares `with_skill` against
+`old_skill` for a same-run edit comparison. `contrast_for` returns the declared contrast for a pair
+of arms and refuses any other pairing, so an arm is never relabelled into another arm's slot. Each
+contrast names its `held_fixed` factors (today `HeldFixedFactor.EFFORT`), and
+`ContrastSpec.comparability` blocks a pair whose arms differ on one.
 The stable identity of a comparison result is `(contrast_id, pair_key)`. Blocked rows and pairing
 diagnostics serialize that contrast ID, so two different comparisons over the same execution rows
 cannot collide or lose their causal question at a persistence boundary.
@@ -353,8 +363,10 @@ sign-flip core, so the interval excludes zero exactly when the test rejects "no 
 path included, and `noise_check`, which reports the cases that moved, the smallest p-value those cases can
 reach, the interval half-width and the headroom left in `without_skill`. `effect_estimates.Estimate`
 builds all three blocks from one set of deltas and stamps each with its `InferenceUnit`, defined
-under **Inference unit** in [`vocabulary.md`](vocabulary.md#report-signals). `construct_pairs` blocks a pair whose arms ran at different effort
-(`effort_mismatch`) or where only one arm recorded effort.
+under **Inference unit** in [`vocabulary.md`](vocabulary.md#report-signals). Through that
+comparability check, `construct_pairs` blocks a pair whose arms ran at different effort
+(`effort_mismatch`) or where only one arm recorded effort, in the benchmark, the ablation
+confirmation, and `token-overhead` alike.
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,
 flaky, and with-skill-failed cases, and `effect_estimates.ceiling_or_floor` separates the two

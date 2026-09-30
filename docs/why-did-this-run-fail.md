@@ -140,19 +140,20 @@ Looks fine to me; no concerns.
 ```
 
 No severity label anywhere — the assertion is right, the text really lacks it. Now check
-*how* the run ended before you read anything into that, via `metadata.json`:
+*how* the run ended before you read anything into that, via `metadata.json` (real output from
+the same offline stub run, re-run 2026-09-30, trimmed to the fields below):
 
 ```json
 {
-  "stop_class": "unobserved",
+  "stop_class": "unavailable",
   "stop_reason": null,
   "stop_source": "codex runner exposes no stop signal",
-  "served_model_check": "unobserved",
-  "effort": { "requested": null, "applied_by": "backend-default" },
+  "served_model_check": "unavailable",
+  "effort": { "requested": null, "applied_by": "backend_default" },
   "provider": "codex",
   "returncode": 0,
   "timed_out": false,
-  "elapsed_ms": 28,
+  "elapsed_ms": 47,
   "usage_normalized": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "source": "trace_normalized" },
   "cost_normalized": { "source": "missing" },
   "skill_invoked": false,
@@ -169,15 +170,17 @@ Read `stop_class` first, because a clean exit code does not prove the answer fin
   `execution-error`, not under an assertion.
 - `refused`: the model declined. The run is still graded, so its zero is a refusal
   rather than a capability miss, and the benchmark's `run_endings` block counts it.
-- `unobserved`: the runner exposes no stop signal. Codex, Vibe, the subagent runner,
+- `unavailable`: the runner exposes no stop signal. Codex, Vibe, the subagent runner,
   and Jetty all record this, and so does this stub. Read the tail of `output.md`; an
   answer that ends mid-sentence was probably cut off.
 
 Then check `served_model_check`: a `mismatch` means a different model answered than
 the one requested, and that run is excluded too (`unscorable_reason:
-served_model_mismatch`).
+served_model_mismatch`). A `mixed` run reported the requested model and another one; it
+stays graded, and `run_endings.served_model_mixed` counts it so you can decide whether to
+trust it.
 
-Here the stop is `unobserved`, `returncode` is 0, `timed_out` is false, and
+Here the stop is `unavailable`, `returncode` is 0, `timed_out` is false, and
 `output.md` ends on a complete sentence, so the run finished and produced real text.
 This is a genuine quality miss, not a crash, a cut-off, or an empty output. (The zero
 token counts and `cost_normalized.source: "missing"` are the offline-stub telemetry

@@ -122,7 +122,7 @@ false matches and an overly rigid raw-dictionary equality check.
 
 Effort is part of that model configuration. Each answer run records
 `effort: {requested, applied_by}`, where an unpinned run records the `backend-default`
-marker because defaults differ by model and CLI version. Pair construction from result
+marker (spelled `backend_default` since 2026-09-30) because defaults differ by model and CLI version. Pair construction from result
 rows (`experimental_pairs.pairs_from_rows`) blocks a with/without pair whose arms ran at
 different effort as `effort_mismatch`, and a pair where only one arm recorded effort as
 `effort_unrecorded_on_one_arm`, since that arm cannot be shown to share the other's level.

@@ -242,6 +242,8 @@ Further optional manifest surfaces (each with a behavior-preserving default; see
 - `turns` on a case: a scripted multi-turn sequence; each turn's assertions grade that turn's transcript entry (`turn-<n>/output.md`), case-level assertions grade the final answer.
 - YAML manifests: a `.yaml` manifest (plus `dataset_files` mapping dataset ids to JSONL row files) compiles to the same shape in memory — validation, lint, and grading are identical.
 - Reference floors: `reference_score` (0-1) / `reference_graded_score` (1-5).
+- `source` on a case: where it came from (`production`, `bug-report`, `hand-written`, `synthesized`, or `imported`); `audit-manifest` counts the sources and flags a suite that records none or only synthesized cases.
+- A known answer on a case: `reference_answer` (inline, tune cases only) or `reference_answer_ref` (a manifest-relative file, the form `holdout` and `holdback` cases must use). The two are mutually exclusive and not allowed on trigger cases. Only `audit-manifest`'s known-answer check reads it, and prepared tasks never carry it.
 
 ## Assertions
 
@@ -311,9 +313,9 @@ Negative assertions use the same view, so invisible
 characters cannot hide banned content. `golden_output`, structured JSON,
 scripts, commands, tool names, and paths retain their exact/protocol semantics.
 
-Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict` on `grade`/`benchmark` promotes soft to gate. An `atLeast` floor on a plain scored judge requires a normalized 0–1 score and decides its pass; on `graded_dimensions` it tightens the normalized form of the dimension threshold. Missing score evidence remains unavailable rather than becoming a failure. Dynamic and per-step judges use `minimum_criteria` and `min_met_fraction` respectively instead of `atLeast`. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for text/process/efficiency), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`).
+Every assertion may declare a **severity** — `critical` (an absorbing barrier: one failure vetoes the run, every rate collapses to 0.0 and the graded score is withheld), `gate` (lowers the pass rate; the default for objective types), or `soft` (feeds only the graded score channel — a soft failure never moves the objective, qualitative, or combined pass rates; the default for judge/similarity). Declare `severity: "gate"` on a judge assertion to keep it in the qualitative/combined rate. `--strict`, one of the [grading options](docs/commands.md#grading-options) every grading command takes, promotes soft to gate. An `atLeast` floor on a plain scored judge requires a normalized 0–1 score and decides its pass; on `graded_dimensions` it tightens the normalized form of the dimension threshold. Missing score evidence remains unavailable rather than becoming a failure. Dynamic and per-step judges use `minimum_criteria` and `min_met_fraction` respectively instead of `atLeast`. Every assertion may also declare an **oracle tier** — `strong` (deterministic, the default for text/process/efficiency), `demo` (the default for `script`), or `live` (judge) — reported per case as `oracle_strength` and audited (`weak-oracle-only`).
 
-Use `script` when a keyword check is too weak for the property you care about. The command sees the candidate run directory, so it can inspect `output.md`, generated files under `outputs/`, or metadata. Script assertions are blocked unless you pass `--allow-scripts` to `grade`, `benchmark`, `aggregate`, or `export-anthropic`:
+Use `script` when a keyword check is too weak for the property you care about. The command sees the candidate run directory, so it can inspect `output.md`, generated files under `outputs/`, or metadata. Script assertions are blocked unless you pass `--allow-scripts` to a command that grades ([grading options](docs/commands.md#grading-options)):
 
 ```json
 {
@@ -402,7 +404,7 @@ partial and expose any surviving calculations only under explicitly labelled obs
 }
 ```
 
-The native runners also record how each run ended: `stop_class` (`completed`, `truncated`, `turn_limit`, `refused`, `other`, `unobserved`) beside the raw `stop_reason` and its `stop_source`; `requested_model`, `served_model`, and `served_model_check` (`match`, `mismatch`, `unverifiable`, `unobserved`, `not-requested`); and `effort`, which is `{"requested": null, "applied_by": "backend-default"}` unless `--effort` pinned it. A `truncated` or `turn_limit` stop, or a served-model `mismatch`, makes the run unscorable and blocks its pair; a refusal stays graded. A custom runner may write the same fields. Which backends observe what is in [`docs/commands.md`](docs/commands.md#effort-and-how-answer-runs-ended).
+The native runners also record how each run ended: `stop_class` beside the raw `stop_reason` and its `stop_source`; `requested_model`, `served_model`, `served_models`, and `served_model_check`; and `effort`, which is `{"requested": null, "applied_by": "backend_default"}` unless `--effort` pinned it. A `truncated` or `turn_limit` stop, or a served-model `mismatch`, makes the run unscorable and blocks its pair; a refusal stays graded. The values are defined in [`docs/vocabulary.md`](docs/vocabulary.md#run-artifacts). A custom runner may write the same fields. Which backends observe what is in [`docs/commands.md`](docs/commands.md#effort-and-how-answer-runs-ended).
 
 ## Ablations
 
@@ -469,7 +471,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 
 | Command | What it does |
 |---|---|
-| `skill-benchmark audit-manifest` | Readiness verdict + blockers; `--fail-on-blockers` gates CI on "worth paying to run". |
+| `skill-benchmark audit-manifest` | Readiness verdict + blockers, the known-answer check, and eval health over five marks; `--fail-on-blockers` or `--fail-on KINDS` gates CI. |
 | `skill-benchmark report` | Serialize `benchmark.json` as JUnit XML or GitHub job-summary + annotations. |
 | `skill-benchmark contamination` | Output-side perimeter: canary tripwire, output↔answer n-gram overlap, released-at/cutoff gate. |
 | `skill-benchmark error-analysis` | Open-coding review queue + axial failure taxonomy over a `benchmark.json`; `--feedback feedback.json` fills each row's note from the served review. |
@@ -571,6 +573,16 @@ skill-eval-harness/
 ├── trace_contracts.py          # normalized event-log and event lifecycle contracts
 ├── trigger_contracts.py        # autonomous-trigger invocation/detection/observation contract
 ├── telemetry.py                # schema-v3 availability/provenance/comparison domain
+├── observation_contracts.py    # the Availability vocabulary and telemetry source lists
+├── findings.py                 # case flags, the finding-kind registry, and the eval-health view
+├── gate_policy.py              # which findings fail a command: --fail-on and its presets
+├── manifest_contracts.py       # case, split, variant, model, and run-coordinate identities
+├── invocation_contracts.py     # frozen provider process plans and invocation results
+├── json_contracts.py           # strict JSON parsing shared by every reader
+├── judge_contracts.py          # the judge invocation boundary
+├── text_contracts.py           # rendered human-text comparison views
+├── gemini_contracts.py         # Gemini JSON and stream-JSON contracts
+├── trigger_reporting.py        # complete/incomplete/empty trigger cohorts
 ├── docs/                       # architecture, abstractions, vocabulary, specs, guides (indexed in docs/README.md)
 ├── .github/
 │   ├── PULL_REQUEST_TEMPLATE.md

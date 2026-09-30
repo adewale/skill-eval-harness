@@ -130,24 +130,22 @@ skill-benchmark run-agent --agent codex --tasks tasks.jsonl --runs ../repo/eval-
   --effort high
 ```
 
-Every run records `effort: {requested, applied_by}`, for example `{"requested": "high", "applied_by": "claude --effort"}`. Without `--effort` it records `{"requested": null, "applied_by": "backend-default"}`, because defaults differ by model and CLI version: the claude-api skill lists Claude Opus 5.5's API default effort as `medium` and Claude Opus 5's as `high`.
+Every run records `effort: {requested, applied_by}`, for example `{"requested": "high", "applied_by": "claude --effort"}`. Without `--effort` it records `{"requested": null, "applied_by": "backend_default"}`, because defaults differ by model and CLI version: the claude-api skill lists Claude Opus 5.5's API default effort as `medium` and Claude Opus 5's as `high`.
 
 The same `metadata.json` records how the run stopped and which model answered:
 
 | Field | Values |
 |---|---|
-| `stop_class` | `completed`, `truncated`, `turn_limit`, `refused`, `other`, `unobserved` |
+| `stop_class` | One of the values defined under **Stop class** in [`vocabulary.md`](vocabulary.md#run-artifacts). |
 | `stop_reason`, `stop_source` | The provider's raw value (or `null`) and where it was read. |
-| `requested_model`, `served_model`, `served_models` | The model asked for, the model that wrote the final answer, and every model the run reported. |
-| `served_model_check` | `match`, `mismatch`, `unverifiable`, `unobserved`, `not-requested` |
+| `requested_model`, `served_model`, `served_models` | The model asked for, the one model credited with the answer (`null` when the run reported several), and every distinct model the run reported, in first-seen order. |
+| `served_model_check` | One of the values defined under **Served model check** in [`vocabulary.md`](vocabulary.md#run-artifacts). |
 
-Claude reads the stop reason from the stream-json terminal `result` event (`stop_reason`, with `subtype: error_max_turns` mapped to `turn_limit`) and the served model from each assistant message's `model`. Neither field is in Claude Code's public stream-json reference; Claude Code 2.1.269 writes both, and a stream without them records `unobserved`. Gemini reports its resolved model but no stop reason. Codex, Vibe, `run-subagent`, and Jetty imports record `unobserved` for both. Runs written before this change carry none of these fields, and reports count them as `unrecorded`.
+Claude reads the stop reason from the stream-json terminal `result` event (`stop_reason`, with `subtype: error_max_turns` mapped to `turn_limit`) and the served models from each assistant message's `model`, skipping subagent turns (messages that carry `parent_tool_use_id`), because a subagent may run on another model by design. Neither field is in Claude Code's public stream-json reference; Claude Code 2.1.269 writes both, and a stream without them records `unavailable`. Gemini reports its resolved model but no stop reason. Codex, Vibe, `run-subagent`, and Jetty imports record `unavailable` for both. Every backend then applies the same served-model rule (`completion_contracts.ServedModel`), defined with the check's values in [`vocabulary.md`](vocabulary.md#run-artifacts). Runs written before this change carry none of these fields, and reports count them as `unrecorded`.
 
-`served_model_check` drops a provider prefix such as `anthropic/`, then accepts the exact id or the id plus a dated snapshot suffix (`claude-haiku-4-5` served as `claude-haiku-4-5-20251001`). A bare family alias (`haiku`, `sonnet`, `opus`, `fable`, `mythos`) matches any served id containing that family. Any other alias without a version number is `unverifiable`, which does not block scoring. A request for `claude-sonnet-5` served as `claude-sonnet-5-5` is a `mismatch`.
+A `truncated` or `turn_limit` stop and a served-model `mismatch` make the run unscorable ([execution validity](vocabulary.md#run-artifacts)), because grading a cut-off answer blames the model for the eval's limit and grading another model's answer measures the wrong model. The result row names why in `unscorable_reason` (`stopped:truncated`, `stopped:turn_limit`, `served_model_mismatch`) and the run blocks its pair like any other infrastructure failure. A refusal and a `mixed` served-model run stay graded; the report's [`run_endings`](#how-runs-ended) block counts both, so a refusal's zero reads as a refusal. Result rows copy `stop_class`, `stop_reason`, `served_model`, `served_model_check`, and `effort` from metadata when present.
 
-`execution_valid` ([execution validity](vocabulary.md#run-artifacts)) treats a `truncated` or `turn_limit` stop and a served-model `mismatch` as unscorable, because grading a cut-off answer blames the model for the eval's limit and grading another model's answer measures the wrong model. The result row names why in `unscorable_reason` (`stopped:truncated`, `stopped:turn_limit`, `served_model_mismatch`) and the run blocks its pair like any other infrastructure failure. A refusal stays graded; the report's [`run_endings`](#how-runs-ended) block counts it so its zero reads as a refusal. Result rows copy `stop_class`, `stop_reason`, `served_model`, `served_model_check`, and `effort` from metadata when present.
-
-Pairing checks effort too. A with/without pair whose arms ran at different effort is blocked as `effort_mismatch`, and one arm with recorded effort against one without is blocked as `effort_unrecorded_on_one_arm`. Runs recorded before effort existed carry none and still pair with each other.
+Pairing checks effort too. Every comparison pairs through a declared contrast (`experimental_pairs.ContrastSpec`) whose `held_fixed` factors must match between the arms; today that is effort. A pair whose arms ran at different effort is blocked as `effort_mismatch`, and one arm with recorded effort against one without is blocked as `effort_unrecorded_on_one_arm`. Runs recorded before effort existed carry none and still pair with each other. The benchmark, the ablation confirmation, and `token-overhead` all pair this way, so each blocks the same pairs.
 
 ## Run subagent tasks (in-process seam, tool replay, multi-turn)
 
@@ -221,6 +219,19 @@ skill-pi-trigger-eval ../repo/evals/shared-benchmark.json \
   --trace-runs trigger-traces
 ```
 
+## Grading options
+
+`grade`, `benchmark`, `aggregate`, `export-anthropic`, and `audit-manifest` take the same four options, because each grades runs (or rebuilds the benchmark it reports) and must grade them the same way:
+
+| Option | Effect |
+|---|---|
+| `--judge-results FILE` | Merge judge verdicts keyed by `judge_task_id` (JSONL or JSON). Without them, a manifest with judge assertions grades as partial and the lift headlines are withheld. |
+| `--allow-scripts` | Run the manifest's `script` oracles. Off by default, because it executes repo-supplied commands. |
+| `--strict` | Promote soft-severity assertions to gates. A grading option, not a gate: it changes how verdicts score, not whether a command fails. |
+| `--embed-cmd CMD` | Enable `similarity` with `mode: "embedding"` through an external command (stdin `{texts: [a, b]}`, stdout `{embeddings: [[..], [..]]}`). |
+
+`token-overhead` takes `--judge-results` only. Every `skill-benchmark` report command's `--out` creates missing parent directories, for JSON, markdown, HTML, and JSONL output alike.
+
 ## Grade
 
 `grade` produces per-run grading rows and can emit pending judge tasks:
@@ -242,7 +253,7 @@ skill-benchmark grade ../repo/evals/shared-benchmark.json \
 
 ## Benchmark
 
-`benchmark` aggregates graded rows into variant summaries, paired deltas (with sign-flip `significance`, a confidence `interval`, a `noise_check`, and a `graded` channel), per-model grouping (`by_model`, `model_analysis` ranking and lift losers), slice summaries with lift concentration, oracle-strength shares, held-out vs tune-visible qualitative rates, a `run_endings` block, and case flags. Add `--allow-scripts` only when you trust the repo-owned oracle commands in the manifest; `--strict` promotes soft assertions to gates; `--embed-cmd` enables embedding-mode similarity; `--min-lift X` (0 < X ≤ 1) names the smallest pass-rate lift you would act on, which the noise check compares against.
+`benchmark` aggregates graded rows into variant summaries, paired deltas (with sign-flip `significance`, a confidence `interval`, a `noise_check`, and a `graded` channel), per-model grouping (`by_model`, `model_analysis` ranking and lift losers), slice summaries with lift concentration, oracle-strength shares, held-out vs tune-visible qualitative rates, a `run_endings` block, and case flags. It takes the shared [grading options](#grading-options); add `--allow-scripts` only when you trust the repo-owned oracle commands in the manifest. `--min-lift X` (0 < X ≤ 1) names the smallest pass-rate lift you would act on, which the noise check compares against.
 
 ```bash
 skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
@@ -259,7 +270,9 @@ Multi-model runs prepare with `--models a,b,c` (run dirs gain a model segment: `
 
 `significance` answers whether the observed lift beats chance. Two fields beside it, on `paired_summary` and on each `by_model` entry, answer how large the lift could be and whether the eval could have shown it at all.
 
-`interval` is `{method, confidence: 0.95, n, lower, upper, bounded}`. It inverts the sign-flip test: the interval holds every shift the test would not reject, so it excludes zero exactly when the `significance` block rejects "no lift", on either path. `method` is `sign-flip-inversion-exact` up to 14 paired (case, model) units and `sign-flip-inversion-sampled` (4096 seeded sign patterns) above that. With five or fewer units no shift can be rejected at 95%, so the block reads `bounded: false` with null endpoints and a `reason`. `paired_summary.graded` carries its own `interval` over graded-score deltas.
+`significance`, `interval`, and `noise_check` each carry `unit`, the inference unit their test counts: `case` here, one delta per (case, model) averaged over its repetitions ([inference unit](vocabulary.md#report-signals)). `effect_estimates.Estimate` builds all three from one set of deltas.
+
+`interval` is `{method, confidence: 0.95, n, lower, upper, bounded, unit}`. It inverts the sign-flip test: the interval holds every shift the test would not reject, so it excludes zero exactly when the `significance` block rejects "no lift", on either path. `method` is `sign-flip-inversion-exact` up to 14 paired (case, model) units and `sign-flip-inversion-sampled` (4096 seeded sign patterns) above that. With five or fewer units no shift can be rejected at 95%, so the block reads `bounded: false` with null endpoints and a `reason`. `paired_summary.graded` carries its own `interval` over graded-score deltas.
 
 `noise_check` reports `cases`, `cases_moved` (units whose delta is non-zero), `cases_needed_for_alpha` (6 at `alpha` 0.05), `smallest_achievable_p` (`2 / 2**k` for `k` moved units), `noise_floor` (the interval's half-width), `headroom` (1 minus the `without_skill` pass rate), and `min_lift` when `--min-lift` is set. Its `verdict` is the first limit found, checked in this order:
 
@@ -278,7 +291,7 @@ When pairing is incomplete, both fields move to `observed_interval` / `observed_
 
 ### How runs ended
 
-`run_endings.by_variant` counts every graded run's `stop_class`, `served_model_check`, and effort level per variant; runs that predate these fields count as `unrecorded`. The totals are `refused_runs`, `cut_off_runs` (truncated plus turn-limited), `served_model_mismatches`, and `effort_levels`. `notes` explains each non-zero total and warns when a multi-model report ran every arm at `backend-default` effort. Counts include unscorable runs, because the block describes what the eval ran rather than what it scored; the fields are defined under [Effort and how answer runs ended](#effort-and-how-answer-runs-ended).
+`run_endings.by_variant` counts every graded run's `stop_class`, `served_model_check`, and effort level per variant; runs that predate these fields count as `unrecorded`, and a run recorded with an earlier spelling is counted under that spelling. The totals are `refused_runs`, `cut_off_runs` (truncated plus turn-limited), `served_model_mismatches`, `served_model_mixed`, and `effort_levels`. `notes` explains each non-zero total (a `mixed` run is scored, but no single model can be credited with it) and warns when a multi-model report ran every arm at `backend_default` effort. Counts include unscorable runs, because the block describes what the eval ran rather than what it scored; the fields are defined under [Effort and how answer runs ended](#effort-and-how-answer-runs-ended).
 
 ### Floor and ceiling case flags
 
@@ -355,6 +368,10 @@ skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
 
 Native Claude uses `claude -p --output-format json --no-session-persistence`; tool-free judges add `--tools ""`, and every native Claude judge passes the harness verdict schema through `--json-schema`. Native Codex uses isolated `CODEX_HOME` outside the model workdir plus `codex exec --output-last-message <file> --output-schema <schema.json>` so verdict parsing reads the final assistant message rather than the event JSONL stream. Native Gemini uses isolated `GEMINI_CLI_HOME`, `--output-format stream-json`, conditional nested sandboxing, and a deny-all tool policy; only the stream's final validated assistant segment reaches verdict parsing, while the raw lifecycle stream and session/model metadata are saved as transcript sidecars. It rejects observed tool lifecycles and nonzero aggregate tool counts. Native Vibe uses isolated `VIBE_HOME` outside the model workdir plus `vibe --prompt "$PROMPT" --output json` with tools disabled (`--enabled-tools re:^$`) and reads the final assistant message as the verdict JSON; `--judge-model` is passed through `VIBE_ACTIVE_MODEL`. Native judges run from an explicit working directory: a sanitized run-copy when tool exploration is enabled, otherwise a fresh empty temp directory so they cannot accidentally read the harness repo cwd. For Codex/OpenAI structured output, the harness adapts the canonical verdict schema into a strict provider schema (`additionalProperties:false`; optional fields become nullable) while still validating the returned verdict against the canonical schema. Gemini and Vibe do not expose provider-enforced schema here, so harness-side schema validation is the gate. A shell judge command should return JSON like `{"passed": true, "score": 4, "rationale": "..."}`. Bare or fenced JSON is accepted using `json.raw_decode` scanning rather than brace counting. `--transcripts` saves the exact prompt, stdout, stderr, parsed result, and any provider response/metadata sidecars.
 
+### Repeated judges and panels
+
+`--judge-runs N` judges each task N times with one judge; `--judge-panel MODEL` (repeat it for two or more models) judges each task once per model. Both fold the member verdicts with one rule, `judge_verdict.resolve_consensus`: a strict majority passes, `--quorum K` (panels only) passes on K passing members instead, and an exact tie passes only when the median score clears the verdict's explicit threshold. Otherwise the tie does not pass and is marked `unresolved`. Each merged row carries an `agreement` block, `{concur, n, concur_fraction, unanimous, unresolved}`, so a judge that disagrees with itself on identical input shows up per task; the member verdicts stay under `judge_runs` (repeats) or `judge_panel` (panel).
+
 ## Audit manifest quality
 
 ```bash
@@ -363,28 +380,118 @@ skill-benchmark audit-manifest ../repo/evals/shared-benchmark.json \
   --out eval-audit.md
 ```
 
-Add `--runs ../repo/eval-runs/latest` to include saturated-case, floor, no-lift, flaky repeated-run, and per-assertion discrimination analysis.
+Add `--runs ../repo/eval-runs/latest` to include saturated-case, floor, no-lift, flaky repeated-run, and per-assertion discrimination analysis, plus the run-measured findings behind eval-health marks 3–5. The audit grades those runs the way `benchmark` does and takes the same [grading options](#grading-options). Without `--judge-results`, a manifest with judge assertions yields a partial benchmark, so readiness reports the `benchmark-incomplete` blocker and eval-health marks 3–5 read `unavailable`. `--min-lift X` (with `--runs`) sets the smallest lift worth acting on for the noise check behind mark 4.
 
-The audit reports:
+The JSON report carries `counts`, `taxonomy`, `findings`, `recommendations`, `recommended_fixture_repos_files`, `readiness`, `known_answer_check`, `case_sources`, `eval_health`, `benchmark`, and `benchmark_availability`. `--format markdown` renders the counts, readiness, an **Eval health** table, the findings, and the recommendations. The audit reports:
 
-- a **readiness** verdict — "is this eval worth paying to run?" — collapsing the things that decide whether a measured number will mean anything: ablations materialized vs instruction-simulated, **leak-saturated cases** (every positive objective assertion's value already appears in the prompt, so `with_skill == without_skill` by construction), adversarial coverage, and **objective-only cases** (a behaviour case with no judge assertion can only ever measure objective compliance — if the skill's value is voice/judgement it will read as zero lift). With `--runs`, it also surfaces the signals a static manifest can't see: **base-saturated cases** (measured `with_skill == without_skill` above zero — a blocker, the case measures nothing), **floor cases** (`floor_cases`: both arms' combined score is 0 on every validated pair — a blocker that asks you to audit each case and its assertions before hardening it or spending more on it), and **qualitative-only cases** (objective flat but the combined/judge score lifts — the skill's value is qualitative). A regression-intent case at the floor is listed in `floor_cases`, not in `regression_guards_holding`, because a guard nothing passes is not holding. All with an explicit `blockers` punch list;
+- a **readiness** verdict, "is this eval worth paying to run?": ablations materialized vs instruction-simulated, `leak_saturated_cases`, `adversarial_cases`, `objective_only_cases` and `judge_only_cases`, and with `--runs`, `base_saturated_cases`, `floor_cases`, `qualitative_only_cases` and `regression_guards_holding`. The blockers are typed findings in `blocker_findings`, with their messages repeated in `blockers`; the terms and the six blocking kinds are defined under **Readiness** in [`vocabulary.md`](vocabulary.md#report-signals);
 - missing positive, negative, and adversarial eval coverage,
 - missing holdout/holdback split coverage,
 - missing trigger/no-trigger coverage,
 - missing domain/difficulty/success-goal taxonomy for slice summaries,
+- where the cases came from: `case_sources` counts each case's declared `source` (`production`, `bug-report`, `hand-written`, `synthesized`, or `imported`); a suite where any case records none gets `case-source-unrecorded`, and one where every case is `synthesized` gets `synthesized-cases-only`,
+- the **known-answer check** (`known_answer_check`, model-free): every non-trigger case with at least one gate or critical text check (`contains`, `contains_any`, `contains_all`, `excludes_any`, `regex`, `not_regex`) takes part. A declared reference answer must pass every such check, or the case is listed in `reference_failures` with a `reference-answer-fails` finding. The null answer, the case's prompt echoed back, must fail at least one, or the case is listed in `null_answer_passes` with a `null-answer-passes` finding. Only a case whose gate checks are all text checks and whose prompt is inline (`prompt` or `turns`, not a private `prompt_ref`) is null-checked, and a case readiness already reports as leak-saturated is not reported again. The block also counts `references_checked` and `null_answers_checked`,
 - ablation-plan suggestions from major skill sections,
 - the instruction-simulated ablations that should be materialized (and dangling/unknown ablation references),
 - saturated and no-lift cases when run data is available, with a `floor-eval` (recommended) finding in place of `no-lift-eval` for a floor case, regression-intent cases included,
-- assertions with identical with/without pass rates, and
-- recommended fixture repos/files.
+- assertions with identical with/without pass rates,
+- recommended fixture repos/files, and
+- **eval health**, the five marks rated from these findings (below).
 
-**Gate it in CI.** `--fail-on-blockers` makes `audit-manifest` exit non-zero when the readiness block has any blockers, so a skill repo can keep its eval suite at "worth paying to run" the same way it keeps tests green:
+### Eval health
+
+`eval_health` is a view over the audit's findings and readiness blockers, not a second copy of them (`findings.eval_health`). Each finding kind belongs to at most one mark ([table below](#finding-kinds)). A mark with a finding of its kinds is `concern`; a mark whose evidence was observed with no such finding is `ok`; any other mark is `unavailable`, which is not the same as `ok`. Mark 1 is observed when at least one case records a `source`, mark 2 when the known-answer check graded a reference or a null answer, and marks 3–5 when `--runs` points at a complete benchmark. The block is `{"marks": [...], "counts": {"ok": n, "concern": n, "unavailable": n}}`, and each mark is `{mark, id, question, status, finding_kinds, notes?}`. Real output on `examples/demo-skill` with six runs per arm and the stub judge's verdicts (2026-09-30), marks 1 and 4, reformatted:
+
+```json
+{"mark": 1, "id": "realistic-cases",
+ "question": "Are the cases realistic, and does the skill load the way real use loads it?",
+ "status": "concern",
+ "finding_kinds": ["missing-positive-evals", "missing-negative-evals", "missing-adversarial-evals",
+                   "missing-trigger-no-trigger-cases", "case-source-unrecorded"],
+ "notes": ["activation is forced: the task tells the agent to use the skill, while real use relies on discovery (issue #48)"]},
+{"mark": 4, "id": "noise-below-min-lift",
+ "question": "Is the noise smaller than the smallest lift worth acting on?",
+ "status": "concern", "finding_kinds": ["underpowered-eval"]}
+```
+
+What each mark asks and why the harness uses these five is [`comparing-with-claude-api-evals.md`](comparing-with-claude-api-evals.md).
+
+### Gate it in CI
+
+`--fail-on-blockers` makes `audit-manifest` exit non-zero when the readiness block has any blockers, so a skill repo can keep its eval suite at "worth paying to run" the same way it keeps tests green:
 
 ```bash
 skill-benchmark audit-manifest evals/shared-benchmark.json --fail-on-blockers
 ```
 
+`--strict-judge` exits non-zero on a `judge-is-model-under-test` finding. For anything else, `--fail-on KINDS` takes finding kinds, severities (`required`, `recommended`), or presets, comma-separated and repeatable, and exits 1 when a finding or readiness blocker matches; each reason is printed to stderr as `fail-on: <kind>: <message>`. An unknown token stops the command before any work (`unknown --fail-on token 'florr-eval': use a finding kind, a severity, or one of: blockers, contamination, judge-robustness, recommended, required, strict-judge`). When `--runs` points at an incomplete benchmark, `--fail-on` fails closed rather than passing on findings it never computed.
+
+The presets are the same policies the older flags apply (`gate_policy.PRESETS`): `blockers` is the six readiness kinds that `--fail-on-blockers` gates on, and `strict-judge` is `judge-is-model-under-test`. `contamination` (`canary-hit`, `output-answer-overlap`, `released-before-cutoff`) and `judge-robustness` (`order-flip-inconsistent`, `passes-empty-control`, `passes-master-key-control`, `judge-call-incomplete`) name the kinds that `contamination --fail-on-contamination` and `judge-robustness --fail-on-findings` fail on in their own commands; `audit-manifest` does not run those checks, so in its `--fail-on` those two presets match nothing. `--strict` is a grading option, not a gate: it changes how verdicts score, not whether the command fails.
+
 The systematic way to upgrade a suite is to drive those blockers to empty, repo by repo: materialize the ablations (`materialize-ablations` / declare a `mechanism`+`target`), de-leak the leak-saturated cases (move the answer out of the prompt, or assert a downstream consequence), and add adversarial cases where missing — then the gate goes green. The walkthrough is [`gating-ci-on-evals.md`](gating-ci-on-evals.md).
+
+### Finding kinds
+
+Every finding the harness emits has a registered kind in `findings.FindingKind`, which fixes what it is about, its default severity, and the eval-health mark it counts against (marks are numbered as in [Eval health](#eval-health)). This table is that registry; `--fail-on` accepts any kind in it.
+
+| Kind | About | Default severity | Mark | Raised by |
+|---|---|---|---:|---|
+| `missing-domain-taxonomy` | eval | recommended | — | `audit-manifest` |
+| `missing-difficulty-taxonomy` | eval | recommended | — | `audit-manifest` |
+| `missing-success-goals` | eval | recommended | — | `audit-manifest` |
+| `missing-positive-evals` | eval | required | 1 | `audit-manifest` |
+| `missing-negative-evals` | eval | required | 1 | `audit-manifest` |
+| `missing-adversarial-evals` | eval | recommended | 1 | `audit-manifest` |
+| `no-adversarial-cases` | eval | required | 1 | readiness blocker |
+| `missing-hidden-splits` | eval | required | — | `audit-manifest` |
+| `missing-trigger-no-trigger-cases` | eval | required | 1 | `audit-manifest` |
+| `case-source-unrecorded` | eval | recommended | 1 | `audit-manifest` |
+| `synthesized-cases-only` | eval | recommended | 1 | `audit-manifest` |
+| `missing-ablation-plan` | eval | recommended | — | `audit-manifest` |
+| `ablation-instruction-simulated` | eval | recommended | — | `audit-manifest`; readiness blocker |
+| `ablation-no-expected-regression` | eval | recommended | — | `audit-manifest` |
+| `ablation-dangling-reference` | eval | recommended | — | `audit-manifest` |
+| `ablation-unknown-case` | eval | recommended | — | `audit-manifest` |
+| `ablation-unknown-assertion` | eval | recommended | — | `audit-manifest` |
+| `ablation-high-spend-no-structured-regression` | eval | recommended | — | `audit-manifest --runs` (cost) |
+| `prompt-assertion-leakage` | eval | recommended | 5 | `audit-manifest` |
+| `leak-saturated-case` | eval | required | 5 | readiness blocker |
+| `held-out-rubric-leak` | eval | required | 5 | `audit-manifest` |
+| `weak-oracle-only` | grader | recommended | 2 | `audit-manifest` |
+| `non-discriminating-assertions` | grader | recommended | 2 | `audit-manifest --runs` |
+| `judge-is-model-under-test` | grader | required | 2 | `audit-manifest` |
+| `reference-answer-fails` | grader | required | 2 | `audit-manifest` (known-answer check) |
+| `null-answer-passes` | grader | required | 2 | `audit-manifest` (known-answer check) |
+| `high-cost-judge-only-case` | grader | recommended | — | `audit-manifest --runs` (cost) |
+| `order-flip-inconsistent` | grader | recommended | 2 | `judge-robustness` |
+| `passes-empty-control` | grader | required | 2 | `judge-robustness` |
+| `passes-master-key-control` | grader | required | 2 | `judge-robustness` |
+| `judge-call-incomplete` | run | required | — | `judge-robustness` |
+| `benchmark-incomplete` | run | required | — | readiness blocker (with `--runs`) |
+| `floor-eval` | eval | recommended | 3 | `audit-manifest --runs`; readiness blocker |
+| `saturated-eval` | eval | recommended | 3 | `audit-manifest --runs` |
+| `base-saturated-case` | eval | recommended | 3 | readiness blocker (with `--runs`) |
+| `suite-headroom-exhausted` | eval | recommended | 3 | `audit-manifest --runs` |
+| `no-lift-eval` | skill | recommended | — | `audit-manifest --runs` |
+| `flaky-eval` | eval | required | 4 | `audit-manifest --runs` |
+| `underpowered-eval` | eval | recommended | 4 | `audit-manifest --runs` |
+| `arm-conditions-differ` | run | required | 5 | `audit-manifest --runs` |
+| `served-model-mismatch` | run | required | 5 | `audit-manifest --runs` |
+| `served-model-mixed` | run | recommended | 5 | `audit-manifest --runs` |
+| `expensive-saturated-case` | eval | recommended | — | `audit-manifest --runs` (cost) |
+| `expensive-no-lift-case` | skill | recommended | — | `audit-manifest --runs` (cost) |
+| `spend-on-non-discriminating-case` | eval | recommended | — | `cost-summary --benchmark` |
+| `high-footprint-low-lift-skill` | skill | recommended | — | `audit-manifest --runs` (cost) |
+| `missing-skill-file` | skill | required | — | `profile-skill` |
+| `skill-too-large` | skill | recommended | — | `profile-skill` |
+| `many-references` | skill | recommended | — | `profile-skill` |
+| `references-too-large` | skill | recommended | — | `profile-skill` |
+| `many-modules` | skill | recommended | — | `profile-skill` |
+| `canary-hit` | eval | required | — | `contamination` |
+| `output-answer-overlap` | eval | recommended | — | `contamination` |
+| `released-before-cutoff` | eval | recommended | — | `contamination` |
+
+The mark 3–5 kinds from `audit-manifest --runs` that do not come from case flags (`suite-headroom-exhausted`, `underpowered-eval`, `arm-conditions-differ`, `served-model-mismatch`, `served-model-mixed`) are raised only when that benchmark is complete. Per-case benchmark flags are the closed set `findings.CaseFlag`, whose values are the exact strings reports carry; `flaky repeated pass rates`, `critical-failure` and `below-reference-floor` add `: <detail>`.
 
 ## Contamination perimeter (output-side, model-free)
 
@@ -558,7 +665,7 @@ The form takes case id, model, variant, run number, an optional judge assertion 
 ]}
 ```
 
-Each entry is `{case_id, variant, run_number, model?, assertion?, verdict?, note?}` and needs a verdict, a note, or both; `run_number` defaults to 1, and the `good`/`bad` verdicts of the first form are read as `pass`/`fail`. A later entry for the same run and assertion replaces the earlier one. An invalid new entry gets HTTP 400 and leaves the file unchanged; an old entry that no longer validates is kept verbatim under `unparsed_entries` and ignored by the readers.
+Each entry is `{case_id, variant, run_number, model?, assertion?, verdict?, note?}` and needs a verdict, a note, or both; `variant` must be a real arm (`with_skill`, `without_skill`, `old_skill`, or `ablation:<id>`), because the entry's run is the same `RunCoordinate` that judge tasks and result rows use; `run_number` defaults to 1, and the `good`/`bad` verdicts of the first form are read as `pass`/`fail`. A later entry for the same run and assertion replaces the earlier one. An invalid new entry gets HTTP 400 and leaves the file unchanged; an old entry that no longer validates is kept verbatim under `unparsed_entries` and ignored by the readers.
 
 ## Trigger matrix (activation across agents and models)
 

@@ -312,7 +312,7 @@ a right answer reached the wrong way as a finding, not a pass.
 - **Unbounded smoke runs**: cap thinking and require a bounded answer; capture timeouts as
   artifacts instead of aborting the round. A capped answer that gets cut off is recorded, not
   graded: Claude runs write `stop_class: truncated` and the run is excluded from scoring. Other
-  runners record `unobserved`, so on those read failing outputs for answers that end
+  runners record `unavailable`, so on those read failing outputs for answers that end
   mid-sentence.
 - **Trigger cases written as meta-prompts**: run the real user prompt, and detect skill loading
   from the copied skill path, not from a name in the output.
