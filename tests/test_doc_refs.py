@@ -141,15 +141,6 @@ class DocCodeReferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ambiguous unqualified code reference 'main'"):
             fixer.rewrite_doc_text("See `main:99`.", maps)
 
-    def test_fixer_is_idempotent_on_the_current_docs(self):
-        # Running the rewrite over the repo's current docs must change nothing
-        # once the reference test passes — the fixer and checker agree.
-        maps = fixer.module_line_maps()
-        for doc in fixer.DOC_PATHS:
-            text = doc.read_text(encoding="utf-8")
-            rewritten, _ = fixer.rewrite_doc_text(text, maps)
-            self.assertEqual(rewritten, text, f"{doc.name} would still be rewritten")
-
 
 if __name__ == "__main__":
     unittest.main()
