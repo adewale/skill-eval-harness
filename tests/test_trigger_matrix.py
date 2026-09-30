@@ -292,6 +292,38 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             self.assertEqual(measurements["total_tokens"]["availability"], "unavailable")
             self.assertEqual(measurements["cost"]["availability"], "unavailable")
 
+    def test_pi_runner_redacts_ambient_and_auth_secrets_before_writing(self):
+        # One secret from the environment, one from the Pi auth the run copies;
+        # the model echoes both into its stream and stderr.
+        env_secret, auth_secret = "ambient-env-secret-123", "pi-auth-secret-456"
+
+        def leaky_pi(plan):
+            assistant = {"role": "assistant", "stopReason": "stop",
+                         "content": [{"type": "text", "text": f"{env_secret} {auth_secret}"}]}
+            return InvocationOutcome.from_process(
+                stdout=json.dumps({"type": "agent_end", "messages": [assistant]}) + "\n",
+                stderr=f"debug {env_secret} {auth_secret}", returncode=0, elapsed_ms=1)
+
+        with tempfile.TemporaryDirectory() as td:
+            pi_home = Path(td) / "pi-home"
+            pi_home.mkdir()
+            (pi_home / "auth.json").write_text(json.dumps({"token": auth_secret}), encoding="utf-8")
+            trace_dir = Path(td) / "trace"
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": env_secret,
+                                              "PI_CODING_AGENT_DIR": str(pi_home)}), \
+                 mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=leaky_pi):
+                row = tr.observe_query(DEMO_MANIFEST, "ordinary chat", False, 12, None,
+                                       trace_dir=trace_dir).as_row()
+            written = {path.name: path.read_text(encoding="utf-8")
+                       for path in trace_dir.iterdir()}
+        written["row"] = json.dumps(row)
+        self.assertIn("[REDACTED]", written["trace.jsonl"])
+        self.assertIn("[REDACTED]", row["stderr"])
+        for name, text in written.items():
+            with self.subTest(artifact=name):
+                self.assertNotIn(env_secret, text)
+                self.assertNotIn(auth_secret, text)
+
     def test_pi_adapter_propagates_json_provider_error_as_incomplete(self):
         provider_error = json.dumps({
             "type": "agent_end", "willRetry": False,

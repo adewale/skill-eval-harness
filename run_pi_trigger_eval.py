@@ -77,9 +77,14 @@ def skill_name_from_manifest(manifest: dict[str, Any]) -> str:
     return str(manifest.get("skill_name") or "skill-under-test")
 
 
+def pi_source_config_dir() -> Path:
+    """The user's own Pi config dir, the source of the auth a run copies."""
+    return Path(os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent")))
+
+
 def seed_config_dir(config_dir: Path) -> None:
     """Copy authentication only; ambient settings/system prompts are behavior."""
-    source = Path(os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent")))
+    source = pi_source_config_dir()
     for name in ["auth.json"]:
         src = source / name
         if src.exists() and src.is_file():
@@ -215,6 +220,14 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
                   identity: TriggerRepetitionIdentity | None = None,
                   protocol_sha256: str | None = None) -> TriggerObservation:
     """Keep the typed observation alive until report aggregation completes."""
+    # The matrix imports this module's row loaders at load time, so its
+    # redaction (shared by both trigger runners) is imported at call time.
+    from run_trigger_matrix import (
+        ambient_secret_values,
+        redact_detection,
+        redact_invocation,
+    )
+
     manifest = load_manifest(manifest_path)
     with tempfile.TemporaryDirectory(prefix="pi-trigger-") as td:
         config_dir = Path(td)
@@ -241,6 +254,10 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
             cost_normalized = dict(stream.cost_normalized)
         else:
             usage_normalized, cost_normalized = {"source": "missing"}, {"source": "missing"}
+        # The copied auth.json holds the same values as its source, so the
+        # ambient secrets cover this run's config dir too.
+        secrets = ambient_secret_values()
+        redacted = redact_invocation(invocation, secrets)
         is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
         # The materialized ablation's provenance goes through Provenance (one
         # schema). skill_tree_hash names the bytes this arm actually mounted;
@@ -261,8 +278,8 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
             model=model,
             query=query,
             expectation=TriggerExpectation.from_bool(should_trigger),
-            invocation=invocation,
-            detection=detection,
+            invocation=redacted,
+            detection=redact_detection(detection, secrets),
             usage=usage_normalized,
             cost=cost_normalized,
             metadata={
@@ -275,9 +292,11 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
             },
             identity=identity,
         )
-        result = observation.as_row()
         if trace_dir is not None:
-            write_trigger_trace_artifacts(trace_dir, invocation.stdout, result, stream)
+            artifact_stream = (stream if redacted.stdout == invocation.stdout
+                               else PiStream.parse(redacted.stdout))
+            write_trigger_trace_artifacts(
+                trace_dir, redacted.stdout, observation.as_row(), artifact_stream)
         return observation
 
 
