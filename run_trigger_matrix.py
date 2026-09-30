@@ -84,6 +84,7 @@ from run_pi_trigger_eval import (
     load_manifest,
     pi_argv,
     pi_invocation_outcome,
+    pi_source_config_dir,
     seed_config_dir,
     skill_name_from_manifest,
     validate_trigger_rows,
@@ -302,7 +303,9 @@ def ambient_secret_values() -> list[str]:
     secrets = [value for name in SENSITIVE_ENV_VARS if len(value := os.environ.get(name, "")) >= 8]
     codex_source = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     vibe_source = Path(os.environ.get("VIBE_HOME", str(Path.home() / ".vibe")))
-    secrets.extend(_secret_values_from_files((codex_source / "auth.json", codex_source / "config.toml", vibe_source / ".env")))
+    secrets.extend(_secret_values_from_files((
+        codex_source / "auth.json", codex_source / "config.toml", vibe_source / ".env",
+        pi_source_config_dir() / "auth.json")))
     return sorted({s for s in secrets if s}, key=len, reverse=True)
 
 
@@ -326,6 +329,23 @@ def redact_sensitive_value(value: Any, secrets: list[str]) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_sensitive_value(child, secrets) for child in value)
     return value
+
+
+def redact_invocation(invocation: InvocationOutcome, secrets: list[str]) -> InvocationOutcome:
+    """The invocation's wire text and metadata with every secret removed."""
+    return invocation.with_wire_text(
+        stdout=redact_sensitive_text(invocation.stdout, secrets),
+        stderr=redact_sensitive_text(invocation.stderr, secrets),
+        provider_error=(redact_sensitive_text(invocation.provider_error, secrets)
+                        if invocation.provider_error is not None else None),
+    ).with_metadata(redact_sensitive_value(dict(invocation.metadata), secrets))
+
+
+def redact_detection(detection: TriggerDetection, secrets: list[str]) -> TriggerDetection:
+    return TriggerDetection(tuple(
+        TriggerEvidence(item.kind, redact_sensitive_text(item.text, secrets))
+        for item in detection.evidence
+    ))
 
 
 def safe_trace_segment(text: str, fallback: str) -> str:
@@ -768,19 +788,7 @@ def adapter_instance(
         "max_turns": max_turns,
         **dict(backend_options or {}),
     }
-    binding = binding_for(name, "trigger")
-    adapter_cls = ADAPTERS[name]
-    registered_cls = binding.implementation.resolve()
-    # Preserve the established replacement seam: tests and integrations may
-    # substitute a zero-argument adapter. Provider CLI options describe only
-    # the implementation registered by the backend row.
-    options = binding.option_values(values) if adapter_cls is registered_cls else {}
-    return adapter_cls(**options)
-
-
-def matrix_capabilities() -> dict[str, Any]:
-    """Capability rows for exactly the agents accepted by this command."""
-    return {name: require_agent_capabilities(name) for name in sorted(ADAPTERS)}
+    return ADAPTERS[name](**binding_for(name, "trigger").option_values(values))
 
 
 def trigger_tree_for_manifest(repo_root: Path, manifest: dict[str, Any], work_dir: Path, ablation: str | None) -> tuple[Path, str, dict[str, Any] | None]:
@@ -820,15 +828,6 @@ def matrix_failure_observation(
     )
 
 
-def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger: bool,
-                       exc: BaseException, metadata: dict[str, Any] | None = None,
-                       identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
-    """Compatibility wire adapter; matrix aggregation retains the typed value."""
-    return matrix_failure_observation(
-        agent, model, query, should_trigger, exc, metadata, identity,
-    ).as_row()
-
-
 def observe_cell_query(
     adapter: AgentAdapter,
     tree_dir: Path,
@@ -859,21 +858,8 @@ def observe_cell_query(
         secrets = workspace_secret_values(workspace) + ambient_secret_values()
         detection = adapter.detect(invocation, names, copied)
 
-    redacted_stdout = redact_sensitive_text(invocation.stdout, secrets)
-    redacted_stderr = redact_sensitive_text(invocation.stderr, secrets)
-    redacted_provider_error = (
-        redact_sensitive_text(invocation.provider_error, secrets)
-        if invocation.provider_error is not None else None
-    )
-    redacted_invocation = invocation.with_wire_text(
-        stdout=redacted_stdout,
-        stderr=redacted_stderr,
-        provider_error=redacted_provider_error,
-    ).with_metadata(redact_sensitive_value(dict(invocation.metadata), secrets))
-    redacted_detection = TriggerDetection(tuple(
-        TriggerEvidence(item.kind, redact_sensitive_text(item.text, secrets))
-        for item in detection.evidence
-    ))
+    redacted_invocation = redact_invocation(invocation, secrets)
+    redacted_detection = redact_detection(detection, secrets)
 
     telemetry_error = None
     if invocation.observation_complete:
@@ -934,15 +920,16 @@ def observe_cell_query(
             **dict(redacted_invocation.metadata),
             **observation_metadata,
         }
-        if redacted_provider_error is not None:
-            trace_metadata["provider_error"] = redacted_provider_error
+        if redacted_invocation.provider_error is not None:
+            trace_metadata["provider_error"] = redacted_invocation.provider_error
         try:
             # Reparse only the sanitized artifact boundary; detection and telemetry
             # above share the single provider payload retained by the invocation.
-            artifact_pi_stream = PiStream.parse(redacted_stdout) if adapter.name == "pi" else None
+            artifact_pi_stream = (PiStream.parse(redacted_invocation.stdout)
+                                  if adapter.name == "pi" else None)
             write_trace_artifacts(
                 trace_dir,
-                redacted_stdout,
+                redacted_invocation.stdout,
                 source=adapter.name,
                 metadata=trace_metadata,
                 extra_metrics={
@@ -960,17 +947,6 @@ def observe_cell_query(
             trace_error = f"{type(exc).__name__}: {exc}"
             observation = observation.with_metadata({"trace_error": trace_error})
     return observation
-
-
-def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_trigger: bool,
-                   model: str | None, timeout: int, trace_dir: Path | None = None,
-                   metadata: dict[str, Any] | None = None,
-                   identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
-    """Compatibility wire adapter for callers that need one persisted row."""
-    return observe_cell_query(
-        adapter, tree_dir, query, should_trigger, model, timeout, trace_dir,
-        metadata, identity,
-    ).as_row()
 
 
 def summarize_matrix(observations: list[TriggerObservation]) -> list[dict[str, Any]]:

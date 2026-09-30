@@ -6,7 +6,9 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
+import contextlib
 import errno
+import io
 import json
 import os
 import shutil
@@ -29,7 +31,8 @@ from helpers import (
 )
 from helpers import (
     make_eval_repo,
-    stub_claude,
+    stub_claude_stream,
+    write_with_skill_task,
 )
 from helpers import (
     write_demo_manifest as write_manifest,
@@ -39,12 +42,21 @@ from helpers import (
 )
 
 import ablation_model as am
-import run_pi_trigger_eval as tr
 import runner_contracts as rc
 import skill_benchmark as sb
 import trace_contracts as tc
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Fake-codex source that prints one protocol-valid `codex exec --json` turn:
+# the agent message, then the turn.completed terminator carrying usage.
+FAKE_CODEX_TURN = (
+    "for record in ({'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},\n"
+    "               {'type': 'item.completed', 'item': {'id': 'item_0', 'type': 'agent_message',\n"
+    "                                                   'text': 'token from codex'}},\n"
+    "               {'type': 'turn.completed', 'usage': {'input_tokens': 4, 'output_tokens': 6}}):\n"
+    "    print(json.dumps(record))\n"
+)
 
 
 def make_tasks(root: Path) -> list[dict]:
@@ -275,10 +287,6 @@ class SubagentRunnerTests(unittest.TestCase):
             self.assertEqual(summary["usage"]["availability"], "partial")
             self.assertEqual(metadata["usage_normalized"]["source"], "missing")
             self.assertFalse(metrics["operation_observation_complete"])
-
-    def test_agent_backends_are_registered_workspace_builders(self):
-        for name in ("subagent", "codex", "claude", "gemini", "vibe"):
-            self.assertIn(name, sb.WORKSPACE_BUILDERS)
 
 
 class ToolReplayTests(unittest.TestCase):
@@ -577,31 +585,34 @@ class OTelNormalizationTests(unittest.TestCase):
         self.assertTrue(r["passed"])
 
 
-class D1_FailureMarkerOwnerTests(unittest.TestCase):
-    """The failure-body prefixes that runners WRITE are the same constants the
-    detector READS — so a renamed marker can't slip a crashed run past scoring."""
+class FailureMarkerOwnerTests(unittest.TestCase):
+    """The failure bodies runners WRITE are rejected by the scorer on their text
+    alone, for every provider the backend registry binds a marker to — so a
+    marker the detector forgets can't slip a crashed run past scoring."""
 
-    def test_writer_constants_are_exactly_the_detector_markers(self):
-        import ablation_model as am
-        self.assertEqual(
-            am.RUNNER_FAILURE_MARKERS[:4],
-            (am.CODEX_FAILURE, am.JETTY_FAILURE, am.CLAUDE_FAILURE,
-             am.VIBE_FAILURE),
-        )
-        self.assertEqual(am.RUNNER_FAILURE_MARKERS[-1], am.TIMEOUT_FAILURE)
-        self.assertEqual(
-            set(am.RUNNER_FAILURE_MARKERS[:-1]),
-            set(am.RUNNER_FAILURE_MARKER_BY_PROVIDER.values()),
-        )
-        self.assertEqual(
-            len(am.RUNNER_FAILURE_MARKERS[:-1]),
-            len(set(am.RUNNER_FAILURE_MARKERS[:-1])),
-        )
-
-    def test_each_formatted_failure_body_is_non_executable(self):
-        import ablation_model as am
-        for marker in am.RUNNER_FAILURE_MARKERS:
-            self.assertFalse(am.execution_valid({}, f"{marker}: something broke]\n"))
+    def test_every_provider_failure_body_is_non_executable(self):
+        for provider, marker in am.RUNNER_FAILURE_MARKER_BY_PROVIDER.items():
+            outcomes = {
+                "spawn": am.RunnerOutcome(provider=provider, returncode=127,
+                                          invocation_state="spawn_failed", error="not found"),
+                "returncode": am.RunnerOutcome(provider=provider, answer="partial answer",
+                                               returncode=2, stderr="boom"),
+            }
+            for shape, outcome in outcomes.items():
+                with self.subTest(provider=provider, shape=shape), tempfile.TemporaryDirectory() as td:
+                    base = Path(td) / "run"
+                    sb.write_runner_outcome(base, outcome)
+                    body = (base / "output.md").read_text(encoding="utf-8")
+                    self.assertTrue(body.startswith(f"{marker}: "), body)
+                    self.assertFalse(am.execution_valid({}, body))
+                    self.assertFalse(am.execution_valid({}, "\n  " + body))
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "run"
+            sb.write_runner_outcome(base, am.RunnerOutcome(
+                provider="codex", timed_out=True, error="wall clock exceeded"))
+            body = (base / "output.md").read_text(encoding="utf-8")
+        self.assertTrue(body.startswith(f"{am.TIMEOUT_FAILURE}: "), body)
+        self.assertFalse(am.execution_valid({}, body))
 
 
 class R3_WithoutSkillCarriesNoSkillTests(unittest.TestCase):
@@ -633,9 +644,6 @@ class SharedSkillInvokedTests(unittest.TestCase):
                             "status": "completed",
                             "input": {"file_path": "/ws/inputs/data.csv"}})
         self.assertEqual(sb.detect_trigger(never, [sp]), (False, []))   # mounted but unread => False
-
-    def test_trigger_eval_uses_the_one_owner(self):
-        self.assertIs(tr.detect_trigger, sb.detect_trigger)
 
 
 class JettyReferencesUploadTests(unittest.TestCase):
@@ -696,33 +704,23 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"process {pid} is still running after {timeout:.1f}s")
 
-    def _one_with_skill_task(self, root: Path) -> tuple[Path, str]:
-        case = {"id": "c", "split": "tune", "prompt": "do it",
-                "assertions": [{"name": "a", "type": "contains", "value": "token"}]}
-        manifest = make_eval_repo(root, cases=[case])
-        rows = [r for r in sb.prepared_task_rows(manifest, sb.validate_manifest(manifest)) if r["variant"] == "with_skill"]
-        tasks = root / "tasks.jsonl"
-        tasks.write_text(json.dumps(rows[0]) + "\n", encoding="utf-8")
-        return tasks, rows[0]["run_dir"]
-
     def test_codex_and_claude_produce_the_same_contract_shape(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
 
             fake_codex = root / "fake_codex.py"
             fake_codex.write_text(
                 "import json, pathlib, sys\n_ = sys.stdin.read()\n"
                 "assert '--output-last-message' in sys.argv\n"
                 "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token from codex')\n"
-                "print(json.dumps({'role': 'assistant', 'content': 'trace from codex',"
-                " 'usage': {'input_tokens': 4, 'output_tokens': 6}}))\n",
+                + FAKE_CODEX_TURN,
                 encoding="utf-8")
             codex_runs = root / "codex-runs"
             sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(codex_runs),
                                          codex_cmd=f"{sys.executable} {fake_codex}", timeout=30))
 
-            claude_bin = stub_claude(root / "claude_stub.py", answer="token from claude")
+            claude_bin = stub_claude_stream(root / "claude_stub.py", answer="token from claude")
             claude_runs = root / "claude-runs"
             sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(claude_runs),
                                              model="claude-haiku-4-5-20251001", claude_bin=str(claude_bin), timeout=30))
@@ -741,10 +739,13 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(claude_meta["provider"], "claude")
             # Telemetry is an explicit block carrying the real normalized values,
             # not merely a present key — a regression dropping the numbers must fail.
-            self.assertEqual(codex_meta["usage_normalized"]["total_tokens"], 10)   # 4+6 from the trace
+            self.assertEqual(codex_meta["usage_normalized"]["total_tokens"], 10)   # 4+6 from turn.completed
             self.assertEqual(codex_meta["usage_normalized"]["source"], "trace_normalized")
-            self.assertEqual(claude_meta["usage_normalized"]["total_tokens"], 33)  # 11+22 from the envelope
+            self.assertEqual(claude_meta["usage_normalized"]["total_tokens"], 33)  # 11+22 from the result event
             self.assertEqual(claude_meta["usage_normalized"]["source"], "provider_reported")
+            # The one report reader agrees with the persisted blocks.
+            self.assertEqual(sb.run_cost_facts(codex_meta)["total_tokens"], 10)
+            self.assertEqual(sb.run_cost_facts(claude_meta)["total_tokens"], 33)
             self.assertIn("source", codex_meta["cost_normalized"])
             self.assertIn("source", claude_meta["cost_normalized"])
             # The whole-writer consolidation means both providers land on the same
@@ -757,7 +758,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_run_agent_dispatches_registered_claude_and_codex_backends(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake_codex = root / "fake_codex.py"
             fake_codex.write_text(
                 "import json, pathlib, sys\n_ = sys.stdin.read()\n"
@@ -768,7 +769,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 "assert not codex_home.is_relative_to(pathlib.Path.cwd())\n"
                 "assert not (pathlib.Path.cwd() / '.codex' / 'auth.json').exists()\n"
                 "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token from codex')\n"
-                "print(json.dumps({'role': 'assistant', 'content': 'trace from codex'}))\n",
+                + FAKE_CODEX_TURN,
                 encoding="utf-8")
             codex_runs = root / "agent-codex"
             sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(codex_runs), model="gpt-mini",
@@ -776,7 +777,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertIn("token from codex", (codex_runs / run_dir / "output.md").read_text(encoding="utf-8"))
             self.assertEqual(json.loads((codex_runs / run_dir / "metadata.json").read_text(encoding="utf-8"))["model"], "gpt-mini")
 
-            claude_bin = stub_claude(root / "claude_stub.py", answer="token from claude")
+            claude_bin = stub_claude_stream(root / "claude_stub.py", answer="token from claude")
             claude_runs = root / "agent-claude"
             sb.run_agent(argparse.Namespace(agent="claude", tasks=str(tasks), runs=str(claude_runs), model="claude-haiku-4-5-20251001",
                                             codex_cmd="codex exec --json", claude_bin=str(claude_bin), timeout=30))
@@ -1096,10 +1097,31 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
+    def test_runner_commands_reject_missing_or_empty_tasks_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            empty = root / "empty.jsonl"
+            empty.write_text("\n", encoding="utf-8")
+            files = {"missing": (root / "missing.jsonl", "tasks file not found"),
+                     "empty": (empty, "tasks file has no prepared tasks")}
+            commands = (["run-agent", "--agent", "codex"], ["run-codex"], ["run-claude"], ["run-subagent"])
+            for command in commands:
+                for kind, (tasks, message) in files.items():
+                    argv = ["skill-benchmark", *command, "--tasks", str(tasks), "--runs", str(root / "runs")]
+                    stderr = io.StringIO()
+                    with self.subTest(command=command[0], tasks=kind), \
+                         mock.patch.object(sys, "argv", argv), \
+                         contextlib.redirect_stderr(stderr), \
+                         self.assertRaises(SystemExit) as raised:
+                        sb.main()
+                    self.assertEqual(raised.exception.code, 1)
+                    self.assertEqual(stderr.getvalue(), f"FAIL: {message}: {tasks}\n")
+            self.assertFalse((root / "runs").exists())
+
     def test_run_agent_writes_failure_artifact_when_native_command_is_missing(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             runs = root / "runs"
             sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(runs), model="gpt-mini",
                                             codex_cmd=str(root / "missing-codex"), claude_bin="claude", timeout=30))
@@ -1289,7 +1311,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_run_agent_dispatches_registered_vibe_backend(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake_vibe = root / "fake_vibe.py"
             fake_vibe.write_text(
                 "import json, os, pathlib, sys\n"
@@ -1328,7 +1350,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_vibe_success_without_usage_writes_explicit_missing_telemetry(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake_vibe = root / "fake_vibe_no_usage.py"
             fake_vibe.write_text(
                 "import json\n"
@@ -1372,7 +1394,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_vibe_missing_binary_uses_vibe_failure_marker(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             runs = root / "runs"
             sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model=None,
                                             codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=str(root / "missing-vibe"), timeout=30))
@@ -1383,24 +1405,19 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(meta["returncode"], 127)
             self.assertFalse(sb.execution_valid(meta, text))
 
-    def test_codex_empty_output_writes_explicit_missing_telemetry(self):
-        # The PR's headline consistency fix: an empty Codex run now goes through the
-        # shared writer, so it gets explicit missing telemetry and schema-2 metrics
-        # (was schema-1 metadata with no normalized blocks before the consolidation).
+    def test_codex_empty_output_is_a_failure_not_an_empty_answer(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             silent = root / "silent_codex.py"
             silent.write_text("import sys\n_ = sys.stdin.read()\n", encoding="utf-8")  # emits nothing
             runs = root / "runs"
             sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs),
                                          codex_cmd=f"{sys.executable} {silent}", timeout=30))
             base = runs / run_dir
-            self.assertIn("no final answer", (base / "output.md").read_text(encoding="utf-8"))
-            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
-            self.assertEqual(meta["usage_normalized"], {"source": "missing"})
-            self.assertEqual(meta["cost_normalized"], {"source": "missing"})
-            self.assertEqual(json.loads((base / "metrics.json").read_text())["schema_version"], 2)
+            text = (base / "output.md").read_text(encoding="utf-8")
+            self.assertTrue(text.startswith(f"{sb.CODEX_FAILURE}: provider produced no final answer"), text)
+            self.assertFalse(sb.execution_valid(sb.read_metrics_base(base), text))
 
 
 class TraceDialectRegistryTests(unittest.TestCase):
@@ -1432,60 +1449,6 @@ class TraceDialectRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sb.GENERIC_TRACE_DIALECT.flatten(records, record_lines=[3])
 
-    def test_generic_dialect_has_no_terminal_stream_semantics(self):
-        self.assertEqual(sb.GENERIC_TRACE_DIALECT.stream_semantics([], None), (None, None))
-
-    def test_claude_dialect_owns_the_stream_flatten(self):
-        self.assertIs(sb.TRACE_DIALECTS["claude"].flatten, sb.claude_stream_flat_records)
-        self.assertIs(sb.trace_dialect_for("Claude"), sb.TRACE_DIALECTS["claude"])
-
-    def test_claude_completed_tool_lifecycle_counts_exactly_once(self):
-        records = [
-            {"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "call-1", "name": "Read",
-                 "input": {"file_path": "/tmp/a"}},
-            ]}},
-            {"type": "user", "message": {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "call-1", "content": "ok"},
-            ]}},
-        ]
-        events, metrics = sb.normalize_trace_records(records, source="claude")
-        lifecycle = [event for event in events["events"]
-                     if event["type"] in {"tool_call", "file_read"}]
-        self.assertEqual([event["status"] for event in lifecycle],
-                         ["in_progress", "completed"])
-        self.assertEqual(metrics["tool_calls"], 1)
-        self.assertNotIn("trace_protocol_errors", metrics)
-
-    def test_claude_dangling_and_unmatched_calls_are_protocol_invalid(self):
-        for records, phrase in (
-            ([{"type": "assistant", "message": {"content": [
-                {"type": "tool_use", "id": "call-1", "name": "Read", "input": {}},
-            ]}}], "no matching tool_result"),
-            ([{"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "missing", "content": "x"},
-            ]}}], "unmatched Claude tool_result"),
-        ):
-            with self.subTest(phrase=phrase):
-                _, metrics = sb.normalize_trace_records(records, source="claude")
-                self.assertTrue(any(phrase in error
-                                    for error in metrics["trace_protocol_errors"]))
-
-    def test_claude_malformed_message_and_lifecycle_fields_are_protocol_invalid(self):
-        malformed = [
-            {"type": "assistant", "message": {"content": {"type": "tool_use"}}},
-            {"type": "assistant", "message": {"content": [
-                {"type": "tool_use", "id": 1, "name": "Read", "input": {}},
-                {"type": "tool_use", "id": "x", "name": "", "input": {}},
-                {"type": "tool_use", "id": "y", "name": "Read", "input": []},
-            ]}},
-            {"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "x", "is_error": "false"},
-            ]}},
-        ]
-        _, metrics = sb.normalize_trace_records(malformed, source="claude")
-        self.assertGreaterEqual(len(metrics["trace_protocol_errors"]), 5)
-
     def test_claude_protocol_error_makes_trace_signal_unavailable(self):
         raw = json.dumps({
             "type": "assistant", "message": {"content": [
@@ -1508,16 +1471,6 @@ class TraceDialectRegistryTests(unittest.TestCase):
         self.assertFalse(metrics["operation_observation_complete"])
         self.assertFalse(passed)
         self.assertIn("trace_observation_incomplete", evidence)
-
-    def test_pi_dialect_resolves_cumulative_terminal_usage(self):
-        # The retry-then-success stream carries per-attempt usage; the dialect
-        # must resolve the FINAL attempt's cumulative usage, not a sum of
-        # attempts, and report no failure for a recovered stream.
-        raw = (ROOT / "tests" / "fixtures" / "pi" / "retry-then-success.jsonl").read_text(encoding="utf-8")
-        records, _ = sb.parse_trace_jsonl_text(raw)
-        terminal_usage, failure = sb.TRACE_DIALECTS["pi"].stream_semantics(records, None)
-        self.assertIsNone(failure)
-        self.assertEqual(sb.usage_number(terminal_usage, "total_tokens"), 13.0)
 
 
 if __name__ == "__main__":

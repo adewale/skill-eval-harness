@@ -269,11 +269,11 @@ class SkillBenchmarkTests(unittest.TestCase):
         repo_event = json.dumps({
             "type": "file_read", "status": "completed",
             "path": "good-readme/README.md"})
-        self.assertEqual(tr.detect_trigger(repo_event, copied), (False, []))
+        self.assertEqual(sb.detect_trigger(repo_event, copied), (False, []))
         skill_event = json.dumps({
             "type": "file_read", "status": "completed",
             "path": "/tmp/pi-trigger-x/skills/good-readme/SKILL.md"})
-        triggered, evidence = tr.detect_trigger(skill_event, copied)
+        triggered, evidence = sb.detect_trigger(skill_event, copied)
         self.assertTrue(triggered)
         self.assertIn("/tmp/pi-trigger-x/skills/good-readme/SKILL.md", evidence[0])
 
@@ -282,7 +282,7 @@ class SkillBenchmarkTests(unittest.TestCase):
         event = json.dumps({
             "type": "command", "status": "completed",
             "command": ["bash", "-lc", f"cat {copied[0]}"]})
-        triggered, evidence = tr.detect_trigger(event, copied)
+        triggered, evidence = sb.detect_trigger(event, copied)
         self.assertTrue(triggered)
         self.assertIn("SKILL.md", evidence[0])
 

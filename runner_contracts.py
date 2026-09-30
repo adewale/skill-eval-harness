@@ -277,12 +277,3 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
     if answer is None or not answer.strip():
         return ProviderFailed(context, returncode=0, reason="provider produced no final answer")
     return Completed(context, answer=answer)
-
-
-def classify_runner_result(*, provider: str, answer: str | None, returncode: int,
-                           timed_out: bool, elapsed_ms: int | None, stderr: str = "",
-                           error: str | None = None, timeout_s: int | None = None,
-                           **context: Any) -> AnswerOutcome:
-    return RunnerOutcome(provider=provider, answer=answer, returncode=returncode,
-                         timed_out=timed_out, elapsed_ms=elapsed_ms, stderr=stderr,
-                         error=error, timeout_s=timeout_s, **context)

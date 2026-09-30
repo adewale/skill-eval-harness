@@ -10,9 +10,9 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import claude_stream_records as _canonical_stream_records
-from helpers import make_eval_repo
 from helpers import stub_claude as _stub_claude
 from helpers import stub_claude_stream as _stub_claude_stream
+from helpers import write_with_skill_task
 
 import skill_benchmark as sb
 
@@ -26,11 +26,6 @@ def claude_stream_records(**overrides) -> list[dict]:
 
 def stream_text(records: list[dict]) -> str:
     return "\n".join(json.dumps(r) for r in records) + "\n"
-
-
-def _manifest(rp: Path, cases):
-    # Shared builder: writes the demo skill AND the manifest.
-    return make_eval_repo(rp.parent, skill_name="demo", cases=cases)
 
 
 class ParseClaudeEnvelopeTests(unittest.TestCase):
@@ -141,6 +136,22 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
         self.assertIn("unmatched Claude tool_result", event["input_summary"])
         self.assertEqual(event["raw_ref"], {"file": "trace.jsonl", "line": 1})
         self.assertEqual(event["raw_result_ref"], {"file": "trace.jsonl", "line": 1})
+        self.assertIn("unmatched Claude tool_result", " ".join(metrics["trace_protocol_errors"]))
+
+    def test_malformed_message_and_lifecycle_fields_are_protocol_invalid(self):
+        malformed = [
+            {"type": "assistant", "message": {"content": {"type": "tool_use"}}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": 1, "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "x", "name": "", "input": {}},
+                {"type": "tool_use", "id": "y", "name": "Read", "input": []},
+            ]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "x", "is_error": "false"},
+            ]}},
+        ]
+        _, metrics = sb.normalize_trace_records(malformed, source="claude")
+        self.assertGreaterEqual(len(metrics["trace_protocol_errors"]), 5)
 
     def test_duplicate_open_tool_id_is_error_and_cannot_replace_first_call(self):
         records = [
@@ -281,20 +292,16 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
 
 
 class RunClaudeAdapterTests(unittest.TestCase):
-    def _run(self, td: Path, *, cost=0.0123, returncode=0, answer="STUB ANSWER token-XYZ"):
-        rp = td / "repo"
+    def _run(self, td: Path, *, cost=0.0123, returncode=0, answer="STREAM ANSWER token-XYZ"):
         case = {"id": "c", "split": "tune", "prompt": "do it",
                 "assertions": [{"name": "a", "type": "contains", "value": "token-XYZ"}]}
-        p = _manifest(rp, [case])
-        rows = [r for r in sb.prepared_task_rows(p, sb.validate_manifest(p)) if r["variant"] == "with_skill"]
-        tasks = td / "tasks.jsonl"
-        tasks.write_text("".join(json.dumps(r) + "\n" for r in rows))
-        stub = _stub_claude(td / "claude_stub.py", cost=cost, returncode=returncode, answer=answer)
+        p, tasks, run_dir = write_with_skill_task(td, cases=[case])
+        stub = _stub_claude_stream(td / "claude_stub.py", cost=cost, returncode=returncode, answer=answer)
         runs = td / "runs"
         ns = argparse.Namespace(tasks=str(tasks), runs=str(runs),
                                 model="claude-haiku-4-5-20251001", claude_bin=str(stub), timeout=60)
         sb.run_claude(ns)
-        return p, runs, rows[0]["run_dir"]
+        return p, runs, run_dir
 
     def test_writes_output_and_cost_metrics(self):
         with tempfile.TemporaryDirectory() as t:
@@ -315,10 +322,13 @@ class RunClaudeAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
             _, runs, run_dir = self._run(td, returncode=3)
-            text = (runs / run_dir / "output.md").read_text()
+            base = runs / run_dir
+            text = (base / "output.md").read_text()
+            meta = sb.read_metrics_base(base)
+            self.assertEqual(meta["returncode"], 3)
             self.assertTrue(text.lstrip().startswith(sb.CLAUDE_FAILURE))
-            # and it is recognized as a non-scorable infra failure
-            self.assertFalse(sb.execution_valid({"returncode": 3}, text))
+            # and the run as written is a non-scorable infra failure
+            self.assertFalse(sb.execution_valid(meta, text))
 
     def test_json_is_error_marks_infra_failure_even_with_zero_exit(self):
         with tempfile.TemporaryDirectory() as t:
@@ -378,20 +388,8 @@ class RunClaudeAdapterTests(unittest.TestCase):
         # so events.json carries the run's actual tool-use trajectory and
         # process assertions have evidence on Claude answer runs.
         with tempfile.TemporaryDirectory() as t:
-            td = Path(t)
-            rp = td / "repo"
-            case = {"id": "c", "split": "tune", "prompt": "do it",
-                    "assertions": [{"name": "a", "type": "contains", "value": "token-XYZ"}]}
-            p = _manifest(rp, [case])
-            rows = [r for r in sb.prepared_task_rows(p, sb.validate_manifest(p)) if r["variant"] == "with_skill"]
-            tasks = td / "tasks.jsonl"
-            tasks.write_text("".join(json.dumps(r) + "\n" for r in rows))
-            stub = _stub_claude_stream(td / "claude_stream_stub.py", cost=0.031)
-            runs = td / "runs"
-            sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(runs),
-                                             model="claude-haiku-4-5-20251001",
-                                             claude_bin=str(stub), timeout=60))
-            base = runs / rows[0]["run_dir"]
+            _, runs, run_dir = self._run(Path(t), cost=0.031)
+            base = runs / run_dir
             self.assertIn("token-XYZ", (base / "output.md").read_text())
             trace = (base / "trace.jsonl").read_text(encoding="utf-8")
             self.assertIn("tool_use", trace)   # raw provider stream is preserved verbatim

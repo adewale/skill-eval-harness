@@ -190,7 +190,7 @@ Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | Lo
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10462`), Claude (`run_claude:10664`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10473`), Claude (`run_claude:10664`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
 subagent runner (`run_subagent:13229`, which hosts record/replay tool I/O via `ToolReplayStore`),
 Jetty (`JettyClient:4047` and the export/run/import commands), and any runner that writes the

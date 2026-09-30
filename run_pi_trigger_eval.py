@@ -31,7 +31,6 @@ from skill_benchmark import (
     build_canonical_skill_tree,
     canonical_json_sha256,
     canonical_trigger_query,
-    detect_trigger,
     detect_trigger_records,
     event_texts_for_tool_input,
     expected_trigger_polarity,
@@ -41,7 +40,6 @@ from skill_benchmark import (
     load_manifest_source,
     materialize_trigger_ablation,
     mount_skill_tree,
-    pi_stream_terminal_error,
     repo_root_for_manifest,
     safe_trace_label,
     skill_tree_hash,
@@ -78,9 +76,14 @@ def skill_name_from_manifest(manifest: dict[str, Any]) -> str:
     return str(manifest.get("skill_name") or "skill-under-test")
 
 
+def pi_source_config_dir() -> Path:
+    """The user's own Pi config dir, the source of the auth a run copies."""
+    return Path(os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent")))
+
+
 def seed_config_dir(config_dir: Path) -> None:
     """Copy authentication only; ambient settings/system prompts are behavior."""
-    source = Path(os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent")))
+    source = pi_source_config_dir()
     for name in ["auth.json"]:
         src = source / name
         if src.exists() and src.is_file():
@@ -147,11 +150,6 @@ def pi_trigger_protocol(
     }
 
 
-def pi_terminal_error(raw_text: str) -> str | None:
-    """Compatibility name for the shared Pi stream terminal-error parser."""
-    return pi_stream_terminal_error(raw_text)
-
-
 def pi_invocation_outcome(run: InvocationOutcome) -> InvocationOutcome:
     """Attach Pi's one parsed provider stream to its classified process state."""
     if not isinstance(run, InvocationOutcome):
@@ -160,12 +158,6 @@ def pi_invocation_outcome(run: InvocationOutcome) -> InvocationOutcome:
     if stream.terminal_error or (run.observation_complete and stream.protocol_error):
         return run.with_provider_error(stream.failure_error, payload=stream)
     return run.with_provider_payload(stream)
-
-
-def pi_invoke_result(run: dict[str, Any] | InvocationOutcome) -> dict[str, Any]:
-    """Compatibility dictionary boundary for callers not yet using typed outcomes."""
-    outcome = run if isinstance(run, InvocationOutcome) else InvocationOutcome.from_legacy_dict("pi", run)
-    return pi_invocation_outcome(outcome).as_legacy_dict()
 
 
 def pi_argv(query: str, model: str | None = None) -> list[str]:
@@ -216,6 +208,14 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
                   identity: TriggerRepetitionIdentity | None = None,
                   protocol_sha256: str | None = None) -> TriggerObservation:
     """Keep the typed observation alive until report aggregation completes."""
+    # The matrix imports this module's row loaders at load time, so its
+    # redaction (shared by both trigger runners) is imported at call time.
+    from run_trigger_matrix import (
+        ambient_secret_values,
+        redact_detection,
+        redact_invocation,
+    )
+
     manifest = load_manifest(manifest_path)
     with tempfile.TemporaryDirectory(prefix="pi-trigger-") as td:
         config_dir = Path(td)
@@ -242,6 +242,10 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
             cost_normalized = dict(stream.cost_normalized)
         else:
             usage_normalized, cost_normalized = {"source": "missing"}, {"source": "missing"}
+        # The copied auth.json holds the same values as its source, so the
+        # ambient secrets cover this run's config dir too.
+        secrets = ambient_secret_values()
+        redacted = redact_invocation(invocation, secrets)
         is_ablation = bool(ablation) and abl_prov is not None and abl_prov.get("mode") != "baseline"
         # The materialized ablation's provenance goes through Provenance (one
         # schema). skill_tree_hash names the bytes this arm actually mounted;
@@ -262,8 +266,8 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
             model=model,
             query=query,
             expectation=TriggerExpectation.from_bool(should_trigger),
-            invocation=invocation,
-            detection=detection,
+            invocation=redacted,
+            detection=redact_detection(detection, secrets),
             usage=usage_normalized,
             cost=cost_normalized,
             metadata={
@@ -276,22 +280,12 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
             },
             identity=identity,
         )
-        result = observation.as_row()
         if trace_dir is not None:
-            write_trigger_trace_artifacts(trace_dir, invocation.stdout, result, stream)
+            artifact_stream = (stream if redacted.stdout == invocation.stdout
+                               else PiStream.parse(redacted.stdout))
+            write_trigger_trace_artifacts(
+                trace_dir, redacted.stdout, observation.as_row(), artifact_stream)
         return observation
-
-
-def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int,
-              model: str | None, trace_dir: Path | None = None,
-              ablation: str | None = None,
-              identity: TriggerRepetitionIdentity | None = None,
-              protocol_sha256: str | None = None) -> dict[str, Any]:
-    """Compatibility wire adapter for one trigger result row."""
-    return observe_query(
-        manifest_path, query, should_trigger, timeout, model, trace_dir,
-        ablation, identity, protocol_sha256,
-    ).as_row()
 
 
 def trigger_query_from_case(case: dict[str, Any]) -> str:

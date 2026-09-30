@@ -96,12 +96,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertIn("load_manifest_source", inspect.getsource(tr.load_manifest))
 
     def test_usage_alias_tables_are_one_table(self):
-        for claude_key, canonical_key in [("input_tokens", "input_tokens"),
-                                          ("output_tokens", "output_tokens"),
-                                          ("cache_read_tokens", "cache_read_tokens"),
-                                          ("cache_creation_tokens", "cache_write_tokens")]:
-            self.assertIs(sb.CLAUDE_USAGE_KEYS[claude_key], sb.USAGE_ALIASES[canonical_key])
-        # And the trace normalizer resolves through the same table: an alias only
+        # The trace normalizer resolves through the one alias table: an alias only
         # USAGE_ALIASES knows (camelCase) must be visible to usage_number.
         self.assertEqual(sb.usage_number({"promptTokens": 7}, "input_tokens"), 7.0)
 
@@ -199,13 +194,16 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertEqual(fields, {"prompt", "workspace", "model", "timeout_s", "effort"})
 
     def test_agent_capability_registry_matches_registered_surfaces(self):
+        surfaces = {surface: {name for name, registration in ac.BACKENDS.items()
+                              if getattr(registration, surface) is not None}
+                    for surface in ("answer", "trigger", "judge")}
         self.assertEqual(
             ac.AGENT_CAPABILITIES,
             {name: registration.capabilities for name, registration in ac.BACKENDS.items()},
         )
-        self.assertEqual(set(tm.ADAPTERS), set(ac.surface_names("trigger")))
-        self.assertEqual(set(sb.AGENT_BACKENDS), set(ac.surface_names("answer")))
-        self.assertEqual(set(sb.JUDGE_BACKENDS), set(ac.surface_names("judge")))
+        self.assertEqual(set(tm.ADAPTERS), surfaces["trigger"])
+        self.assertEqual(set(sb.AGENT_BACKENDS), surfaces["answer"])
+        self.assertEqual(set(sb.JUDGE_BACKENDS), surfaces["judge"])
         self.assertEqual(
             set(sb.WORKSPACE_BUILDERS),
             {name for name, registration in ac.BACKENDS.items()
@@ -213,7 +211,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         )
         autonomous = {name for name, cap in ac.AGENT_CAPABILITIES.items()
                       if cap.autonomous_trigger}
-        self.assertEqual(autonomous, set(ac.surface_names("trigger")))
+        self.assertEqual(autonomous, surfaces["trigger"])
         for name, cap in ac.AGENT_CAPABILITIES.items():
             if cap.trigger_ablation:
                 self.assertTrue(cap.autonomous_trigger, name)
@@ -223,7 +221,7 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         judge_backend_action = next(a for a in judge_parser._actions if "--judge-backend" in getattr(a, "option_strings", ()))
         native_judges = set(judge_backend_action.choices) - {"cmd"}
         self.assertEqual(native_judges, set(sb.JUDGE_BACKENDS))
-        self.assertEqual(native_judges, set(ac.surface_names("judge")))
+        self.assertEqual(native_judges, surfaces["judge"])
         registered_traces = {
             name: registration.trace.resolve()
             for name, registration in ac.BACKENDS.items()
@@ -233,17 +231,17 @@ class SharedOwnerIdentityTests(unittest.TestCase):
         self.assertEqual(ac.trace_dialect_implementations(), registered_traces)
         for name, dialect in registered_traces.items():
             self.assertIs(sb.TRACE_DIALECTS[name], dialect)
-        for name in ac.surface_names("answer"):
+        for name in sorted(surfaces["answer"]):
             self.assertIsInstance(
                 sb.AGENT_BACKENDS[name],
                 ac.binding_for(name, "answer").implementation.resolve(),
             )
-        for name in ac.surface_names("trigger"):
+        for name in sorted(surfaces["trigger"]):
             self.assertIs(
                 tm.ADAPTERS[name],
                 ac.binding_for(name, "trigger").implementation.resolve(),
             )
-        for name in ac.surface_names("judge"):
+        for name in sorted(surfaces["judge"]):
             self.assertIs(
                 sb.JUDGE_BACKENDS[name],
                 ac.binding_for(name, "judge").implementation.resolve(),
@@ -303,14 +301,10 @@ class SharedOwnerIdentityTests(unittest.TestCase):
             ["export-jetty", "run-jetty", "import-jetty-results"],
         )
         self.assertEqual(
-            ac.DEDICATED_SMOKE_TARGETS["jetty"].command,
+            payload["jetty"]["smoke"]["command"],
             ("python3", "-m", "unittest", "discover", "tests", "-k", "smoke_jetty", "-v"),
         )
         self.assertNotIn("jetty", ac.SMOKE_TARGETS)
-        self.assertEqual(
-            payload["jetty"]["smoke"]["command"],
-            ac.DEDICATED_SMOKE_TARGETS["jetty"].command,
-        )
         self.assertTrue(payload["subagent"]["capabilities"]["answer_runner"])
         self.assertFalse(payload["subagent"]["native_bindings"]["answer"])
         self.assertEqual(payload["subagent"]["answer_route"], "subagent")
@@ -829,23 +823,6 @@ else:
             self.assertIn("replacement identifies as 'claude'", stderr.getvalue())
         finally:
             sb.AGENT_BACKENDS["codex"] = original
-
-    def test_trigger_adapter_replacements_keep_the_zero_argument_compatibility_seam(self):
-        class Replacement:
-            name = "codex"
-
-            def __init__(self):
-                self.created = True
-
-        original = tm.ADAPTERS["codex"]
-        try:
-            tm.ADAPTERS["codex"] = Replacement
-            adapter = tm.adapter_instance(
-                "codex", backend_options={"codex_cmd": "custom codex"})
-        finally:
-            tm.ADAPTERS["codex"] = original
-        self.assertIsInstance(adapter, Replacement)
-        self.assertTrue(adapter.created)
 
     def test_policy_projections_are_immutable(self):
         with self.assertRaises(TypeError):

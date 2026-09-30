@@ -129,7 +129,7 @@ assumed.
 - **Goal:** ship graders authors reach for often, so they stop hand-rolling rubrics.
 - **Abstractions used or changed:** `tool_call` and `structured_output` are deterministic, so
   they become new types in `TEXT_ASSERTIONS` / `PROCESS_ASSERTIONS` and gain a branch in
-  `assertion_result`. `tool_call` reuses `command_events` (`:6426`) and the `command_order`
+  `assertion_result`. `tool_call` reuses `command_events` (`:6437`) and the `command_order`
   logic; `structured_output` extends `json_field_equals` with JSON-Schema validation.
   `factuality` adds no core code: it is a named rubric that `judge_prompt` (`:11747`) renders
   and still runs through `--judge-cmd`.
@@ -333,7 +333,7 @@ assumed.
 - **Goal:** deterministic re-runs that pay nothing for external dependencies, by recording tool
   inputs and outputs.
 - **Abstractions used or changed:** this lives in the runner, not core grading. Recording sits
-  beside `write_trace_artifacts` (`:8287`): a `tool-replay.json` keyed per tool, with
+  beside `write_trace_artifacts` (`:8298`): a `tool-replay.json` keyed per tool, with
   `sanitize` and `version`. Modes (`auto`, `record`, `off`, `strict`) come from an environment
   variable that `run_codex` and the Pi and subagent runners read.
 - **Design:** orthogonal to the disk re-grade the harness already does. Replay makes the agent
@@ -344,8 +344,8 @@ assumed.
 
 ### 2.4 OpenTelemetry GenAI normalization target
 - **Goal:** make the trace adapter boundary a standard rather than a bespoke schema.
-- **Abstractions used or changed:** `normalize_trace_record` (`:7344`) and
-  `normalize_trace_records` (`:8003`) keep their inputs but emit OTel GenAI semantic-key
+- **Abstractions used or changed:** `normalize_trace_record` (`:7355`) and
+  `normalize_trace_records` (`:8014`) keep their inputs but emit OTel GenAI semantic-key
   attributes; the `events.json` schema version bumps. Process and efficiency assertions read the
   new keys with backward-compatible fallbacks.
 - **Design:** additive schema. An old `events.json` still grades.
@@ -447,7 +447,7 @@ assumed.
 - **Goal:** evaluate conversational skills across a send/respond sequence.
 - **Abstractions changed (core contract):** a case gains an optional `turns` list. The
   run-output contract grows from one `output.md` to a turn-indexed transcript, so
-  `read_output_base` (`:6289`) and `discover_run_bases` learn the turn layout; runners drive the
+  `read_output_base` (`:6300`) and `discover_run_bases` learn the turn layout; runners drive the
   sequence; `grade_case_variant` grades per turn and aggregates.
 - **Design:** single-shot stays the default, so existing manifests are untouched.
 - **Testing:** a fixture multi-turn run asserting per-turn grading and aggregate, plus a

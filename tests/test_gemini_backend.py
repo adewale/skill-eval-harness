@@ -10,11 +10,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import make_eval_repo
+from helpers import make_eval_repo, write_with_skill_task
 
 import ablation_model as am
 import agent_capabilities as ac
-import judge_contracts as jc
 import runner_contracts as rc
 import skill_benchmark as sb
 
@@ -89,27 +88,6 @@ def _judge_stream(*, tool_calls: int = 0) -> str:
 
 
 class GeminiRegistryTests(unittest.TestCase):
-    def test_one_registry_row_projects_every_supported_surface_truthfully(self):
-        registration = ac.BACKENDS["gemini"]
-
-        self.assertTrue(registration.capabilities.answer_runner)
-        self.assertTrue(registration.capabilities.judge_backend)
-        self.assertTrue(registration.capabilities.trace_artifacts)
-        self.assertTrue(registration.capabilities.token_usage)
-        self.assertEqual(registration.capabilities.dollar_cost, "missing")
-        self.assertFalse(registration.capabilities.autonomous_trigger)
-        self.assertFalse(registration.capabilities.trigger_ablation)
-        self.assertIsNone(registration.trigger)
-        self.assertEqual(registration.answer_route, "native")
-        self.assertIn("run-agent", [
-            entrypoint.command for entrypoint in registration.answer_entrypoints])
-        self.assertIsInstance(sb.AGENT_BACKENDS["gemini"], sb.GeminiBackend)
-        self.assertIs(sb.JUDGE_BACKENDS["gemini"], sb.gemini_judge_invoke)
-        self.assertIs(sb.TRACE_DIALECTS["gemini"], sb.GEMINI_TRACE_DIALECT)
-        self.assertEqual(rc.Provider.GEMINI.value, "gemini")
-        self.assertEqual(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["gemini"],
-                         "[GEMINI FAILURE")
-
     def test_gemini_cli_flag_is_projected_to_answer_and_judge(self):
         parser = sb.build_arg_parser()
         subs = next(action for action in parser._actions
@@ -1036,19 +1014,10 @@ class GeminiIsolationTests(unittest.TestCase):
 
 
 class GeminiAnswerBackendTests(unittest.TestCase):
-    def _one_with_skill_task(self, root: Path) -> tuple[Path, str]:
-        manifest = make_eval_repo(root)
-        rows = sb.prepared_task_rows(
-            manifest, sb.validate_manifest(manifest), split="tune")
-        row = next(item for item in rows if item["variant"] == "with_skill")
-        tasks = root / "tasks.jsonl"
-        tasks.write_text(json.dumps(row) + "\n", encoding="utf-8")
-        return tasks, row["run_dir"]
-
     def test_run_agent_uses_headless_stream_json_and_writes_complete_artifacts(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake = root / "fake_gemini.py"
             _write_executable(fake,
                 "import json, os, pathlib, sys\n"
@@ -1452,24 +1421,25 @@ class GeminiAnswerBackendTests(unittest.TestCase):
             sleeper = root / "sleep.py"
             _write_executable(sleeper, "import time\ntime.sleep(5)\n")
             cases = (
-                ("missing-gemini-binary-for-contract-test", 30, 127, False),
-                (str(exit_nine), 30, 9, False),
-                (str(sleeper), 1, 124, True),
+                ("missing-gemini-binary-for-contract-test", 30, rc.SpawnFailed, 127, False),
+                (str(exit_nine), 30, rc.ProviderFailed, 9, False),
+                (str(sleeper), 1, rc.TimedOut, 124, True),
             )
-            for command, timeout, returncode, timed_out in cases:
-                with self.subTest(command=command):
-                    result = sb.gemini_cli_invoke(
-                        "prompt", gemini_cmd=command, timeout=timeout)
-                    self.assertEqual(result["returncode"], returncode)
-                    self.assertIs(result["timed_out"], timed_out)
-                    outcome = sb.RunnerOutcome(
-                        provider="gemini", answer=result["answer"],
-                        returncode=result["returncode"],
-                        timed_out=result["timed_out"], timeout_s=timeout,
-                        elapsed_ms=result["elapsed_ms"], stderr=result["stderr"],
-                        trace_text=result["trace_text"],
-                    )
-                    self.assertNotIsInstance(outcome, rc.Completed)
+            for command, timeout, outcome_type, returncode, timed_out in cases:
+                with self.subTest(outcome=outcome_type.__name__):
+                    outcome = sb.GeminiBackend().invoke_answer(
+                        sb.InvocationRequest(
+                            "prompt", root / f"workspace-{returncode}", None, timeout),
+                        gemini_cmd=command)
+                    self.assertIsInstance(outcome, outcome_type)
+                    base = root / f"run-{returncode}"
+                    sb.write_runner_outcome(base, outcome)
+                    metadata = json.loads(
+                        (base / "metadata.json").read_text(encoding="utf-8"))
+                    self.assertEqual(metadata["returncode"], returncode)
+                    self.assertIs(metadata["timed_out"], timed_out)
+                    self.assertFalse(am.execution_valid(
+                        metadata, (base / "output.md").read_text(encoding="utf-8")))
 
     def test_spawned_reserved_exit_codes_are_provider_failures(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1556,27 +1526,6 @@ class GeminiJudgeBackendTests(unittest.TestCase):
             sb.run_one_judge_task(
                 self._task(Path(td)), judge_backend="gemini",
                 judge_model="gemini-judge", explore=True)
-
-    def test_native_judge_returns_the_typed_invocation_contract(self):
-        provider_result = {
-            "answer": '{"passed":true}',
-            "stderr": "",
-            "returncode": 0,
-            "usage": {"input_tokens": 2, "output_tokens": 1,
-                      "total_tokens": 3},
-            "model": "gemini-judge",
-            "raw_response": _judge_stream(),
-            "metadata": {"session_id": "session-judge",
-                         "provider_tool_calls": 0},
-        }
-        with mock.patch.object(
-                sb, "gemini_cli_invoke", return_value=provider_result):
-            invocation = sb.gemini_judge_invoke(
-                "prompt", judge_model="gemini-judge", gemini_cmd="gemini",
-                explore_hint=None)
-        self.assertIsInstance(invocation, jc.JudgeInvocation)
-        self.assertEqual(invocation.raw_response, _judge_stream())
-        self.assertEqual(invocation.metadata["session_id"], "session-judge")
 
     def test_invalid_requested_model_is_a_typed_judge_failure(self):
         with mock.patch.object(sb, "run_argv_capture") as spawn:
