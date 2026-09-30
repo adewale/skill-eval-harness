@@ -185,6 +185,8 @@ from jetty_contracts import (
     lifecycle_from_status,
 )
 from json_contracts import (
+    StrictJSONViolation,
+    strict_json_decoder,
     strict_json_loads,
     thaw_json_value,
     unique_json_object,
@@ -585,10 +587,10 @@ def iter_json_objects(text: str):
     for line in text.splitlines():
         try:
             yield strict_json_loads(line)
+        except StrictJSONViolation as exc:
+            raise ValueError(exc.msg) from exc
         except json.JSONDecodeError as exc:
-            if (exc.__cause__ is not None
-                    or "duplicate object key" in exc.msg
-                    or "non-finite numeric constant" in exc.msg):
+            if exc.__cause__ is not None:
                 raise ValueError(exc.msg) from exc
             continue
 
@@ -7300,9 +7302,7 @@ def parse_trace_jsonl_text_with_lines(
         try:
             obj = strict_json_loads(line)
         except json.JSONDecodeError as exc:
-            if ("duplicate object key" in exc.msg
-                    or "non-finite numeric constant" in exc.msg
-                    ) and strict_json_errors:
+            if isinstance(exc, StrictJSONViolation) and strict_json_errors:
                 raise ValueError(exc.msg) from exc
             errors.append(f"line {line_number}: {exc}")
             continue
@@ -11621,13 +11621,7 @@ def load_judge_results(path: str | None) -> dict[str, dict[str, Any]]:
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
-    def reject_constant(constant: str) -> Any:
-        raise json.JSONDecodeError(
-            f"non-finite numeric constant is not valid JSON: {constant}", "", 0)
-
-    decoder = json.JSONDecoder(
-        object_pairs_hook=unique_json_object,
-        parse_constant=reject_constant)
+    decoder = strict_json_decoder()
     found: list[dict[str, Any]] = []
     i = 0
     while i < len(text):
@@ -11637,10 +11631,9 @@ def extract_json_object(text: str) -> dict[str, Any]:
             continue
         try:
             obj, end = decoder.raw_decode(text[i:])
-        except json.JSONDecodeError as exc:
-            if ("duplicate object key" in exc.msg
-                    or "non-finite numeric constant" in exc.msg):
-                raise ValueError(exc.msg) from exc
+        except StrictJSONViolation as exc:
+            raise ValueError(exc.msg) from exc
+        except json.JSONDecodeError:
             i += 1
             continue
         if isinstance(obj, dict):
