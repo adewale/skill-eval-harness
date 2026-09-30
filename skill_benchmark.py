@@ -14708,15 +14708,6 @@ def mean_rate(rows: list[dict[str, Any]], key: str = "objective_pass_rate") -> f
     return ResultSet(rows).mean_rate(key)
 
 
-def _exact_rate(successes: int, observations: int) -> float:
-    """An inference-grade rate: never round before computing a delta/test."""
-    if (isinstance(successes, bool) or not isinstance(successes, int)
-            or isinstance(observations, bool) or not isinstance(observations, int)
-            or observations < 1 or successes < 0 or successes > observations):
-        raise ValueError("rate counts must satisfy 0 <= successes <= observations")
-    return successes / observations
-
-
 def sign_flip_significance(deltas: list[float], *, max_exact_n: int = 14, samples: int = 4096) -> dict[str, Any]:
     """The paired lift test (roadmap 2.2). ``effect_estimates`` owns it so the
     lift interval inverts the very test reported here."""
