@@ -58,7 +58,7 @@ class FindingKindTests(unittest.TestCase):
 
 
 class EvalHealthTests(unittest.TestCase):
-    def test_a_finding_makes_its_mark_a_concern_and_unobserved_is_not_ok(self):
+    def test_a_finding_makes_its_mark_a_concern_and_unavailable_is_not_ok(self):
         health = fd.eval_health(
             [{"kind": "floor-eval", "severity": "recommended", "message": "m"},
              {"kind": "no-lift-eval", "severity": "recommended", "message": "m"},
@@ -69,10 +69,10 @@ class EvalHealthTests(unittest.TestCase):
         self.assertEqual(by_id["baseline-headroom"]["status"], "concern")
         self.assertEqual(by_id["baseline-headroom"]["finding_kinds"], ["floor-eval"])
         self.assertEqual(by_id["grader-correct"]["status"], "ok")
-        self.assertEqual(by_id["noise-below-min-lift"]["status"], "unobserved")
+        self.assertEqual(by_id["noise-below-min-lift"]["status"], "unavailable")
         self.assertEqual(by_id["realistic-cases"]["notes"], ["activation is forced"])
         self.assertEqual([entry["mark"] for entry in health["marks"]], [1, 2, 3, 4, 5])
-        self.assertEqual(health["counts"], {"ok": 1, "concern": 1, "unobserved": 3})
+        self.assertEqual(health["counts"], {"ok": 1, "concern": 1, "unavailable": 3})
 
 
 class GatePolicyTests(unittest.TestCase):

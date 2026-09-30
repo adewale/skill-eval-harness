@@ -1,6 +1,9 @@
 """One vocabulary for "did we observe it", one list of telemetry sources."""
+import ast
+import subprocess
 import typing
 import unittest
+from pathlib import Path
 
 import agent_capabilities as caps
 import judge_contracts as jc
@@ -42,6 +45,31 @@ class AvailabilityTests(unittest.TestCase):
     def test_only_complete_counts_as_observed(self):
         self.assertEqual([item for item in oc.Availability if item.observed],
                          [oc.Availability.COMPLETE])
+
+
+class RetiredSpellingTests(unittest.TestCase):
+    """The spellings Availability replaced do not come back in new code.
+
+    observation_contracts keeps them only to read old artifacts. Two Gemini
+    sandbox fields persisted before this vocabulary are listed explicitly."""
+
+    RETIRED = {"unobserved", "not-requested", "backend-default", "not-applicable"}
+    PERSISTED = {("skill_benchmark.py", "not-applicable"): 2}
+
+    def test_no_production_module_writes_a_retired_spelling(self):
+        root = Path(__file__).resolve().parents[1]
+        files = subprocess.check_output(
+            ["git", "ls-files", "*.py", "scripts/*.py"], cwd=root, text=True).split()
+        found: dict[tuple[str, str], int] = {}
+        for name in files:
+            if name.startswith(("tests/", "type_tests/")) or name == "observation_contracts.py":
+                continue
+            tree = ast.parse((root / name).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and node.value in self.RETIRED:
+                    key = (name, str(node.value))
+                    found[key] = found.get(key, 0) + 1
+        self.assertEqual(found, self.PERSISTED)
 
 
 class TelemetrySourceTests(unittest.TestCase):

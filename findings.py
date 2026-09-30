@@ -343,7 +343,9 @@ def kind_of(finding: Mapping[str, Any] | Finding) -> FindingKind | None:
 class MarkStatus(str, Enum):
     OK = "ok"
     CONCERN = "concern"
-    UNOBSERVED = "unobserved"
+    # The canonical spelling for "no evidence was available", as in
+    # observation_contracts.Availability.
+    UNAVAILABLE = "unavailable"
 
 
 def eval_health(
@@ -355,9 +357,9 @@ def eval_health(
     """Rate an eval on the five marks from findings already produced.
 
     ``observed`` says, per mark, whether the inputs held any evidence for it
-    (a mark measured on runs is unobserved without runs). A mark with a
-    finding is a concern; an observed mark with none is ok; the rest are
-    unobserved, which is not the same as ok.
+    (a mark measured on runs has none without runs). A mark with a finding is
+    a concern; an observed mark with none is ok; the rest are unavailable,
+    which is not the same as ok.
     """
     by_mark: dict[EvalMark, list[str]] = {mark: [] for mark in EvalMark}
     for finding in findings:
@@ -372,7 +374,7 @@ def eval_health(
         elif observed.get(mark, False):
             status = MarkStatus.OK
         else:
-            status = MarkStatus.UNOBSERVED
+            status = MarkStatus.UNAVAILABLE
         entry: dict[str, Any] = {
             "mark": mark.number,
             "id": mark.value,

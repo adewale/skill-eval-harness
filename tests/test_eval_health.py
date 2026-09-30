@@ -105,8 +105,8 @@ class ReadinessGateTests(unittest.TestCase):
         self.assertIn("benchmark-incomplete", blockers)
         self.assertEqual(code, 1)
         self.assertIn("benchmark report is incomplete", stderr)
-        # Marks measured on runs are unobserved, not ok, on partial evidence.
-        self.assertEqual(marks(report)["noise-below-min-lift"]["status"], "unobserved")
+        # Marks measured on runs are unavailable, not ok, on partial evidence.
+        self.assertEqual(marks(report)["noise-below-min-lift"]["status"], "unavailable")
 
     def test_fail_on_names_kinds_and_fails_closed_on_partial_runs(self):
         with tempfile.TemporaryDirectory() as td:
