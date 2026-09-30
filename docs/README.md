@@ -100,7 +100,7 @@ those two, `authoring-evals.md`, and `migrating-evals.md` — do not all carry r
    deeper tool picks up.
 
 Housekeeping when the doc lands: add its row to the table above (this index is the
-only list of docs; the main README points here); tick (or add) its entry in the TODO backlog; keep any
-`name:line` code references accurate — `tests/test_doc_refs.py` fails on drift;
-if the journey adds a command, `CONTRIBUTING.md`'s checklist applies to the
-command too.
+only list of docs; the main README points here); tick (or add) its entry in the TODO
+backlog; keep any `name:line` code references accurate — `tests/test_doc_refs.py` fails
+on drift, and `tests/test_doc_facts.py` fails if the new doc is missing from this index;
+if the journey adds a command, `CONTRIBUTING.md`'s checklist applies to the command too.
