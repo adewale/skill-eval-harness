@@ -7,7 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from helpers import attach_jetty_task_contract, make_eval_repo
+from helpers import (
+    attach_jetty_task_contract,
+    demo_manifest,
+    make_eval_repo,
+    write_demo_manifest,
+)
 
 import skill_benchmark as sb
 
@@ -104,29 +109,7 @@ class RunArtifactOwnershipTests(unittest.TestCase):
 
 class JettyImportTransactionTests(unittest.TestCase):
     def make_import(self, root: Path) -> tuple[Path, list[dict], dict]:
-        repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text(
-            "---\nname: demo\ndescription: Demo\n---\n", encoding="utf-8"
-        )
-        (repo / "evals").mkdir()
-        manifest = repo / "evals" / "shared-benchmark.json"
-        manifest.write_text(json.dumps({
-            "version": 1,
-            "skill_name": "demo",
-            "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [{
-                "id": "case-1",
-                "split": "tune",
-                "kind": "behavior",
-                "prompt": "Say alpha.",
-                "assertions": [
-                    {"name": "has-alpha", "type": "contains", "value": "alpha"}
-                ],
-            }],
-            "ablations": [],
-        }), encoding="utf-8")
+        manifest = write_demo_manifest(root, demo_manifest())
         validated = sb.validate_manifest(manifest)
         tasks = sb.prepared_task_rows(manifest, validated, models=["model-a"])
         design = sb.answer_design_from_tasks(tasks)
@@ -159,11 +142,17 @@ class JettyImportTransactionTests(unittest.TestCase):
         )
 
     def invoke(self, manifest: Path, records_path: Path, runs: Path) -> None:
+        sb.import_jetty_results(SimpleNamespace(
+            manifest=str(manifest), jetty_runs=str(records_path), runs=str(runs)
+        ))
+
+    def assert_import_rejected(
+        self, manifest: Path, records_path: Path, runs: Path, message: str,
+    ) -> None:
         stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            sb.import_jetty_results(SimpleNamespace(
-                manifest=str(manifest), jetty_runs=str(records_path), runs=str(runs)
-            ))
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            self.invoke(manifest, records_path, runs)
+        self.assertIn(message, stderr.getvalue())
 
     def test_preflight_failure_writes_neither_design_nor_any_run(self):
         with tempfile.TemporaryDirectory() as td:
@@ -177,8 +166,8 @@ class JettyImportTransactionTests(unittest.TestCase):
             records_path = root / "jetty.jsonl"
             self.write_records(records_path, records)
 
-            with self.assertRaises(SystemExit):
-                self.invoke(manifest, records_path, runs)
+            self.assert_import_rejected(
+                manifest, records_path, runs, "unsafe or ambiguous path")
 
             self.assertFalse((runs / sb.ANSWER_DESIGN_NAME).exists())
             self.assertEqual(
@@ -196,8 +185,9 @@ class JettyImportTransactionTests(unittest.TestCase):
             records_path = root / "jetty.jsonl"
             self.write_records(records_path, records)
 
-            with self.assertRaises(SystemExit):
-                self.invoke(manifest, records_path, runs)
+            self.assert_import_rejected(
+                manifest, records_path, runs,
+                "harness identity changed after task attestation")
 
             self.assertFalse((runs / sb.ANSWER_DESIGN_NAME).exists())
             self.assertFalse(runs.exists())
@@ -228,8 +218,9 @@ class JettyImportTransactionTests(unittest.TestCase):
                 return real_replace(source, destination)
 
             with mock.patch.object(sb.os, "replace", side_effect=fail_second_install):
-                with self.assertRaises(SystemExit):
-                    self.invoke(manifest, records_path, runs)
+                self.assert_import_rejected(
+                    manifest, records_path, runs,
+                    "simulated second install failure")
 
             self.assertFalse((runs / sb.ANSWER_DESIGN_NAME).exists())
             for index, destination in enumerate(destinations, 1):
