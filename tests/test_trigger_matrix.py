@@ -20,6 +20,7 @@ Live smokes need the relevant CLI and API credentials, and spend real tokens.
 The cheap agent smoke asserts invocation only; the trigger-matrix smokes assert
 observed trigger-eval runs and at least one autonomous load.
 """
+import importlib.util
 import json
 import os
 import sys
@@ -1240,18 +1241,34 @@ class AgentInvokeSmokeConfigTests(unittest.TestCase):
         self.assertEqual(models["pi"], [None])
         self.assertEqual(models["vibe"], [None])
 
-    def test_advertised_live_smoke_envs_are_consumed_by_tests(self):
-        # Trigger smokes live here; Gemini and Jetty answer-path smokes have
-        # dedicated modules. An advertised env var must gate a real test.
-        sources = [
-            Path(__file__),
-            Path(__file__).with_name("test_gemini_backend.py"),
-            Path(__file__).with_name("test_smoke_jetty.py"),
-        ]
-        test_source = "".join(p.read_text(encoding="utf-8") for p in sources)
-        for agent, cap in AGENT_CAPABILITIES.items():
-            if cap.live_smoke_env:
-                self.assertIn(cap.live_smoke_env, test_source, agent)
+    def test_each_advertised_live_smoke_env_enables_a_skipped_test(self):
+        # Users are told to set a backend's live_smoke_env to run its live
+        # smoke, so setting it must turn on a test that is skipped by default.
+        advertised = {cap.live_smoke_env: agent for agent, cap in AGENT_CAPABILITIES.items()
+                      if cap.live_smoke_env}
+
+        def runnable_tests(path, environ):
+            spec = importlib.util.spec_from_file_location(f"_smoke_gate_{path.stem}", path)
+            module = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(os.environ, environ):
+                spec.loader.exec_module(module)
+            loader = unittest.TestLoader()   # unaffected by a -k name filter
+            return {f"{cls.__name__}.{name}"
+                    for cls in vars(module).values()
+                    if isinstance(cls, type) and issubclass(cls, unittest.TestCase)
+                    and not getattr(cls, "__unittest_skip__", False)
+                    for name in loader.getTestCaseNames(cls)
+                    if not getattr(getattr(cls, name), "__unittest_skip__", False)}
+
+        unset = {name: "" for name in advertised}
+        for env_name, agent in advertised.items():
+            enabled = set()
+            for path in sorted(Path(__file__).parent.glob("test_*.py")):
+                if env_name in path.read_text(encoding="utf-8"):
+                    enabled |= (runnable_tests(path, {**unset, env_name: "1"})
+                                - runnable_tests(path, unset))
+            with self.subTest(agent=agent, env=env_name):
+                self.assertTrue(enabled, f"{env_name}=1 enables no test")
 
 
 @unittest.skipUnless(os.environ.get("RUN_TRIGGER_SMOKE") == "1",
