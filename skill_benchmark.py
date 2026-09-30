@@ -493,13 +493,7 @@ def write_json(path: Path, data: Any) -> None:
         data, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def _atomic_write_text(
-    path: Path,
-    text: str,
-    *,
-    before_replace: Callable[[], None] | None = None,
-    after_replace: Callable[[], None] | None = None,
-) -> None:
+def _atomic_write_text(path: Path, text: str) -> None:
     """Durably replace one text file without exposing a partial new value."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, raw_tmp = tempfile.mkstemp(
@@ -510,8 +504,6 @@ def _atomic_write_text(
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        if before_replace is not None:
-            before_replace()
         os.replace(tmp, path)
         try:
             parent_fd = os.open(path.parent, os.O_RDONLY)
@@ -525,8 +517,6 @@ def _atomic_write_text(
                 pass
             finally:
                 os.close(parent_fd)
-        if after_replace is not None:
-            after_replace()
     finally:
         try:
             tmp.unlink()
@@ -534,29 +524,12 @@ def _atomic_write_text(
             pass
 
 
-def atomic_write_jsonl(
-    path: Path,
-    records: Iterable[dict[str, Any]],
-    *,
-    fault_inject: Callable[[str], None] | None = None,
-) -> None:
+def atomic_write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
     """Atomically publish a complete JSONL prefix for resumable producers."""
-    text = "".join(
+    _atomic_write_text(path, "".join(
         json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
         for record in records
-    )
-    _atomic_write_text(
-        path,
-        text,
-        before_replace=(
-            (lambda: fault_inject("before_result_commit"))
-            if fault_inject is not None else None
-        ),
-        after_replace=(
-            (lambda: fault_inject("after_result_commit"))
-            if fault_inject is not None else None
-        ),
-    )
+    ))
 
 
 def emit_report(report: Any, out: str | Path | None) -> None:

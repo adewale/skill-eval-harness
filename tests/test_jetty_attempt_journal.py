@@ -359,20 +359,23 @@ class JettyAttemptJournalTests(unittest.TestCase):
             path = Path(td) / "runs.jsonl"
             path.write_text('{"old":true}\n', encoding="utf-8")
             records = [{"new": 1}, {"new": 2}]
+            real_replace = os.replace
 
-            with self.assertRaises(InjectedCrash):
-                sb.atomic_write_jsonl(
-                    path, records,
-                    fault_inject=crash_on("before_result_commit"),
-                )
-            self.assertEqual(path.read_text(encoding="utf-8"), '{"old":true}\n')
+            def replace_then_crash(source, destination):
+                real_replace(source, destination)
+                raise InjectedCrash("after replace")
 
-            with self.assertRaises(InjectedCrash):
-                sb.atomic_write_jsonl(
-                    path, records,
-                    fault_inject=crash_on("after_result_commit"),
-                )
-            self.assertEqual(sb.load_jsonl(path), records)
+            for crash, published in (
+                (InjectedCrash("before replace"), [{"old": True}]),
+                (replace_then_crash, records),
+            ):
+                with (
+                    mock.patch.object(sb.os, "replace", side_effect=crash),
+                    self.assertRaises(InjectedCrash),
+                ):
+                    sb.atomic_write_jsonl(path, records)
+                self.assertEqual(sb.load_jsonl(path), published)
+                self.assertEqual([p.name for p in Path(td).iterdir()], ["runs.jsonl"])
 
     def test_run_jetty_commits_the_journal_and_rebuilds_output_without_network(self):
         with tempfile.TemporaryDirectory() as td:
