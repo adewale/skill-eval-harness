@@ -447,7 +447,8 @@ assumed.
 - **Goal:** evaluate conversational skills across a send/respond sequence.
 - **Abstractions changed (core contract):** a case gains an optional `turns` list. The
   run-output contract grows from one `output.md` to a turn-indexed transcript, so
-  `read_output_base` (`:6296`) and `discover_run_bases` learn the turn layout; runners drive the
+  `read_output_base` (`:6296`) and `discover_run_bases` (since replaced by
+  `discover_run_bases_under` with `discover_case_model_roots`) learn the turn layout; runners drive the
   sequence; `grade_case_variant` grades per turn and aggregates.
 - **Design:** single-shot stays the default, so existing manifests are untouched.
 - **Testing:** a fixture multi-turn run asserting per-turn grading and aggregate, plus a
@@ -547,7 +548,9 @@ reachable p is 0.0625 (`2 / 2**5`), and reaching 0.05 takes six cases moving the
   improve beyond noise, revert on a regression or when tune improves while held-out stays flat.
 - [ ] **5.11 Export to the hillclimb on-disk format (`export-hillclimb`).** Goal: write a harness run
   tree as the hillclimb guide's layout (`_state.json` with split ids, per-round `results.jsonl`,
-  `traces/<id>_rep<k>.json`), so that loop can start from a harness baseline and split.
+  `traces/<id>_rep<k>.json`), so that loop can start from a harness baseline and split. The
+  mapping: `without_skill` → `baseline/`, `with_skill` → `v1/`, and `tune`/`holdout`/`holdback` →
+  train/validation/test, so `/claude-api hillclimb` can climb a skill with the harness as its eval.
 
 ---
 

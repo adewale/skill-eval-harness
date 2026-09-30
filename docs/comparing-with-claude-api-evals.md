@@ -229,10 +229,10 @@ For a skill, the pieces line up: the skill is the artifact the hillclimb tunes,
 `without_skill` is the baseline, and each skill revision's `with_skill` arm is a variant.
 The hillclimb guide reads a fixed on-disk layout (`_state.json`, `baseline/`, `vN/`, each
 variant with `results.jsonl` and `traces/`). An `export-hillclimb` command that writes a
-harness run into that layout, mapping `without_skill` → `baseline`, `with_skill` → `v1`,
-and `tune` / `holdout` / `holdback` → train / validation / test, is roadmap 5.11 and **not
-implemented**. Until it exists, run the harness at each round yourself and read its
-outputs at the step that asks for them.
+harness run into that layout is roadmap 5.11 and **not implemented**; the
+[spec entry](eval-framework-roadmap-spec.md#bucket-5--eval-health-from-the-claude-api-build-eval-and-hillclimb-comparison)
+holds the arm and split mapping it would use. Until it exists, run the harness at each
+round yourself and read its outputs at the step that asks for them.
 
 ### Which harness output answers each guide step
 

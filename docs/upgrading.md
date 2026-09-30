@@ -197,8 +197,9 @@ changes first:
 - **Comparisons use exact pairs.** Lift, reliability, cost, token, slice, readiness, and
   ablation views exclude missing, mismatched, ineligible, or cross-population arms.
 - **Ablation confirmation needs more evidence.** The two-sided paired sign-flip gate
-  cannot confirm five informative pairs (`p >= 0.0625`); six unanimous pairs reach
-  `p = 0.03125`. Named assertion coverage must also be symmetric across the pair.
+  needs at least six unanimous pairs to confirm (see **Inference unit** in
+  [`vocabulary.md`](vocabulary.md#report-signals)). Named assertion coverage must also be
+  symmetric across the pair.
 - **Failed Pi streams cannot pass as clean negative triggers.** Exit zero does not
   override a provider/protocol failure or a missing terminal event.
 - **Trace counts require proven completion.** Started, failed, malformed, and unknown
@@ -235,7 +236,8 @@ runs count, which pairs form, and how a few report and audit fields read.
   recorded earlier carry none of them, grade as before, and appear as `unrecorded` in the new
   `run_endings` report block.
 - A run whose `stop_class` is `truncated` or `turn_limit`, or whose `served_model_check` is
-  `mismatch`, is unscorable (`unscorable_reason`: `stopped:truncated`, `stopped:turn_limit`,
+  `mismatch`, is unscorable ([execution validity](vocabulary.md#run-artifacts);
+  `unscorable_reason`: `stopped:truncated`, `stopped:turn_limit`,
   `served_model_mismatch`) and blocks its pair. A new Claude run tree can therefore have fewer
   scorable pairs than an older tree of the same cases; read `unscorable_reason` before reading the
   smaller denominator as a skill change. A refusal is still graded.

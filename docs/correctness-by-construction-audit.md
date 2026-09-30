@@ -436,6 +436,10 @@ Mode-specific constructors preserve the distinction between materialized, instru
 and invalid-skill experiments. `MaterializedArm` still requires a genuinely edited tree and matching
 provenance, so a canonical tree cannot be labeled as a materialized removal.
 
+*Note (2026-09-30): `Population` has since been replaced by `manifest_contracts.CasePopulation`, the
+one case-population enum, and the lift test and its interval now share one sign-flip core, so they
+also agree above 14 paired units.*
+
 ## Test proof
 
 The suite uses four complementary proof styles:

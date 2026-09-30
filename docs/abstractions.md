@@ -18,7 +18,7 @@ This is the **engineering lens** on the terms in [`vocabulary.md`](vocabulary.md
 | Split | `manifest_contracts.Split` | Which cases are visible during iteration. |
 | Assertion | `assertion_result` | A single pass/fail check over one run. |
 | Prepared task row | `prepared_task_rows` | A runner-neutral unit of work. |
-| Run-output contract | `discover_run_bases` | The files a runner leaves on disk. |
+| Run-output contract | `discover_run_bases_under` | The files a runner leaves on disk. |
 | Runner / adapter | `run_codex` | Turns a task row into contract files. |
 | Trace normalization | `normalize_trace_records` | Runner-specific events, made uniform. |
 | Judge plumbing | `collect_judge_tasks` | Qualitative checks, deferred to a model you supply. |
@@ -107,8 +107,8 @@ An assertion is one check. The code-side registries are `TEXT_ASSERTIONS`,
 graded `script` oracle set a real value), and `grade_case_variant` stamps a `severity`
 (`critical`/`gate`/`soft`) and an `oracle` tier (`strong`/`demo`/`live`) on each.
 
-Severity decides how a result counts: a `critical` failure vetoes the run and is excluded from
-every mean; a `gate` carries the pass rate; a `soft` result feeds only the graded score. The
+Severity decides how a result counts; the three tiers are defined under **Severity** in
+[`vocabulary.md`](vocabulary.md#things-you-assert). The
 graded shape (roadmap 2.2, ported from `adewale/anti-slop-writing`) adds two `judge` assertion
 forms:
 
@@ -170,7 +170,8 @@ runs/<case_id>/<variant>/[run-<n>/]metrics.json       # optional, normalized
 runs/<case_id>/<variant>/[run-<n>/]artifact-commit.json # harness-written commit marker
 ```
 
-`discover_run_bases` and `read_output_base` read this layout. A runner that writes these
+`discover_case_model_roots` finds each case's variant directories (with or without a model
+segment), and `discover_run_bases_under` and `read_output_base` read the runs under them. A runner that writes these
 files is a valid runner, whether it is Pi, Codex, Jetty, a subagent, or a person with a text
 editor. Harness-owned schema-v1 writers commit their required files and SHA-256 inventory by
 writing `artifact-commit.json` last; a missing or stale marker makes such a declared artifact
@@ -227,9 +228,9 @@ counted, because a subagent may use another model by design. The check reads `ma
 `mixed`, `unverifiable`, `unavailable` or `not_requested`. `EffortSetting` records the requested
 level and how the backend applied it, or `backend_default`. The shared writer fills `unavailable`
 and `backend_default` for any runner that reports nothing, so an old run and a run with no evidence
-are distinguishable. `execution_valid` treats a truncated, turn-limited or wrong-model run as
-unscorable, because grading it would blame the requested model for the eval's limits or for another
-model's answer; a refusal and a mixed run stay graded and are counted in the report's `run_endings`
+are distinguishable. `execution_valid` ([execution validity](vocabulary.md#run-artifacts)) treats a
+truncated, turn-limited or wrong-model run as unscorable, because grading it would blame the
+requested model for the eval's limits or for another model's answer; a refusal and a mixed run stay graded and are counted in the report's `run_endings`
 block.
 
 `observation_contracts.py` owns how the harness says whether it observed something.
@@ -350,8 +351,9 @@ Each paired block also carries `effect_estimates.sign_flip_interval`, the sign-f
 into a confidence interval. The test (`sign_flip_significance`) and the interval share one
 sign-flip core, so the interval excludes zero exactly when the test rejects "no lift", sampled
 path included, and `noise_check`, which reports the cases that moved, the smallest p-value those cases can
-reach (`2 / 2**k` for `k` moved cases), the interval half-width and the headroom left in
-`without_skill`. `construct_pairs` blocks a pair whose arms ran at different effort
+reach, the interval half-width and the headroom left in `without_skill`. `effect_estimates.Estimate`
+builds all three blocks from one set of deltas and stamps each with its `InferenceUnit`, defined
+under **Inference unit** in [`vocabulary.md`](vocabulary.md#report-signals). `construct_pairs` blocks a pair whose arms ran at different effort
 (`effort_mismatch`) or where only one arm recorded effort.
 `build_slice_summary` breaks results down
 by domain, difficulty, trigger type, and success goal. Case flags mark saturated, no-lift,

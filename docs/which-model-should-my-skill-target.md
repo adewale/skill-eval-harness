@@ -132,12 +132,14 @@ the weakest tier you support sets the bound, and a skill's value is a property o
   cross-model comparison"); the offline fan-out above carries exactly that note. Gemini
   and Vibe have no known effort control, so `--effort` is refused on them before any
   run starts.
-- **Per-model lift is a paired delta and needs repeats.** A single run per (case,
-  model) cell is a coin flip, exactly like every other lift number in the harness. Use
-  `prepare --runs-per-variant` to replicate before you rank tiers; a marginal ordering
-  over n=1 cells is noise. The offline block above shows `significant_at_0_05: false`
-  precisely because it is underpowered — read the significance field, not just the
-  lift.
+- **Per-model lift is a paired delta, and its test counts cases.** A single run per
+  (case, model) cell is a coin flip, so `prepare --runs-per-variant` steadies each
+  cell's rate before you rank tiers. Repeats do not add cases, though: each tier's
+  significance test runs over its cases, and no tier can reach p ≤ 0.05 until at least
+  6 of them move the same way (see **Inference unit** in
+  [`vocabulary.md`](vocabulary.md#report-signals)). To make a tier ranking significant,
+  add cases. The offline block above shows `significant_at_0_05: false` precisely
+  because it is underpowered — read the significance field, not just the lift.
 - **An offline stub cannot tell you which model to pick.** It is model-blind by
   construction, so its identical-across-tiers ranking proves the pipeline and nothing
   about model choice. Only a runner that actually varies by capability

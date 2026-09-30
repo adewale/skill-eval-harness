@@ -29,14 +29,18 @@ whole loop, runnable with no key:
 cd examples/demo-skill
 HARNESS=../../skill_benchmark.py
 
-# (assumes /tmp/demo-runs exists from the demo README's prepare + run-codex steps)
+# (assumes /tmp/demo-runs and /tmp/demo-judge.jsonl exist from the demo README's
+# prepare, run-codex and judge steps)
 python3 $HARNESS benchmark evals/shared-benchmark.json --runs /tmp/demo-runs \
-  --variant with_skill --variant without_skill --out /tmp/demo-benchmark.json
+  --variant with_skill --variant without_skill \
+  --judge-results /tmp/demo-judge.jsonl --out /tmp/demo-benchmark.json
 
 python3 $HARNESS report --benchmark /tmp/demo-benchmark.json --format github
 ```
 
-Real output (2026-07-05, Python 3.11):
+The demo's `c-review` case has a judge assertion, so the benchmark needs the judge
+verdicts; without `--judge-results` the report reads "Experiment status: incomplete" and
+withholds the lift. Real output (2026-09-30, Python 3.11, six runs per arm):
 
 ```text
 # Skill eval — demo-reviewer
@@ -45,23 +49,25 @@ Real output (2026-07-05, Python 3.11):
 
 | variant | cases | runs | mean objective | mean combined | missing | exec errors |
 |---|---|---|---|---|---|---|
-| with_skill | 2 | 2 | 1.00 | 1.00 | 0 | 0 |
-| without_skill | 2 | 2 | 0.00 | 0.00 | 0 | 0 |
+| with_skill | 2 | 12 | 1.00 | 1.00 | 0 | 0 |
+| without_skill | 2 | 12 | 0.00 | 0.00 | 0 | 0 |
 ```
 
 `--format github` writes a job-summary table (and annotations) straight into a GitHub
 Actions run. `--format junit` writes the same result as JUnit XML, one `<testcase>` per
-case/variant/run, which any CI that reads JUnit will render and gate on:
+case/variant/run, which any CI that reads JUnit will render and gate on. The same run,
+reformatted and trimmed to `run-1` of each arm:
 
 ```text
-<testsuite name="skill-eval:demo-reviewer" tests="4" failures="2" errors="0" ...>
-  <testcase classname="demo-reviewer.c-review" name="with_skill/run-1" />
-  <testcase classname="demo-reviewer.c-review" name="without_skill/run-1">
-    <failure message="2 failing check(s)">severity-label: none matched: ['Blocking', 'Minor', 'Clean']
-cite-checklist: none matched: ['file and line']</failure>
+<testsuite name="skill-eval:demo-reviewer" tests="24" failures="12" errors="0" ...>
+  <testcase classname="demo-reviewer.c-review.default-model" name="default-model/with_skill/run-1" ... />
+  <testcase classname="demo-reviewer.c-review.default-model" name="default-model/without_skill/run-1" ...>
+    <failure message="3 failing check(s)">severity-label: none matched: ['Blocking', 'Minor', 'Clean']
+cite-checklist: none matched: ['file and line']
+actionable-review: no justification for the finding, or the concrete gap (the missing test) is never named</failure>
   </testcase>
-  <testcase classname="demo-reviewer.c-adversarial" name="with_skill/run-1" />
-  <testcase classname="demo-reviewer.c-adversarial" name="without_skill/run-1">
+  <testcase classname="demo-reviewer.c-adversarial.default-model" name="default-model/with_skill/run-1" ... />
+  <testcase classname="demo-reviewer.c-adversarial.default-model" name="default-model/without_skill/run-1" ...>
     <failure message="1 failing check(s)">severity-label: none matched: ['Blocking', 'Minor', 'Clean']</failure>
   </testcase>
 </testsuite>
@@ -102,35 +108,45 @@ python3 $HARNESS audit-manifest evals/shared-benchmark.json --fail-on-blockers
 echo "exit=$?"
 ```
 
-Real output (2026-07-05) — the demo is a *ready* manifest, so it passes:
+Real output (2026-09-30) — the demo is a *ready* manifest, so it passes:
 
 ```text
 exit=0
 ```
 
-with a readiness block reporting:
+with a readiness block reporting (trimmed):
 
 ```json
 "readiness": {
   "ablations": { "total": 3, "materialized": 3, "instruction_simulated": 0 },
   "leak_saturated_cases": [],
-  "blockers": []
+  "blockers": [],
+  "blocker_findings": []
 }
 ```
 
-`--fail-on-blockers` keys on `readiness.blockers` — the structural problems that make a
-green meaningless: no adversarial cases (nothing tests whether the skill holds under
-pressure), a leak-saturated case (an assertion the base model passes from the prompt
-alone), an ablation that is only *instruction-simulated* and so can never confirm a
-causal regression, or — once run data is supplied — a base-saturated case. The demo has
-none, so it gates clean.
+`--fail-on-blockers` keys on the readiness blockers, the structural problems that make a
+green meaningless. They are typed findings, and which kinds block (including the
+`benchmark-incomplete` blocker for a partial `--runs` benchmark) is the **Readiness**
+entry in [`vocabulary.md`](vocabulary.md#report-signals). The demo has none, so it gates
+clean.
 
-Note the distinction the exit code draws: `audit-manifest` *also* emitted eight
+Note the distinction the exit code draws: `audit-manifest` *also* emitted nine
 `findings` at `recommended`/`required` severity on this same run (missing domain tags,
 missing difficulty tags, …). Those are advice, not blockers — `--fail-on-blockers`
 deliberately does **not** fail on them, so your CI fails on "this suite can't be trusted"
 without nagging on "this suite could be richer." Add `--strict-judge` to also fail when
 the declared judge model is the model under test.
+
+When you do want a finding to fail the build, name it. `--fail-on` takes finding kinds,
+severities (`required`, `recommended`) or preset names (`blockers`, `strict-judge`,
+`contamination`, `judge-robustness`), comma-separated and repeatable, and exits 1 when a
+matching finding fires. `--fail-on floor-eval,underpowered-eval` fails a suite whose runs
+show a case failing in both arms or noise too wide to resolve the lift; `--fail-on
+required` fails on every required finding. An unknown token is an error, not a gate that
+never fires, and when `--runs` points at an incomplete benchmark the gate fails closed.
+The accepted kinds and each one's default severity are listed in
+[`commands.md`](commands.md#audit-manifest-quality).
 
 ## A workflow that ties it together
 
@@ -164,11 +180,14 @@ blow its budget — the operational half of the same gate.
   `summary`; the harness runs no significance test between those two arms. To test a
   named component, read `ablation_regressions`, which compares each ablation arm with
   `with_skill` and confirms an expected regression only when a named assertion flips.
-  Gate on *confirmed* regressions, not on a one-run dip; an ablation cohort needs ≥6
-  exact repetition pairs to clear its two-sided sign-flip gate.
+  Gate on *confirmed* regressions, not on a one-run dip; an ablation cohort needs at
+  least 6 matched repetition pairs to clear its sign-flip gate (see **Inference unit** in
+  [`vocabulary.md`](vocabulary.md#report-signals)).
 - **`audit-manifest --fail-on-blockers` exits non-zero** → read the `blockers` list. A
   `leak-saturated` blocker means an assertion passes from the prompt alone; a
-  no-adversarial blocker means nothing tests the skill under pressure. Fix the
+  no-adversarial blocker means nothing tests the skill under pressure; a
+  `benchmark-incomplete` blocker means the runs behind `--runs` were not fully graded
+  (for a suite with judge assertions, pass `--judge-results`). Fix the
   manifest, not the threshold. (Missing hidden splits surface as a `required`
   *finding*, not a blocker — advice the exit code deliberately does not fail on.)
 - **JUnit shows `errors` > 0 (not `failures`)** → runs crashed or timed out. These are

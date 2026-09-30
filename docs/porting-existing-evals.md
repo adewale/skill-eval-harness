@@ -124,7 +124,7 @@ python3 $H run-codex --tasks "$S/tasks.jsonl" --runs "$S/runs" \
 python3 $H benchmark "$S/ported.yaml" --runs "$S/runs" --out "$S/bench.json"
 ```
 
-Real output (2026-07-10), trimmed to the paired summary:
+Real output (2026-09-30), trimmed to the paired summary:
 
 ```json
 "paired_summary": {
@@ -136,7 +136,9 @@ Real output (2026-07-10), trimmed to the paired summary:
     "n": 3,
     "observed_mean_delta": 1.0,
     "p_value": 0.25,
-    "significant_at_0_05": false
+    "p_value_upper_bound": 0.25,
+    "significant_at_0_05": false,
+    "unit": "case"
   }
 }
 ```
@@ -144,8 +146,11 @@ Real output (2026-07-10), trimmed to the paired summary:
 The ported cases now measure lift: 1.0 with the skill mounted, 0.0 without, on the same
 prompts your old suite ran. And the significance block is the first honesty check on the
 port itself — a *perfect* delta over three cases still reads `p_value: 0.25`, because a
-sign-flip test over n=3 cannot clear 0.05. Port the whole suite, not a sample, and add
-repeats (`prepare --runs-per-variant`) before quoting the lift.
+sign-flip test over n=3 cannot clear 0.05. The block's `unit` is `case`: the test counts
+cases, so it needs at least 6 cases that move before p ≤ 0.05 is reachable, and repeats
+(`prepare --runs-per-variant`) steady each case's rate without adding a case (see
+**Inference unit** in [`vocabulary.md`](vocabulary.md#report-signals)). Port the whole
+suite, not a sample, before quoting the lift.
 
 Two demo caveats. The stub is prompt-blind (it answers from the mounted skill tree, the
 same text for every case), so this run proves the seams — YAML compile, row fan-out,

@@ -251,9 +251,9 @@ hides the signal:
   scored run, flagged `floor: fails in both arms` and reported by `audit-manifest --runs` as
   `floor-eval`), suspect the case or its assertion first: read the outputs and check whether any
   correct answer could pass.
-- **Saturated**: every `with_skill` run passes. Weak evidence of lift, though not a skill
-  failure; when the baseline passes everything too, the case is base-saturated and
-  measures nothing.
+- **Saturated** (`saturated/non-discriminating`): both arms pass every scored run, so the
+  case cannot show lift ([`vocabulary.md`](vocabulary.md#report-signals) separates this flag
+  from a with-skill ceiling and from a base-saturated case).
 - **Flaky**: repeated runs disagree. Investigate before trusting the number.
 - **With-skill-failed**: the skill made things worse. This is the highest-priority flag.
 - **Missing output**: not measured, which differs from measured-and-failed. Excluded from

@@ -163,7 +163,8 @@ No severity label anywhere — the assertion is right, the text really lacks it.
 Read `stop_class` first, because a clean exit code does not prove the answer finished:
 
 - `truncated` or `turn_limit`: the model was cut off by an output or turn limit. The
-  run is excluded from scoring, its result row carries `unscorable_reason`
+  run is excluded from scoring ([execution validity](vocabulary.md#run-artifacts)), its
+  result row carries `unscorable_reason`
   (`stopped:truncated` or `stopped:turn_limit`), and `error-analysis` files it under
   `execution-error`, not under an assertion.
 - `refused`: the model declined. The run is still graded, so its zero is a refusal

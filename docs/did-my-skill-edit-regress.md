@@ -199,10 +199,12 @@ empty diff instead (real output, same command against a cosmetic-only iteration)
 - **A single-shot diff is noise.** Rerun the ablation arm with one run per arm and the same
   block reads `evidence_class: "indeterminate"`, `expected_regression_confirmed: null`, with
   the note *"regression observed but not significant per case across replicates (min
-  p=1.0); a case needs >= 6 matched pairs to confirm."* The confirmed verdict above only
-  appears at six unanimous repetition pairs, where the two-sided sign-flip floor is
-  `2/2^6 = 0.03125 ≤ 0.05` (five pairs floor at `0.0625`). A regression is a *named assertion flipping with
-  provenance and significance*, not a score that wobbled once.
+  p=1.0); p <= 0.05 needs at least 6 matched replicate pairs that move the same way (the
+  smallest reachable p with 6 is 0.03125)"* (re-run 2026-09-30). The confirmed verdict
+  above only appears at six unanimous repetition pairs; the unit it counts is the
+  **Inference unit** entry in [`vocabulary.md`](vocabulary.md#report-signals). A regression
+  is a *named assertion flipping with provenance and significance*, not a score that
+  wobbled once.
 - **The demo diff is exact only because the stub is deterministic.**
   Its six matched replicates are identical, so the paired sign-flip test clears on perfect separation. A
   real model's runs carry variance; there you need *genuine* repeats before a one-run diff

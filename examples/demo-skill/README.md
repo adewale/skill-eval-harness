@@ -65,8 +65,9 @@ provenance), and six unanimous repeats reach the per-case sign-flip test's thres
 
 Fewer repeats, or a skipped step 4, give `indeterminate` for the same observed drop, each
 with its own note. At four repeats the smallest possible p is 0.125, and the note reads
-`regression observed but not significant per case across replicates (min p=0.125); a case
-needs >= 6 matched pairs to confirm`. Without step 4 the report is partial and the note
+`regression observed but not significant per case across replicates (min p=0.125); p <= 0.05
+needs at least 6 matched replicate pairs that move the same way (the smallest reachable p with 6
+is 0.03125)`. Without step 4 the report is partial and the note
 reads `grading evidence is incomplete`, however many repeats you ran, because a declared
 grader has not produced its verdicts. Swap the stub for a real runner
 (`--codex-cmd "codex exec"`, etc.) to run it against an actual model — for Claude, use `skill-benchmark run-claude` instead, which parses the `claude -p` JSON envelope and captures cost.

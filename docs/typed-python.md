@@ -74,12 +74,15 @@ consumer-only type check does not prove malformed wire data cannot construct the
 
 1. every top-level runtime module to be in the wheel's `py-modules` inventory;
 2. `ty` to retain its runtime, tooling, example, and static-proof globs;
-3. the explicit `TRIGGER_IDENTITY_MODULES` conservative module inventory to be packaged, versioned,
-   and to contain the trigger entrypoints and shared process/pair owners without pulling their
+3. `[tool.ty.src]` to hold only `include`, so the gate cannot exclude a packaged module: no
+   `tool.ty.overrides` glob may re-scope one, and no `ty.toml` may replace the pyproject
+   configuration;
+4. the explicit `TRIGGER_IDENTITY_MODULES` conservative module inventory to be packaged and to
+   contain the trigger entrypoints and shared process/pair owners without pulling their
    standalone CLI, grading, judge, report, Jetty, or unsupported-Gemini-trigger modules into causal
    identity;
-4. every `*_contracts.py` boundary module to be named by the abstraction documentation; and
-5. Linux and Windows CI to promote `ty` warnings to failures.
+5. every `*_contracts.py` boundary module to be named by the abstraction documentation; and
+6. Linux and Windows CI to promote `ty` warnings to failures.
 
 Packaging, static analysis, and causal identity answer different questions; filesystem equality
 between them would make every unrelated report or CLI module edit invalidate trigger comparability.

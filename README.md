@@ -107,7 +107,7 @@ viewer    -> review.html with assertion evidence and output previews
 
 `benchmark.json` records one row per case/variant/run, plus aggregate pass rates, timing/token summaries, and flags for saturated (both arms always pass), floor (`floor: fails in both arms`), no-lift, flaky, or with-skill-failed cases. It also carries a `reliability` block — unbiased **pass@k** and **pass^k** per (case, variant) from the repeated runs — beside the paired lift's sign-flip `significance`, and a `trajectory_diff` block: per case, over validated experimental pairs, the commands exclusive to one arm across the case's complete repetition set, event-count deltas (steps/commands/tool calls/file reads/file writes), and per-arm skill-load rates — how the arms *behaved*, beside whether they passed. An arm without non-empty, readable trace evidence blocks its pair with a named reason instead of reading as an empty diff.
 
-Each paired lift also carries an `interval` (the sign-flip test inverted into a 95% confidence interval, unbounded below six paired cases) and a `noise_check` whose `verdict` names what stops the eval from resolving a lift: too few cases moved, a noise floor above the `without_skill` headroom, or one above the `--min-lift` you would act on. A `run_endings` block counts, per variant, how runs stopped, whether the served model matched the request, and the effort each ran at, so a refusal is not read as a capability miss. The fields are in [`docs/commands.md`](docs/commands.md#lift-interval-and-noise-check).
+Each paired lift also carries an `interval` (the sign-flip test inverted into a 95% confidence interval, unbounded below six paired cases; the six-unit bound is the **Inference unit** entry in [`docs/vocabulary.md`](docs/vocabulary.md#report-signals)) and a `noise_check` whose `verdict` names what stops the eval from resolving a lift: too few cases moved, a noise floor above the `without_skill` headroom, or one above the `--min-lift` you would act on. A `run_endings` block counts, per variant, how runs stopped, whether the served model matched the request, and the effort each ran at, so a refusal is not read as a capability miss. The fields are in [`docs/commands.md`](docs/commands.md#lift-interval-and-noise-check).
 
 ## Installation
 
@@ -157,48 +157,17 @@ skill-benchmark --help
 
 ## Documentation map
 
-[`docs/README.md`](docs/README.md) groups these by kind (user journeys, concepts, reference, specs, audits) and holds the convention for adding a new user-journey walkthrough.
+Everything under `docs/` is indexed once, in [`docs/README.md`](docs/README.md): user journeys (each titled by the question it answers), concepts, the command reference, specs, and audits, with the convention for adding a user-journey walkthrough. The table below covers the files outside `docs/`.
 
 | File | Use it for |
 |---|---|
 | `README.md` | Manifest shape, run layout, and the command index. |
-| `docs/README.md` | The docs index: journeys/concepts/reference/specs grouping and the convention for adding a user-journey walkthrough. |
-| `docs/commands.md` | Full per-command reference: flags, examples, and output shapes for every subcommand. |
 | `CHANGELOG.md` | Release history and unreleased repo-surface changes. |
 | `CONTRIBUTING.md` | Local setup, validation commands, and eval-safety rules. |
 | `LESSONS_LEARNED.md` | Design lessons from the multi-skill saturation work and the roadmap/cost build-out. |
-| `docs/architecture.md` | How the pipeline fits together: the stages, the runner boundary, the model/variant/run fan-out, and the invariants that keep grading honest. |
-| `docs/abstractions.md` | What each core object is: manifest, prepared task, run-output contract, assertion result, `ResultSet`. |
-| `docs/typed-python.md` | Which Python surfaces `ty` checks, the boundary inventory, and the drift rules for new modules. |
-| `docs/authoring-evals.md` | Opinionated workflow/quickstart for writing a new eval suite, including severity and graded assertions. |
-| `docs/tuning-skill-activation.md` | The activation-tuning loop: trigger cases in both polarities, the (agent, model) trigger-rate matrix, how to read under/over-trigger, and the adapter seam for adding agents. |
-| `docs/is-my-skill-worth-its-tokens.md` | Keep/trim/cut walkthrough: static footprint (`profile-skill`) vs. runtime lift-per-token and lift-per-dollar (`token-overhead`, `cost-summary`). |
-| `docs/gating-ci-on-evals.md` | The CI recipe: `report --format junit|github` for regressions plus `audit-manifest --fail-on-blockers` for manifest trust. |
-| `docs/did-my-skill-edit-regress.md` | The edit → re-run → diff loop: the within-run `ablation_regressions` block (assertion-level, significance-gated) and cross-iteration `render-viewer --previous-workspace` diffs over the `iteration-N/` convention. |
-| `docs/which-model-should-my-skill-target.md` | Ranking model tiers by lift: `prepare --models` fan-out, the `by_model` / `model_analysis` blocks, and reading real lift vs. base-model saturation per tier. |
-| `docs/why-did-this-run-fail.md` | Debugging one failing run: the `error-analysis` taxonomy + review queue, then the run dir (`output.md`/`metadata.json`), mapped to a failure class and a manifest-or-skill decision. |
-| `docs/can-i-trust-my-judge.md` | Calibrating a judge before believing its numbers: `judge-robustness` (order-flip + negative controls), `judge-alignment` (human labels, Cohen's kappa, precision/recall), and `compare-judges` (does the lift survive a judge swap?). |
-| `docs/eval-framework-roadmap-spec.md` | The eval-framework roadmap: goals, abstractions, and tests per feature (CF.1–CF.4, buckets 1–4 implemented, migration, and bucket 5 eval health, partly shipped). |
-| `docs/migrating-evals.md` | Upgrading a manifest between versions (v1 → v2): what `migrate` stamps and the judgment calls it leaves. |
-| `docs/upgrading.md` | Version-by-version harness upgrades: saved-run backup, artifact migration, strict input repairs, expected report changes, and rollback. |
-| `docs/comparing-with-claude-api-evals.md` | Choosing between `/claude-api build-eval` / `/claude-api hillclimb` and this harness: what each does, where each goes further, why their noise floors and test sets differ, and which harness output answers each guide step. |
-| `docs/porting-existing-evals.md` | Arriving from another framework: `dataset_files` + a template case carry the rows across, then the paired baseline, splits, leakage lint, and the `audit-manifest` punch list supply what the old suite had no slot for. |
-| `docs/vocabulary.md` | Glossary of harness terms: variants, splits, models, ablations, assertions, severity/oracle tiers, graded scoring, cost telemetry, trace artifacts, agent/judge backends, judge calibration, reliability, contamination, and report flags. |
-| `docs/evals-are-not-tests.md` | Why a skill eval is not a unit test, and what that changes about reading results. |
-| `docs/academic-grounding.md` | The research constructs behind the harness's terms, with citations; meshes the workflow, measurement, and theory layers. |
-| `docs/jetty-support-spec.md` | Jetty payload/import contract and live-token unknowns. |
-| `docs/trace-aware-eval-spec.md` | Trace artifact contract, shipped v0.4.1 runner support, process/efficiency assertions, and remaining trace work. |
-| `docs/telemetry-availability-and-comparability-spec.md` | Implemented schema-v3 contract for measured-zero, unavailable, partial, and blocked telemetry/comparisons, including legacy migration. |
-| `docs/agent-backend-interface-spec.md` | Draft spec for turning Claude/Codex/Gemini/Vibe support into a shared agent backend interface: parity matrix, judge backends, trigger adapters, telemetry, and tool replay. |
-| `docs/agent-cli-control-plane.md` | The shared native-CLI control plane: process invocation, config isolation, tool policy, final-answer channels, schemas, telemetry, where Claude/Codex/Gemini/Vibe intentionally differ, and the cheap comprehensive live-smoke command. |
-| `docs/agent-cli-tradeoffs.md` | Claude/Codex/Gemini/Vibe trade-offs: which CLI surfaces are strong or weak and what missing schema/telemetry/prompt controls mean for eval reports. |
-| `docs/agent-parity.md` | The per-agent support matrix: which answer/judge/trigger surfaces Claude, Codex, Gemini, Vibe, Pi, Jetty, subagent, and the stub each cover, with live-smoke status per backend. |
-| `docs/skill-ablation-spec.md` | Design spec for materialized (real, altered skill file) ablations: the three-layer model, manifest schema, removal mechanisms, gates, and phased plan. |
-| `docs/ablation-study-walkthrough.md` + `examples/skill-pins.json` | A worked ablation study across ten real skills, pinned to exact commit SHAs (+ canonical tree hashes) so it reproduces against the evaluated versions **without vendoring** any skill content. Includes the replication lesson (2 of 3 single-shot findings refuted at n=5). |
-| `docs/repo-effectiveness-audit.md` | `good-repo` audit, score, package metadata fixes, and manual GitHub settings checklist. |
-| `docs/correctness-by-construction-audit.md` | The closed trigger, experimental-pair, answer-outcome, judge-verdict, prepared-task, Jetty, trace, human-text comparison, and ablation-provenance constructions, their proof tests, and residual risks. |
 | `TODO.md` | Status tracker: the eval-framework roadmap, remaining Jetty work, Gemini's explicitly gated autonomous-trigger follow-up, the `swap:<id>` ablation follow-on, and migration/user-journey documentation. |
 | `examples/demo-skill/` | Self-contained, **offline** end-to-end example: a tiny synthetic skill, two answer-path materialized ablations, one discovery ablation for trigger examples, and a deterministic stub runner (no model/API). `prepare → run-codex → benchmark` confirms a regression per answer-path ablation; exercised by `tests/test_example_demo.py`. Also carries should-fire/should-not-fire trigger cases for `skill-trigger-matrix` (offline via `--agent stub`; live smoke via `RUN_TRIGGER_SMOKE=1`). Start here. |
+| `examples/skill-pins.json` | Exact commit SHAs and canonical tree hashes for the ten skills in [`docs/ablation-study-walkthrough.md`](docs/ablation-study-walkthrough.md), so that study reproduces without vendoring any skill content. |
 | `examples/adewale-workspace/` | Adewale-specific Pi smoke runner and cross-repo aggregate report (the trigger runners are the top-level `skill-pi-trigger-eval` and `skill-trigger-matrix`). |
 | `scripts/smoke_supported_clis.py` | Opt-in, low-cost smoke across native Claude/Codex/Gemini/Vibe answer paths and Pi trigger path using a disposable demo-skill eval. |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
@@ -460,7 +429,7 @@ skill-benchmark materialize-ablations ../repo/evals/shared-benchmark.json \
 
 Each declared ablation is written to `ablated/<id>/` as a complete altered skill tree (every manifest root, identical surface to `with_skill`, differing only by the declared edit). Mechanisms are `frontmatter_field`, `section` (fence-aware), `list_item`, deletion-only `patch`, `reference` (pointer/content/both), `script`, `asset`, and `preprocess` (inline `` !`command` ``), composable across multiple components. Ablation is removal-only — replacement/substitution is the separate `swap:<id>` feature tracked in `TODO.md`. Materialized arms are blind: the model-visible input is identical to `with_skill` (the hypothesis lives only in harness metadata).
 
-The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), the autonomous-trigger runners (`skill-trigger-matrix --ablation <id>` with any registered adapter, or `run_pi_trigger_eval.py --ablation <id>`) trigger-test a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. A discovery ablation graduates from raw measurement to a causal evidence class through `skill-benchmark trigger-compare`, which pairs the baseline and `--ablation` matrix reports of the same revision under the same provenance/coverage/significance gate the answer path uses. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the autonomous-trigger runners. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision **and** the replicated regression clears a significance test (a two-sided paired sign-flip test run **per (case, model)** over exact repetition-level deltas; a regression is significant iff at least one confirmed cohort clears p≤0.05). Because the exact test discretizes, a cohort needs **≥6 matched pairs** to ever reach significance (`2/2^6=0.03125`; five pairs floor at `0.0625`); fewer pairs are reported `INDETERMINATE`, never confirmed. See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
+The materialized tree flows through the runners: the Pi smoke runner mounts it (answer-population only), the autonomous-trigger runners (`skill-trigger-matrix --ablation <id>` with any registered adapter, or `run_pi_trigger_eval.py --ablation <id>`) trigger-test a discovery (e.g. weakened-description) skill, and `export-jetty --include-ablations --ablation-dir DIR` uploads it recursively. A discovery ablation graduates from raw measurement to a causal evidence class through `skill-benchmark trigger-compare`, which pairs the baseline and `--ablation` matrix reports of the same revision under the same provenance/coverage/significance gate the answer path uses. `prepare`/`export-jetty` emit only **answer-population** ablation rows (on non-trigger cases); discovery ablations are measured by the autonomous-trigger runners. The benchmark report's `ablation_regressions` block separates an aggregate "score regressed" from an assertion-level "expected regression confirmed", and only confirms when recorded provenance proves both arms ran the same skill revision **and** the replicated regression clears a significance test (a two-sided paired sign-flip test run **per (case, model)** over exact repetition-level deltas; a regression is significant iff at least one confirmed cohort clears p≤0.05). A cohort with fewer than **6 matched pairs** can never reach significance and is reported `INDETERMINATE`, never confirmed ([inference unit](docs/vocabulary.md#report-signals)). See [`docs/skill-ablation-spec.md`](docs/skill-ablation-spec.md) for the mechanism table, the component-class model, and the correctness gates.
 
 **Evidence paths (discovery vs answer).** A single runner report and a paired comparison have deliberately different evidentiary strength:
 
@@ -486,7 +455,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 | `skill-benchmark benchmark` | Aggregate into variant summaries, paired lift + significance + `interval` + `noise_check` (`--min-lift`), by-model, cost, `run_endings`, and case flags. |
 | `skill-benchmark render-viewer` | Static or `--serve`d review page with embedded artifacts and iteration diffs; served mode stores pass/fail/unsure verdicts and notes in `feedback.json`. |
 
-**Runners** (the only model-touching commands)
+**Runners** (every one but `import-trace` calls a model; so do `judge` and `judge-robustness` below)
 
 | Command | What it does |
 |---|---|
@@ -507,7 +476,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 | `skill-benchmark compare-judges` | Flag whether measured lift depends on which judge model graded. |
 | `skill-benchmark judge-alignment` | Score a judge against human labels (`--labels feedback.json`, or a legacy labels file): agreement, Cohen's kappa, precision/recall/F1. |
 | `skill-benchmark judge-robustness` | Order-flip self-consistency + negative controls a robust judge must reject (opt-in, model-touching). |
-| `skill-benchmark judge` | Run deferred `judge`/`rubric` assertions through `--judge-backend`/`--judge-model` or `--judge-cmd`. |
+| `skill-benchmark judge` | Run deferred `judge`/`rubric` assertions through `--judge-backend`/`--judge-model` or `--judge-cmd` (model-touching). |
 
 **Cost and size**
 
@@ -568,7 +537,7 @@ For manifest or grading changes, add or update `tests/test_skill_benchmark.py`. 
 
 ## Non-goals
 
-- Grading and aggregation do not call a model. Model execution happens outside that path, except for the explicit runner/judge commands that exist to call one: `run-codex`, `run-claude`, `run-agent`, `run-jetty`, and `judge` (via `--judge-cmd` or a native `--judge-backend`).
+- Grading and aggregation do not call a model. Model execution happens outside that path, in the explicit commands that exist to call one: the runners (`run-codex`, `run-claude`, `run-agent`, `run-subagent`, `run-jetty`, and the `skill-trigger-matrix` / `skill-pi-trigger-eval` entry points), `judge` (via `--judge-cmd` or a native `--judge-backend`), and `judge-robustness`.
 - The harness does not decide qualitative truth by itself; it emits judge prompts, runs a judge (an opt-in `--judge-cmd`, or a native `--judge-backend` plus `--judge-model`), and merges the returned JSON — recording which backend/model produced each verdict.
 - Hidden prompts are not protected if you pass `--include-answer-key` to generation jobs.
 - A passing answer benchmark does not prove autonomous skill loading; run `skill-trigger-matrix` (any adapter-backed agent × model) or `skill-pi-trigger-eval` (Pi, with ablation arms) for that.
@@ -602,7 +571,7 @@ skill-eval-harness/
 ├── trace_contracts.py          # normalized event-log and event lifecycle contracts
 ├── trigger_contracts.py        # autonomous-trigger invocation/detection/observation contract
 ├── telemetry.py                # schema-v3 availability/provenance/comparison domain
-├── docs/                       # architecture, abstractions, vocabulary, specs, guides (see the map above)
+├── docs/                       # architecture, abstractions, vocabulary, specs, guides (indexed in docs/README.md)
 ├── .github/
 │   ├── PULL_REQUEST_TEMPLATE.md
 │   ├── ISSUE_TEMPLATE/

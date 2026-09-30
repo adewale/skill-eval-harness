@@ -90,6 +90,10 @@ channel can promote another channel.
 - Provenance applies only to available values: `provider_reported`,
   `trace_normalized`, `price_table_estimated`, `estimated`, or `legacy_unverified`.
   `missing` is no longer provenance; it is an unavailable state.
+  *Update (2026-09-30): provenance now also includes `process_measured` (a duration the
+  harness times around the provider process), and usage sources and cost sources are
+  separate sets, so a cost is never a bare `estimated`. The current lists live in
+  [`commands.md`](commands.md#cost-telemetry-tokens-and-dollars).*
 - Money is exact (`Decimal` internally and a canonical decimal string on the wire),
   non-negative, and always carries an ISO currency. A non-USD amount must not be
   called `cost_usd`.
