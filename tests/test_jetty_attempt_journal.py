@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -796,16 +798,28 @@ class JettyAttemptJournalTests(unittest.TestCase):
             self.assertEqual(out.read_text(encoding="utf-8"), "")
 
     def test_live_run_jetty_requires_file_output(self):
-        args = SimpleNamespace(
-            payloads="unused.jsonl", out=None, journal=None,
-            timeout=1, poll_interval=0, resubmit_unknown=False,
-            dry_run=False,
-        )
-        with (
-            mock.patch.object(sb, "load_jsonl", return_value=[]),
-            self.assertRaises(SystemExit),
-        ):
-            sb.run_jetty(args)
+        with tempfile.TemporaryDirectory() as td:
+            payloads_path = Path(td) / "payloads.jsonl"
+            payloads_path.write_text(
+                json.dumps(executable_payload()) + "\n", encoding="utf-8")
+            args = SimpleNamespace(
+                payloads=str(payloads_path), out=None, journal=None,
+                timeout=1, poll_interval=0, resubmit_unknown=False,
+                dry_run=False,
+            )
+            client = RecordingClient()
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(
+                    os.environ, {"JETTY_API_TOKEN": "test-token"}),
+                mock.patch.object(sb, "JettyClient", return_value=client),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit),
+            ):
+                sb.run_jetty(args)
+
+        self.assertIn("live run-jetty requires --out", stderr.getvalue())
+        self.assertEqual(client.submit_calls, 0)
 
 
 if __name__ == "__main__":
