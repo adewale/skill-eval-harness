@@ -4,7 +4,6 @@ import unittest
 import ablation_model
 import skill_benchmark as sb
 from manifest_contracts import (
-    ABLATION_VARIANT_PREFIX,
     CaseId,
     CaseKind,
     CasePopulation,
@@ -62,7 +61,6 @@ class ManifestIdentityContractTests(unittest.TestCase):
             ExecutionVariant("ablation:")
 
     def test_ablation_model_reexports_the_canonical_compatibility_helpers(self):
-        self.assertEqual(ablation_model.ABLATION_VARIANT_PREFIX, ABLATION_VARIANT_PREFIX)
         self.assertIs(ablation_model.ablation_id_of, ablation_id_of)
         self.assertIs(ablation_model.is_ablation_variant, is_ablation_variant)
 

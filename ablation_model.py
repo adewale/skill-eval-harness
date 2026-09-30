@@ -42,7 +42,6 @@ from agent_capabilities import BACKENDS
 from completion_contracts import completion_unscorable_reason
 from json_contracts import freeze_json_value
 from manifest_contracts import (
-    ABLATION_VARIANT_PREFIX,
     CaseId,
     CaseKind,
     ExecutionVariant,
