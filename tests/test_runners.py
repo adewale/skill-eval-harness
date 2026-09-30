@@ -1454,53 +1454,6 @@ class TraceDialectRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sb.GENERIC_TRACE_DIALECT.flatten(records, record_lines=[3])
 
-    def test_claude_completed_tool_lifecycle_counts_exactly_once(self):
-        records = [
-            {"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "call-1", "name": "Read",
-                 "input": {"file_path": "/tmp/a"}},
-            ]}},
-            {"type": "user", "message": {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "call-1", "content": "ok"},
-            ]}},
-        ]
-        events, metrics = sb.normalize_trace_records(records, source="claude")
-        lifecycle = [event for event in events["events"]
-                     if event["type"] in {"tool_call", "file_read"}]
-        self.assertEqual([event["status"] for event in lifecycle],
-                         ["in_progress", "completed"])
-        self.assertEqual(metrics["tool_calls"], 1)
-        self.assertNotIn("trace_protocol_errors", metrics)
-
-    def test_claude_dangling_and_unmatched_calls_are_protocol_invalid(self):
-        for records, phrase in (
-            ([{"type": "assistant", "message": {"content": [
-                {"type": "tool_use", "id": "call-1", "name": "Read", "input": {}},
-            ]}}], "no matching tool_result"),
-            ([{"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "missing", "content": "x"},
-            ]}}], "unmatched Claude tool_result"),
-        ):
-            with self.subTest(phrase=phrase):
-                _, metrics = sb.normalize_trace_records(records, source="claude")
-                self.assertTrue(any(phrase in error
-                                    for error in metrics["trace_protocol_errors"]))
-
-    def test_claude_malformed_message_and_lifecycle_fields_are_protocol_invalid(self):
-        malformed = [
-            {"type": "assistant", "message": {"content": {"type": "tool_use"}}},
-            {"type": "assistant", "message": {"content": [
-                {"type": "tool_use", "id": 1, "name": "Read", "input": {}},
-                {"type": "tool_use", "id": "x", "name": "", "input": {}},
-                {"type": "tool_use", "id": "y", "name": "Read", "input": []},
-            ]}},
-            {"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "x", "is_error": "false"},
-            ]}},
-        ]
-        _, metrics = sb.normalize_trace_records(malformed, source="claude")
-        self.assertGreaterEqual(len(metrics["trace_protocol_errors"]), 5)
-
     def test_claude_protocol_error_makes_trace_signal_unavailable(self):
         raw = json.dumps({
             "type": "assistant", "message": {"content": [

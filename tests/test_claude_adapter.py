@@ -136,6 +136,22 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
         self.assertIn("unmatched Claude tool_result", event["input_summary"])
         self.assertEqual(event["raw_ref"], {"file": "trace.jsonl", "line": 1})
         self.assertEqual(event["raw_result_ref"], {"file": "trace.jsonl", "line": 1})
+        self.assertIn("unmatched Claude tool_result", " ".join(metrics["trace_protocol_errors"]))
+
+    def test_malformed_message_and_lifecycle_fields_are_protocol_invalid(self):
+        malformed = [
+            {"type": "assistant", "message": {"content": {"type": "tool_use"}}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": 1, "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "x", "name": "", "input": {}},
+                {"type": "tool_use", "id": "y", "name": "Read", "input": []},
+            ]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "x", "is_error": "false"},
+            ]}},
+        ]
+        _, metrics = sb.normalize_trace_records(malformed, source="claude")
+        self.assertGreaterEqual(len(metrics["trace_protocol_errors"]), 5)
 
     def test_duplicate_open_tool_id_is_error_and_cannot_replace_first_call(self):
         records = [
