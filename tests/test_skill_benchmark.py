@@ -12,6 +12,7 @@ from helpers import (
     attach_jetty_task_contract,
     attest_answer_design,
     load_example_module,
+    write_run,
 )
 
 import run_pi_trigger_eval as tr
@@ -251,6 +252,10 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertIn("non-discriminating-assertions", kinds)
 
     def test_missing_outputs_do_not_create_no_lift_flags(self):
+        # A case with no outputs has no pairs, so it must not be flagged at all.
+        # Any missing output makes the report partial, which empties case_flags
+        # for every case; the per-case contract lives on observed_case_flags,
+        # which audit-manifest reads for a partial report.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest = self.make_manifest(root)
@@ -265,13 +270,15 @@ class SkillBenchmarkTests(unittest.TestCase):
             manifest.write_text(json.dumps(data), encoding="utf-8")
             runs = root / "repo" / "eval-runs" / "latest"
             for variant in ["with_skill", "without_skill"]:
-                base = runs / "case-1" / variant
-                base.mkdir(parents=True)
-                (base / "output.md").write_text("alpha beta", encoding="utf-8")
+                write_run(runs / "case-1" / variant, "alpha beta")
             attest_answer_design(manifest, runs)
             report = sb.build_benchmark_report(manifest, runs)
-            flagged_ids = {f["case_id"] for f in report["case_flags"]}
-            self.assertNotIn("case-2", flagged_ids)
+        self.assertEqual(report["case_flags_availability"], "partial")
+        self.assertEqual(report["case_flags"], [])
+        observed = {row["case_id"]: row["flags"] for row in report["observed_case_flags"]}
+        # The paired case still gets its flags, so the view is not vacuously empty.
+        self.assertIn("no objective lift", observed["case-1"])
+        self.assertNotIn("case-2", observed)
 
     def test_trigger_eval_extracts_real_user_prompt(self):
         case = {
