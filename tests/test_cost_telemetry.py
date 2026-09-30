@@ -13,9 +13,38 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from helpers import attest_answer_design
+from helpers import attest_answer_design, make_eval_repo, result_row, write_run
 
 import skill_benchmark as sb
+
+ALPHA_CASE = {"id": "c1", "split": "tune", "kind": "behavior", "prompt": "p",
+              "assertions": [{"name": "a", "type": "contains", "value": "alpha"}]}
+
+
+def cost_repo(root: Path, cases: list[dict] | None = None) -> Path:
+    """The skill "d" eval repo these tests price runs against."""
+    return make_eval_repo(root, skill_name="d", cases=cases or [ALPHA_CASE])
+
+
+def cost_metadata(*, cost: float | None, tokens: int | None, currency: str = "USD",
+                  provider: str = "test-provider") -> dict:
+    """Run metadata carrying provider-reported usage and cost blocks."""
+    usage = ({"input_tokens": tokens - 10, "output_tokens": 10, "total_tokens": tokens,
+              "source": "provider_reported"} if tokens is not None else {"source": "missing"})
+    cost_block = ({"currency": currency, "total_cost": cost, "source": "provider_reported"}
+                  if cost is not None else {"source": "missing"})
+    return {"provider": provider, "model": "test-model", "billing_scope": "run",
+            "usage_normalized": usage, "cost_normalized": cost_block}
+
+
+def cost_row(case_id: str, variant: str, *, cost: float | None, tokens: int | None,
+             currency: str = "USD", exec_valid: bool = True, missing: bool = False,
+             rate: float | None = 1.0) -> dict:
+    """A graded result row whose metadata carries cost telemetry."""
+    return result_row(case_id, variant, rate=rate, exec_valid=exec_valid, missing=missing,
+                      assertions=[], run_number=1,
+                      metadata={**cost_metadata(cost=cost, tokens=tokens, currency=currency),
+                                "elapsed_ms": 1000})
 
 
 class NormalizeUsageCostTests(unittest.TestCase):
@@ -350,17 +379,7 @@ class RunnerStampTests(unittest.TestCase):
     def test_subagent_metadata_carries_provider_blocks(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"
-            (repo / "skill").mkdir(parents=True)
-            (repo / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-            (repo / "evals").mkdir()
-            manifest_path = repo / "evals" / "shared-benchmark.json"
-            manifest_path.write_text(json.dumps({
-                "version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                "variants": ["with_skill", "without_skill"],
-                "cases": [{"id": "c1", "split": "tune", "kind": "behavior", "prompt": "p",
-                           "assertions": [{"type": "contains", "value": "x"}]}],
-            }), encoding="utf-8")
+            manifest_path = cost_repo(root)
             manifest = sb.validate_manifest(manifest_path)
             tasks = [r for r in sb.prepared_task_rows(manifest_path, manifest, split="tune") if r["variant"] == "with_skill"]
 
@@ -385,25 +404,9 @@ class RunnerStampTests(unittest.TestCase):
         self.assertEqual(row["cost_normalized"], {"source": "missing"})
 
 
-def result_row(case_id: str, variant: str, *, cost: float | None, tokens: int | None, currency: str = "USD", exec_valid: bool = True, missing: bool = False, rate: float | None = 1.0) -> dict:
-    metadata = {"provider": "test-provider", "model": "test-model", "billing_scope": "run"}
-    if tokens is not None:
-        metadata["usage_normalized"] = {"input_tokens": tokens - 10, "output_tokens": 10, "total_tokens": tokens, "source": "provider_reported"}
-    else:
-        metadata["usage_normalized"] = {"source": "missing"}
-    if cost is not None:
-        metadata["cost_normalized"] = {"currency": currency, "total_cost": cost, "source": "provider_reported"}
-    else:
-        metadata["cost_normalized"] = {"source": "missing"}
-    metadata["elapsed_ms"] = 1000
-    return {"case_id": case_id, "variant": variant, "run_number": 1, "missing_output": missing,
-            "execution_valid": exec_valid, "objective_pass_rate": rate, "metadata": metadata,
-            "assertions": [], "qualitative_assertions": []}
-
-
 class CostSummaryTests(unittest.TestCase):
     def test_cost_rows_require_a_string_variant_before_grouping(self):
-        row = result_row("c", "with_skill", cost=1.0, tokens=10)
+        row = cost_row("c", "with_skill", cost=1.0, tokens=10)
         row["variant"] = None
         with self.assertRaisesRegex(ValueError, "string variant"):
             sb.build_cost_summary([row])
@@ -420,10 +423,10 @@ class CostSummaryTests(unittest.TestCase):
 
     def test_ledger_totals_coverage_and_paired_delta(self):
         results = [
-            result_row("c1", "with_skill", cost=0.30, tokens=300),
-            result_row("c1", "without_skill", cost=0.10, tokens=100),
-            result_row("c2", "with_skill", cost=None, tokens=None),                    # missing telemetry
-            result_row("c2", "ablation:no-x", cost=0.50, tokens=500, exec_valid=False, rate=None),  # failed run still costs
+            cost_row("c1", "with_skill", cost=0.30, tokens=300),
+            cost_row("c1", "without_skill", cost=0.10, tokens=100),
+            cost_row("c2", "with_skill", cost=None, tokens=None),                    # missing telemetry
+            cost_row("c2", "ablation:no-x", cost=0.50, tokens=500, exec_valid=False, rate=None),  # failed run still costs
         ]
         summary = sb.build_cost_summary(results, confirmed_regressions=1)
         self.assertEqual(summary["coverage"], {"runs_seen": 4, "runs_with_token_usage": 3, "runs_with_dollar_cost": 3,
@@ -440,10 +443,10 @@ class CostSummaryTests(unittest.TestCase):
 
     def test_mixed_currency_pair_deltas_never_claim_one_dollar_mean(self):
         summary = sb.build_cost_summary([
-            result_row("c1", "with_skill", cost=2.0, tokens=10, currency="USD"),
-            result_row("c1", "without_skill", cost=1.0, tokens=10, currency="USD"),
-            result_row("c2", "with_skill", cost=2.0, tokens=10, currency="EUR"),
-            result_row("c2", "without_skill", cost=1.0, tokens=10, currency="EUR"),
+            cost_row("c1", "with_skill", cost=2.0, tokens=10, currency="USD"),
+            cost_row("c1", "without_skill", cost=1.0, tokens=10, currency="USD"),
+            cost_row("c2", "with_skill", cost=2.0, tokens=10, currency="EUR"),
+            cost_row("c2", "without_skill", cost=1.0, tokens=10, currency="EUR"),
         ])
         self.assertEqual(summary["mean_paired_cost_delta"], 1.0)
         self.assertEqual(summary["mean_paired_cost_delta_basis"], {"currency": "USD"})
@@ -452,10 +455,10 @@ class CostSummaryTests(unittest.TestCase):
 
     def test_all_missing_and_measured_zero_are_not_conflated(self):
         unavailable = sb.build_cost_summary([
-            result_row("c1", "with_skill", cost=None, tokens=None),
+            cost_row("c1", "with_skill", cost=None, tokens=None),
         ])
         zero = sb.build_cost_summary([
-            result_row("c1", "with_skill", cost=0.0, tokens=0),
+            cost_row("c1", "with_skill", cost=0.0, tokens=0),
         ])
         self.assertIsNone(unavailable["totals"]["total_cost_usd"])
         self.assertEqual(unavailable["totals"]["total_cost_usd_availability"], "unavailable")
@@ -467,7 +470,7 @@ class CostSummaryTests(unittest.TestCase):
             "a": {"cost_usd": 0.02, "cost_normalized": {"currency": "USD", "total_cost": 0.02, "source": "provider_reported"}},
             "b": {"cost_normalized": {"source": "missing"}},
         }
-        summary = sb.build_cost_summary([result_row("c1", "with_skill", cost=1.0, tokens=100)], judge_results=judge_results)
+        summary = sb.build_cost_summary([cost_row("c1", "with_skill", cost=1.0, tokens=100)], judge_results=judge_results)
         self.assertEqual(summary["judge"]["verdicts"], 2)
         self.assertEqual(summary["judge"]["verdicts_with_cost"], 1)
         self.assertIsNone(summary["judge"]["total_cost_usd"])
@@ -477,27 +480,10 @@ class CostSummaryTests(unittest.TestCase):
     def test_benchmark_report_carries_cost_summary(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"
-            (repo / "skill").mkdir(parents=True)
-            (repo / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-            (repo / "evals").mkdir()
-            path = repo / "evals" / "shared-benchmark.json"
-            path.write_text(json.dumps({
-                "version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                "variants": ["with_skill", "without_skill"],
-                "cases": [{"id": "c1", "split": "tune", "kind": "behavior", "prompt": "p",
-                           "assertions": [{"name": "a", "type": "contains", "value": "alpha"}]}],
-            }), encoding="utf-8")
+            path = cost_repo(root)
             runs = root / "runs"
             for variant, text, cost in [("with_skill", "alpha", 0.4), ("without_skill", "nope", 0.1)]:
-                base = runs / "c1" / variant
-                base.mkdir(parents=True)
-                (base / "output.md").write_text(text, encoding="utf-8")
-                (base / "metadata.json").write_text(json.dumps({
-                    "provider": "test-provider", "model": "test-model", "billing_scope": "run",
-                    "usage_normalized": {"total_tokens": 100, "source": "provider_reported"},
-                    "cost_normalized": {"currency": "USD", "total_cost": cost, "source": "provider_reported"},
-                }), encoding="utf-8")
+                write_run(runs / "c1" / variant, text, metadata=cost_metadata(cost=cost, tokens=100))
             attest_answer_design(path, runs)
             report = sb.build_benchmark_report(path, runs)
         self.assertEqual(report["cost_summary"]["totals"]["total_cost_usd"], 0.5)
@@ -507,17 +493,7 @@ class CostSummaryTests(unittest.TestCase):
 
 class SuiteLedgerTests(unittest.TestCase):
     def build_repo(self, root: Path) -> tuple[Path, Path]:
-        repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-        (repo / "evals").mkdir()
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps({
-            "version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [{"id": "c1", "split": "tune", "kind": "behavior", "prompt": "p",
-                       "assertions": [{"name": "a", "type": "contains", "value": "alpha"}]}],
-        }), encoding="utf-8")
+        path = cost_repo(root)
         runs = root / "runs"
         layout = [
             (runs / "c1" / "with_skill", 0.30, "pi"),
@@ -526,13 +502,7 @@ class SuiteLedgerTests(unittest.TestCase):
             (runs / "c1" / "model-b" / "with_skill", 0.20, "claude"),   # multi-model layout
         ]
         for base, cost, provider in layout:
-            base.mkdir(parents=True)
-            (base / "output.md").write_text("alpha", encoding="utf-8")
-            (base / "metadata.json").write_text(json.dumps({
-                "provider": provider,
-                "usage_normalized": {"total_tokens": 100, "source": "provider_reported"},
-                "cost_normalized": {"currency": "USD", "total_cost": cost, "source": "provider_reported"},
-            }), encoding="utf-8")
+            write_run(base, "alpha", metadata=cost_metadata(cost=cost, tokens=100, provider=provider))
         return path, runs
 
     def test_ledger_walks_all_arms_and_ranks_spend(self):
@@ -631,27 +601,11 @@ class TokenOverheadDollarTests(unittest.TestCase):
     def test_non_usd_pairs_never_populate_dollar_fields(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"
-            (repo / "skill").mkdir(parents=True)
-            (repo / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\nbody\n", encoding="utf-8")
-            (repo / "evals").mkdir()
-            path = repo / "evals" / "shared-benchmark.json"
-            path.write_text(json.dumps({
-                "version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                "variants": ["with_skill", "without_skill"],
-                "cases": [{"id": "c1", "split": "tune", "kind": "behavior", "prompt": "p",
-                           "assertions": [{"name": "a", "type": "contains", "value": "alpha"}]}],
-            }), encoding="utf-8")
+            path = cost_repo(root)
             runs = root / "runs"
             for variant, text, cost, tokens in [("with_skill", "alpha", 0.30, 300), ("without_skill", "nope", 0.10, 100)]:
-                base = runs / "c1" / variant
-                base.mkdir(parents=True)
-                (base / "output.md").write_text(text, encoding="utf-8")
-                (base / "metadata.json").write_text(json.dumps({
-                    "provider": "test-provider", "model": "test-model", "billing_scope": "run",
-                    "usage_normalized": {"total_tokens": tokens, "input_tokens": tokens - 10, "output_tokens": 10, "source": "provider_reported"},
-                    "cost_normalized": {"currency": "EUR", "total_cost": cost, "source": "provider_reported"},
-                }), encoding="utf-8")
+                write_run(runs / "c1" / variant, text,
+                          metadata=cost_metadata(cost=cost, tokens=tokens, currency="EUR"))
             attest_answer_design(path, runs)
             report = sb.paired_token_overhead_report(path, runs=runs)
         pair = report["pairs"][0]
@@ -666,27 +620,10 @@ class TokenOverheadDollarTests(unittest.TestCase):
     def test_saturated_pair_cost_is_reported_as_waste(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"
-            (repo / "skill").mkdir(parents=True)
-            (repo / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-            (repo / "evals").mkdir()
-            path = repo / "evals" / "shared-benchmark.json"
-            path.write_text(json.dumps({
-                "version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-                "variants": ["with_skill", "without_skill"],
-                "cases": [{"id": "c1", "split": "tune", "kind": "behavior", "prompt": "p",
-                           "assertions": [{"name": "a", "type": "contains", "value": "alpha"}]}],
-            }), encoding="utf-8")
+            path = cost_repo(root)
             runs = root / "runs"
-            for variant in ["with_skill", "without_skill"]:
-                base = runs / "c1" / variant
-                base.mkdir(parents=True)
-                (base / "output.md").write_text("alpha", encoding="utf-8")   # both pass: saturated
-                (base / "metadata.json").write_text(json.dumps({
-                    "provider": "test-provider", "model": "test-model", "billing_scope": "run",
-                    "usage_normalized": {"total_tokens": 100, "source": "provider_reported"},
-                    "cost_normalized": {"currency": "USD", "total_cost": 0.25, "source": "provider_reported"},
-                }), encoding="utf-8")
+            for variant in ["with_skill", "without_skill"]:   # both pass: saturated
+                write_run(runs / "c1" / variant, "alpha", metadata=cost_metadata(cost=0.25, tokens=100))
             attest_answer_design(path, runs)
             report = sb.paired_token_overhead_report(path, runs=runs)
         self.assertEqual(report["summary"]["saturated_or_no_lift_cost_usd"], 0.5)
@@ -694,31 +631,17 @@ class TokenOverheadDollarTests(unittest.TestCase):
 
 class CostAuditFindingTests(unittest.TestCase):
     def build_repo(self, root: Path, *, case_cost: float) -> Path:
-        repo = root / "repo"
-        (repo / "skill").mkdir(parents=True)
-        (repo / "skill" / "SKILL.md").write_text("---\nname: d\ndescription: D\n---\n", encoding="utf-8")
-        (repo / "evals").mkdir()
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps({
-            "version": 1, "skill_name": "d", "skill_paths": ["skill/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [
-                {"id": "sat-case", "split": "tune", "kind": "behavior", "prompt": "p",
-                 "assertions": [{"name": "a", "type": "contains", "value": "alpha"}]},
-                {"id": "judge-case", "split": "tune", "kind": "behavior", "prompt": "q",
-                 "assertions": [{"name": "j", "type": "judge", "severity": "gate",
-                                  "rubric": ["good"]}]},
-            ],
-        }), encoding="utf-8")
+        path = cost_repo(root, [
+            {**ALPHA_CASE, "id": "sat-case"},
+            {"id": "judge-case", "split": "tune", "kind": "behavior", "prompt": "q",
+             "assertions": [{"name": "j", "type": "judge", "severity": "gate",
+                             "rubric": ["good"]}]},
+        ])
         runs = root / "runs"
         for case_id in ["sat-case", "judge-case"]:
-            for variant in ["with_skill", "without_skill"]:
-                base = runs / case_id / variant
-                base.mkdir(parents=True)
-                (base / "output.md").write_text("alpha", encoding="utf-8")   # saturated
-                (base / "metadata.json").write_text(json.dumps({
-                    "cost_normalized": {"currency": "USD", "total_cost": case_cost, "source": "provider_reported"},
-                }), encoding="utf-8")
+            for variant in ["with_skill", "without_skill"]:   # saturated
+                write_run(runs / case_id / variant, "alpha",
+                          metadata=cost_metadata(cost=case_cost, tokens=None))
         attest_answer_design(path, runs)
         return path
 
@@ -770,8 +693,8 @@ class SuiteBudgetGateTests(unittest.TestCase):
 
     def test_foreign_currency_observations_do_not_dilute_usd_budget_history(self):
         summary = sb.build_cost_summary([
-            result_row("usd", "with_skill", cost=10.0, tokens=10, currency="USD"),
-            result_row("eur", "with_skill", cost=20.0, tokens=10, currency="EUR"),
+            cost_row("usd", "with_skill", cost=10.0, tokens=10, currency="USD"),
+            cost_row("eur", "with_skill", cost=20.0, tokens=10, currency="EUR"),
         ])
         self.assertEqual(summary["coverage"]["runs_with_dollar_cost"], 1)
         self.assertEqual(summary["coverage"]["runs_with_non_usd_cost"], 1)

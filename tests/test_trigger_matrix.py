@@ -827,29 +827,23 @@ class CodexAdapterTests(unittest.TestCase):
         prose = json.dumps({"type": "message", "content": "I would use demo-reviewer."})
         self.assertFalse(tm.CodexAdapter().detect(completed_invocation(prose), ["demo-reviewer"], [mounted]).triggered)
 
-    def test_codex_malformed_stream_is_not_a_valid_negative_observation(self):
-        def fake_run(*args, **kwargs):
-            return InvocationOutcome.from_process(
-                stdout="not-json\n", stderr="", returncode=0, elapsed_ms=1,
-            )
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
-            workspace = Path(td) / "workspace"
-            workspace.mkdir()
-            result = tm.CodexAdapter().invoke("q", None, workspace, 1)
-        self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
+    def test_malformed_or_unterminated_streams_are_not_valid_negative_observations(self):
+        # Parseable JSON is not enough: Codex must end its turn and Vibe must
+        # end with an assistant answer before absence of evidence counts.
+        for adapter_cls in (tm.CodexAdapter, tm.VibeAdapter):
+            for stdout, reason in (("not-json\n", "is malformed"), ("{}\n", "JSON stream must")):
+                def fake_run(*args, _stdout=stdout, **kwargs):
+                    return InvocationOutcome.from_process(
+                        stdout=_stdout, stderr="", returncode=0, elapsed_ms=1)
 
-    def test_codex_parseable_but_unterminated_stream_is_not_a_valid_negative_observation(self):
-        def fake_run(*args, **kwargs):
-            return InvocationOutcome.from_process(
-                stdout="{}\n", stderr="", returncode=0, elapsed_ms=1,
-            )
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(tm.CodexAdapter, "_run_argv", staticmethod(fake_run)):
-            workspace = Path(td) / "workspace"
-            workspace.mkdir()
-            result = tm.CodexAdapter().invoke("q", None, workspace, 1)
-        self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
+                with self.subTest(adapter=adapter_cls.name, stdout=stdout), \
+                     tempfile.TemporaryDirectory() as td, \
+                     mock.patch.object(adapter_cls, "_run_argv", staticmethod(fake_run)):
+                    workspace = Path(td) / "workspace"
+                    workspace.mkdir()
+                    result = adapter_cls().invoke("q", None, workspace, 1)
+                    self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
+                    self.assertIn(reason, result.provider_error or "")
 
     def test_codex_invoke_appends_raw_query_model_and_external_skill_dir(self):
         seen = {}
@@ -1057,30 +1051,6 @@ class VibeAdapterTests(unittest.TestCase):
         self.assertIn("Vibe skill tool invoked: demo-reviewer", detection.legacy_evidence)
         other = json.dumps({"role": "assistant", "tool_calls": [{"function": {"name": "skill", "arguments": json.dumps({"name": "other"})}}]})
         self.assertFalse(tm.VibeAdapter().detect(completed_invocation(other), ["demo-reviewer"], []).triggered)
-
-    def test_vibe_malformed_stream_is_not_a_valid_negative_observation(self):
-        def fake_run(*args, **kwargs):
-            return InvocationOutcome.from_process(
-                stdout="not-json\n", stderr="", returncode=0, elapsed_ms=1,
-            )
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(tm.VibeAdapter, "_run_argv", staticmethod(fake_run)):
-            workspace = Path(td) / "workspace"
-            workspace.mkdir()
-            result = tm.VibeAdapter().invoke("q", None, workspace, 1)
-        self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
-
-    def test_vibe_parseable_but_answerless_stream_is_not_a_valid_negative_observation(self):
-        def fake_run(*args, **kwargs):
-            return InvocationOutcome.from_process(
-                stdout="{}\n", stderr="", returncode=0, elapsed_ms=1,
-            )
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(tm.VibeAdapter, "_run_argv", staticmethod(fake_run)):
-            workspace = Path(td) / "workspace"
-            workspace.mkdir()
-            result = tm.VibeAdapter().invoke("q", None, workspace, 1)
-        self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
 
     def test_vibe_invoke_uses_isolated_home_model_env_and_prompt_arg(self):
         seen = {}

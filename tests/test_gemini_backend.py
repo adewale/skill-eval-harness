@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import make_eval_repo
+from helpers import make_eval_repo, write_with_skill_task
 
 import ablation_model as am
 import agent_capabilities as ac
@@ -1014,19 +1014,10 @@ class GeminiIsolationTests(unittest.TestCase):
 
 
 class GeminiAnswerBackendTests(unittest.TestCase):
-    def _one_with_skill_task(self, root: Path) -> tuple[Path, str]:
-        manifest = make_eval_repo(root)
-        rows = sb.prepared_task_rows(
-            manifest, sb.validate_manifest(manifest), split="tune")
-        row = next(item for item in rows if item["variant"] == "with_skill")
-        tasks = root / "tasks.jsonl"
-        tasks.write_text(json.dumps(row) + "\n", encoding="utf-8")
-        return tasks, row["run_dir"]
-
     def test_run_agent_uses_headless_stream_json_and_writes_complete_artifacts(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake = root / "fake_gemini.py"
             _write_executable(fake,
                 "import json, os, pathlib, sys\n"

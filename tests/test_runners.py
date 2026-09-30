@@ -32,6 +32,7 @@ from helpers import (
 from helpers import (
     make_eval_repo,
     stub_claude_stream,
+    write_with_skill_task,
 )
 from helpers import (
     write_demo_manifest as write_manifest,
@@ -703,19 +704,10 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"process {pid} is still running after {timeout:.1f}s")
 
-    def _one_with_skill_task(self, root: Path) -> tuple[Path, str]:
-        case = {"id": "c", "split": "tune", "prompt": "do it",
-                "assertions": [{"name": "a", "type": "contains", "value": "token"}]}
-        manifest = make_eval_repo(root, cases=[case])
-        rows = [r for r in sb.prepared_task_rows(manifest, sb.validate_manifest(manifest)) if r["variant"] == "with_skill"]
-        tasks = root / "tasks.jsonl"
-        tasks.write_text(json.dumps(rows[0]) + "\n", encoding="utf-8")
-        return tasks, rows[0]["run_dir"]
-
     def test_codex_and_claude_produce_the_same_contract_shape(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
 
             fake_codex = root / "fake_codex.py"
             fake_codex.write_text(
@@ -766,7 +758,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_run_agent_dispatches_registered_claude_and_codex_backends(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake_codex = root / "fake_codex.py"
             fake_codex.write_text(
                 "import json, pathlib, sys\n_ = sys.stdin.read()\n"
@@ -1129,7 +1121,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_run_agent_writes_failure_artifact_when_native_command_is_missing(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             runs = root / "runs"
             sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(runs), model="gpt-mini",
                                             codex_cmd=str(root / "missing-codex"), claude_bin="claude", timeout=30))
@@ -1319,7 +1311,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_run_agent_dispatches_registered_vibe_backend(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake_vibe = root / "fake_vibe.py"
             fake_vibe.write_text(
                 "import json, os, pathlib, sys\n"
@@ -1358,7 +1350,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_vibe_success_without_usage_writes_explicit_missing_telemetry(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             fake_vibe = root / "fake_vibe_no_usage.py"
             fake_vibe.write_text(
                 "import json\n"
@@ -1402,7 +1394,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
     def test_vibe_missing_binary_uses_vibe_failure_marker(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             runs = root / "runs"
             sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model=None,
                                             codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=str(root / "missing-vibe"), timeout=30))
@@ -1419,7 +1411,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
         # (was schema-1 metadata with no normalized blocks before the consolidation).
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            tasks, run_dir = self._one_with_skill_task(root)
+            _, tasks, run_dir = write_with_skill_task(root)
             silent = root / "silent_codex.py"
             silent.write_text("import sys\n_ = sys.stdin.read()\n", encoding="utf-8")  # emits nothing
             runs = root / "runs"

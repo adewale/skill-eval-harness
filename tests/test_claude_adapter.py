@@ -10,9 +10,9 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import claude_stream_records as _canonical_stream_records
-from helpers import make_eval_repo
 from helpers import stub_claude as _stub_claude
 from helpers import stub_claude_stream as _stub_claude_stream
+from helpers import write_with_skill_task
 
 import skill_benchmark as sb
 
@@ -26,11 +26,6 @@ def claude_stream_records(**overrides) -> list[dict]:
 
 def stream_text(records: list[dict]) -> str:
     return "\n".join(json.dumps(r) for r in records) + "\n"
-
-
-def _manifest(rp: Path, cases):
-    # Shared builder: writes the demo skill AND the manifest.
-    return make_eval_repo(rp.parent, skill_name="demo", cases=cases)
 
 
 class ParseClaudeEnvelopeTests(unittest.TestCase):
@@ -282,19 +277,15 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
 
 class RunClaudeAdapterTests(unittest.TestCase):
     def _run(self, td: Path, *, cost=0.0123, returncode=0, answer="STREAM ANSWER token-XYZ"):
-        rp = td / "repo"
         case = {"id": "c", "split": "tune", "prompt": "do it",
                 "assertions": [{"name": "a", "type": "contains", "value": "token-XYZ"}]}
-        p = _manifest(rp, [case])
-        rows = [r for r in sb.prepared_task_rows(p, sb.validate_manifest(p)) if r["variant"] == "with_skill"]
-        tasks = td / "tasks.jsonl"
-        tasks.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        p, tasks, run_dir = write_with_skill_task(td, cases=[case])
         stub = _stub_claude_stream(td / "claude_stub.py", cost=cost, returncode=returncode, answer=answer)
         runs = td / "runs"
         ns = argparse.Namespace(tasks=str(tasks), runs=str(runs),
                                 model="claude-haiku-4-5-20251001", claude_bin=str(stub), timeout=60)
         sb.run_claude(ns)
-        return p, runs, rows[0]["run_dir"]
+        return p, runs, run_dir
 
     def test_writes_output_and_cost_metrics(self):
         with tempfile.TemporaryDirectory() as t:

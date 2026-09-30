@@ -539,3 +539,22 @@ sys.exit({returncode})
     path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return path
+
+
+# --------------------------------------------------------------------------- #
+# lane3: answer-runner fixtures
+# --------------------------------------------------------------------------- #
+
+
+def write_with_skill_task(root: Path, **repo: Any) -> tuple[Path, Path, str]:
+    """An eval repo under root (make_eval_repo's keywords) and a tasks.jsonl
+    holding its first with_skill prepared task, the input every answer-runner
+    command reads. Returns (manifest, tasks, run_dir)."""
+    import skill_benchmark as sb
+
+    manifest = make_eval_repo(root, **repo)
+    row = next(r for r in sb.prepared_task_rows(manifest, sb.validate_manifest(manifest))
+               if r["variant"] == "with_skill")
+    tasks = root / "tasks.jsonl"
+    tasks.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    return manifest, tasks, row["run_dir"]
