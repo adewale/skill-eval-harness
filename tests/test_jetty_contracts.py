@@ -38,7 +38,7 @@ class JettyLifecycleTruthTableTests(unittest.TestCase):
             **{raw: jc.Queued for raw in ("pending", "queued", "starting")},
             **{raw: jc.Running for raw in ("running", "in_progress")},
             **{raw: jc.Succeeded for raw in ("completed", "complete", "succeeded", "success")},
-            **{raw: jc.Failed for raw in ("failed", "failure", "error", "errored", "canceled", "cancelled")},
+            **{raw: jc.Failed for raw in ("failed", "failure", "error", "errored", "canceled", "cancelled", "archived")},
             **{raw: jc.TimedOut for raw in ("timeout", "timed_out")},
         }
         for raw, expected_type in table.items():
@@ -48,6 +48,8 @@ class JettyLifecycleTruthTableTests(unittest.TestCase):
                 self.assertEqual(lifecycle.terminal, not isinstance(lifecycle, (jc.Queued, jc.Running)))
         self.assertTrue(jc.lifecycle_from_status("completed").successful)
         self.assertFalse(jc.lifecycle_from_status("failed").successful)
+        # A trajectory archived mid-poll ends the run as an explained failure.
+        self.assertIn("archived", jc.lifecycle_from_status("archived").message)
 
     def test_unknown_missing_and_non_string_statuses_are_protocol_invalid(self):
         for raw in (None, "", "new-provider-state", 7, True):

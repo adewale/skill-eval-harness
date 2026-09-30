@@ -2171,9 +2171,6 @@ JETTY_SUBMIT_TIMEOUT_HINT_S = 60
 # Python-urllib/x.y agent signature outright (403, error code 1010) — every
 # request must carry a real User-Agent.
 JETTY_USER_AGENT = "skill-eval-harness"
-JETTY_TERMINAL_SUCCESS = {"completed", "complete", "succeeded", "success"}
-JETTY_TERMINAL_FAILURE = {"failed", "failure", "error", "errored", "canceled", "cancelled", "timeout", "timed_out"}
-JETTY_PENDING = {"pending", "queued", "running", "in_progress", "starting"}
 
 CODEX_HOME_FILES = ("auth.json", "config.toml")
 
