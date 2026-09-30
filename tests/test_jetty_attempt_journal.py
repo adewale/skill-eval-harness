@@ -10,106 +10,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from helpers import (
+    FakeJettyClient,
+    attest_jetty_payload,
+    jetty_payload,
+    jetty_task_upload,
+)
+
 import skill_benchmark as sb
 
 
 class InjectedCrash(BaseException):
     pass
-
-
-def executable_payload(*, with_upload: bool = False) -> dict:
-    payload = {
-        "harness": {
-            "executable": True,
-            "case_id": "case-1",
-            "variant": "with_skill",
-            "run_number": 1,
-            "run_dir": "case-1/with_skill",
-        },
-        "jetty_request": {
-            "model": "model-1",
-            "messages": [],
-            "jetty": {
-                "collection": "collection-1",
-                "task": "task-1",
-                "agent": "claude-code",
-                "model_provider": "anthropic",
-                "snapshot": "snapshot-1",
-            },
-        },
-        "upload_plan": {"files": []},
-    }
-    if with_upload:
-        payload["upload_plan"] = {
-            "bundle": {
-                "placeholder": "upload://task-1/bundle/zip",
-                "archive_name": "task-1.zip",
-            },
-            "files": [{
-                "role": "task",
-                "placeholder": "upload://task-1/task/json",
-                "remote_path_hint": "tasks/task-1.json",
-                "content": "{}",
-            }],
-        }
-        payload["jetty_request"]["jetty"]["file_paths"] = [
-            "upload://task-1/bundle/zip"]
-    payload["harness"]["jetty_task_contract_sha256"] = (
-        sb.jetty_task_contract_sha256(payload))
-    return payload
-
-
-class RecordingClient:
-    def __init__(self, *, artifact: bool = False, submit_error: Exception | None = None):
-        self.artifact = artifact
-        self.submit_error = submit_error
-        self.upload_calls = 0
-        self.submit_calls = 0
-        self.poll_calls = 0
-        self.fetch_calls = 0
-        self.download_calls = 0
-
-    def upload_bundle(self, archive_name, data):
-        self.upload_calls += 1
-        return "collection-1/_sandbox_uploads/bundle/task-1.zip"
-
-    def submit(self, request):
-        self.submit_calls += 1
-        if self.submit_error is not None:
-            raise self.submit_error
-        return {"trajectory_id": "trajectory-1"}
-
-    def poll(self, *args, **kwargs):
-        self.poll_calls += 1
-        return {
-            "status": "completed",
-            "trajectory_id": "trajectory-1",
-            "storage_path": "collection-1/task-1/0000",
-        }
-
-    def fetch_trajectory(self, *args, **kwargs):
-        self.fetch_calls += 1
-        results_files = []
-        if self.artifact:
-            results_files.append({
-                "path": (
-                    "collection-1/task-1/0000/"
-                    "trajectory-1.run.0000.app--results--output.md"),
-                "content_type": "text/markdown",
-            })
-        return {
-            "status": "completed",
-            "trajectory_id": "trajectory-1",
-            "storage_path": "collection-1/task-1/0000",
-            "steps": {"run": {"outputs": {
-                "success": True,
-                "results_files": results_files,
-            }}},
-        }
-
-    def download_file(self, storage_path):
-        self.download_calls += 1
-        return b"done"
 
 
 def crash_on(target: str):
@@ -160,8 +72,9 @@ class JettyAttemptJournalTests(unittest.TestCase):
         }
         for event, (with_upload, uploads, submits, polls, fetches, downloads) in cases.items():
             with self.subTest(event=event), tempfile.TemporaryDirectory() as td:
-                payload = executable_payload(with_upload=with_upload)
-                client = RecordingClient(artifact=downloads > 0)
+                payload = jetty_payload(
+                    files=[jetty_task_upload()] if with_upload else None)
+                client = FakeJettyClient(artifact=downloads > 0)
                 journal_path = Path(td) / "attempts.json"
 
                 with self.assertRaises(InjectedCrash):
@@ -181,8 +94,8 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_submission_without_acknowledgement_fails_closed_until_explicit_override(self):
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "attempts.json"
-            payload = executable_payload()
-            failed_client = RecordingClient(
+            payload = jetty_payload()
+            failed_client = FakeJettyClient(
                 submit_error=ConnectionError("response lost"))
 
             [unknown] = self.execute(payload, failed_client, journal_path)
@@ -198,12 +111,12 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 "submission_unknown",
             )
 
-            blocked_client = RecordingClient()
+            blocked_client = FakeJettyClient()
             [blocked] = self.execute(payload, blocked_client, journal_path)
             self.assertEqual(blocked["attempt_state"], "submission_unknown")
             self.assertEqual(blocked_client.submit_calls, 0)
 
-            override_client = RecordingClient()
+            override_client = FakeJettyClient()
             [completed] = self.execute(
                 payload, override_client, journal_path,
                 resubmit_unknown=True,
@@ -219,7 +132,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
         for status, expected_state in cases.items():
             with self.subTest(status=status), tempfile.TemporaryDirectory() as td:
                 journal_path = Path(td) / "attempts.json"
-                payload = executable_payload()
+                payload = jetty_payload()
                 error = sb.urllib.error.HTTPError(
                     "https://example.test/v1/chat/completions",
                     status,
@@ -230,14 +143,14 @@ class JettyAttemptJournalTests(unittest.TestCase):
 
                 [first] = self.execute(
                     payload,
-                    RecordingClient(submit_error=error),
+                    FakeJettyClient(submit_error=error),
                     journal_path,
                 )
 
                 digest = payload["harness"]["jetty_task_contract_sha256"]
                 entry = sb.JettyAttemptJournal(journal_path).entry(digest)
                 self.assertEqual(entry["state"], expected_state)
-                restarted = RecordingClient()
+                restarted = FakeJettyClient()
                 [second] = self.execute(payload, restarted, journal_path)
                 if status == 408:
                     self.assertEqual(first["attempt_state"], "submission_unknown")
@@ -250,13 +163,13 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_process_interruption_inside_submit_is_durably_unknown(self):
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "attempts.json"
-            payload = executable_payload()
-            interrupted = RecordingClient(submit_error=InjectedCrash("stopped"))
+            payload = jetty_payload()
+            interrupted = FakeJettyClient(submit_error=InjectedCrash("stopped"))
 
             with self.assertRaises(InjectedCrash):
                 self.execute(payload, interrupted, journal_path)
 
-            restarted = RecordingClient()
+            restarted = FakeJettyClient()
             [blocked] = self.execute(payload, restarted, journal_path)
             self.assertEqual(blocked["attempt_state"], "submission_unknown")
             self.assertEqual(restarted.submit_calls, 0)
@@ -264,8 +177,8 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_process_interruption_after_submit_response_is_durably_unknown(self):
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "attempts.json"
-            payload = executable_payload()
-            submitted = RecordingClient()
+            payload = jetty_payload()
+            submitted = FakeJettyClient()
 
             with self.assertRaises(InjectedCrash):
                 self.execute(
@@ -278,7 +191,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
             self.assertEqual(entry["state"], "submitting")
             self.assertEqual(submitted.submit_calls, 1)
 
-            restarted = RecordingClient()
+            restarted = FakeJettyClient()
             [blocked] = self.execute(payload, restarted, journal_path)
             self.assertEqual(blocked["attempt_state"], "submission_unknown")
             self.assertEqual(restarted.submit_calls, 0)
@@ -289,13 +202,12 @@ class JettyAttemptJournalTests(unittest.TestCase):
             journal_path = root / "attempts.json"
             source = root / "task.json"
             source.write_text("{}", encoding="utf-8")
-            payload = executable_payload(with_upload=True)
+            payload = jetty_payload(files=[jetty_task_upload()])
             upload = payload["upload_plan"]["files"][0]
             upload.pop("content")
             upload["local_path"] = str(source)
-            payload["harness"]["jetty_task_contract_sha256"] = (
-                sb.jetty_task_contract_sha256(payload))
-            client = RecordingClient()
+            attest_jetty_payload(payload)
+            client = FakeJettyClient()
 
             with self.assertRaises(InjectedCrash):
                 self.execute(
@@ -310,18 +222,18 @@ class JettyAttemptJournalTests(unittest.TestCase):
             self.assertEqual(client.submit_calls, 1)
 
     def test_local_poll_wait_expiry_keeps_acknowledged_attempt_resumable(self):
-        class LocalTimeoutClient(RecordingClient):
+        class LocalTimeoutClient(FakeJettyClient):
             def poll(self, *args, **kwargs):
                 self.poll_calls += 1
                 raise sb.JettyPollWaitExpired({
                     "status": "running",
                     "trajectory_id": "trajectory-1",
-                    "storage_path": "collection-1/task-1/0000",
+                    "storage_path": "c/t/0000",
                 })
 
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "attempts.json"
-            payload = executable_payload()
+            payload = jetty_payload()
             timed_out_client = LocalTimeoutClient()
 
             [timed_out] = self.execute(
@@ -354,21 +266,21 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 self.assertEqual(sb.run_jetty(args), 1)
             self.assertEqual(sb.load_jsonl(out)[0]["status"], "running")
 
-            restarted = RecordingClient()
+            restarted = FakeJettyClient()
             [completed] = self.execute(payload, restarted, journal_path)
             self.assertEqual(completed["status"], "completed")
             self.assertEqual(restarted.submit_calls, 0)
             self.assertEqual(restarted.poll_calls, 1)
 
     def test_post_ack_transport_failure_is_not_importable(self):
-        class PollFailureClient(RecordingClient):
+        class PollFailureClient(FakeJettyClient):
             def poll(self, *args, **kwargs):
                 self.poll_calls += 1
                 raise ConnectionError("poll response lost")
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            payload = executable_payload()
+            payload = jetty_payload()
             client = PollFailureClient()
 
             [failed] = self.execute(
@@ -382,8 +294,8 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_receipt_identity_conflict_fails_closed_before_network_io(self):
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "attempts.json"
-            payload = executable_payload(with_upload=True)
-            first_client = RecordingClient()
+            payload = jetty_payload(files=[jetty_task_upload()])
+            first_client = FakeJettyClient()
             with self.assertRaises(InjectedCrash):
                 self.execute(
                     payload, first_client, journal_path,
@@ -396,7 +308,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
             journal_path.write_text(
                 json.dumps(raw, ensure_ascii=False) + "\n", encoding="utf-8")
 
-            client = RecordingClient()
+            client = FakeJettyClient()
             [record] = self.execute(payload, client, journal_path)
 
             self.assertEqual(record["status"], "failed")
@@ -407,14 +319,14 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_committed_result_replays_without_any_remote_call(self):
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "attempts.json"
-            payload = executable_payload()
-            client = RecordingClient()
+            payload = jetty_payload()
+            client = FakeJettyClient()
             [record] = self.execute(payload, client, journal_path)
             digest = payload["harness"]["jetty_task_contract_sha256"]
             journal = sb.JettyAttemptJournal(journal_path)
             journal.mark_result_committed(digest, record)
 
-            restarted = RecordingClient()
+            restarted = FakeJettyClient()
             [replayed] = self.execute(payload, restarted, journal_path)
 
             self.assertEqual(replayed, record)
@@ -425,8 +337,8 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_corrupted_committed_result_fails_closed_before_network_io(self):
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "attempts.json"
-            payload = executable_payload()
-            [record] = self.execute(payload, RecordingClient(), journal_path)
+            payload = jetty_payload()
+            [record] = self.execute(payload, FakeJettyClient(), journal_path)
             digest = payload["harness"]["jetty_task_contract_sha256"]
             sb.JettyAttemptJournal(journal_path).mark_result_committed(
                 digest, record)
@@ -435,7 +347,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
             journal_path.write_text(
                 json.dumps(raw) + "\n", encoding="utf-8")
 
-            restarted = RecordingClient()
+            restarted = FakeJettyClient()
             [blocked] = self.execute(payload, restarted, journal_path)
 
             self.assertEqual(blocked["status"], "failed")
@@ -465,7 +377,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_run_jetty_commits_the_journal_and_rebuilds_output_without_network(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            payload = executable_payload()
+            payload = jetty_payload()
             payloads_path = root / "payloads.jsonl"
             out = root / "runs.jsonl"
             journal_path = root / "attempts.json"
@@ -476,7 +388,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 journal=str(journal_path), timeout=1, poll_interval=0,
                 resubmit_unknown=False, dry_run=False,
             )
-            client = RecordingClient()
+            client = FakeJettyClient()
 
             with (
                 mock.patch.dict(os.environ, {"JETTY_API_TOKEN": "test-token"}),
@@ -490,7 +402,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
             self.assertEqual(
                 raw_journal["attempts"][digest]["state"], "result_committed")
 
-            restarted = RecordingClient()
+            restarted = FakeJettyClient()
             with (
                 mock.patch.dict(os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(sb, "JettyClient", return_value=restarted),
@@ -505,14 +417,13 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_restart_never_regresses_already_committed_output(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            first = executable_payload()
-            second = executable_payload()
+            first = jetty_payload()
+            second = jetty_payload()
             second["harness"].update({
                 "case_id": "case-2",
                 "run_dir": "case-2/with_skill",
             })
-            second["harness"]["jetty_task_contract_sha256"] = (
-                sb.jetty_task_contract_sha256(second))
+            attest_jetty_payload(second)
             payloads = [first, second]
             payloads_path = root / "payloads.jsonl"
             out = root / "runs.jsonl"
@@ -530,7 +441,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    sb, "JettyClient", return_value=FakeJettyClient()),
             ):
                 self.assertEqual(sb.run_jetty(args), 0)
             committed = sb.load_jsonl(out)
@@ -542,7 +453,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    sb, "JettyClient", return_value=FakeJettyClient()),
                 self.assertRaisesRegex(
                     RuntimeError, "omits previously durable"),
             ):
@@ -557,7 +468,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    sb, "JettyClient", return_value=FakeJettyClient()),
                 mock.patch.object(
                     sb, "execute_jetty_payloads",
                     side_effect=InjectedCrash("before replay"),
@@ -575,7 +486,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    sb, "JettyClient", return_value=FakeJettyClient()),
                 mock.patch.object(
                     sb, "execute_jetty_payloads",
                     side_effect=replay_one_then_crash,
@@ -588,7 +499,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_failed_artifact_checkpoint_cannot_commit_synthetic_failure(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            payload = executable_payload()
+            payload = jetty_payload()
             payloads_path = root / "payloads.jsonl"
             out = root / "runs.jsonl"
             journal_path = root / "attempts.json"
@@ -618,7 +529,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    sb, "JettyClient", return_value=FakeJettyClient()),
                 mock.patch.object(
                     sb.JettyAttemptJournal, "_persist",
                     fail_artifact_checkpoint_once,
@@ -632,7 +543,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
             [failed] = sb.load_jsonl(out)
             self.assertEqual(failed["attempt_state"], "terminal_observed")
 
-            restarted = RecordingClient()
+            restarted = FakeJettyClient()
             with (
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
@@ -650,7 +561,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_run_jetty_refuses_a_second_owner_before_network_io(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            payload = executable_payload()
+            payload = jetty_payload()
             payloads_path = root / "payloads.jsonl"
             out = root / "runs.jsonl"
             journal_path = root / "attempts.json"
@@ -661,7 +572,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 journal=str(journal_path), timeout=1, poll_interval=0,
                 resubmit_unknown=False, dry_run=False,
             )
-            client = RecordingClient()
+            client = FakeJettyClient()
 
             with (
                 sb.JettyAttemptJournalLock(journal_path),
@@ -749,7 +660,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
     def test_run_jetty_refuses_result_path_that_would_replace_lock(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            payload = executable_payload()
+            payload = jetty_payload()
             payloads_path = root / "payloads.jsonl"
             journal_path = root / "attempts.json"
             out = Path(str(journal_path) + ".lock")
@@ -760,7 +671,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 journal=str(journal_path), timeout=1, poll_interval=0,
                 resubmit_unknown=False, dry_run=False,
             )
-            client = RecordingClient()
+            client = FakeJettyClient()
 
             with (
                 mock.patch.dict(
@@ -791,7 +702,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
-                    sb, "JettyClient", return_value=RecordingClient()),
+                    sb, "JettyClient", return_value=FakeJettyClient()),
             ):
                 self.assertEqual(sb.run_jetty(args), 0)
 
@@ -801,13 +712,13 @@ class JettyAttemptJournalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             payloads_path = Path(td) / "payloads.jsonl"
             payloads_path.write_text(
-                json.dumps(executable_payload()) + "\n", encoding="utf-8")
+                json.dumps(jetty_payload()) + "\n", encoding="utf-8")
             args = SimpleNamespace(
                 payloads=str(payloads_path), out=None, journal=None,
                 timeout=1, poll_interval=0, resubmit_unknown=False,
                 dry_run=False,
             )
-            client = RecordingClient()
+            client = FakeJettyClient()
             stderr = io.StringIO()
             with (
                 mock.patch.dict(

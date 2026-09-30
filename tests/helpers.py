@@ -502,3 +502,120 @@ sys.exit({returncode})
     path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return path
+
+
+# --- lane4: Jetty executor fixtures -------------------------------------
+# One attested payload builder and one scripted client for every test that
+# drives execute_jetty_payloads/run_jetty (previously two payload builders, an
+# inlined third, and a dozen hand-written client classes).
+
+
+def attest_jetty_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Stamp the task-contract digest the executor re-derives before any
+    network I/O. Re-attest after an edit the test means to be genuine; skip it
+    to model a payload that changed after attestation."""
+    import skill_benchmark as sb
+
+    payload["harness"]["jetty_task_contract_sha256"] = sb.jetty_task_contract_sha256(payload)
+    return payload
+
+
+def jetty_task_upload(content: Any = "{}") -> dict[str, Any]:
+    """The task-JSON upload item an exported Jetty payload carries."""
+    return {"role": "task", "placeholder": "upload://task",
+            "remote_path_hint": "tasks/task.json", "content": content}
+
+
+def jetty_payload(
+    *,
+    harness: dict[str, Any] | None = None,
+    files: list[dict[str, Any]] | None = None,
+    messages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """An attested, executable run-jetty payload for case-1/with_skill in
+    collection "c", task "t". `harness` entries override that identity;
+    `files` ride one bundled upload, as export-jetty plans them."""
+    payload: dict[str, Any] = {
+        "harness": {
+            "executable": True, "case_id": "case-1", "variant": "with_skill",
+            "run_number": 1, "run_dir": "case-1/with_skill", **(harness or {}),
+        },
+        "jetty_request": {
+            "model": "m",
+            "messages": messages or [],
+            "jetty": {"collection": "c", "task": "t", "agent": "claude-code",
+                      "model_provider": "anthropic", "snapshot": "s"},
+        },
+        "upload_plan": {"files": files or []},
+    }
+    if files:
+        payload["upload_plan"]["bundle"] = {
+            "placeholder": "upload://bundle", "archive_name": "bundle.zip"}
+        payload["jetty_request"]["jetty"]["file_paths"] = ["upload://bundle"]
+    return attest_jetty_payload(payload)
+
+
+class FakeJettyClient:
+    """A scripted Jetty client that counts every remote call. By default it
+    acknowledges `trajectory_id`, polls it to `status` under
+    `<collection>/<task>/0000`, and (with `artifact=True`) lists one output.md
+    for download. Pass a response to replace only the surface under test."""
+
+    def __init__(
+        self,
+        *,
+        trajectory_id: str = "trajectory-1",
+        status: str = "completed",
+        artifact: bool = False,
+        submission: dict[str, Any] | None = None,
+        submit_error: BaseException | None = None,
+        poll_response: dict[str, Any] | None = None,
+        detail_response: dict[str, Any] | None = None,
+    ) -> None:
+        self.trajectory_id = trajectory_id
+        self.status = status
+        self.artifact = artifact
+        self.submission = submission
+        self.submit_error = submit_error
+        self.poll_response = poll_response
+        self.detail_response = detail_response
+        self.bundle: tuple[str, bytes] | None = None
+        self.submitted: dict[str, Any] | None = None
+        self.upload_calls = self.submit_calls = self.poll_calls = 0
+        self.fetch_calls = self.download_calls = 0
+
+    def upload_bundle(self, archive_name: str, data: bytes) -> str:
+        self.upload_calls += 1
+        self.bundle = (archive_name, data)
+        return "remote-bundle"
+
+    def submit(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.submit_calls += 1
+        self.submitted = request
+        if self.submit_error is not None:
+            raise self.submit_error
+        if self.submission is not None:
+            return json.loads(json.dumps(self.submission))
+        return {"trajectory_id": self.trajectory_id}
+
+    def poll(self, collection: str, task: str, trajectory_id: str, **_: Any) -> dict[str, Any]:
+        self.poll_calls += 1
+        if self.poll_response is not None:
+            return json.loads(json.dumps(self.poll_response))
+        return {"status": self.status, "trajectory_id": self.trajectory_id,
+                "storage_path": f"{collection}/{task}/0000"}
+
+    def fetch_trajectory(self, collection: str, task: str, trajectory_id: str) -> dict[str, Any]:
+        self.fetch_calls += 1
+        if self.detail_response is not None:
+            return json.loads(json.dumps(self.detail_response))
+        storage = f"{collection}/{task}/0000"
+        results = ([{"path": f"{storage}/{self.trajectory_id}.run.0000.app--results--output.md",
+                     "content_type": "text/markdown"}] if self.artifact else [])
+        return {"status": "completed", "trajectory_id": self.trajectory_id,
+                "storage_path": storage,
+                "steps": {"run": {"outputs": {"success": True, "results_files": results}}}}
+
+    def download_file(self, storage_path: str) -> bytes:
+        self.download_calls += 1
+        return b"done"

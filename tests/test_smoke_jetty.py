@@ -27,6 +27,8 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from helpers import FakeJettyClient
+
 import skill_benchmark as sb
 from ablation_model import JETTY_FAILURE
 
@@ -110,34 +112,8 @@ class JettySmokePayloadContractTests(unittest.TestCase):
                 row for row in payloads
                 if row["harness"]["variant"] == "with_skill")
 
-            class Client:
-                submitted = None
-
-                def upload_bundle(self, archive_name, data):
-                    return "skill-evals/_sandbox_uploads/offline/failure.zip"
-
-                def submit(self, request):
-                    self.submitted = request
-                    return {"jetty_metadata": {"trajectory_id": "failure-trajectory"}}
-
-                def poll(self, *args, **kwargs):
-                    return {
-                        "status": "failed",
-                        "trajectory_id": "failure-trajectory",
-                        "storage_path": f"{args[0]}/{args[1]}/0000",
-                    }
-
-                def fetch_trajectory(self, *args, **kwargs):
-                    return {
-                        "status": "completed",
-                        "trajectory_id": "failure-trajectory",
-                        "storage_path": f"{args[0]}/{args[1]}/0000",
-                        "steps": {"run": {"outputs": {
-                            "success": False, "results_files": [],
-                        }}},
-                    }
-
-            client = Client()
+            client = FakeJettyClient(
+                trajectory_id="failure-trajectory", status="failed")
             record = next(sb.execute_jetty_payloads([payload], client=client))
             self.assertIsNotNone(client.submitted)
             self.assertEqual(record["trajectory_id"], "failure-trajectory")
