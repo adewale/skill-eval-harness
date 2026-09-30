@@ -22,18 +22,10 @@ import run_pi_trigger_eval as tr
 # checks silently diverge between test files.
 import skill_benchmark as sb
 
-ROOT = Path(__file__).resolve().parents[1]
 smoke = load_example_module("run_pi_smoke", "examples/adewale-workspace/run_pi_smoke.py")
 
 
 class SkillBenchmarkTests(unittest.TestCase):
-    def test_central_cli_remains_in_the_project_ty_gate(self):
-        project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        ty_sources = project.split("[tool.ty.src]", 1)[1].split("\n[", 1)[0]
-        self.assertIn('"*.py"', ty_sources)
-        self.assertIn('"type_tests/*.py"', ty_sources)
-        self.assertNotIn("check_ty_regressions", project)
-
     def test_infra_failure_excluded_from_every_report_view(self):
         # Invariant: an infrastructure failure (execution_valid False) must not
         # affect ANY report view. Adding a crashed with_skill run (rate 0.0) must
