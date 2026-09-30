@@ -1430,24 +1430,25 @@ class GeminiAnswerBackendTests(unittest.TestCase):
             sleeper = root / "sleep.py"
             _write_executable(sleeper, "import time\ntime.sleep(5)\n")
             cases = (
-                ("missing-gemini-binary-for-contract-test", 30, 127, False),
-                (str(exit_nine), 30, 9, False),
-                (str(sleeper), 1, 124, True),
+                ("missing-gemini-binary-for-contract-test", 30, rc.SpawnFailed, 127, False),
+                (str(exit_nine), 30, rc.ProviderFailed, 9, False),
+                (str(sleeper), 1, rc.TimedOut, 124, True),
             )
-            for command, timeout, returncode, timed_out in cases:
-                with self.subTest(command=command):
-                    result = sb.gemini_cli_invoke(
-                        "prompt", gemini_cmd=command, timeout=timeout)
-                    self.assertEqual(result["returncode"], returncode)
-                    self.assertIs(result["timed_out"], timed_out)
-                    outcome = sb.RunnerOutcome(
-                        provider="gemini", answer=result["answer"],
-                        returncode=result["returncode"],
-                        timed_out=result["timed_out"], timeout_s=timeout,
-                        elapsed_ms=result["elapsed_ms"], stderr=result["stderr"],
-                        trace_text=result["trace_text"],
-                    )
-                    self.assertNotIsInstance(outcome, rc.Completed)
+            for command, timeout, outcome_type, returncode, timed_out in cases:
+                with self.subTest(outcome=outcome_type.__name__):
+                    outcome = sb.GeminiBackend().invoke_answer(
+                        sb.InvocationRequest(
+                            "prompt", root / f"workspace-{returncode}", None, timeout),
+                        gemini_cmd=command)
+                    self.assertIsInstance(outcome, outcome_type)
+                    base = root / f"run-{returncode}"
+                    sb.write_runner_outcome(base, outcome)
+                    metadata = json.loads(
+                        (base / "metadata.json").read_text(encoding="utf-8"))
+                    self.assertEqual(metadata["returncode"], returncode)
+                    self.assertIs(metadata["timed_out"], timed_out)
+                    self.assertFalse(am.execution_valid(
+                        metadata, (base / "output.md").read_text(encoding="utf-8")))
 
     def test_spawned_reserved_exit_codes_are_provider_failures(self):
         with tempfile.TemporaryDirectory() as td:
