@@ -37,9 +37,6 @@ from agent_capabilities import AGENT_CAPABILITIES
 from trigger_contracts import (
     InvocationOutcome,
     InvocationState,
-    TriggerExpectation,
-    TriggerObservation,
-    TriggerRepetitionIdentity,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +52,44 @@ def completed_invocation(stdout: str) -> InvocationOutcome:
     return InvocationOutcome.from_process(stdout=stdout, stderr="", returncode=0, elapsed_ms=1)
 
 
+PI_STOP = {"type": "agent_end", "messages": [{"role": "assistant", "stopReason": "stop"}]}
+
+
+def pi_stream(*events) -> str:
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
+def pi_runs(fake):
+    """Replace the Pi process boundary the matrix's Pi adapter calls."""
+    return mock.patch.object(tm.PiAdapter, "_run_argv", staticmethod(fake))
+
+
+def write_rows(root: Path, rows) -> Path:
+    path = root / "rows.json"
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    return path
+
+
+def run_pi_cli(extra_argv, fake, out: Path):
+    """Run `skill-pi-trigger-eval` on the demo manifest; return (exit code, report)."""
+    argv = ["skill-pi-trigger-eval", str(DEMO_MANIFEST), *extra_argv, "--out", str(out)]
+    with mock.patch.object(sys, "argv", argv), pi_runs(fake), mock.patch("builtins.print"):
+        code = tr.main()
+    return code, json.loads(out.read_text(encoding="utf-8"))
+
+
+def observe_pi(query, should_trigger, fake, *, trace_dir=None):
+    """One Pi cell of the matrix on the demo skill's canonical tree."""
+    manifest = tm.load_manifest(DEMO_MANIFEST)
+    with tempfile.TemporaryDirectory() as td:
+        tree, tree_hash, _ = tm.trigger_tree_for_manifest(
+            sb.repo_root_for_manifest(DEMO_MANIFEST), manifest, Path(td), None)
+        with pi_runs(fake):
+            return tm.observe_cell_query(
+                tm.PiAdapter(), tree, query, should_trigger, None, 12,
+                trace_dir=trace_dir, metadata={"skill_tree_hash": tree_hash})
+
+
 class TriggerRowBoundaryTests(unittest.TestCase):
     def test_eval_set_requires_real_boolean_should_trigger(self):
         with tempfile.TemporaryDirectory() as td:
@@ -65,18 +100,14 @@ class TriggerRowBoundaryTests(unittest.TestCase):
                 tm.eval_rows_from_args(args, DEMO_MANIFEST)
         self.assertIn("should_trigger must be true or false", str(ctx.exception))
 
-    def test_protocol_producers_reject_nonpositive_concurrency_limits(self):
+    def test_the_protocol_rejects_nonpositive_concurrency_limits(self):
         for field, mutation in (
             ("timeout_seconds", {"timeout": 0, "runs_per_query": 1, "workers": 1}),
             ("runs_per_query", {"timeout": 1, "runs_per_query": 0, "workers": 1}),
             ("workers", {"timeout": 1, "runs_per_query": 1, "workers": 0}),
             ("workers", {"timeout": 1, "runs_per_query": 1, "workers": False}),
         ):
-            with self.subTest(producer="pi", field=field), \
-                 self.assertRaisesRegex(ValueError, field):
-                tr.pi_trigger_protocol(model=None, **mutation)
-            with self.subTest(producer="matrix", field=field), \
-                 self.assertRaisesRegex(ValueError, field):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 tm.trigger_protocol([], None, **mutation)
 
     def test_matrix_rejects_zero_workers_before_constructing_an_executor(self):
@@ -86,12 +117,9 @@ class TriggerRowBoundaryTests(unittest.TestCase):
                 models=[None], runs_per_query=1, timeout=30, workers=0,
             )
 
-    def test_protocol_producers_reject_ambiguous_model_identities(self):
+    def test_the_protocol_rejects_ambiguous_model_identities(self):
         for model in ("", "   ", False):
-            with self.subTest(producer="pi", model=model), self.assertRaises(ValueError):
-                tr.pi_trigger_protocol(
-                    timeout=1, runs_per_query=1, workers=1, model=model)
-            with self.subTest(producer="matrix", model=model), self.assertRaises(ValueError):
+            with self.subTest(model=model), self.assertRaises(ValueError):
                 tm.trigger_protocol(
                     [tm.AgentAdapter()], [model],
                     timeout=1, runs_per_query=1, workers=1)
@@ -113,7 +141,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             {"query_id": "same", "query": "two", "should_trigger": False},
         ]
         with self.assertRaisesRegex(SystemExit, "conflicting queries"):
-            tr.validate_trigger_rows(rows, "fixture")
+            tm.validate_trigger_rows(rows, "fixture")
 
     def test_exact_duplicate_query_id_is_rejected_before_runs_are_scheduled(self):
         rows = [
@@ -121,7 +149,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             {"query_id": "same", "query": "one", "should_trigger": True},
         ]
         with self.assertRaisesRegex(SystemExit, "duplicate query_id"):
-            tr.validate_trigger_rows(rows, "fixture")
+            tm.validate_trigger_rows(rows, "fixture")
 
     def test_distinct_ids_cannot_alias_the_same_authored_query(self):
         rows = [
@@ -129,7 +157,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             {"query_id": "second", "query": "one", "should_trigger": True},
         ]
         with self.assertRaisesRegex(SystemExit, "alias the same query"):
-            tr.validate_trigger_rows(rows, "fixture")
+            tm.validate_trigger_rows(rows, "fixture")
 
     def test_cosmetic_query_variants_are_one_inference_identity(self):
         rows = [
@@ -137,13 +165,13 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             {"query_id": "second", "query": "  CAFE\u0301 prompt\t", "should_trigger": True},
         ]
         with self.assertRaisesRegex(SystemExit, "alias the same query"):
-            tr.validate_trigger_rows(rows, "fixture")
+            tm.validate_trigger_rows(rows, "fixture")
 
     def test_conflicting_id_aliases_are_rejected(self):
         rows = [{"id": "first", "query_id": "second",
                  "query": "one", "should_trigger": True}]
         with self.assertRaisesRegex(SystemExit, "conflicting query_id and id"):
-            tr.validate_trigger_rows(rows, "fixture")
+            tm.validate_trigger_rows(rows, "fixture")
 
     def test_eval_set_rejects_evals_and_queries_aliases_together(self):
         with tempfile.TemporaryDirectory() as td:
@@ -152,76 +180,65 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             path.write_text(json.dumps({"evals": [row], "queries": [row]}), encoding="utf-8")
             args = SimpleNamespace(eval_set=str(path), split="tune")
             with self.assertRaisesRegex(SystemExit, "exactly one of evals or queries"):
-                tr.eval_rows_from_args(args, DEMO_MANIFEST)
+                tm.eval_rows_from_args(args, DEMO_MANIFEST)
 
-    def test_pi_trigger_runner_invokes_pi_from_isolated_workspace(self):
+    def test_pi_cli_is_the_matrix_with_the_pi_adapter_in_an_isolated_config(self):
         seen = {}
 
         def fake_run(plan):
-            argv, cwd = list(plan.argv), plan.cwd
-            env, timeout = dict(plan.environment or {}), int(plan.timeout_s)
-            seen.update({"argv": argv, "cwd": str(cwd), "config_dir": env["PI_CODING_AGENT_DIR"], "timeout": timeout})
-            return InvocationOutcome.from_process(
-                stdout=json.dumps({"type": "agent_end", "messages": [{"stopReason": "stop"}]}) + "\n",
-                stderr="", returncode=0, elapsed_ms=1,
-            )
+            config = Path(dict(plan.environment or {})["PI_CODING_AGENT_DIR"])
+            seen.update({"argv": list(plan.argv), "cwd": Path(plan.cwd), "config": config,
+                         "mounted": sorted(path.name for path in (config / "skills").iterdir())})
+            return completed_invocation(pi_stream(PI_STOP))
 
-        with mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=fake_run):
-            result = tr.observe_query(DEMO_MANIFEST, "ordinary chat", False, 12, None).as_row()
-        self.assertTrue(result["pass"])
-        self.assertEqual(seen["cwd"], seen["config_dir"])
-        self.assertIn("pi-trigger-", seen["cwd"])
-        self.assertNotEqual(Path(seen["cwd"]).resolve(), ROOT.resolve())
+        with tempfile.TemporaryDirectory() as td:
+            eval_set = write_rows(Path(td), [{"query_id": "negative", "query": "ordinary chat",
+                                              "should_trigger": False}])
+            code, report = run_pi_cli(
+                ["--eval-set", str(eval_set), "--runs-per-query", "1", "--workers", "1"],
+                fake_run, Path(td) / "report.json")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["protocol"]["producer"], "skill-trigger-matrix")
+        self.assertEqual([adapter["agent"] for adapter in report["protocol"]["adapters"]], ["pi"])
+        self.assertEqual(seen["argv"][0], "pi")
+        self.assertNotEqual(seen["cwd"].resolve(), ROOT.resolve())
+        self.assertTrue(seen["config"].is_relative_to(seen["cwd"]))
+        self.assertNotEqual(seen["config"], tm.pi_source_config_dir())
+        self.assertTrue(seen["mounted"])
 
-    def test_pi_ablation_row_names_edited_tree_and_repetition(self):
-        def fake_run(*args, **kwargs):
-            return InvocationOutcome.from_process(
-                stdout=json.dumps({
-                    "type": "agent_end",
-                    "messages": [{"role": "assistant", "stopReason": "stop"}],
-                }) + "\n",
-                stderr="", returncode=0, elapsed_ms=1,
-            )
-
-        identity = TriggerRepetitionIdentity("pi-query", 2)
-        with mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=fake_run):
-            result = tr.observe_query(
-                DEMO_MANIFEST, "ordinary chat", False, 12, None,
-                ablation="weaker-description", identity=identity).as_row()
-        self.assertEqual(result["skill_tree_hash"], result["ablation"]["skill_hash"])
-        self.assertNotEqual(result["skill_tree_hash"],
-                            result["ablation"]["parent_skill_hash"])
-        self.assertEqual((result["query_id"], result["run_number"]),
-                         ("pi-query", 2))
+    def test_pi_ablation_report_names_the_edited_tree_on_every_repetition(self):
+        with tempfile.TemporaryDirectory() as td:
+            eval_set = write_rows(Path(td), [{"query_id": "pi-query", "query": "ordinary chat",
+                                              "should_trigger": False}])
+            code, report = run_pi_cli(
+                ["--eval-set", str(eval_set), "--runs-per-query", "2", "--workers", "1",
+                 "--ablation", "weaker-description"],
+                lambda plan: completed_invocation(pi_stream(PI_STOP)), Path(td) / "report.json")
+        self.assertEqual(code, 0)
+        provenance = report["provenance"]
+        self.assertEqual(report["skill_tree_hash"], provenance["skill_hash"])
+        self.assertNotEqual(report["skill_tree_hash"], provenance["parent_skill_hash"])
+        self.assertEqual(sorted((row["query_id"], row["run_number"]) for row in report["results"]),
+                         [("pi-query", 1), ("pi-query", 2)])
+        self.assertEqual({row["skill_tree_hash"] for row in report["results"]},
+                         {report["skill_tree_hash"]})
 
     def test_pi_main_reports_are_accepted_by_trigger_comparer(self):
-        terminal = InvocationOutcome.from_process(
-            stdout=json.dumps({
-                "type": "agent_end",
-                "messages": [{"role": "assistant", "stopReason": "stop"}],
-            }) + "\n",
-            stderr="", returncode=0, elapsed_ms=1,
-        )
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            eval_set = root / "rows.json"
-            eval_set.write_text(json.dumps([
-                {"query_id": "negative", "query": "ordinary chat",
-                 "should_trigger": False},
-            ]), encoding="utf-8")
+            eval_set = write_rows(root, [{"query_id": "negative", "query": "ordinary chat",
+                                          "should_trigger": False}])
             reports = []
             for ablation in (None, "weaker-description"):
-                out = root / ("ablation.json" if ablation else "baseline.json")
-                argv = ["skill-pi-trigger-eval", str(DEMO_MANIFEST),
-                        "--eval-set", str(eval_set), "--runs-per-query", "1",
-                        "--workers", "1", "--timeout", "12", "--out", str(out)]
+                extra = ["--eval-set", str(eval_set), "--runs-per-query", "1",
+                         "--workers", "1", "--timeout", "12"]
                 if ablation:
-                    argv.extend(["--ablation", ablation])
-                with mock.patch.object(sys, "argv", argv), \
-                     mock.patch.object(tr, "invoke_argv_with_timeout", return_value=terminal), \
-                     mock.patch("builtins.print"):
-                    self.assertEqual(tr.main(), 0)
-                reports.append(json.loads(out.read_text(encoding="utf-8")))
+                    extra.extend(["--ablation", ablation])
+                code, report = run_pi_cli(
+                    extra, lambda plan: completed_invocation(pi_stream(PI_STOP)),
+                    root / ("ablation.json" if ablation else "baseline.json"))
+                self.assertEqual(code, 0)
+                reports.append(report)
         compared = sb.build_trigger_comparison(reports[0], reports[1])
         self.assertTrue(compared["provenance"]["verified"])
         self.assertEqual(compared["paired"]["blocked"], [])
@@ -232,21 +249,14 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             stderr="timeout", returncode=124, elapsed_ms=1,
         )
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            eval_set = root / "rows.json"
-            out = root / "report.json"
-            eval_set.write_text(json.dumps([
-                {"query_id": "negative", "query": "ordinary chat",
-                 "should_trigger": False},
-            ]), encoding="utf-8")
-            argv = ["skill-pi-trigger-eval", str(DEMO_MANIFEST),
-                    "--eval-set", str(eval_set), "--runs-per-query", "1",
-                    "--workers", "1", "--timeout", "1", "--out", str(out)]
-            with mock.patch.object(sys, "argv", argv), \
-                 mock.patch.object(tr, "invoke_argv_with_timeout", return_value=timed_out), \
-                 mock.patch("builtins.print"):
-                self.assertEqual(tr.main(), 1)
-            summary = json.loads(out.read_text(encoding="utf-8"))["summary"]
+            eval_set = write_rows(Path(td), [{"query_id": "negative", "query": "ordinary chat",
+                                              "should_trigger": False}])
+            code, report = run_pi_cli(
+                ["--eval-set", str(eval_set), "--runs-per-query", "1", "--workers", "1",
+                 "--timeout", "1"],
+                lambda plan: timed_out, Path(td) / "report.json")
+        summary = report["summary"]
+        self.assertEqual(code, 1)
         self.assertEqual(summary["measurement_status"], "incomplete")
         self.assertEqual(
             (summary["complete"], summary["incomplete"], summary["total"]),
@@ -254,7 +264,6 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         )
         self.assertNotIn("pass_rate", summary)
         self.assertNotIn("observed_pass_rate", summary)
-
 
     def test_pi_json_provider_error_cannot_pass_a_negative_trigger(self):
         provider_error = json.dumps({
@@ -265,20 +274,18 @@ class TriggerRowBoundaryTests(unittest.TestCase):
                                     "cost": {"total": 0.009}}}],
         })
 
-        def failed_provider(*args, **kwargs):
-            return InvocationOutcome.from_process(
-                stdout=provider_error + "\n", stderr="", returncode=0, elapsed_ms=1,
-            )
-
         with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=failed_provider), \
-             mock.patch.object(tr.PiStream, "parse", wraps=tr.PiStream.parse) as parse_stream:
+             mock.patch.object(tm.PiStream, "parse", wraps=tm.PiStream.parse) as parse_stream:
             trace_dir = Path(td) / "trace"
-            result = tr.observe_query(DEMO_MANIFEST, "ordinary chat", False, 12, None, trace_dir=trace_dir).as_row()
+            result = observe_pi(
+                "ordinary chat", False,
+                lambda plan: completed_invocation(provider_error + "\n"),
+                trace_dir=trace_dir).as_row()
             artifacts = [
                 json.loads((trace_dir / name).read_text(encoding="utf-8"))
                 for name in ("metrics.json", "metadata.json")
             ]
+        # Detection, telemetry and the trace artifacts share one parsed stream.
         self.assertEqual(parse_stream.call_count, 1)
         self.assertFalse(result["observation_complete"])
         self.assertIsNone(result["pass"])
@@ -311,10 +318,8 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             (pi_home / "auth.json").write_text(json.dumps({"token": auth_secret}), encoding="utf-8")
             trace_dir = Path(td) / "trace"
             with mock.patch.dict(os.environ, {"OPENAI_API_KEY": env_secret,
-                                              "PI_CODING_AGENT_DIR": str(pi_home)}), \
-                 mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=leaky_pi):
-                row = tr.observe_query(DEMO_MANIFEST, "ordinary chat", False, 12, None,
-                                       trace_dir=trace_dir).as_row()
+                                              "PI_CODING_AGENT_DIR": str(pi_home)}):
+                row = observe_pi("ordinary chat", False, leaky_pi, trace_dir=trace_dir).as_row()
             written = {path.name: path.read_text(encoding="utf-8")
                        for path in trace_dir.iterdir()}
         written["row"] = json.dumps(row)
@@ -368,16 +373,37 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         self.assertTrue(row["triggered"])
         self.assertEqual(row["usage_normalized"]["total_tokens"], 5)
 
+    def test_pi_trace_artifacts_carry_the_detector_evidence_and_the_query(self):
+        def reads_skill(plan):
+            skill = Path(plan.cwd) / ".pi-config" / "skills"
+            mounted = next(skill.rglob("SKILL.md"))
+            usage = {"input": 3, "output": 2, "totalTokens": 5}
+            return completed_invocation(pi_stream(
+                {"type": "tool_execution_start", "toolName": "read", "args": {"path": str(mounted)}},
+                {"type": "tool_execution_end", "toolName": "read", "args": {"path": str(mounted)},
+                 "result": "ok"},
+                {"type": "agent_end", "messages": [{"role": "assistant", "stopReason": "stop",
+                                                    "usage": usage}]}))
+
+        with tempfile.TemporaryDirectory() as td:
+            trace_dir = Path(td) / "trace"
+            observe_pi("demo", True, reads_skill, trace_dir=trace_dir)
+            metrics = json.loads((trace_dir / "metrics.json").read_text(encoding="utf-8"))
+            meta = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
+        self.assertTrue(metrics["skill_invoked"])
+        self.assertEqual(metrics["total_tokens"], 5)
+        self.assertEqual((meta["query"], meta["should_trigger"], meta["pass"]), ("demo", True, True))
+
     def test_pi_timeout_with_parseable_partial_trace_is_not_telemetry_complete(self):
-        def timed_out(*args, **kwargs):
+        def timed_out(plan):
             return InvocationOutcome.from_process(
                 stdout=json.dumps({"type": "command", "command": "partial"}) + "\n",
                 stderr="timeout", returncode=124, elapsed_ms=10,
             )
 
-        with tempfile.TemporaryDirectory() as td, mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=timed_out):
+        with tempfile.TemporaryDirectory() as td:
             trace_dir = Path(td) / "trace"
-            tr.observe_query(DEMO_MANIFEST, "ordinary chat", False, 1, None, trace_dir=trace_dir)
+            observe_pi("ordinary chat", False, timed_out, trace_dir=trace_dir)
             meta = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
         self.assertFalse(meta["observation_complete"])
         self.assertEqual(meta["telemetry"]["measurements"]["commands"]["availability"], "unavailable")
@@ -608,22 +634,17 @@ class TriggerCliStatusTests(unittest.TestCase):
              ]):
             self.assertEqual(tm.main(), 1)
 
-    def test_pi_cli_exits_nonzero_for_incomplete_observations(self):
-        failed = TriggerObservation.harness_failure(
-            agent="pi",
-            model=None,
-            query="q",
-            expectation=TriggerExpectation.TRIGGER,
-            error=RuntimeError("provider unavailable"),
-            metadata={"skill_tree_hash": "sha256:test"},
-        )
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(tr, "observe_query", return_value=failed), \
-             mock.patch.object(sys, "argv", [
-                 "skill-pi-trigger-eval", str(DEMO_MANIFEST), "--runs-per-query", "1",
-                 "--out", str(Path(td) / "report.json"),
-             ]):
-            self.assertEqual(tr.main(), 1)
+    def test_a_crashed_pi_query_is_an_incomplete_row_not_a_crashed_run(self):
+        def crash(plan):
+            raise RuntimeError("provider unavailable")
+
+        with tempfile.TemporaryDirectory() as td:
+            code, report = run_pi_cli(["--runs-per-query", "1"], crash, Path(td) / "report.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(report["summary"]["measurement_status"], "incomplete")
+        self.assertTrue(report["results"])
+        self.assertEqual({row["error"] for row in report["results"]},
+                         {"RuntimeError: provider unavailable"})
 
 
 class ClaudeDetectionTests(unittest.TestCase):

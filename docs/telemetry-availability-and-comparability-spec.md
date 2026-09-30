@@ -193,7 +193,7 @@ It owns:
 6. pair matching, comparison, and ratio construction; and
 7. JSON/Markdown display helpers.
 
-`skill_benchmark.py`, `run_pi_trigger_eval.py`, and `run_trigger_matrix.py` consume this API.
+`skill_benchmark.py` and `run_trigger_matrix.py` (which `run_pi_trigger_eval.py` wraps) consume this API.
 Compatibility fields (`usage_normalized`, `cost_normalized`, `cost_usd`, `total_tokens`) are read
 through boundary adapters; derived comparisons and aggregates do not use `... or 0` fallbacks.
 

@@ -35,7 +35,7 @@ from helpers import (
     write_good_pr_skill as _skill,
 )
 
-import run_pi_trigger_eval as tr
+import run_trigger_matrix as tm
 import skill_benchmark as sb
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,9 +61,9 @@ class D3_TriggerPolarityTests(unittest.TestCase):
 
     def test_eval_and_resolver_agree(self):
         manifest = {"skill_name": "good-pr", "cases": [self.POS, self.NEG]}
-        rows = {r["query"]: r["should_trigger"] for r in tr.cases_from_manifest(manifest, None)}
-        self.assertTrue(rows[tr.trigger_query_from_case(self.POS)])
-        self.assertFalse(rows[tr.trigger_query_from_case(self.NEG)])
+        rows = {r["query"]: r["should_trigger"] for r in tm.cases_from_manifest(manifest, None)}
+        self.assertTrue(rows[tm.trigger_query_from_case(self.POS)])
+        self.assertFalse(rows[tm.trigger_query_from_case(self.NEG)])
 
     def test_audit_classifies_every_trigger_case(self):
         with tempfile.TemporaryDirectory() as td:

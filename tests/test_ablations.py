@@ -22,7 +22,6 @@ from helpers import (
 )
 
 import ablation_model as am
-import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
 import skill_benchmark as sb
 from manifest_contracts import CasePopulation
@@ -94,6 +93,14 @@ def _is_subsequence(small: bytes, big: bytes) -> bool:
     additions/substitutions) — i.e. the change is a pure deletion."""
     it = iter(big)
     return all(ch in it for ch in small)
+
+
+def pi_mount(manifest_path: Path, manifest: dict, workspace: Path, ablation: str | None):
+    """Mount the trigger tree the matrix builds (canonical, or the materialized
+    ablation) where the Pi adapter mounts it; return (copied paths, provenance)."""
+    tree, _, provenance = tm.trigger_tree_for_manifest(
+        sb.repo_root_for_manifest(manifest_path), manifest, workspace / "_trees", ablation)
+    return tm.PiAdapter().mount(tree, workspace), provenance
 
 
 def _tree_files(d: Path) -> dict[str, bytes]:
@@ -541,7 +548,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             p = self.repo(root, [self.DISCO_ABL])
             manifest = sb.validate_manifest(p)
             with tempfile.TemporaryDirectory() as cd:
-                copied, prov = tr.copy_skill_to_config(p, manifest, Path(cd), ablation_id="no-wtu")
+                copied, prov = pi_mount(p, manifest, Path(cd), "no-wtu")
                 self.assertIn("skill_hash", prov)               # provenance returned for the run record (#9)
                 self.assertIn("parent_skill_hash", prov)        # canonical hash for same-revision pairing
                 self.assertIn("components", prov)               # components recorded for the run record (#8)
@@ -571,16 +578,16 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             p = self.repo(root, [self.DISCO_ABL])
             manifest = sb.validate_manifest(p)
             with tempfile.TemporaryDirectory() as cb, tempfile.TemporaryDirectory() as ca:
-                base_copied, base_prov = tr.copy_skill_to_config(p, manifest, Path(cb))
-                abl_copied, abl_prov = tr.copy_skill_to_config(p, manifest, Path(ca), ablation_id="no-wtu")
+                base_copied, base_prov = pi_mount(p, manifest, Path(cb), None)
+                abl_copied, abl_prov = pi_mount(p, manifest, Path(ca), "no-wtu")
 
-                def rel_files(cfg):
-                    sd = Path(cfg) / "skills"
+                def rel_files(workspace):
+                    sd = Path(workspace) / ".pi-config" / "skills"
                     return {q.relative_to(sd).as_posix() for q in sd.rglob("*") if q.is_file()}
 
                 # identical mount dir names and identical relative file trees
-                self.assertEqual({d.name for d in (Path(cb) / "skills").iterdir()},
-                                 {d.name for d in (Path(ca) / "skills").iterdir()})
+                self.assertEqual({d.name for d in (Path(cb) / ".pi-config" / "skills").iterdir()},
+                                 {d.name for d in (Path(ca) / ".pi-config" / "skills").iterdir()})
                 self.assertEqual(rel_files(cb), rel_files(ca))
                 # the references file survives in BOTH arms (the old ad-hoc copier path is gone)
                 self.assertTrue(any(f.endswith("references/severity.md") for f in rel_files(cb)))
@@ -696,7 +703,7 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             pd = self.repo(root / "disc", [self.DISCO_ABL])
             dm = sb.validate_manifest(pd)
             with tempfile.TemporaryDirectory() as cd:
-                _, tprov = tr.copy_skill_to_config(pd, dm, Path(cd), ablation_id="no-wtu")
+                _, tprov = pi_mount(pd, dm, Path(cd), "no-wtu")
             assert_records_provenance(tprov, "pi-trigger")
 
     def test_recorded_provenance_is_a_provenance_value_object(self):
@@ -745,8 +752,8 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])   # answer-population (section/instructions)
             manifest = sb.validate_manifest(p)
-            with tempfile.TemporaryDirectory() as cd, self.assertRaises(RuntimeError) as cm:
-                tr.copy_skill_to_config(p, manifest, Path(cd), ablation_id="no-rp")
+            with tempfile.TemporaryDirectory() as cd, self.assertRaises(SystemExit) as cm:
+                pi_mount(p, manifest, Path(cd), "no-rp")
             self.assertIn("answer-population", str(cm.exception))
 
     def test_prepare_fails_without_ablation_dir_for_materialized(self):

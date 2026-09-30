@@ -512,7 +512,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 | Command | What it does |
 |---|---|
 | `skill-trigger-matrix` | Autonomous trigger rate per (agent × model), split by should-fire / should-not-fire. |
-| `skill-pi-trigger-eval` | The deeper Pi-specific trigger tool: discovery-population ablation arms, traces, cost. |
+| `skill-pi-trigger-eval` | `skill-trigger-matrix --agent pi` under its own name, kept for existing scripts. |
 | `skill-benchmark trigger-compare` | Pair baseline and `--ablation` trigger reports of the same skill revision: declared-cell/repetition completeness, duplicate rejection, agent/model cells collapsed by stable authored-query ID, direction-aware sign-flip significance, and a causal-confirmation evidence class. |
 
 ## Compatibility notes
@@ -542,7 +542,7 @@ For manifest or grading changes, add or update `tests/test_skill_benchmark.py`. 
 - Grading and aggregation do not call a model. Model execution happens outside that path, in the explicit commands that exist to call one: the runners (`run-codex`, `run-claude`, `run-agent`, `run-subagent`, `run-jetty`, and the `skill-trigger-matrix` / `skill-pi-trigger-eval` entry points), `judge` (via `--judge-cmd` or a native `--judge-backend`), and `judge-robustness`.
 - The harness does not decide qualitative truth by itself; it emits judge prompts, runs a judge (an opt-in `--judge-cmd`, or a native `--judge-backend` plus `--judge-model`), and merges the returned JSON — recording which backend/model produced each verdict.
 - Hidden prompts are not protected if you pass `--include-answer-key` to generation jobs.
-- A passing answer benchmark does not prove autonomous skill loading; run `skill-trigger-matrix` (any adapter-backed agent × model) or `skill-pi-trigger-eval` (Pi, with ablation arms) for that.
+- A passing answer benchmark does not prove autonomous skill loading; run `skill-trigger-matrix` (any adapter-backed agent × model; `skill-pi-trigger-eval` is its Pi-only form) for that.
 
 ## Repository layout
 
@@ -555,7 +555,7 @@ skill-eval-harness/
 ├── TODO.md
 ├── pyproject.toml
 ├── skill_benchmark.py          # the CLI, grading, reporting, and runner adapters
-├── run_pi_trigger_eval.py      # autonomous-trigger runner (Pi: ablation arms, traces, cost)
+├── run_pi_trigger_eval.py      # skill-pi-trigger-eval: the trigger matrix with the Pi adapter alone
 ├── run_trigger_matrix.py       # activation matrix across agents × models (claude/codex/pi/vibe/stub adapters)
 ├── ablation_model.py           # typed ablation/provenance/task value objects
 ├── agent_capabilities.py       # unified backend surfaces, capabilities, CLI options, smoke, and failure policy
@@ -612,7 +612,7 @@ The test suite is organized by subject: manifest validation and eval hygiene (`t
 This README was written against:
 
 - `skill_benchmark.py` CLI and assertion implementation
-- `run_pi_trigger_eval.py` trigger runner
+- `run_pi_trigger_eval.py` Pi entry point over the trigger matrix
 - `run_trigger_matrix.py` agent×model activation matrix
 - `pyproject.toml` package metadata
 - `docs/repo-effectiveness-audit.md` for the current `good-repo` audit

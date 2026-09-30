@@ -310,6 +310,12 @@ Python names still exist.
   finished, or over a runs directory missing an arm, starts failing; point it at the complete run.
 - Paired edit comparison: `benchmark` with an `old_skill` arm selected (`--variant old_skill`
   beside the two defaults) adds `paired_edit_summary`; without that arm the report is unchanged.
+- `skill-pi-trigger-eval` writes the `skill-trigger-matrix` report: the protocol producer is
+  `skill-trigger-matrix` with one `pi` adapter, and the report gains `agents` and `matrix`.
+  `trigger-compare` still reads reports from the old Pi producer. Each row's `ablation` is the
+  ablation id; the provenance is the report's `provenance`, as in the matrix. Traces written
+  with `--trace-runs` land in a `matrix-*` directory under it. A query whose run crashes is now
+  an incomplete row (exit 1) instead of stopping the whole run.
 - `aggregate` and `export-anthropic` accept `--strict` and `--embed-cmd`; pass them there too if
   your `benchmark` command uses them, or the numbers will differ.
 
@@ -326,7 +332,8 @@ Python names still exist.
 
 ### Removed names
 
-These module-level names had no production caller and are gone. Code that imported them from
+These module-level names are gone from the module shown, most because only tests called them,
+and the Pi runner's because it now delegates to the trigger matrix. Code that imported them from
 the harness modules needs the replacement:
 
 | Removed | Use instead |
@@ -345,6 +352,8 @@ the harness modules needs the replacement:
 | `ablation_model.Arm.harness_record` | `PreparedTask.harness_record` |
 | `run_pi_trigger_eval.run_query`, `run_trigger_matrix.run_cell_query` | `observe_query` / `observe_cell_query`, then `as_row()` |
 | `run_pi_trigger_eval.detect_trigger` (re-export) | `skill_benchmark.detect_trigger` |
+| `run_pi_trigger_eval.observe_query`, `copy_skill_to_config`, `pi_trigger_protocol`, `write_trigger_trace_artifacts` | `run_trigger_matrix.run_matrix` with `agents=["pi"]`, or `observe_cell_query(PiAdapter(), ...)` |
+| `run_pi_trigger_eval.load_manifest`, `skill_name_from_manifest`, `trigger_query_from_case`, `cases_from_manifest`, `validate_trigger_rows`, `eval_rows_from_args`, `pi_argv`, `pi_invocation_outcome`, `pi_source_config_dir`, `seed_config_dir` | the same names in `run_trigger_matrix` |
 | `skill_benchmark.two_sample_permutation_significance`, `_combinations`, `_exact_rate`, `iteration_dirs`, `next_iteration_dir`, `final_answer_from_events`, `text_files_under`, `missing_evidence`, `resolved_task_upload_bytes`, `JETTY_TERMINAL_SUCCESS`, `JETTY_TERMINAL_FAILURE`, `JETTY_PENDING`, `run_pi_trigger_eval.pi_terminal_error`, `pi_invoke_result`, `run_trigger_matrix.matrix_capabilities`, `matrix_failure_row`, `runner_contracts.classify_runner_result`, `agent_capabilities.surface_names`, `DEDICATED_SMOKE_TARGETS`, `report_contracts.diagnostic_rates`, `ablation_model.Provenance.SCHEMA_KEYS`, `ablation_model._LEGACY_FAILURE_MARKER_ORDER` | nothing; they were dead or test-only |
 
 The `iteration-N/` directory convention that `render-viewer --previous-workspace` reads is

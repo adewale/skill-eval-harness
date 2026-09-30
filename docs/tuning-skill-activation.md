@@ -221,10 +221,9 @@ or materialized skill tree and the same detector rules decide "triggered." The
 matrix validates the unified row before starting runs so a new adapter cannot
 finish live calls and then fail during report assembly.
 
-For Pi specifically, `skill-pi-trigger-eval` remains a compatibility entry point for
-older scripts. The matrix now has the shared surfaces that matter for parity: per-run
-trace artifacts, materialized trigger ablations, cost/usage parsing where the stream
-reports it, and the same evidence-class stamp.
+For Pi specifically, `skill-pi-trigger-eval` is the matrix with the Pi adapter
+alone, kept for older scripts. It writes the matrix report, so everything above
+applies to it unchanged.
 
 The demo's Haiku cell is the method in miniature: one run said the description was
 fine, three runs put its Haiku trigger rate at 1-in-3, and only the matrix made the

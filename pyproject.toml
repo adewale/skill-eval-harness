@@ -70,7 +70,6 @@ required-version = "==0.16.0"
 "telemetry.py" = ["TRY004"]
 # Runner boundaries must report arbitrary provider/CLI failures as evaluation
 # results, and the matrix's class attributes are immutable fixture shapes.
-"run_pi_trigger_eval.py" = ["F401"]
 "run_trigger_matrix.py" = ["BLE001", "F401", "RUF012"]
 "skill_benchmark.py" = ["BLE001", "F401", "S112"]
 # Test classes use container-valued fixtures, while nested patch contexts make

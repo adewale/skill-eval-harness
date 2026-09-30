@@ -27,9 +27,9 @@ Five adapters ship:
 - `vibe`    — Mistral Vibe CLI (`vibe --prompt ...`), with skills mounted under
               workspace `.agents/skills` and `VIBE_HOME` isolated outside the
               model workdir. Native `skill` tool calls are primary evidence.
-- `pi`      — the Pi coding agent, same mount/detect approach as
-              run_pi_trigger_eval.py (which remains a compatibility wrapper
-              for the Pi-only entry point).
+- `pi`      — the Pi coding agent, with skills under an isolated
+              PI_CODING_AGENT_DIR. `skill-pi-trigger-eval` is this matrix
+              with the Pi adapter alone.
 - `stub`    — offline and deterministic: "triggers" iff the query shares
               enough words with the mounted description, and emits the same
               stream shape the detector reads. It exists so the whole matrix
@@ -42,9 +42,8 @@ headless on the raw query, return its JSON event stream), then add one row to
 agent_capabilities.BACKENDS and its explicit trace-dialect semantics. detect()
 only needs overriding when load evidence is not a file path in the stream.
 
-Every number this emits is a RAW autonomous-trigger measurement (the same
-evidence class as run_pi_trigger_eval.py) — a rate to steer description edits,
-not a provenance-verified causal comparison.
+Every number this emits is a RAW autonomous-trigger measurement — a rate to
+steer description edits, not a provenance-verified causal comparison.
 """
 from __future__ import annotations
 
@@ -80,17 +79,6 @@ from agent_capabilities import (
 )
 from completion_contracts import StopClass, StopObservation, claude_result_stop
 from content_digests import file_sha256
-from run_pi_trigger_eval import (
-    cases_from_manifest,
-    eval_rows_from_args,
-    load_manifest,
-    pi_argv,
-    pi_invocation_outcome,
-    pi_source_config_dir,
-    seed_config_dir,
-    skill_name_from_manifest,
-    validate_trigger_rows,
-)
 from skill_benchmark import (
     VALID_SPLITS,
     VIBE_DEFAULT_CMD,
@@ -101,12 +89,17 @@ from skill_benchmark import (
     build_canonical_skill_tree,
     build_vibe_cli_argv,
     canonical_json_sha256,
+    canonical_trigger_query,
     codex_env_for_home,
     detect_trigger_detection,
     detect_trigger_records,
+    expected_trigger_polarity,
     frontmatter_value,
     invoke_argv_with_timeout,
+    is_trigger_case,
+    iter_cases,
     iter_json_objects,
+    load_manifest_source,
     materialize_trigger_ablation,
     mount_skill_tree,
     normalize_trace_records,
@@ -156,6 +149,116 @@ SENSITIVE_WORKSPACE_FILES = (
     ".vibe-home/.env",
 )
 SENSITIVE_ENV_VARS = ("MISTRAL_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN")
+
+
+# Trigger rows: the manifest's trigger cases or an --eval-set file, validated
+# once for every agent.
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    """The harness's manifest loader (JSON or YAML, dataset files resolved,
+    clean FAIL on bad input) — never a private json.loads fork that would make
+    YAML manifests or dataset_files work in `benchmark` but break here."""
+    return load_manifest_source(path)
+
+
+def skill_name_from_manifest(manifest: dict[str, Any]) -> str:
+    return str(manifest.get("skill_name") or "skill-under-test")
+
+
+def trigger_query_from_case(case: dict[str, Any]) -> str:
+    prompt = str(case.get("prompt") or case.get("scenario") or case.get("id"))
+    # Shared manifests often store trigger fixtures as a meta-classification prompt:
+    # "Trigger decision eval. User prompt: <real prompt>\n\nReturn exactly ...".
+    # Autonomous trigger testing must run the real user prompt, not the meta prompt,
+    # otherwise skill discovery is being tested on the wrong task.
+    match = re.search(r"User prompt:\s*(.*?)(?:\n\s*\n\s*Return exactly|$)", prompt, re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return prompt
+
+
+def cases_from_manifest(manifest: dict[str, Any], split: str | None) -> list[dict[str, Any]]:
+    out = []
+    # iter_cases (not raw manifest["cases"]) so dataset-templated trigger cases
+    # fan out here exactly as they do for validation, audit, and the benchmark.
+    for c in iter_cases(manifest, split):
+        if is_trigger_case(c):
+            prompt = trigger_query_from_case(c)
+            # Single shared resolver with the manifest audit (skill_benchmark), so the
+            # eval and the audit cannot disagree on a case's expected polarity.
+            should = expected_trigger_polarity(c) == "TRIGGER"
+            out.append({"query_id": str(c.get("id") or ""),
+                        "query": prompt, "should_trigger": should})
+    return out
+
+
+def validate_trigger_rows(rows: Any, source: str) -> list[dict[str, Any]]:
+    """Validate the shared trigger-row JSON boundary.
+
+    `should_trigger` must already be a JSON boolean; using Python truthiness here
+    would turn strings like "false" into True and invert the measurement."""
+    if not isinstance(rows, list):
+        raise SystemExit(f"{source}: expected a list of trigger rows or an object with evals/queries")
+    out: list[dict[str, Any]] = []
+    seen: dict[str, tuple[str, bool]] = {}
+    seen_definitions: dict[str, tuple[str, bool]] = {}
+    for i, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            raise SystemExit(f"{source}: row {i} must be an object")
+        query = row.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise SystemExit(f"{source}: row {i} query must be a non-empty string")
+        should_trigger = row.get("should_trigger")
+        if not isinstance(should_trigger, bool):
+            raise SystemExit(f"{source}: row {i} should_trigger must be true or false")
+        if ("query_id" in row and "id" in row
+                and row.get("query_id") != row.get("id")):
+            raise SystemExit(
+                f"{source}: row {i} has conflicting query_id and id aliases")
+        query_id = row.get("query_id", row.get("id"))
+        if query_id is None or query_id == "":
+            encoded = json.dumps([query, should_trigger], ensure_ascii=False,
+                                 separators=(",", ":")).encode("utf-8")
+            query_id = "query-" + hashlib.sha256(encoded).hexdigest()
+        if not isinstance(query_id, str) or not query_id.strip():
+            raise SystemExit(f"{source}: row {i} query_id must be a non-empty string")
+        authored = (query, should_trigger)
+        if query_id in seen:
+            if seen[query_id] != authored:
+                raise SystemExit(
+                    f"{source}: duplicate query_id {query_id!r} identifies conflicting queries")
+            raise SystemExit(f"{source}: duplicate query_id {query_id!r}")
+        inference_query = canonical_trigger_query(query)
+        prior = seen_definitions.setdefault(
+            inference_query, (query_id, should_trigger))
+        if prior != (query_id, should_trigger):
+            raise SystemExit(
+                f"{source}: canonical query aliases alias the same query and must share one query ID and polarity; "
+                f"got {prior!r} and {(query_id, should_trigger)!r}")
+        seen[query_id] = authored
+        normalized = dict(row)
+        normalized.pop("id", None)
+        normalized["query_id"] = query_id
+        normalized["query"] = query
+        normalized["should_trigger"] = should_trigger
+        out.append(normalized)
+    return out
+
+
+def eval_rows_from_args(args: Any, manifest_path: Path) -> list[dict[str, Any]]:
+    """Resolve the trigger rows for a runner invocation: an explicit --eval-set
+    file ({query, should_trigger} rows, bare list or under evals/queries), else
+    the manifest's kind:'trigger' cases. Shared with run_trigger_matrix."""
+    if args.eval_set:
+        rows = strict_json_loads(Path(args.eval_set).read_text(encoding="utf-8"))
+        if isinstance(rows, dict):
+            aliases = [key for key in ("evals", "queries") if key in rows]
+            if len(aliases) != 1:
+                raise SystemExit(
+                    f"{args.eval_set}: expected exactly one of evals or queries")
+            rows = rows[aliases[0]]
+        return validate_trigger_rows(rows, str(args.eval_set))
+    return validate_trigger_rows(cases_from_manifest(load_manifest(manifest_path), args.split), str(manifest_path))
 
 
 def mounted_skill_names(copied: list[Path]) -> list[str]:
@@ -569,10 +672,46 @@ class CodexAdapter(AgentAdapter):
         )
 
 
+def pi_source_config_dir() -> Path:
+    """The user's own Pi config dir, the source of the auth a run copies."""
+    return Path(os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent")))
+
+
+def seed_config_dir(config_dir: Path) -> None:
+    """Copy authentication only; ambient settings/system prompts are behavior."""
+    source = pi_source_config_dir()
+    for name in ["auth.json"]:
+        src = source / name
+        if src.exists() and src.is_file():
+            shutil.copy2(src, config_dir / name)
+
+
+def pi_invocation_outcome(run: InvocationOutcome) -> InvocationOutcome:
+    """Attach Pi's one parsed provider stream to its classified process state."""
+    if not isinstance(run, InvocationOutcome):
+        raise TypeError("Pi invocation requires InvocationOutcome")
+    stream = PiStream.parse(run.stdout)
+    if stream.terminal_error or (run.observation_complete and stream.protocol_error):
+        return run.with_provider_error(stream.failure_error, payload=stream)
+    return run.with_provider_payload(stream)
+
+
+def pi_argv(query: str, model: str | None = None) -> list[str]:
+    """THE Pi CLI invocation for trigger evals — isolated JSON-stream mode with
+    read-only tools. The trigger matrix's Pi adapter uses this same argv, so the
+    two runners cannot drift apart on flags."""
+    argv = [
+        "pi", "--no-session", "--mode", "json", "--no-context-files", "--no-prompt-templates", "--no-extensions",
+        "--thinking", "minimal", "--tools", "read,grep,find,ls", "-p", query,
+    ]
+    if model:
+        argv[1:1] = ["--model", model]
+    return argv
+
+
 class PiAdapter(AgentAdapter):
-    """The Pi coding agent, mounted and detected exactly like
-    run_pi_trigger_eval.py (which stays as the compatibility entry point for
-    people already using `skill-pi-trigger-eval`)."""
+    """The Pi coding agent. Skills mount under an isolated PI_CODING_AGENT_DIR
+    seeded with auth only; `skill-pi-trigger-eval` runs this adapter alone."""
 
     name = "pi"
 
@@ -907,6 +1046,9 @@ def observe_cell_query(
             "population": "trigger",
             "provider": adapter.name,
             "model": model,
+            "query": row["query"],
+            "should_trigger": row["should_trigger"],
+            "pass": row["pass"],
             "returncode": row["returncode"],
             "timed_out": row["timed_out"],
             "observation_complete": row["observation_complete"],
@@ -921,10 +1063,15 @@ def observe_cell_query(
         if redacted_invocation.provider_error is not None:
             trace_metadata["provider_error"] = redacted_invocation.provider_error
         try:
-            # Reparse only the sanitized artifact boundary; detection and telemetry
-            # above share the single provider payload retained by the invocation.
-            artifact_pi_stream = (PiStream.parse(redacted_invocation.stdout)
-                                  if adapter.name == "pi" else None)
+            # Detection and telemetry above share the one provider payload the
+            # invocation retained; the artifact reparses only a stream that
+            # redaction changed.
+            artifact_pi_stream = None
+            if isinstance(invocation.provider_payload, PiStream):
+                artifact_pi_stream = (
+                    invocation.provider_payload
+                    if redacted_invocation.stdout == invocation.stdout
+                    else PiStream.parse(redacted_invocation.stdout))
             write_trace_artifacts(
                 trace_dir,
                 redacted_invocation.stdout,
@@ -1083,8 +1230,8 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
     return {
         "skill_name": skill_name_from_manifest(manifest),
         "generated_at": int(time.time()),
-        # Same caveat as run_pi_trigger_eval.py: single-arm raw measurements —
-        # rates that steer description edits, not confirmed causal effects.
+        # Single-arm raw measurements: rates that steer description edits,
+        # not confirmed causal effects.
         # Pair a baseline report with an --ablation report through
         # `skill-benchmark trigger-compare` to reach a causal evidence class.
         "evidence_class": TRIGGER_MEASUREMENT_EVIDENCE_CLASS,

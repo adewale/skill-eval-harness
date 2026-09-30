@@ -61,25 +61,15 @@ class SharedOwnerIdentityTests(unittest.TestCase):
     """Every helper both a runner and the harness need must BE the harness's
     object. (Pattern established by test_audit_fixes' detect_trigger check.)"""
 
-    def test_trigger_runners_share_the_harness_repo_root_resolver(self):
-        self.assertIs(tr.repo_root_for_manifest, sb.repo_root_for_manifest)
+    def test_the_trigger_runner_shares_the_harness_repo_root_resolver(self):
         self.assertIs(tm.repo_root_for_manifest, sb.repo_root_for_manifest)
 
-    def test_trigger_runners_share_the_harness_mount_and_subprocess_helpers(self):
-        self.assertIs(tr.mount_skill_tree, sb.mount_skill_tree)
+    def test_the_trigger_runner_shares_the_harness_mount_and_subprocess_helpers(self):
         self.assertIs(tm.mount_skill_tree, sb.mount_skill_tree)
         self.assertIs(tm.AgentAdapter._mount_tree, sb.mount_skill_tree)
-        self.assertIs(tr.invoke_argv_with_timeout, sb.invoke_argv_with_timeout)
         self.assertIs(tm.AgentAdapter._run_argv, sb.invoke_argv_with_timeout)
 
-    def test_trigger_matrix_reuses_the_pi_runner_row_loaders(self):
-        self.assertIs(tm.cases_from_manifest, tr.cases_from_manifest)
-        self.assertIs(tm.eval_rows_from_args, tr.eval_rows_from_args)
-        self.assertIs(tm.validate_trigger_rows, tr.validate_trigger_rows)
-        self.assertIs(tm.pi_argv, tr.pi_argv)
-
-    def test_trigger_runners_share_trace_label_sanitizer(self):
-        self.assertIs(tr.safe_trace_label, sb.safe_trace_label)
+    def test_the_trigger_runner_shares_the_trace_label_sanitizer(self):
         self.assertIs(tm.safe_trace_label, sb.safe_trace_label)
 
     def test_codex_default_command_has_one_code_owner(self):
@@ -98,7 +88,6 @@ class SharedOwnerIdentityTests(unittest.TestCase):
 
     def test_evidence_class_literal_is_owned_by_ablation_model(self):
         self.assertEqual(am.TRIGGER_MEASUREMENT_EVIDENCE_CLASS, "raw_autonomous_trigger_measurement")
-        self.assertIs(tr.TRIGGER_MEASUREMENT_EVIDENCE_CLASS, am.TRIGGER_MEASUREMENT_EVIDENCE_CLASS)
         self.assertIs(tm.TRIGGER_MEASUREMENT_EVIDENCE_CLASS, am.TRIGGER_MEASUREMENT_EVIDENCE_CLASS)
         # The literal must not be re-spelled in the runners' source.
         for module_path in (ROOT / "run_pi_trigger_eval.py", ROOT / "run_trigger_matrix.py"):

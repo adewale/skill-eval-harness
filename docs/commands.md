@@ -691,7 +691,7 @@ skill-pi-trigger-eval ../repo/evals/shared-benchmark.json \
   --out trigger-report.json
 ```
 
-This creates a temporary `PI_CODING_AGENT_DIR`, copies the skill under `skills/`, runs Pi without forced `--skill`, and detects whether the model loaded the skill from JSON stream events. It is the deeper Pi-specific tool: discovery-population ablation arms, per-query trace artifacts, and cost telemetry.
+This is `skill-trigger-matrix --agent pi` with Pi's defaults (`--timeout 120`, one optional `--model`), and it writes the same report. The Pi adapter creates an isolated `PI_CODING_AGENT_DIR` seeded with auth only, mounts the skill under its `skills/`, runs Pi without forced `--skill`, and detects whether the model loaded the skill from JSON stream events. `--ablation` and `--trace-runs` work as they do for the matrix; traces land in a `matrix-*` directory under `--trace-runs`.
 
 ## Trigger comparison (paired causal evidence for activation)
 

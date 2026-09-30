@@ -17,7 +17,7 @@ from helpers import (
     write_run,
 )
 
-import run_pi_trigger_eval as tr
+import run_trigger_matrix as tm
 
 # Normal imports (not private importlib loads): the whole suite must share ONE
 # skill_benchmark module instance, or registries/monkeypatches/`is`-identity
@@ -262,7 +262,7 @@ class SkillBenchmarkTests(unittest.TestCase):
         case = {
             "prompt": "Trigger decision eval. User prompt: write a README\n\nReturn exactly one label first: TRIGGER or NO_TRIGGER."
         }
-        self.assertEqual(tr.trigger_query_from_case(case), "write a README")
+        self.assertEqual(tm.trigger_query_from_case(case), "write a README")
 
     def test_trigger_detector_uses_copied_skill_paths_not_bare_skill_name(self):
         copied = [Path("/tmp/pi-trigger-x/skills/good-readme/SKILL.md")]
@@ -569,23 +569,6 @@ class SkillBenchmarkTests(unittest.TestCase):
                             self.assertTrue(Path(path).resolve().is_relative_to(ws), path)
                     self.assertEqual([Path(p).resolve() for p in inputs],
                                      [ws / "inputs" / "fixtures" / "input.txt"])
-
-    def test_pi_trigger_trace_artifact_writer_uses_detector_evidence(self):
-        with tempfile.TemporaryDirectory() as td:
-            run_dir = Path(td) / "trigger-run"
-            stdout = "\n".join([
-                json.dumps({"type": "tool_execution_end", "toolName": "read",
-                            "args": {"path": "/tmp/pi-trigger/skills/demo/SKILL.md"}}),
-                json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 3, "output": 2, "totalTokens": 5}}}),
-                json.dumps({"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 3, "output": 2, "totalTokens": 5}}]}),
-            ]) + "\n"
-            result = {"query": "demo", "should_trigger": True, "triggered": True, "pass": True, "elapsed_ms": 50, "returncode": 0, "timed_out": False, "evidence": ["/tmp/pi-trigger/skills/demo/SKILL.md"]}
-            tr.write_trigger_trace_artifacts(run_dir, stdout, result)
-            metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
-            meta = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
-            self.assertTrue(metrics["skill_invoked"])
-            self.assertEqual(metrics["total_tokens"], 5)
-            self.assertEqual(meta["query"], "demo")
 
     def test_script_assertion_requires_opt_in_and_executes_oracle(self):
         with tempfile.TemporaryDirectory() as td:
