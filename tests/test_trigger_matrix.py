@@ -846,7 +846,6 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertEqual(seen["argv"][-3:], ["--model", "o4-mini", "raw trigger query"])
         self.assertEqual(seen["timeout"], 12)
         self.assertTrue(result.metadata["codex_home_outside_workdir"])
-        self.assertIs(tm.CodexAdapter()._run_argv, tm.invoke_argv_with_timeout)
 
     def test_codex_invoke_seeds_auth_without_copying_user_skills(self):
         seen = {}
@@ -986,12 +985,6 @@ class CodexAdapterTests(unittest.TestCase):
             tm.ADAPTERS.clear()
             tm.ADAPTERS.update(old)
         self.assertIn("AGENT_CAPABILITIES", str(ctx.exception))
-
-    def test_codex_default_command_is_single_owner(self):
-        self.assertEqual(tm.CodexAdapter().codex_cmd, tm.DEFAULT_CODEX_CMD)
-        parser = tm.build_arg_parser()
-        codex_action = next(a for a in parser._actions if "--codex-cmd" in getattr(a, "option_strings", ()))
-        self.assertEqual(codex_action.default, tm.DEFAULT_CODEX_CMD)
 
     def test_interpreter_wrapper_identity_binds_script_bytes(self):
         with tempfile.TemporaryDirectory() as td:

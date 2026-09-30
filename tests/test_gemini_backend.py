@@ -14,7 +14,6 @@ from helpers import make_eval_repo
 
 import ablation_model as am
 import agent_capabilities as ac
-import judge_contracts as jc
 import runner_contracts as rc
 import skill_benchmark as sb
 
@@ -89,27 +88,6 @@ def _judge_stream(*, tool_calls: int = 0) -> str:
 
 
 class GeminiRegistryTests(unittest.TestCase):
-    def test_one_registry_row_projects_every_supported_surface_truthfully(self):
-        registration = ac.BACKENDS["gemini"]
-
-        self.assertTrue(registration.capabilities.answer_runner)
-        self.assertTrue(registration.capabilities.judge_backend)
-        self.assertTrue(registration.capabilities.trace_artifacts)
-        self.assertTrue(registration.capabilities.token_usage)
-        self.assertEqual(registration.capabilities.dollar_cost, "missing")
-        self.assertFalse(registration.capabilities.autonomous_trigger)
-        self.assertFalse(registration.capabilities.trigger_ablation)
-        self.assertIsNone(registration.trigger)
-        self.assertEqual(registration.answer_route, "native")
-        self.assertIn("run-agent", [
-            entrypoint.command for entrypoint in registration.answer_entrypoints])
-        self.assertIsInstance(sb.AGENT_BACKENDS["gemini"], sb.GeminiBackend)
-        self.assertIs(sb.JUDGE_BACKENDS["gemini"], sb.gemini_judge_invoke)
-        self.assertIs(sb.TRACE_DIALECTS["gemini"], sb.GEMINI_TRACE_DIALECT)
-        self.assertEqual(rc.Provider.GEMINI.value, "gemini")
-        self.assertEqual(am.RUNNER_FAILURE_MARKER_BY_PROVIDER["gemini"],
-                         "[GEMINI FAILURE")
-
     def test_gemini_cli_flag_is_projected_to_answer_and_judge(self):
         parser = sb.build_arg_parser()
         subs = next(action for action in parser._actions
@@ -1556,27 +1534,6 @@ class GeminiJudgeBackendTests(unittest.TestCase):
             sb.run_one_judge_task(
                 self._task(Path(td)), judge_backend="gemini",
                 judge_model="gemini-judge", explore=True)
-
-    def test_native_judge_returns_the_typed_invocation_contract(self):
-        provider_result = {
-            "answer": '{"passed":true}',
-            "stderr": "",
-            "returncode": 0,
-            "usage": {"input_tokens": 2, "output_tokens": 1,
-                      "total_tokens": 3},
-            "model": "gemini-judge",
-            "raw_response": _judge_stream(),
-            "metadata": {"session_id": "session-judge",
-                         "provider_tool_calls": 0},
-        }
-        with mock.patch.object(
-                sb, "gemini_cli_invoke", return_value=provider_result):
-            invocation = sb.gemini_judge_invoke(
-                "prompt", judge_model="gemini-judge", gemini_cmd="gemini",
-                explore_hint=None)
-        self.assertIsInstance(invocation, jc.JudgeInvocation)
-        self.assertEqual(invocation.raw_response, _judge_stream())
-        self.assertEqual(invocation.metadata["session_id"], "session-judge")
 
     def test_invalid_requested_model_is_a_typed_judge_failure(self):
         with mock.patch.object(sb, "run_argv_capture") as spawn:

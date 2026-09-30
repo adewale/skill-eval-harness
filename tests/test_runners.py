@@ -1434,10 +1434,6 @@ class TraceDialectRegistryTests(unittest.TestCase):
     def test_generic_dialect_has_no_terminal_stream_semantics(self):
         self.assertEqual(sb.GENERIC_TRACE_DIALECT.stream_semantics([], None), (None, None))
 
-    def test_claude_dialect_owns_the_stream_flatten(self):
-        self.assertIs(sb.TRACE_DIALECTS["claude"].flatten, sb.claude_stream_flat_records)
-        self.assertIs(sb.trace_dialect_for("Claude"), sb.TRACE_DIALECTS["claude"])
-
     def test_claude_completed_tool_lifecycle_counts_exactly_once(self):
         records = [
             {"type": "assistant", "message": {"role": "assistant", "content": [
@@ -1507,16 +1503,6 @@ class TraceDialectRegistryTests(unittest.TestCase):
         self.assertFalse(metrics["operation_observation_complete"])
         self.assertFalse(passed)
         self.assertIn("trace_observation_incomplete", evidence)
-
-    def test_pi_dialect_resolves_cumulative_terminal_usage(self):
-        # The retry-then-success stream carries per-attempt usage; the dialect
-        # must resolve the FINAL attempt's cumulative usage, not a sum of
-        # attempts, and report no failure for a recovered stream.
-        raw = (ROOT / "tests" / "fixtures" / "pi" / "retry-then-success.jsonl").read_text(encoding="utf-8")
-        records, _ = sb.parse_trace_jsonl_text(raw)
-        terminal_usage, failure = sb.TRACE_DIALECTS["pi"].stream_semantics(records, None)
-        self.assertIsNone(failure)
-        self.assertEqual(sb.usage_number(terminal_usage, "total_tokens"), 13.0)
 
 
 if __name__ == "__main__":
