@@ -79,6 +79,7 @@ from agent_capabilities import (
     surface_option_values,
 )
 from completion_contracts import StopClass, StopObservation, claude_result_stop
+from content_digests import file_sha256
 from run_pi_trigger_eval import (
     cases_from_manifest,
     eval_rows_from_args,
@@ -402,7 +403,7 @@ class AgentAdapter:
             "adapter": f"{type(self).__module__}.{type(self).__qualname__}",
             "agent": self.name,
             "implementation_sha256": "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest(),
-            "producer_sha256": "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "producer_sha256": "sha256:" + file_sha256(Path(__file__)),
             "trace_dialect": self.name,
             "required_observations": {},
         }
@@ -717,11 +718,7 @@ def executable_identity(command: str) -> dict[str, Any]:
     if resolved:
         path = Path(resolved)
         if path.is_file():
-            digest = hashlib.sha256()
-            with path.open("rb") as fh:
-                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            payload["executable_sha256"] = "sha256:" + digest.hexdigest()
+            payload["executable_sha256"] = "sha256:" + file_sha256(path)
     argument_files: dict[str, str] = {}
     for argument in argv[1:]:
         candidate = Path(argument).expanduser()
@@ -730,8 +727,7 @@ def executable_identity(command: str) -> dict[str, Any]:
         if not candidate.is_file():
             continue
         resolved_argument = candidate.resolve()
-        argument_files[str(resolved_argument)] = (
-            "sha256:" + hashlib.sha256(resolved_argument.read_bytes()).hexdigest())
+        argument_files[str(resolved_argument)] = "sha256:" + file_sha256(resolved_argument)
     if argument_files:
         payload["argument_files"] = argument_files
     interpreter = Path(executable).name.casefold()

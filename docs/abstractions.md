@@ -188,13 +188,20 @@ Likewise, `read_event_log_base` produces `MissingEventLog | InvalidEventLog | Lo
 `read_events_base` is only the legacy tuple adapter. Strict JSON parsing lives in
 `json_contracts.py`, so every disk reader shares duplicate-key and non-finite-number rejection.
 
+`content_digests.py` owns how bytes are hashed. `file_sha256` is the digest an artifact commit
+records and verifies; `tree_sha256` hashes a file tree as (relative path, bytes) entries sorted by
+path component, each framed as path, NUL, then content. The canonical `skill_tree_hash`, the
+workspace fixture hash, the script-oracle trees in the eval contract, and the Jetty upload plan
+all go through it, so a digest computed from the upload plan equals the canonical one it is
+checked against. The judge's explore-surface digest frames directories too and stays separate.
+
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10471`), Claude (`run_claude:10662`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10447`), Claude (`run_claude:10638`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13227`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:4043` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13208`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4019` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger

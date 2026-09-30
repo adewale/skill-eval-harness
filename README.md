@@ -560,6 +560,7 @@ skill-eval-harness/
 ├── ablation_model.py           # typed ablation/provenance/task value objects
 ├── agent_capabilities.py       # unified backend surfaces, capabilities, CLI options, smoke, and failure policy
 ├── artifact_contracts.py       # closed persisted-artifact observations and integrity verification
+├── content_digests.py          # file and file-tree digests: skill, fixture, oracle, and Jetty upload trees
 ├── cli_contracts.py            # validated command, path, model, variant, and numeric CLI values
 ├── experimental_pairs.py       # exact pair identities and blocked-pair construction
 ├── completion_contracts.py     # stop class, served-model check, and effort per answer run

@@ -125,7 +125,6 @@ from artifact_contracts import (
     CompleteArtifactSet,
     LegacyArtifactSet,
     artifact_commit_valid,
-    file_sha256,
     observe_artifact_set,
 )
 from cli_contracts import CLICommand, CLIInvocation
@@ -139,6 +138,7 @@ from completion_contracts import (
     completion_unscorable_reason,
     effort_identity,
 )
+from content_digests import directory_tree_sha256, file_sha256, tree_sha256
 from effect_estimates import (
     DiscriminationFailure,
     Estimate,
@@ -1580,19 +1580,14 @@ def eval_contract_sha256(
         })
     oracle_trees = []
     for root in sorted(script_roots):
-        digest = hashlib.sha256()
-        for candidate in sorted(root.rglob("*")):
-            if candidate.is_symlink():
-                raise ValueError(f"script oracle tree contains a symlink: {candidate}")
-            if not candidate.is_file():
-                continue
-            relative = candidate.relative_to(root).as_posix()
-            digest.update(relative.encode("utf-8") + b"\0")
-            digest.update(candidate.read_bytes())
+        try:
+            tree_digest = directory_tree_sha256(root, reject_symlinks=True)
+        except ValueError as exc:
+            raise ValueError(f"script oracle {exc}") from exc
         oracle_trees.append({
             "path": root.relative_to(manifest_dir).as_posix()
             if root != manifest_dir else ".",
-            "sha256": digest.hexdigest(),
+            "sha256": tree_digest,
         })
     return canonical_json_sha256({
         "schema_version": 1,
@@ -1917,11 +1912,7 @@ def prepared_fixture_tree_hash(pt: PreparedTask) -> str:
         if not source.is_file():
             raise ValueError(f"input fixture is not a file: {source}")
         destinations[destination] = source
-    digest = hashlib.sha256()
-    for destination, source in sorted(destinations.items()):
-        digest.update(destination.encode("utf-8") + b"\0")
-        digest.update(source.read_bytes())
-    return digest.hexdigest()
+    return tree_sha256(destinations.items())
 
 
 def manifest_case_input_fingerprint(
@@ -2315,7 +2306,7 @@ def resolve_skill_root(comp: dict[str, Any], skill_paths: list[str]) -> str | No
 def _skill_root_key(rel: str) -> str:
     """Sanitized directory name for a skill root inside a built tree. The SAME
     function must name the canonical (with_skill) tree and the materialized pre-edit
-    tree, because _hash_tree includes this directory name — any divergence would make
+    tree, because skill_tree_hash includes this directory name — any divergence would make
     canonical_skill_tree_hash != the ablation's parent_skill_hash and break
     TreeIdentity.same_revision_as."""
     return re.sub(r"[^A-Za-z0-9_.-]", "_", rel)
@@ -2707,19 +2698,6 @@ def _write_text_preserving_newlines(path: Path, text_lf: str) -> None:
     path.write_bytes(out.encode("utf-8"))
 
 
-def _hash_tree(root: Path) -> str:
-    """Stable content hash of a directory tree: sorted posix relpaths plus bytes.
-    Identical inputs (same files, same content, same relative layout) hash equal,
-    so a materialized ablation's pre-edit tree and the canonical with_skill tree —
-    built by the same copier with the same key naming — produce the same hash."""
-    digest = hashlib.sha256()
-    for f in sorted(root.rglob("*")):
-        if f.is_file():
-            digest.update(f.relative_to(root).as_posix().encode("utf-8") + b"\0")
-            digest.update(f.read_bytes())
-    return digest.hexdigest()
-
-
 def skill_tree_hash(root: Path) -> str:
     """Hash an already-built skill tree at the attestation boundary.
 
@@ -2730,7 +2708,7 @@ def skill_tree_hash(root: Path) -> str:
     root = Path(root)
     if not root.is_dir():
         raise ValueError(f"skill tree is not a directory: {root}")
-    return _hash_tree(root)
+    return directory_tree_sha256(root)
 
 
 def _safe_under(base: Path, path: Path) -> Path:
@@ -3168,7 +3146,7 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
 
         # Hash the canonical (pre-edit) tree: the with_skill arm's oracle. Both arms
         # record this so the report can prove they share a skill revision.
-        parent_skill_hash = _hash_tree(tmp)
+        parent_skill_hash = skill_tree_hash(tmp)
 
         file_text: dict[Path, str] = {}
         file_ops: dict[Path, list[tuple[int, int, str]]] = {}
@@ -3217,7 +3195,7 @@ def materialize(validated: ValidatedAblation, out_root: Path) -> MaterializedArm
                 if not required_fields_present(main.read_text(encoding="utf-8-sig")):
                     raise AblationError('required frontmatter field (name/description) became empty or missing; set "invalid_skill": true to run that as an invalid-skill experiment')
 
-        skill_hash = _hash_tree(tmp)
+        skill_hash = skill_tree_hash(tmp)
         tmp.rename(dest)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -3300,7 +3278,7 @@ def canonical_skill_tree_hash(repo_root: Path, manifest: dict[str, Any]) -> str:
     tmp = Path(tempfile.mkdtemp(prefix=".canon-hash-"))
     try:
         build_canonical_skill_tree(repo_root, manifest, tmp / "tree")
-        return _hash_tree(tmp / "tree")
+        return skill_tree_hash(tmp / "tree")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -3481,9 +3459,10 @@ def jetty_archive_member_path(value: Any) -> str:
 def planned_file_surface_hash(
     files: Iterable[dict[str, Any]], *, role: str, path_prefix: str,
 ) -> str:
-    """Hash upload bytes using their model-visible relative destinations."""
-    digest = hashlib.sha256()
-    entries: list[tuple[str, bytes]] = []
+    """Hash upload bytes using their model-visible relative destinations, as
+    tree_sha256 hashes the tree they rebuild, so the plan matches the canonical
+    skill_tree_hash it is checked against."""
+    entries: list[tuple[str, bytes | Path]] = []
     seen: set[str] = set()
     for item in files:
         if item.get("role") != role:
@@ -3496,10 +3475,7 @@ def planned_file_surface_hash(
             raise ValueError(f"duplicate or empty {role} upload destination: {relative!r}")
         seen.add(relative)
         entries.append((relative, _jetty_upload_bytes(item)))
-    for relative, content in sorted(entries):
-        digest.update(relative.encode("utf-8") + b"\0")
-        digest.update(content)
-    return digest.hexdigest()
+    return tree_sha256(entries)
 
 
 def _jetty_upload_bytes(item: dict[str, Any]) -> bytes:
@@ -11488,7 +11464,12 @@ JUDGE_EVIDENCE_MODES = {
 
 
 def judge_explore_surface_sha256(run_base: Path) -> str:
-    """Hash the names/content surface copied for a read-only exploring judge."""
+    """Hash the names/content surface copied for a read-only exploring judge.
+
+    Not content_digests.tree_sha256: a judge exploring the copy also sees its
+    directories, so directory entries are framed too, and the persisted digest
+    keeps this format.
+    """
     if not run_base.is_dir():
         raise ValueError("judge explore evidence requires a readable run directory")
     digest = hashlib.sha256()

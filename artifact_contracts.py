@@ -1,7 +1,6 @@
 """Typed observations of one persisted run-artifact set."""
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -11,6 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, TypeAlias
 
+from content_digests import file_sha256
 from json_contracts import strict_json_loads
 
 ARTIFACT_COMMIT_NAME = "artifact-commit.json"
@@ -108,16 +108,6 @@ def _invalid_inventory_entries(inventory: Mapping[Any, Any]) -> bool:
         or ".." in Path(name).parts
         for name, digest in inventory.items()
     )
-
-
-def file_sha256(path: Path) -> str:
-    """The digest an artifact commit records for each file; the writer in
-    skill_benchmark and the validator here must hash identically."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _invalid(reason: str) -> InvalidArtifactCommit:
