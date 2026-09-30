@@ -123,5 +123,26 @@ class InvocationPlanContractTests(unittest.TestCase):
         self.assertIs(sb.ProcessInvocationPlan, ProcessInvocationPlan)
 
 
+class ReachedExitTests(unittest.TestCase):
+    def test_only_a_process_that_exited_on_its_own_counts(self):
+        # One definition for the trigger contract, the Pi trace writer and the
+        # answer runners: a timeout, a spawn failure or a harness failure never
+        # observed the provider exit.
+        expected = {
+            InvocationState.COMPLETE: True,
+            InvocationState.PROCESS_FAILED: True,
+            InvocationState.PROVIDER_FAILED: True,
+            InvocationState.TIMED_OUT: False,
+            InvocationState.SPAWN_FAILED: False,
+            InvocationState.HARNESS_FAILED: False,
+        }
+        self.assertEqual(set(expected), set(InvocationState))
+        for state, reached in expected.items():
+            with self.subTest(state=state):
+                self.assertIs(state.reached_exit, reached)
+        outcome = InvocationOutcome.from_process(stdout="", stderr="", returncode=0, elapsed_ms=0)
+        self.assertIs(outcome.process_observation_complete, outcome.state.reached_exit)
+
+
 if __name__ == "__main__":
     unittest.main()

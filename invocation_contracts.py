@@ -27,6 +27,13 @@ class InvocationState(str, Enum):
     PROVIDER_FAILED = "provider_failed"
     HARNESS_FAILED = "harness_failed"
 
+    @property
+    def reached_exit(self) -> bool:
+        """Whether a provider process was spawned and exited on its own, with
+        success or failure; a timeout or spawn failure never observed an exit."""
+        return self in {InvocationState.COMPLETE, InvocationState.PROCESS_FAILED,
+                        InvocationState.PROVIDER_FAILED}
+
 
 def validate_invocation_lifecycle(
     state: InvocationState,

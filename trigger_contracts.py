@@ -118,11 +118,7 @@ class InvocationOutcome:
     @property
     def process_observation_complete(self) -> bool:
         """Whether a provider process was spawned and reached an exit."""
-        return self.state in {
-            InvocationState.COMPLETE,
-            InvocationState.PROCESS_FAILED,
-            InvocationState.PROVIDER_FAILED,
-        }
+        return self.state.reached_exit
 
     @classmethod
     def from_process(cls, *, stdout: str, stderr: str, returncode: int,

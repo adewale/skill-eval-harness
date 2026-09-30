@@ -180,11 +180,7 @@ def write_trigger_trace_artifacts(run_dir: Path, stdout: str, result: dict[str, 
     except (TypeError, ValueError):
         process_complete = None
     else:
-        process_complete = invocation_state in {
-            InvocationState.COMPLETE,
-            InvocationState.PROCESS_FAILED,
-            InvocationState.PROVIDER_FAILED,
-        }
+        process_complete = invocation_state.reached_exit
     write_trace_artifacts(
         run_dir,
         stdout,
