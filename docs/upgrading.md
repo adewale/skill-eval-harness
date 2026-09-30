@@ -224,17 +224,28 @@ it.
 
 ## 0.6.0 → unreleased `main`
 
-These notes cover the run-ending, lift-interval, and feedback-store changes on `main` after
-0.6.0; the changelog's [Unreleased](../CHANGELOG.md#unreleased) section lists the rest. No
-manifest or telemetry migration is needed and saved runs stay readable. What changes is which
-runs count, which pairs form, and how a few report and audit fields read.
+These notes cover the run-ending, lift-interval, feedback-store, eval-health, and gate changes
+on `main` after 0.6.0; the changelog's [Unreleased](../CHANGELOG.md#unreleased) section lists the
+rest. No manifest or telemetry migration is needed and saved runs stay readable. What changes is
+which runs count, which pairs form, how a few report and audit fields read, and which internal
+Python names still exist.
 
 ### Run metadata and scoring
 
 - Native answer runs now record `stop_class`, `stop_reason`, `stop_source`, `requested_model`,
   `served_model`, `served_models`, `served_model_check`, and `effort` in `metadata.json`. Runs
   recorded earlier carry none of them, grade as before, and appear as `unrecorded` in the new
-  `run_endings` report block.
+  `run_endings` report block. A backend that exposes no evidence records `unavailable`, and an
+  unpinned effort records `applied_by: "backend_default"`; the values are defined in
+  [`vocabulary.md`](vocabulary.md#run-artifacts).
+- A run tree written by a pre-release build of `main` may carry the earlier spellings
+  `unobserved`, `not-requested`, and `backend-default`. Such runs grade the same, `run_endings`
+  counts them under the old spelling, and their effort still pairs with new runs, because an
+  unrequested effort reads as the backend default either way. Re-run them if you want one
+  spelling in the report.
+- A run that reports several models credits none of them: `served_model` is `null`, and the check
+  reads `mixed` (scored, counted in `run_endings.served_model_mixed`) when the requested model is
+  among them, or `mismatch` (unscorable) when it is not. Claude subagent turns are not counted.
 - A run whose `stop_class` is `truncated` or `turn_limit`, or whose `served_model_check` is
   `mismatch`, is unscorable ([execution validity](vocabulary.md#run-artifacts);
   `unscorable_reason`: `stopped:truncated`, `stopped:turn_limit`,
@@ -243,7 +254,7 @@ runs count, which pairs form, and how a few report and audit fields read.
   smaller denominator as a skill change. A refusal is still graded.
 - A pair whose arms ran at different effort is blocked as `effort_mismatch`, and a pair where only
   one arm recorded effort as `effort_unrecorded_on_one_arm`. Re-run an old arm rather than pairing
-  it with a new one. `run-agent --agent gemini|vibe --effort …` now exits before any run.
+  it with a new one. The ablation confirmation and `token-overhead` block these pairs too. `run-agent --agent gemini|vibe --effort …` now exits before any run.
 
 ### Human feedback
 
@@ -255,7 +266,8 @@ runs count, which pairs form, and how a few report and audit fields read.
   verbatim to `unparsed_entries` on the next save instead of blocking it. `judge-alignment` and
   `error-analysis` ignore those entries, and `judge-alignment` counts them in
   `label_source.skipped.unparsed`. Fix an entry there and move it back to `entries` if it
-  should count.
+  should count. An entry whose `variant` is not a real arm (`with_skill`, `without_skill`,
+  `old_skill`, or `ablation:<id>`) no longer validates either.
 - An entry that names a judge `assertion` with a pass/fail verdict is a `judge-alignment` label,
   so `--labels feedback.json` can replace a separately kept labels file. The legacy
   `{judge_task_id, passed}` file still loads.
@@ -273,3 +285,63 @@ runs count, which pairs form, and how a few report and audit fields read.
   `regression_guards_holding`, which never blocks; it now blocks, so
   `audit-manifest --fail-on-blockers` can start failing on a suite that passed under 0.6.0.
   Audit the case and its assertions rather than removing the regression intent.
+- Every paired `significance`, `interval`, and `noise_check` block gains `unit`, the inference unit
+  its test counts (`case` for benchmark lift).
+- Ablation pairing diagnostics read `contrast_id: "ablation:<id>"` (0.6.0 wrote `skill_presence`),
+  and a missing ablation run blocks as `missing_ablation:<id>` instead of `missing_without_skill`.
+  Update any script that filters on those strings.
+- Repeated judge runs (`judge --judge-runs N`) now carry an `agreement` block, and an even split
+  no longer fails silently: it does not pass and reads `unresolved`, unless the median score
+  clears the verdict's explicit threshold.
+- `audit-manifest` output gains `eval_health`, `known_answer_check`, `case_sources`, and
+  `readiness.blocker_findings`, and may report the new finding kinds listed in the changelog.
+  `audit-manifest --runs` on an incomplete benchmark now reports the `benchmark-incomplete`
+  blocker, so `--fail-on-blockers` can fail a suite that passed under 0.6.0; a suite with judge
+  assertions needs `--judge-results`, which `audit-manifest` now accepts with the other
+  [grading options](commands.md#grading-options).
+- A manifest may now declare `source`, `reference_answer`, and `reference_answer_ref` on a case.
+  Existing manifests are unaffected, but `validate` rejects an unknown `source`, both answer
+  fields on one case, an inline `reference_answer` on a `holdout` or `holdback` case, and either
+  field on a trigger case.
+- `aggregate` and `export-anthropic` accept `--strict` and `--embed-cmd`; pass them there too if
+  your `benchmark` command uses them, or the numbers will differ.
+
+### Fixes that change saved numbers
+
+- Codex trace normalization no longer counts the stream's opening `thread.started` event as a
+  file read. `file_reads` was one too high on every Codex run; the count is written when a trace
+  is normalized, so a saved run keeps the old count until its `trace.jsonl` is normalized again
+  (`import-trace --source codex`).
+- A trigger observation now rejects a bare `estimated` cost source, as the answer path already
+  did, and accepts the missing-cost block with observed parts that `normalize_cost` writes. A
+  saved trigger report with an `estimated` cost row fails re-validation in `trigger-compare`;
+  regenerate it.
+
+### Removed names
+
+These module-level names had no production caller and are gone. Code that imported them from
+the harness modules needs the replacement:
+
+| Removed | Use instead |
+|---|---|
+| `skill_benchmark.read_metadata_base` | `read_metrics_base` (same body) |
+| `skill_benchmark.discover_run_bases` | `discover_case_model_roots` with `discover_run_bases_under` |
+| `skill_benchmark.read_output`, `read_metadata` | `read_output_base`, `read_metrics_base` |
+| `skill_benchmark.judge_cost_usd` | `judge_cost_block` |
+| `skill_benchmark.CLAUDE_USAGE_KEYS` | `telemetry.USAGE_ALIASES` |
+| `skill_benchmark.TRIGGER_SEMANTIC_MODULES`, `HARNESS_SEMANTIC_MODULES` | `TRIGGER_IDENTITY_MODULES` |
+| `skill_benchmark.GEMINI_AUTH_FILES` | `GEMINI_AUTH_FILES_BY_TYPE` |
+| `skill_benchmark.load_trace_jsonl` | `parse_trace_jsonl_text` |
+| `skill_benchmark.persist_answer_design_value` | `persist_answer_design` |
+| `skill_benchmark.register_workspace_builder` | a workspace builder on the backend's `agent_capabilities.BACKENDS` row |
+| `ablation_model.Population` | `manifest_contracts.CasePopulation` |
+| `ablation_model.Arm.harness_record` | `PreparedTask.harness_record` |
+| `run_pi_trigger_eval.run_query`, `run_trigger_matrix.run_cell_query` | `observe_query` / `observe_cell_query`, then `as_row()` |
+| `run_pi_trigger_eval.detect_trigger` (re-export) | `skill_benchmark.detect_trigger` |
+| `skill_benchmark.two_sample_permutation_significance`, `_combinations`, `_exact_rate`, `iteration_dirs`, `next_iteration_dir`, `final_answer_from_events`, `text_files_under`, `missing_evidence`, `resolved_task_upload_bytes`, `JETTY_TERMINAL_SUCCESS`, `JETTY_TERMINAL_FAILURE`, `JETTY_PENDING`, `run_pi_trigger_eval.pi_terminal_error`, `pi_invoke_result`, `run_trigger_matrix.matrix_capabilities`, `matrix_failure_row`, `runner_contracts.classify_runner_result`, `agent_capabilities.surface_names`, `DEDICATED_SMOKE_TARGETS`, `report_contracts.diagnostic_rates`, `ablation_model.Provenance.SCHEMA_KEYS`, `ablation_model._LEGACY_FAILURE_MARKER_ORDER` | nothing; they were dead or test-only |
+
+The `iteration-N/` directory convention that `render-viewer --previous-workspace` reads is
+unchanged; only the unused helpers went. Four names that a pre-release build of `main` added
+were removed before release: `skill_benchmark.FLOOR_FLAG` (use `findings.CaseFlag.FLOOR`),
+`experimental_pairs.effort_comparability` (use `ContrastSpec.comparability`),
+`completion_contracts.stop_from_finish_reason`, and `human_judgements.judgements_from_document`.
