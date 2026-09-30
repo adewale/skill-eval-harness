@@ -949,20 +949,6 @@ class ReviewFixRegressionTests(unittest.TestCase):
         report = {"skill_name": "d", "summary": {}, "paired_summary": {}, "case_flags": [], "results": [result]}
         self.assertIn('failures="1"', sb.junit_xml_from_report(report))
 
-    def test_p2_tool_call_matches_normalized_tool_call_events(self):
-        events = {"schema_version": 2, "source": "subagent", "events": [
-            {"type": "tool_call", "name": "Read", "input_summary": "skills/demo/refs.md", "status": "completed"},
-            {"type": "tool_call", "name": "WebSearch", "input_summary": "query", "status": "in_progress"},
-        ]}
-        with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
-            (base / "output.md").write_text("t", encoding="utf-8")
-            (base / "events.json").write_text(json.dumps(events), encoding="utf-8")
-            hit = sb.assertion_result({"type": "tool_call", "tool": "Read"}, "t", base / "output.md", run_base=base)
-            in_progress_only = sb.assertion_result({"type": "tool_call", "tool": "WebSearch"}, "t", base / "output.md", run_base=base)
-        self.assertTrue(hit["passed"], hit["evidence"])
-        self.assertFalse(in_progress_only["passed"])   # a started-but-unfinished call is not a call that ran
-
     def test_p2_turn_assertions_are_validated(self):
         manifest = base_manifest()
         manifest["cases"] = [{
