@@ -95,12 +95,12 @@ class ArtifactSetObservationTests(unittest.TestCase):
     def test_metadata_projection_exposes_reasoned_state_and_legacy_shape(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            self.assertEqual(sb.read_metadata_base(base), {})
+            self.assertEqual(sb.read_metrics_base(base), {})
             (base / "metadata.json").write_text(json.dumps({
                 "artifact_contract_version": ac.ARTIFACT_CONTRACT_VERSION,
             }), encoding="utf-8")
 
-            metadata = sb.read_metadata_base(base)
+            metadata = sb.read_metrics_base(base)
 
             self.assertFalse(metadata["artifact_set_complete"])
             self.assertEqual(metadata["artifact_set_state"], "missing_commit")

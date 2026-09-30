@@ -1124,7 +1124,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(meta["returncode"], 0)  # actual process exit is preserved
             self.assertFalse(meta["provider_response_complete"])
             self.assertNotIn(trace, text)
-            self.assertFalse(sb.execution_valid(sb.read_metadata_base(base), text))
+            self.assertFalse(sb.execution_valid(sb.read_metrics_base(base), text))
 
     def test_native_structured_adapters_reject_invalid_utf8_answer_channels(self):
         claude_bytes = (
@@ -1212,7 +1212,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "second")
             self.assertFalse((base / "trace.jsonl").exists())
             self.assertFalse((base / "grading.json").exists())
-            self.assertTrue(sb.read_metadata_base(base)["artifact_set_complete"])
+            self.assertTrue(sb.read_metrics_base(base)["artifact_set_complete"])
 
     def test_atomic_run_replacement_restores_previous_commit_on_install_failure(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1231,7 +1231,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 sb.write_runner_outcome(
                     base, am.RunnerOutcome(provider="subagent", answer="new", returncode=0))
             self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "old")
-            self.assertTrue(sb.read_metadata_base(base)["artifact_set_complete"])
+            self.assertTrue(sb.read_metrics_base(base)["artifact_set_complete"])
 
     def test_artifact_commit_is_required_and_detects_post_commit_mutation(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1239,11 +1239,11 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             sb.write_runner_outcome(
                 base, am.RunnerOutcome(provider="subagent", answer="hi", returncode=0))
             text = (base / "output.md").read_text(encoding="utf-8")
-            committed = sb.read_metadata_base(base)
+            committed = sb.read_metrics_base(base)
             self.assertTrue(committed["artifact_set_complete"])
             self.assertTrue(am.execution_valid(committed, text))
             (base / "output.md").write_text("tampered", encoding="utf-8")
-            tampered = sb.read_metadata_base(base)
+            tampered = sb.read_metrics_base(base)
             self.assertFalse(tampered["artifact_set_complete"])
             self.assertFalse(am.execution_valid(tampered, "tampered"))
 
@@ -1284,7 +1284,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["returncode"], 0)  # protocol failure does not rewrite process evidence
             self.assertFalse(meta["provider_response_complete"])
-            self.assertFalse(am.execution_valid(sb.read_metadata_base(base), text))
+            self.assertFalse(am.execution_valid(sb.read_metrics_base(base), text))
 
     def test_run_agent_dispatches_registered_vibe_backend(self):
         with tempfile.TemporaryDirectory() as td:

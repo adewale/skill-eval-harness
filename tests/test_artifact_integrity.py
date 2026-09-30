@@ -62,23 +62,32 @@ class RunArtifactOwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "multiple output aliases"):
                 sb.read_output_base(base)
 
-    def test_metadata_and_metrics_use_one_conflict_rejecting_merge(self):
+    def test_sidecars_merge_agreeing_fields_and_reject_conflicting_ones(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             (base / "metadata.json").write_text(
                 json.dumps({"returncode": 0, "provider": "test"}),
                 encoding="utf-8",
             )
-            (base / "metrics.json").write_text(
+            metrics = base / "metrics.json"
+            metrics.write_text(
+                json.dumps({"returncode": 0, "total_tokens": 5}),
+                encoding="utf-8",
+            )
+            merged = sb.read_metrics_base(base)
+            self.assertEqual(
+                (merged["returncode"], merged["provider"], merged["total_tokens"]),
+                (0, "test", 5),
+            )
+
+            metrics.write_text(
                 json.dumps({"returncode": 1, "total_tokens": 5}),
                 encoding="utf-8",
             )
-
-            for reader in (sb.read_metadata_base, sb.read_metrics_base):
-                result = reader(base)
-                self.assertFalse(result["metadata_artifact_valid"])
-                self.assertIn("conflicting field 'returncode'", result["metadata_error"])
-                self.assertNotIn("total_tokens", result)
+            rejected = sb.read_metrics_base(base)
+            self.assertFalse(rejected["metadata_artifact_valid"])
+            self.assertIn("conflicting field 'returncode'", rejected["metadata_error"])
+            self.assertNotIn("total_tokens", rejected)
 
     def test_invalid_lower_precedence_sidecar_is_not_ignored(self):
         with tempfile.TemporaryDirectory() as td:
@@ -88,28 +97,9 @@ class RunArtifactOwnershipTests(unittest.TestCase):
             )
             (base / "metrics.json").write_text("{not-json", encoding="utf-8")
 
-            for reader in (sb.read_metadata_base, sb.read_metrics_base):
-                result = reader(base)
-                self.assertFalse(result["metadata_artifact_valid"])
-                self.assertIn("invalid JSON in metrics.json", result["metadata_error"])
-
-    def test_nonconflicting_sidecars_merge_identically_for_every_reader(self):
-        with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
-            (base / "metadata.json").write_text(
-                json.dumps({"returncode": 0, "provider": "test"}),
-                encoding="utf-8",
-            )
-            (base / "metrics.json").write_text(
-                json.dumps({"returncode": 0, "total_tokens": 5}),
-                encoding="utf-8",
-            )
-
-            metadata = sb.read_metadata_base(base)
-            metrics = sb.read_metrics_base(base)
-            self.assertEqual(metadata, metrics)
-            self.assertEqual(metadata["returncode"], 0)
-            self.assertEqual(metadata["total_tokens"], 5)
+            result = sb.read_metrics_base(base)
+            self.assertFalse(result["metadata_artifact_valid"])
+            self.assertIn("invalid JSON in metrics.json", result["metadata_error"])
 
 
 class JettyImportTransactionTests(unittest.TestCase):
@@ -267,7 +257,7 @@ class JettyImportTransactionTests(unittest.TestCase):
             for record in records:
                 destination = runs / record["harness"]["run_dir"]
                 self.assertTrue(sb.artifact_commit_valid(destination))
-                metadata = sb.read_metadata_base(destination)
+                metadata = sb.read_metrics_base(destination)
                 self.assertTrue(metadata["artifact_set_complete"])
                 self.assertEqual(metadata["answer_design_sha256"], design["design_sha256"])
 

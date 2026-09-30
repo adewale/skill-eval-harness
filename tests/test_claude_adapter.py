@@ -356,7 +356,7 @@ class RunClaudeAdapterTests(unittest.TestCase):
                 model="claude-haiku-4-5-20251001", claude_bin=str(malformed), timeout=60))
             base = runs / run_dir
             text = (base / "output.md").read_text(encoding="utf-8")
-            meta = sb.read_metadata_base(base)
+            meta = sb.read_metrics_base(base)
             self.assertEqual(meta["returncode"], 0)
             self.assertTrue(meta["process_observation_complete"])
             self.assertFalse(meta["provider_response_complete"])
@@ -405,7 +405,7 @@ class RunClaudeAdapterTests(unittest.TestCase):
             # provider-reported usage/cost still win over trace-derived counts
             self.assertEqual(metrics["input_tokens"], 11)
             self.assertEqual(metrics["cost_usd"], 0.031)
-            meta = sb.read_metadata_base(base)
+            meta = sb.read_metrics_base(base)
             self.assertEqual(meta["usage_normalized"]["source"], "provider_reported")
             env = json.loads((base / "environment.json").read_text())
             self.assertIn("stream-json", env["command"])

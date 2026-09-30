@@ -6162,7 +6162,7 @@ def discovered_run_units(runs: Path, case: dict[str, Any], variants: list[str]):
         for variant in variants:
             for run_number, base in discover_run_bases_under(model_root / variant):
                 text, output_path = read_output_base(base)
-                meta = read_metadata_base(base)
+                meta = read_metrics_base(base)
                 yield model_name, variant, run_number, base, text, output_path, meta
 
 
@@ -6360,15 +6360,8 @@ def _with_committed_artifact_state(base: Path, data: dict[str, Any]) -> dict[str
     return enriched
 
 
-def read_metadata_base(base: Path) -> dict[str, Any]:
-    merged, error = read_run_sidecar_contract(base)
-    if error is not None:
-        return {"metadata_error": error, "metadata_artifact_valid": False}
-    return _with_committed_artifact_state(base, merged)
-
-
 def read_metadata(runs: Path, case_id: str, variant: str) -> dict[str, Any]:
-    return read_metadata_base(runs / case_id / variant)
+    return read_metrics_base(runs / case_id / variant)
 
 
 def read_json_dict_or_list(path: Path) -> Any:
@@ -8525,7 +8518,7 @@ def import_trace(args: argparse.Namespace) -> int:
     except UnicodeDecodeError:
         trace_text = trace_bytes.decode("utf-8", errors="backslashreplace")
         trace_utf8_valid = False
-    existing = read_metadata_base(run_dir)
+    existing = read_metrics_base(run_dir)
     output_text, _ = read_output_base(run_dir)
     provider_complete = output_text is not None and execution_valid(existing, output_text)
     returncode = existing.get("returncode")
@@ -17839,7 +17832,7 @@ def index_comparison_runs(case_id: str, role: str,
 def comparison_run_artifact(base: Path) -> tuple[str | None, Path, dict[str, Any]]:
     """Read one candidate and enforce the shared scorable-run boundary."""
     text, output_path = read_output_base(base)
-    metadata = read_metadata_base(base)
+    metadata = read_metrics_base(base)
     missing_output = not output_path.is_file() or text is None or not text.strip()
     exec_valid = execution_valid(metadata, None if missing_output else text)
     if not scorable_run({
@@ -19325,8 +19318,8 @@ def paired_token_overhead_report(
                 without_metrics = read_metrics_base(without_base)
                 with_text, with_output_path = read_output_base(with_base)
                 without_text, without_output_path = read_output_base(without_base)
-                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, read_metadata_base(with_base), run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
-                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, read_metadata_base(without_base), run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
+                with_grade, _ = grade_case_variant(case, with_variant, with_text, with_output_path, read_metrics_base(with_base), run_number=run_number, run_base=with_base, manifest_dir=manifest_path.parent)
+                without_grade, _ = grade_case_variant(case, without_variant, without_text, without_output_path, read_metrics_base(without_base), run_number=run_number, run_base=without_base, manifest_dir=manifest_path.parent)
                 # A crashed/timed-out or output-less arm is an infrastructure failure,
                 # not evidence of token cost or accuracy; exclude the pair via the same
                 # scorable predicate every report view uses (was: graded raw, so a

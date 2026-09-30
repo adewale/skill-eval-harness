@@ -258,7 +258,7 @@ def attest_answer_design(
                 if not variant_root.exists():
                     continue
                 for run_number, base in sb.discover_run_bases_under(variant_root):
-                    metadata = sb.read_metadata_base(base)
+                    metadata = sb.read_metrics_base(base)
                     row_model = metadata.get("model", model)
                     old = coordinates.get((row_model, run_number), (False, False))
                     coordinates[(row_model, run_number)] = (
