@@ -143,9 +143,6 @@ SENSITIVE_WORKSPACE_FILES = (
     ".trigger-config/.credentials.json",
     ".codex/auth.json",
     ".codex/config.toml",
-    ".pi-config/auth.json",
-    ".pi-config/settings.json",
-    ".pi-config/APPEND_SYSTEM.md",
     ".vibe-home/.env",
 )
 SENSITIVE_ENV_VARS = ("MISTRAL_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN")
@@ -484,6 +481,10 @@ class AgentAdapter:
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         raise NotImplementedError
 
+    def release(self, workspace: Path) -> None:
+        """Remove anything mount() created outside the workspace. Called once
+        the cell ends, including when mounting or invoking failed."""
+
     def detect(self, invocation: InvocationOutcome, skill_names: list[str], copied: list[Path]) -> TriggerDetection:
         if isinstance(invocation.provider_payload, PiStream):
             return detect_trigger_records(
@@ -637,6 +638,9 @@ class CodexAdapter(AgentAdapter):
         # invoke() grants the skills directory only via --add-dir.
         return self._mount_tree(tree_dir, self._codex_home(workspace) / "skills")
 
+    def release(self, workspace: Path) -> None:
+        shutil.rmtree(self._codex_home(workspace), ignore_errors=True)
+
     def protocol_parameters(self) -> dict[str, Any]:
         return {
             **super().protocol_parameters(),
@@ -711,15 +715,27 @@ def pi_argv(query: str, model: str | None = None) -> list[str]:
 
 class PiAdapter(AgentAdapter):
     """The Pi coding agent. Skills mount under an isolated PI_CODING_AGENT_DIR
-    seeded with auth only; `skill-pi-trigger-eval` runs this adapter alone."""
+    seeded with auth only; `skill-pi-trigger-eval` runs this adapter alone.
+
+    Pi runs with read, grep, find and ls, so its home sits beside the workspace
+    rather than in it, as Codex's does: the copied auth is not readable from the
+    working directory, and the skill is reachable only through Pi's own skill
+    discovery, not by listing the working directory."""
 
     name = "pi"
 
+    @staticmethod
+    def _pi_home(workspace: Path) -> Path:
+        return workspace.parent / f"{workspace.name}-pi-home"
+
     def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
-        config_dir = workspace / ".pi-config"
+        config_dir = self._pi_home(workspace)
         config_dir.mkdir(parents=True, exist_ok=True)
-        seed_config_dir(config_dir)   # auth/settings, never the user's skills
+        seed_config_dir(config_dir)   # auth only, never the user's skills or settings
         return self._mount_tree(tree_dir, config_dir / "skills")
+
+    def release(self, workspace: Path) -> None:
+        shutil.rmtree(self._pi_home(workspace), ignore_errors=True)
 
     def protocol_parameters(self) -> dict[str, Any]:
         return {
@@ -727,19 +743,23 @@ class PiAdapter(AgentAdapter):
             "command": executable_identity("pi"),
             "tools": ["read", "grep", "find", "ls"],
             "thinking": "minimal",
-            "isolation_policy": "isolated PI_CODING_AGENT_DIR seeded without user skills",
-            "required_observations": {"config_isolated": True},
+            "isolation_policy": "external ephemeral PI_CODING_AGENT_DIR seeded with auth only",
+            "required_observations": {"config_isolated": True, "pi_home_outside_workdir": True},
         }
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         env = os.environ.copy()
-        env["PI_CODING_AGENT_DIR"] = str(workspace / ".pi-config")
-        return pi_invocation_outcome(validate_invoke_result(
-            self.name,
-            self._run_argv(ProcessInvocationPlan.from_values(
-                pi_argv(query, model), input_text="", cwd=workspace,
-                timeout_s=timeout, environment=env)),
-        )).with_metadata(config_isolated=True)
+        env["PI_CODING_AGENT_DIR"] = str(self._pi_home(workspace))
+        try:
+            result = validate_invoke_result(
+                self.name,
+                self._run_argv(ProcessInvocationPlan.from_values(
+                    pi_argv(query, model), input_text="", cwd=workspace,
+                    timeout_s=timeout, environment=env)))
+        finally:
+            self.release(workspace)
+        return pi_invocation_outcome(result).with_metadata(
+            config_isolated=True, pi_home_outside_workdir=True)
 
 
 class VibeAdapter(AgentAdapter):
@@ -980,20 +1000,23 @@ def observe_cell_query(
     secrets: list[str] = []
     with tempfile.TemporaryDirectory(prefix=f"trigger-{adapter.name}-") as td:
         workspace = Path(td)
-        copied = adapter.mount(tree_dir, workspace)
-        mounted_roots = [path.parent if path.name == "SKILL.md" else path for path in copied]
-        mounted_parents = {root.parent.resolve() for root in mounted_roots}
-        if not mounted_roots or len(mounted_parents) != 1:
-            raise ValueError(f"{adapter.name} mount did not expose one complete skill tree")
-        mounted_hash = skill_tree_hash(next(iter(mounted_parents)))
-        expected_hash = str((metadata or {}).get("skill_tree_hash") or "")
-        if mounted_hash != expected_hash:
-            raise ValueError(
-                f"{adapter.name} mounted skill tree hash {mounted_hash} does not match {expected_hash}")
-        names = mounted_skill_names(copied)
-        invocation = validate_invoke_result(adapter.name, adapter.invoke(query, model, workspace, timeout))
-        secrets = workspace_secret_values(workspace) + ambient_secret_values()
-        detection = adapter.detect(invocation, names, copied)
+        try:
+            copied = adapter.mount(tree_dir, workspace)
+            mounted_roots = [path.parent if path.name == "SKILL.md" else path for path in copied]
+            mounted_parents = {root.parent.resolve() for root in mounted_roots}
+            if not mounted_roots or len(mounted_parents) != 1:
+                raise ValueError(f"{adapter.name} mount did not expose one complete skill tree")
+            mounted_hash = skill_tree_hash(next(iter(mounted_parents)))
+            expected_hash = str((metadata or {}).get("skill_tree_hash") or "")
+            if mounted_hash != expected_hash:
+                raise ValueError(
+                    f"{adapter.name} mounted skill tree hash {mounted_hash} does not match {expected_hash}")
+            names = mounted_skill_names(copied)
+            invocation = validate_invoke_result(adapter.name, adapter.invoke(query, model, workspace, timeout))
+            secrets = workspace_secret_values(workspace) + ambient_secret_values()
+            detection = adapter.detect(invocation, names, copied)
+        finally:
+            adapter.release(workspace)
 
     redacted_invocation = redact_invocation(invocation, secrets)
     redacted_detection = redact_detection(detection, secrets)

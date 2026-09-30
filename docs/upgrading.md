@@ -316,6 +316,10 @@ Python names still exist.
   ablation id; the provenance is the report's `provenance`, as in the matrix. Traces written
   with `--trace-runs` land in a `matrix-*` directory under it. A query whose run crashes is now
   an incomplete row (exit 1) instead of stopping the whole run.
+- Pi's `PI_CODING_AGENT_DIR` now sits beside its working directory instead of inside it, so a
+  Pi report's protocol requires `pi_home_outside_workdir` and its rows record it. `trigger-compare`
+  still reads Pi reports made before the move; a baseline from before and an ablation from after
+  use different protocols and do not pair, so regenerate both arms.
 - `aggregate` and `export-anthropic` accept `--strict` and `--embed-cmd`; pass them there too if
   your `benchmark` command uses them, or the numbers will differ.
 

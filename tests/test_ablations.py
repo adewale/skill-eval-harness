@@ -100,7 +100,10 @@ def pi_mount(manifest_path: Path, manifest: dict, workspace: Path, ablation: str
     ablation) where the Pi adapter mounts it; return (copied paths, provenance)."""
     tree, _, provenance = tm.trigger_tree_for_manifest(
         sb.repo_root_for_manifest(manifest_path), manifest, workspace / "_trees", ablation)
-    return tm.PiAdapter().mount(tree, workspace), provenance
+    # The Pi home sits beside the workspace, so mount one level down to keep it
+    # inside the caller's temporary directory.
+    (workspace / "ws").mkdir()
+    return tm.PiAdapter().mount(tree, workspace / "ws"), provenance
 
 
 def _tree_files(d: Path) -> dict[str, bytes]:
@@ -581,13 +584,16 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
                 base_copied, base_prov = pi_mount(p, manifest, Path(cb), None)
                 abl_copied, abl_prov = pi_mount(p, manifest, Path(ca), "no-wtu")
 
+                def skills_dir(workspace):
+                    return tm.PiAdapter._pi_home(Path(workspace) / "ws") / "skills"
+
                 def rel_files(workspace):
-                    sd = Path(workspace) / ".pi-config" / "skills"
+                    sd = skills_dir(workspace)
                     return {q.relative_to(sd).as_posix() for q in sd.rglob("*") if q.is_file()}
 
                 # identical mount dir names and identical relative file trees
-                self.assertEqual({d.name for d in (Path(cb) / ".pi-config" / "skills").iterdir()},
-                                 {d.name for d in (Path(ca) / ".pi-config" / "skills").iterdir()})
+                self.assertEqual({d.name for d in skills_dir(cb).iterdir()},
+                                 {d.name for d in skills_dir(ca).iterdir()})
                 self.assertEqual(rel_files(cb), rel_files(ca))
                 # the references file survives in BOTH arms (the old ad-hoc copier path is gone)
                 self.assertTrue(any(f.endswith("references/severity.md") for f in rel_files(cb)))

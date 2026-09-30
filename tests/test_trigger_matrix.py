@@ -20,7 +20,9 @@ Live smokes need the relevant CLI and API credentials, and spend real tokens.
 The cheap agent smoke asserts invocation only; the trigger-matrix smokes assert
 observed trigger-eval runs and at least one autonomous load.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -182,29 +184,64 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "exactly one of evals or queries"):
                 tm.eval_rows_from_args(args, DEMO_MANIFEST)
 
-    def test_pi_cli_is_the_matrix_with_the_pi_adapter_in_an_isolated_config(self):
+    def test_pi_cli_is_the_matrix_with_pi_home_outside_its_working_directory(self):
         seen = {}
 
         def fake_run(plan):
-            config = Path(dict(plan.environment or {})["PI_CODING_AGENT_DIR"])
-            seen.update({"argv": list(plan.argv), "cwd": Path(plan.cwd), "config": config,
-                         "mounted": sorted(path.name for path in (config / "skills").iterdir())})
+            config, cwd = Path(dict(plan.environment or {})["PI_CODING_AGENT_DIR"]), Path(plan.cwd)
+            seen.update({
+                "argv": list(plan.argv), "cwd": cwd, "config": config,
+                "auth_copied": (config / "auth.json").is_file(),
+                "mounted": sorted(path.name for path in (config / "skills").iterdir()),
+                # What Pi's read/grep/find/ls tools can reach from where it runs.
+                "reachable": sorted(path.name for path in cwd.rglob("*")),
+            })
             return completed_invocation(pi_stream(PI_STOP))
 
         with tempfile.TemporaryDirectory() as td:
+            user_home = Path(td) / "user-pi"
+            user_home.mkdir()
+            (user_home / "auth.json").write_text('{"token": "user-token-123"}', encoding="utf-8")
             eval_set = write_rows(Path(td), [{"query_id": "negative", "query": "ordinary chat",
                                               "should_trigger": False}])
-            code, report = run_pi_cli(
-                ["--eval-set", str(eval_set), "--runs-per-query", "1", "--workers", "1"],
-                fake_run, Path(td) / "report.json")
+            with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": str(user_home)}):
+                code, report = run_pi_cli(
+                    ["--eval-set", str(eval_set), "--runs-per-query", "1", "--workers", "1"],
+                    fake_run, Path(td) / "report.json")
         self.assertEqual(code, 0)
         self.assertEqual(report["protocol"]["producer"], "skill-trigger-matrix")
         self.assertEqual([adapter["agent"] for adapter in report["protocol"]["adapters"]], ["pi"])
+        self.assertEqual(report["results"][0]["protocol_observation"],
+                         {"config_isolated": True, "pi_home_outside_workdir": True})
         self.assertEqual(seen["argv"][0], "pi")
         self.assertNotEqual(seen["cwd"].resolve(), ROOT.resolve())
-        self.assertTrue(seen["config"].is_relative_to(seen["cwd"]))
-        self.assertNotEqual(seen["config"], tm.pi_source_config_dir())
+        self.assertNotEqual(seen["config"], user_home)
+        self.assertFalse(seen["config"].is_relative_to(seen["cwd"]))
+        self.assertTrue(seen["auth_copied"])
         self.assertTrue(seen["mounted"])
+        self.assertNotIn("auth.json", seen["reachable"])
+        self.assertNotIn("SKILL.md", seen["reachable"])
+        self.assertFalse(seen["config"].exists(), "the Pi home and its copied auth are removed")
+
+    def test_an_agent_home_is_removed_even_when_the_mount_is_refused(self):
+        for adapter in (tm.PiAdapter(), tm.CodexAdapter()):
+            with self.subTest(agent=adapter.name), tempfile.TemporaryDirectory() as td:
+                tree = Path(td) / "tree" / "demo"
+                tree.mkdir(parents=True)
+                (tree / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+                created = []
+                real_mount = type(adapter).mount
+
+                def spy(self, tree_dir, workspace, _real=real_mount, _created=created):
+                    _created.append(workspace)
+                    return _real(self, tree_dir, workspace)
+
+                with mock.patch.object(type(adapter), "mount", spy), \
+                     self.assertRaisesRegex(ValueError, "does not match"):
+                    tm.observe_cell_query(adapter, tree.parent, "q", True, None, 5,
+                                          metadata={"skill_tree_hash": "0" * 64})
+                home = (adapter._pi_home if adapter.name == "pi" else adapter._codex_home)(created[0])
+                self.assertFalse(home.exists())
 
     def test_pi_ablation_report_names_the_edited_tree_on_every_repetition(self):
         with tempfile.TemporaryDirectory() as td:
@@ -345,8 +382,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
 
     def test_pi_matrix_detection_and_telemetry_share_one_parsed_stream(self):
         def successful_pi(plan):
-            cwd = plan.cwd
-            skill = Path(cwd) / ".pi-config" / "skills" / "demo" / "SKILL.md"
+            skill = Path(plan.environment["PI_CODING_AGENT_DIR"]) / "skills" / "demo" / "SKILL.md"
             assistant = {"role": "assistant", "stopReason": "stop",
                          "usage": {"input": 4, "output": 1, "totalTokens": 5}}
             stdout = "\n".join([
@@ -375,7 +411,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
 
     def test_pi_trace_artifacts_carry_the_detector_evidence_and_the_query(self):
         def reads_skill(plan):
-            skill = Path(plan.cwd) / ".pi-config" / "skills"
+            skill = Path(plan.environment["PI_CODING_AGENT_DIR"]) / "skills"
             mounted = next(skill.rglob("SKILL.md"))
             usage = {"input": 3, "output": 2, "totalTokens": 5}
             return completed_invocation(pi_stream(
@@ -1394,6 +1430,38 @@ def trigger_report(rows, *, ablation=None, provenance=None, tree_hash=BASE_HASH,
             "manifest_identity": sb.trigger_manifest_identity(TRIGGER_MANIFEST),
             "protocol": protocol, "protocol_sha256": protocol_sha256,
             "runs_per_query": runs_per_query, "design": design, "results": rows}
+
+
+class PiProtocolRequirementTests(unittest.TestCase):
+    """A Pi report declares the isolation controls it ran under. Reports made
+    before Pi's home moved out of its working directory stay readable; any
+    other control set is refused."""
+
+    def protocol(self, required):
+        adapter = tm.PiAdapter().protocol_parameters()
+        return {"schema_version": 1, "producer": "skill-trigger-matrix",
+                "harness_identity": sb.trigger_harness_identity(),
+                "timeout_seconds": 30, "runs_per_query": 1, "workers": 1,
+                "adapters": [{**adapter, "required_observations": required, "models": [None]}]}
+
+    def validate(self, required):
+        return sb._validated_trigger_protocol(
+            self.protocol(required), label="report", runs_per_query=1,
+            design_pairs={("pi", None)})
+
+    def test_the_adapter_declares_its_home_outside_the_working_directory(self):
+        declared = tm.PiAdapter().protocol_parameters()["required_observations"]
+        self.assertEqual(self.validate(declared), {"pi": declared})
+
+    def test_a_report_from_before_the_move_is_still_read(self):
+        self.assertEqual(self.validate({"config_isolated": True}),
+                         {"pi": {"config_isolated": True}})
+
+    def test_any_other_control_set_is_refused(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            self.validate({"pi_home_outside_workdir": True})
+        self.assertIn("must require", stderr.getvalue())
 
 
 class TriggerComparisonTests(unittest.TestCase):

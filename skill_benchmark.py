@@ -14668,19 +14668,22 @@ def _validated_trigger_protocol(
                 die(
                     f"{label} matrix protocol adapter {agent!r} must use "
                     f"{known_implementation}, got {implementation}")
+            # The first set is what the adapter requires today; any later set
+            # is an earlier protocol that reports already saved may declare.
             known_requirements = {
-                "claude": {"config_isolated": True},
-                "codex": {"codex_home_outside_workdir": True},
-                "pi": {"config_isolated": True},
-                "stub": {},
-                "vibe": {"config_isolated": True,
-                         "vibe_home_outside_workdir": True},
+                "claude": ({"config_isolated": True},),
+                "codex": ({"codex_home_outside_workdir": True},),
+                "pi": ({"config_isolated": True, "pi_home_outside_workdir": True},
+                       {"config_isolated": True}),
+                "stub": ({},),
+                "vibe": ({"config_isolated": True,
+                          "vibe_home_outside_workdir": True},),
             }.get(agent)
             if (known_requirements is not None
-                    and required_mapping != known_requirements):
+                    and required_mapping not in known_requirements):
                 die(
                     f"{label} matrix protocol adapter {agent!r} must require "
-                    f"{known_requirements}, got {required_mapping}")
+                    f"{known_requirements[0]}, got {required_mapping}")
             if agent in requirements:
                 die(f"{label} matrix protocol duplicates adapter {agent!r}")
             requirements[agent] = {
