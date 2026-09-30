@@ -67,6 +67,11 @@ claude-api skill uses (the reasoning is in
 4. **Synthesized variants of those seeds**, never cases invented from the skill's text with
    nothing real to anchor them.
 
+Record where each case came from in its `source` field: `production`, `bug-report`,
+`hand-written`, `synthesized`, or `imported` for a case carried over from another suite.
+`audit-manifest` counts the sources, and a suite that records none, or only synthesized cases,
+gets a finding against eval-health mark 1 (realistic cases).
+
 A case earns its place when you can say why it is hard, and the reason is one a domain expert
 would name. "Today's model fails it" does not count: a set picked that way measures one model's
 failure fingerprint, and its lift shrinks when the next model arrives.
@@ -200,14 +205,24 @@ Open the outputs and write the smallest assertions that capture the behavior, in
 If `validate` warns that a value is in the prompt, replace the keyword with a scoped regex, a
 fixture-backed check, a script oracle, or a judge.
 
-Before trusting the assertions, grade two answers whose verdict you already know. For each case,
-write a reference answer by hand and an answer that only restates the prompt, put them in a
-scratch run layout (`<case_id>/with_skill/run-1/output.md` for the reference,
-`<case_id>/without_skill/run-1/output.md` for the echo), and run `benchmark` on it. The reference
-must pass every gate and the echo must fail. A failing reference means an assertion rejects a
-correct answer; a passing echo means an assertion leaks. Do not use an empty file as the bad
-answer, because an empty output is recorded as `missing_output` and never scored. Process
-assertions fail closed without trace evidence, so this check covers output assertions only.
+Before trusting the assertions, grade two answers whose verdict you already know: a reference
+answer written by hand and an answer that only restates the prompt. The reference must pass every
+gate and the echo must fail. A failing reference means an assertion rejects a correct answer; a
+passing echo means an assertion leaks.
+
+Where a case has a deterministic known answer, declare it and let `audit-manifest` run that check
+on every audit. Put it inline as `reference_answer` on a `tune` case; a `holdout` or `holdback`
+case must name a private file with `reference_answer_ref` instead, because a known answer is an
+answer key. The audit's known-answer check runs the case's gate text checks (`contains`,
+`contains_any`, `contains_all`, `excludes_any`, `regex`, `not_regex`) on the reference answer and on
+the prompt echoed back, and reports `reference-answer-fails` or `null-answer-passes` against
+eval-health mark 2. The reference answer never reaches a runner.
+
+For checks the audit cannot run on a string (files, scripts, JSON fields), grade the pair by hand:
+put them in a scratch run layout (`<case_id>/with_skill/run-1/output.md` for the reference,
+`<case_id>/without_skill/run-1/output.md` for the echo) and run `benchmark` on it. Do not use an
+empty file as the bad answer, because an empty output is recorded as `missing_output` and never
+scored. Process assertions fail closed without trace evidence, so neither check covers them.
 
 Then read about five graded failures in each arm of a real run. If more than about one in ten
 are assertion errors rather than real misses, fix the assertions before a full run. Misgrades on
@@ -258,6 +273,41 @@ hides the signal:
 - **With-skill-failed**: the skill made things worse. This is the highest-priority flag.
 - **Missing output**: not measured, which differs from measured-and-failed. Excluded from
   lift and saturation.
+
+Then rate the eval itself before you trust any lift it reports. `audit-manifest` over the same
+runs rates the five eval-health marks; pass the judge verdicts too, or a suite with judge
+assertions reads as incomplete and marks 3–5 stay `unavailable`. On the bundled demo, after the
+[demo README](../examples/demo-skill/README.md)'s prepare, run, and judge steps:
+
+```bash
+cd examples/demo-skill
+skill-benchmark audit-manifest evals/shared-benchmark.json --runs /tmp/demo-runs \
+  --judge-results /tmp/demo-judge.jsonl --format markdown --out /tmp/demo-audit.md
+```
+
+The Eval health section of `/tmp/demo-audit.md` (real output, 2026-09-30, six runs per arm):
+
+```text
+## Eval health
+
+| Mark | Question | Status | Findings |
+|---:|---|---|---|
+| 1 | Are the cases realistic, and does the skill load the way real use loads it? | concern | missing-positive-evals, missing-negative-evals, missing-adversarial-evals, missing-trigger-no-trigger-cases, case-source-unrecorded |
+| 2 | Is the grader right on known answers? | ok | — |
+| 3 | Does the baseline arm have room to move, with no case failing in both arms? | ok | — |
+| 4 | Is the noise smaller than the smallest lift worth acting on? | concern | underpowered-eval |
+| 5 | Do the arms differ only in the skill? | ok | — |
+- mark 1: activation is forced: the task tells the agent to use the skill, while real use relies on discovery (issue #48)
+- mark 2: no case declares reference_answer, so no known-good answer was graded
+```
+
+Read it mark by mark. Mark 1 is a concern because the demo has too few cases of each polarity
+and records no `source`. Mark 2 is `ok` only on the null-answer half: its note says no case
+declares a `reference_answer`, so the known-good half was never graded. Mark 4 is the
+`underpowered-eval` finding: two cases can never reach p ≤ 0.05 however many repeats run, so the
+fix is more cases. A mark that reads `unavailable` had no evidence, which is not a pass. The five
+marks, and why they differ from the hillclimbing post's four, are in
+[`comparing-with-claude-api-evals.md`](comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval).
 
 ## Step 6 — Iterate, and respect the splits
 

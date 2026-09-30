@@ -501,7 +501,7 @@ effort applied inconsistently, a noise floor wider than the smallest change wort
 tasks that fail every run. Although the harness already had split discipline and a paired
 significance test, it did not record how a run ended, check that both arms ran at one effort,
 compare its noise with the smallest lift worth acting on, or tell a case nothing passes from a
-hard one. The first four items below shipped; the rest are open and tracked in
+hard one. Items 5.1–5.4, 5.6 and 5.7 have shipped; the rest are open and tracked in
 [#99](https://github.com/adewale/skill-eval-harness/issues/99). The governing invariant still holds: each item is model-free or opt-in, and none picks a
 model.
 
@@ -530,12 +530,21 @@ reachable p is 0.0625 (`2 / 2**5`), and reaching 0.05 takes six cases moving the
   treat the candidate output as untrusted data, a same-order flip rate (the same input graded
   twice), and "I don't know" and wrong-question negative controls beside the existing empty-output
   and master-key controls.
-- [ ] **5.6 Eval-health scorecard.** Goal: one report that rates an eval against the post's four marks
-  (tasks mirror production, scores rise with stronger models and more effort, passable headroom at
-  the frontier, low run-to-run variance), read before any lift.
-- [ ] **5.7 Typed findings and one gate vocabulary.** Goal: audit, readiness, contamination, and judge
-  findings share one typed shape and one severity scale, so `--fail-on-blockers`,
-  `--fail-on-contamination`, and `--fail-on-findings` gate on the same field.
+- [x] **5.6 Eval-health scorecard.** Goal: one report that rates an eval before any lift is read.
+  The post's four marks describe an eval that scores one system, so the scorecard uses five that fit
+  a lift eval: realistic cases loaded the way real use loads them, a grader right on known answers,
+  baseline headroom with no case failing in both arms, noise below the smallest lift worth acting
+  on, and arms that differ only in the skill. Shipped as `eval_health` in `audit-manifest`, a view
+  over typed findings that rates each mark `ok`, `concern` or `unavailable`; "stronger models score
+  higher" stays a per-arm diagnostic. The mapping and the reasons are in
+  [`comparing-with-claude-api-evals.md`](comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval).
+- [x] **5.7 Typed findings and one gate vocabulary.** Goal: audit, readiness, contamination, and judge
+  findings share one typed shape and one severity scale, so the gate flags key on the same field.
+  Shipped for `audit-manifest`: `findings.FindingKind` registers every kind with its subject,
+  severity and mark, readiness blockers are typed findings, and `gate_policy` presets back
+  `--fail-on-blockers` and `--strict-judge` beside a new `--fail-on` that takes kinds, severities
+  and presets. `contamination --fail-on-contamination` and `judge-robustness --fail-on-findings`
+  still apply their own checks over the same kinds.
 - [ ] **5.8 Effort as a prepared-task axis (`prepare --efforts`).** Goal: fan rows over effort levels
   the way `--models` fans over models, so effort becomes a report axis rather than one run tree per
   `--effort` value.

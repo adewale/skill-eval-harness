@@ -2,7 +2,7 @@
 
 This page is the canonical glossary: each term is defined here once, with the place it shows up in a manifest, a command, or a report. The other concept docs apply a lens to these terms rather than redefine them — [`abstractions.md`](abstractions.md) the engineering shape, [`academic-grounding.md`](academic-grounding.md) the research construct, [`evals-are-not-tests.md`](evals-are-not-tests.md) how to read the number — so when a definition changes, it changes here and the lenses follow. (The README still defines a term inline where you first meet it in a workflow; that is reference-at-use, not a second home for the definition.)
 
-Terms are grouped by what they describe: the units you evaluate, the comparison structure, the things you assert, the artifacts a run produces, the runners and judges that produce and grade them, and the signals a report flags.
+Terms are grouped by what they describe: the units you evaluate, the comparison structure, the things you assert, the artifacts a run produces, the runners and judges that produce and grade them, the signals a report flags, and the eval's own health.
 
 ## Units of evaluation
 
@@ -204,7 +204,19 @@ A case can stop discriminating at either extreme. The four entries below are dif
 
 **Contamination** — output-side evidence that a case was answered from memory rather than worked: the `contamination` command checks verbatim n-gram containment between output and answer key (`ngram_containment`), a per-case `canary` GUID tripwire that must never appear in an output, and a `released_at` vs `--model-cutoff` gate for cases older than the model's training data. Model-free; `--fail-on-contamination` gates CI.
 
-**Finding** — one typed record of something wrong with a skill, an eval, its grader, or a run, serialized as `{kind, severity, message, evidence?}`. Every `kind` is registered in `findings.FindingKind` with what it is about, a default severity (`required` or `recommended`), and, for most kinds, the eval-health mark it counts against; [`commands.md`](commands.md#finding-kinds) lists them. Whether a finding fails a command is decided by a gate policy (`gate_policy.GatePolicy`, the policy behind `--fail-on` and its presets), not by the finding.
+## Eval health
+
+**Eval health** — `audit-manifest`'s rating of the eval itself, read before any lift: five marks, each `ok`, `concern` (a finding counts against it), or `unavailable` (no evidence was available, which is not the same as `ok`). By `id`:
+
+1. `realistic-cases` — the cases are real requests, and the skill loads the way real use loads it.
+2. `grader-correct` — the grader passes a known-good answer, fails a null answer, and agrees with people.
+3. `baseline-headroom` — the `without_skill` arm has room to move, and no case fails in both arms.
+4. `noise-below-min-lift` — the noise is smaller than the smallest lift worth acting on.
+5. `arms-differ-only-in-skill` — effort and model are held fixed, the arms are paired within one run, and no answer leaks.
+
+Marks 3–5 need `--runs` and a complete benchmark. Why these five replace the hillclimbing post's four, and which finding kinds count against each, is [`comparing-with-claude-api-evals.md`](comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval); the report shape is in [`commands.md`](commands.md#eval-health).
+
+**Finding** — one typed record of something wrong with a skill, an eval, its grader, or a run, serialized as `{kind, severity, message, evidence?}`. Every `kind` is registered in `findings.FindingKind` with what it is about, a default severity (`required` or `recommended`), and the eval-health mark it counts against, if any; [`commands.md`](commands.md#finding-kinds) lists them. Whether a finding fails a command is decided by a gate policy (`gate_policy.GatePolicy`, the policy behind `--fail-on` and its presets), not by the finding.
 
 ## Populations and evidence
 

@@ -110,7 +110,7 @@ with the wrong mechanism is a rejection.
 | | `/claude-api` guides | This harness |
 |---|---|---|
 | Human sign-off | Inputs and grading each need an explicit yes; the pilot asks whether you would have scored any case differently | No interview; `render-viewer --serve` collects verdicts after a run into `feedback.json` |
-| Pipeline oracle and null | Reference answers and an empty or constant output go through the suite's own runner and grader before the first paid run | Detector fixtures (CF.1) prove each assertion type fires and passes on known inputs; nothing pushes a suite's references or a null answer through end to end |
+| Pipeline oracle and null | Reference answers and an empty or constant output go through the suite's own runner and grader before the first paid run | Detector fixtures (CF.1) prove each assertion type fires and passes on known inputs, and `audit-manifest`'s known-answer check runs each case's `reference_answer` and its prompt echoed back through the case's gate text checks. Neither goes through the runner, and a case graded by files, scripts, or a judge is not covered |
 | Failure classes | Every failed attempt, in whatever runner the guide builds: refusal, harness or serving error, timeout, genuine failure | `stop_class` and served model are read from Claude runs, served model only from Gemini; Codex, Vibe, subagent, and Jetty runs record `unavailable` |
 | Per-case auditor | One cheap model call per case flags ambiguous, suspect gold, answerable from memory, grader too strict or too lenient, cheatable | `audit-manifest` lints the manifest; no per-case model audit |
 | Judge prompt | Tells the judge not to reward length, treats candidate text as untrusted data, and tests three known negatives | `judge-robustness` runs two negative controls (empty, master-key) and an order flip; the prompt guards are roadmap 5.5 ([#98](https://github.com/adewale/skill-eval-harness/issues/98)), not implemented |
@@ -225,6 +225,77 @@ this, and the harness's splits already have that shape:
 Under the default two-way split, a hillclimb's "test" plays the harness's `holdout` role
 and nothing plays `holdback`, so the reported delta is a selection-set number.
 
+## Five marks of a lift eval
+
+The post lists four marks of a well-designed eval: the tasks mirror production, performance
+improves with stronger models and more thinking, there is headroom at the frontier, and
+run-to-run variance is low. Those marks describe an eval that scores one system. This harness
+measures a difference between two arms, so it rates an eval on five marks that fit a lift
+eval, and `audit-manifest` reports them as `eval_health`
+([output shape](commands.md#eval-health)). Each finding kind counts against at most one
+mark; this table is that mapping (`findings.FindingKind`):
+
+| Mark | `id` | Passes when | From the post | Finding kinds |
+|---:|---|---|---|---|
+| 1 | `realistic-cases` | The cases are real requests, and the skill loads the way real use loads it | Kept, plus the load path | `missing-positive-evals`, `missing-negative-evals`, `missing-adversarial-evals`, `no-adversarial-cases`, `missing-trigger-no-trigger-cases`, `case-source-unrecorded`, `synthesized-cases-only` |
+| 2 | `grader-correct` | The grader passes a known-good answer, fails a null one, and agrees with people | New: the guides' oracle-and-null and judge-calibration steps | `weak-oracle-only`, `non-discriminating-assertions`, `judge-is-model-under-test`, `reference-answer-fails`, `null-answer-passes`, `order-flip-inconsistent`, `passes-empty-control`, `passes-master-key-control` |
+| 3 | `baseline-headroom` | The `without_skill` arm has room to move, and no case fails in both arms | Headroom, moved to the baseline arm | `floor-eval`, `saturated-eval`, `base-saturated-case`, `suite-headroom-exhausted` |
+| 4 | `noise-below-min-lift` | The noise is smaller than the smallest lift worth acting on | Low variance, measured against a target | `flaky-eval`, `underpowered-eval` |
+| 5 | `arms-differ-only-in-skill` | Effort and model are held fixed, the arms are paired within one run, and no answer leaks | New: takes the post's effort-consistency check | `prompt-assertion-leakage`, `leak-saturated-case`, `held-out-rubric-leak`, `arm-conditions-differ`, `served-model-mismatch`, `served-model-mixed` |
+
+Marks 1 and 2 are rated from the manifest. Marks 3–5 need `audit-manifest --runs` and a
+complete benchmark, and read `unavailable` until then, which is not the same as `ok`.
+`audit-manifest` does not run `judge-robustness`, so the three robustness kinds in mark 2
+reach a gate through that command's own `--fail-on-findings`, not through `eval_health`.
+
+**1. Realistic cases, loaded the way real use loads them.** Kept, because a lift measured on
+invented requests says little about the requests the skill will get. Record where each case
+came from in `source`, in the order `/claude-api build-eval` sources cases: `production`,
+`bug-report`, `hand-written`, then `synthesized` (or `imported`). The harness adds the load
+path: an answer case tells the agent to use the skill, while real use depends on the agent
+discovering it. That nudge exists only in the eval
+([#48](https://github.com/adewale/skill-eval-harness/issues/48)), so every eval-health report
+with answer cases carries a note saying activation was forced, and the trigger cases measure
+discovery separately.
+
+**2. The grader is right on known answers.** Not one of the post's four, but the step the
+guides run before any paid run: reference answers must score about 100% and a null output
+about 0%, and the judge must agree with a person. In a lift eval a grader error does more than
+add noise, because a correct baseline answer marked wrong inflates the lift. The known-answer
+check grades each case's `reference_answer` and its prompt echoed back with the case's own
+gate text checks; `judge-robustness` feeds the judge negative controls. `judge-alignment`
+scores the judge against human labels, but its result is not a finding yet, so eval health
+cannot see it.
+
+**3. The baseline arm has room to move, and no case fails in both arms.** The post asks for
+headroom at the frontier, where the best system still fails. In a lift eval the room that
+matters is in `without_skill`: once the baseline passes, no skill can show lift, and the
+useful goal becomes the same quality at lower cost (`suite-headroom-exhausted` fires when
+`without_skill` averages a 95% or higher objective pass rate over the capability runs). The mark also catches the other
+extreme, a case that fails in both arms, which is more often broken than hard. It applies to
+capability cases: a regression guard (`eval_intent: "regression"`) is meant to pass in both
+arms, and only a guard at the floor counts against it.
+
+**4. The noise is smaller than the smallest lift worth acting on.** The post asks for low
+variance, but low variance is a means. A lift eval needs its noise floor below the smallest
+lift you would ship, counted in the unit the test uses, which is cases, not runs
+([The noise floor](#the-noise-floor)). `noise_check` makes that comparison when you pass
+`--min-lift`, and `underpowered-eval` fires when its verdict is anything but `resolvable`.
+
+**5. The arms differ only in the skill.** The post folds "effort applied consistently" into
+its variance mark. For a lift eval it is a mark of its own and a wider one, because whatever
+else differs between the arms is reported as lift. Pairs form only within one case, model and
+repetition of one run; a pair whose arms ran at different effort is blocked; a run answered by
+another model is unscorable; and the leakage lints catch an answer that reaches the model
+through the prompt or the public eval text.
+
+**What became of "stronger models and more effort score higher."** A stronger model raises
+both arms and often shrinks the lift, because its base model needs the skill less. So the
+harness does not rate it as a mark and never reads it as a claim about lift. It stays an
+optional per-arm diagnostic: in a `prepare --models` run, each arm's pass rate should rise with
+the tier, and a stronger tier scoring lower in the same arm points at an ambiguous case or a
+miscalibrated grader ([which-model-should-my-skill-target.md](which-model-should-my-skill-target.md)).
+
 ## Using them together
 
 ### The harness as the eval a hillclimb climbs
@@ -251,7 +322,7 @@ round yourself and read its outputs at the step that asks for them.
 | eval-audit: judge tested on known negatives | Does the judge reject junk? | `judge-robustness` (empty and master-key controls, order flip) |
 | Step 4.5 stall bucketing | Why do the remaining cases fail? | `error-analysis --feedback feedback.json`: the review queue and failure taxonomy ([`why-did-this-run-fail.md`](why-did-this-run-fail.md)) |
 | Step 5 report with CIs | Is the delta outside noise? | `paired_summary.interval` (`bounded: false` means no shift can be excluded) and `significance` |
-| The post's low-variance mark: effort applied consistently | Did both arms run the same config? | `effort` on every run (`--effort` on `run-claude`, `run-codex`, `run-agent`); pairing blocks `effort_mismatch`, and `run_endings.notes` warns when a multi-model report ran every arm at `backend_default` effort |
+| Mark 5, arms differ only in the skill: effort applied consistently | Did both arms run the same config? | `effort` on every run (`--effort` on `run-claude`, `run-codex`, `run-agent`); pairing blocks `effort_mismatch`, and `run_endings.notes` warns when a multi-model report ran every arm at `backend_default` effort |
 
 ## What keeps the comparison honest
 

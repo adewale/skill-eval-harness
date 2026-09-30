@@ -745,6 +745,11 @@ and the noise floor sits below the smallest lift worth acting on. By that last m
 one fifth of the cost at parity, because parity needs quality to hold rather than to rise past the
 noise.
 
+*Update (2026-09-30):* the harness now rates an eval on five marks that fit a lift eval, and
+`audit-manifest` reports them as `eval_health`. Which of the post's four were kept, re-scoped or
+replaced, and why "stronger models score higher" became a per-arm diagnostic, is in
+[`docs/comparing-with-claude-api-evals.md`](docs/comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval).
+
 **Rule:**
 - Read `paired_summary.noise_check` before the lift. `smallest_achievable_p` is 2/2^k for k moved
   cases, so fewer than 6 cases moving the same way can never reach p ≤ 0.05

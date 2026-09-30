@@ -400,7 +400,7 @@ The JSON report carries `counts`, `taxonomy`, `findings`, `recommendations`, `re
 
 ### Eval health
 
-`eval_health` is a view over the audit's findings and readiness blockers, not a second copy of them (`findings.eval_health`). Each finding kind belongs to at most one mark ([table below](#finding-kinds)). A mark with a finding of its kinds is `concern`; a mark whose evidence was observed with no such finding is `ok`; any other mark is `unavailable`, which is not the same as `ok`. Mark 1 is observed when at least one case records a `source`, mark 2 when the known-answer check graded a reference or a null answer, and marks 3–5 when `--runs` points at a complete benchmark. The block is `{"marks": [...], "counts": {"ok": n, "concern": n, "unavailable": n}}`, and each mark is `{mark, id, question, status, finding_kinds, notes?}`. Real output on `examples/demo-skill` with six runs per arm and the stub judge's verdicts (2026-09-30), marks 1 and 4, reformatted:
+`eval_health` is a view over the audit's findings and readiness blockers, not a second copy of them (`findings.eval_health`). Each finding kind counts against at most one mark; the mapping is the five-marks table in [`comparing-with-claude-api-evals.md`](comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval). A mark with a finding of its kinds is `concern`; a mark whose evidence was observed with no such finding is `ok`; any other mark is `unavailable`, which is not the same as `ok`. Mark 1 is observed when at least one case records a `source`, mark 2 when the known-answer check graded a reference or a null answer, and marks 3–5 when `--runs` points at a complete benchmark. The block is `{"marks": [...], "counts": {"ok": n, "concern": n, "unavailable": n}}`, and each mark is `{mark, id, question, status, finding_kinds, notes?}`. Real output on `examples/demo-skill` with six runs per arm and the stub judge's verdicts (2026-09-30), marks 1 and 4, reformatted:
 
 ```json
 {"mark": 1, "id": "realistic-cases",
@@ -414,7 +414,7 @@ The JSON report carries `counts`, `taxonomy`, `findings`, `recommendations`, `re
  "status": "concern", "finding_kinds": ["underpowered-eval"]}
 ```
 
-What each mark asks and why the harness uses these five is [`comparing-with-claude-api-evals.md`](comparing-with-claude-api-evals.md).
+What each mark asks, and why the harness uses these five rather than the hillclimbing post's four, is [`comparing-with-claude-api-evals.md`](comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval).
 
 ### Gate it in CI
 
@@ -432,64 +432,64 @@ The systematic way to upgrade a suite is to drive those blockers to empty, repo 
 
 ### Finding kinds
 
-Every finding the harness emits has a registered kind in `findings.FindingKind`, which fixes what it is about, its default severity, and the eval-health mark it counts against (marks are numbered as in [Eval health](#eval-health)). This table is that registry; `--fail-on` accepts any kind in it.
+Every finding the harness emits has a registered kind in `findings.FindingKind`, which fixes what it is about, its default severity, and the eval-health mark it counts against ([mapping](comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval)). This table lists every kind; `--fail-on` accepts any of them.
 
-| Kind | About | Default severity | Mark | Raised by |
-|---|---|---|---:|---|
-| `missing-domain-taxonomy` | eval | recommended | — | `audit-manifest` |
-| `missing-difficulty-taxonomy` | eval | recommended | — | `audit-manifest` |
-| `missing-success-goals` | eval | recommended | — | `audit-manifest` |
-| `missing-positive-evals` | eval | required | 1 | `audit-manifest` |
-| `missing-negative-evals` | eval | required | 1 | `audit-manifest` |
-| `missing-adversarial-evals` | eval | recommended | 1 | `audit-manifest` |
-| `no-adversarial-cases` | eval | required | 1 | readiness blocker |
-| `missing-hidden-splits` | eval | required | — | `audit-manifest` |
-| `missing-trigger-no-trigger-cases` | eval | required | 1 | `audit-manifest` |
-| `case-source-unrecorded` | eval | recommended | 1 | `audit-manifest` |
-| `synthesized-cases-only` | eval | recommended | 1 | `audit-manifest` |
-| `missing-ablation-plan` | eval | recommended | — | `audit-manifest` |
-| `ablation-instruction-simulated` | eval | recommended | — | `audit-manifest`; readiness blocker |
-| `ablation-no-expected-regression` | eval | recommended | — | `audit-manifest` |
-| `ablation-dangling-reference` | eval | recommended | — | `audit-manifest` |
-| `ablation-unknown-case` | eval | recommended | — | `audit-manifest` |
-| `ablation-unknown-assertion` | eval | recommended | — | `audit-manifest` |
-| `ablation-high-spend-no-structured-regression` | eval | recommended | — | `audit-manifest --runs` (cost) |
-| `prompt-assertion-leakage` | eval | recommended | 5 | `audit-manifest` |
-| `leak-saturated-case` | eval | required | 5 | readiness blocker |
-| `held-out-rubric-leak` | eval | required | 5 | `audit-manifest` |
-| `weak-oracle-only` | grader | recommended | 2 | `audit-manifest` |
-| `non-discriminating-assertions` | grader | recommended | 2 | `audit-manifest --runs` |
-| `judge-is-model-under-test` | grader | required | 2 | `audit-manifest` |
-| `reference-answer-fails` | grader | required | 2 | `audit-manifest` (known-answer check) |
-| `null-answer-passes` | grader | required | 2 | `audit-manifest` (known-answer check) |
-| `high-cost-judge-only-case` | grader | recommended | — | `audit-manifest --runs` (cost) |
-| `order-flip-inconsistent` | grader | recommended | 2 | `judge-robustness` |
-| `passes-empty-control` | grader | required | 2 | `judge-robustness` |
-| `passes-master-key-control` | grader | required | 2 | `judge-robustness` |
-| `judge-call-incomplete` | run | required | — | `judge-robustness` |
-| `benchmark-incomplete` | run | required | — | readiness blocker (with `--runs`) |
-| `floor-eval` | eval | recommended | 3 | `audit-manifest --runs`; readiness blocker |
-| `saturated-eval` | eval | recommended | 3 | `audit-manifest --runs` |
-| `base-saturated-case` | eval | recommended | 3 | readiness blocker (with `--runs`) |
-| `suite-headroom-exhausted` | eval | recommended | 3 | `audit-manifest --runs` |
-| `no-lift-eval` | skill | recommended | — | `audit-manifest --runs` |
-| `flaky-eval` | eval | required | 4 | `audit-manifest --runs` |
-| `underpowered-eval` | eval | recommended | 4 | `audit-manifest --runs` |
-| `arm-conditions-differ` | run | required | 5 | `audit-manifest --runs` |
-| `served-model-mismatch` | run | required | 5 | `audit-manifest --runs` |
-| `served-model-mixed` | run | recommended | 5 | `audit-manifest --runs` |
-| `expensive-saturated-case` | eval | recommended | — | `audit-manifest --runs` (cost) |
-| `expensive-no-lift-case` | skill | recommended | — | `audit-manifest --runs` (cost) |
-| `spend-on-non-discriminating-case` | eval | recommended | — | `cost-summary --benchmark` |
-| `high-footprint-low-lift-skill` | skill | recommended | — | `audit-manifest --runs` (cost) |
-| `missing-skill-file` | skill | required | — | `profile-skill` |
-| `skill-too-large` | skill | recommended | — | `profile-skill` |
-| `many-references` | skill | recommended | — | `profile-skill` |
-| `references-too-large` | skill | recommended | — | `profile-skill` |
-| `many-modules` | skill | recommended | — | `profile-skill` |
-| `canary-hit` | eval | required | — | `contamination` |
-| `output-answer-overlap` | eval | recommended | — | `contamination` |
-| `released-before-cutoff` | eval | recommended | — | `contamination` |
+| Kind | About | Default severity | Raised by |
+|---|---|---|---|
+| `missing-domain-taxonomy` | eval | recommended | `audit-manifest` |
+| `missing-difficulty-taxonomy` | eval | recommended | `audit-manifest` |
+| `missing-success-goals` | eval | recommended | `audit-manifest` |
+| `missing-positive-evals` | eval | required | `audit-manifest` |
+| `missing-negative-evals` | eval | required | `audit-manifest` |
+| `missing-adversarial-evals` | eval | recommended | `audit-manifest` |
+| `no-adversarial-cases` | eval | required | readiness blocker |
+| `missing-hidden-splits` | eval | required | `audit-manifest` |
+| `missing-trigger-no-trigger-cases` | eval | required | `audit-manifest` |
+| `case-source-unrecorded` | eval | recommended | `audit-manifest` |
+| `synthesized-cases-only` | eval | recommended | `audit-manifest` |
+| `missing-ablation-plan` | eval | recommended | `audit-manifest` |
+| `ablation-instruction-simulated` | eval | recommended | `audit-manifest`; readiness blocker |
+| `ablation-no-expected-regression` | eval | recommended | `audit-manifest` |
+| `ablation-dangling-reference` | eval | recommended | `audit-manifest` |
+| `ablation-unknown-case` | eval | recommended | `audit-manifest` |
+| `ablation-unknown-assertion` | eval | recommended | `audit-manifest` |
+| `ablation-high-spend-no-structured-regression` | eval | recommended | `audit-manifest --runs` (cost) |
+| `prompt-assertion-leakage` | eval | recommended | `audit-manifest` |
+| `leak-saturated-case` | eval | required | readiness blocker |
+| `held-out-rubric-leak` | eval | required | `audit-manifest` |
+| `weak-oracle-only` | grader | recommended | `audit-manifest` |
+| `non-discriminating-assertions` | grader | recommended | `audit-manifest --runs` |
+| `judge-is-model-under-test` | grader | required | `audit-manifest` |
+| `reference-answer-fails` | grader | required | `audit-manifest` (known-answer check) |
+| `null-answer-passes` | grader | required | `audit-manifest` (known-answer check) |
+| `high-cost-judge-only-case` | grader | recommended | `audit-manifest --runs` (cost) |
+| `order-flip-inconsistent` | grader | recommended | `judge-robustness` |
+| `passes-empty-control` | grader | required | `judge-robustness` |
+| `passes-master-key-control` | grader | required | `judge-robustness` |
+| `judge-call-incomplete` | run | required | `judge-robustness` |
+| `benchmark-incomplete` | run | required | readiness blocker (with `--runs`) |
+| `floor-eval` | eval | recommended | `audit-manifest --runs`; readiness blocker |
+| `saturated-eval` | eval | recommended | `audit-manifest --runs` |
+| `base-saturated-case` | eval | recommended | readiness blocker (with `--runs`) |
+| `suite-headroom-exhausted` | eval | recommended | `audit-manifest --runs` |
+| `no-lift-eval` | skill | recommended | `audit-manifest --runs` |
+| `flaky-eval` | eval | required | `audit-manifest --runs` |
+| `underpowered-eval` | eval | recommended | `audit-manifest --runs` |
+| `arm-conditions-differ` | run | required | `audit-manifest --runs` |
+| `served-model-mismatch` | run | required | `audit-manifest --runs` |
+| `served-model-mixed` | run | recommended | `audit-manifest --runs` |
+| `expensive-saturated-case` | eval | recommended | `audit-manifest --runs` (cost) |
+| `expensive-no-lift-case` | skill | recommended | `audit-manifest --runs` (cost) |
+| `spend-on-non-discriminating-case` | eval | recommended | `cost-summary --benchmark` |
+| `high-footprint-low-lift-skill` | skill | recommended | `audit-manifest --runs` (cost) |
+| `missing-skill-file` | skill | required | `profile-skill` |
+| `skill-too-large` | skill | recommended | `profile-skill` |
+| `many-references` | skill | recommended | `profile-skill` |
+| `references-too-large` | skill | recommended | `profile-skill` |
+| `many-modules` | skill | recommended | `profile-skill` |
+| `canary-hit` | eval | required | `contamination` |
+| `output-answer-overlap` | eval | recommended | `contamination` |
+| `released-before-cutoff` | eval | recommended | `contamination` |
 
 The mark 3–5 kinds from `audit-manifest --runs` that do not come from case flags (`suite-headroom-exhausted`, `underpowered-eval`, `arm-conditions-differ`, `served-model-mismatch`, `served-model-mixed`) are raised only when that benchmark is complete. Per-case benchmark flags are the closed set `findings.CaseFlag`, whose values are the exact strings reports carry; `flaky repeated pass rates`, `critical-failure` and `below-reference-floor` add `: <detail>`.
 

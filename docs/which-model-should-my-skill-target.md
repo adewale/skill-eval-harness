@@ -120,7 +120,9 @@ the weakest tier you support sets the bound, and a skill's value is a property o
   because its base model needs the skill less, and that is not an inversion. The
   inversion to chase is a stronger tier scoring *lower* than a weaker one in the same
   arm: when that happens, the same post says, "ambiguous tasks or a miscalibrated
-  grader often are hobbling performance," so open the cases before you rank.
+  grader often are hobbling performance," so open the cases before you rank. This check
+  is a per-arm diagnostic, not one of the harness's eval-health marks
+  ([why](comparing-with-claude-api-evals.md#five-marks-of-a-lift-eval)).
 - **Pin effort before comparing tiers.** Unless you pass `--effort` to `run-claude`,
   `run-codex`, or `run-agent`, each tier runs at its CLI's default effort, and those
   defaults differ by model and CLI version: per the claude-api skill, Claude Opus

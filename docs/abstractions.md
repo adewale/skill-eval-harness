@@ -305,12 +305,19 @@ and the review note cannot disagree.
 per-case benchmark flags; each value is the exact wire text (three carry a `": detail"` suffix), and
 consumers compare members instead of matching substrings. `FindingKind` registers every finding
 kind the harness emits, from `audit-manifest`, readiness, `profile-skill`, `cost-summary`,
-`contamination` and `judge-robustness`; each kind declares its `Subject` (`skill`, `eval`, `grader`, `run`), its default
-`Severity` and the eval-health mark it is evidence against, if any. `Finding.as_dict` keeps the
-historical `{kind, severity, message, evidence}` shape. `eval_health` is a view over findings, not
-a second copy of them: it rates the five marks (realistic cases, grader correct on known answers,
-baseline headroom, noise below the smallest lift worth acting on, arms that differ only in the
-skill) as `ok`, `concern` or `unavailable`.
+`contamination` and `judge-robustness`; each kind declares its `Subject` (`skill`, `eval`,
+`grader`, `run`), its default `Severity` and the `EvalMark` it is evidence against, if any.
+`Finding.as_dict` keeps the historical `{kind, severity, message, evidence}` shape.
+
+`eval_health` is a view over findings, not a second copy of them. It takes the findings and a
+per-mark `observed` flag, and rates each of the five marks
+([defined in the glossary](vocabulary.md#eval-health)): a mark with a finding of its kinds is
+`concern`, an observed mark with none is `ok`, and the rest are `unavailable`, which is not `ok`.
+`audit_manifest_report` supplies the observations: a recorded case `source` for mark 1, a graded
+reference or null answer from `known_answer_check` for mark 2, and a complete benchmark for marks
+3–5, whose run-measured findings (`run_measured_findings`) are computed only then. It feeds the
+audit findings and the readiness blocker findings through the same view, so a blocker such as
+`floor-eval` counts against mark 3 like any other finding of that kind.
 
 `gate_policy.py` decides what fails a command. A `GatePolicy` names finding kinds and severities,
 and `decide` fails on any matching finding and, when told the evidence is incomplete, fails closed.
@@ -318,8 +325,9 @@ Four presets carry the older flags' meaning: `READINESS` (`blockers`), `SELF_JUD
 (`strict-judge`), `CONTAMINATION` and `JUDGE_ROBUSTNESS`. `audit-manifest --fail-on-blockers` and
 `--strict-judge` evaluate through the first two; `contamination --fail-on-contamination` and
 `judge-robustness --fail-on-findings` still apply their own checks, which fail on exactly the
-kinds of the last two presets (the robustness check also fails on an incomplete report). `parse_fail_on` reads the kinds, severities and preset names a user
-passes to `audit-manifest --fail-on` and rejects an unknown token. Grading options such as
+kinds of the last two presets (the robustness check also fails on an incomplete report).
+`parse_fail_on` reads the kinds, severities and preset names a user passes to
+`audit-manifest --fail-on` and rejects an unknown token. Grading options such as
 `--strict` are not gates: they change how verdicts are scored, not whether a command fails.
 
 ## Grade result row

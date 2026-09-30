@@ -273,8 +273,8 @@ and the `/claude-api build-eval` and `/claude-api hillclimb` guides in the claud
 - [x] 5.3 Floor vs ceiling
 - [x] 5.4 One human-judgement store
 - [ ] 5.5 Judge prompt guards ([#98](https://github.com/adewale/skill-eval-harness/issues/98))
-- [ ] 5.6 Eval-health scorecard over the four marks
-- [ ] 5.7 Typed findings and one gate vocabulary
+- [x] 5.6 Eval-health scorecard over five marks (`eval_health` in `audit-manifest`)
+- [x] 5.7 Typed findings and one gate vocabulary (`audit-manifest --fail-on` and presets)
 - [ ] 5.8 Effort as a prepared-task axis (`prepare --efforts`)
 - [ ] 5.9 Random stratified split helper and a holdback-read ledger
 - [ ] 5.10 Model-free keep/revert referee
@@ -407,7 +407,7 @@ reading guide, honesty rules, boundary — is written down in [`docs/README.md`]
       [`docs/comparing-with-claude-api-evals.md`](docs/comparing-with-claude-api-evals.md):
       what each command does, where each is ahead, why the noise floor and the test set
       mean different things in each, and which harness output answers each guide step.
-      Runnable offline on `examples/demo-skill` (real 2026-09-29 `noise_check` output:
+      Runnable offline on `examples/demo-skill` (real `noise_check` output, refreshed 2026-09-30:
       2 cases at 4 repeats, every pair moved, `too-few-cases-moved`).
 - [ ] **"Did my skill change HOW the model works, not just whether it passes?"** — the
       machinery shipped with the trace-depth slice: Claude answer runs now stream real
