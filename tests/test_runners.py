@@ -29,7 +29,7 @@ from helpers import (
 )
 from helpers import (
     make_eval_repo,
-    stub_claude,
+    stub_claude_stream,
 )
 from helpers import (
     write_demo_manifest as write_manifest,
@@ -44,6 +44,16 @@ import skill_benchmark as sb
 import trace_contracts as tc
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Fake-codex source that prints one protocol-valid `codex exec --json` turn:
+# the agent message, then the turn.completed terminator carrying usage.
+FAKE_CODEX_TURN = (
+    "for record in ({'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},\n"
+    "               {'type': 'item.completed', 'item': {'id': 'item_0', 'type': 'agent_message',\n"
+    "                                                   'text': 'token from codex'}},\n"
+    "               {'type': 'turn.completed', 'usage': {'input_tokens': 4, 'output_tokens': 6}}):\n"
+    "    print(json.dumps(record))\n"
+)
 
 
 def make_tasks(root: Path) -> list[dict]:
@@ -714,14 +724,13 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 "import json, pathlib, sys\n_ = sys.stdin.read()\n"
                 "assert '--output-last-message' in sys.argv\n"
                 "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token from codex')\n"
-                "print(json.dumps({'role': 'assistant', 'content': 'trace from codex',"
-                " 'usage': {'input_tokens': 4, 'output_tokens': 6}}))\n",
+                + FAKE_CODEX_TURN,
                 encoding="utf-8")
             codex_runs = root / "codex-runs"
             sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(codex_runs),
                                          codex_cmd=f"{sys.executable} {fake_codex}", timeout=30))
 
-            claude_bin = stub_claude(root / "claude_stub.py", answer="token from claude")
+            claude_bin = stub_claude_stream(root / "claude_stub.py", answer="token from claude")
             claude_runs = root / "claude-runs"
             sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(claude_runs),
                                              model="claude-haiku-4-5-20251001", claude_bin=str(claude_bin), timeout=30))
@@ -740,10 +749,13 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertEqual(claude_meta["provider"], "claude")
             # Telemetry is an explicit block carrying the real normalized values,
             # not merely a present key — a regression dropping the numbers must fail.
-            self.assertEqual(codex_meta["usage_normalized"]["total_tokens"], 10)   # 4+6 from the trace
+            self.assertEqual(codex_meta["usage_normalized"]["total_tokens"], 10)   # 4+6 from turn.completed
             self.assertEqual(codex_meta["usage_normalized"]["source"], "trace_normalized")
-            self.assertEqual(claude_meta["usage_normalized"]["total_tokens"], 33)  # 11+22 from the envelope
+            self.assertEqual(claude_meta["usage_normalized"]["total_tokens"], 33)  # 11+22 from the result event
             self.assertEqual(claude_meta["usage_normalized"]["source"], "provider_reported")
+            # The one report reader agrees with the persisted blocks.
+            self.assertEqual(sb.run_cost_facts(codex_meta)["total_tokens"], 10)
+            self.assertEqual(sb.run_cost_facts(claude_meta)["total_tokens"], 33)
             self.assertIn("source", codex_meta["cost_normalized"])
             self.assertIn("source", claude_meta["cost_normalized"])
             # The whole-writer consolidation means both providers land on the same
@@ -767,7 +779,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 "assert not codex_home.is_relative_to(pathlib.Path.cwd())\n"
                 "assert not (pathlib.Path.cwd() / '.codex' / 'auth.json').exists()\n"
                 "pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token from codex')\n"
-                "print(json.dumps({'role': 'assistant', 'content': 'trace from codex'}))\n",
+                + FAKE_CODEX_TURN,
                 encoding="utf-8")
             codex_runs = root / "agent-codex"
             sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(codex_runs), model="gpt-mini",
@@ -775,7 +787,7 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertIn("token from codex", (codex_runs / run_dir / "output.md").read_text(encoding="utf-8"))
             self.assertEqual(json.loads((codex_runs / run_dir / "metadata.json").read_text(encoding="utf-8"))["model"], "gpt-mini")
 
-            claude_bin = stub_claude(root / "claude_stub.py", answer="token from claude")
+            claude_bin = stub_claude_stream(root / "claude_stub.py", answer="token from claude")
             claude_runs = root / "agent-claude"
             sb.run_agent(argparse.Namespace(agent="claude", tasks=str(tasks), runs=str(claude_runs), model="claude-haiku-4-5-20251001",
                                             codex_cmd="codex exec --json", claude_bin=str(claude_bin), timeout=30))

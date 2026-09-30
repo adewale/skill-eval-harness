@@ -507,7 +507,8 @@ def stub_claude(
     probe_path: Path | None = None,
 ) -> Path:
     """A fake `claude` executable: reads the prompt on stdin and emits the
-    `claude -p --output-format json` envelope. With probe_path it also records
+    `claude -p --output-format json` envelope, and refuses a stream-json request
+    (use stub_claude_stream for the answer path). With probe_path it also records
     its argv and the listing of any --add-dir it was given (the argv-capture
     variant the tool-using-judge tests need)."""
     probe_snippet = ""
@@ -525,6 +526,9 @@ open({json.dumps(str(probe_path))}, "w").write(json.dumps(probe))
 import sys, json
 _ = sys.stdin.read()
 {probe_snippet}
+if "stream-json" in sys.argv:
+    sys.stdout.write("envelope stub invoked with --output-format stream-json")
+    sys.exit(1)
 env = {{"type":"result","result":{json.dumps(answer)},
        "total_cost_usd":{cost},
        "usage":{{"input_tokens":{in_tok},"output_tokens":{out_tok},
