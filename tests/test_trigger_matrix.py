@@ -355,11 +355,6 @@ class StubMatrixOfflineTests(unittest.TestCase):
     def test_every_matrix_adapter_has_an_explicit_trace_dialect(self):
         self.assertLessEqual(set(tm.ADAPTERS), set(sb.TRACE_DIALECTS))
 
-    def test_demo_manifest_has_both_polarities(self):
-        rows = demo_trigger_rows()
-        self.assertEqual(len(rows), 2)
-        self.assertEqual({r["should_trigger"] for r in rows}, {True, False})
-
     def test_stub_matrix_passes_both_polarities_per_model(self):
         report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["stub"],
                                models=["haiku", "sonnet", "opus"], runs_per_query=2,

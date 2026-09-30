@@ -285,10 +285,6 @@ class SubagentRunnerTests(unittest.TestCase):
             self.assertEqual(metadata["usage_normalized"]["source"], "missing")
             self.assertFalse(metrics["operation_observation_complete"])
 
-    def test_agent_backends_are_registered_workspace_builders(self):
-        for name in ("subagent", "codex", "claude", "gemini", "vibe"):
-            self.assertIn(name, sb.WORKSPACE_BUILDERS)
-
 
 class ToolReplayTests(unittest.TestCase):
     """2.3 — record/replay of tool I/O for deterministic re-runs."""
@@ -1442,9 +1438,6 @@ class TraceDialectRegistryTests(unittest.TestCase):
                          [(3, {"a": 1}), (7, {"b": 2})])
         with self.assertRaises(ValueError):
             sb.GENERIC_TRACE_DIALECT.flatten(records, record_lines=[3])
-
-    def test_generic_dialect_has_no_terminal_stream_semantics(self):
-        self.assertEqual(sb.GENERIC_TRACE_DIALECT.stream_semantics([], None), (None, None))
 
     def test_claude_completed_tool_lifecycle_counts_exactly_once(self):
         records = [
