@@ -372,39 +372,6 @@ def result_row(
     return row
 
 
-def judge_task(
-    case_id: str = "c",
-    variant: str = "with_skill",
-    run_number: int = 1,
-    *,
-    assertion: dict[str, Any] | None = None,
-    prompt: str = "judge it",
-    output_path: str = "",
-    **over: Any,
-) -> dict[str, Any]:
-    """One judge task row shaped like collect_judge_tasks/grade_case_variant emit."""
-    assertion = assertion or {"name": "j", "type": "judge", "prompt": "Is it good?"}
-    task = {
-        "judge_task_id": f"{case_id}::{variant}::run-{run_number}::{assertion.get('name', 'j')}",
-        "case_id": case_id,
-        "variant": variant,
-        "run_number": run_number,
-        "prompt": prompt,
-        "output_path": output_path,
-        "assertion": assertion,
-    }
-    task.update(over)
-    return task
-
-
-def file_judge_cmd(tmp: Path, verdict: dict[str, Any]) -> str:
-    """A judge command that ignores its input and emits a fixed verdict —
-    deterministic, offline, no model."""
-    verdict_path = tmp / "verdict.json"
-    verdict_path.write_text(json.dumps(verdict), encoding="utf-8")
-    return f"cat {verdict_path}"
-
-
 def claude_stream_records(
     *,
     answer: str = "STREAM ANSWER token-XYZ",
