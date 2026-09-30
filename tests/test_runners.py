@@ -6,7 +6,9 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
+import contextlib
 import errno
+import io
 import json
 import os
 import shutil
@@ -1102,6 +1104,27 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                     os.kill(child_pid, 9)
                 except ProcessLookupError:
                     pass
+
+    def test_runner_commands_reject_missing_or_empty_tasks_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            empty = root / "empty.jsonl"
+            empty.write_text("\n", encoding="utf-8")
+            files = {"missing": (root / "missing.jsonl", "tasks file not found"),
+                     "empty": (empty, "tasks file has no prepared tasks")}
+            commands = (["run-agent", "--agent", "codex"], ["run-codex"], ["run-claude"], ["run-subagent"])
+            for command in commands:
+                for kind, (tasks, message) in files.items():
+                    argv = ["skill-benchmark", *command, "--tasks", str(tasks), "--runs", str(root / "runs")]
+                    stderr = io.StringIO()
+                    with self.subTest(command=command[0], tasks=kind), \
+                         mock.patch.object(sys, "argv", argv), \
+                         contextlib.redirect_stderr(stderr), \
+                         self.assertRaises(SystemExit) as raised:
+                        sb.main()
+                    self.assertEqual(raised.exception.code, 1)
+                    self.assertEqual(stderr.getvalue(), f"FAIL: {message}: {tasks}\n")
+            self.assertFalse((root / "runs").exists())
 
     def test_run_agent_writes_failure_artifact_when_native_command_is_missing(self):
         with tempfile.TemporaryDirectory() as td:

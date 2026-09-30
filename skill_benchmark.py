@@ -5276,6 +5276,17 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return [strict_json_loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def load_prepared_tasks(path: Path) -> list[dict[str, Any]]:
+    """The --tasks rows an answer-run command executes; a missing or empty file
+    is a usage error, not an empty run."""
+    if not path.is_file():
+        die(f"tasks file not found: {path}")
+    tasks = load_jsonl(path)
+    if not tasks:
+        die(f"tasks file has no prepared tasks: {path}")
+    return tasks
+
+
 def durable_jetty_result_slots(
     payloads: list[dict[str, Any]], journal: JettyAttemptJournal,
 ) -> list[dict[str, Any] | None]:
@@ -10535,7 +10546,7 @@ def run_agent(args: argparse.Namespace) -> int:
     backend = registered_agent_backend(agent)
     provider_options = binding_for(agent, "answer").option_values(
         surface_option_values(args, "answer"))
-    return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), backend,
+    return run_agent_tasks(load_prepared_tasks(Path(args.tasks)), Path(args.runs), backend,
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
                            effort=getattr(args, "effort", None),
                            **provider_options)
@@ -10551,7 +10562,7 @@ def agent_capabilities_command(args: argparse.Namespace) -> int:
 
 
 def run_codex(args: argparse.Namespace) -> int:
-    return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("codex"),
+    return run_agent_tasks(load_prepared_tasks(Path(args.tasks)), Path(args.runs), registered_agent_backend("codex"),
                            timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
                            effort=getattr(args, "effort", None),
                            codex_cmd=getattr(args, "codex_cmd", None) or CODEX_ANSWER_DEFAULT_CMD)
@@ -10750,7 +10761,7 @@ def claude_run_metrics(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_claude(args: argparse.Namespace) -> int:
-    return run_agent_tasks(load_jsonl(Path(args.tasks)), Path(args.runs), registered_agent_backend("claude"),
+    return run_agent_tasks(load_prepared_tasks(Path(args.tasks)), Path(args.runs), registered_agent_backend("claude"),
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
                            effort=getattr(args, "effort", None),
                            claude_bin=getattr(args, "claude_bin", None) or "claude")
@@ -13345,7 +13356,7 @@ def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S)
 
 
 def run_subagent(args: argparse.Namespace) -> int:
-    tasks = load_jsonl(Path(args.tasks))
+    tasks = load_prepared_tasks(Path(args.tasks))
     runs = Path(args.runs)
     agent_cmd = getattr(args, "agent_cmd", None)
     if agent_cmd:
