@@ -40,7 +40,6 @@ from skill_benchmark import (
     load_manifest_source,
     materialize_trigger_ablation,
     mount_skill_tree,
-    pi_stream_terminal_error,
     repo_root_for_manifest,
     safe_trace_label,
     skill_tree_hash,
@@ -151,11 +150,6 @@ def pi_trigger_protocol(
     }
 
 
-def pi_terminal_error(raw_text: str) -> str | None:
-    """Compatibility name for the shared Pi stream terminal-error parser."""
-    return pi_stream_terminal_error(raw_text)
-
-
 def pi_invocation_outcome(run: InvocationOutcome) -> InvocationOutcome:
     """Attach Pi's one parsed provider stream to its classified process state."""
     if not isinstance(run, InvocationOutcome):
@@ -164,12 +158,6 @@ def pi_invocation_outcome(run: InvocationOutcome) -> InvocationOutcome:
     if stream.terminal_error or (run.observation_complete and stream.protocol_error):
         return run.with_provider_error(stream.failure_error, payload=stream)
     return run.with_provider_payload(stream)
-
-
-def pi_invoke_result(run: dict[str, Any] | InvocationOutcome) -> dict[str, Any]:
-    """Compatibility dictionary boundary for callers not yet using typed outcomes."""
-    outcome = run if isinstance(run, InvocationOutcome) else InvocationOutcome.from_legacy_dict("pi", run)
-    return pi_invocation_outcome(outcome).as_legacy_dict()
 
 
 def pi_argv(query: str, model: str | None = None) -> list[str]:
@@ -298,18 +286,6 @@ def observe_query(manifest_path: Path, query: str, should_trigger: bool, timeout
             write_trigger_trace_artifacts(
                 trace_dir, redacted.stdout, observation.as_row(), artifact_stream)
         return observation
-
-
-def run_query(manifest_path: Path, query: str, should_trigger: bool, timeout: int,
-              model: str | None, trace_dir: Path | None = None,
-              ablation: str | None = None,
-              identity: TriggerRepetitionIdentity | None = None,
-              protocol_sha256: str | None = None) -> dict[str, Any]:
-    """Compatibility wire adapter for one trigger result row."""
-    return observe_query(
-        manifest_path, query, should_trigger, timeout, model, trace_dir,
-        ablation, identity, protocol_sha256,
-    ).as_row()
 
 
 def trigger_query_from_case(case: dict[str, Any]) -> str:

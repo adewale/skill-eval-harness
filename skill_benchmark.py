@@ -10578,17 +10578,6 @@ def run_codex(args: argparse.Namespace) -> int:
 # thing every other adapter leaves the caller to reconstruct out of band.
 # --------------------------------------------------------------------------- #
 
-# The Claude envelope's normalized keys, aliased through the ONE table above.
-# (`cache_creation_tokens` is Claude's historical metrics.json field name for
-# what USAGE_ALIASES normalizes as cache_write_tokens.)
-CLAUDE_USAGE_KEYS = {
-    "input_tokens": USAGE_ALIASES["input_tokens"],
-    "output_tokens": USAGE_ALIASES["output_tokens"],
-    "cache_read_tokens": USAGE_ALIASES["cache_read_tokens"],
-    "cache_creation_tokens": USAGE_ALIASES["cache_write_tokens"],
-}
-
-
 def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     """Parse `claude -p` output in either output format.
 

@@ -770,11 +770,6 @@ def binding_for(name: str, surface: BackendSurface) -> SurfaceBinding:
     return binding
 
 
-def surface_names(surface: BackendSurface) -> tuple[str, ...]:
-    return tuple(name for name, registration in BACKENDS.items()
-                 if getattr(registration, surface) is not None)
-
-
 def surface_implementations(
     surface: BackendSurface, *, instantiate: bool = False,
     registrations: Mapping[str, BackendRegistration] | None = None,
@@ -935,10 +930,4 @@ SMOKE_TARGETS = MappingProxyType({
     name: registration.smoke
     for name, registration in BACKENDS.items()
     if isinstance(registration.smoke, SmokeTarget)
-})
-
-DEDICATED_SMOKE_TARGETS = MappingProxyType({
-    name: registration.smoke
-    for name, registration in BACKENDS.items()
-    if isinstance(registration.smoke, DedicatedSmokeTarget)
 })

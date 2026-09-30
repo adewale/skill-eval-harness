@@ -788,19 +788,7 @@ def adapter_instance(
         "max_turns": max_turns,
         **dict(backend_options or {}),
     }
-    binding = binding_for(name, "trigger")
-    adapter_cls = ADAPTERS[name]
-    registered_cls = binding.implementation.resolve()
-    # Preserve the established replacement seam: tests and integrations may
-    # substitute a zero-argument adapter. Provider CLI options describe only
-    # the implementation registered by the backend row.
-    options = binding.option_values(values) if adapter_cls is registered_cls else {}
-    return adapter_cls(**options)
-
-
-def matrix_capabilities() -> dict[str, Any]:
-    """Capability rows for exactly the agents accepted by this command."""
-    return {name: require_agent_capabilities(name) for name in sorted(ADAPTERS)}
+    return ADAPTERS[name](**binding_for(name, "trigger").option_values(values))
 
 
 def trigger_tree_for_manifest(repo_root: Path, manifest: dict[str, Any], work_dir: Path, ablation: str | None) -> tuple[Path, str, dict[str, Any] | None]:
@@ -838,15 +826,6 @@ def matrix_failure_observation(
         metadata=metadata,
         identity=identity,
     )
-
-
-def matrix_failure_row(agent: str, model: str | None, query: str, should_trigger: bool,
-                       exc: BaseException, metadata: dict[str, Any] | None = None,
-                       identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
-    """Compatibility wire adapter; matrix aggregation retains the typed value."""
-    return matrix_failure_observation(
-        agent, model, query, should_trigger, exc, metadata, identity,
-    ).as_row()
 
 
 def observe_cell_query(
@@ -968,17 +947,6 @@ def observe_cell_query(
             trace_error = f"{type(exc).__name__}: {exc}"
             observation = observation.with_metadata({"trace_error": trace_error})
     return observation
-
-
-def run_cell_query(adapter: AgentAdapter, tree_dir: Path, query: str, should_trigger: bool,
-                   model: str | None, timeout: int, trace_dir: Path | None = None,
-                   metadata: dict[str, Any] | None = None,
-                   identity: TriggerRepetitionIdentity | None = None) -> dict[str, Any]:
-    """Compatibility wire adapter for callers that need one persisted row."""
-    return observe_cell_query(
-        adapter, tree_dir, query, should_trigger, model, timeout, trace_dir,
-        metadata, identity,
-    ).as_row()
 
 
 def summarize_matrix(observations: list[TriggerObservation]) -> list[dict[str, Any]]:

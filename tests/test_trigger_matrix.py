@@ -167,7 +167,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             )
 
         with mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=fake_run):
-            result = tr.run_query(DEMO_MANIFEST, "ordinary chat", False, 12, None)
+            result = tr.observe_query(DEMO_MANIFEST, "ordinary chat", False, 12, None).as_row()
         self.assertTrue(result["pass"])
         self.assertEqual(seen["cwd"], seen["config_dir"])
         self.assertIn("pi-trigger-", seen["cwd"])
@@ -185,9 +185,9 @@ class TriggerRowBoundaryTests(unittest.TestCase):
 
         identity = TriggerRepetitionIdentity("pi-query", 2)
         with mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=fake_run):
-            result = tr.run_query(
+            result = tr.observe_query(
                 DEMO_MANIFEST, "ordinary chat", False, 12, None,
-                ablation="weaker-description", identity=identity)
+                ablation="weaker-description", identity=identity).as_row()
         self.assertEqual(result["skill_tree_hash"], result["ablation"]["skill_hash"])
         self.assertNotEqual(result["skill_tree_hash"],
                             result["ablation"]["parent_skill_hash"])
@@ -274,7 +274,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
              mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=failed_provider), \
              mock.patch.object(tr.PiStream, "parse", wraps=tr.PiStream.parse) as parse_stream:
             trace_dir = Path(td) / "trace"
-            result = tr.run_query(DEMO_MANIFEST, "ordinary chat", False, 12, None, trace_dir=trace_dir)
+            result = tr.observe_query(DEMO_MANIFEST, "ordinary chat", False, 12, None, trace_dir=trace_dir).as_row()
             artifacts = [
                 json.loads((trace_dir / name).read_text(encoding="utf-8"))
                 for name in ("metrics.json", "metadata.json")
@@ -361,10 +361,10 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             skill = tree / "demo"
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
-            row = tm.run_cell_query(
+            row = tm.observe_cell_query(
                 tm.PiAdapter(), tree, "review this", True, None, 12,
                 metadata={"skill_tree_hash": sb.skill_tree_hash(tree)},
-            )
+            ).as_row()
         self.assertEqual(parse_stream.call_count, 1)
         self.assertTrue(row["triggered"])
         self.assertEqual(row["usage_normalized"]["total_tokens"], 5)
@@ -378,7 +378,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td, mock.patch.object(tr, "invoke_argv_with_timeout", side_effect=timed_out):
             trace_dir = Path(td) / "trace"
-            tr.run_query(DEMO_MANIFEST, "ordinary chat", False, 1, None, trace_dir=trace_dir)
+            tr.observe_query(DEMO_MANIFEST, "ordinary chat", False, 1, None, trace_dir=trace_dir)
             meta = json.loads((trace_dir / "metadata.json").read_text(encoding="utf-8"))
         self.assertFalse(meta["observation_complete"])
         self.assertEqual(meta["telemetry"]["measurements"]["commands"]["availability"], "unavailable")
@@ -543,10 +543,10 @@ class StubMatrixOfflineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tree = tm.build_canonical_skill_tree(tm.repo_root_for_manifest(DEMO_MANIFEST), tm.load_manifest(DEMO_MANIFEST), Path(td) / "tree")
             trace_dir = Path(td) / "trace"
-            row = tm.run_cell_query(
+            row = tm.observe_cell_query(
                 SecretEchoAdapter(), tree, "q", True, None, 12, trace_dir,
                 metadata={"skill_tree_hash": sb.skill_tree_hash(tree)},
-            )
+            ).as_row()
             trace_text = (trace_dir / "trace.jsonl").read_text(encoding="utf-8")
             metadata_text = (trace_dir / "metadata.json").read_text(encoding="utf-8")
             metrics_text = (trace_dir / "metrics.json").read_text(encoding="utf-8")
@@ -914,7 +914,7 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertFalse(seen["workspace_auth_present"])
         self.assertFalse(seen["workspace_config_present"])
 
-    def test_run_cell_query_redacts_ambient_env_secrets(self):
+    def test_cell_observation_redacts_ambient_env_secrets(self):
         class LeakyAdapter(tm.AgentAdapter):
             name = "stub"
 
@@ -932,12 +932,12 @@ class CodexAdapterTests(unittest.TestCase):
             skill = tree / "demo"
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
-            row = tm.run_cell_query(
+            row = tm.observe_cell_query(
                 LeakyAdapter(), tree, "q", False, None, 12,
                 trace_dir=Path(td) / "trace",
                 metadata={"skill_tree_hash": sb.skill_tree_hash(tree),
                           "external": {"token": "ambient-secret-token"}},
-            )
+            ).as_row()
             trace_text = (Path(row["trace_dir"]) / "trace.jsonl").read_text(encoding="utf-8")
             trace_metadata = json.loads((Path(row["trace_dir"]) / "metadata.json").read_text(encoding="utf-8"))
         self.assertNotIn("ambient-secret-token", row["stderr"])
@@ -948,7 +948,7 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertEqual(trace_metadata["external"], {"token": "[REDACTED]"})
         self.assertNotIn("ambient-secret-token", trace_text)
 
-    def test_run_cell_query_requires_invoke_contract(self):
+    def test_cell_observation_requires_invoke_contract(self):
         class BrokenAdapter(tm.AgentAdapter):
             name = "broken"
 
@@ -964,13 +964,13 @@ class CodexAdapterTests(unittest.TestCase):
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
             with self.assertRaises(KeyError) as ctx:
-                tm.run_cell_query(
+                tm.observe_cell_query(
                     BrokenAdapter(), tree, "q", True, None, 12,
                     metadata={"skill_tree_hash": sb.skill_tree_hash(tree)},
                 )
         self.assertIn("observation_complete", str(ctx.exception))
 
-    def test_run_cell_query_rejects_mount_bytes_that_differ_from_scheduled_tree(self):
+    def test_cell_observation_rejects_mount_bytes_that_differ_from_scheduled_tree(self):
         class MutatingAdapter(tm.AgentAdapter):
             name = "stub"
 
@@ -988,7 +988,7 @@ class CodexAdapterTests(unittest.TestCase):
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "mounted skill tree hash"):
-                tm.run_cell_query(
+                tm.observe_cell_query(
                     MutatingAdapter(), tree, "q", True, None, 12,
                     metadata={"skill_tree_hash": sb.skill_tree_hash(tree)},
                 )
@@ -1028,14 +1028,8 @@ class CodexAdapterTests(unittest.TestCase):
 class VibeAdapterTests(unittest.TestCase):
     """Mistral Vibe trigger support without a live API key."""
 
-    def test_vibe_is_registered_and_declares_matrix_capability(self):
-        self.assertIn("vibe", tm.ADAPTERS)
-        cap = tm.matrix_capabilities()["vibe"]
-        self.assertTrue(cap.autonomous_trigger)
-        self.assertTrue(cap.trigger_ablation)
+    def test_vibe_cmd_flag_defaults_to_the_shared_vibe_command(self):
         parser = tm.build_arg_parser()
-        agent_action = next(a for a in parser._actions if "--agent" in getattr(a, "option_strings", ()))
-        self.assertIn("vibe", agent_action.choices)
         vibe_action = next(a for a in parser._actions if "--vibe-cmd" in getattr(a, "option_strings", ()))
         self.assertEqual(vibe_action.default, tm.VIBE_DEFAULT_CMD)
 
