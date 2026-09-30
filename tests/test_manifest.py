@@ -546,13 +546,17 @@ class MigrationTests(unittest.TestCase):
 class GuideHintTests(unittest.TestCase):
     """1.5 follow-on — the authoring guide's rules surface where checkable."""
 
-    def test_leakage_finding_points_at_the_guide(self):
+    def test_leakage_lint_names_the_echoed_value_and_points_at_the_guide(self):
+        # The one owner of the basic prompt/assertion leakage lint.
+        manifest = base_manifest()
         with tempfile.TemporaryDirectory() as td:
-            manifest = base_manifest()
-            manifest["cases"][0]["prompt"] = "Please mention alpha in your answer."
             path = write_manifest(Path(td), manifest)
+            quiet = sb.prompt_assertion_leakage_findings(manifest, path)   # "Do the task." echoes nothing
+            manifest["cases"][0]["prompt"] = "Please mention alpha in your answer."
             findings = sb.prompt_assertion_leakage_findings(manifest, path)
-        self.assertTrue(findings)
+        self.assertEqual(quiet, [])
+        self.assertEqual([(f["case_id"], f["assertion"], f["value"]) for f in findings],
+                         [("case-1", "has-alpha", "alpha")])
         self.assertIn("docs/authoring-evals.md", findings[0]["guide"])
 
     def test_fixture_recommendations_point_at_the_guide(self):

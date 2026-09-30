@@ -627,13 +627,6 @@ class SkillBenchmarkTests(unittest.TestCase):
             self.assertEqual(allowed["results"][0]["objective_pass_rate"], 1.0)
             self.assertIn("checked output", allowed["results"][0]["assertions"][0]["evidence"])
 
-    def test_prompt_assertion_leakage_lint_finds_literal_contains_values(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            manifest = self.make_manifest(root)
-            findings = sb.prompt_assertion_leakage_findings(sb.load_json(manifest), manifest)
-            self.assertTrue(any(f["case_id"] == "case-1" and f["value"] == "alpha" for f in findings))
-
     def test_judge_command_backend_writes_loadable_results(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
