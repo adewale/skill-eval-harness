@@ -78,6 +78,7 @@ from agent_capabilities import (
     surface_implementations,
     surface_option_values,
 )
+from completion_contracts import StopClass, StopObservation, claude_result_stop
 from run_pi_trigger_eval import (
     cases_from_manifest,
     eval_rows_from_args,
@@ -464,7 +465,7 @@ class ClaudeAdapter(AgentAdapter):
         # Hitting --max-turns exits nonzero, but the model HAD its window to
         # load the skill. The only legal non-zero completion uses this explicit transition.
         if (result.state is InvocationState.PROCESS_FAILED
-                and self._result_subtype(result.stdout) == "error_max_turns"):
+                and self._terminal_stop(result.stdout).stop_class is StopClass.TURN_LIMIT):
             result = result.as_agent_window_complete()
         if result.observation_complete:
             error = json_stream_protocol_error(result.stdout, self.name)
@@ -480,17 +481,18 @@ class ClaudeAdapter(AgentAdapter):
                     error = f"Claude JSON stream protocol error: {protocol_errors[0]}"
             if (error is None and isinstance(terminal, dict)
                     and terminal.get("is_error") is True
-                    and terminal.get("subtype") != "error_max_turns"):
+                    and claude_result_stop(terminal).stop_class is not StopClass.TURN_LIMIT):
                 error = "Claude terminal result reports an error"
             result = result.with_provider_error(error)
         return result
 
     @staticmethod
-    def _result_subtype(stdout: str) -> str | None:
-        for event in iter_json_objects(stdout):
-            if isinstance(event, dict) and event.get("type") == "result":
-                return event.get("subtype")
-        return None
+    def _terminal_stop(stdout: str) -> StopObservation:
+        # completion_contracts owns what a Claude result event means; the
+        # answer runner reads the same classification.
+        terminal = next((event for event in iter_json_objects(stdout)
+                         if isinstance(event, dict) and event.get("type") == "result"), None)
+        return claude_result_stop(terminal)
 
     def detect(self, invocation: InvocationOutcome, skill_names: list[str], copied: list[Path]) -> TriggerDetection:
         # Primary evidence: the Skill tool invoked with a mounted skill's name.
