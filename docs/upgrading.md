@@ -303,6 +303,13 @@ Python names still exist.
   Existing manifests are unaffected, but `validate` rejects an unknown `source`, both answer
   fields on one case, an inline `reference_answer` on a `holdout` or `holdback` case, and either
   field on a trigger case.
+- `benchmark` output gains `incomplete_reasons`, the root causes behind a `partial` availability. The
+  `benchmark-incomplete` readiness blocker names them in its message and evidence.
+- `contamination` output gains `coverage`, and `--fail-on-contamination` now fails when an answer
+  case arm has no saved output, as well as on a finding. A CI job that ran the gate before the runs
+  finished, or over a runs directory missing an arm, starts failing; point it at the complete run.
+- Paired edit comparison: `benchmark` with an `old_skill` arm selected (`--variant old_skill`
+  beside the two defaults) adds `paired_edit_summary`; without that arm the report is unchanged.
 - `aggregate` and `export-anthropic` accept `--strict` and `--embed-cmd`; pass them there too if
   your `benchmark` command uses them, or the numbers will differ.
 

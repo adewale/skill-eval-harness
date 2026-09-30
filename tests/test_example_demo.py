@@ -95,6 +95,11 @@ class DemoExampleTests(unittest.TestCase):
                 self.assertNotEqual(status[mark], "unavailable")
         # Two cases cannot move six the same way: the noise mark says so.
         self.assertEqual(status["noise-below-min-lift"], "concern")
+        # The partial audit says what is missing: the judge verdicts, not --runs.
+        noise_notes = next(mark["notes"] for mark in partial["eval_health"]["marks"]
+                           if mark["id"] == "noise-below-min-lift")
+        self.assertEqual(noise_notes, [
+            "the benchmark is incomplete: judge assertions have no verdicts; pass --judge-results"])
 
 
 class DemoJudgeTests(unittest.TestCase):

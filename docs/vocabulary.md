@@ -202,7 +202,7 @@ A case can stop discriminating at either extreme. The four entries below are dif
 
 **Noise check** — `paired_summary.noise_check` asks whether the eval can resolve the lift you care about. It sets `cases_moved` against the 6 moved units p ≤ 0.05 needs (see **Inference unit**), and the `noise_floor` (the interval's half-width) against the `headroom` left above `without_skill` and against `benchmark --min-lift` when given; its `verdict` is `no-data`, `too-few-cases-moved`, `unbounded`, `noise-exceeds-headroom`, `noise-exceeds-min-lift`, or `resolvable`. With incomplete pairing, both it and the interval move to `observed_noise_check` / `observed_interval`.
 
-**Contamination** — output-side evidence that a case was answered from memory rather than worked: the `contamination` command checks verbatim n-gram containment between output and answer key (`ngram_containment`), a per-case `canary` GUID tripwire that must never appear in an output, and a `released_at` vs `--model-cutoff` gate for cases older than the model's training data. Model-free; `--fail-on-contamination` gates CI.
+**Contamination** — output-side evidence that a case was answered from memory rather than worked: the `contamination` command checks verbatim n-gram containment between output and answer key (`ngram_containment`), a per-case `canary` GUID tripwire that must never appear in an output, and a `released_at` vs `--model-cutoff` gate for cases older than the model's training data. Model-free; `--fail-on-contamination` gates CI and fails on any answer arm it had no output to check.
 
 ## Eval health
 

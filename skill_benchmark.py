@@ -213,7 +213,7 @@ from manifest_contracts import (
     RunNumber,
     Split,
 )
-from observation_contracts import COST_SOURCES, USAGE_SOURCES
+from observation_contracts import COST_SOURCES, USAGE_SOURCES, Availability
 from text_contracts import (
     ComparisonProfile,
     ComparisonText,
@@ -13404,9 +13404,12 @@ def judge_robustness_command(args: argparse.Namespace) -> int:
     report = judge_robustness_report(tasks, tmp_dir=tmp, judge_cmd=judge_cmd, judge_model=judge_model,
                                      claude_bin=getattr(args, "claude_bin", None) or "claude")
     emit_report(report, getattr(args, "out", None))
-    gate_failed = (report["summary"].get("availability") != "complete"
-                   or bool(report["findings"]))
-    return 1 if (getattr(args, "fail_on_findings", False) and gate_failed) else 0
+    if not getattr(args, "fail_on_findings", False):
+        return 0
+    availability = report["summary"].get("availability")
+    return gate_exit(gate_policy.JUDGE_ROBUSTNESS.decide(
+        report["findings"], complete=availability == "complete",
+        incomplete_reason=f"judge-robustness evidence is {availability}"), "judge-robustness")
 
 
 def judge_command(args: argparse.Namespace) -> int:
@@ -17080,6 +17083,7 @@ def build_benchmark_report(
         runs, results, manifest=manifest, manifest_path=path,
         case_ids=answer_case_ids, variants=variants)
     paired_summary = build_paired_summary(results, min_lift=min_lift)
+    pairing_blocked = paired_summary.get("availability") != "complete"
     unscorable_results = [row for row in results if not scorable_run(row)]
     grading_blocked_results = [
         row for row in results
@@ -17156,6 +17160,18 @@ def build_benchmark_report(
                     block[key] = None
                 block["availability"] = "partial"
                 block["reason"] = judge_reason
+    # Why the report is partial, one code per root cause; availability is
+    # derived from this list so the two cannot disagree. A pending judge
+    # verdict also leaves its row's grading partial and blocks its pair, and an
+    # unscorable run blocks its pair, so those consequences are not listed again.
+    incomplete_reasons = [reason for reason, present in (
+        ("answer_design_incomplete", not design_coverage["complete"]),
+        ("unscorable_answer_attempts", bool(unscorable_results)),
+        ("deferred_judge_verdicts", bool(deferred_judge_tasks)),
+        ("grading_evidence_incomplete", any(
+            not row.get("deferred_judge_tasks") for row in grading_blocked_results)),
+        ("incomplete_answer_pairing", pairing_blocked and not unscorable_results),
+    ) if present]
     if not design_coverage["complete"]:
         reason = "answer_design_incomplete"
         summary = invalidate_variant_summaries(summary, reason)
@@ -17183,11 +17199,8 @@ def build_benchmark_report(
         # CONFIRMED_CAUSAL is reserved for the per-ablation causal_confirmation
         # door and lives on ablation_regressions, not on a with/without summary.)
         "population": "answer",
-        "availability": (
-            "complete" if (design_coverage["complete"] and not unscorable_results
-                           and not deferred_judge_tasks and not grading_blocked_results
-                           and not pairing_incomplete)
-            else "partial"),
+        "availability": "partial" if incomplete_reasons else "complete",
+        "incomplete_reasons": incomplete_reasons,
         "answer_design": design_coverage,
         "skipped_trigger_cases": skipped_trigger_cases,
         "deferred_judge_tasks": deferred_judge_tasks,
@@ -19598,6 +19611,7 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
         return {
             "availability": "partial",
             "reason": "benchmark report population is incomplete",
+            "incomplete_reasons": list(benchmark_report.get("incomplete_reasons") or []),
             "base_saturated_cases": [],
             "base_saturated_expected_cases": [],
             "qualitative_only_cases": [],
@@ -19605,6 +19619,21 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
             "observed": observed,
         }
     return {"availability": "complete", **observed}
+
+
+# What to do about each reason a benchmark report is partial
+# (build_benchmark_report's incomplete_reasons).
+INCOMPLETE_REMEDIES = {
+    "answer_design_incomplete": "some planned case arms have no run; finish the runs",
+    "unscorable_answer_attempts": "some runs are unscorable (cut off, wrong model, or not completed); re-run them",
+    "grading_evidence_incomplete": "some runs could not be graded; see grading_availability on the results",
+    "deferred_judge_verdicts": "judge assertions have no verdicts; pass --judge-results",
+    "incomplete_answer_pairing": "some pairs are blocked (a missing arm, or arms run at different effort); see paired_summary.pairing",
+}
+
+
+def incomplete_remedy(reason: str) -> str:
+    return INCOMPLETE_REMEDIES.get(reason, reason)
 
 
 def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str | None = None, leakage_min_chars: int = 4, benchmark_report: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -19666,7 +19695,13 @@ def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str 
         # An incomplete benchmark yields empty signal lists; reading those as
         # "no base-saturated or floor cases" would pass a gate on evidence it
         # never saw.
-        blockers.append(Finding(FindingKind.BENCHMARK_INCOMPLETE, "the benchmark report is incomplete, so run-measured readiness signals are unknown — finish or re-grade the runs before relying on readiness"))
+        causes = run.get("incomplete_reasons") or []
+        blockers.append(Finding(
+            FindingKind.BENCHMARK_INCOMPLETE,
+            "the benchmark report is incomplete, so run-measured readiness signals are unknown: "
+            + ("; ".join(incomplete_remedy(cause) for cause in causes)
+               or "finish or re-grade the runs before relying on readiness"),
+            {"incomplete_reasons": causes}))
     if run["base_saturated_cases"]:
         blockers.append(Finding(FindingKind.BASE_SATURATED_CASE, f"{len(run['base_saturated_cases'])} case(s) are base-saturated (measured with_skill == without_skill) — they cannot measure the skill; cut or harden them", run["base_saturated_cases"]))
     if run.get("floor_cases"):
@@ -19793,11 +19828,17 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
     variants = manifest.get("variants", DEFAULT_VARIANTS)
     cases_out: list[dict[str, Any]] = []
     total = 0
+    # Coverage: each answer case's arms whose output was read. A gate that
+    # never saw an arm's output cannot say that arm did not leak.
+    unscanned: list[dict[str, str]] = []
+    expected_arms = 0
     for case in iter_cases(manifest, split):
         max_overlap, findings = 0.0, []
+        scanned_variants: set[str] = set()
         for model_name, variant, run_number, _base, text, _path, _meta in discovered_run_units(runs, case, variants):
             if text is None:
                 continue
+            scanned_variants.add(variant)
             chk = contamination_check(case, text, manifest_dir=manifest_path.parent, n=n,
                                       overlap_threshold=overlap_threshold, model_cutoff=model_cutoff)
             max_overlap = max(max_overlap, chk["overlap"])
@@ -19806,7 +19847,16 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
         total += len(findings)
         if findings or max_overlap > 0:
             cases_out.append({"case_id": case["id"], "max_overlap": round(max_overlap, 4), "findings": findings})
+        if not is_trigger_case(case):
+            expected_arms += len(variants)
+            unscanned.extend({"case_id": case["id"], "variant": variant}
+                             for variant in variants if variant not in scanned_variants)
+    scanned_arms = expected_arms - len(unscanned)
+    availability = (Availability.COMPLETE if not unscanned
+                    else Availability.PARTIAL if scanned_arms else Availability.UNAVAILABLE)
     return {"cases": cases_out, "total_findings": total,
+            "coverage": {"availability": availability.value, "expected_arms": expected_arms,
+                         "scanned_arms": scanned_arms, "unscanned": unscanned},
             "params": {"ngram": n, "overlap_threshold": overlap_threshold, "model_cutoff": model_cutoff,
                        "comparison": ComparisonProfile.RENDERED_V1.value}}
 
@@ -19816,7 +19866,15 @@ def contamination_command(args: argparse.Namespace) -> int:
                                   n=getattr(args, "ngram", 8), overlap_threshold=getattr(args, "overlap_threshold", 0.6),
                                   model_cutoff=getattr(args, "model_cutoff", None))
     emit_report(report, getattr(args, "out", None))
-    return 1 if (getattr(args, "fail_on_contamination", False) and report["total_findings"]) else 0
+    if not getattr(args, "fail_on_contamination", False):
+        return 0
+    coverage = report["coverage"]
+    return gate_exit(gate_policy.CONTAMINATION.decide(
+        [finding for case in report["cases"] for finding in case["findings"]],
+        complete=coverage["availability"] == Availability.COMPLETE.value,
+        incomplete_reason=(f"contamination scanned {coverage['scanned_arms']} of "
+                           f"{coverage['expected_arms']} case arms; the rest have no saved output")),
+        "contamination")
 
 
 def reference_answer_text(case: dict[str, Any], manifest_dir: Path) -> str | None:
@@ -20252,6 +20310,13 @@ def audit_manifest_report(
 
     # Marks 3-5 on runs: only a complete benchmark can support them.
     bench_complete = bool(bench_report) and bench_report.get("availability") == "complete"
+    if bench_complete:
+        runs_notes: list[str] = []
+    elif bench_report:
+        runs_notes = ["the benchmark is incomplete: " + "; ".join(
+            incomplete_remedy(cause) for cause in bench_report.get("incomplete_reasons") or [])]
+    else:
+        runs_notes = ["measured on runs: pass --runs"]
     if bench_report and bench_complete:
         for item in run_measured_findings(bench_report):
             findings.append(item.as_dict())
@@ -20271,10 +20336,11 @@ def audit_manifest_report(
                 "relies on discovery (issue #48)")] if answer_cases else []),
             EvalMark.GRADER: ([] if known["references_checked"] else [
                 "no case declares reference_answer, so no known-good answer was graded"]),
-            EvalMark.HEADROOM: ([] if bench_complete else ["measured on runs: pass --runs"]),
-            EvalMark.NOISE: ([] if bench_complete else ["measured on runs: pass --runs"]),
-            EvalMark.ISOLATION: ([] if bench_complete else [
-                "effort and served-model checks need --runs; the leakage lint ran on the manifest"]),
+            EvalMark.HEADROOM: runs_notes,
+            EvalMark.NOISE: runs_notes,
+            EvalMark.ISOLATION: runs_notes + ([(
+                "the leakage lint ran on the manifest; effort and served-model checks need a "
+                "complete benchmark")] if not bench_complete else []),
         })
 
     return {
@@ -20388,11 +20454,15 @@ def audit_manifest(args: argparse.Namespace) -> int:
             [*report.get("findings", []), *blocker_findings],
             complete=report.get("benchmark_availability") in (None, "complete"),
             incomplete_reason="the benchmark report is incomplete, so run-measured findings are unknown")
-        if decision.failed:
-            for reason in decision.reasons:
-                print(f"fail-on: {reason}", file=sys.stderr)
-            return 1
+        return gate_exit(decision, "fail-on")
     return 0
+
+
+def gate_exit(decision: gate_policy.GateDecision, label: str) -> int:
+    """Print each reason a gate failed to stderr and return the exit code."""
+    for reason in decision.reasons:
+        print(f"{label}: {reason}", file=sys.stderr)
+    return decision.exit_code
 
 
 SUITE_TIERS = {"preflight", "static", "prepare", "jetty-dry-run"}
@@ -21027,7 +21097,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ngram", type=int, default=8, help="word n-gram size for output<->answer overlap")
     p.add_argument("--overlap-threshold", type=float, default=0.6, help="flag when this fraction of the answer key's n-grams appear verbatim in the output")
     p.add_argument("--model-cutoff", help="model training cutoff (e.g. 2025-01); flags cases whose released_at is at/before it")
-    p.add_argument("--fail-on-contamination", action="store_true", help="exit non-zero if any contamination finding fires (CI gate)")
+    p.add_argument("--fail-on-contamination", action="store_true", help="exit non-zero if a contamination finding fires or an answer arm has no saved output to check (CI gate)")
     p.add_argument("--out")
 
     p = sub.add_parser("judge-robustness", help="probe a judge's stability: order-flip self-consistency + empty/master-key negative controls a robust judge must reject (model-touching; opt-in)")
@@ -21145,7 +21215,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--leakage-min-chars", type=int, default=4)
     p.add_argument("--fail-on-blockers", action="store_true", help="exit non-zero if the readiness block has any blockers (for CI gating of an eval suite)")
     p.add_argument("--strict-judge", action="store_true", help="exit non-zero when the declared judge model is also a model under test")
-    p.add_argument("--fail-on", action="append", metavar="KINDS", help="exit non-zero on these finding kinds, severities (required, recommended) or presets (blockers, strict-judge); comma-separated, repeatable; fails closed on an incomplete benchmark")
+    p.add_argument("--fail-on", action="append", metavar="KINDS", help="exit non-zero on these finding kinds, severities (required, recommended) or presets (blockers, strict-judge, contamination, judge-robustness); comma-separated, repeatable; fails closed on an incomplete benchmark")
     p.add_argument("--min-lift", type=float, help="smallest lift worth acting on, for the noise check behind eval-health mark 4 (with --runs)")
     add_grading_options(p)
     p.add_argument("--expensive-case-usd", type=float, default=1.0, help="dollar threshold above which cost-quality findings fire for saturated/no-lift/judge-only cases and unstructured ablation arms (issue #21)")

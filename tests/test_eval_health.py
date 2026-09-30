@@ -105,8 +105,18 @@ class ReadinessGateTests(unittest.TestCase):
         self.assertIn("benchmark-incomplete", blockers)
         self.assertEqual(code, 1)
         self.assertIn("benchmark report is incomplete", stderr)
-        # Marks measured on runs are unavailable, not ok, on partial evidence.
-        self.assertEqual(marks(report)["noise-below-min-lift"]["status"], "unavailable")
+        # Marks measured on runs are unavailable, not ok, on partial evidence,
+        # and the blocker and the notes name the cause rather than asking for --runs.
+        noise = marks(report)["noise-below-min-lift"]
+        self.assertEqual(noise["status"], "unavailable")
+        # The fixture's missing output is an empty run directory: an unscorable run.
+        self.assertEqual(noise["notes"], [(
+            "the benchmark is incomplete: some runs are unscorable (cut off, wrong model, "
+            "or not completed); re-run them")])
+        self.assertIn("some runs are unscorable", stderr)
+        incomplete = next(item for item in report["readiness"]["blocker_findings"]
+                          if item["kind"] == "benchmark-incomplete")
+        self.assertEqual(incomplete["evidence"], {"incomplete_reasons": ["unscorable_answer_attempts"]})
 
     def test_fail_on_names_kinds_and_fails_closed_on_partial_runs(self):
         with tempfile.TemporaryDirectory() as td:

@@ -733,6 +733,40 @@ class ContaminationPerimeterTests(unittest.TestCase):
         self.assertEqual(report["cases"][0]["case_id"], "c")
         self.assertEqual(report["cases"][0]["findings"][0]["kind"], "canary-hit")
 
+    def test_the_gate_fails_on_a_finding_and_on_an_arm_it_never_read(self):
+        from types import SimpleNamespace
+
+        def gate(outputs, *, armed=True):
+            with tempfile.TemporaryDirectory() as td:
+                root, p = self._manifest(td, {"canary": "ZZ-CANARY-99"})
+                runs = root / "runs"
+                runs.mkdir()
+                for variant, text in outputs.items():
+                    write_run(runs / "c" / variant, text)
+                args = SimpleNamespace(manifest=str(p), runs=str(runs), split="tune", ngram=8,
+                                       overlap_threshold=0.6, model_cutoff=None,
+                                       fail_on_contamination=armed, out=str(root / "c.json"))
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    code = sb.contamination_command(args)
+                report = json.loads((root / "c.json").read_text(encoding="utf-8"))
+            return code, report["coverage"], stderr.getvalue()
+
+        clean = {"with_skill": "clean", "without_skill": "clean"}
+        self.assertEqual(gate(clean)[0], 0)
+        code, _, stderr = gate({**clean, "with_skill": "ZZ-CANARY-99"})
+        self.assertEqual(code, 1)
+        self.assertIn("contamination: canary-hit", stderr)
+        # An arm with no saved output was never checked, so the gate cannot pass it.
+        code, coverage, stderr = gate({"with_skill": "clean"})
+        self.assertEqual(code, 1)
+        self.assertEqual(coverage["availability"], "partial")
+        self.assertEqual(coverage["unscanned"], [{"case_id": "c", "variant": "without_skill"}])
+        self.assertIn("scanned 1 of 2 case arms", stderr)
+        self.assertEqual(gate({}, armed=True)[1]["availability"], "unavailable")
+        # Unarmed, the command reports and exits 0.
+        self.assertEqual(gate({}, armed=False)[0], 0)
+
 
 class ClosedManifestBoundaryTests(unittest.TestCase):
     def _validate(self, case: dict):

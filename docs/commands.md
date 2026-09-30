@@ -253,7 +253,7 @@ skill-benchmark grade ../repo/evals/shared-benchmark.json \
 
 ## Benchmark
 
-`benchmark` aggregates graded rows into variant summaries, paired deltas (with sign-flip `significance`, a confidence `interval`, a `noise_check`, and a `graded` channel), per-model grouping (`by_model`, `model_analysis` ranking and lift losers), slice summaries with lift concentration, oracle-strength shares, held-out vs tune-visible qualitative rates, a `run_endings` block, and case flags. It takes the shared [grading options](#grading-options); add `--allow-scripts` only when you trust the repo-owned oracle commands in the manifest. `--min-lift X` (0 < X ≤ 1) names the smallest pass-rate lift you would act on, which the noise check compares against.
+`benchmark` aggregates graded rows into variant summaries, paired deltas (with sign-flip `significance`, a confidence `interval`, a `noise_check`, and a `graded` channel), per-model grouping (`by_model`, `model_analysis` ranking and lift losers), slice summaries with lift concentration, oracle-strength shares, held-out vs tune-visible qualitative rates, a `run_endings` block, and case flags. The report's `availability` is `partial` exactly when `incomplete_reasons` is non-empty; each entry names a root cause: `answer_design_incomplete` (a planned case arm has no run), `unscorable_answer_attempts`, `deferred_judge_verdicts` (pass `--judge-results`), `grading_evidence_incomplete` (an assertion could not be graded for a reason other than a pending verdict), or `incomplete_answer_pairing` (a pair blocked for a reason other than an unscorable run, such as `effort_mismatch`). A pending verdict or an unscorable run also blocks its pair, and is not listed twice. It takes the shared [grading options](#grading-options); add `--allow-scripts` only when you trust the repo-owned oracle commands in the manifest. `--min-lift X` (0 < X ≤ 1) names the smallest pass-rate lift you would act on, which the noise check compares against.
 
 ```bash
 skill-benchmark benchmark ../repo/evals/shared-benchmark.json \
@@ -388,7 +388,7 @@ Add `--runs ../repo/eval-runs/latest` to include saturated-case, floor, no-lift,
 
 The JSON report carries `counts`, `taxonomy`, `findings`, `recommendations`, `recommended_fixture_repos_files`, `readiness`, `known_answer_check`, `case_sources`, `eval_health`, `benchmark`, and `benchmark_availability`. `--format markdown` renders the counts, readiness, an **Eval health** table, the findings, and the recommendations. The audit reports:
 
-- a **readiness** verdict, "is this eval worth paying to run?": ablations materialized vs instruction-simulated, `leak_saturated_cases`, `adversarial_cases`, `objective_only_cases` and `judge_only_cases`, and with `--runs`, `base_saturated_cases`, `floor_cases`, `qualitative_only_cases` and `regression_guards_holding`. The blockers are typed findings in `blocker_findings`, with their messages repeated in `blockers`; the terms and the six blocking kinds are defined under **Readiness** in [`vocabulary.md`](vocabulary.md#report-signals);
+- a **readiness** verdict, "is this eval worth paying to run?": ablations materialized vs instruction-simulated, `leak_saturated_cases`, `adversarial_cases`, `objective_only_cases` and `judge_only_cases`, and with `--runs`, `base_saturated_cases`, `floor_cases`, `qualitative_only_cases` and `regression_guards_holding`. The blockers are typed findings in `blocker_findings`, with their messages repeated in `blockers`; `benchmark-incomplete` carries the benchmark's `incomplete_reasons` as evidence and says what to do about each, and the eval-health notes for marks 3–5 repeat that remedy; the terms and the six blocking kinds are defined under **Readiness** in [`vocabulary.md`](vocabulary.md#report-signals);
 - missing positive, negative, and adversarial eval coverage,
 - missing holdout/holdback split coverage,
 - missing trigger/no-trigger coverage,
@@ -430,7 +430,7 @@ skill-benchmark audit-manifest evals/shared-benchmark.json --fail-on-blockers
 
 `--strict-judge` exits non-zero on a `judge-is-model-under-test` finding. For anything else, `--fail-on KINDS` takes finding kinds, severities (`required`, `recommended`), or presets, comma-separated and repeatable, and exits 1 when a finding or readiness blocker matches; each reason is printed to stderr as `fail-on: <kind>: <message>`. An unknown token stops the command before any work (`unknown --fail-on token 'florr-eval': use a finding kind, a severity, or one of: blockers, contamination, judge-robustness, recommended, required, strict-judge`). When `--runs` points at an incomplete benchmark, `--fail-on` fails closed rather than passing on findings it never computed.
 
-The presets are the same policies the older flags apply (`gate_policy.PRESETS`): `blockers` is the six readiness kinds that `--fail-on-blockers` gates on, and `strict-judge` is `judge-is-model-under-test`. `contamination` (`canary-hit`, `output-answer-overlap`, `released-before-cutoff`) and `judge-robustness` (`order-flip-inconsistent`, `passes-empty-control`, `passes-master-key-control`, `judge-call-incomplete`) name the kinds that `contamination --fail-on-contamination` and `judge-robustness --fail-on-findings` fail on in their own commands; `audit-manifest` does not run those checks, so in its `--fail-on` those two presets match nothing. `--strict` is a grading option, not a gate: it changes how verdicts score, not whether the command fails.
+The presets are the same policies the older flags apply (`gate_policy.PRESETS`): `blockers` is the six readiness kinds that `--fail-on-blockers` gates on, and `strict-judge` is `judge-is-model-under-test`. `contamination` (`canary-hit`, `output-answer-overlap`, `released-before-cutoff`) and `judge-robustness` (`order-flip-inconsistent`, `passes-empty-control`, `passes-master-key-control`, `judge-call-incomplete`) are the policies `contamination --fail-on-contamination` and `judge-robustness --fail-on-findings` apply in their own commands, and like `--fail-on` they fail closed on incomplete evidence; `audit-manifest` does not run those checks, so in its `--fail-on` those two presets match nothing. `--strict` is a grading option, not a gate: it changes how verdicts score, not whether the command fails.
 
 The systematic way to upgrade a suite is to drive those blockers to empty, repo by repo: materialize the ablations (`materialize-ablations` / declare a `mechanism`+`target`), de-leak the leak-saturated cases (move the answer out of the prompt, or assert a downstream consequence), and add adversarial cases where missing — then the gate goes green. The walkthrough is [`gating-ci-on-evals.md`](gating-ci-on-evals.md).
 
@@ -507,7 +507,7 @@ skill-benchmark contamination ../repo/evals/shared-benchmark.json \
   --out contamination.json
 ```
 
-Three model-free checks over saved outputs: a canary tripwire (a case's declared canary string appearing through the `rendered-v1` human-text view), output↔answer-key n-gram containment through that same view (`--ngram`, flagged above `--overlap-threshold`), and a `released_at`-vs-`--model-cutoff` gate for cases the model may have seen in training. `--fail-on-contamination` makes it a CI gate.
+Three model-free checks over saved outputs: a canary tripwire (a case's declared canary string appearing through the `rendered-v1` human-text view), output↔answer-key n-gram containment through that same view (`--ngram`, flagged above `--overlap-threshold`), and a `released_at`-vs-`--model-cutoff` gate for cases the model may have seen in training. `coverage` counts the answer case arms whose output was read (`expected_arms`, `scanned_arms`, `unscanned`, `availability`); trigger cases have no answer output and are not counted. `--fail-on-contamination` makes it a CI gate: it exits 1 on a finding, and on any arm in `unscanned`, since an output never read cannot be shown clean. Each reason goes to stderr as `contamination: <reason>`.
 
 ## Judge robustness probes
 
@@ -519,7 +519,7 @@ skill-benchmark judge-robustness ../repo/evals/shared-benchmark.json \
   --out judge-robustness.json
 ```
 
-Probes a judge's stability before you trust its verdicts (model-touching; opt-in): order-flip self-consistency plus empty-output and master-key negative controls a robust judge must reject. Takes the same `--judge-cmd`/`--judge-model` backends as `judge`; `--fail-on-findings` makes it a CI gate.
+Probes a judge's stability before you trust its verdicts (model-touching; opt-in): order-flip self-consistency plus empty-output and master-key negative controls a robust judge must reject. Takes the same `--judge-cmd`/`--judge-model` backends as `judge`; `--fail-on-findings` makes it a CI gate that exits 1 on a finding and when `summary.availability` is not `complete`, printing each reason as `judge-robustness: <reason>`.
 
 ## Cost telemetry (tokens and dollars)
 

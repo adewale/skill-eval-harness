@@ -105,6 +105,13 @@ class GatePolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             gp.parse_fail_on([" , "])
 
+    def test_every_judge_negative_control_is_gated(self):
+        import skill_benchmark as sb
+        for name in sb.JUDGE_NEGATIVE_CONTROLS:
+            with self.subTest(control=name):
+                finding = {"kind": f"passes-{name}-control", "message": "m"}
+                self.assertTrue(gp.JUDGE_ROBUSTNESS.decide([finding]).failed)
+
     def test_severity_on_the_record_beats_the_kind_default(self):
         policy = gp.parse_fail_on(["required"])
         downgraded = {"kind": "missing-hidden-splits", "severity": "recommended", "message": "m"}

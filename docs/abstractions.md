@@ -323,9 +323,10 @@ audit findings and the readiness blocker findings through the same view, so a bl
 and `decide` fails on any matching finding and, when told the evidence is incomplete, fails closed.
 Four presets carry the older flags' meaning: `READINESS` (`blockers`), `SELF_JUDGING`
 (`strict-judge`), `CONTAMINATION` and `JUDGE_ROBUSTNESS`. `audit-manifest --fail-on-blockers` and
-`--strict-judge` evaluate through the first two; `contamination --fail-on-contamination` and
-`judge-robustness --fail-on-findings` still apply their own checks, which fail on exactly the
-kinds of the last two presets (the robustness check also fails on an incomplete report).
+`--strict-judge` evaluate through the first two, `contamination --fail-on-contamination` and
+`judge-robustness --fail-on-findings` through the last two. Each command says when its evidence is
+incomplete: the benchmark's availability, contamination's `coverage` of answer arms, robustness's
+`summary.availability`. `gate_exit` prints each reason and returns the exit code.
 `parse_fail_on` reads the kinds, severities and preset names a user passes to
 `audit-manifest --fail-on` and rejects an unknown token. Grading options such as
 `--strict` are not gates: they change how verdicts are scored, not whether a command fails.
