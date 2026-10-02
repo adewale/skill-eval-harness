@@ -91,6 +91,13 @@ REQUIRED_TRIGGERS = {"ci.yml": "pull_request", "publish.yml": "release"}
 # gated event, any of them lets a pull request or release bypass the gates.
 TRIGGER_FILTERS = ("branches", "branches-ignore", "paths", "paths-ignore")
 
+# A `types:` list on the gated event must keep these activity types: without
+# them a pull request is gated only when, say, it is closed.
+REQUIRED_ACTIVITY_TYPES = {
+    "pull_request": {"opened", "synchronize", "reopened"},
+    "release": {"published"},
+}
+
 # Shell spellings that turn a failing command into a passing step.
 FAILURE_SWALLOWERS = ("|| true", "|| :", "|| exit 0", "set +e", "--exit-zero")
 
@@ -159,6 +166,11 @@ def workflow_violations(workflows: dict[str, dict], required: dict[str, dict[str
                 if isinstance(config, dict) and key in config:
                     found.append(f"{name}: a {key!r} filter on {trigger} skips the gates "
                                  "on changes it does not match")
+            if isinstance(config, dict) and "types" in config:
+                missing = REQUIRED_ACTIVITY_TYPES[trigger] - set(config["types"] or [])
+                if missing:
+                    found.append(f"{name}: {trigger} types leave out {sorted(missing)}, "
+                                 "so those events skip the gates")
         for job_id, job in jobs.items():
             where = f"{name} job {job_id}"
             if "continue-on-error" in job:
@@ -244,6 +256,8 @@ class WorkflowGateTests(unittest.TestCase):
                               "a 'branches' filter on pull_request skips the gates"),
             "paths-filter": (lambda ci: ci[True].update({"pull_request": {"paths": ["docs/**"]}}),
                              "a 'paths' filter on pull_request skips the gates"),
+            "closed-only": (lambda ci: ci[True].update({"pull_request": {"types": ["closed"]}}),
+                            "pull_request types leave out ['opened', 'reopened', 'synchronize']"),
             "bash-without-errexit": (lambda ci: rewrite(ci["jobs"]["test"], unit, shell="bash {0}",
                                                         run=f"{unit}\necho done"),
                                      "'Run unit tests': shell 'bash {0}' drops errexit"),
@@ -295,6 +309,8 @@ class WorkflowGateTests(unittest.TestCase):
                                              run=f"{unit}\necho done"),
             "single-command-pwsh": rewrite(shell="pwsh"),
             "push-branch-filter": lambda ci: ci[True].update({"push": {"branches": ["main"]}}),
+            "extra-activity-type": lambda ci: ci[True].update({"pull_request": {
+                "types": ["opened", "synchronize", "reopened", "ready_for_review"]}}),
             "timeout": rewrite(**{"timeout-minutes": 20}),
         }
         for label, edit in edits.items():
