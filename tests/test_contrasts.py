@@ -133,6 +133,14 @@ class EditContrastTests(unittest.TestCase):
         # without_skill rows are not part of this contrast.
         self.assertEqual(summary["pairing"]["eligible_pairs"], 7)
 
+    def test_the_edit_noise_check_measures_headroom_on_the_previous_revision(self):
+        # Headroom is what the revision being replaced left to gain:
+        # previous rates 0.25 x3, 0.5 x4 average 2.75/7, so 1 - 2.75/7 = 4.25/7.
+        # (The current rates average 6.5/7, which would leave 0.5/7.)
+        summary = sb.paired_edit_summary(self.rows(
+            [(1.0, 0.25)] * 3 + [(1.0, 0.5)] * 3 + [(0.5, 0.5)]))
+        self.assertAlmostEqual(summary["noise_check"]["headroom"], 4.25 / 7, places=6)
+
     def test_no_old_skill_arm_means_no_edit_summary(self):
         rows = [row for row in self.rows([(1.0, 0.0)]) if row["variant"] != "old_skill"]
         self.assertIsNone(sb.paired_edit_summary(rows))
