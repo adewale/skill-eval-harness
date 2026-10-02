@@ -1587,6 +1587,28 @@ class VibeAdapterTests(unittest.TestCase):
         self.assertTrue(result.metadata["config_isolated"])
         self.assertTrue(result.metadata["vibe_home_outside_workdir"])
 
+    def test_a_vibe_2_23_history_entry_stream_is_a_complete_cell_with_skill_tool_evidence(self):
+        # Vibe 2.23 and later write public history entries (built from Vibe
+        # 2.25.8's own code, tests/fixtures/vibe/README.md). A stream that
+        # loads the mounted `demo` skill triggers; one that answers without a
+        # tool is a complete observation that did not trigger.
+        fixtures = ROOT / "tests" / "fixtures" / "vibe"
+        rows = [{"query_id": "q", "query": "Review this pull request description.", "should_trigger": True}]
+        for name, triggered, evidence in (
+                ("streaming.2.25.8.skill-load.jsonl", True, ["Vibe skill tool invoked: demo"]),
+                ("streaming.2.25.8.no-tools.jsonl", False, [])):
+            with self.subTest(fixture=name), tempfile.TemporaryDirectory() as td:
+                fake_vibe = Path(td) / "fake_vibe.py"
+                fake_vibe.write_text(
+                    f"import sys\nsys.stdout.write(open({str(fixtures / name)!r}, encoding='utf-8').read())\n",
+                    encoding="utf-8")
+                report = tm.run_matrix(DEMO_MANIFEST, rows, agents=["vibe"], models=[None],
+                                       runs_per_query=1, timeout=30, workers=1,
+                                       vibe_cmd=f"{sys.executable} {fake_vibe}")
+                row = report["results"][0]
+                self.assertIs(row["observation_complete"], True, row.get("provider_error"))
+                self.assertEqual((row["triggered"], row["evidence"]), (triggered, evidence))
+
 
 def _csv_env(name, default):
     raw = os.environ.get(name)

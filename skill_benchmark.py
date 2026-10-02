@@ -7663,9 +7663,127 @@ def identity_flat_records(records: list[dict[str, Any]], *,
             for i, record in enumerate(records, 1)]
 
 
+# Vibe's `--output streaming` record shape changed in 2.23. Through 2.22 it
+# wrote one LLMMessage dump per line (`role`, string `content`, OpenAI-style
+# `tool_calls`; vibe/core/output_formatters.py). From 2.23 it writes public
+# history entries (vibe/cli/programmatic.py, vibe/app_server/models.py): each
+# carries a `type`, fields are camelCase, a `message` entry holds its text as
+# content blocks, and one `effect` entry is one finished tool call. A stream's
+# first record says which shape it is in; each shape has its own parser.
+VIBE_HISTORY_CONTENT_ENTRY_TYPES = frozenset({"message", "reasoning", "effect", "callback"})
+VIBE_HISTORY_METADATA_ENTRY_TYPES = frozenset({"checkpoint", "notice"})
+
+
+def vibe_records_are_history_entries(records: Sequence[Mapping[str, Any]]) -> bool:
+    """True for a Vibe 2.23+ stream of public history entries, False for the
+    LLMMessage dumps Vibe 2.22 and earlier wrote (they carry no `type`)."""
+    return bool(records) and "type" in records[0]
+
+
+def vibe_entry_text(entry: Mapping[str, Any]) -> str:
+    """The text of a Vibe 2.23+ `message` entry, joined as Vibe's own
+    PublicMessageEntry.text joins it."""
+    content = entry.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "\n\n".join(block["text"] for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                        and isinstance(block.get("text"), str))
+
+
+def _vibe_tool_flat_record(name: str, arguments: Mapping[str, Any]) -> dict[str, Any] | None:
+    """One Vibe tool call in the harness trace vocabulary, for the tools the
+    harness enables (VIBE_READ_ONLY_TOOLS); None for any other tool. Reads the
+    LLMMessage argument spellings and the 2.23+ camelCase effect input."""
+    if name == "skill":
+        return {"type": "skill_load", "name": name,
+                "path": str(arguments.get("name") or arguments.get("skill") or "")}
+    if name == "read_file":
+        return {"type": "file_read", "name": name,
+                "path": str(arguments.get("path") or arguments.get("file_path")
+                            or arguments.get("filePath") or "")}
+    if name == "grep":
+        return {"type": "tool_use", "tool": name, "input": dict(arguments)}
+    return None
+
+
 def vibe_stream_flat_records(records: list[dict[str, Any]], *,
                              record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
-    """Flatten Vibe's OpenAI-style message/tool lifecycle without dropping it."""
+    """Flatten a Vibe stream in whichever record shape it is in."""
+    if vibe_records_are_history_entries(records):
+        return vibe_history_entry_flat_records(records, record_lines=record_lines)
+    return vibe_llm_message_flat_records(records, record_lines=record_lines)
+
+
+def vibe_history_entry_flat_records(
+    records: list[dict[str, Any]], *, record_lines: list[int] | None = None,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten Vibe 2.23+ public history entries. Vibe writes an entry once it
+    is completed, so an `effect` entry is a whole tool call: its input under
+    `detail`, its outcome under `state`."""
+    if record_lines is not None and len(record_lines) != len(records):
+        raise ValueError("record_lines must have one physical line per trace record")
+    flat: list[tuple[int, dict[str, Any]]] = []
+    seen: set[str] = set()
+
+    def invalid(line: int, message: str) -> None:
+        flat.append((line, _claude_protocol_error(f"Vibe {message}")))
+
+    for ordinal, record in enumerate(records, 1):
+        line = record_lines[ordinal - 1] if record_lines is not None else ordinal
+        kind, entry_id = record.get("type"), record.get("id")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            invalid(line, "history entry id must be a non-empty string")
+            continue
+        if entry_id in seen:
+            invalid(line, f"history entry id {entry_id!r} is duplicated")
+            continue
+        seen.add(entry_id)
+        if record.get("generationStatus") != "completed":
+            invalid(line, f"history entry {entry_id!r} is not completed")
+            continue
+        if kind == "message":
+            role, content = record.get("role"), record.get("content")
+            if role not in {"user", "assistant", "system"}:
+                invalid(line, f"message role {role!r} is unsupported")
+            elif not isinstance(content, list) or not all(isinstance(block, dict) for block in content):
+                invalid(line, "message content must be a list of content blocks")
+            elif vibe_entry_text(record).strip():
+                flat.append((line, {"type": "message", "role": role, "text": vibe_entry_text(record)}))
+        elif kind == "effect":
+            detail, state = record.get("detail"), record.get("state")
+            name = detail.get("toolName") if isinstance(detail, dict) else None
+            arguments = detail.get("input") if isinstance(detail, dict) else None
+            if not isinstance(name, str) or not name.strip() or not isinstance(state, dict):
+                invalid(line, "effect must carry a detail.toolName and a state")
+                continue
+            spec = _vibe_tool_flat_record(name, arguments if isinstance(arguments, dict) else {})
+            if spec is None:
+                invalid(line, f"tool call function {name!r} is unsupported")
+                continue
+            status = state.get("status")
+            if status not in {"completed", "failed", "cancelled", "skipped"}:
+                invalid(line, f"effect {entry_id!r} state {status!r} is not a finished tool call")
+                continue
+            flat.append((line, {**spec, "status": "completed" if status == "completed" else "failed",
+                                **({} if status == "completed" else {"is_error": True}),
+                                "output": stringify_trace_value(
+                                    state.get("output") if status == "completed"
+                                    else state.get("error") or state.get("reason"))[:1000],
+                                "_raw_call_line": line, "_raw_result_line": line}))
+        elif kind == "reasoning":
+            if not isinstance(record.get("text"), str):
+                invalid(line, "reasoning entry text must be a string")
+        elif kind == "callback" or kind in VIBE_HISTORY_METADATA_ENTRY_TYPES:
+            flat.append((line, record))
+        else:
+            invalid(line, f"history entry type {kind!r} is unsupported")
+    return flat
+
+
+def vibe_llm_message_flat_records(records: list[dict[str, Any]], *,
+                                  record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten Vibe 2.22's OpenAI-style message/tool lifecycle without dropping it."""
     if record_lines is not None and len(record_lines) != len(records):
         raise ValueError("record_lines must have one physical line per trace record")
     flat: list[tuple[int, dict[str, Any]]] = []
@@ -7711,15 +7829,8 @@ def vibe_stream_flat_records(records: list[dict[str, Any]], *,
                 if not isinstance(arguments, dict):
                     invalid(line, "tool call arguments must be an object")
                     continue
-                if name == "skill":
-                    spec = {"type": "skill_load", "name": name,
-                            "path": str(arguments.get("name") or arguments.get("skill") or "")}
-                elif name == "read_file":
-                    spec = {"type": "file_read", "name": name,
-                            "path": str(arguments.get("path") or arguments.get("file_path") or "")}
-                elif name == "grep":
-                    spec = {"type": "tool_use", "tool": name, "input": arguments}
-                else:
+                spec = _vibe_tool_flat_record(name, arguments)
+                if spec is None:
                     invalid(line, f"tool call function {name!r} is unsupported")
                     continue
                 flat.append((line, {**spec, "status": "in_progress"}))
@@ -7939,9 +8050,18 @@ def _claude_trace_protocol_error(
 def _vibe_trace_protocol_error(
     records: list[dict[str, Any]], pi_stream: PiStream | None,
 ) -> str | None:
-    terminal_answer = (records and records[-1].get("role") == "assistant"
-                       and isinstance(records[-1].get("content"), str)
-                       and bool(records[-1]["content"].strip()))
+    if vibe_records_are_history_entries(records):
+        # Session content ends with the answer; a checkpoint or notice entry
+        # (metadata) may still follow it.
+        content = [record for record in records
+                   if record.get("type") in VIBE_HISTORY_CONTENT_ENTRY_TYPES]
+        terminal_answer = (bool(content) and content[-1].get("type") == "message"
+                           and content[-1].get("role") == "assistant"
+                           and bool(vibe_entry_text(content[-1]).strip()))
+    else:
+        terminal_answer = (bool(records) and records[-1].get("role") == "assistant"
+                           and isinstance(records[-1].get("content"), str)
+                           and bool(records[-1]["content"].strip()))
     if not terminal_answer:
         return "Vibe trace must end with one non-empty assistant response"
     return None
@@ -10037,8 +10157,8 @@ def parse_vibe_messages_with_errors(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Parse Vibe --output json (one list) or --output streaming (JSONL).
 
-    The Vibe CLI emits LLMMessage dictionaries, not a provider-enforced answer
-    schema. The harness therefore treats the final assistant message content as
+    The Vibe CLI emits LLMMessage dictionaries (through 2.22) or public
+    history entries (2.23 and later), not a provider-enforced answer schema. The harness therefore treats the final assistant message content as
     the answer/verdict, while preserving all parsed messages as trace JSONL."""
     text = coerce_text(stdout).strip()
     if not text:

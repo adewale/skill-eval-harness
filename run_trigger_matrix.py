@@ -334,15 +334,14 @@ def codex_stream_protocol_error(stdout: str) -> str | None:
 
 
 def vibe_stream_protocol_error(stdout: str) -> str | None:
-    """Require a final assistant answer so empty event objects cannot certify absence."""
+    """Require a final assistant answer so empty event objects cannot certify
+    absence. The Vibe trace dialect owns that rule for each of Vibe's record
+    shapes, as it does for answer runs."""
     error = json_stream_protocol_error(stdout, "vibe")
     if error is not None:
         return error
     records, _ = parse_trace_jsonl_text(stdout)
-    terminal_answer = (records[-1].get("role") == "assistant"
-                       and isinstance(records[-1].get("content"), str)
-                       and bool(records[-1]["content"].strip()))
-    if not terminal_answer:
+    if trace_dialect_for("vibe").protocol_error(records, None) is not None:
         return "Vibe JSON stream must end with one non-empty assistant response"
     return None
 

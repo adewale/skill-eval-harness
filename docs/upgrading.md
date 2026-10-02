@@ -229,6 +229,12 @@ that file still invalidates trigger identity until those owners are extracted in
   mounted under (`demo` for `skills/demo/SKILL.md`), which is how Claude Code 2.1.269 invokes
   project skills. A Claude trigger report saved with such a CLI can show should-fire misses that
   were activations; re-run it. Vibe's `skill` tool detection reads the same two names.
+- Vibe 2.23 and later write `--output streaming` as public history entries instead of
+  `LLMMessage` records. Every such line was a trace protocol error, so a `run-agent --agent vibe`
+  run with a current Vibe had `trace_observation_complete: false` and failed its process
+  assertions for missing evidence, and every `skill-trigger-matrix --agent vibe` cell was
+  incomplete. Both shapes now read; re-run Vibe answer runs and trigger reports made with Vibe
+  2.23 or later.
 - The Claude trigger adapter now reads a stream by the answer parser's rule: exactly one `result`
   record and no session content after it (`assistant`, `user`, `result`, `stream_event`, or a
   record with a `message` object). It took the last `result` and accepted a turn after it, so a
