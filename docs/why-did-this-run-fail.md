@@ -59,7 +59,7 @@ The `judge` step grades `c-review`'s `actionable-review` assertion with the demo
 offline stub judge. Skip it and the benchmark is partial, and `error-analysis` over a
 partial report returns an empty taxonomy.
 
-Representative output (offline stub, six matched runs per arm so materialized ablations can clear the paired sign-flip gate), trimmed to the summary, taxonomy, and selected review-queue rows:
+Real output (2026-10-02, offline stub, six matched runs per arm so materialized ablations can clear the paired sign-flip gate), trimmed to the summary, taxonomy, and two of the 30 review-queue rows, with each row's `run_base` path dropped:
 
 ```json
 "summary": {
@@ -87,6 +87,8 @@ Representative output (offline stub, six matched runs per arm so materialized ab
   {
     "case_id": "c-review",
     "variant": "without_skill",
+    "model": null,
+    "run_number": 1,
     "category": "text:severity-label",
     "objective_pass_rate": 0.0,
     "combined_pass_rate": 0.0,
@@ -101,8 +103,11 @@ Representative output (offline stub, six matched runs per arm so materialized ab
   {
     "case_id": "c-review",
     "variant": "ablation:no-checklist",
+    "model": null,
+    "run_number": 1,
     "category": "text:cite-checklist",
     "objective_pass_rate": 0.5,
+    "combined_pass_rate": 0.6666666666666666,
     "first_failure": {
       "name": "cite-checklist",
       "type": "contains_any",
