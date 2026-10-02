@@ -10651,23 +10651,6 @@ def claude_cli_invoke(prompt: str, *, model: str | None = None, claude_bin: str 
     return parsed
 
 
-def claude_run_metrics(result: dict[str, Any]) -> dict[str, Any]:
-    """The metrics.json body for one Claude run: the token usage, the real dollar
-    cost, and timing — the fields the benchmark report aggregates."""
-    usage = result.get("usage") or {}
-    metrics: dict[str, Any] = {"schema_version": 1, "source": "claude"}
-    for k in ("input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_creation_tokens"):
-        if isinstance(usage.get(k), (int, float)):
-            metrics[k] = int(usage[k])
-    if isinstance(result.get("cost_usd"), (int, float)):
-        metrics["cost_usd"] = float(result["cost_usd"])
-    if isinstance(result.get("elapsed_ms"), (int, float)):
-        metrics["elapsed_ms"] = int(result["elapsed_ms"])
-    if result.get("returncode") is not None:
-        metrics["returncode"] = result["returncode"]
-    return metrics
-
-
 def run_claude(args: argparse.Namespace) -> int:
     return run_agent_tasks(load_prepared_tasks(Path(args.tasks)), Path(args.runs), registered_agent_backend("claude"),
                            model=getattr(args, "model", None), timeout=int(getattr(args, "timeout", DEFAULT_RUNNER_TIMEOUT_S)),
@@ -13253,9 +13236,20 @@ def run_subagent(args: argparse.Namespace) -> int:
                 transcript = "\n\n".join(f"[user]\n{h['prompt']}\n\n[assistant]\n{h['answer']}" for h in history)
                 prompt = f"Conversation so far:\n{transcript}\n\n[user]\n{prompt}"
             result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
+            error = result.get("provider_error") or result.get("parse_error")
+            if error and result.get("returncode") == 0:
+                # An exit-zero error envelope or unreadable output is a failed
+                # run, as run-claude records it, not an answer to grade.
+                raise RuntimeError(error)
+            # The provider's usage as run-claude records it, with the cost the
+            # subagent contract reads from usage.cost_usd. Only numeric fields:
+            # the subagent usage contract rejects labels such as `source`.
+            usage = dict(result.get("usage") or {})
+            if isinstance(result.get("cost_usd"), (int, float)):
+                usage["cost_usd"] = result["cost_usd"]
             return {"answer": result.get("answer"), "returncode": result.get("returncode"),
                     "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
-                    "usage": claude_run_metrics(result)}
+                    "usage": usage}
     return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
                               replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode())
 
@@ -14702,7 +14696,8 @@ def _validated_trigger_protocol(
                     f"{label} matrix protocol adapter {agent!r} must use "
                     f"{known_implementation}, got {implementation}")
             known_requirements = {
-                "claude": {"config_isolated": True},
+                "claude": {"config_isolated": True,
+                           "claude_config_outside_workdir": True},
                 "codex": {"codex_home_outside_workdir": True},
                 "pi": {"config_isolated": True, "pi_home_outside_workdir": True},
                 "stub": {},

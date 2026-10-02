@@ -18,7 +18,7 @@ import argparse
 import json
 from pathlib import Path
 
-from run_trigger_matrix import eval_rows_from_args, run_matrix
+from run_trigger_matrix import DEFAULT_TIMEOUT_S, eval_rows_from_args, run_matrix
 from skill_benchmark import VALID_SPLITS, write_json
 
 
@@ -31,7 +31,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--split", choices=sorted(VALID_SPLITS))
     ap.add_argument("--runs-per-query", type=int, default=3, help="repetitions per query; a trigger RATE needs repetition (default 3, the floor docs/tuning-skill-activation.md recommends)")
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S,
+                    help=f"seconds per Pi run (default {DEFAULT_TIMEOUT_S}, the trigger matrix's default)")
     ap.add_argument("--model")
     ap.add_argument("--out", required=True)
     ap.add_argument("--trace-runs", help="optional directory for per-query trace.jsonl/events.json/metrics.json artifacts")

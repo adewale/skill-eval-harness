@@ -31,6 +31,8 @@ from helpers import (
 )
 from helpers import (
     make_eval_repo,
+    run_cli,
+    stub_claude,
     stub_claude_stream,
     write_with_skill_task,
 )
@@ -287,6 +289,49 @@ class SubagentRunnerTests(unittest.TestCase):
             self.assertEqual(summary["usage"]["availability"], "partial")
             self.assertEqual(metadata["usage_normalized"]["source"], "missing")
             self.assertFalse(metrics["operation_observation_complete"])
+
+    def test_run_subagent_without_agent_cmd_runs_the_claude_cli(self):
+        # The default backend drives `claude -p` and reports its usage and cost.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, tasks, run_dir = write_with_skill_task(root)
+            stub = stub_claude(root / "claude")
+            code, _, stderr = run_cli("run-subagent", "--tasks", tasks, "--runs", root / "runs",
+                                      "--claude-bin", stub)
+            base = root / "runs" / run_dir
+            output = (base / "output.md").read_text(encoding="utf-8")
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(output, "STUB ANSWER token-XYZ")
+        usage = meta["usage_normalized"]
+        self.assertEqual(
+            [usage[key] for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")],
+            [11, 22, 100, 5])
+        self.assertEqual(meta["cost_normalized"]["total_cost"], 0.0123)
+
+    def test_run_subagent_does_not_grade_a_claude_error_envelope(self):
+        # Claude Code exits 0 with `is_error: true` when the API fails; run-claude
+        # records that as a provider failure, not as the answer.
+        envelope = {"type": "result", "is_error": True, "api_error_status": 529,
+                    "result": "API Error: 529 overloaded",
+                    "usage": {"input_tokens": 1, "output_tokens": 0}}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, tasks, run_dir = write_with_skill_task(root)
+            stub = root / "claude"
+            stub.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n"
+                            f"sys.stdout.write({json.dumps(json.dumps(envelope))})\n",
+                            encoding="utf-8")
+            stub.chmod(0o755)
+            code, _, stderr = run_cli("run-subagent", "--tasks", tasks, "--runs", root / "runs",
+                                      "--claude-bin", stub)
+            base = root / "runs" / run_dir
+            output = (base / "output.md").read_text(encoding="utf-8")
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("API Error: 529 overloaded", output)
+        self.assertIn("Claude provider error (HTTP 529)", output)
+        self.assertNotEqual(meta["invocation_state"], "complete")
 
 
 class ToolReplayTests(unittest.TestCase):

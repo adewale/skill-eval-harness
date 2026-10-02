@@ -16,9 +16,9 @@ Five adapters ship:
               haiku / sonnet / opus aliases. The skill mounts as a project
               skill; loading is detected from the Skill tool-use event and,
               as a fallback, path evidence of the model reading the mounted
-              SKILL.md. It uses an isolated CLAUDE_CONFIG_DIR when auth can be
-              copied, otherwise preserves the normal Claude config so
-              OAuth/keychain logins still work.
+              SKILL.md. It uses an isolated CLAUDE_CONFIG_DIR beside the
+              workspace when auth can be copied, otherwise preserves the
+              normal Claude config so OAuth/keychain logins still work.
 - `codex`   — Codex CLI (`codex exec --json` by default), with skills mounted
               under an isolated external `$CODEX_HOME/skills` and exposed as a
               skills-only read root. It is detected through the shared
@@ -80,6 +80,7 @@ from agent_capabilities import (
 from completion_contracts import StopClass, StopObservation, claude_result_stop
 from content_digests import file_sha256
 from skill_benchmark import (
+    CODEX_HOME_FILES,
     VALID_SPLITS,
     VIBE_DEFAULT_CMD,
     VIBE_READ_ONLY_TOOLS,
@@ -138,14 +139,17 @@ from trigger_reporting import (
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
 DEFAULT_CODEX_CMD = CODEX_TRIGGER_DEFAULT_CMD
+# Seconds one agent run gets. Part of the experimental protocol, so every
+# entry point (this CLI and skill-pi-trigger-eval) defaults to this one value.
+DEFAULT_TIMEOUT_S = 240
 CLAUDE_PORTABLE_AUTH_FILES = (".credentials.json",)
 SENSITIVE_WORKSPACE_FILES = (
-    ".trigger-config/.credentials.json",
     ".codex/auth.json",
     ".codex/config.toml",
     ".vibe-home/.env",
 )
-SENSITIVE_ENV_VARS = ("MISTRAL_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN")
+SENSITIVE_ENV_VARS = ("MISTRAL_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN",
+                      "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
 
 
 # Trigger rows: the manifest's trigger cases or an --eval-set file, validated
@@ -259,19 +263,25 @@ def eval_rows_from_args(args: Any, manifest_path: Path) -> list[dict[str, Any]]:
 
 
 def mounted_skill_names(copied: list[Path]) -> list[str]:
-    """The `name:` each mounted SKILL.md declares in frontmatter (falling back
-    to its directory name). Claude Code invokes skills by this name, so it is
-    the needle for Skill-tool detection. Parsed with the harness's real
-    frontmatter parser, not a regex that breaks on quoted/folded values."""
+    """Every name an agent may use to invoke a mounted skill: the `name:` its
+    SKILL.md declares (parsed with the harness's real frontmatter parser) and
+    the directory it is mounted under. Claude Code 2.1.269 invokes project
+    skills by directory name (`Skill` called with `skills_demo_SKILL.md`),
+    while older builds and other agents use the declared name, so both are
+    load evidence. Each is an exact-match needle for the Claude and Vibe
+    skill-tool detectors; a name in prose or another skill firing never
+    matches."""
     names: list[str] = []
     for p in copied:
         skill_md = p if p.name == "SKILL.md" else p / "SKILL.md"
-        name = skill_md.parent.name
+        candidates = [skill_md.parent.name]
         if skill_md.exists():
             declared = frontmatter_value(skill_md.read_text(encoding="utf-8"), "name")
             if declared:
-                name = str(declared)
-        names.append(name)
+                candidates.insert(0, str(declared))
+        for name in candidates:
+            if name not in names:
+                names.append(name)
     return names
 
 
@@ -395,8 +405,10 @@ def _secret_values_from_files(paths: Iterable[Path]) -> list[str]:
     return secrets
 
 
-def workspace_secret_values(workspace: Path) -> list[str]:
-    secrets = _secret_values_from_files(workspace / rel for rel in SENSITIVE_WORKSPACE_FILES)
+def cell_secret_values(adapter: AgentAdapter, workspace: Path) -> list[str]:
+    """Secret values in the cell's credential files, read after the run and
+    before release(), so a token the agent refreshed during the run counts."""
+    secrets = _secret_values_from_files(adapter.secret_files(workspace))
     # Longest first handles whole-file redaction before nested token values.
     return sorted({s for s in secrets if s}, key=len, reverse=True)
 
@@ -451,8 +463,14 @@ def redact_detection(detection: TriggerDetection, secrets: list[str]) -> Trigger
 
 
 def safe_trace_segment(text: str, fallback: str) -> str:
+    """A path-safe directory name for text. When sanitising changed it, a short
+    digest of the raw text keeps distinct values apart (`vendor/model-a` and
+    `vendor:model-a` both sanitise to `vendor-model-a`)."""
     label = safe_trace_label(text, fallback).strip(".-")
-    return label if label and label not in {".", ".."} else fallback
+    label = label if label and label not in {".", ".."} else fallback
+    if label != text:
+        label += "-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    return label
 
 
 class AgentAdapter:
@@ -485,6 +503,11 @@ class AgentAdapter:
         """Remove anything mount() created outside the workspace. Called once
         the cell ends, including when mounting or invoking failed."""
 
+    def secret_files(self, workspace: Path) -> list[Path]:
+        """Files holding the credentials this cell's agent runs with. They are
+        scanned for redaction after invoke() and before release()."""
+        return [workspace / rel for rel in SENSITIVE_WORKSPACE_FILES]
+
     def detect(self, invocation: InvocationOutcome, skill_names: list[str], copied: list[Path]) -> TriggerDetection:
         if isinstance(invocation.provider_payload, PiStream):
             return detect_trigger_records(
@@ -503,8 +526,13 @@ class AgentAdapter:
             source = inspect.getsource(type(self))
         except (OSError, TypeError):
             source = f"{type(self).__module__}.{type(self).__qualname__}"
+        module = type(self).__module__
+        if module == __name__ == "__main__":
+            # The documented direct-script entry point (`python3 run_trigger_matrix.py`)
+            # runs these same classes; name them by their canonical module.
+            module = "run_trigger_matrix"
         return {
-            "adapter": f"{type(self).__module__}.{type(self).__qualname__}",
+            "adapter": f"{module}.{type(self).__qualname__}",
             "agent": self.name,
             "implementation_sha256": "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest(),
             "producer_sha256": "sha256:" + file_sha256(Path(__file__)),
@@ -524,9 +552,22 @@ class ClaudeAdapter(AgentAdapter):
         self.claude_bin = claude_bin
         self.max_turns = max_turns
 
+    @staticmethod
+    def _config_dir(workspace: Path) -> Path:
+        # Beside the workspace, not in it: Claude runs with Read and Glob, and
+        # this directory holds the copied OAuth credentials.
+        return workspace.parent / f"{workspace.name}-claude-config"
+
     def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
         # Project skills: Claude Code discovers <cwd>/.claude/skills on its own.
         return self._mount_tree(tree_dir, workspace / ".claude" / "skills")
+
+    def release(self, workspace: Path) -> None:
+        shutil.rmtree(self._config_dir(workspace), ignore_errors=True)
+
+    def secret_files(self, workspace: Path) -> list[Path]:
+        return [*super().secret_files(workspace),
+                *(self._config_dir(workspace) / name for name in CLAUDE_PORTABLE_AUTH_FILES)]
 
     def protocol_parameters(self) -> dict[str, Any]:
         return {
@@ -534,8 +575,9 @@ class ClaudeAdapter(AgentAdapter):
             "command": executable_identity(self.claude_bin),
             "max_turns": self.max_turns,
             "allowed_tools": ["Skill", "Read", "Glob", "Grep"],
-            "isolation_policy": "isolated config when portable auth exists; otherwise normal config",
-            "required_observations": {"config_isolated": True},
+            "isolation_policy": ("isolated config outside the workdir when portable auth exists; "
+                                 "otherwise normal config"),
+            "required_observations": {"config_isolated": True, "claude_config_outside_workdir": True},
         }
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
@@ -544,7 +586,7 @@ class ClaudeAdapter(AgentAdapter):
         # not file-seedable; pointing CLAUDE_CONFIG_DIR at an empty directory
         # turns a valid login into "not logged in", so preserve the normal CLI
         # config path in that case.
-        config_dir = workspace / ".trigger-config"
+        config_dir = self._config_dir(workspace)
         argv = [self.claude_bin, "-p", query, "--output-format", "stream-json", "--verbose",
                 "--max-turns", str(self.max_turns),
                 "--allowedTools", "Skill", "Read", "Glob", "Grep"]
@@ -560,7 +602,10 @@ class ClaudeAdapter(AgentAdapter):
                 argv, input_text="", cwd=workspace, timeout_s=timeout,
                 environment=env))
         )
-        metadata: dict[str, Any] = {"config_isolated": config_isolated}
+        # Either config dir is outside the workdir: the isolated one beside it,
+        # or the user's own.
+        metadata: dict[str, Any] = {"config_isolated": config_isolated,
+                                    "claude_config_outside_workdir": True}
         if not config_isolated:
             metadata["config_isolation_warning"] = (
                 "Claude OAuth/keychain auth was not portable; preserved the normal Claude config, "
@@ -641,6 +686,10 @@ class CodexAdapter(AgentAdapter):
     def release(self, workspace: Path) -> None:
         shutil.rmtree(self._codex_home(workspace), ignore_errors=True)
 
+    def secret_files(self, workspace: Path) -> list[Path]:
+        home = self._codex_home(workspace)
+        return [*super().secret_files(workspace), *(home / name for name in CODEX_HOME_FILES)]
+
     def protocol_parameters(self) -> dict[str, Any]:
         return {
             **super().protocol_parameters(),
@@ -659,19 +708,21 @@ class CodexAdapter(AgentAdapter):
             argv += ["--model", model]
         argv.append(query)
         env, meta = codex_env_for_home(codex_home)
-        try:
-            result = validate_invoke_result(
-                self.name, self._run_argv(ProcessInvocationPlan.from_values(
-                    argv, input_text="", cwd=workspace, timeout_s=timeout,
-                    environment=env))
-            )
-        finally:
-            shutil.rmtree(codex_home, ignore_errors=True)
+        # The home outlives the run until release(): Codex may have refreshed
+        # the token in auth.json, and redaction reads the refreshed value.
+        result = validate_invoke_result(
+            self.name, self._run_argv(ProcessInvocationPlan.from_values(
+                argv, input_text="", cwd=workspace, timeout_s=timeout,
+                environment=env))
+        )
         if result.observation_complete:
             result = result.with_provider_error(
                 codex_stream_protocol_error(result.stdout))
+        # Which files were seeded is a record, not an isolation control, so it
+        # is kept under a key that is not a (boolean) protocol observation.
         return result.with_metadata(
-            {k: v for k, v in meta.items() if k != "codex_home"},
+            {k: v for k, v in meta.items() if k not in {"codex_home", "codex_home_files_copied"}},
+            codex_home_files=list(meta.get("codex_home_files_copied") or ()),
             codex_home_outside_workdir=True,
         )
 
@@ -737,6 +788,9 @@ class PiAdapter(AgentAdapter):
     def release(self, workspace: Path) -> None:
         shutil.rmtree(self._pi_home(workspace), ignore_errors=True)
 
+    def secret_files(self, workspace: Path) -> list[Path]:
+        return [*super().secret_files(workspace), self._pi_home(workspace) / "auth.json"]
+
     def protocol_parameters(self) -> dict[str, Any]:
         return {
             **super().protocol_parameters(),
@@ -750,14 +804,13 @@ class PiAdapter(AgentAdapter):
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(self._pi_home(workspace))
-        try:
-            result = validate_invoke_result(
-                self.name,
-                self._run_argv(ProcessInvocationPlan.from_values(
-                    pi_argv(query, model), input_text="", cwd=workspace,
-                    timeout_s=timeout, environment=env)))
-        finally:
-            self.release(workspace)
+        # The home outlives the run until release(): Pi may have refreshed the
+        # OAuth token in auth.json, and redaction reads the refreshed value.
+        result = validate_invoke_result(
+            self.name,
+            self._run_argv(ProcessInvocationPlan.from_values(
+                pi_argv(query, model), input_text="", cwd=workspace,
+                timeout_s=timeout, environment=env)))
         return pi_invocation_outcome(result).with_metadata(
             config_isolated=True, pi_home_outside_workdir=True)
 
@@ -1013,7 +1066,7 @@ def observe_cell_query(
                     f"{adapter.name} mounted skill tree hash {mounted_hash} does not match {expected_hash}")
             names = mounted_skill_names(copied)
             invocation = validate_invoke_result(adapter.name, adapter.invoke(query, model, workspace, timeout))
-            secrets = workspace_secret_values(workspace) + ambient_secret_values()
+            secrets = cell_secret_values(adapter, workspace) + ambient_secret_values()
             detection = adapter.detect(invocation, names, copied)
         finally:
             adapter.release(workspace)
@@ -1192,9 +1245,14 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         # One skill tree for the whole matrix: every cell mounts the exact same
         # bytes, and the recorded hash/provenance proves which revision was measured.
         tree_dir, tree_hash, provenance = trigger_tree_for_manifest(repo_root, manifest, Path(td), ablation)
-        protocol = trigger_protocol(
-            adapters, models, runs_per_query=runs_per_query,
-            timeout=timeout, workers=workers)
+        try:
+            protocol = trigger_protocol(
+                adapters, models, runs_per_query=runs_per_query,
+                timeout=timeout, workers=workers)
+        except ValueError as exc:
+            # A model or command the protocol cannot record unambiguously
+            # (an empty --model, an unfingerprintable wrapper) is a usage error.
+            raise SystemExit(str(exc)) from exc
         protocol_sha256 = canonical_json_sha256(protocol)
         manifest_identity = trigger_manifest_identity(manifest)
         trace_root = None
@@ -1283,7 +1341,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--agent", action="append", choices=sorted(ADAPTERS), help="agent adapter, repeatable (default: claude)")
     ap.add_argument("--model", action="append", help="model for every selected agent, repeatable (default: the adapter's own list; claude = haiku, sonnet, opus)")
     ap.add_argument("--runs-per-query", type=int, default=3, help="repetitions per (agent, model, query); a trigger RATE needs repetition (default 3)")
-    ap.add_argument("--timeout", type=int, default=240)
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-turns", type=int, default=6, help="claude/vibe adapters: turns the model gets to load the skill (its observation window)")
     ap.add_argument("--trace-runs", help="optional directory for per-run trace.jsonl/events.json/metrics.json artifacts for every selected agent")

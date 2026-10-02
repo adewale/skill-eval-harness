@@ -68,6 +68,10 @@ that file still invalidates trigger identity until those owners are extracted in
   requested level, so an unpinned run recorded with `applied_by: "backend-default"` counts as
   `backend_default` and still pairs with new runs. Re-run them if you want one spelling in the
   report.
+- A pre-release build of `main` read a realistic alias as a served-model `mismatch`, so a run that
+  requested `sonnet[1m]`, `claude-sonnet-4-0`, a `-latest` id, a Bedrock id such as
+  `us.anthropic.claude-sonnet-4-5-20250929-v1:0`, or a Vertex `@date` id was unscorable. The check
+  is stored when the run is recorded, so re-run those runs; new runs read them as `match`.
 - A run that reports several models credits none of them: `served_model` is `null`, and the check
   reads `mixed` (scored, counted in `run_endings.served_model_mixed`) when the requested model is
   among them, or `mismatch` (unscorable) when it is not. Claude subagent turns are not counted.
@@ -142,9 +146,19 @@ that file still invalidates trigger identity until those owners are extracted in
   `trigger-compare` no longer accepts the old `skill-pi-trigger-eval` producer. Each row's `ablation` is the
   ablation id; the provenance is the report's `provenance`, as in the matrix. Traces written
   with `--trace-runs` land in a `matrix-*` directory under it. A query whose run crashes is now
-  an incomplete row (exit 1) instead of stopping the whole run.
+  an incomplete row (exit 1) instead of stopping the whole run. Its `--timeout` now defaults to
+  240 seconds, the matrix's default, instead of 120; the timeout is part of the protocol, so a
+  report left at the old default does not pair with a matrix report. Pass `--timeout 120` to keep
+  the old window.
 - Pi's `PI_CODING_AGENT_DIR` now sits beside its working directory instead of inside it, so a
   Pi report's protocol requires `pi_home_outside_workdir` and its rows record it.
+- The Claude trigger adapter's isolated `CLAUDE_CONFIG_DIR`, with the copied OAuth credentials,
+  moved from `.trigger-config/` inside the working directory, where the model's Read and Glob
+  could reach it, to a directory beside it. A Claude report's protocol requires
+  `claude_config_outside_workdir` and its rows record it.
+- Codex trigger rows record the files seeded into `CODEX_HOME` as `codex_home_files` instead of
+  `codex_home_files_copied`. `trigger-compare` read that list as an unsafe protocol observation
+  and blocked every Codex cell; the regenerated reports the identity bump already requires pair.
 - `aggregate` and `export-anthropic` accept `--strict` and `--embed-cmd`; pass them there too if
   your `benchmark` command uses them, or the numbers will differ.
 
@@ -158,6 +172,11 @@ that file still invalidates trigger identity until those owners are extracted in
   did, and accepts the missing-cost block with observed parts that `normalize_cost` writes. A
   saved trigger report with an `estimated` cost row fails re-validation in `trigger-compare`;
   regenerate it.
+- Claude trigger detection also counts a `Skill` call that names the directory the skill is
+  mounted under (`skills_demo_SKILL.md` for `skills/demo/SKILL.md`), which is how Claude Code
+  2.1.269 invokes project skills. A Claude trigger report saved with such a CLI can show
+  should-fire misses that were activations; re-run it. Vibe's `skill` tool detection reads the
+  same two names.
 
 ### Removed names
 
@@ -172,6 +191,7 @@ the harness modules needs the replacement:
 | `skill_benchmark.read_output`, `read_metadata` | `read_output_base`, `read_metrics_base` |
 | `skill_benchmark.judge_cost_usd` | `judge_cost_block` |
 | `skill_benchmark.CLAUDE_USAGE_KEYS` | `telemetry.USAGE_ALIASES` |
+| `skill_benchmark.claude_run_metrics` | the `usage` and `cost_usd` fields `claude_cli_invoke` returns |
 | `skill_benchmark.TRIGGER_SEMANTIC_MODULES`, `HARNESS_SEMANTIC_MODULES` | `TRIGGER_IDENTITY_MODULES` |
 | `skill_benchmark.GEMINI_AUTH_FILES` | `GEMINI_AUTH_FILES_BY_TYPE` |
 | `skill_benchmark.load_trace_jsonl` | `parse_trace_jsonl_text` |
