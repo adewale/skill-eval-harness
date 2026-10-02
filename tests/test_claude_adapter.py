@@ -7,12 +7,11 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from helpers import claude_stream_records as _canonical_stream_records
+from helpers import run_cli, write_with_skill_task
 from helpers import stub_claude as _stub_claude
 from helpers import stub_claude_stream as _stub_claude_stream
-from helpers import write_with_skill_task
 
 import skill_benchmark as sb
 
@@ -482,21 +481,18 @@ class ClaudeJudgeAndPanelTests(unittest.TestCase):
         self.assertEqual(result["observed"]["judges"], ["complete"])
 
     def test_compare_judges_rejects_blank_and_duplicate_identities_before_loading(self):
-        def rejected(message):
-            raise ValueError(message)
-
+        # None of the report files exist, so a check that ran after loading
+        # would fail on the missing file instead of naming the identity.
         for reports, message in (
-            (["=first.json", "b=second.json"], "non-empty"),
-            (["same=first.json", "same=second.json", "b=third.json"], "duplicate"),
-            (["a=", "b=second.json"], "path"),
+            (["=first.json", "b=second.json"], "--report judge name must be non-empty"),
+            (["same=first.json", "same=second.json", "b=third.json"], "duplicate --report judge name 'same'"),
+            (["a=", "b=second.json"], "--report path for judge 'a' must be non-empty"),
         ):
-            args = argparse.Namespace(report=reports, magnitude_eps=0.1, out=None)
-            with self.subTest(reports=reports), \
-                 mock.patch.object(sb, "load_json") as load_json, \
-                 mock.patch.object(sb, "die", side_effect=rejected), \
-                 self.assertRaisesRegex(ValueError, message):
-                sb.compare_judges(args)
-            load_json.assert_not_called()
+            with self.subTest(reports=reports), tempfile.TemporaryDirectory() as td:
+                argv = [arg for report in reports for arg in ("--report", report)]
+                self.assertEqual(run_cli("compare-judges", *argv, "--out", Path(td) / "out.json"),
+                                 (1, "", f"FAIL: {message}\n"))
+                self.assertFalse((Path(td) / "out.json").exists())
 
 
 if __name__ == "__main__":
