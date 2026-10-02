@@ -132,8 +132,10 @@ that file still invalidates trigger identity until those owners are extracted in
 - `contamination` output gains `coverage`, and `--fail-on-contamination` now fails when an answer
   case arm has no saved output, as well as on a finding. A CI job that ran the gate before the runs
   finished, or over a runs directory missing an arm, starts failing; point it at the complete run.
-- Paired edit comparison: `benchmark` with an `old_skill` arm selected (`--variant old_skill`
-  beside the two defaults) adds `paired_edit_summary`; without that arm the report is unchanged.
+- Paired edit comparison: `benchmark` with an `old_skill` arm selected adds
+  `paired_edit_summary`; without that arm the report is unchanged. `--variant` replaces the
+  default arms, so pass all three: `--variant with_skill --variant without_skill --variant
+  old_skill`.
 - `skill-pi-trigger-eval` writes the `skill-trigger-matrix` report: the protocol producer is
   `skill-trigger-matrix` with one `pi` adapter, and the report gains `agents` and `matrix`.
   `trigger-compare` no longer accepts the old `skill-pi-trigger-eval` producer. Each row's `ablation` is the
