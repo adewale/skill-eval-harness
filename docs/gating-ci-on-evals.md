@@ -146,7 +146,7 @@ show a case failing in both arms or noise too wide to resolve the lift; `--fail-
 required` fails on every required finding. An unknown token is an error, not a gate that
 never fires, and when `--runs` points at an incomplete benchmark the gate fails closed.
 The accepted kinds and each one's default severity are listed in
-[`commands.md`](commands.md#audit-manifest-quality).
+[`commands.md`](commands.md#finding-kinds).
 
 ## A workflow that ties it together
 
