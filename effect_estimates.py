@@ -30,7 +30,7 @@ import random
 import statistics
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -46,6 +46,7 @@ MAX_EXACT_CASES = 14
 SAMPLED_PATTERNS = 4096
 _TOLERANCE = 1e-12
 _SEARCH_STEPS = 60
+_DECIMALS = 6
 
 
 class DiscriminationFailure(str, Enum):
@@ -147,12 +148,21 @@ class _SignPatterns:
     Each group carries the running count of patterns behind its sorted sums,
     and ``zero_offsets`` the ``(B, count)`` spread of the zero deltas, which
     move ``B`` but never ``A``.
+
+    A tail count visits every (group, zero offset) pair. With many groups and
+    many zeros that is slow, so ``cells`` then keeps the ``(A, B, count)``
+    triples flat: an evaluation sorts ``A - delta * B`` once and visits each
+    zero offset with two binary searches instead.
     """
 
     groups: tuple[tuple[int, tuple[float, ...], tuple[int, ...]], ...]
     zero_offsets: tuple[tuple[int, int], ...]
     total: int
     exact: bool
+    cells: tuple[tuple[float, ...], tuple[int, ...], tuple[int, ...]] | None = None
+    # The last evaluation's sort order: the search's shifts converge, so the
+    # next sort starts nearly sorted.
+    last_order: list[int] = field(default_factory=list, compare=False, repr=False)
 
 
 def _exact_fits(deltas: Sequence[float], max_exact_n: int) -> bool:
@@ -184,10 +194,15 @@ def _exact_patterns(deltas: Sequence[float]) -> _SignPatterns:
         items.sort()
         groups.append((b, tuple(a for a, _ in items),
                        tuple(itertools.accumulate((w for _, w in items), initial=0))))
+    # A shifted tail count costs one pair of binary searches per (group, zero
+    # offset), or one sort of the outcomes plus a pair per zero offset.
+    flat = len(groups) * (zeros + 1) > len(outcomes) + zeros + 1
     return _SignPatterns(groups=tuple(groups),
                          zero_offsets=tuple((zeros - 2 * j, math.comb(zeros, j))
                                             for j in range(zeros + 1)),
-                         total=1 << len(deltas), exact=True)
+                         total=1 << len(deltas), exact=True,
+                         cells=(tuple(a for a, _, _ in outcomes), tuple(b for _, b, _ in outcomes),
+                                tuple(w for _, _, w in outcomes)) if flat else None)
 
 
 def _sampled_patterns(deltas: Sequence[float], samples: int, seed: int) -> _SignPatterns:
@@ -233,6 +248,20 @@ def _tail(patterns: _SignPatterns, whole: float, n: int, delta: float) -> tuple[
     offsets = (patterns.zero_offsets if delta != 0
                else ((0, sum(count for _, count in patterns.zero_offsets)),))
     hits = 0
+    if patterns.cells is not None and delta != 0 and threshold > 0:
+        # |A - delta * (B + z)| >= t  <=>  u >= z * delta + t  or  u <= z * delta - t,
+        # with u = A - delta * B sorted once for this delta.
+        sums, weights, multiplicity = patterns.cells
+        shifted = [a - delta * b for a, b in zip(sums, weights)]
+        order = sorted(patterns.last_order or range(len(shifted)), key=shifted.__getitem__)
+        patterns.last_order[:] = order
+        ordered = list(map(shifted.__getitem__, order))
+        running = list(itertools.accumulate(map(multiplicity.__getitem__, order), initial=0))
+        for offset, weight in offsets:
+            centre = offset * delta
+            hits += weight * (running[-1] - running[bisect.bisect_left(ordered, centre + threshold)]
+                              + running[bisect.bisect_right(ordered, centre - threshold)])
+        return hits / patterns.total, hits / patterns.total
     for b, values, counts in patterns.groups:
         for offset, weight in offsets:
             centre = (b + offset) * delta
@@ -298,12 +327,16 @@ def _bound(patterns: _SignPatterns, whole: float, n: int, centre: float,
     Moving away from the mean, the observed statistic grows with slope ``n``
     while every pattern's statistic grows with slope ``|B| <= n``, so the
     p-value never rises again once it falls. That makes the accepted region
-    an interval and bisection exact.
+    an interval and bisection exact. The endpoint is reported to six
+    decimals, so the search stops once both ends of the bracket round alike:
+    the boundary lies between them and rounds the same way.
     """
     if not _rejects(patterns, whole, n, far, alpha):
         return None
     accepted, rejected = centre, far
     for _ in range(_SEARCH_STEPS):
+        if round(accepted, _DECIMALS) == round(rejected, _DECIMALS):
+            break
         middle = (accepted + rejected) / 2
         if not _rejects(patterns, whole, n, middle, alpha):
             accepted = middle
@@ -358,8 +391,8 @@ def sign_flip_interval(deltas: Sequence[float], *, confidence: float = DEFAULT_C
         return {**base, "method": method, "lower": None, "upper": None, "bounded": False,
                 "reason": (f"every paired delta is the same ({values[0]:g}); a sign-flip "
                            "test reads only signs, so it cannot bound a constant sample")}
-    return {**base, "method": method, "lower": round(lower, 6), "upper": round(upper, 6),
-            "bounded": True}
+    return {**base, "method": method, "lower": round(lower, _DECIMALS),
+            "upper": round(upper, _DECIMALS), "bounded": True}
 
 
 def noise_check(deltas: Sequence[float], without_rates: Sequence[float], *,

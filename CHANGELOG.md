@@ -65,6 +65,7 @@ All notable public changes are listed here. Release tags are the source of truth
 - A case gated only by judges no longer crashes `benchmark` and `audit-manifest` when a critical judge fails: the vetoed run's `objective_pass_rate` stays null (it has no objective check) instead of reading 0.0 beside `objective_total: 0`.
 - A case gated only by judges now gets per-case flags, read from the combined score readiness reads, so a judge-only floor case is flagged `floor` and audited as `floor-eval`; every `case_flags` entry names its `signal` (`objective` or `combined`).
 - A plain judge assertion may declare `score_scale: [low, high]` (validated: two finite numbers, low < high). Its score must fall in range (else a parse error), pass/fail compares the raw score with `threshold` on that scale, and the graded channel takes the score normalized to 0–1, so a 1–5 judge no longer leaves `graded` partial. Absent the field nothing changes.
+- The exact lift interval is about 14 times faster when many cases did not move (a 300-case interval with deltas in {-1, 0, 1}: 1.5 s to 0.1 s). An evaluation sorts the pattern sums once instead of visiting every pattern-weight and unchanged-count pair, and the search stops once its bracket rounds to the six reported decimals; the endpoints are unchanged.
 
 ## v0.6.0 — 2026-07-10
 

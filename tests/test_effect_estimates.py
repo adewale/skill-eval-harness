@@ -4,14 +4,17 @@ The interval is the sign-flip test inverted, so it must exclude zero exactly
 when the exact test rejects "no lift". The noise check must say when an eval
 could not have shown a lift at all. A case both arms fail must never be sent
 to suggest-cases for hardening."""
+import bisect
 import itertools
 import json
 import math
 import random
 import statistics
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from helpers import (
     attest_answer_design,
@@ -31,6 +34,23 @@ from findings import CaseFlag
 def thirds(values: list[int]) -> list[float]:
     """Per-case deltas at three repeats per arm, the blog's customer-support shape."""
     return [value / 3 for value in values]
+
+
+def three_value_p(up: int, down: int, zeros: int, shift: float) -> float:
+    """The two-sided sign-flip p-value of ``d - shift`` for ``up`` deltas of
+    +1, ``down`` of -1 and ``zeros`` of 0, counted over how many of each kind
+    are flipped, each count weighted by its binomial coefficients."""
+    n = up + down + zeros
+    observed = abs(up - down - n * shift) - 1e-12
+    hits = 0
+    for i in range(up + 1):
+        for k in range(down + 1):
+            a = (up - 2 * i) - (down - 2 * k)
+            b = (up - 2 * i) + (down - 2 * k)
+            for j in range(zeros + 1):   # j zeros flipped: B gains zeros - 2j
+                if abs(a - shift * (b + zeros - 2 * j)) >= observed:
+                    hits += math.comb(up, i) * math.comb(down, k) * math.comb(zeros, j)
+    return hits / 2 ** n
 
 
 def brute_force_p(deltas: list[float]):
@@ -162,6 +182,40 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
         self.assertFalse(ee.sign_flip_interval([])["bounded"])
         with self.assertRaises(ValueError):
             ee.sign_flip_interval([float("nan"), 1.0])
+
+    def test_a_300_case_exact_interval_takes_few_evaluations(self):
+        # 300 cases: 120 gained a run, 60 lost one, 120 did not move. Equal
+        # deltas group and unchanged cases only spread the pattern weight, so
+        # the path is exact, but each p-value evaluation visited every (pattern
+        # weight, unchanged-case count) pair, and the search bisected 60 times
+        # a side: 122 evaluations and about 1.5 s for one interval.
+        deltas = [1.0] * 120 + [-1.0] * 60 + [0.0] * 120
+        # The deterministic guards: how many evaluations, and how many binary
+        # searches each takes (one per unchanged-case count, not one per
+        # pattern weight as well).
+        with mock.patch.object(ee, "_tail", wraps=ee._tail) as tail, \
+                mock.patch.object(bisect, "bisect_left", wraps=bisect.bisect_left) as search:
+            ee.sign_flip_interval(deltas)
+        self.assertLessEqual(tail.call_count, 60)
+        self.assertLessEqual(search.call_count, tail.call_count * (120 + 1))
+        started = time.perf_counter()
+        interval = ee.sign_flip_interval(deltas)
+        elapsed = time.perf_counter() - started
+        # The endpoints the 60-step search recorded before the change.
+        self.assertEqual((interval["method"], interval["lower"], interval["upper"]),
+                         ("sign-flip-inversion-exact", 0.114865, 0.284848))
+        self.assertLess(elapsed, 0.5)   # about 0.1 s here; generous, not a tight timer
+
+    def test_unchanged_cases_keep_the_interval_exact(self):
+        # An independent count over how many +1, -1 and 0 deltas flip agrees
+        # with the interval on both sides of each endpoint.
+        up, down, zeros = 14, 6, 10
+        interval = ee.sign_flip_interval([1.0] * up + [-1.0] * down + [0.0] * zeros)
+        self.assertEqual(interval["method"], "sign-flip-inversion-exact")
+        for end, inside in ((interval["lower"], 1e-5), (interval["upper"], -1e-5)):
+            with self.subTest(end=end):
+                self.assertGreater(three_value_p(up, down, zeros, end + inside), 0.05)
+                self.assertLessEqual(three_value_p(up, down, zeros, end - inside), 0.05)
 
 
 class NoiseCheckTests(unittest.TestCase):
