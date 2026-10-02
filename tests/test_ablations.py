@@ -901,55 +901,39 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertEqual(reg["evidence"][0]["case"], "c1")
         self.assertEqual(reg["evidence"][0]["assertion"], "detect-weak")
 
-    def test_incomplete_grading_cannot_construct_confirmed_causal_evidence(self):
-        results = []
-        for run_number in range(1, 7):
-            results.append({
-                "case_id": "c1", "variant": "with_skill", "run_number": run_number,
-                "objective_pass_rate": 1.0, "grading_availability": "partial",
-                "assertions": [{"name": "detect-weak", "passed": True}],
-                "qualitative_assertions": [], **self.ws(),
-            })
-            results.append({
-                "case_id": "c1", "variant": "ablation:no-rp", "run_number": run_number,
-                "objective_pass_rate": 0.0, "grading_availability": "partial",
-                "assertions": [{"name": "detect-weak", "passed": False}],
-                "qualitative_assertions": [], **self.prov(),
-            })
-        entry = self.report(self.MANIFEST, results)[0]
-        regression = entry["regressions"][0]
-        self.assertEqual(entry["pairing"]["eligible_pairs"], 0)
-        self.assertEqual(
-            entry["pairing"]["blocked_reason_counts"],
-            {"grading_evidence_incomplete": 6},
-        )
-        self.assertEqual(regression["evidence_class"], "indeterminate")
-        self.assertIsNone(regression["expected_regression_confirmed"])
+    def _pairs(self, ablation_metadata, *, with_skill_metadata=None, ablation="no-rp"):
+        """One flipped, score-dropping with_skill/ablation pair per entry of
+        ablation_metadata (the metadata each ablation run recorded). Six good
+        pairs clear the paired sign-flip floor, so a pair set built here
+        confirms unless something else blocks it."""
+        rows = []
+        for run_number, metadata in enumerate(ablation_metadata, start=1):
+            rows.append({"case_id": "c1", "variant": "with_skill", "run_number": run_number,
+                         "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}],
+                         "qualitative_assertions": [],
+                         "metadata": with_skill_metadata or self.ws()["metadata"]})
+            rows.append({"case_id": "c1", "variant": f"ablation:{ablation}", "run_number": run_number,
+                         "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}],
+                         "qualitative_assertions": [], "metadata": metadata})
+        return rows
 
-    def test_missing_grading_status_cannot_default_to_complete_causal_evidence(self):
-        results = []
-        for run_number in range(1, 7):
-            results.append({
-                "case_id": "c1", "variant": "with_skill", "run_number": run_number,
-                "objective_pass_rate": 1.0,
-                "assertions": [{"name": "detect-weak", "passed": True}],
-                "qualitative_assertions": [], **self.ws(),
-            })
-            results.append({
-                "case_id": "c1", "variant": "ablation:no-rp", "run_number": run_number,
-                "objective_pass_rate": 0.0,
-                "assertions": [{"name": "detect-weak", "passed": False}],
-                "qualitative_assertions": [], **self.prov(),
-            })
-        entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
-        regression = entry["regressions"][0]
-        self.assertEqual(entry["pairing"]["eligible_pairs"], 0)
-        self.assertEqual(
-            entry["pairing"]["blocked_reason_counts"],
-            {"grading_evidence_incomplete": 6},
-        )
-        self.assertEqual(regression["evidence_class"], "indeterminate")
-        self.assertIsNone(regression["expected_regression_confirmed"])
+    def test_grading_that_is_not_complete_cannot_confirm(self):
+        # A partial grade, or a row that never states its grading status, is
+        # not complete evidence; it must not default to complete.
+        provenance = self.prov()["metadata"]
+        for label, grading in (("partial", {"grading_availability": "partial"}),
+                               ("unstated", {})):
+            with self.subTest(grading=label):
+                results = [{**row, **grading} for row in self._pairs([provenance] * 6)]
+                entry = sb.build_ablation_regression_report(self.MANIFEST, results)[0]
+                regression = entry["regressions"][0]
+                self.assertEqual(entry["pairing"]["eligible_pairs"], 0)
+                self.assertEqual(
+                    entry["pairing"]["blocked_reason_counts"],
+                    {"grading_evidence_incomplete": 6},
+                )
+                self.assertEqual(regression["evidence_class"], "indeterminate")
+                self.assertIsNone(regression["expected_regression_confirmed"])
 
     def test_blocked_cited_repetition_prevents_answer_causal_confirmation(self):
         results = []
@@ -1163,15 +1147,18 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertFalse(reg["expected_regression_confirmed"])
 
     def test_invalid_skill_never_confirms_behavioral_regression(self):
-        manifest = {"skill_name": "s", "skill_paths": ["x"], "ablations": [{"id": "no-desc", "invalid_skill": True, "removed_component": "d", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}, "expected_regressions": [{"summary": "x", "cases": ["c1"], "assertions": ["a"]}]}]}
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "a", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-desc", "objective_pass_rate": 0.0, "assertions": [{"name": "a", "passed": False}], "qualitative_assertions": [], **self.prov(manifest)},
-        ]
+        # Six verified, flipped, score-dropping pairs: a valid ablation with this
+        # evidence confirms, so only the invalid-skill rule can withhold it.
+        manifest = {"skill_name": "s", "skill_paths": ["x"], "ablations": [{"id": "no-desc", "invalid_skill": True, "removed_component": "d", "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}, "expected_regressions": [{"summary": "x", "cases": ["c1"], "assertions": ["detect-weak"]}]}]}
+        results = self._pairs([self.prov(manifest)["metadata"]] * 6, ablation="no-desc")
         entry = self.report(manifest, results)[0]
+        self.assertTrue(entry["invalid_skill"])
         self.assertTrue(entry["provenance_verified"])             # invalid_skill mode verifies as such
         reg = entry["regressions"][0]
+        self.assertTrue(reg["significance"]["significant_at_0_05"])
+        self.assertEqual(reg["evidence_class"], "indeterminate")
         self.assertIsNone(reg["expected_regression_confirmed"])   # parser rejection != behavioral evidence
+        self.assertIn("invalid-skill experiment", reg["note"])
 
     def test_missing_output_ablation_row_never_confirms_regression(self):
         # The ablation arm produced NO output (the run failed/never ran). Its
@@ -1269,90 +1256,53 @@ class AblationRegressionReportTests(unittest.TestCase):
         self.assertEqual(reg["confirmed_cases"], [])              # but no single case had both
         self.assertFalse(reg["expected_regression_confirmed"])
 
-    def test_confirmation_blocked_when_provenance_missing(self):
-        # A genuine flip + score drop, but NO run recorded ablation provenance: we
-        # cannot prove a materialized tree was mounted, so we must not confirm.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": []},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        reg = entry["regressions"][0]
-        self.assertIsNone(reg["expected_regression_confirmed"])    # not confirmed despite the flip
-        self.assertIn("provenance unverified", reg["note"])
+    def test_unverified_provenance_blocks_an_otherwise_significant_confirmation(self):
+        # Six verified, flipped, score-dropping pairs confirm (the control). Each
+        # provenance defect alone must turn that into INDETERMINATE and name the
+        # verifier's reason. A single shot cannot confirm, so it cannot show a
+        # block either.
+        good = self.prov()["metadata"]
 
-    def test_confirmation_blocked_when_a_measured_run_lacks_provenance(self):
-        # One ablation run records provenance, a SECOND measured run does not. The
-        # unprovenanced run could be driving the rate, so confirmation is blocked.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": []},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("recorded no provenance", entry["provenance_note"])
+        def recorded(**over):
+            return self.prov(**over)["metadata"]
 
-    def test_confirmation_blocked_when_recorded_mode_is_instruction_simulated(self):
-        # The run actually mounted the FULL skill (mode instruction_simulated), so a
-        # measured drop is not evidence the materialized ablation caused it.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(mode="instruction_simulated")},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("mode", entry["provenance_note"])
-        self.assertIsNone(entry["regressions"][0]["expected_regression_confirmed"])
-
-    def test_confirmation_blocked_when_recorded_provenance_is_malformed(self):
-        # A runner recorded an ablation provenance missing skill_hash. The strict
-        # JSON-boundary parser rejects it, but the report must DEGRADE (block the
-        # confirmation with a note) rather than crash with an unhandled parse error.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(skill_hash=None)},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("malformed", entry["provenance_note"])
-        self.assertIsNone(entry["regressions"][0]["expected_regression_confirmed"])
-
-    def test_confirmation_blocked_when_with_skill_revision_differs(self):
-        # The with_skill arm recorded a DIFFERENT canonical hash than the ablation's
-        # parent: the two arms were built from different skill revisions.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws(parent="OTHER-REVISION")},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov()},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("different skill revisions", entry["provenance_note"])
-
-    def test_confirmation_blocked_when_component_target_differs(self):
-        # The recorded component targets a different heading than the manifest declares.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [],
-             **self.prov(components=[{"class": "instructions", "mechanism": "section", "skill_root": "skills/good-pr/SKILL.md", "target": {"heading": "## A DIFFERENT SECTION"}}])},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("components", entry["provenance_note"])
-
-    def test_confirmation_blocked_when_runs_disagree_on_tree(self):
-        # Two ablation runs report different skill_hash: they didn't mount the same
-        # tree, so the paired comparison is unsound.
-        results = [
-            {"case_id": "c1", "variant": "with_skill", "objective_pass_rate": 1.0, "assertions": [{"name": "detect-weak", "passed": True}], "qualitative_assertions": [], **self.ws()},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(skill_hash="AAA")},
-            {"case_id": "c1", "variant": "ablation:no-rp", "objective_pass_rate": 0.0, "assertions": [{"name": "detect-weak", "passed": False}], "qualitative_assertions": [], **self.prov(skill_hash="BBB")},
-        ]
-        entry = self.report(self.MANIFEST, results)[0]
-        self.assertFalse(entry["provenance_verified"])
-        self.assertIn("skill_hash mismatch", entry["provenance_note"])
-        self.assertIsNone(entry["regressions"][0]["expected_regression_confirmed"])
+        other_target = [{"class": "instructions", "mechanism": "section",
+                         "skill_root": "skills/good-pr/SKILL.md",
+                         "target": {"heading": "## A DIFFERENT SECTION"}}]
+        defects = {
+            # label: (each ablation run's metadata, with_skill metadata, reason)
+            "no run recorded provenance": (
+                [{}] * 6, None, "no run recorded ablation provenance"),
+            "one measured run recorded none": (
+                [good] * 5 + [{}], None, "1 of 6 measured ablation run(s) recorded no provenance"),
+            "an instruction-simulated record": (
+                [recorded(mode="instruction_simulated")] * 6, None, "malformed"),
+            "an invalid-skill record for a valid ablation": (
+                [recorded(mode="invalid_skill")] * 6, None,
+                "recorded mode 'invalid_skill' != expected 'materialized'"),
+            "a record without skill_hash": (
+                [recorded(skill_hash=None)] * 6, None, "malformed"),
+            "with_skill built from another revision": (
+                [good] * 6, {"skill_tree_hash": "OTHER-REVISION"}, "different skill revisions"),
+            "a different component target": (
+                [recorded(components=other_target)] * 6, None, "recorded components"),
+            "runs that mounted different trees": (
+                [recorded(skill_hash="AAA")] * 3 + [recorded(skill_hash="BBB")] * 3, None,
+                "skill_hash mismatch"),
+        }
+        control = self.report(self.MANIFEST, self._pairs([good] * 6))[0]
+        self.assertTrue(control["provenance_verified"])
+        self.assertTrue(control["regressions"][0]["expected_regression_confirmed"])
+        for label, (ablation_metadata, with_skill_metadata, reason) in defects.items():
+            with self.subTest(label):
+                entry = self.report(self.MANIFEST, self._pairs(
+                    ablation_metadata, with_skill_metadata=with_skill_metadata))[0]
+                reg = entry["regressions"][0]
+                self.assertFalse(entry["provenance_verified"])
+                self.assertIn(reason, entry["provenance_note"])
+                self.assertEqual(reg["note"], f"provenance unverified: {entry['provenance_note']}")
+                self.assertEqual(reg["evidence_class"], "indeterminate")
+                self.assertIsNone(reg["expected_regression_confirmed"])
 
 
 class AblationCoverageTests(unittest.TestCase):
@@ -1531,10 +1481,6 @@ class AblationSpecCompletenessTests(unittest.TestCase):
             self.assertIn("ablation-no-expected-regression", kinds)
             self.assertIn("ablation-unknown-case", kinds)
             self.assertIn("ablation-unknown-assertion", kinds)
-
-    def test_regression_report_tags_invalid_skill(self):
-        manifest = {"skill_name": "s", "skill_paths": ["x"], "ablations": [{"id": "no-desc", "removed_component": "d", "invalid_skill": True, "mechanism": "frontmatter_field", "class": "discovery", "target": {"field": "description"}, "expected_regressions": []}]}
-        self.assertTrue(sb.build_ablation_regression_report(manifest, [])[0]["invalid_skill"])
 
 
 class AblationLiveExecutionTests(unittest.TestCase):
