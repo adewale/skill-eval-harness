@@ -13,8 +13,10 @@ These tests close those holes:
   failing command;
 * ``CollectionParityCheckTests`` feed ``scripts/check_test_collection_parity.py``
   planted pytest-only and unittest-only tests;
-* ``SkipLedgerTests`` require every skip to be ledgered with its reason, and
-  each live smoke to run exactly when its documented variable is set.
+* ``SkipLedgerTests`` require every skip to be ledgered with its reason (a
+  runtime skip with the test that holds it and the one capability call its
+  ``try`` guards), and each live smoke to run exactly when its documented
+  variable is set and never to return early.
 
 Each rule has a teeth test: a planted violation it must report.
 """
@@ -387,10 +389,17 @@ PLATFORM_SKIPS = {
     "process-group cleanup requires POSIX": lambda: not hasattr(os, "killpg"),
 }
 
-# Runtime skips (skipTest / SkipTest / pytest.skip) per test file. Each must be
-# a capability probe that cannot hide a product failure: the two Jetty journal
-# skips fire only when the OS cannot create a symlink.
-RUNTIME_SKIP_SITES = {"test_jetty_attempt_journal.py": 2}
+# Runtime skips (skipTest / SkipTest / pytest.skip), keyed by the test that
+# holds them, with the one call the guarding ``try`` may make. Each skip must
+# sit in that try's ``except`` and the try body must be that call alone, so the
+# skip is a capability probe that cannot hide a product failure: the two Jetty
+# journal skips fire only when the OS cannot create a symlink.
+RUNTIME_SKIP_SITES = {
+    "test_jetty_attempt_journal.JettyAttemptJournalTests."
+    "test_journal_symlink_alias_uses_the_same_lock_identity": "symlink_to",
+    "test_jetty_attempt_journal.JettyAttemptJournalTests."
+    "test_lock_symlink_is_rejected_without_modifying_its_target": "symlink_to",
+}
 
 
 def iter_tests(suite):
@@ -474,37 +483,75 @@ def is_runtime_skip(node: ast.AST) -> bool:
     return False
 
 
-def runtime_skip_sites(source: str) -> list[tuple[str, int]]:
-    """(enclosing class or function, line) of each runtime skip."""
+def runtime_skip_sites(tree: ast.AST) -> list[tuple[str, int, list[ast.stmt] | None]]:
+    """(enclosing class or function, line, guard) of each runtime skip, where
+    guard is the body of the ``try`` whose ``except`` holds the skip, or None."""
     sites = []
 
-    def visit(node, owner):
+    def visit(node, owner, guard):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            owner, guard = (f"{owner}.{node.name}" if owner else node.name), None
+        if is_runtime_skip(node):
+            sites.append((owner, node.lineno, guard))
         for child in ast.iter_child_nodes(node):
-            name = owner
-            if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                name = f"{owner}.{child.name}" if owner else child.name
-            if is_runtime_skip(child):
-                sites.append((name, child.lineno))
-            visit(child, name)
+            in_handler = isinstance(node, ast.Try) and any(child is h for h in node.handlers)
+            visit(child, owner, node.body if in_handler else guard)
 
-    visit(ast.parse(source), "")
+    visit(tree, "", None)
     return sites
 
 
-def runtime_skip_violations(sources: dict[str, str], allowed: dict[str, int],
+def guards_only(guard: list[ast.stmt] | None, call: str) -> bool:
+    """Whether a ``try`` body is one ``something.call(...)`` statement."""
+    return (guard is not None and len(guard) == 1 and isinstance(guard[0], ast.Expr)
+            and isinstance(guard[0].value, ast.Call)
+            and isinstance(guard[0].value.func, ast.Attribute)
+            and guard[0].value.func.attr == call)
+
+
+def returns_in(function: ast.AST) -> list[int]:
+    """Lines of the ``return`` statements in a function's own body."""
+    lines = []
+    for child in ast.iter_child_nodes(function):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(child, ast.Return):
+            lines.append(child.lineno)
+        lines.extend(returns_in(child))
+    return lines
+
+
+def runtime_skip_violations(sources: dict[str, str], allowed: dict[str, str],
                             live: dict[str, str]) -> list[str]:
+    """Every runtime skip or early return that can turn a failing test into a pass."""
     found = []
     smoke_classes = {test_id.rsplit(".", 1)[0] for test_id in live}
+    seen = set()
     for filename, source in sorted(sources.items()):
-        sites = runtime_skip_sites(source)
         module = filename.removesuffix(".py")
-        for owner, line in sites:
-            if any(f"{module}.{owner}".startswith(cls) for cls in smoke_classes):
+        tree = ast.parse(source)
+        for owner, line, guard in runtime_skip_sites(tree):
+            test = f"{module}.{owner}"
+            seen.add(test)
+            if any(test.startswith(cls) for cls in smoke_classes):
                 found.append(f"{filename}:{line}: a live smoke skips at run time ({owner}); "
                              "once its variable is set it must fail, not skip")
-        if len(sites) != allowed.get(filename, 0):
-            found.append(f"{filename}: {len(sites)} runtime skip(s) {sites}, "
-                         f"ledger allows {allowed.get(filename, 0)}")
+            elif test not in allowed:
+                found.append(f"{filename}:{line}: unledgered runtime skip in {owner}")
+            elif not guards_only(guard, allowed[test]):
+                found.append(f"{filename}:{line}: the runtime skip in {owner} must sit in the "
+                             f"except of a try whose only statement calls .{allowed[test]}()")
+        methods = {f"{cls.name}.{fn.name}": fn for cls in tree.body if isinstance(cls, ast.ClassDef)
+                   for fn in cls.body if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for test_id in sorted(live):
+            owner = test_id.removeprefix(module + ".")
+            if test_id.startswith(module + ".") and owner in methods:
+                for line in returns_in(methods[owner]):
+                    found.append(f"{filename}:{line}: a live smoke returns early ({owner}); "
+                                 "once its variable is set it must fail, not pass")
+    for test in sorted(set(allowed) - seen):
+        if f"{test.split('.', 1)[0]}.py" in sources:
+            found.append(f"{test}: ledgered runtime skip no longer exists")
     return found
 
 
@@ -582,10 +629,63 @@ class SkipLedgerTests(unittest.TestCase):
             self.assertEqual(enablement_violations(Path(td), {smoke: "RUN_PLANTED_SMOKE"}), [])
             violations = runtime_skip_violations({"test_planted.py": path.read_text(encoding="utf-8")},
                                                  {}, {smoke: "RUN_PLANTED_SMOKE"})
-        self.assertEqual(len(violations), 2, violations)
-        self.assertIn("a live smoke skips at run time (PlantedSmokeTests.test_live)", violations[0])
-        self.assertIn("2 runtime skip(s)", violations[1])
-        self.assertIn("('OrdinaryTests.test_symlink', 22)", violations[1])
+        self.assertEqual(violations, [
+            ("test_planted.py:10: a live smoke skips at run time (PlantedSmokeTests.test_live); "
+             "once its variable is set it must fail, not skip"),
+            "test_planted.py:22: unledgered runtime skip in OrdinaryTests.test_symlink",
+        ])
+
+    PLANTED_RUNTIME = """
+        import shutil
+        import unittest
+
+        class PlantedSmokeTests(unittest.TestCase):
+            def test_live(self):
+                def installed():
+                    return shutil.which("planted-cli")
+                if not installed():
+                    return
+                self.assertTrue(installed())
+
+        class JournalTests(unittest.TestCase):
+            def test_capability_probe(self):
+                try:
+                    self.path.symlink_to(self.target)
+                except OSError as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
+                self.assertTrue(self.lock())
+
+            def test_skip_wraps_the_product_call(self):
+                self.path.symlink_to(self.target)
+                try:
+                    self.assertTrue(self.lock())
+                except AssertionError as exc:
+                    self.skipTest(f"lock rejection unavailable: {exc}")
+
+            def test_probe_and_product_call_share_the_try(self):
+                try:
+                    self.path.symlink_to(self.target)
+                    self.assertTrue(self.lock())
+                except (OSError, AssertionError) as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
+    """
+
+    def test_planted_runtime_skips_and_early_returns_are_reported(self):
+        journal = "test_planted.JournalTests."
+        allowed = {journal + name: "symlink_to" for name in (
+            "test_capability_probe", "test_skip_wraps_the_product_call",
+            "test_probe_and_product_call_share_the_try", "test_removed")}
+        violations = runtime_skip_violations(
+            {"test_planted.py": textwrap.dedent(self.PLANTED_RUNTIME)}, allowed,
+            {"test_planted.PlantedSmokeTests.test_live": "RUN_PLANTED_SMOKE"})
+        guard = "must sit in the except of a try whose only statement calls .symlink_to()"
+        self.assertEqual(violations, [
+            f"test_planted.py:26: the runtime skip in JournalTests.test_skip_wraps_the_product_call {guard}",
+            f"test_planted.py:33: the runtime skip in JournalTests.test_probe_and_product_call_share_the_try {guard}",
+            ("test_planted.py:10: a live smoke returns early (PlantedSmokeTests.test_live); "
+             "once its variable is set it must fail, not pass"),
+            "test_planted.JournalTests.test_removed: ledgered runtime skip no longer exists",
+        ])
 
 
 if __name__ == "__main__":
