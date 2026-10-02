@@ -6106,6 +6106,11 @@ def discover_case_model_roots(runs: Path, case_id: str, variants: list[str]) -> 
     return roots or [(None, base)]
 
 
+class RunLayoutError(ValueError):
+    """A runs directory whose run-N layout cannot be read. main() reports it
+    as one FAIL line naming the directory, not a traceback."""
+
+
 def discover_run_bases_under(base: Path) -> list[tuple[int, Path]]:
     """Run-instance discovery for one case/variant directory (either
     <case>/<variant> or <case>/<model>/<variant>)."""
@@ -6117,18 +6122,18 @@ def discover_run_bases_under(base: Path) -> list[tuple[int, Path]]:
         if child.is_dir() and child.name.startswith("run-"):
             match = re.fullmatch(r"run-([1-9]\d*)", child.name)
             if match is None:
-                raise ValueError(f"invalid run directory name: {child.name}")
+                raise RunLayoutError(f"invalid run directory name: {child.name}")
             n = int(match.group(1))
             if n in seen_numbers:
-                raise ValueError(f"duplicate run identity under {base}: {n}")
+                raise RunLayoutError(f"duplicate run identity under {base}: {n}")
             seen_numbers.add(n)
             run_dirs.append((n, child))
     if run_dirs:
         if any((base / name).exists() for name in OUTPUT_FILE_ALIASES):
-            raise ValueError(f"mixed root and run-N output layouts under {base}")
+            raise RunLayoutError(f"mixed root and run-N output layouts under {base}")
         expected = set(range(1, max(seen_numbers) + 1))
         if seen_numbers != expected:
-            raise ValueError(f"non-contiguous run identities under {base}")
+            raise RunLayoutError(f"non-contiguous run identities under {base}")
         return sorted(run_dirs, key=lambda x: x[0])
     return [(1, base)]
 
@@ -6209,14 +6214,14 @@ def discover_turn_bases(base: Path) -> list[tuple[int, Path]]:
         if child.is_dir() and child.name.startswith("turn-"):
             m = re.fullmatch(r"turn-([1-9]\d*)", child.name)
             if m is None:
-                raise ValueError(f"invalid turn directory name: {child.name}")
+                raise RunLayoutError(f"invalid turn directory name: {child.name}")
             number = int(m.group(1))
             if number in seen:
-                raise ValueError(f"duplicate turn identity under {base}: {number}")
+                raise RunLayoutError(f"duplicate turn identity under {base}: {number}")
             seen.add(number)
             found.append((number, child))
     if seen and seen != set(range(1, max(seen) + 1)):
-        raise ValueError(f"non-contiguous turn identities under {base}")
+        raise RunLayoutError(f"non-contiguous turn identities under {base}")
     return sorted(found)
 
 
@@ -21388,9 +21393,12 @@ def main() -> int:
         raise RuntimeError(
             f"CLI commands have no handler: {sorted(item.value for item in missing)}")
     answer_handler = answer_handlers.get(invocation.command.value)
-    if answer_handler is not None:
-        return answer_handler(args)
-    return builtin_handlers[invocation.command](args)
+    try:
+        if answer_handler is not None:
+            return answer_handler(args)
+        return builtin_handlers[invocation.command](args)
+    except RunLayoutError as exc:
+        die(str(exc))
 
 
 if __name__ == "__main__":

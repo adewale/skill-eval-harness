@@ -878,6 +878,22 @@ class SkillBenchmarkTests(unittest.TestCase):
                 list(sb.paired_run_bases(
                     runs, "case", "with_skill", "without_skill"))
 
+    def test_a_missing_middle_run_is_a_fail_line_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = self.make_manifest(root)
+            runs = root / "repo" / "eval-runs" / "latest"
+            for variant in ("with_skill", "without_skill"):
+                for run in ("run-1", "run-3"):
+                    base = runs / "case-1" / variant / run
+                    base.mkdir(parents=True)
+                    (base / "output.md").write_text("alpha beta", encoding="utf-8")
+            code, _, stderr = run_cli("benchmark", manifest, "--runs", runs,
+                                      "--out", root / "benchmark.json")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL: non-contiguous run identities under", stderr)
+        self.assertNotIn("Traceback", stderr)
+
     def test_token_overhead_reports_missing_and_unscorable_pairs_as_blocked(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
