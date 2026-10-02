@@ -1640,6 +1640,35 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             self.assertTrue(text.startswith(f"{sb.CODEX_FAILURE}: provider produced no final answer"), text)
             self.assertFalse(sb.execution_valid(sb.read_metrics_base(base), text))
 
+    def test_vibe_run_says_its_output_carries_no_stop_reason(self):
+        # Vibe's --output streaming writes one LLMMessage per line (Vibe 2.22,
+        # vibe/core/output_formatters.py); none of its fields says why the
+        # model stopped, and a turn or price limit exits 1 instead. So the
+        # stop is unavailable, and the record says why rather than guessing.
+        message = {"content": None, "images": None, "injected": False, "reasoning_content": None,
+                   "reasoning_state": None, "reasoning_signature": None,
+                   "reasoning_message_id": None, "tool_calls": None, "name": None,
+                   "tool_call_id": None, "message_id": "m1", "user_display_content": None}
+        stream = [{**message, "role": "user", "content": "Task prompt"},
+                  {**message, "role": "assistant", "content": "alpha", "message_id": "m2"}]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, tasks, run_dir = write_with_skill_task(root)
+            fake_vibe = root / "fake_vibe.py"
+            fake_vibe.write_text(
+                "import json\n"
+                f"for message in {stream!r}:\n"
+                "    print(json.dumps(message))\n", encoding="utf-8")
+            code, _, stderr = run_cli(
+                "run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", root / "runs",
+                "--model", "devstral-small-latest", "--vibe-cmd", f"{sys.executable} {fake_vibe}")
+            meta = sb.read_metrics_base(root / "runs" / run_dir)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual((meta["stop_class"], meta["stop_reason"], meta["stop_source"]),
+                         ("unavailable", None, "vibe output carries no stop reason"))
+        self.assertEqual(meta["served_model_check"], "unavailable")
+        self.assertTrue(am.execution_valid(meta, "alpha"))
+
 
 class TraceDialectRegistryTests(unittest.TestCase):
     """ONE registry of per-provider trace semantics — how raw records flatten

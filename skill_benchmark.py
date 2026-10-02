@@ -10326,7 +10326,12 @@ class VibeBackend(AgentBackend):
             auto_approve=True,
         )
         env = dict(result.get("environment") or {})
+        # Vibe's programmatic output (LLMMessage records through 2.22, public
+        # history entries from 2.23) names no finish or stop reason, and a
+        # turn, price or token limit exits 1 instead. Say so rather than guess.
+        stop = StopObservation.unavailable("vibe output carries no stop reason")
         return RunnerOutcome(
+            metadata_extra=stop.as_metadata(),
             provider="vibe", answer=result.get("answer") or "",
             returncode=result.get("returncode"), timed_out=bool(result.get("timed_out", False)),
             invocation_state=result.get("invocation_state"),

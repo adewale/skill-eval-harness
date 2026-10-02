@@ -177,8 +177,9 @@ Read `stop_class` first, because a clean exit code does not prove the answer fin
   assertion, only in `observed.taxonomy` and `observed.review_queue`.
 - `refused`: the model declined. The run is still graded, so its zero is a refusal
   rather than a capability miss, and the benchmark's `run_endings` block counts it.
-- `unavailable`: the runner exposes no stop signal. Codex, Vibe, the subagent runner,
-  and Jetty all record this, and so does this stub. Read the tail of `output.md`; an
+- `unavailable`: the runner exposes no stop signal. Codex, Vibe, Jetty, and an
+  `--agent-cmd` subagent that reports no `stop_class` record this, and so does this stub;
+  `stop_source` says why. Read the tail of `output.md`; an
   answer that ends mid-sentence was probably cut off.
 
 Then check `served_model_check`: a `mismatch` means a different model answered than
