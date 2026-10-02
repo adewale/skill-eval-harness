@@ -280,7 +280,8 @@ arms, and only a guard at the floor counts against it.
 variance, but low variance is a means. A lift eval needs its noise floor below the smallest
 lift you would ship, counted in the unit the test uses, which is cases, not runs
 ([The noise floor](#the-noise-floor)). `noise_check` makes that comparison when you pass
-`--min-lift`, and `underpowered-eval` fires when its verdict is anything but `resolvable`.
+`--min-lift`, and `underpowered-eval` fires when its verdict is anything but `resolvable` or
+`no-data` (no paired units, so nothing to resolve).
 
 **5. The arms differ only in the skill.** The post folds "effort applied consistently" into
 its variance mark. For a lift eval it is a mark of its own and a wider one, because whatever
