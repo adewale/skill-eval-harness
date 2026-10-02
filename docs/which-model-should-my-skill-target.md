@@ -37,7 +37,8 @@ python3 $H benchmark evals/shared-benchmark.json --runs /tmp/model-runs \
 ```
 
 The `judge` step grades `c-review`'s `actionable-review` assertion with the demo's offline
-stub judge. Without it the report is partial and every `ranking` entry reads `null`.
+stub judge. Without it the report is partial and every `ranking` entry's `lift`,
+`with_skill`, and `without_skill` read `null`.
 
 `prepare` emitted **12 rows** — 2 answer cases × 2 variants × 3 models — and stamped
 each with a `model` and a model-segmented `run_dir` (`c-review/haiku/with_skill`, …).
