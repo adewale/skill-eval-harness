@@ -33,7 +33,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from helpers import assert_dies, run_cli
+from helpers import assert_dies, claude_streams_ending_after_result, run_cli
 
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
@@ -1023,6 +1023,23 @@ class ClaudeDetectionTests(unittest.TestCase):
         self.assertIsNone(result.provider_error)
         detection = self._adapter().detect(result, ["probe-plugin:tidy-commit"], [])
         self.assertEqual(detection.legacy_evidence, ["Skill tool invoked: probe-plugin:tidy-commit"])
+        # Every recording that continues after `result` is a complete
+        # observation too; the skills it invoked are read off the stream itself.
+        for source, text in claude_streams_ending_after_result():
+            invoked = [str(block["input"]["skill"])
+                       for record in map(json.loads, filter(str.strip, text.splitlines()))
+                       if record.get("type") == "assistant"
+                       for block in record["message"]["content"]
+                       if block.get("type") == "tool_use" and block.get("name") == "Skill"]
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as td, \
+                 mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(
+                     lambda plan, text=text: completed_invocation(text))), \
+                 mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
+                result = tm.ClaudeAdapter().invoke("q", None, Path(td) / "run", 1)
+                self.assertIs(result.state, InvocationState.COMPLETE, result.provider_error)
+                self.assertIsNone(result.provider_error)
+                detection = self._adapter().detect(result, invoked, [])
+                self.assertEqual(detection.legacy_evidence, [f"Skill tool invoked: {name}" for name in invoked][:5])
 
     def test_skill_tool_called_by_mounted_directory_name_is_trigger_evidence(self):
         # Claude Code 2.1.269 invokes a project skill by the directory it is
