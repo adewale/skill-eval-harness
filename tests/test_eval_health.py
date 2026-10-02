@@ -9,7 +9,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import attest_answer_design, demo_manifest, run_cli, write_demo_manifest
+from helpers import (
+    attest_answer_design,
+    demo_manifest,
+    judge_with_stub,
+    run_cli,
+    write_demo_manifest,
+)
 
 import skill_benchmark as sb
 from findings import CaseFlag, FindingKind
@@ -149,6 +155,31 @@ class ReadinessGateTests(unittest.TestCase):
                 self.assertEqual([line.split(": ")[1] for line in stderr.splitlines()],
                                  failed_kinds)
 
+
+    def test_a_case_judged_only_by_a_gate_judge_leaves_the_benchmark_complete(self):
+        # validate accepts a case whose only gate is a judge. It has no
+        # objective assertion in either arm, so it is out of scope for the
+        # objective pairing: with every verdict supplied nothing is pending,
+        # and the readiness gate passes.
+        judged = {"id": "judged", "split": "tune", "kind": "behavior", "prompt": "Do it.",
+                  "assertions": [{"name": "quality", "type": "judge", "severity": "gate",
+                                  "rubric": ["Names the first Greek letter"]}]}
+        lift = {"with_skill": "alpha", "without_skill": "none"}
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), [judged, case("b", kind="adversarial")],
+                         {"judged": lift, "b": lift})
+            verdicts = judge_with_stub(fx.path, fx.runs, Path(td) / "verdicts.jsonl",
+                                       passes_on="alpha")
+            code, stderr = fx.cli("--judge-results", verdicts, "--fail-on-blockers")
+            audit = json.loads((fx.path.parent / "audit.json").read_text(encoding="utf-8"))
+            report = sb.build_benchmark_report(fx.path, fx.runs, judge_results_path=str(verdicts))
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(audit["benchmark_availability"], "complete")
+        self.assertEqual(report["incomplete_reasons"], [])
+        self.assertEqual(report["paired_summary"]["pairing"], {
+            "contrast_id": "skill_presence", "eligible_pairs": 1, "blocked_pairs": 0,
+            "blocked_reason_counts": {}, "not_applicable_pairs": 1})
+        self.assertEqual(report["paired_summary"]["absolute_delta"], 1.0)
 
 class KnownAnswerTests(unittest.TestCase):
     def test_a_reference_answer_that_fails_its_own_checks_is_a_grader_finding(self):

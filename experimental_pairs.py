@@ -378,6 +378,10 @@ class PairConstruction(Generic[PayloadT]):
     contrast: ContrastSpec
     pairs: tuple[ExperimentalPair[PayloadT], ...]
     blocked: tuple[BlockedExperimentalPair, ...]
+    # Identities whose two arms both declare nothing the metric measures (a
+    # case with no objective assertion, for an objective rate): out of scope,
+    # so neither paired nor blocked.
+    not_applicable: tuple[ExperimentalPairKey, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.contrast, ContrastSpec):
@@ -390,27 +394,36 @@ class PairConstruction(Generic[PayloadT]):
             isinstance(item, BlockedExperimentalPair) for item in self.blocked
         ):
             raise TypeError("blocked pairs must be a tuple of BlockedExperimentalPair values")
+        if not isinstance(self.not_applicable, tuple) or not all(
+            isinstance(item, ExperimentalPairKey) for item in self.not_applicable
+        ):
+            raise TypeError("not-applicable identities must be a tuple of ExperimentalPairKey values")
         pair_keys = [item.key for item in self.pairs]
         blocked_keys = [item.key for item in self.blocked]
         if any(item.contrast != self.contrast for item in self.pairs):
             raise ValueError("constructed pairs must use the construction contrast")
         if any(item.contrast_id != self.contrast.contrast_id for item in self.blocked):
             raise ValueError("blocked pairs must use the construction contrast")
-        if len(set(pair_keys)) != len(pair_keys) or len(set(blocked_keys)) != len(blocked_keys):
+        if any(len(set(keys)) != len(keys)
+               for keys in (pair_keys, blocked_keys, list(self.not_applicable))):
             raise ValueError("pair construction cannot repeat an experimental identity")
-        if set(pair_keys) & set(blocked_keys):
+        if (set(pair_keys) & set(blocked_keys)
+                or set(self.not_applicable) & (set(pair_keys) | set(blocked_keys))):
             raise ValueError("an experimental identity cannot be paired and blocked")
 
     def diagnostics(self) -> dict[str, Any]:
         reason_counts: dict[str, int] = {}
         for item in self.blocked:
             reason_counts[item.reason] = reason_counts.get(item.reason, 0) + 1
-        return {
+        out: dict[str, Any] = {
             "contrast_id": self.contrast.contrast_id,
             "eligible_pairs": len(self.pairs),
             "blocked_pairs": len(self.blocked),
             "blocked_reason_counts": dict(sorted(reason_counts.items())),
         }
+        if self.not_applicable:
+            out["not_applicable_pairs"] = len(self.not_applicable)
+        return out
 
 
 def construct_pairs(
@@ -418,12 +431,16 @@ def construct_pairs(
     *,
     contrast: ContrastSpec = SKILL_PRESENCE_CONTRAST,
     comparable: Callable[[PayloadT, PayloadT], str | None] | None = None,
+    not_applicable: Callable[[PayloadT], bool] | None = None,
 ) -> PairConstruction[PayloadT]:
     """Build matched pairs and reject duplicate observations for either arm.
 
     ``comparable`` returns a block reason when two eligible arms share an
     identity but ran under conditions that make their difference meaningless
-    (for example, different effort levels)."""
+    (for example, different effort levels). ``not_applicable`` is true of an
+    arm that declares nothing the metric measures; an identity whose two arms
+    are both present and both not applicable is recorded as out of scope
+    instead of blocked. One such arm beside a measured one still blocks."""
     indexed: dict[
         ExperimentalPairKey, dict[ExperimentalArmId, ExperimentalArm[PayloadT]]
     ] = {}
@@ -445,12 +462,16 @@ def construct_pairs(
 
     pairs: list[ExperimentalPair[PayloadT]] = []
     blocked: list[BlockedExperimentalPair] = []
+    out_of_scope: list[ExperimentalPairKey] = []
     for key in sorted(indexed, key=lambda item: (
             item.case_id, item.model or "", item.run_number, item.population.value)):
         slots = indexed[key]
         left = slots.get(contrast.treatment_arm)
         right = slots.get(contrast.control_arm)
-        if left is None:
+        if (left is not None and right is not None and not_applicable is not None
+                and not_applicable(left.payload) and not_applicable(right.payload)):
+            out_of_scope.append(key)
+        elif left is None:
             blocked.append(BlockedExperimentalPair(
                 key, f"missing_{contrast.treatment_arm}", contrast.contrast_id))
         elif right is None:
@@ -467,7 +488,7 @@ def construct_pairs(
             blocked.append(BlockedExperimentalPair(key, reason, contrast.contrast_id))
         else:
             pairs.append(ExperimentalPair(key, contrast, left, right))
-    return PairConstruction(contrast, tuple(pairs), tuple(blocked))
+    return PairConstruction(contrast, tuple(pairs), tuple(blocked), tuple(out_of_scope))
 
 
 def pairs_from_rows(
@@ -476,6 +497,7 @@ def pairs_from_rows(
     population: ExperimentalPopulation,
     eligibility: Callable[[Mapping[str, Any]], tuple[bool, str | None]] | None = None,
     contrast: ContrastSpec = SKILL_PRESENCE_CONTRAST,
+    not_applicable: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> PairConstruction[Mapping[str, Any]]:
     """Parse untrusted result rows into arms, then construct validated pairs."""
     arms: list[ExperimentalArm[Mapping[str, Any]]] = []
@@ -488,4 +510,5 @@ def pairs_from_rows(
         assert isinstance(arm, str)
         arms.append(ExperimentalArm(
             key, ExperimentalArmId(arm), row, eligible, reason))
-    return construct_pairs(arms, contrast=contrast, comparable=contrast.comparability)
+    return construct_pairs(arms, contrast=contrast, comparable=contrast.comparability,
+                           not_applicable=not_applicable)

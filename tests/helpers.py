@@ -701,3 +701,25 @@ def run_cli(*argv: str | Path) -> tuple[int, str, str]:
                 print(exc.code, file=stderr)
             code = exc.code if isinstance(exc.code, int) else int(exc.code is not None)
     return code, stdout.getvalue(), stderr.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# lane M: judge verdicts from the real `judge` command
+# --------------------------------------------------------------------------- #
+
+
+def judge_with_stub(manifest: Path, runs: Path, out: Path, *, passes_on: str) -> Path:
+    """Write judge verdicts for every judge task under `runs` through the real
+    `skill-benchmark judge` command, with a local stub judge (no model) that
+    passes an answer exactly when `passes_on` appears in its prompt."""
+    stub = out.parent / "stub_judge.py"
+    stub.write_text(
+        "import json, sys\n"
+        f"hit = {passes_on!r} in sys.stdin.read()\n"
+        "print(json.dumps({'passed': hit, 'rationale': 'stub'}))\n",
+        encoding="utf-8")
+    code, _, stderr = run_cli("judge", manifest, "--runs", runs,
+                              "--judge-cmd", f"{sys.executable} {stub}", "--out", out)
+    if code != 0:
+        raise AssertionError(f"judge stub failed: {stderr}")
+    return out

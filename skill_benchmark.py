@@ -15221,11 +15221,17 @@ def _metric_pair_construction(results: list[dict[str, Any]], key: str, *,
         if key in {"objective_pass_rate", "combined_pass_rate", "graded_score"} and not 0 <= float(value) <= 1:
             return False, f"invalid_{key}"
         return True, None
+
+    def no_objective_assertions(row: Mapping[str, Any]) -> bool:
+        # A case gated only by judges has no objective rate in either arm: it
+        # is out of scope for the objective pairing, not a missing value.
+        return scorable_run(row) and row.get("objective_total") == 0
     return pair_domain.pairs_from_rows(
         results,
         population=pair_domain.ExperimentalPopulation.ANSWER,
         eligibility=eligibility,
         contrast=contrast,
+        not_applicable=no_objective_assertions if key == "objective_pass_rate" else None,
     )
 
 

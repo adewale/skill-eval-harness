@@ -129,6 +129,10 @@ that file still invalidates trigger identity until those owners are extracted in
   field on a trigger case.
 - `benchmark` output gains `incomplete_reasons`, the root causes behind a `partial` availability. The
   `benchmark-incomplete` readiness blocker names them in its message and evidence.
+- A case with no objective assertion in either arm (gated only by judges) no longer blocks the
+  objective pairing as `missing_objective_pass_rate`. Its pairs are left out of it and counted in
+  `pairing.not_applicable_pairs`, so `paired_summary` can read `complete` where 0.6.0 read
+  `partial`. A pair with a missing or unscorable arm still blocks.
 - `contamination` output gains `coverage`, and `--fail-on-contamination` now fails when an answer
   case arm has no saved output, as well as on a finding. A CI job that ran the gate before the runs
   finished, or over a runs directory missing an arm, starts failing; point it at the complete run.
