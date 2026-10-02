@@ -857,7 +857,7 @@ class ClaudeDetectionTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(source)}, clear=True):
                 result = tm.ClaudeAdapter().invoke("q", "haiku", root / "run", 12)
         self.assertEqual(seen["credentials"], '{"token":"t"}')
-        self.assertTrue(str(seen["config_dir"]).endswith(".trigger-config"))
+        self.assertFalse(seen["config_dir"].is_relative_to(root / "run"))
         self.assertTrue(result.metadata["config_isolated"])
         self.assertNotIn("config_isolation_warning", result.metadata)
 
@@ -877,7 +877,7 @@ class ClaudeDetectionTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(source)}, clear=True):
                 result = tm.ClaudeAdapter().invoke("q", "haiku", workspace, 12)
         self.assertEqual(seen["config_dir"], str(source))
-        self.assertFalse((workspace / ".trigger-config").exists())
+        self.assertFalse(tm.ClaudeAdapter._config_dir(workspace).exists())
         self.assertFalse(result.metadata["config_isolated"])
         self.assertIn("personal config may influence", result.metadata["config_isolation_warning"])
 
@@ -979,6 +979,47 @@ class ClaudeDetectionTests(unittest.TestCase):
             for token in tokens.values():
                 with self.subTest(artifact=name, token=token):
                     self.assertNotIn(token, text)
+
+    def test_copied_claude_credentials_sit_outside_the_working_directory(self):
+        # Claude runs with Read and Glob from its working directory, so the
+        # config dir holding the copied OAuth credentials must not be in it.
+        seen = {}
+
+        def fake_run(plan):
+            config, cwd = Path(dict(plan.environment or {})["CLAUDE_CONFIG_DIR"]), Path(plan.cwd)
+            seen.update({
+                "config": config, "cwd": cwd,
+                "credentials": (config / ".credentials.json").read_text(encoding="utf-8"),
+                "reachable": sorted(path.name for path in cwd.rglob("*")),
+            })
+            return completed_invocation(
+                json.dumps({"type": "result", "subtype": "success", "result": "ok"}) + "\n")
+
+        rows = [{"query_id": "negative", "query": "ordinary chat", "should_trigger": False}]
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)):
+            source = Path(td) / "user-claude"
+            source.mkdir()
+            (source / ".credentials.json").write_text(
+                '{"claudeAiOauth": {"accessToken": "user-oauth-access-token"}}', encoding="utf-8")
+            paths = {}
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(source)}):
+                for arm, ablation in (("baseline", None), ("ablation", "weaker-description")):
+                    report = tm.run_matrix(DEMO_MANIFEST, rows, agents=["claude"], models=["haiku"],
+                                           runs_per_query=1, timeout=30, workers=1, ablation=ablation)
+                    paths[arm] = Path(td) / f"{arm}.json"
+                    paths[arm].write_text(json.dumps(report), encoding="utf-8")
+            code, stdout, stderr = run_cli("trigger-compare", "--baseline", paths["baseline"],
+                                           "--ablation", paths["ablation"])
+        self.assertIn("user-oauth-access-token", seen["credentials"])
+        self.assertFalse(seen["config"].is_relative_to(seen["cwd"]))
+        self.assertNotIn(".credentials.json", seen["reachable"])
+        self.assertFalse(seen["config"].exists(), "the copied config is removed with the cell")
+        self.assertEqual(report["results"][0]["protocol_observation"],
+                         {"config_isolated": True, "claude_config_outside_workdir": True})
+        # trigger-compare requires the same controls the adapter declares.
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["paired"]["blocked"], [])
 
 
 class CodexAdapterTests(unittest.TestCase):

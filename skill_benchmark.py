@@ -14697,7 +14697,8 @@ def _validated_trigger_protocol(
                     f"{label} matrix protocol adapter {agent!r} must use "
                     f"{known_implementation}, got {implementation}")
             known_requirements = {
-                "claude": {"config_isolated": True},
+                "claude": {"config_isolated": True,
+                           "claude_config_outside_workdir": True},
                 "codex": {"codex_home_outside_workdir": True},
                 "pi": {"config_isolated": True, "pi_home_outside_workdir": True},
                 "stub": {},

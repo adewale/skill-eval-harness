@@ -16,9 +16,9 @@ Five adapters ship:
               haiku / sonnet / opus aliases. The skill mounts as a project
               skill; loading is detected from the Skill tool-use event and,
               as a fallback, path evidence of the model reading the mounted
-              SKILL.md. It uses an isolated CLAUDE_CONFIG_DIR when auth can be
-              copied, otherwise preserves the normal Claude config so
-              OAuth/keychain logins still work.
+              SKILL.md. It uses an isolated CLAUDE_CONFIG_DIR beside the
+              workspace when auth can be copied, otherwise preserves the
+              normal Claude config so OAuth/keychain logins still work.
 - `codex`   — Codex CLI (`codex exec --json` by default), with skills mounted
               under an isolated external `$CODEX_HOME/skills` and exposed as a
               skills-only read root. It is detected through the shared
@@ -141,7 +141,6 @@ STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "th
 DEFAULT_CODEX_CMD = CODEX_TRIGGER_DEFAULT_CMD
 CLAUDE_PORTABLE_AUTH_FILES = (".credentials.json",)
 SENSITIVE_WORKSPACE_FILES = (
-    ".trigger-config/.credentials.json",
     ".codex/auth.json",
     ".codex/config.toml",
     ".vibe-home/.env",
@@ -539,9 +538,22 @@ class ClaudeAdapter(AgentAdapter):
         self.claude_bin = claude_bin
         self.max_turns = max_turns
 
+    @staticmethod
+    def _config_dir(workspace: Path) -> Path:
+        # Beside the workspace, not in it: Claude runs with Read and Glob, and
+        # this directory holds the copied OAuth credentials.
+        return workspace.parent / f"{workspace.name}-claude-config"
+
     def mount(self, tree_dir: Path, workspace: Path) -> list[Path]:
         # Project skills: Claude Code discovers <cwd>/.claude/skills on its own.
         return self._mount_tree(tree_dir, workspace / ".claude" / "skills")
+
+    def release(self, workspace: Path) -> None:
+        shutil.rmtree(self._config_dir(workspace), ignore_errors=True)
+
+    def secret_files(self, workspace: Path) -> list[Path]:
+        return [*super().secret_files(workspace),
+                *(self._config_dir(workspace) / name for name in CLAUDE_PORTABLE_AUTH_FILES)]
 
     def protocol_parameters(self) -> dict[str, Any]:
         return {
@@ -549,8 +561,9 @@ class ClaudeAdapter(AgentAdapter):
             "command": executable_identity(self.claude_bin),
             "max_turns": self.max_turns,
             "allowed_tools": ["Skill", "Read", "Glob", "Grep"],
-            "isolation_policy": "isolated config when portable auth exists; otherwise normal config",
-            "required_observations": {"config_isolated": True},
+            "isolation_policy": ("isolated config outside the workdir when portable auth exists; "
+                                 "otherwise normal config"),
+            "required_observations": {"config_isolated": True, "claude_config_outside_workdir": True},
         }
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
@@ -559,7 +572,7 @@ class ClaudeAdapter(AgentAdapter):
         # not file-seedable; pointing CLAUDE_CONFIG_DIR at an empty directory
         # turns a valid login into "not logged in", so preserve the normal CLI
         # config path in that case.
-        config_dir = workspace / ".trigger-config"
+        config_dir = self._config_dir(workspace)
         argv = [self.claude_bin, "-p", query, "--output-format", "stream-json", "--verbose",
                 "--max-turns", str(self.max_turns),
                 "--allowedTools", "Skill", "Read", "Glob", "Grep"]
@@ -575,7 +588,10 @@ class ClaudeAdapter(AgentAdapter):
                 argv, input_text="", cwd=workspace, timeout_s=timeout,
                 environment=env))
         )
-        metadata: dict[str, Any] = {"config_isolated": config_isolated}
+        # Either config dir is outside the workdir: the isolated one beside it,
+        # or the user's own.
+        metadata: dict[str, Any] = {"config_isolated": config_isolated,
+                                    "claude_config_outside_workdir": True}
         if not config_isolated:
             metadata["config_isolation_warning"] = (
                 "Claude OAuth/keychain auth was not portable; preserved the normal Claude config, "
