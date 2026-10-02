@@ -445,6 +445,52 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         self.assertFalse(meta["observation_complete"])
         self.assertEqual(meta["telemetry"]["measurements"]["commands"]["availability"], "unavailable")
 
+    def test_a_token_the_agent_refreshes_during_the_run_is_redacted(self):
+        # Pi and Codex rewrite auth.json in their home when they refresh an
+        # OAuth token. The refreshed token exists only in the run's copy of the
+        # home, never in the user's source auth, and the model echoes it.
+        refreshed = "refreshed-token-written-during-the-run"
+        home_vars = {"pi": "PI_CODING_AGENT_DIR", "codex": "CODEX_HOME"}
+
+        def refreshing(agent):
+            def run(plan):
+                home = Path(dict(plan.environment or {})[home_vars[agent]])
+                (home / "auth.json").write_text(json.dumps({"access_token": refreshed}),
+                                                encoding="utf-8")
+                if agent == "pi":
+                    return completed_invocation(pi_stream({"type": "agent_end", "messages": [
+                        {"role": "assistant", "stopReason": "stop",
+                         "content": [{"type": "text", "text": f"token {refreshed}"}]}]}))
+                return completed_invocation(pi_stream(
+                    {"type": "thread.started", "thread_id": "t"}, {"type": "turn.started"},
+                    {"type": "item.completed", "item": {"id": "item_0", "type": "agent_message",
+                                                        "text": f"token {refreshed}"}},
+                    {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}))
+            return run
+
+        rows = [{"query_id": "negative", "query": "ordinary chat", "should_trigger": False}]
+        for agent, adapter_cls in (("pi", tm.PiAdapter), ("codex", tm.CodexAdapter)):
+            with self.subTest(agent=agent), tempfile.TemporaryDirectory() as td:
+                source = Path(td) / "user-home"
+                source.mkdir()
+                (source / "auth.json").write_text(json.dumps({"access_token": "token-before-refresh"}),
+                                                  encoding="utf-8")
+                traces = Path(td) / "traces"
+                with mock.patch.dict(os.environ, {home_vars[agent]: str(source)}), \
+                     mock.patch.object(adapter_cls, "_run_argv", staticmethod(refreshing(agent))):
+                    report = tm.run_matrix(DEMO_MANIFEST, rows, agents=[agent], models=[None],
+                                           runs_per_query=1, timeout=30, workers=1,
+                                           trace_runs=traces)
+                written = {str(path.relative_to(traces)): path.read_text(encoding="utf-8")
+                           for path in traces.rglob("*") if path.is_file()}
+                written["report"] = json.dumps(report)
+                self.assertTrue(report["results"][0]["observation_complete"])
+                for name, text in written.items():
+                    with self.subTest(artifact=name):
+                        self.assertNotIn(refreshed, text)
+                self.assertTrue(any(name.endswith("trace.jsonl") and "[REDACTED]" in text
+                                    for name, text in written.items()))
+
 
 class StubMatrixOfflineTests(unittest.TestCase):
     def test_every_matrix_adapter_has_an_explicit_trace_dialect(self):
@@ -1211,11 +1257,14 @@ class AgentInvokeSmokeTests(unittest.TestCase):
                     with tempfile.TemporaryDirectory(prefix=f"{agent_name}-invoke-smoke-") as td:
                         workspace = Path(td)
                         tree = tm.build_canonical_skill_tree(repo_root, manifest, workspace / "tree")
-                        copied = adapter.mount(tree, workspace)
-                        result = tm.validate_invoke_result(
-                            agent_name,
-                            adapter.invoke(query, model, workspace, timeout),
-                        )
+                        try:
+                            copied = adapter.mount(tree, workspace)
+                            result = tm.validate_invoke_result(
+                                agent_name,
+                                adapter.invoke(query, model, workspace, timeout),
+                            )
+                        finally:
+                            adapter.release(workspace)
                     row.update({
                         "returncode": result.returncode,
                         "timed_out": result.timed_out,

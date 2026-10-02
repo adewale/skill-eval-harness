@@ -80,6 +80,7 @@ from agent_capabilities import (
 from completion_contracts import StopClass, StopObservation, claude_result_stop
 from content_digests import file_sha256
 from skill_benchmark import (
+    CODEX_HOME_FILES,
     VALID_SPLITS,
     VIBE_DEFAULT_CMD,
     VIBE_READ_ONLY_TOOLS,
@@ -395,8 +396,10 @@ def _secret_values_from_files(paths: Iterable[Path]) -> list[str]:
     return secrets
 
 
-def workspace_secret_values(workspace: Path) -> list[str]:
-    secrets = _secret_values_from_files(workspace / rel for rel in SENSITIVE_WORKSPACE_FILES)
+def cell_secret_values(adapter: AgentAdapter, workspace: Path) -> list[str]:
+    """Secret values in the cell's credential files, read after the run and
+    before release(), so a token the agent refreshed during the run counts."""
+    secrets = _secret_values_from_files(adapter.secret_files(workspace))
     # Longest first handles whole-file redaction before nested token values.
     return sorted({s for s in secrets if s}, key=len, reverse=True)
 
@@ -484,6 +487,11 @@ class AgentAdapter:
     def release(self, workspace: Path) -> None:
         """Remove anything mount() created outside the workspace. Called once
         the cell ends, including when mounting or invoking failed."""
+
+    def secret_files(self, workspace: Path) -> list[Path]:
+        """Files holding the credentials this cell's agent runs with. They are
+        scanned for redaction after invoke() and before release()."""
+        return [workspace / rel for rel in SENSITIVE_WORKSPACE_FILES]
 
     def detect(self, invocation: InvocationOutcome, skill_names: list[str], copied: list[Path]) -> TriggerDetection:
         if isinstance(invocation.provider_payload, PiStream):
@@ -641,6 +649,10 @@ class CodexAdapter(AgentAdapter):
     def release(self, workspace: Path) -> None:
         shutil.rmtree(self._codex_home(workspace), ignore_errors=True)
 
+    def secret_files(self, workspace: Path) -> list[Path]:
+        home = self._codex_home(workspace)
+        return [*super().secret_files(workspace), *(home / name for name in CODEX_HOME_FILES)]
+
     def protocol_parameters(self) -> dict[str, Any]:
         return {
             **super().protocol_parameters(),
@@ -659,14 +671,13 @@ class CodexAdapter(AgentAdapter):
             argv += ["--model", model]
         argv.append(query)
         env, meta = codex_env_for_home(codex_home)
-        try:
-            result = validate_invoke_result(
-                self.name, self._run_argv(ProcessInvocationPlan.from_values(
-                    argv, input_text="", cwd=workspace, timeout_s=timeout,
-                    environment=env))
-            )
-        finally:
-            shutil.rmtree(codex_home, ignore_errors=True)
+        # The home outlives the run until release(): Codex may have refreshed
+        # the token in auth.json, and redaction reads the refreshed value.
+        result = validate_invoke_result(
+            self.name, self._run_argv(ProcessInvocationPlan.from_values(
+                argv, input_text="", cwd=workspace, timeout_s=timeout,
+                environment=env))
+        )
         if result.observation_complete:
             result = result.with_provider_error(
                 codex_stream_protocol_error(result.stdout))
@@ -737,6 +748,9 @@ class PiAdapter(AgentAdapter):
     def release(self, workspace: Path) -> None:
         shutil.rmtree(self._pi_home(workspace), ignore_errors=True)
 
+    def secret_files(self, workspace: Path) -> list[Path]:
+        return [*super().secret_files(workspace), self._pi_home(workspace) / "auth.json"]
+
     def protocol_parameters(self) -> dict[str, Any]:
         return {
             **super().protocol_parameters(),
@@ -750,14 +764,13 @@ class PiAdapter(AgentAdapter):
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
         env = os.environ.copy()
         env["PI_CODING_AGENT_DIR"] = str(self._pi_home(workspace))
-        try:
-            result = validate_invoke_result(
-                self.name,
-                self._run_argv(ProcessInvocationPlan.from_values(
-                    pi_argv(query, model), input_text="", cwd=workspace,
-                    timeout_s=timeout, environment=env)))
-        finally:
-            self.release(workspace)
+        # The home outlives the run until release(): Pi may have refreshed the
+        # OAuth token in auth.json, and redaction reads the refreshed value.
+        result = validate_invoke_result(
+            self.name,
+            self._run_argv(ProcessInvocationPlan.from_values(
+                pi_argv(query, model), input_text="", cwd=workspace,
+                timeout_s=timeout, environment=env)))
         return pi_invocation_outcome(result).with_metadata(
             config_isolated=True, pi_home_outside_workdir=True)
 
@@ -1013,7 +1026,7 @@ def observe_cell_query(
                     f"{adapter.name} mounted skill tree hash {mounted_hash} does not match {expected_hash}")
             names = mounted_skill_names(copied)
             invocation = validate_invoke_result(adapter.name, adapter.invoke(query, model, workspace, timeout))
-            secrets = workspace_secret_values(workspace) + ambient_secret_values()
+            secrets = cell_secret_values(adapter, workspace) + ambient_secret_values()
             detection = adapter.detect(invocation, names, copied)
         finally:
             adapter.release(workspace)
