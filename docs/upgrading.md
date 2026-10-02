@@ -113,6 +113,12 @@ that file still invalidates trigger identity until those owners are extracted in
   the ceiling.
 - `audit-manifest --runs` reports such a case as `floor-eval` instead of `no-lift-eval`, now
   including regression-intent cases, and `suggest-cases` no longer seeds it.
+- A case gated only by judges used to get no `case_flags` entry at all, though readiness could list
+  it in `floor_cases`. It is now flagged on the combined score readiness reads, so it can gain
+  `floor`, `saturated/non-discriminating`, `no objective lift`, `with-skill failure`, `flaky`,
+  `critical-failure` and `below-reference-floor` flags and the audit findings they raise. Every
+  entry gains `signal` (`objective`, or `combined` for such a case), naming the rate its flags
+  and `with_skill`/`without_skill` values read.
 - Readiness moves a case whose combined score is 0 in both arms out of `base_saturated_cases` into
   `floor_cases`, which carries its own blocker. A regression-intent case at the floor used to count in
   `regression_guards_holding`, which never blocks; it now blocks, so

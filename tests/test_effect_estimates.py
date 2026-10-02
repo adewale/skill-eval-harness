@@ -389,6 +389,73 @@ class FloorEndToEndTests(unittest.TestCase):
         self.assertEqual(audit["readiness"]["floor_cases"], [])
         self.assertEqual(audit["readiness"]["qualitative_only_cases"], ["case-1"])
 
+    def test_a_case_gated_only_by_judges_is_flagged_on_the_score_readiness_reads(self):
+        # A judge-only case has no objective rate, so it is outside the
+        # objective pairing. Its flags must come from the combined score that
+        # readiness reads, or readiness lists a floor case no flag or finding
+        # names. Each case below exercises one flag; the stub judge passes an
+        # answer that says "gamma" (score 1.0) and fails the rest (score 0.0).
+        def judge(name, severity):
+            return {"name": name, "type": "judge", "severity": severity,
+                    "rubric": ["Names the third Greek letter"]}
+        outputs = {  # case -> (with_skill runs, without_skill runs)
+            "floor": (["none", "none"], ["none", "none"]),
+            "ceiling": (["gamma", "gamma"], ["gamma", "gamma"]),
+            "flaky": (["gamma", "none"], ["none", "none"]),
+            "critical": (["gamma", "gamma"], ["none", "none"]),
+            "graded": (["none", "none"], ["gamma", "gamma"]),
+        }
+        assertions = {"floor": [judge("quality", "gate")], "ceiling": [judge("quality", "gate")],
+                      "flaky": [judge("quality", "gate")],
+                      "critical": [judge("quality", "critical")],
+                      "graded": [judge("quality", "gate"), judge("polish", "soft")]}
+        cases = [{"id": cid, "split": "tune", "kind": "behavior", "prompt": "Do the task.",
+                  "assertions": assertions[cid],
+                  **({"reference_score": 0.5} if cid == "graded" else {})} for cid in outputs]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_demo_manifest(root, demo_manifest(cases=cases))
+            runs = root / "runs"
+            for cid, arms in outputs.items():
+                for variant, texts in zip(("with_skill", "without_skill"), arms):
+                    for number, text in enumerate(texts, 1):
+                        write_run(runs / cid / variant / f"run-{number}", text)
+            attest_answer_design(path, runs)
+            verdicts = judge_with_stub(path, runs, root / "verdicts.jsonl",
+                                       passes_on="gamma", scored=True)
+            code, _, stderr = run_cli("benchmark", path, "--runs", runs, "--judge-results",
+                                      verdicts, "--out", root / "benchmark.json")
+            self.assertEqual(code, 0, stderr)
+            report = json.loads((root / "benchmark.json").read_text(encoding="utf-8"))
+            code, _, stderr = run_cli("audit-manifest", path, "--runs", runs, "--judge-results",
+                                      verdicts, "--out", root / "audit.json")
+            self.assertEqual(code, 0, stderr)
+            audit = json.loads((root / "audit.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["availability"], "complete")
+        flags = {entry["case_id"]: entry for entry in report["case_flags"]}
+        self.assertEqual({cid: flags[cid]["flags"] for cid in flags}, {
+            "floor": [CaseFlag.FLOOR.value, "no objective lift", "with-skill failure"],
+            "ceiling": ["saturated/non-discriminating", "no objective lift"],
+            "flaky": ["with-skill failure", "flaky repeated pass rates: with_skill"],
+            "critical": ["critical-failure: without_skill (quality)"],
+            "graded": ["no objective lift", "with-skill failure",
+                       "below-reference-floor: polish"],
+        })
+        self.assertEqual({cid: (flags[cid]["with_skill"], flags[cid]["without_skill"])
+                          for cid in flags},
+                         {"floor": (0.0, 0.0), "ceiling": (1.0, 1.0), "flaky": (0.5, 0.0),
+                          "critical": (1.0, 0.0), "graded": (0.0, 1.0)})
+        self.assertEqual({flags[cid]["signal"] for cid in flags}, {"combined"})
+        # Readiness and the flags name the same floor and ceiling cases.
+        self.assertEqual(audit["readiness"]["floor_cases"], ["floor"])
+        self.assertEqual(audit["readiness"]["base_saturated_cases"], ["ceiling"])
+        found = {(finding["kind"], finding["evidence"].get("case_id"))
+                 for finding in audit["findings"] if isinstance(finding.get("evidence"), dict)}
+        self.assertLessEqual({("floor-eval", "floor"), ("saturated-eval", "ceiling"),
+                              ("no-lift-eval", "ceiling"), ("no-lift-eval", "graded"),
+                              ("flaky-eval", "flaky")}, found)
+        self.assertNotIn(("no-lift-eval", "floor"), found)
+
 
 class EstimateTests(unittest.TestCase):
     def test_test_interval_and_noise_come_from_one_set_of_deltas(self):

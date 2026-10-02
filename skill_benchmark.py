@@ -17025,15 +17025,28 @@ def build_benchmark_report(
         case_rows = everything.where(case_id=cid).all
         by_var_case = ResultSet(case_rows).by_variant()
         pairing = _metric_pair_construction(case_rows, "objective_pass_rate")
+        signal = "objective"
+        rate: Callable[[Mapping[str, Any]], float | None] = (
+            lambda row: row.get("objective_pass_rate"))
+        if not pairing.pairs and pairing.not_applicable:
+            # Gated only by judges: no objective rate exists, so every flag
+            # reads the combined score readiness reads, over its pairs.
+            pairing = combined_pair_construction(case_rows)
+            signal, rate = "combined", combined_signal
         if not pairing.pairs:
             continue
         ws_rows = [pair.with_skill.payload for pair in pairing.pairs]
         ns_rows = [pair.without_skill.payload for pair in pairing.pairs]
-        w_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ws_rows)
-        n_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ns_rows)
+        combined_means = combined_arm_means(pairing.pairs)
+        if signal == "objective":
+            w_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ws_rows)
+            n_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ns_rows)
+        elif combined_means is not None:
+            w_rate, n_rate = combined_means
+        else:
+            continue
         flags = []
         extreme = ceiling_or_floor(w_rate, n_rate)
-        combined_means = combined_arm_means(pairing.pairs)
         if (combined_means is not None
                 and ceiling_or_floor(*combined_means) is DiscriminationFailure.FLOOR):
             # Both arms fail every scored run, judges included. That is more
@@ -17054,7 +17067,7 @@ def build_benchmark_report(
         if w_rate is not None and w_rate < 1:
             flags.append(CaseFlag.WITH_SKILL_FAILURE.render())
         for variant, vrows in by_var_case.items():
-            rr = [r["objective_pass_rate"] for r in vrows if r["objective_pass_rate"] is not None]
+            rr = [value for r in vrows if (value := rate(r)) is not None]
             if len(rr) > 1 and len(set(rr)) > 1:
                 flags.append(CaseFlag.FLAKY.render(variant))
             # A critical (absorbing-barrier) failure is surfaced on its own,
@@ -17067,7 +17080,8 @@ def build_benchmark_report(
             flags.append(CaseFlag.BELOW_REFERENCE_FLOOR.render(', '.join(floor_hits)))
         if flags:
             case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate,
-                               "without_skill": n_rate, "pairing": pairing.diagnostics(),
+                               "without_skill": n_rate, "signal": signal,
+                               "pairing": pairing.diagnostics(),
                                "eval_intent": ws_rows[0].get("eval_intent", "capability")})
 
     # 1.7: per case, how much of the pass rate rests on strong oracles. A case
@@ -19606,6 +19620,15 @@ def combined_signal(row: Mapping[str, Any]) -> float | None:
             and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
 
 
+def combined_pair_construction(rows: Iterable[Mapping[str, Any]]) -> _ResultPairConstruction:
+    """The pairs the combined signal is read over: every scorable arm, with
+    no objective rate required, so a case gated only by judges pairs too."""
+    return pair_domain.pairs_from_rows(
+        rows, population=pair_domain.ExperimentalPopulation.ANSWER,
+        eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
+    )
+
+
 def combined_arm_means(pairs: Iterable[_ResultPair]) -> tuple[float, float] | None:
     """Mean combined score per arm over the pairs where both arms have one.
     A case is at the floor when both means are 0 (`ceiling_or_floor`), the
@@ -19639,10 +19662,7 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
     intent: dict[Any, str] = {}
     for row in rows:
         intent.setdefault(row.get("case_id"), row.get("eval_intent", "capability"))
-    pairing = pair_domain.pairs_from_rows(
-        rows, population=pair_domain.ExperimentalPopulation.ANSWER,
-        eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
-    )
+    pairing = combined_pair_construction(rows)
     by_case: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in pairing.pairs:
         by_case[pair.key.case_id].append(pair)
@@ -20192,7 +20212,8 @@ def audit_manifest_report(
                 finding(FindingKind.SATURATED_EVAL, f"Case {flag['case_id']} is saturated/non-discriminating.", flag)
             if (CaseFlag.NO_OBJECTIVE_LIFT in present and CaseFlag.FLOOR not in present
                     and not guard):
-                finding(FindingKind.NO_LIFT_EVAL, f"Case {flag['case_id']} shows no objective lift.", flag)
+                measure = "judge-gated" if flag.get("signal") == "combined" else "objective"
+                finding(FindingKind.NO_LIFT_EVAL, f"Case {flag['case_id']} shows no {measure} lift.", flag)
             if CaseFlag.FLAKY in present:
                 finding(FindingKind.FLAKY_EVAL, f"Case {flag['case_id']} has repeated-run variance.", flag)
         assertion_rows = []

@@ -150,7 +150,7 @@ assumed.
 ### 1.3 Judge config slot and the "judge is not the model under test" guard
 - **Goal:** make an existing convention enforceable.
 - **Abstractions used or changed:** read an optional `judge` block in the manifest; add a check
-  in `audit_manifest_report` (`:20076`) comparing the declared judge model against `jetty.model`
+  in `audit_manifest_report` (`:20096`) comparing the declared judge model against `jetty.model`
   or the run metadata `model`.
 - **Design:** warn by default, error under `--strict-judge`.
 - **Testing:** unit tests for matching and differing model ids.
@@ -167,7 +167,7 @@ assumed.
 - **Status:** `docs/authoring-evals.md` shipped, alongside `architecture.md` and
   `abstractions.md`.
 - **Follow-on:** surface the guide's rules where they are checkable. Extend the messaging in
-  `prompt_assertion_leakage_findings` (`:845`) and `fixture_recommendations` (`:19570`) to point
+  `prompt_assertion_leakage_findings` (`:845`) and `fixture_recommendations` (`:19584`) to point
   at the relevant section.
 - **Testing:** assert the new hint strings appear for crafted manifests.
 
@@ -194,7 +194,7 @@ assumed.
   (`strong` / `demo` / `live`), defaulting by type (deterministic text/process are `strong`,
   `script` is `demo` unless marked, judge/live are `live`). `build_benchmark_report` (`:16968`)
   reports, per case, the share of its pass rate carried by `strong` oracles;
-  `audit_manifest_report` (`:20076`) warns when a case passes only on weak ones. This extends
+  `audit_manifest_report` (`:20096`) warns when a case passes only on weak ones. This extends
   leakage lint (`:164`) from prompts to oracles.
 - **Strongest tier — the rendered-artifact oracle:** the top of the ladder is an oracle that
   builds or renders the artifact and inspects the result, not the source text.
@@ -229,7 +229,7 @@ assumed.
 - **Abstractions used or changed:** reads the cross-run history from 2.6. A `prune` report (or a
   flag in `build_benchmark_report` (`:16968`)) marks a case a removal candidate when, across the
   last N runs, it never failed and never showed lift (`with_skill` == `without_skill` every time).
-  `audit_manifest_report` (`:20076`) lists the candidates; removal stays a human decision.
+  `audit_manifest_report` (`:20096`) lists the candidates; removal stays a human decision.
 - **Design:** the harness suggests, never deletes. A case may be kept deliberately as a
   regression guard even when stale; the report says so rather than acting.
 - **Depends on:** 2.6 (needs run history to judge "never failed over time").
@@ -370,7 +370,7 @@ assumed.
 - **Goal:** watch lift, saturation, and token drift over time.
 - **Abstractions used or changed:** a consumer of `build_benchmark_report`. Add an append-only
   history store and a `trend` subcommand that diffs successive `benchmark.json` files, reusing
-  the `compare_results` (`:18205`) logic.
+  the `compare_results` (`:18219`) logic.
 - **Severity-weighted ranking (from the macro-evals notebook):** when surfacing recurring
   failures across runs, rank them by `prevalence × severity`, not raw count, so a rare but severe
   failure outranks a common trivial one. This is the floor-raising principle made quantitative;
@@ -409,7 +409,7 @@ assumed.
 ### 2.8 Interactive served report and richer artifacts
 - **Goal:** capture feedback in the browser and render image, PDF, and xlsx artifacts, beyond the
   static `render_viewer`.
-- **Abstractions used or changed:** extend `render_viewer` (`:19006`) with a `serve` mode and
+- **Abstractions used or changed:** extend `render_viewer` (`:19020`) with a `serve` mode and
   artifact encoders. Anthropic's `eval-viewer/generate_review.py` is the blueprint, including
   `feedback.json` persistence and a `--previous-workspace` diff.
 - **Testing:** unit-test the artifact embedding and categorization and the feedback round trip;
