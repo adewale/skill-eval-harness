@@ -827,6 +827,25 @@ class ClaudeDetectionTests(unittest.TestCase):
         self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
         self.assertIn("protocol error", result.provider_error or "")
 
+    def test_a_recorded_claude_stream_is_a_complete_observation_with_skill_evidence(self):
+        # Real Claude Code output (tests/fixtures/claude/README.md): system
+        # events, thinking blocks and parent_tool_use_id: null that the
+        # canned fragments above never carry must not fail the protocol checks.
+        recorded = (Path(__file__).parent / "fixtures" / "claude"
+                    / "stream-json.plugin-skill.jsonl").read_text(encoding="utf-8")
+
+        def fake_run(*args, **kwargs):
+            return InvocationOutcome.from_process(stdout=recorded, stderr="", returncode=0, elapsed_ms=1)
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)), \
+             mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
+            result = tm.ClaudeAdapter().invoke("q", None, Path(td), 1)
+        self.assertIs(result.state, InvocationState.COMPLETE)
+        self.assertIsNone(result.provider_error)
+        detection = self._adapter().detect(result, ["probe-plugin:tidy-commit"], [])
+        self.assertEqual(detection.legacy_evidence, ["Skill tool invoked: probe-plugin:tidy-commit"])
+
 
 class CodexAdapterTests(unittest.TestCase):
     """Codex trigger support without a live codex binary."""

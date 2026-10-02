@@ -4,6 +4,7 @@ in the benchmark report."""
 import argparse
 import json
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -410,6 +411,39 @@ class RunClaudeAdapterTests(unittest.TestCase):
             passed, evidence = sb.process_or_efficiency_assertion_result(
                 {"type": "command_ran", "pattern": "npm test"}, base, meta)
             self.assertTrue(passed, evidence)
+
+    def test_run_agent_reads_a_recorded_claude_stream(self):
+        # Real Claude Code output (tests/fixtures/claude/README.md) rather than
+        # the canonical hand-built stream; expected values are read off its
+        # terminal result event.
+        recorded = Path(__file__).parent / "fixtures" / "claude" / "stream-json.plugin-skill.jsonl"
+        records = [json.loads(line) for line in recorded.read_text(encoding="utf-8").splitlines()]
+        served = records[1]["model"]   # the init event names the model that ran
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            _, tasks, run_dir = write_with_skill_task(td)
+            stub = td / "claude"
+            stub.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n"
+                            "assert 'stream-json' in sys.argv\n"
+                            f"sys.stdout.write(open({str(recorded)!r}, encoding='utf-8').read())\n",
+                            encoding="utf-8")
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+            result = run_cli("run-agent", "--agent", "claude", "--tasks", tasks, "--runs", td / "runs",
+                             "--model", served, "--claude-bin", stub)
+            base = td / "runs" / run_dir
+            output = (base / "output.md").read_text(encoding="utf-8")
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(output, records[-1]["result"])
+        self.assertTrue(meta["trace_observation_complete"])
+        self.assertEqual((meta["stop_class"], meta["stop_reason"]), ("completed", "end_turn"))
+        self.assertEqual((meta["served_models"], meta["served_model_check"]), ([served], "match"))
+        self.assertEqual(meta["cost_normalized"]["total_cost"], 0.046597)
+        self.assertEqual(
+            {key: meta["usage_normalized"][key]
+             for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")},
+            {"input_tokens": 4, "output_tokens": 246, "cache_read_tokens": 29905, "cache_write_tokens": 9537})
+        self.assertEqual(meta["skill_invocation_evidence"], ["probe-plugin:tidy-commit Skill"])
 
 
 class ClaudeJudgeAndPanelTests(unittest.TestCase):

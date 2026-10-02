@@ -9,10 +9,15 @@ the first real run.
 """
 import io
 import json
+import tempfile
 import unittest
+import urllib.parse
+import urllib.request
 import zipfile
 from pathlib import Path
 from unittest import mock
+
+from helpers import attest_jetty_payload, jetty_payload, run_cli
 
 import skill_benchmark as sb
 from jetty_contracts import JettyObservation, lifecycle_from_record
@@ -105,6 +110,46 @@ class JettyLiveContractTests(unittest.TestCase):
         self.assertEqual(meta["usage_normalized"]["source"], "provider_reported")
         self.assertEqual(meta["usage_normalized"]["input_tokens"], 4)
         self.assertEqual(meta["cost_normalized"]["source"], "provider_reported")
+
+    def test_run_jetty_completes_a_task_from_the_recorded_responses(self):
+        # The executor tests use FakeJettyClient, whose submit returns a
+        # top-level trajectory_id no captured response has. Here the real
+        # client and executor run against the captured bodies of one run
+        # (bb2bb71e); only the artifact bytes are not recorded.
+        routes = {
+            ("POST", "/v1/chat/completions"): "chat-completion-200-completed.json",
+            ("GET", "/api/v1/db/trajectory/skill-evals/skill-eval-contract-probe/bb2bb71e"):
+                "db-trajectory-completed.json",
+            ("GET", "/api/v1/trajectory/skill-evals/skill-eval-contract-probe/bb2bb71e"):
+                "trajectory-detail-completed.json",
+        }
+        artifact = ("/api/v1/file/skill-evals/skill-eval-contract-probe/0000/"
+                    "bb2bb71e.runbook.0007.app--results--output.md")
+        requested = []
+
+        def recorded_wire(opener, req, timeout=0):
+            route = (req.get_method(), urllib.parse.urlsplit(req.full_url).path)
+            requested.append(route)
+            if route == ("GET", artifact):
+                return _FakeResponse(b"probe ok\n")
+            return _FakeResponse((FIXTURES / routes[route]).read_bytes())
+
+        payload = jetty_payload()
+        payload["jetty_request"]["jetty"].update(collection="skill-evals", task="skill-eval-contract-probe")
+        attest_jetty_payload(payload)
+        with tempfile.TemporaryDirectory() as td:
+            payloads, out = Path(td) / "payloads.jsonl", Path(td) / "results.jsonl"
+            payloads.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            with mock.patch.dict("os.environ", {"JETTY_API_TOKEN": "token"}), \
+                 mock.patch.object(urllib.request.OpenerDirector, "open", recorded_wire):
+                result = run_cli("run-jetty", "--payloads", payloads, "--out", out, "--poll-interval", "0.01")
+            self.assertEqual(result, (0, "", ""))
+            record = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(requested, [*routes, ("GET", artifact)])
+        self.assertEqual((record["trajectory_id"], record["lifecycle"]["kind"]), ("bb2bb71e", "succeeded"))
+        self.assertEqual(record["trajectory"]["usage"]["total_tokens"], 162)
+        self.assertEqual([(item["path"], item["content"]) for item in record["artifacts"]],
+                         [("/app/results/output.md", "probe ok\n")])
 
 
 if __name__ == "__main__":
