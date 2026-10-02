@@ -241,7 +241,8 @@ not a skill edit.
 
 **A run with no output or a timeout — not a quality failure at all.** If a queue row's
 category is `missing-output` or `execution-error`, stop and read `metadata.json` before
-counting it against the skill. Timeouts are encoded the same way everywhere the harness
+counting it against the skill. Such a run leaves the benchmark partial, so look for the row
+under `observed.review_queue`; the headline queue is empty. Timeouts are encoded the same way everywhere the harness
 spawns a process: `timed_out: true` plus `returncode: 124` (the shell's timeout code). Per
 `LESSONS_LEARNED.md`'s 2026-06-09 *"Missing outputs are not failed/no-lift cases"*, a
 missing output is **not measured** — it is excluded from lift and saturation, not scored
