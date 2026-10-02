@@ -61,8 +61,8 @@ only produce that one number. `stub_runner.py` answers by reading the skill tree
 the harness mounted. It is deterministic and **model-blind**: it never reads the
 `model` label the row carries. So all three model rows run through the same stub and
 produce the same output, and `by_model` / `paired_summary.by_model` show the same
-delta three times. This is exactly analogous to the token journey's "runtime pairs 0
-/ `None`" shape ([`is-my-skill-worth-its-tokens.md`](is-my-skill-worth-its-tokens.md)):
+delta three times. This is exactly analogous to the token journey's "twelve runtime
+pairs, every delta `—`" shape ([`is-my-skill-worth-its-tokens.md`](is-my-skill-worth-its-tokens.md)):
 the offline run proves the *plumbing* — that rows fan per model, the model axis
 threads through grading into the report, and `ranking` / `lift_losers` populate — but
 it cannot prove *divergence*, because the thing that makes tiers differ (a real model

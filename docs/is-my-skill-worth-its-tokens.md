@@ -76,17 +76,19 @@ python3 ../../skill_benchmark.py token-overhead evals/shared-benchmark.json \
   --runs /tmp/demo-runs --judge-results /tmp/demo-judge.jsonl --format markdown
 ```
 
-Real output against the offline stub runs (2026-09-29, six repeats per arm):
+Real output against the offline stub runs (2026-10-02, six repeats per arm; the summary
+table, before the per-case pairs):
 
 ```text
 # Token overhead report
 
-| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | ... | Mean objective lift | Lift per 1k total tokens | Mean cost delta USD | Lift per $ | Saturated/no-lift cost USD |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| demo-reviewer | 144 | 51 | 12 | None | ... | 1.0 | None | None | None | 0.0 |
+| Skill | Static SKILL tokens | Reference tokens | Runtime pairs | Mean total delta | Median total delta | Mean input delta | Mean objective lift | Lift per 1k total tokens | Mean cost delta USD | Lift per $ | Saturated/no-lift cost USD |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| demo-reviewer | 144 | 51 | 12 | — | — | — | 1.0 | — | — | — | 0.0 |
 ```
 
-**Twelve runtime pairs and a lift of 1.0, but every token and cost delta is `None`.** The
+**Twelve runtime pairs and a lift of 1.0, but every token and cost delta is `—`** (the
+JSON report holds `null` there). The
 lift is real arithmetic over the stub's answers; the deltas are missing because the stub
 stands in for a model and has no tokens to report. Each run's trace-normalized usage block
 reads zero, and a zero-token basis cannot divide a lift, so each pair's token comparison
@@ -117,7 +119,7 @@ different claims, and the ledger keeps them apart.
 To get real runtime numbers, run the same cases through a runner that captures
 telemetry. `run-claude` parses the `claude -p` JSON envelope and records
 `usage_normalized` / `cost_normalized`; the Pi smoke runner does the same. Re-run
-`token-overhead` / `cost-summary` against *those* runs and the `None`s become the deltas
+`token-overhead` / `cost-summary` against *those* runs and the `—` cells become the deltas
 below.
 
 ## Reading the numbers, symptom by symptom
