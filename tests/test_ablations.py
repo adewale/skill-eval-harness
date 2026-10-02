@@ -1961,8 +1961,6 @@ class SkillCorpusConformanceTests(unittest.TestCase):
 
     def test_differential_invariant_holds_on_a_real_skill(self):
         src = CORPUS_DIR / "good-pr.SKILL.md"
-        if not src.exists():
-            self.skipTest("good-pr corpus missing")
         text = src.read_text(encoding="utf-8")
         lines = text.split("\n")
         mask = sb._fenced_mask(lines)
