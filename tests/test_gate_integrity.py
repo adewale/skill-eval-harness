@@ -16,7 +16,8 @@ These tests close those holes:
 * ``SkipLedgerTests`` require every skip to be ledgered with its reason (a
   runtime skip with the test that holds it and the one capability call its
   ``try`` guards), and each live smoke to run exactly when its documented
-  variable is set and never to return early.
+  variable is set, never to return early, and to fail, not pass or skip, when
+  it runs with its variable set but no agent binary or credential.
 
 Each rule has a teeth test: a planted violation it must report.
 """
@@ -27,12 +28,15 @@ import contextlib
 import copy
 import importlib.util
 import io
+import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -682,6 +686,77 @@ def runtime_skip_violations(sources: dict[str, str], allowed: dict[str, str],
     return found
 
 
+# Runs one test by id in a child interpreter and writes its outcome as JSON to
+# the path in argv[2] (the smoke's own prints go to stdout).
+STRANDED_SMOKE_RUNNER = r"""
+import json, sys, unittest
+loader = unittest.TestLoader()
+suite = loader.loadTestsFromName(sys.argv[1])
+result = unittest.TestResult()
+suite.run(result)
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump({"run": result.testsRun, "failed": len(result.failures) + len(result.errors),
+               "skipped": [reason for _, reason in result.skipped],
+               "load_errors": loader.errors}, handle)
+"""
+
+
+def stranded_smoke_outcome(tests_dir: Path, test_id: str, env: str, *, timeout: int = 120) -> dict:
+    """Run one live smoke with its variable set and nothing it needs: PATH is an
+    empty directory, so no agent binary resolves; HOME is fresh and no token is
+    set; the HTTP(S) proxies point at a closed local port. Every ledgered smoke
+    spawns its agent CLI by name, or (the Jetty smoke) asserts its token before
+    it builds a client, so none of them reaches the network."""
+    with tempfile.TemporaryDirectory(prefix="stranded-smoke-") as td:
+        scratch = Path(td)
+        (scratch / "bin").mkdir()
+        (scratch / "home").mkdir()
+        child_env = {
+            "PATH": str(scratch / "bin"), "HOME": str(scratch / "home"),
+            "USERPROFILE": str(scratch / "home"),
+            "TMPDIR": td, "TEMP": td, "TMP": td, env: "1",
+            "PYTHONPATH": os.pathsep.join(map(str, (tests_dir, ROOT, TESTS))),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            **{name: "http://127.0.0.1:9" for name in
+               ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")},
+        }
+        if "SYSTEMROOT" in os.environ:  # Windows needs it to start Python
+            child_env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+        outcome_path = scratch / "outcome.json"
+        try:
+            subprocess.run([sys.executable, "-c", STRANDED_SMOKE_RUNNER, test_id, str(outcome_path)],
+                           cwd=td, env=child_env, capture_output=True, text=True,
+                           timeout=timeout, check=False)
+        except subprocess.TimeoutExpired:
+            return {"timed_out": True}
+        if not outcome_path.exists():
+            return {"load_errors": ["the runner wrote no outcome"]}
+        return json.loads(outcome_path.read_text(encoding="utf-8"))
+
+
+def stranded_smoke_violations(tests_dir: Path, live: dict[str, str]) -> list[str]:
+    """Each live smoke must fail, not pass or skip, when its variable is set but
+    no agent binary or credential is available: a smoke that passes there
+    returns early somewhere (a helper's ``return``, an ``if shutil.which(...)``
+    around its body) and would pass the same way on a machine without the CLI."""
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = dict(zip(sorted(live), pool.map(
+            lambda test_id: stranded_smoke_outcome(tests_dir, test_id, live[test_id]), sorted(live))))
+    found = []
+    for test_id, outcome in outcomes.items():
+        where = f"{test_id} with {live[test_id]}=1 and no agent binary or credentials"
+        if outcome.get("timed_out"):
+            found.append(f"{where}: did not finish")
+        elif outcome.get("load_errors") or outcome.get("run") != 1:
+            errors = outcome.get("load_errors") or [f"ran {outcome.get('run')} tests"]
+            found.append(f"{where}: did not run as one test ({errors[0].strip().splitlines()[-1]})")
+        elif outcome["skipped"]:
+            found.append(f"{where}: skips ({outcome['skipped'][0]!r}); it must fail")
+        elif not outcome["failed"]:
+            found.append(f"{where}: passes; it must fail")
+    return found
+
+
 class SkipLedgerTests(unittest.TestCase):
     def test_every_load_time_skip_is_ledgered(self):
         loader = unittest.TestLoader()
@@ -813,6 +888,69 @@ class SkipLedgerTests(unittest.TestCase):
              "once its variable is set it must fail, not pass"),
             "test_planted.JournalTests.test_removed: ledgered runtime skip no longer exists",
         ])
+
+    def test_each_live_smoke_fails_without_its_agent_binary_or_credentials(self):
+        self.assertEqual(stranded_smoke_violations(TESTS, LIVE_SMOKES), [])
+
+    PLANTED_BYPASSES = """
+        import os
+        import shutil
+        import subprocess
+        import unittest
+
+        def run_planted_cli(case):
+            if not shutil.which("planted-cli"):
+                return
+            case.assertEqual(subprocess.run(["planted-cli"]).returncode, 0)
+
+        def require_planted_cli(case):
+            if not shutil.which("planted-cli"):
+                case.skipTest("planted-cli not installed")
+
+        @unittest.skipUnless(os.environ.get("RUN_PLANTED_SMOKE") == "1", "set RUN_PLANTED_SMOKE=1")
+        class PlantedSmokeTests(unittest.TestCase):
+            def test_helper_returns_early(self):
+                run_planted_cli(self)
+
+            def test_body_runs_only_when_the_cli_exists(self):
+                if shutil.which("planted-cli"):
+                    self.assertEqual(subprocess.run(["planted-cli"]).returncode, 0)
+
+            def test_body_runs_only_with_a_token(self):
+                if os.environ.get("PLANTED_TOKEN"):
+                    self.fail("would spend tokens")
+
+            def test_helper_skips(self):
+                require_planted_cli(self)
+
+            def test_spawns_the_cli(self):
+                self.assertEqual(subprocess.run(["planted-cli"]).returncode, 0)
+
+            def test_requires_its_token(self):
+                self.assertTrue(os.environ.get("PLANTED_TOKEN"), "RUN_PLANTED_SMOKE=1 needs PLANTED_TOKEN")
+    """
+
+    def test_planted_smoke_bypasses_fail_the_stranded_run(self):
+        names = ("test_helper_returns_early", "test_body_runs_only_when_the_cli_exists",
+                 "test_body_runs_only_with_a_token", "test_helper_skips",
+                 "test_spawns_the_cli", "test_requires_its_token")
+        live = {f"test_planted_bypass.PlantedSmokeTests.{name}": "RUN_PLANTED_SMOKE" for name in names}
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "test_planted_bypass.py"
+            path.write_text(textwrap.dedent(self.PLANTED_BYPASSES), encoding="utf-8")
+            violations = stranded_smoke_violations(Path(td), live)
+            # The static rule sees none of these: no skip or return in a smoke's own body.
+            static = runtime_skip_violations({path.name: path.read_text(encoding="utf-8")},
+                                             {}, live)
+        where = "with RUN_PLANTED_SMOKE=1 and no agent binary or credentials"
+        smoke = "test_planted_bypass.PlantedSmokeTests"
+        self.assertEqual(violations, [
+            f"{smoke}.test_body_runs_only_when_the_cli_exists {where}: passes; it must fail",
+            f"{smoke}.test_body_runs_only_with_a_token {where}: passes; it must fail",
+            f"{smoke}.test_helper_returns_early {where}: passes; it must fail",
+            f"{smoke}.test_helper_skips {where}: skips ('planted-cli not installed'); it must fail",
+        ])
+        self.assertEqual(static, ["test_planted_bypass.py:14: unledgered runtime skip in require_planted_cli"])
 
 
 if __name__ == "__main__":
