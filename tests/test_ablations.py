@@ -2609,6 +2609,30 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
             self.assertEqual(record["status"], "failed")
             self.assertIn("changed after attestation", record["error"])
 
+    def test_jetty_plan_rejects_skill_bytes_that_differ_from_the_prepared_tree(self):
+        # The export-time twin of the workspace mount check: the planned skill
+        # upload must hash to the tree recorded at prepare, so a source edited
+        # after prepare never ships under the prepared hash.
+        with tempfile.TemporaryDirectory() as td:
+            path = self.manifest(Path(td))
+            manifest = sb.validate_manifest(path)
+            row = next(item for item in sb.prepared_task_rows(path, manifest)
+                       if item["variant"] == "with_skill")
+
+            def build():
+                return sb.build_jetty_payload(
+                    sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None,
+                    agent="claude-code", model="m", model_provider="anthropic", snapshot="s")
+
+            self.assertEqual(build()["harness"]["skill_tree_hash"], row["skill_tree_hash"])
+            source = Path(row["skill_paths"][0]).parent / "references" / "guide.md"
+            source.write_text("changed after prepare\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                build()
+        self.assertIn("Jetty mounted skill tree hash", stderr.getvalue())
+        self.assertIn(f"does not match expected {row['skill_tree_hash']!r}", stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
