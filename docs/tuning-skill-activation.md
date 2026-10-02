@@ -188,6 +188,8 @@ gates, command option, smoke policy, and other supported surfaces belong in
 `agent_capabilities.BACKENDS`:
 
 ```python
+from invocation_contracts import ProcessInvocationPlan
+
 class MyAgentAdapter(AgentAdapter):
     name = "my-agent"
 
@@ -196,7 +198,10 @@ class MyAgentAdapter(AgentAdapter):
 
     def invoke(self, query, model, workspace, timeout):
         argv = ["my-agent", "run", "--json", query] + (["--model", model] if model else [])
-        return self._run_argv(argv, cwd=workspace, env=os.environ.copy(), timeout=timeout)
+        # _run_argv takes one frozen plan: argv, stdin, cwd, timeout and environment.
+        return self._run_argv(ProcessInvocationPlan.from_values(
+            argv, input_text="", cwd=workspace, timeout_s=timeout,
+            environment=os.environ.copy()))
 
 # Add as another argument to backend_registry(...), which builds BACKENDS:
 BackendRegistration(
