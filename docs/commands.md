@@ -585,7 +585,7 @@ skill-benchmark token-overhead \
   --out token-overhead.json
 ```
 
-If a repo has no paired trace metrics, the report still includes the static footprint and shows `0` runtime pairs. The decision loop that reads these numbers is [`is-my-skill-worth-its-tokens.md`](is-my-skill-worth-its-tokens.md).
+If a repo has no paired runs, the report is `partial` and withholds its headline: the top-level `summary` and each report's `summary` read `null` for the static footprint and the runtime-pair count, and the observed values (the static token counts, `runtime_pairs: 0`) sit under `summary.observed`. Each report's `profile` block still carries the static footprint. The markdown table prints `—` in every cell of that skill's row. The decision loop that reads these numbers is [`is-my-skill-worth-its-tokens.md`](is-my-skill-worth-its-tokens.md).
 
 ## Suite preflight / allowlisted multi-skill tiers
 
