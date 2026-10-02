@@ -4,7 +4,6 @@ These are the facts that decide whether a graded answer measures the requested
 model: an answer cut off at a token limit, an answer from a substituted model,
 and two arms at different effort all look like ordinary results unless the run
 records them."""
-import argparse
 import json
 import sys
 import tempfile
@@ -209,9 +208,10 @@ class ClaudeRunnerCompletionTests(unittest.TestCase):
         effort = stub_options.pop("effort", None)
         stub = stub_claude_stream(td / "claude_stub.py", probe_path=probe, **stub_options)
         runs = td / "runs"
-        sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(runs),
-                                         model="claude-haiku-4-5", claude_bin=str(stub),
-                                         timeout=60, effort=effort))
+        code, _, stderr = run_cli("run-claude", "--tasks", tasks, "--runs", runs,
+                                  "--model", "claude-haiku-4-5", "--claude-bin", stub,
+                                  "--timeout", "60", *(["--effort", effort] if effort else []))
+        self.assertEqual(code, 0, stderr)
         meta = sb.read_metrics_base(runs / rows[0]["run_dir"])
         argv = json.loads(probe.read_text()) if probe.exists() else None
         return meta, argv

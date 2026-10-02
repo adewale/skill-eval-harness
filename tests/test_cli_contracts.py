@@ -114,6 +114,9 @@ class CLIInvocationTests(unittest.TestCase):
                     CLIInvocation.from_namespace(namespace)
 
     def test_unknown_command_is_not_an_invocation(self):
+        # A hand-built namespace on purpose: the parser rejects an unknown
+        # subcommand itself (exit 2), so no argv reaches from_namespace with
+        # one; this pins the boundary's own guard for programmatic callers.
         with self.assertRaisesRegex(ValueError, "unknown CLI command"):
             CLIInvocation.from_namespace(argparse.Namespace(cmd="surprise"))
 

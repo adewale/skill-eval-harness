@@ -1,12 +1,13 @@
 """The bundled offline example is executable documentation: prepare -> run (with the
 deterministic stub 'model') -> report, and the two materialized ablations each
 confirm a regression on a distinct assertion. Runs in CI with no model/API."""
-import argparse
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from helpers import run_cli
 
 import skill_benchmark as sb
 
@@ -31,7 +32,10 @@ class DemoExampleTests(unittest.TestCase):
         rows = sb.prepared_task_rows(mp, manifest, include_ablations=True, ablation_dir=str(td / "abl"), runs_per_variant=6)
         (td / "tasks.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
         stub = f"{sys.executable} {DEMO / 'stub_runner.py'}"
-        sb.run_codex(argparse.Namespace(tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"), codex_cmd=stub, timeout=120))
+        code, _, stderr = run_cli("run-codex", "--tasks", td / "tasks.jsonl", "--runs", td / "runs",
+                                  "--codex-cmd", stub, "--timeout", "120")
+        if code != 0:
+            raise AssertionError(f"run-codex exited {code}: {stderr}")
         variants = sorted({r["variant"] for r in rows})   # include the ablation arms, not just the manifest variants
         # The example declares one judge assertion, so an executable end-to-end
         # report must also materialize its verdicts. Leaving them deferred would
@@ -126,8 +130,10 @@ class DemoJudgeTests(unittest.TestCase):
         rows = sb.prepared_task_rows(mp, manifest, include_ablations=True, ablation_dir=str(td / "abl"))
         rows = [r for r in rows if r["variant"] in self.VARIANTS]
         (td / "tasks.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-        sb.run_codex(argparse.Namespace(tasks=str(td / "tasks.jsonl"), runs=str(td / "runs"),
-                                        codex_cmd=f"{sys.executable} {DEMO / 'stub_runner.py'}", timeout=120))
+        code, _, stderr = run_cli("run-codex", "--tasks", td / "tasks.jsonl", "--runs", td / "runs",
+                                  "--codex-cmd", f"{sys.executable} {DEMO / 'stub_runner.py'}",
+                                  "--timeout", "120")
+        self.assertEqual(code, 0, stderr)
         tasks = sb.collect_judge_tasks(mp, td / "runs", variants=self.VARIANTS)
         self.assertEqual(len(tasks), 4)   # one actionable-review task per c-review arm
         cmd = f"{sys.executable} {DEMO / 'stub_judge.py'}" + (" --lenient" if lenient else "")

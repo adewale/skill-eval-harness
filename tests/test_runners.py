@@ -5,7 +5,6 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
-import argparse
 import contextlib
 import errno
 import io
@@ -723,7 +722,6 @@ class JettyReferencesUploadTests(unittest.TestCase):
     even with no materialized ablations, so Jetty matches codex's dir mount."""
 
     def test_with_skill_uploads_references_without_ablations(self):
-        import argparse
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); rp = root / "repo"; sd = rp / "skills" / "good-pr"; (sd / "references").mkdir(parents=True)
             (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: d. Use it.\n---\n\n# B\n\nSee [g](references/g.md).\n", encoding="utf-8")
@@ -735,7 +733,8 @@ class JettyReferencesUploadTests(unittest.TestCase):
                  "ablations": []}
             p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
             out = root / "jetty.jsonl"
-            sb.export_jetty(argparse.Namespace(manifest=str(p), out=str(out)))
+            code, _, stderr = run_cli("export-jetty", p, "--out", out)
+            self.assertEqual(code, 0, stderr)
             payloads = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
             ws = next(pl for pl in payloads if pl["harness"]["variant"] == "with_skill")
             hints = [f["remote_path_hint"] for f in ws["upload_plan"]["files"] if f["role"] == "skill"]
@@ -789,13 +788,16 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 + FAKE_CODEX_TURN,
                 encoding="utf-8")
             codex_runs = root / "codex-runs"
-            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(codex_runs),
-                                         codex_cmd=f"{sys.executable} {fake_codex}", timeout=30))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", codex_runs,
+                                      "--codex-cmd", f"{sys.executable} {fake_codex}", "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
 
             claude_bin = stub_claude_stream(root / "claude_stub.py", answer="token from claude")
             claude_runs = root / "claude-runs"
-            sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(claude_runs),
-                                             model="claude-haiku-4-5-20251001", claude_bin=str(claude_bin), timeout=30))
+            code, _, stderr = run_cli("run-claude", "--tasks", tasks, "--runs", claude_runs,
+                                      "--model", "claude-haiku-4-5-20251001", "--claude-bin", claude_bin,
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
 
             codex_base = codex_runs / run_dir
             claude_base = claude_runs / run_dir
@@ -844,15 +846,19 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 + FAKE_CODEX_TURN,
                 encoding="utf-8")
             codex_runs = root / "agent-codex"
-            sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(codex_runs), model="gpt-mini",
-                                            codex_cmd=f"{sys.executable} {fake_codex}", claude_bin="claude", timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "codex", "--tasks", tasks, "--runs", codex_runs,
+                                      "--model", "gpt-mini", "--codex-cmd", f"{sys.executable} {fake_codex}",
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             self.assertIn("token from codex", (codex_runs / run_dir / "output.md").read_text(encoding="utf-8"))
             self.assertEqual(json.loads((codex_runs / run_dir / "metadata.json").read_text(encoding="utf-8"))["model"], "gpt-mini")
 
             claude_bin = stub_claude_stream(root / "claude_stub.py", answer="token from claude")
             claude_runs = root / "agent-claude"
-            sb.run_agent(argparse.Namespace(agent="claude", tasks=str(tasks), runs=str(claude_runs), model="claude-haiku-4-5-20251001",
-                                            codex_cmd="codex exec --json", claude_bin=str(claude_bin), timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "claude", "--tasks", tasks, "--runs", claude_runs,
+                                      "--model", "claude-haiku-4-5-20251001", "--claude-bin", claude_bin,
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             self.assertIn("token from claude", (claude_runs / run_dir / "output.md").read_text(encoding="utf-8"))
 
     def test_codex_cleanup_race_preserves_artifacts_and_next_task(self):
@@ -1195,8 +1201,10 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             root = Path(td)
             _, tasks, run_dir = write_with_skill_task(root)
             runs = root / "runs"
-            sb.run_agent(argparse.Namespace(agent="codex", tasks=str(tasks), runs=str(runs), model="gpt-mini",
-                                            codex_cmd=str(root / "missing-codex"), claude_bin="claude", timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "codex", "--tasks", tasks, "--runs", runs,
+                                      "--model", "gpt-mini", "--codex-cmd", root / "missing-codex",
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             text = (base / "output.md").read_text(encoding="utf-8")
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
@@ -1403,8 +1411,10 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 " 'usage': {'input_tokens': 5, 'output_tokens': 7}, 'cost_usd': 0.02}))\n",
                 encoding="utf-8")
             runs = root / "vibe-runs"
-            sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model="mistral-test",
-                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=f"{sys.executable} {fake_vibe}", timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", runs,
+                                      "--model", "mistral-test", "--vibe-cmd", f"{sys.executable} {fake_vibe}",
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             self.assertIn("token from vibe", (base / "output.md").read_text(encoding="utf-8"))
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
@@ -1429,8 +1439,10 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 "print(json.dumps({'role': 'assistant', 'content': 'token from vibe'}))\n",
                 encoding="utf-8")
             runs = root / "vibe-runs"
-            sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model="mistral-test",
-                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=f"{sys.executable} {fake_vibe}", timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", runs,
+                                      "--model", "mistral-test", "--vibe-cmd", f"{sys.executable} {fake_vibe}",
+                                      "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["provider"], "vibe")
@@ -1468,8 +1480,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             root = Path(td)
             _, tasks, run_dir = write_with_skill_task(root)
             runs = root / "runs"
-            sb.run_agent(argparse.Namespace(agent="vibe", tasks=str(tasks), runs=str(runs), model=None,
-                                            codex_cmd="codex exec --json", claude_bin="claude", vibe_cmd=str(root / "missing-vibe"), timeout=30))
+            code, _, stderr = run_cli("run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", runs,
+                                      "--vibe-cmd", root / "missing-vibe", "--timeout", "30")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             text = (base / "output.md").read_text(encoding="utf-8")
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))

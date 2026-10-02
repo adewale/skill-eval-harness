@@ -766,10 +766,13 @@ else:
         original = sb.AGENT_BACKENDS["codex"]
         try:
             sb.AGENT_BACKENDS["codex"] = WrongBackend()
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
-                sb.run_agent(argparse.Namespace(agent="codex"))
-            self.assertIn("replacement identifies as 'claude'", stderr.getvalue())
+            with tempfile.TemporaryDirectory() as td:
+                code, _, stderr = run_cli("run-agent", "--agent", "codex",
+                                          "--tasks", Path(td) / "tasks.jsonl",
+                                          "--runs", Path(td) / "runs")
+                self.assertFalse((Path(td) / "runs").exists())
+            self.assertEqual(code, 1)
+            self.assertIn("replacement identifies as 'claude'", stderr)
         finally:
             sb.AGENT_BACKENDS["codex"] = original
 

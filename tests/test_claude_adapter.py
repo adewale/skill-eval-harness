@@ -1,7 +1,6 @@
 """First-class Claude adapter: parse the `claude -p --output-format json`
 envelope in one place, capture real cost/usage into metrics.json, and total it
 in the benchmark report."""
-import argparse
 import json
 import stat
 import sys
@@ -337,9 +336,10 @@ class RunClaudeAdapterTests(unittest.TestCase):
         p, tasks, run_dir = write_with_skill_task(td, cases=[case])
         stub = _stub_claude_stream(td / "claude_stub.py", cost=cost, returncode=returncode, answer=answer)
         runs = td / "runs"
-        ns = argparse.Namespace(tasks=str(tasks), runs=str(runs),
-                                model="claude-haiku-4-5-20251001", claude_bin=str(stub), timeout=60)
-        sb.run_claude(ns)
+        code, _, stderr = run_cli("run-claude", "--tasks", tasks, "--runs", runs,
+                                  "--model", "claude-haiku-4-5-20251001", "--claude-bin", stub,
+                                  "--timeout", "60")
+        self.assertEqual(code, 0, stderr)
         return p, runs, run_dir
 
     def test_writes_output_and_cost_metrics(self):
@@ -382,7 +382,10 @@ class RunClaudeAdapterTests(unittest.TestCase):
             _, runs, run_dir = self._run(td, cost=0.0, answer="unused")
             # Re-run the same prepared task through the quota-shaped stub.
             tasks = td / "tasks.jsonl"
-            sb.run_claude(argparse.Namespace(tasks=str(tasks), runs=str(runs), model="claude-haiku-4-5-20251001", claude_bin=str(stub), timeout=60))
+            code, _, stderr = run_cli("run-claude", "--tasks", tasks, "--runs", runs,
+                                      "--model", "claude-haiku-4-5-20251001", "--claude-bin", stub,
+                                      "--timeout", "60")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             text = (base / "output.md").read_text()
             meta = json.loads((base / "metadata.json").read_text())
@@ -400,9 +403,10 @@ class RunClaudeAdapterTests(unittest.TestCase):
                                  encoding="utf-8")
             malformed.chmod(malformed.stat().st_mode | stat.S_IXUSR)
             _, runs, run_dir = self._run(td)
-            sb.run_claude(argparse.Namespace(
-                tasks=str(td / "tasks.jsonl"), runs=str(runs),
-                model="claude-haiku-4-5-20251001", claude_bin=str(malformed), timeout=60))
+            code, _, stderr = run_cli("run-claude", "--tasks", td / "tasks.jsonl", "--runs", runs,
+                                      "--model", "claude-haiku-4-5-20251001", "--claude-bin", malformed,
+                                      "--timeout", "60")
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             text = (base / "output.md").read_text(encoding="utf-8")
             meta = sb.read_metrics_base(base)

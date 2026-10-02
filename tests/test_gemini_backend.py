@@ -1,7 +1,6 @@
 """Offline integration tests for the official Gemini CLI backend."""
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -10,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import make_eval_repo, write_with_skill_task
+from helpers import make_eval_repo, run_cli, write_with_skill_task
 
 import ablation_model as am
 import agent_capabilities as ac
@@ -1040,13 +1039,11 @@ class GeminiAnswerBackendTests(unittest.TestCase):
                 f"sys.stdout.write({_success_stream()!r})\n")
             runs = root / "runs"
 
-            result = sb.run_agent(argparse.Namespace(
-                agent="gemini", tasks=str(tasks), runs=str(runs),
-                model="gemini-test", gemini_cmd=str(fake),
-                timeout=30,
-            ))
+            code, _, stderr = run_cli(
+                "run-agent", "--agent", "gemini", "--tasks", tasks, "--runs", runs,
+                "--model", "gemini-test", "--gemini-cmd", fake, "--timeout", "30")
 
-            self.assertEqual(result, 0)
+            self.assertEqual(code, 0, stderr)
             base = runs / run_dir
             self.assertEqual((base / "output.md").read_text(encoding="utf-8"),
                              "answer from Gemini")
@@ -1641,11 +1638,12 @@ class GeminiLiveSmokeTests(unittest.TestCase):
             runs = root / "runs"
             model = os.environ.get("SMOKE_GEMINI_MODEL", "gemini-2.5-flash")
 
-            sb.run_agent(argparse.Namespace(
-                agent="gemini", tasks=str(tasks), runs=str(runs), model=model,
-                gemini_cmd=os.environ.get("GEMINI_SMOKE_CMD", "gemini"),
-                timeout=int(os.environ.get("GEMINI_SMOKE_TIMEOUT", "120")),
-            ))
+            code, _, stderr = run_cli(
+                "run-agent", "--agent", "gemini", "--tasks", tasks, "--runs", runs,
+                "--model", model,
+                "--gemini-cmd", os.environ.get("GEMINI_SMOKE_CMD", "gemini"),
+                "--timeout", os.environ.get("GEMINI_SMOKE_TIMEOUT", "120"))
+            self.assertEqual(code, 0, stderr)
 
             base = runs / row["run_dir"]
             output = (base / "output.md").read_text(encoding="utf-8")

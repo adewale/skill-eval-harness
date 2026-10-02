@@ -5,7 +5,6 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
-import argparse
 import contextlib
 import functools
 import hashlib
@@ -22,6 +21,7 @@ from helpers import (
     assert_dies,
     load_example_module,
     make_eval_repo,
+    run_cli,
 )
 
 import ablation_model as am
@@ -377,8 +377,9 @@ class SkillAblationTests(unittest.TestCase):
             (bad_out / sb._ABLATION_MARKER).write_text("owned\n", encoding="utf-8")
             sentinel = bad_out / "keep.txt"
             sentinel.write_text("precious", encoding="utf-8")
-            assert_dies(self, lambda: sb.materialize_ablations(argparse.Namespace(manifest=str(path), out_dir=str(bad_out), out=None)),
-                        "is inside source skill root")
+            code, _, stderr = run_cli("materialize-ablations", path, "--out-dir", bad_out)
+            self.assertEqual(code, 1)
+            self.assertIn("is inside source skill root", stderr)
             self.assertTrue(sentinel.exists())                 # not cleared before reject
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "precious")
 
@@ -2426,8 +2427,9 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
             root = Path(td)
             path = self.manifest(root, multi_turn=True)
             out = root / "jetty.jsonl"
-            assert_dies(self, lambda: sb.export_jetty(argparse.Namespace(manifest=str(path), out=str(out))),
-                        "Jetty export does not support multi-turn prepared tasks")
+            code, _, stderr = run_cli("export-jetty", path, "--out", out)
+            self.assertEqual(code, 1)
+            self.assertIn("Jetty export does not support multi-turn prepared tasks", stderr)
             self.assertFalse(out.exists())
 
     def test_jetty_execution_rechecks_attested_upload_bytes(self):
@@ -2435,7 +2437,8 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
             root = Path(td)
             path = self.manifest(root)
             out = root / "jetty.jsonl"
-            sb.export_jetty(argparse.Namespace(manifest=str(path), out=str(out)))
+            code, _, stderr = run_cli("export-jetty", path, "--out", out)
+            self.assertEqual(code, 0, stderr)
             payloads = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
             payload = next(
                 item for item in payloads if item["harness"]["variant"] == "with_skill")

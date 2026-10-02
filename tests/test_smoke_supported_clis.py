@@ -1,7 +1,6 @@
 """Offline contract tests for the opt-in supported-CLI live-smoke runner."""
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import subprocess
@@ -164,11 +163,9 @@ class SupportedCliSmokeTests(unittest.TestCase):
 
     def test_failed_prepare_short_circuits_before_any_answer_call(self):
         with tempfile.TemporaryDirectory() as td:
-            args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="claude",
-                                      claude_model="haiku", codex_model="unused",
-                                      gemini_model="unused", vibe_model="unused",
-                                      pi_model="unused", timeout=1)
-            with mock.patch.object(smoke, "parse_args", return_value=args), \
+            argv = [str(SCRIPT), "--out-dir", str(Path(td) / "out"), "--live", "--agents", "claude",
+                    "--claude-model", "haiku", "--timeout", "1"]
+            with mock.patch.object(sys, "argv", argv), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/claude"), \
                  mock.patch.object(smoke, "run", return_value=False) as run:
                 self.assertEqual(smoke.main(), 1)
@@ -197,11 +194,9 @@ class SupportedCliSmokeTests(unittest.TestCase):
 
     def test_registry_population_dispatches_pi_to_trigger_runner(self):
         with tempfile.TemporaryDirectory() as td:
-            args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="pi",
-                                      claude_model="unused", codex_model="unused",
-                                      gemini_model="unused", vibe_model="unused",
-                                      pi_model="model", timeout=1)
-            with mock.patch.object(smoke, "parse_args", return_value=args), \
+            argv = [str(SCRIPT), "--out-dir", str(Path(td) / "out"), "--live", "--agents", "pi",
+                    "--pi-model", "model", "--timeout", "1"]
+            with mock.patch.object(sys, "argv", argv), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/pi"), \
                  mock.patch.object(smoke, "run", return_value=True) as run, \
                  mock.patch.object(smoke, "assess_trigger_report", return_value=True):
@@ -213,10 +208,11 @@ class SupportedCliSmokeTests(unittest.TestCase):
     def test_registry_dispatch_supports_a_non_pi_trigger_target(self):
         synthetic = SmokeTarget("other", "SMOKE_OTHER_MODEL", "cheap", "trigger")
         with tempfile.TemporaryDirectory() as td:
-            args = argparse.Namespace(out_dir=str(Path(td) / "out"), live=True, agents="other",
-                                      other_model="cheap", timeout=1)
+            argv = [str(SCRIPT), "--out-dir", str(Path(td) / "out"), "--live", "--agents", "other",
+                    "--other-model", "cheap", "--timeout", "1"]
             with mock.patch.object(smoke, "SMOKE_TARGETS", {"other": synthetic}), \
-                 mock.patch.object(smoke, "parse_args", return_value=args), \
+                 mock.patch.dict(smoke.DEFAULT_MODELS, {"other": "unused-default"}), \
+                 mock.patch.object(sys, "argv", argv), \
                  mock.patch.object(smoke.shutil, "which", return_value="/mock/other"), \
                  mock.patch.object(smoke, "run", return_value=True) as run, \
                  mock.patch.object(smoke, "assess_trigger_report", return_value=True) as assess:
