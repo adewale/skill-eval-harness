@@ -481,6 +481,56 @@ class SubagentRunnerTests(unittest.TestCase):
                     sb.validate_subagent_response({"answer": "alpha", **fields})
                 self.assertIn(message, str(caught.exception))
 
+    def test_a_claude_run_carries_the_same_process_evidence_under_run_subagent_as_run_claude(self):
+        # The canonical stub stream runs `npm test` through Bash and Reads the
+        # skill's SKILL.md before answering; the process assertions below can
+        # only pass on that tool-use evidence, never on the answer text. The
+        # fake also records the files in its working directory: the prompt
+        # names the skill by its path in the run's workspace.
+        case = {"id": "case-1", "split": "tune", "prompt": "Run the tests.",
+                "assertions": [
+                    {"name": "ran-tests", "type": "command_ran", "pattern": "npm test"},
+                    {"name": "loaded-skill", "type": "skill_invoked", "expected": True}]}
+        evidence = {}
+        for command in ("run-claude", "run-subagent"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                manifest = make_eval_repo(root, cases=[case])
+                tasks, runs, bench = root / "tasks.jsonl", root / "runs", root / "benchmark.json"
+                stub, calls = stub_claude_stream(root / "claude-stream"), root / "calls.jsonl"
+                claude = root / "claude"
+                claude.write_text(
+                    f"#!{sys.executable}\nimport json, os, sys\n"
+                    "prompt = sys.stdin.read()\n"
+                    "files = sorted(os.path.relpath(os.path.join(d, f)) for d, _, fs in os.walk('.') for f in fs)\n"
+                    f"print(json.dumps([prompt, files]), file=open({str(calls)!r}, 'a'))\n"
+                    f"os.execv({str(stub)!r}, [{str(stub)!r}, *sys.argv[1:]])\n", encoding="utf-8")
+                claude.chmod(0o755)
+                for argv in (("prepare", manifest, "--out", tasks),
+                             (command, "--tasks", tasks, "--runs", runs, "--claude-bin", claude),
+                             ("benchmark", manifest, "--runs", runs, "--out", bench)):
+                    code, _, stderr = run_cli(*argv)
+                    self.assertEqual(code, 0, f"{argv[0]}: {stderr}")
+                seen = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(sorted("skills/demo/SKILL.md" in files
+                                        for prompt, files in seen if "skills/demo/SKILL.md" in prompt), [True])
+                base = runs / "case-1" / "with_skill"
+                events = json.loads((base / "events.json").read_text(encoding="utf-8"))
+                metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+                row = next(row for row in json.loads(bench.read_text(encoding="utf-8"))["results"]
+                           if row["variant"] == "with_skill")
+                self.assertEqual([(e["type"], e["name"], e["input_summary"]) for e in events["events"]
+                                  if e["status"] == "completed" and e.get("name")],
+                                 [("command", "Bash", "npm test"),
+                                  ("skill_load", "Read", "skills/demo/SKILL.md")])
+                self.assertEqual({a["name"]: a["passed"] for a in row["assertions"]},
+                                 {"ran-tests": True, "loaded-skill": True})
+                # Read through the Claude stream dialect, as run-claude reads it.
+                self.assertEqual(metrics["source"], "claude")
+                self.assertTrue(metrics["trace_observation_complete"])
+                evidence[command] = (metrics["commands"], metrics["tool_calls"], metrics["skill_invoked"])
+        self.assertEqual(evidence.get("run-subagent"), evidence.get("run-claude"))
+
 
 class ToolReplayTests(unittest.TestCase):
     """2.3 — record/replay of tool I/O for deterministic re-runs."""

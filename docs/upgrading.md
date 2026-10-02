@@ -79,6 +79,12 @@ that file still invalidates trigger identity until those owners are extracted in
   `max_tokens` stop records `truncated` and is unscorable, as in `run-claude`. An `--agent-cmd`
   reply may add `stop_class`, `stop_reason`, and `served_models`; a reply without them still runs
   and records `unavailable`.
+- `run-subagent`'s default Claude backend ran `claude` in an empty temporary directory, so the
+  skill and input paths its prompt named did not exist there, and it kept no trace, so every
+  process assertion on its runs failed for missing evidence. It now runs in the run's workspace
+  and keeps the stream as the trace (`metrics.json` `source: "claude"`, read by the Claude trace
+  dialect, as for `run-claude`). Re-run saved default-backend `run-subagent` runs: their
+  `with_skill` answers were produced without access to the skill.
 - A run that reports several models credits none of them: `served_model` is `null`, and the check
   reads `mixed` (scored, counted in `run_endings.served_model_mixed`) when the requested model is
   among them, or `mismatch` (unscorable) when it is not. Claude subagent turns are not counted.

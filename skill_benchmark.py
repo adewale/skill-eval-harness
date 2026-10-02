@@ -8642,7 +8642,7 @@ def _write_runner_outcome_files(run_dir: Path, outcome: AnswerOutcome,
                      "invocation_state": invocation_state.value,
                      **({"elapsed_ms": elapsed} if elapsed is not None else {})}
     events, metrics = write_trace_artifacts(
-        run_dir, trace_text, source=context.provider.value, metadata=metadata,
+        run_dir, trace_text, source=(context.trace_source or context.provider).value, metadata=metadata,
         extra_metrics=extra_metrics,
         environment=dict(context.environment) if context.environment is not None else None,
         write_metadata=True, write_raw_trace=bool(trace_text),
@@ -13051,6 +13051,7 @@ def run_subagent_tasks(
     model: str | None = None,
     live_tools: dict[str, Any] | None = None,
     replay_mode: str | None = None,
+    trace_source: str | None = None,
 ) -> int:
     """The built-in subagent runner (roadmap 2.7): no external CLI required —
     `agent_fn(prompt, workspace, model, tool_executor)` is the seam (a Claude
@@ -13060,7 +13061,10 @@ def run_subagent_tasks(
     events.json, metrics.json), so grading stays file-based and re-runnable.
     Multi-turn telemetry aggregates only when every response declares
     ``telemetry_scope: turn_delta``; every attempted turn is retained under
-    ``turn-N/`` regardless. Tool replay (2.3) wraps the executor per run."""
+    ``turn-N/`` regardless. Tool replay (2.3) wraps the executor per run.
+    ``trace_source`` names the provider whose stream records a backend returns
+    as ``trace`` (the default Claude backend's), so they normalize through that
+    provider's trace dialect instead of the generic one."""
     mode = replay_mode or tool_replay_mode()
     workspace_builder = registered_workspace_builder("subagent")
     validated: list[tuple[dict[str, Any], PreparedTask, str | None, Path]] = []
@@ -13209,8 +13213,8 @@ def run_subagent_tasks(
                         provider="subagent", answer=turn_answer,
                         returncode=int(turn_rc), timed_out=bool(turn_timed_out),
                         error=turn_error, elapsed_ms=turn_elapsed,
-                        trace_text=turn_trace_text, usage=turn_usage,
-                        cost_usd=turn_cost, model=row_model,
+                        trace_text=turn_trace_text, trace_source=trace_source,
+                        usage=turn_usage, cost_usd=turn_cost, model=row_model,
                         metadata_extra={
                             "tool_replay_mode": mode, **prov_extra,
                             "billing_scope": "turn", "turn_number": n,
@@ -13302,7 +13306,7 @@ def run_subagent_tasks(
             # TIMEOUT marker, not the provider marker, heads the body.
             error=error or ("subagent timed out" if timed_out else None),
             elapsed_ms=(int(elapsed_ms) if isinstance(elapsed_ms, (int, float)) else None),
-            trace_text=trace_text,
+            trace_text=trace_text, trace_source=trace_source,
             usage=raw_usage, cost_usd=aggregate_cost_usd, model=row_model,
             metadata_extra={"tool_replay_mode": mode, **prov_extra, **multi_turn_extra,
                             **completion},
@@ -13353,10 +13357,12 @@ def run_subagent(args: argparse.Namespace) -> int:
                 transcript = "\n\n".join(f"[user]\n{h['prompt']}\n\n[assistant]\n{h['answer']}" for h in history)
                 prompt = f"Conversation so far:\n{transcript}\n\n[user]\n{prompt}"
             # stream-json, as run-claude reads it: the terminal result event
-            # carries the stop reason and the main-thread assistant messages
-            # name the model that served each turn.
+            # carries the stop reason, the main-thread assistant messages name
+            # the model that served each turn, and the stream is the run's
+            # trace. Claude runs in the run's workspace, where the prompt's
+            # skill and input paths are.
             result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout,
-                                       output_format="stream-json")
+                                       cwd=workspace, output_format="stream-json")
             error = result.get("provider_error") or result.get("parse_error")
             if error and result.get("returncode") == 0:
                 # An exit-zero error envelope or unreadable output is a failed
@@ -13378,11 +13384,13 @@ def run_subagent(args: argparse.Namespace) -> int:
                       if isinstance(item, str) and item.strip()]
             if served:
                 completion["served_models"] = served
+            trace, _ = parse_trace_jsonl_text(str(result.get("raw_response") or ""))
             return {"answer": result.get("answer"), "returncode": result.get("returncode"),
                     "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
-                    "usage": usage, **completion}
+                    "usage": usage, "trace": trace, **completion}
     return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
-                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode())
+                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode(),
+                              trace_source=None if agent_cmd else "claude")
 
 
 JUDGE_NEGATIVE_CONTROLS = {
