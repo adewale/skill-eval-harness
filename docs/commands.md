@@ -181,7 +181,7 @@ skill-benchmark judge-alignment \
   --out judge-alignment.json
 ```
 
-`--labels` reads the served review's `feedback.json` ([Review viewer](#review-viewer-static-or-served)) directly: an entry that names a judge `assertion` with a `pass` or `fail` verdict becomes the label for that assertion's `judge_task_id`. Run-level entries and `unsure` or note-only entries are skipped and counted in the report's `label_source`, `{"format": "feedback", "skipped": {"run_level": n, "unsure_or_note_only": n}}`. The legacy file keyed by `judge_task_id` with a `passed` bool still loads, as `label_source: {"format": "judge_task_labels"}`.
+`--labels` reads the served review's `feedback.json` ([Review viewer](#review-viewer-static-or-served)) directly: an entry that names a judge `assertion` with a `pass` or `fail` verdict becomes the label for that assertion's `judge_task_id`. Run-level entries and `unsure` or note-only entries are skipped and counted in the report's `label_source`, `{"format": "feedback", "skipped": {"run_level": n, "unsure_or_note_only": n, "unparsed": n}}`, where `unparsed` counts the old entries kept under `unparsed_entries` (always present, `0` when there are none). The legacy file keyed by `judge_task_id` with a `passed` bool still loads, as `label_source: {"format": "judge_task_labels"}`.
 
 It reports `agreement`, **Cohen's `cohen_kappa`** (chance-corrected, so an imbalanced label set can't flatter the judge) with a `kappa_interpretation` band, and `precision`/`recall`/`f1` plus the `confusion` matrix. Below `--min-labels` (default 50) matched labels it warns that the metrics are unstable. Fully model-free — it grades a judge you already ran.
 
