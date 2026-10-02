@@ -650,3 +650,22 @@ def write_with_skill_task(root: Path, **repo: Any) -> tuple[Path, Path, str]:
     tasks = root / "tasks.jsonl"
     tasks.write_text(json.dumps(row) + "\n", encoding="utf-8")
     return manifest, tasks, row["run_dir"]
+
+
+# --------------------------------------------------------------------------- #
+# lane B: negative-control assertions
+# --------------------------------------------------------------------------- #
+
+
+def assert_dies(test: Any, callback: Any, message: str) -> None:
+    """Assert that callback() stops through the harness's die(): SystemExit
+    with `message` in what it printed to stderr. A bare assertRaises(SystemExit)
+    also passes when an earlier, unrelated guard fires; the message names the
+    guard the control is for."""
+    import contextlib
+    import io
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), test.assertRaises(SystemExit):
+        callback()
+    test.assertIn(message, stderr.getvalue())

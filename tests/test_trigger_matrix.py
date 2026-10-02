@@ -21,6 +21,7 @@ The cheap agent smoke asserts invocation only; the trigger-matrix smokes assert
 observed trigger-eval runs and at least one autonomous load.
 """
 import contextlib
+import functools
 import importlib.util
 import io
 import json
@@ -31,6 +32,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+from helpers import assert_dies
 
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
@@ -1651,35 +1654,6 @@ class TriggerComparisonTests(unittest.TestCase):
                          "repetition_count_mismatch")
         self.assertEqual(out["evidence_class"], "indeterminate")
 
-    def test_declared_repetition_shortfall_is_rejected(self):
-        short = [trigger_row("short", True, triggered=True, run_number=1)]
-        with self.assertRaises(SystemExit):
-            self._compare(base_rows=short, abl_rows=self._ablation_rows())
-
-    def test_whole_declared_cell_missing_from_results_is_rejected(self):
-        baseline = trigger_report(self._baseline_rows())
-        baseline["results"] = [row for row in baseline["results"]
-                               if row["query_id"] != self.QUERIES[0]]
-        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
-                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
-        with self.assertRaises(SystemExit):
-            sb.build_trigger_comparison(baseline, ablation)
-
-    def test_duplicate_repetition_identity_is_rejected(self):
-        duplicate = [trigger_row("duplicate", True, triggered=True, run_number=1),
-                     trigger_row("duplicate", True, triggered=True, run_number=1),
-                     trigger_row("duplicate", True, triggered=True, run_number=2)]
-        with self.assertRaises(SystemExit):
-            self._compare(base_rows=duplicate, abl_rows=self._ablation_rows())
-
-    def test_design_cannot_omit_a_persisted_result_cell(self):
-        baseline = trigger_report(self._baseline_rows())
-        baseline["design"] = baseline["design"][1:]
-        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
-                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
-        with self.assertRaises(SystemExit):
-            sb.build_trigger_comparison(baseline, ablation)
-
     def test_manifest_declared_component_target_is_authoritative(self):
         wrong = {
             **ABLATION_PROVENANCE,
@@ -1720,40 +1694,6 @@ class TriggerComparisonTests(unittest.TestCase):
         self.assertTrue(any("experimental protocols" in reason
                             for reason in out["provenance"]["reasons"]))
 
-    def test_protocol_semantics_must_match_report_design(self):
-        for mutation in (
-            lambda protocol: protocol.update(runs_per_query=999),
-            lambda protocol: protocol["adapters"][0].update(agent="not-the-row-agent"),
-        ):
-            with self.subTest(mutation=mutation):
-                baseline = trigger_report(self._baseline_rows())
-                mutation(baseline["protocol"])
-                baseline["protocol_sha256"] = sb.canonical_json_sha256(baseline["protocol"])
-                for row in baseline["results"]:
-                    row["protocol_sha256"] = baseline["protocol_sha256"]
-                ablation = trigger_report(
-                    self._ablation_rows(), ablation="drop-description",
-                    provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
-                with self.assertRaises(SystemExit):
-                    sb.build_trigger_comparison(baseline, ablation)
-
-    def test_protocol_dependency_identity_cannot_omit_a_module(self):
-        baseline = trigger_report(self._baseline_rows())
-        identity = baseline["protocol"]["harness_identity"]
-        self.assertIn("trigger_reporting.py", identity["modules"])
-        identity["modules"].pop("trigger_reporting.py")
-        payload = {key: value for key, value in identity.items()
-                   if key != "identity_sha256"}
-        identity["identity_sha256"] = sb.canonical_json_sha256(payload)
-        baseline["protocol_sha256"] = sb.canonical_json_sha256(baseline["protocol"])
-        for row in baseline["results"]:
-            row["protocol_sha256"] = baseline["protocol_sha256"]
-        ablation = trigger_report(
-            self._ablation_rows(), ablation="drop-description",
-            provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
-        with self.assertRaises(SystemExit):
-            sb.build_trigger_comparison(baseline, ablation)
-
     def test_observed_isolation_drift_blocks_the_cell(self):
         base = [trigger_row("isolation", True, triggered=True, run_number=n)
                 for n in range(1, 3)]
@@ -1781,15 +1721,6 @@ class TriggerComparisonTests(unittest.TestCase):
         self.assertTrue(all(item["reason"] == "protocol_observation_unsafe"
                             for item in out["paired"]["blocked"]))
 
-    def test_cosmetic_query_aliases_cannot_manufacture_six_units(self):
-        queries = ["identical prompt" + (" " * n) for n in range(6)]
-        base = [trigger_row(query, True, triggered=True, query_id=f"q{n}")
-                for n, query in enumerate(queries)]
-        abl = [trigger_row(query, True, triggered=False, query_id=f"q{n}")
-               for n, query in enumerate(queries)]
-        with self.assertRaises(SystemExit):
-            self._compare(base_rows=base, abl_rows=abl, base_runs_per_query=1)
-
     def test_negative_polarity_overtriggering_is_a_causal_regression(self):
         queries = [f"negative {n}" for n in range(1, 7)]
         baseline = [trigger_row(q, False, triggered=False, run_number=n)
@@ -1811,14 +1742,6 @@ class TriggerComparisonTests(unittest.TestCase):
                          "query_definition_mismatch")
         self.assertEqual(out["evidence_class"], "indeterminate")
 
-    def test_row_hash_must_match_report_hash(self):
-        baseline = trigger_report(self._baseline_rows())
-        baseline["results"][0]["skill_tree_hash"] = "sha256:other"
-        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
-                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
-        with self.assertRaises(SystemExit):
-            sb.build_trigger_comparison(baseline, ablation)
-
     def test_real_matrix_reports_feed_the_comparer_without_provenance_drift(self):
         baseline = tm.run_matrix(
             DEMO_MANIFEST, demo_trigger_rows(), agents=["stub"], models=["offline"],
@@ -1832,25 +1755,80 @@ class TriggerComparisonTests(unittest.TestCase):
         self.assertEqual(ablation["skill_tree_hash"],
                          ablation["provenance"]["skill_hash"])
 
-    def test_malformed_row_is_rejected(self):
-        bad = self._baseline_rows()
-        bad[0] = {**bad[0], "pass": True, "triggered": False}   # contradicts derived pass
-        with self.assertRaises(SystemExit):
-            self._compare(base_rows=bad)
+    def test_a_baseline_that_contradicts_itself_is_rejected_by_its_guard(self):
+        def baseline(rows=None, **report):
+            return trigger_report(
+                self._baseline_rows() if rows is None else rows, **report)
 
-    def test_baseline_carrying_an_ablation_is_rejected(self):
-        baseline = trigger_report(self._baseline_rows(), ablation="drop-description",
-                                  provenance=ABLATION_PROVENANCE)
-        ablation = trigger_report(self._ablation_rows(), ablation="drop-description",
-                                  provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
-        with self.assertRaises(SystemExit):
-            sb.build_trigger_comparison(baseline, ablation)
+        def changed(mutate, *, rehash_protocol=False):
+            def make():
+                report = baseline()
+                mutate(report)
+                if rehash_protocol:
+                    report["protocol_sha256"] = sb.canonical_json_sha256(report["protocol"])
+                    for row in report["results"]:
+                        row["protocol_sha256"] = report["protocol_sha256"]
+                return report
+            return make
 
-    def test_non_trigger_report_is_rejected(self):
-        baseline = trigger_report(self._baseline_rows())
-        baseline["evidence_class"] = "answer"
-        with self.assertRaises(SystemExit):
-            sb.build_trigger_comparison(baseline, trigger_report(self._ablation_rows(), ablation="x", provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH))
+        def omit_identity_module(report):
+            identity = report["protocol"]["harness_identity"]
+            self.assertIn("trigger_reporting.py", identity["modules"])
+            identity["modules"].pop("trigger_reporting.py")
+            identity["identity_sha256"] = sb.canonical_json_sha256(
+                {key: value for key, value in identity.items() if key != "identity_sha256"})
+
+        rejected = {
+            # label: (the baseline report, the guard's message)
+            "a declared repetition is missing": (
+                lambda: baseline([trigger_row("short", True, triggered=True, run_number=1)]),
+                "--baseline has incomplete repetition identities for (stub, None, short): expected [1, 2], got [1]"),
+            "a declared cell has no results": (
+                changed(lambda r: r.update(results=[row for row in r["results"]
+                                                    if row["query_id"] != self.QUERIES[0]])),
+                "--baseline has incomplete repetition identities for (stub, None, query 1): expected [1, 2], got []"),
+            "a repetition is recorded twice": (
+                lambda: baseline([trigger_row("duplicate", True, triggered=True, run_number=n)
+                                  for n in (1, 1, 2)]),
+                "--baseline duplicates repetition 1 for (stub, None, duplicate)"),
+            "the design omits a result cell": (
+                changed(lambda r: r.update(design=r["design"][1:])),
+                "--baseline results row 1 is not present in the declared design"),
+            "the protocol declares other repetitions": (
+                changed(lambda r: r["protocol"].update(runs_per_query=999), rehash_protocol=True),
+                "--baseline protocol runs_per_query disagrees with its report"),
+            "the protocol ran an agent the design never declared": (
+                changed(lambda r: r["protocol"]["adapters"][0].update(
+                    agent="other", trace_dialect="other"), rehash_protocol=True),
+                "--baseline protocol agent/model design disagrees with its report"),
+            "the harness identity omits a module": (
+                changed(omit_identity_module, rehash_protocol=True),
+                "harness_identity must identify exactly"),
+            "cosmetic aliases of one query": (
+                lambda: baseline([trigger_row("identical prompt" + " " * n, True, triggered=True,
+                                              query_id=f"q{n}") for n in range(6)],
+                                 runs_per_query=1),
+                "--baseline design canonical query aliases must share one query ID and polarity"),
+            "a row records another tree": (
+                changed(lambda r: r["results"][0].update(skill_tree_hash="sha256:other")),
+                "--baseline results row 1: skill_tree_hash disagrees with its report"),
+            "a row's pass contradicts its observation": (
+                changed(lambda r: r["results"][0].update({"pass": True, "triggered": False})),
+                "--baseline results row 1: persisted triggered flag disagrees with the typed observation"),
+            "the baseline declares an ablation": (
+                lambda: baseline(ablation="drop-description", provenance=ABLATION_PROVENANCE),
+                "--baseline must be an unablated trigger run (it declares an ablation)"),
+            "an answer report": (
+                changed(lambda r: r.update(evidence_class="answer")),
+                "--baseline is not a skill-trigger-matrix report"),
+        }
+        for label, (make_baseline, message) in rejected.items():
+            with self.subTest(label):
+                ablation = trigger_report(
+                    self._ablation_rows(), ablation="drop-description",
+                    provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
+                compare = functools.partial(sb.build_trigger_comparison, make_baseline(), ablation)
+                assert_dies(self, compare, message)
 
 
 if __name__ == "__main__":
