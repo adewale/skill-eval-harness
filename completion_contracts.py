@@ -134,22 +134,53 @@ class ServedModelCheck(str, Enum):
 
 _FAMILY_ALIASES = frozenset({"haiku", "sonnet", "opus", "fable", "mythos"})
 _SNAPSHOT_SUFFIX = re.compile(r"[-@]\d{8}")
+# Spellings that name the same model as the bare id: Claude Code's context
+# window suffix (``sonnet[1m]``), Bedrock's region and vendor prefix and
+# version suffix (``us.anthropic.claude-x-20250929-v1:0``), Vertex's snapshot
+# separator (``claude-x@20250805``) and the ``-latest`` alias.
+_CONTEXT_SUFFIX = re.compile(r"\[[^\]]*\]$")
+_BEDROCK_PREFIX = re.compile(r"^(?:[a-z]+(?:-[a-z]+)*\.)?anthropic\.")
+_BEDROCK_VERSION = re.compile(r"-v\d+:\d+$")
+_VERTEX_SNAPSHOT = re.compile(r"@(\d{8})$")
+# A Claude model id, in the current (``claude-sonnet-4-5``) or the Claude 3
+# (``claude-3-5-haiku``) order, with an optional dated snapshot.
+_CLAUDE_ID = re.compile(
+    r"claude-(?:(?P<family>[a-z]+)-(?P<version>\d{1,2}(?:-\d{1,2})?)"
+    r"|(?P<version3>\d{1,2}(?:-\d{1,2})?)-(?P<family3>[a-z]+))(?:-(?P<snapshot>\d{8}))?")
 
 
 def _model_tail(model: str) -> str:
-    """Drop provider routing prefixes: ``anthropic/x``, ``models/x``, ``anthropic.x``."""
-    tail = model.strip().casefold().rsplit("/", 1)[-1]
-    return tail.removeprefix("anthropic.")
+    """The bare model id behind provider spellings: routing prefixes
+    (``anthropic/x``, ``models/x``, ``us.anthropic.x``), a context-window
+    suffix, a Bedrock version suffix, and a Vertex ``@date`` snapshot."""
+    tail = _CONTEXT_SUFFIX.sub("", model.strip().casefold()).rsplit("/", 1)[-1]
+    tail = _BEDROCK_VERSION.sub("", _BEDROCK_PREFIX.sub("", tail))
+    return _VERTEX_SNAPSHOT.sub(r"-\1", tail).removesuffix("-latest")
+
+
+def _claude_id(model: str) -> tuple[str, tuple[int, ...], str | None] | None:
+    """(family, version, snapshot) of a Claude id; ``4-0`` is version 4."""
+    match = _CLAUDE_ID.fullmatch(model)
+    if match is None:
+        return None
+    family = match["family"] or match["family3"]
+    version = [int(part) for part in (match["version"] or match["version3"]).split("-")]
+    while len(version) > 1 and version[-1] == 0:
+        version.pop()
+    return family, tuple(version), match["snapshot"]
 
 
 def served_model_check(requested: str | None, served: str | None) -> ServedModelCheck:
     """Compare a requested model id with the one the provider reported.
 
-    A full id matches itself or itself plus a dated snapshot suffix
-    (``claude-haiku-4-5`` -> ``claude-haiku-4-5-20251001``). A bare family
-    alias (``sonnet``) matches any served id containing that family. Any other
-    alias the harness cannot resolve is ``unverifiable``, which does not block
-    scoring; only a clear mismatch does.
+    Both ids are first reduced to the bare model id (``_model_tail``). Two
+    Claude ids match when family and version agree (``-4-0`` is version 4) and
+    the request either names no snapshot or the served one; a request for a
+    snapshot answered by an undated id is ``unverifiable``. A bare family
+    alias (``sonnet``) matches any served id of that family. Other ids match
+    themselves or themselves plus a dated snapshot suffix. An alias or id the
+    harness cannot resolve is ``unverifiable``, which does not block scoring;
+    only a clear mismatch does.
     """
     if served is None or not served.strip():
         return ServedModelCheck.UNAVAILABLE
@@ -159,13 +190,24 @@ def served_model_check(requested: str | None, served: str | None) -> ServedModel
     got = _model_tail(served)
     if want == got:
         return ServedModelCheck.MATCH
+    want_id, got_id = _claude_id(want), _claude_id(got)
+    if want in _FAMILY_ALIASES:
+        if got_id is not None:
+            return ServedModelCheck.MATCH if got_id[0] == want else ServedModelCheck.MISMATCH
+        tokens = set(re.split(r"[-_.@]", got))
+        return ServedModelCheck.MATCH if want in tokens else ServedModelCheck.UNVERIFIABLE
+    if want_id is not None and got_id is not None:
+        if want_id[:2] != got_id[:2]:
+            return ServedModelCheck.MISMATCH
+        if want_id[2] is None or want_id[2] == got_id[2]:
+            return ServedModelCheck.MATCH
+        return (ServedModelCheck.UNVERIFIABLE if got_id[2] is None
+                else ServedModelCheck.MISMATCH)
+    if want_id is not None or got_id is not None:
+        return ServedModelCheck.UNVERIFIABLE
     if got.startswith(want) and _SNAPSHOT_SUFFIX.fullmatch(got[len(want):]):
         return ServedModelCheck.MATCH
     if not any(char.isdigit() for char in want):
-        if want in _FAMILY_ALIASES:
-            tokens = set(re.split(r"[-_.@]", got))
-            return (ServedModelCheck.MATCH if want in tokens
-                    else ServedModelCheck.MISMATCH)
         return ServedModelCheck.UNVERIFIABLE
     return ServedModelCheck.MISMATCH
 

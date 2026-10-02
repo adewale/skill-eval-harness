@@ -64,41 +64,54 @@ class StopClassificationTests(unittest.TestCase):
             cc.StopObservation(cc.StopClass.UNAVAILABLE, "end_turn", "t")
 
 
+MATCH, MISMATCH = cc.ServedModelCheck.MATCH, cc.ServedModelCheck.MISMATCH
+UNVERIFIABLE = cc.ServedModelCheck.UNVERIFIABLE
+
+# (requested, served, check). Only a clear family, tier, version or snapshot
+# difference is a mismatch, which makes the run unscorable.
+SERVED_MODEL_CHECKS = (
+    ("claude-haiku-4-5", "claude-haiku-4-5", MATCH),
+    ("claude-haiku-4-5", "claude-haiku-4-5-20251001", MATCH),
+    ("claude-opus-4-5", "claude-opus-4-5@20251101", MATCH),
+    # Sonnet 5 and Sonnet 5.5 share a prefix; only a dated suffix is a snapshot.
+    ("claude-sonnet-5", "claude-sonnet-5-5", MISMATCH),
+    ("sonnet", "claude-sonnet-5-5", MATCH),
+    ("sonnet", "claude-haiku-4-5-20251001", MISMATCH),
+    ("default", "claude-sonnet-5-5", UNVERIFIABLE),
+    ("anthropic/claude-opus-5-5", "claude-opus-5-5", MATCH),
+    ("claude-opus-5-5", "anthropic.claude-opus-5-5", MATCH),
+    ("claude-opus-5-5", None, cc.ServedModelCheck.UNAVAILABLE),
+    (None, "claude-opus-5-5", cc.ServedModelCheck.NOT_REQUESTED),
+    # Aliases Claude Code, Bedrock and Vertex accept; each read as a mismatch,
+    # so every run that requested one was unscorable.
+    ("sonnet[1m]", "claude-sonnet-4-5-20250929", MATCH),
+    ("claude-sonnet-4-5[1m]", "claude-sonnet-4-5-20250929", MATCH),
+    ("claude-sonnet-4-0", "claude-sonnet-4-20250514", MATCH),
+    ("claude-3-5-haiku-latest", "claude-3-5-haiku-20241022", MATCH),
+    ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "claude-sonnet-4-5-20250929", MATCH),
+    ("claude-sonnet-4-5", "us.anthropic.claude-sonnet-4-5-20250929-v1:0", MATCH),
+    ("claude-opus-4-1@20250805", "claude-opus-4-1-20250805", MATCH),
+    ("opusplan", "claude-opus-4-1-20250805", UNVERIFIABLE),
+    ("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4",
+     "claude-sonnet-4-5-20250929", UNVERIFIABLE),
+    ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5", UNVERIFIABLE),
+    # A clear difference behind the same spellings still blocks scoring.
+    ("haiku", "claude-sonnet-4-5-20250929", MISMATCH),
+    ("sonnet[1m]", "claude-haiku-4-5-20251001", MISMATCH),
+    ("claude-3-5-haiku-latest", "claude-3-5-sonnet-20241022", MISMATCH),
+    ("claude-sonnet-4-0", "claude-sonnet-4-5-20250929", MISMATCH),
+    ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "claude-opus-4-1-20250805", MISMATCH),
+    ("claude-opus-4-1@20250805", "claude-opus-4-20250514", MISMATCH),
+    ("claude-3-5-sonnet-20240620", "claude-3-5-sonnet-20241022", MISMATCH),
+    ("gemini-2.5-pro", "gemini-2.5-flash", MISMATCH),
+)
+
+
 class ServedModelTests(unittest.TestCase):
-    def test_exact_and_dated_snapshot_match(self):
-        self.assertIs(cc.served_model_check("claude-haiku-4-5", "claude-haiku-4-5"),
-                      cc.ServedModelCheck.MATCH)
-        self.assertIs(cc.served_model_check("claude-haiku-4-5", "claude-haiku-4-5-20251001"),
-                      cc.ServedModelCheck.MATCH)
-        self.assertIs(cc.served_model_check("claude-opus-4-5", "claude-opus-4-5@20251101"),
-                      cc.ServedModelCheck.MATCH)
-
-    def test_a_newer_point_release_is_not_a_snapshot(self):
-        # Sonnet 5 and Sonnet 5.5 share a prefix; only a dated suffix is a snapshot.
-        self.assertIs(cc.served_model_check("claude-sonnet-5", "claude-sonnet-5-5"),
-                      cc.ServedModelCheck.MISMATCH)
-
-    def test_family_alias_matches_its_family_only(self):
-        self.assertIs(cc.served_model_check("sonnet", "claude-sonnet-5-5"),
-                      cc.ServedModelCheck.MATCH)
-        self.assertIs(cc.served_model_check("sonnet", "claude-haiku-4-5-20251001"),
-                      cc.ServedModelCheck.MISMATCH)
-
-    def test_unknown_alias_is_unverifiable_not_mismatch(self):
-        self.assertIs(cc.served_model_check("default", "claude-sonnet-5-5"),
-                      cc.ServedModelCheck.UNVERIFIABLE)
-
-    def test_provider_prefixes_are_ignored(self):
-        self.assertIs(cc.served_model_check("anthropic/claude-opus-5-5", "claude-opus-5-5"),
-                      cc.ServedModelCheck.MATCH)
-        self.assertIs(cc.served_model_check("claude-opus-5-5", "anthropic.claude-opus-5-5"),
-                      cc.ServedModelCheck.MATCH)
-
-    def test_absent_evidence_is_named(self):
-        self.assertIs(cc.served_model_check("claude-opus-5-5", None),
-                      cc.ServedModelCheck.UNAVAILABLE)
-        self.assertIs(cc.served_model_check(None, "claude-opus-5-5"),
-                      cc.ServedModelCheck.NOT_REQUESTED)
+    def test_requested_and_served_model_ids(self):
+        for requested, served, check in SERVED_MODEL_CHECKS:
+            with self.subTest(requested=requested, served=served):
+                self.assertIs(cc.served_model_check(requested, served), check)
 
     def test_one_rule_for_zero_one_and_many_reported_models(self):
         cases = [
@@ -123,6 +136,21 @@ class ServedModelTests(unittest.TestCase):
         self.assertIsNone(cc.completion_unscorable_reason(mixed.as_metadata()))
         self.assertEqual(cc.completion_unscorable_reason(mismatch.as_metadata()),
                          "served_model_mismatch")
+
+    def test_a_context_window_alias_run_stays_scorable(self):
+        # `claude --model 'sonnet[1m]'` is answered by a dated Sonnet id.
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            _, tasks, run_dir = write_with_skill_task(root)
+            stub = stub_claude_stream(root / "claude", served_model="claude-sonnet-4-5-20250929",
+                                      stop_reason="end_turn")
+            code, _, stderr = run_cli("run-claude", "--tasks", tasks, "--runs", root / "runs",
+                                      "--model", "sonnet[1m]", "--claude-bin", stub)
+            meta = sb.read_metrics_base(root / "runs" / run_dir)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual((meta["requested_model"], meta["served_model"], meta["served_model_check"]),
+                         ("sonnet[1m]", "claude-sonnet-4-5-20250929", "match"))
+        self.assertIsNone(cc.completion_unscorable_reason(meta))
 
 
 class EffortTests(unittest.TestCase):
