@@ -24,11 +24,14 @@ Run these before opening a PR:
 ```sh
 pip install -e ".[test]"
 python3 -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
+ruff check .
 ty check --error-on-warning
 python3 -m unittest discover tests -v
 python3 scripts/check_test_collection_parity.py
 python3 scripts/check_installed_wheel.py
 ```
+
+The `test` extra pins the linters CI runs, `ruff==0.16.0` and `ty==0.0.65`; run those versions, because another release can report different findings.
 
 (`pytest tests/` also works — `pyproject.toml` carries the pythonpath config — but CI runs `unittest discover`, so keep tests compatible with both. `scripts/check_test_collection_parity.py` fails when either collector sees a test the other cannot, so a pytest-only test cannot hide from CI. `scripts/check_installed_wheel.py` builds the wheel, installs it into a clean environment, imports every module from there and runs each console script, so a module missing from `py-modules` fails before a release does.)
 
