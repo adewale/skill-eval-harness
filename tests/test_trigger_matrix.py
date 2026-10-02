@@ -951,6 +951,35 @@ class ClaudeDetectionTests(unittest.TestCase):
                 self.assertIs(row["triggered"], triggered)
                 self.assertEqual(row["evidence"], [f"Skill tool invoked: {skill}"] if triggered else [])
 
+    def test_claude_auth_tokens_from_the_environment_are_redacted(self):
+        # Claude Code authenticates from these variables too; a CLI that
+        # prints one (a debug line, an auth error) must not write it out.
+        tokens = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-token-from-setup-token",
+                  "ANTHROPIC_AUTH_TOKEN": "bearer-token-for-a-gateway"}
+
+        def leaky(plan):
+            env = dict(plan.environment or {})
+            echoed = " ".join(env[name] for name in tokens)
+            stdout = json.dumps({"type": "result", "subtype": "success", "result": echoed}) + "\n"
+            return InvocationOutcome.from_process(stdout=stdout, stderr=f"auth: {echoed}",
+                                                  returncode=0, elapsed_ms=1)
+
+        rows = [{"query_id": "negative", "query": "ordinary chat", "should_trigger": False}]
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(leaky)), \
+             mock.patch.dict(os.environ, {**tokens, "CLAUDE_CONFIG_DIR": str(Path(td) / "no-config")}):
+            traces = Path(td) / "traces"
+            report = tm.run_matrix(DEMO_MANIFEST, rows, agents=["claude"], models=["haiku"],
+                                   runs_per_query=1, timeout=30, workers=1, trace_runs=traces)
+            written = {str(path.relative_to(traces)): path.read_text(encoding="utf-8")
+                       for path in traces.rglob("*") if path.is_file()}
+        written["report"] = json.dumps(report)
+        self.assertEqual(report["results"][0]["stderr"], "auth: [REDACTED] [REDACTED]")
+        for name, text in written.items():
+            for token in tokens.values():
+                with self.subTest(artifact=name, token=token):
+                    self.assertNotIn(token, text)
+
 
 class CodexAdapterTests(unittest.TestCase):
     """Codex trigger support without a live codex binary."""

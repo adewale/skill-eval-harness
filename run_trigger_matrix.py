@@ -146,7 +146,8 @@ SENSITIVE_WORKSPACE_FILES = (
     ".codex/config.toml",
     ".vibe-home/.env",
 )
-SENSITIVE_ENV_VARS = ("MISTRAL_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN")
+SENSITIVE_ENV_VARS = ("MISTRAL_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN",
+                      "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
 
 
 # Trigger rows: the manifest's trigger cases or an --eval-set file, validated
