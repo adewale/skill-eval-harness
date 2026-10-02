@@ -17380,18 +17380,10 @@ def github_summary_from_report(report: dict[str, Any]) -> str:
     paired = report.get("paired_summary", {}) or {}
     summary = report.get("summary", {}) or {}
     lines = [f"# Skill eval — {skill}", ""]
-    design = report.get("answer_design") or {}
     if report.get("availability") != "complete":
-        reasons = []
-        if design.get("complete") is not True:
-            reasons.append("answer-design coverage")
-        if report.get("deferred_judge_tasks"):
-            reasons.append("deferred judge verdicts")
-        if any(row.get("grading_availability") != "complete"
-               for row in report.get("results", [])):
-            reasons.append("blocked grading evidence")
-        if any(not scorable_run(row) for row in report.get("results", [])):
-            reasons.append("unscorable attempts")
+        # The report's own root causes, each once (build_benchmark_report owns them).
+        reasons = [incomplete_label(str(reason))
+                   for reason in report.get("incomplete_reasons") or []]
         lines.extend([
             "**Experiment status:** incomplete"
             + (f" ({', '.join(reasons)})" if reasons else ""), "",
@@ -19689,19 +19681,32 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
     return {"availability": "complete", **observed}
 
 
-# What to do about each reason a benchmark report is partial
-# (build_benchmark_report's incomplete_reasons).
-INCOMPLETE_REMEDIES = {
-    "answer_design_incomplete": "some planned case arms have no run; finish the runs",
-    "unscorable_answer_attempts": "some runs are unscorable (cut off, wrong model, or not completed); re-run them",
-    "grading_evidence_incomplete": "some runs could not be graded; see grading_availability on the results",
-    "deferred_judge_verdicts": "judge assertions have no verdicts; pass --judge-results",
-    "incomplete_answer_pairing": "some pairs are blocked (a missing arm, or arms run at different effort); see paired_summary.pairing",
+# Each reason a benchmark report is partial (build_benchmark_report's
+# incomplete_reasons): its short name for a one-line status, and what to do.
+INCOMPLETE_CAUSES = {
+    "answer_design_incomplete": (
+        "answer-design coverage", "some planned case arms have no run; finish the runs"),
+    "unscorable_answer_attempts": (
+        "unscorable attempts",
+        "some runs are unscorable (cut off, wrong model, or not completed); re-run them"),
+    "grading_evidence_incomplete": (
+        "blocked grading evidence",
+        "some runs could not be graded; see grading_availability on the results"),
+    "deferred_judge_verdicts": (
+        "deferred judge verdicts", "judge assertions have no verdicts; pass --judge-results"),
+    "incomplete_answer_pairing": (
+        "blocked pairs",
+        ("some pairs are blocked (a missing arm, or arms run at different effort); "
+         "see paired_summary.pairing")),
 }
 
 
+def incomplete_label(reason: str) -> str:
+    return INCOMPLETE_CAUSES[reason][0] if reason in INCOMPLETE_CAUSES else reason
+
+
 def incomplete_remedy(reason: str) -> str:
-    return INCOMPLETE_REMEDIES.get(reason, reason)
+    return INCOMPLETE_CAUSES[reason][1] if reason in INCOMPLETE_CAUSES else reason
 
 
 def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str | None = None, leakage_min_chars: int = 4, benchmark_report: dict[str, Any] | None = None) -> dict[str, Any]:

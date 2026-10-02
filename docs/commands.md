@@ -303,7 +303,7 @@ A case whose two arms score the same extreme stops discriminating in one of two 
 
 ## CI report formats
 
-`report` serializes a `benchmark.json` for CI: `--format junit` writes one `<testcase>` per case/variant/run with evidence on failures and the paired lift as suite properties; `--format github` writes job-summary markdown plus `::warning` annotations per flagged case (and an `::error` on negative lift).
+`report` serializes a `benchmark.json` for CI: `--format junit` writes one `<testcase>` per case/variant/run with evidence on failures and the paired lift as suite properties; `--format github` writes job-summary markdown plus `::warning` annotations per flagged case (and an `::error` on negative lift); a partial report opens with its experiment status, naming each of the report's `incomplete_reasons` once.
 
 ```bash
 skill-benchmark report --benchmark benchmark.json --format junit --out junit.xml

@@ -133,7 +133,9 @@ that file still invalidates trigger identity until those owners are extracted in
   fields on one case, an inline `reference_answer` on a `holdout` or `holdback` case, and either
   field on a trigger case.
 - `benchmark` output gains `incomplete_reasons`, the root causes behind a `partial` availability. The
-  `benchmark-incomplete` readiness blocker names them in its message and evidence.
+  `benchmark-incomplete` readiness blocker names them in its message and evidence, and
+  `report --format github` prints them, each once, in its experiment status; a `benchmark.json`
+  written by 0.6.0 has no such list, so its status reads just `incomplete`.
 - A case with no objective assertion in either arm (gated only by judges) no longer blocks the
   objective pairing as `missing_objective_pass_rate`. Its pairs are left out of it and counted in
   `pairing.not_applicable_pairs`, so `paired_summary` can read `complete` where 0.6.0 read
