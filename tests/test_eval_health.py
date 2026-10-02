@@ -5,11 +5,17 @@ finding renamed at its producer breaks the consumer test that reads it."""
 import argparse
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import attest_answer_design, demo_manifest, write_demo_manifest
+from helpers import (
+    attest_answer_design,
+    demo_manifest,
+    run_skill_benchmark,
+    write_demo_manifest,
+)
 
 import skill_benchmark as sb
 from findings import CaseFlag, FindingKind
@@ -134,6 +140,29 @@ class ReadinessGateTests(unittest.TestCase):
             self.assertFalse((fx.path.parent / "audit.json").exists())
         self.assertNotEqual(code, 0)
         self.assertIn("unknown --fail-on token", stderr)
+
+    def test_fail_on_blockers_reads_the_readiness_blockers_of_a_complete_benchmark(self):
+        # Readiness blockers are not audit findings, so the `blockers` preset
+        # must gate on them too: a complete benchmark with no adversarial case
+        # fails, and the same suite with one passes.
+        lift = {"with_skill": "alpha", "without_skill": "none"}
+        rows = (
+            ("no adversarial case", [case("a")], {"a": lift}, 1, ["no-adversarial-cases"]),
+            ("adversarial case present", [case("a"), case("b", kind="adversarial")],
+             {"a": lift, "b": lift}, 0, []),
+        )
+        for label, cases, outputs, expected_code, failed_kinds in rows:
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), cases, outputs)
+                code, stderr = run_skill_benchmark(
+                    "audit-manifest", str(fx.path), "--runs", str(fx.runs),
+                    "--out", str(Path(td) / "audit.json"), "--fail-on", "blockers")
+                audit = json.loads((Path(td) / "audit.json").read_text(encoding="utf-8"))
+                self.assertEqual(audit["benchmark_availability"], "complete")
+                self.assertEqual(code, expected_code, stderr)
+                # The gate prints one "fail-on: KIND: message" line per reason.
+                self.assertEqual([line.split(": ")[1] for line in stderr.splitlines()],
+                                 failed_kinds)
 
 
 class KnownAnswerTests(unittest.TestCase):

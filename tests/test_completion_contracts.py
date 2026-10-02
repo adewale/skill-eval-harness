@@ -6,11 +6,18 @@ and two arms at different effort all look like ordinary results unless the run
 records them."""
 import argparse
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import claude_stream_records, make_eval_repo, stub_claude_stream
+from helpers import (
+    claude_stream_records,
+    make_eval_repo,
+    run_skill_benchmark,
+    stub_claude_stream,
+    write_with_skill_task,
+)
 
 import completion_contracts as cc
 import experimental_pairs as pairs
@@ -253,6 +260,40 @@ class ClaudeRunnerCompletionTests(unittest.TestCase):
             sb.run_agent_tasks([], Path(t), sb.registered_agent_backend("vibe"), effort="high")
 
 
+# A protocol-valid `codex exec --json` turn that also records the argv it got.
+FAKE_CODEX = """import json, pathlib, sys
+_ = sys.stdin.read()
+pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))
+pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('token-XYZ')
+for record in ({'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},
+               {'type': 'item.completed', 'item': {'id': 'i', 'type': 'agent_message', 'text': 'token-XYZ'}},
+               {'type': 'turn.completed', 'usage': {'input_tokens': 4, 'output_tokens': 6}}):
+    print(json.dumps(record))
+"""
+
+
+class CodexRunnerEffortTests(unittest.TestCase):
+    def test_requested_effort_reaches_the_codex_cli_only_when_given(self):
+        for flags, overrides, effort in (
+                (["--effort", "high"], ["model_reasoning_effort=high"],
+                 {"requested": "high", "applied_by": "codex -c model_reasoning_effort"}),
+                ([], [], {"requested": None, "applied_by": "backend_default"})):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as t:
+                root = Path(t)
+                _, tasks, run_dir = write_with_skill_task(root)
+                fake, probe, runs = root / "fake_codex.py", root / "argv.json", root / "runs"
+                fake.write_text(FAKE_CODEX, encoding="utf-8")
+                code, stderr = run_skill_benchmark(
+                    "run-codex", "--tasks", str(tasks), "--runs", str(runs),
+                    "--codex-cmd", f"{sys.executable} {fake} {probe}", *flags)
+                self.assertEqual(code, 0, stderr)
+                argv = json.loads(probe.read_text(encoding="utf-8"))
+                meta = sb.read_metrics_base(runs / run_dir)
+                self.assertEqual(
+                    [argv[i + 1] for i, item in enumerate(argv[:-1]) if item == "-c"], overrides)
+                self.assertEqual(meta["effort"], effort)
+
+
 class RunEndingsReportTests(unittest.TestCase):
     def test_block_counts_endings_and_warns_on_default_effort_across_models(self):
         results = [
@@ -268,6 +309,9 @@ class RunEndingsReportTests(unittest.TestCase):
         self.assertEqual(block["served_model_mismatches"], 1)
         self.assertEqual(block["by_variant"]["without_skill"]["stop_class"],
                          {"truncated": 1, "unrecorded": 1})
+        # A run that recorded no served model is unrecorded, never a match.
+        self.assertEqual(block["by_variant"]["without_skill"]["served_model_check"],
+                         {"mismatch": 1, "unrecorded": 1})
         self.assertIn("backend_default", block["effort_levels"])
         self.assertTrue(any("refusal" in note for note in block["notes"]))
 

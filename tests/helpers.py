@@ -672,3 +672,30 @@ def assert_dies(test: Any, callback: Any, message: str) -> None:
     with contextlib.redirect_stderr(stderr), test.assertRaises(SystemExit):
         callback()
     test.assertIn(message, stderr.getvalue())
+
+
+# --------------------------------------------------------------------------- #
+# lane A (kill matrix): drive a command through the real argument parser
+# --------------------------------------------------------------------------- #
+
+
+def run_skill_benchmark(*argv: str) -> tuple[int, str]:
+    """Run `skill-benchmark ARGV...` through the real parser and handler table.
+
+    Returns the exit code (a `die()` or argparse exit included) and stderr, so
+    a gate test can assert both the code and the reason the gate printed."""
+    import contextlib
+    import io
+    from unittest import mock
+
+    import skill_benchmark as sb
+
+    stderr = io.StringIO()
+    with mock.patch.object(sys, "argv", ["skill-benchmark", *argv]), \
+            contextlib.redirect_stderr(stderr):
+        try:
+            code = sb.main()
+        except SystemExit as exc:
+            code = (0 if exc.code is None
+                    else exc.code if isinstance(exc.code, int) else 1)
+    return code, stderr.getvalue()

@@ -134,6 +134,17 @@ class NoiseCheckTests(unittest.TestCase):
         self.assertEqual(ee.cases_needed_for_alpha(0.05), 6)
         self.assertEqual(ee.cases_needed_for_alpha(0.01), 8)
 
+    def test_six_cases_moving_together_are_enough(self):
+        # The boundary next to the blog split: six cases that all gain one full
+        # run reach p = 2/2**6 = 0.03125 <= 0.05. Every shift but +1 leaves six
+        # same-sign deltas the test rejects, so the interval is the point
+        # [1, 1], the noise floor is 0 and the eval can resolve the lift.
+        result = self.check([1.0] * 6, [0.0] * 6)
+        self.assertEqual(result["cases_moved"], 6)
+        self.assertEqual(result["smallest_achievable_p"], 0.03125)
+        self.assertEqual(result["noise_floor"], 0.0)
+        self.assertEqual(result["verdict"], "resolvable")
+
 
 class PairedSummaryTests(unittest.TestCase):
     def rows(self, pairs):
