@@ -258,6 +258,9 @@ class RunEndingsReportTests(unittest.TestCase):
         self.assertEqual(block["served_model_mismatches"], 1)
         self.assertEqual(block["by_variant"]["without_skill"]["stop_class"],
                          {"truncated": 1, "unrecorded": 1})
+        # A run that recorded no served model is unrecorded, never a match.
+        self.assertEqual(block["by_variant"]["without_skill"]["served_model_check"],
+                         {"mismatch": 1, "unrecorded": 1})
         self.assertIn("backend_default", block["effort_levels"])
         self.assertTrue(any("refusal" in note for note in block["notes"]))
 
