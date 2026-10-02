@@ -7888,8 +7888,7 @@ def _codex_trace_protocol_error(
 def _claude_trace_protocol_error(
     records: list[dict[str, Any]], pi_stream: PiStream | None,
 ) -> str | None:
-    terminals = [i for i, record in enumerate(records) if record.get("type") == "result"]
-    if terminals != [len(records) - 1]:
+    if claude_terminal_result_index(records) is None:
         return "Claude trace must contain exactly one final result event"
     return None
 
@@ -10461,6 +10460,25 @@ def run_codex(args: argparse.Namespace) -> int:
 # thing every other adapter leaves the caller to reconstruct out of band.
 # --------------------------------------------------------------------------- #
 
+# Record types Claude Code may emit after the terminal result event without
+# changing the session's outcome (observed: `system`/`task_summary`, 2.1.269).
+CLAUDE_POST_RESULT_RECORD_TYPES = frozenset({"system"})
+
+
+def claude_terminal_result_index(records: Sequence[Mapping[str, Any]]) -> int | None:
+    """The one owner of Claude's terminal-event rule, shared by the answer
+    parser and the trace dialect: exactly one `result` record, followed only
+    by informational `system` records. Anything else (no result, two results,
+    session content after the result) is None: the stream has no final word."""
+    results = [i for i, record in enumerate(records) if record.get("type") == "result"]
+    if len(results) != 1:
+        return None
+    trailing = records[results[0] + 1:]
+    if any(record.get("type") not in CLAUDE_POST_RESULT_RECORD_TYPES for record in trailing):
+        return None
+    return results[0]
+
+
 def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
     """Parse `claude -p` output in either output format.
 
@@ -10484,11 +10502,16 @@ def parse_claude_cli_json(stdout: str) -> dict[str, Any]:
         if errors:
             return {"answer": "", "raw_response": text, "cost_usd": None,
                     "usage": {}, "parse_error": f"malformed Claude stream: {errors[0]}"}
-        if len(results) != 1 or not records or records[-1] is not results[0]:
+        if len(results) != 1:
             return {"answer": "", "raw_response": text, "cost_usd": None,
                     "usage": {}, "parse_error": (
                         "Claude stream must contain exactly one terminal result event")}
-        env = results[0]
+        terminal_index = claude_terminal_result_index(records)
+        if terminal_index is None:
+            return {"answer": "", "raw_response": text, "cost_usd": None,
+                    "usage": {}, "parse_error": (
+                        "Claude stream carries session content after its terminal result event")}
+        env = records[terminal_index]
     else:
         if isinstance(single, dict):
             env = single

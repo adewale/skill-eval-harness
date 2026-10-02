@@ -444,16 +444,19 @@ def stub_claude_stream(
     served_model: str | None = None,
     stop_reason: str | None = None,
     probe_path: Path | None = None,
+    trailing_records: list[dict[str, Any]] | None = None,
 ) -> Path:
     """A fake `claude` executable for the stream-json answer path: it emits the
     canonical claude_stream_records sequence verbatim, and ONLY when
     stream-json was actually requested — so a backend that silently falls back
     to the single-envelope format fails the protocol instead of passing by
-    accident. With probe_path it records its argv."""
+    accident. With probe_path it records its argv; trailing_records are written
+    after the result event, as Claude Code 2.1.269 writes a `system` record."""
     stream_text = "\n".join(
         json.dumps(record)
-        for record in claude_stream_records(answer=answer, cost=cost, in_tok=in_tok, out_tok=out_tok,
-                                            served_model=served_model, stop_reason=stop_reason)
+        for record in [*claude_stream_records(answer=answer, cost=cost, in_tok=in_tok, out_tok=out_tok,
+                                              served_model=served_model, stop_reason=stop_reason),
+                       *(trailing_records or [])]
     ) + "\n"
     probe = ("" if probe_path is None else
              f"import json\nopen({json.dumps(str(probe_path))}, 'w').write(json.dumps(sys.argv[1:]))\n")
