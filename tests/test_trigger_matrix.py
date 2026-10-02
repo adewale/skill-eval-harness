@@ -82,6 +82,39 @@ def run_pi_cli(extra_argv, fake, out: Path):
     return code, json.loads(out.read_text(encoding="utf-8"))
 
 
+def fake_trigger_claude(path: Path, probe: Path) -> Path:
+    """A fake `claude` for trigger runs. Its init event lists the skills Claude
+    Code offers the model: one bundled skill, the project skills mounted in the
+    working directory, the personal skills in its config dir, and an
+    organisation skill when CLAUDE_CODE_SYNC_SKILLS is set. It records where it
+    looked, and echoes any auth token it was given, as a leaky CLI would."""
+    path.write_text(f"""#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+skills = ["update-config"]
+skills += sorted(p.name for p in (Path.cwd() / ".claude" / "skills").iterdir())
+if (config / "skills").is_dir():
+    skills += sorted(p.name for p in (config / "skills").iterdir())
+if os.environ.get("CLAUDE_CODE_SYNC_SKILLS"):
+    skills.append("org-synced-skill")
+with open({str(probe)!r}, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"config": str(config), "cwd": os.getcwd(),
+                             "sync_skills": "CLAUDE_CODE_SYNC_SKILLS" in os.environ}}) + "\\n")
+token = " ".join(os.environ.get(name, "") for name in
+                 ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")).strip()
+sys.stderr.write("auth: " + token + "\\n")
+for record in ({{"type": "system", "subtype": "init", "session_id": "s", "skills": skills}},
+               {{"type": "assistant", "message": {{"role": "assistant", "content": [
+                   {{"type": "text", "text": "Answered with " + token}}]}}}},
+               {{"type": "result", "subtype": "success", "is_error": False,
+                 "result": "Answered.", "total_cost_usd": 0.001}}):
+    print(json.dumps(record))
+""", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
 def observe_pi(query, should_trigger, fake, *, trace_dir=None):
     """One Pi cell of the matrix on the demo skill's canonical tree."""
     manifest = tm.load_manifest(DEMO_MANIFEST)
@@ -865,7 +898,7 @@ class ClaudeDetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)), \
              mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
-            result = tm.ClaudeAdapter().invoke("q", "haiku", Path(td), 1)
+            result = tm.ClaudeAdapter().invoke("q", "haiku", Path(td) / "run", 1)
         self.assertIs(result.state, InvocationState.COMPLETE)
         self.assertTrue(result.observation_complete)
         self.assertIsNone(result.provider_error)
@@ -885,7 +918,7 @@ class ClaudeDetectionTests(unittest.TestCase):
                  tempfile.TemporaryDirectory() as td, \
                  mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)), \
                  mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
-                result = tm.ClaudeAdapter().invoke("q", "haiku", Path(td), 1)
+                result = tm.ClaudeAdapter().invoke("q", "haiku", Path(td) / "run", 1)
             self.assertIs(result.state, state)
 
     def test_mounted_skill_names_read_frontmatter(self):
@@ -923,6 +956,7 @@ class ClaudeDetectionTests(unittest.TestCase):
         def fake_run(plan):
             env = dict(plan.environment or {})
             seen["config_dir"] = env.get("CLAUDE_CONFIG_DIR")
+            seen["sync_skills"] = env.get("CLAUDE_CODE_SYNC_SKILLS")
             return completed_invocation(json.dumps({"type": "result", "subtype": "success"}) + "\n")
 
         with tempfile.TemporaryDirectory() as td, mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)):
@@ -930,12 +964,17 @@ class ClaudeDetectionTests(unittest.TestCase):
             source = root / "oauth-backed-claude"
             source.mkdir()
             workspace = root / "run"
-            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(source)}, clear=True):
+            env = {"CLAUDE_CONFIG_DIR": str(source), "CLAUDE_CODE_SYNC_SKILLS": "1"}
+            with mock.patch.dict(os.environ, env, clear=True):
                 result = tm.ClaudeAdapter().invoke("q", "haiku", workspace, 12)
         self.assertEqual(seen["config_dir"], str(source))
         self.assertFalse(tm.ClaudeAdapter._config_dir(workspace).exists())
         self.assertFalse(result.metadata["config_isolated"])
         self.assertIn("personal config may influence", result.metadata["config_isolation_warning"])
+        # Not isolated: the run is left as the user's own CLI would see it, and
+        # a stream with no init skill list is no evidence about competitors.
+        self.assertEqual(seen["sync_skills"], "1")
+        self.assertNotIn("competing_skills", result.metadata)
 
     def test_claude_malformed_stream_is_not_a_valid_negative_observation(self):
         def fake_run(*args, **kwargs):
@@ -953,7 +992,7 @@ class ClaudeDetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)), \
              mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
-            result = tm.ClaudeAdapter().invoke("q", "haiku", Path(td), 1)
+            result = tm.ClaudeAdapter().invoke("q", "haiku", Path(td) / "run", 1)
         self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
         self.assertIn("protocol error", result.provider_error or "")
 
@@ -970,7 +1009,7 @@ class ClaudeDetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)), \
              mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
-            result = tm.ClaudeAdapter().invoke("q", None, Path(td), 1)
+            result = tm.ClaudeAdapter().invoke("q", None, Path(td) / "run", 1)
         self.assertIs(result.state, InvocationState.COMPLETE)
         self.assertIsNone(result.provider_error)
         detection = self._adapter().detect(result, ["probe-plugin:tidy-commit"], [])
@@ -1076,6 +1115,58 @@ class ClaudeDetectionTests(unittest.TestCase):
         # trigger-compare requires the same controls the adapter declares.
         self.assertEqual(code, 0, stderr)
         self.assertEqual(json.loads(stdout)["paired"]["blocked"], [])
+
+    def test_env_auth_isolates_the_claude_config_so_trigger_compare_accepts_the_cells(self):
+        # CI logs Claude in through an environment variable, with no credentials
+        # file to copy. An empty config dir still authenticates then, so the run
+        # is isolated: the user's personal skill and the organisation's synced
+        # skills must not compete with the skill under test.
+        for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+            with self.subTest(auth=var), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                token = f"{var.lower()}-secret-value"
+                personal = root / "user-claude"
+                (personal / "skills" / "personal-helper").mkdir(parents=True)
+                probe = root / "probe.jsonl"
+                claude = fake_trigger_claude(root / "claude", probe)
+                env = {"PATH": os.environ.get("PATH", ""), "HOME": str(root), var: token,
+                       "CLAUDE_CONFIG_DIR": str(personal), "CLAUDE_CODE_SYNC_SKILLS": "1"}
+                reports = {}
+                with mock.patch.dict(os.environ, env, clear=True), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    for arm, extra in (("baseline", []), ("ablation", ["--ablation", "weaker-description"])):
+                        reports[arm] = root / f"{arm}.json"
+                        with mock.patch.object(sys, "argv", [
+                                "skill-trigger-matrix", str(DEMO_MANIFEST), "--agent", "claude",
+                                "--model", "haiku", "--runs-per-query", "1", "--workers", "1",
+                                "--claude-bin", str(claude), "--trace-runs", str(root / "traces" / arm),
+                                "--out", str(reports[arm]), *extra]):
+                            self.assertEqual(tm.main(), 0)
+                    code, stdout, stderr = run_cli("trigger-compare", "--baseline", reports["baseline"],
+                                                   "--ablation", reports["ablation"])
+                rows = [row for path in reports.values()
+                        for row in json.loads(path.read_text(encoding="utf-8"))["results"]]
+                runs = [json.loads(line) for line in probe.read_text(encoding="utf-8").splitlines()]
+                artifacts = {str(path): path.read_text(encoding="utf-8")
+                             for path in [*reports.values(), *(root / "traces").rglob("*")] if path.is_file()}
+                self.assertTrue(rows)
+                for row in rows:
+                    self.assertEqual(row["protocol_observation"],
+                                     {"config_isolated": True, "claude_config_outside_workdir": True})
+                    self.assertNotIn("config_isolation_warning", row)
+                    # Only the skill bundled with the CLI competed with the mounted one.
+                    self.assertEqual(row.get("competing_skills"), ["update-config"])
+                self.assertEqual(len(runs), len(rows))
+                for run in runs:
+                    config = Path(run["config"])
+                    self.assertNotEqual(config, personal)
+                    self.assertFalse(config.is_relative_to(Path(run["cwd"])))
+                    self.assertFalse(config.exists(), "the isolated config is removed with the cell")
+                    self.assertFalse(run["sync_skills"])
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(json.loads(stdout)["paired"]["blocked"], [])
+                for name, text in artifacts.items():
+                    self.assertNotIn(token, text, name)
 
 
 class CodexAdapterTests(unittest.TestCase):

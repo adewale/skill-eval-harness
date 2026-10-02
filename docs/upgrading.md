@@ -170,6 +170,16 @@ that file still invalidates trigger identity until those owners are extracted in
   moved from `.trigger-config/` inside the working directory, where the model's Read and Glob
   could reach it, to a directory beside it. A Claude report's protocol requires
   `claude_config_outside_workdir` and its rows record it.
+- The Claude trigger adapter now also isolates its config when authentication comes from the
+  environment (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `ANTHROPIC_BASE_URL`, or the Bedrock and Vertex switches), not only when a credentials file can
+  be copied. Under `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_AUTH_TOKEN`, the usual CI login, rows
+  read `config_isolated: false` and `trigger-compare` blocked every cell
+  (`protocol_observation_unsafe`). An isolated run also drops `CLAUDE_CODE_SYNC_SKILLS`, so
+  organisation skills no longer compete with the skill under test, and each row lists the other
+  skills Claude Code offered the model as `competing_skills`. A rate measured with
+  `config_isolated: false` could include personal and organisation skills; re-measure it rather
+  than compare it with an isolated one.
 - Codex trigger rows record the files seeded into `CODEX_HOME` as `codex_home_files` instead of
   `codex_home_files_copied`. `trigger-compare` read that list as an unsafe protocol observation
   and blocked every Codex cell; the regenerated reports the identity bump already requires pair.

@@ -51,8 +51,10 @@ loop:
      Keep editing.
    - *isolation or competing skills*: another skill won the routing. If the run's
      metadata records `config_isolated: false`, a personal skill may have leaked
-     in, so fix the sandbox. A built-in winning is a real routing loss (see below),
-     so treat it as a description gap against that competitor.
+     in, so fix the sandbox (log in through the environment; see below). The row's
+     `competing_skills` names every other skill the model was offered. A built-in
+     winning is a real routing loss (see below), so treat it as a description gap
+     against that competitor.
    - *ambiguous query*: a domain expert could argue either polarity. Rewrite or drop
      the query, not the description.
    - *variance*: the cell flips across identical re-runs by as much as the round
@@ -168,7 +170,15 @@ Each rule below exists because its violation produced a wrong number at least on
   beside the working directory, not inside it, so the copied credentials are out of
   the model's reach, and it is removed when the cell ends. The agent's
   built-in skills stay, because your users run against them too — losing a routing
-  fight to a built-in is a real activation failure.
+  fight to a built-in is a real activation failure. Claude isolation needs portable
+  auth: an API key, auth token, OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`, what
+  `claude setup-token` prints for CI), `ANTHROPIC_BASE_URL`, or Bedrock or Vertex in
+  the environment, or a credentials file it can copy. A keychain login cannot move
+  into a fresh config, so those runs keep your normal config and read
+  `config_isolated: false`, and `trigger-compare` will not compare them. Isolated runs
+  also drop `CLAUDE_CODE_SYNC_SKILLS`, so your organisation's skills stay out, and every
+  row lists the skills that did compete as `competing_skills`. Never compare an
+  isolated rate with an unisolated one.
 - **A passing answer benchmark proves nothing about discovery.** The answer runners
   force-load the skill (`prepare` refuses to even emit trigger-case rows for them).
   Only an autonomous-trigger run measures whether the skill loads by itself.
