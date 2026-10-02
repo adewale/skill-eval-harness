@@ -15966,9 +15966,12 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             for cid, cohort_model in confirmed_cohorts:
                 matched = pairs_by_case_model[(cid, cohort_model)]
                 label = cid if cohort_model is None else f"{cid}@{cohort_model}"
-                per_case_sig[label] = sign_flip_significance(paired_combined_deltas(matched))
+                per_case_sig[label] = Estimate.from_deltas(
+                    paired_combined_deltas(matched),
+                    unit=InferenceUnit.REPLICATE_PAIR).blocks()["significance"]
             significance = {
                 "method": "per-case-model-paired-sign-flip",
+                "unit": InferenceUnit.REPLICATE_PAIR.value,
                 "significant_at_0_05": any(s.get("significant_at_0_05") for s in per_case_sig.values()),
                 "min_p_value": min((s["p_value"] for s in per_case_sig.values() if s.get("p_value") is not None), default=None),
                 "by_case": per_case_sig,

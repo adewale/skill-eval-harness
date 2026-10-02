@@ -1277,6 +1277,16 @@ class AblationRegressionReportTests(unittest.TestCase):
                 self.assertEqual(reg["evidence_class"], "indeterminate")
                 self.assertIsNone(reg["expected_regression_confirmed"])
 
+    def test_regression_significance_names_the_replicate_pair_as_its_unit(self):
+        # The confirmation tests each case's matched repetitions, so its
+        # significance counts replicate pairs, not cases, and says so on the
+        # block and on each case's test, as every paired significance does.
+        entry = self.report(self.MANIFEST, self._pairs([self.prov()["metadata"]] * 6))[0]
+        significance = entry["regressions"][0]["significance"]
+        self.assertEqual(significance["unit"], "replicate_pair")
+        self.assertEqual(significance["by_case"]["c1"]["unit"], "replicate_pair")
+        self.assertEqual(significance["by_case"]["c1"]["p_value"], 0.03125)
+
 
 class AblationCoverageTests(unittest.TestCase):
     """Exercises paths claimed in the spec acceptance criteria but not covered by

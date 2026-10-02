@@ -114,7 +114,8 @@ that file still invalidates trigger identity until those owners are extracted in
   `audit-manifest --fail-on-blockers` can start failing on a suite that passed under 0.6.0.
   Audit the case and its assertions rather than removing the regression intent.
 - Every paired `significance`, `interval`, and `noise_check` block gains `unit`, the inference unit
-  its test counts (`case` for benchmark lift).
+  its test counts (`case` for benchmark lift, `replicate_pair` for an ablation regression's
+  `significance` and each of its `by_case` tests).
 - Ablation pairing diagnostics read `contrast_id: "ablation:<id>"` (0.6.0 wrote `skill_presence`),
   and a missing ablation run blocks as `missing_ablation:<id>` instead of `missing_without_skill`.
   Update any script that filters on those strings.
