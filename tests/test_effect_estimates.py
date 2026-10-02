@@ -4,12 +4,21 @@ The interval is the sign-flip test inverted, so it must exclude zero exactly
 when the exact test rejects "no lift". The noise check must say when an eval
 could not have shown a lift at all. A case both arms fail must never be sent
 to suggest-cases for hardening."""
+import json
 import random
 import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import attest_answer_design, demo_manifest, result_row, write_demo_manifest
+from helpers import (
+    attest_answer_design,
+    demo_manifest,
+    judge_with_stub,
+    result_row,
+    run_cli,
+    write_demo_manifest,
+    write_run,
+)
 
 import effect_estimates as ee
 import skill_benchmark as sb
@@ -170,6 +179,50 @@ class PairedSummaryTests(unittest.TestCase):
         self.assertEqual(summary["interval"]["availability"], "unavailable")
         self.assertTrue(summary["observed_interval"]["bounded"])
         self.assertIn("verdict", summary["observed_noise_check"])
+
+    def test_incomplete_grading_moves_every_estimate_to_observed(self):
+        # Every pair forms, but a script oracle that did not run (no
+        # --allow-scripts) leaves each row's grading incomplete. The report
+        # withholds the lift, and with it the interval, the noise check and
+        # the graded channel, on the pooled block and on each model's.
+        cases = [{"id": f"c{i}", "split": "tune", "kind": "behavior", "prompt": "Do it.",
+                  "assertions": [
+                      {"name": "has-alpha", "type": "contains", "value": "alpha"},
+                      {"name": "oracle", "type": "script", "command": ["true"]},
+                      {"name": "quality", "type": "judge", "rubric": ["Names the first Greek letter"]}]}
+                 for i in range(6)]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_demo_manifest(root, demo_manifest(cases=cases))
+            runs = root / "runs"
+            for i in range(6):
+                for model in ("m1", "m2"):
+                    write_run(runs / f"c{i}" / model / "with_skill", "alpha")
+                    # c0 passes in both arms, so one delta per model is 0.
+                    write_run(runs / f"c{i}" / model / "without_skill", "none" if i else "alpha")
+            attest_answer_design(path, runs)
+            verdicts = judge_with_stub(path, runs, root / "verdicts.jsonl",
+                                       passes_on="alpha", scored=True)
+            out = root / "benchmark.json"
+            code, _, stderr = run_cli("benchmark", path, "--runs", runs,
+                                      "--judge-results", verdicts, "--out", out)
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(report["incomplete_reasons"], ["grading_evidence_incomplete"])
+        withheld = {"availability": "unavailable", "reason": "grading_evidence_incomplete"}
+        lift = report["paired_summary"]
+        for label, block in (("pooled", lift), *lift["by_model"].items()):
+            with self.subTest(block=label):
+                self.assertEqual(block["interval"], withheld)
+                self.assertEqual(block["noise_check"], withheld)
+                # Each model pairs 6 cases, 5 of which moved; pooled, 12 and 10.
+                self.assertEqual(block["observed_interval"]["n"], 12 if label == "pooled" else 6)
+                self.assertEqual(block["observed_noise_check"]["cases_moved"],
+                                 10 if label == "pooled" else 5)
+        self.assertEqual(lift["graded"]["availability"], "partial")
+        self.assertIsNone(lift["graded"]["delta"])
+        self.assertEqual(lift["graded"]["reason"], "grading_evidence_incomplete")
+        self.assertEqual(lift["observed_graded"]["delta"], round(10 / 12, 4))
 
 
 class FloorCeilingTests(unittest.TestCase):

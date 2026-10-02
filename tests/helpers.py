@@ -708,15 +708,18 @@ def run_cli(*argv: str | Path) -> tuple[int, str, str]:
 # --------------------------------------------------------------------------- #
 
 
-def judge_with_stub(manifest: Path, runs: Path, out: Path, *, passes_on: str) -> Path:
+def judge_with_stub(manifest: Path, runs: Path, out: Path, *, passes_on: str,
+                    scored: bool = False) -> Path:
     """Write judge verdicts for every judge task under `runs` through the real
     `skill-benchmark judge` command, with a local stub judge (no model) that
-    passes an answer exactly when `passes_on` appears in its prompt."""
+    passes an answer exactly when `passes_on` appears in its prompt. `scored`
+    adds a normalized score, 1.0 on a pass and 0.0 on a fail."""
     stub = out.parent / "stub_judge.py"
+    score = "'score': 1.0 if hit else 0.0, " if scored else ""
     stub.write_text(
         "import json, sys\n"
         f"hit = {passes_on!r} in sys.stdin.read()\n"
-        "print(json.dumps({'passed': hit, 'rationale': 'stub'}))\n",
+        f"print(json.dumps({{{score}'passed': hit, 'rationale': 'stub'}}))\n",
         encoding="utf-8")
     code, _, stderr = run_cli("judge", manifest, "--runs", runs,
                               "--judge-cmd", f"{sys.executable} {stub}", "--out", out)

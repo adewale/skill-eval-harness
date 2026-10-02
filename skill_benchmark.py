@@ -15310,6 +15310,27 @@ EDIT_HEADLINE_FIELDS = (
 )
 
 
+def withhold_paired_headline(block: dict[str, Any], reason: str, *,
+                             headline_fields: tuple[str, ...] = PAIR_HEADLINE_FIELDS) -> dict[str, Any]:
+    """Move a paired block's headline, significance, interval and noise check
+    under ``observed_*`` and mark the block partial for ``reason``."""
+    out = dict(block)
+    out["availability"] = "partial"
+    for key in headline_fields:
+        out[f"observed_{key}"] = out.get(key)
+        out[key] = None
+    out["observed_significance"] = out.get("significance")
+    out["significance"] = {
+        "method": "unavailable", "n": 0, "p_value": None,
+        "significant_at_0_05": False, "reason": reason,
+    }
+    for key in ("interval", "noise_check"):
+        if key in out:
+            out[f"observed_{key}"] = out[key]
+            out[key] = {"availability": "unavailable", "reason": reason}
+    return out
+
+
 def pairing_aware_block(block: dict[str, Any],
                         construction: _ResultPairConstruction, *,
                         headline_fields: tuple[str, ...] = PAIR_HEADLINE_FIELDS) -> dict[str, Any]:
@@ -15319,20 +15340,7 @@ def pairing_aware_block(block: dict[str, Any],
     if not construction.blocked:
         out["availability"] = "complete"
         return out
-    out["availability"] = "partial"
-    for key in headline_fields:
-        out[f"observed_{key}"] = out.get(key)
-        out[key] = None
-    out["observed_significance"] = out.get("significance")
-    out["significance"] = {
-        "method": "unavailable", "n": 0, "p_value": None,
-        "significant_at_0_05": False, "reason": "incomplete_pairing",
-    }
-    for key in ("interval", "noise_check"):
-        if key in out:
-            out[f"observed_{key}"] = out[key]
-            out[key] = {"availability": "unavailable", "reason": "incomplete_pairing"}
-    return out
+    return withhold_paired_headline(out, "incomplete_pairing", headline_fields=headline_fields)
 
 
 def paired_edit_summary(results: list[dict[str, Any]], *, min_lift: float | None = None) -> dict[str, Any] | None:
@@ -16771,17 +16779,19 @@ def answer_design_coverage(
     }
 
 
-def invalidate_report_pairing(block: dict[str, Any], reason: str) -> dict[str, Any]:
+def invalidate_report_pairing(block: dict[str, Any], reason: str, *,
+                              headline_fields: tuple[str, ...] = PAIR_HEADLINE_FIELDS) -> dict[str, Any]:
+    """Withhold a paired block, its per-model blocks and its graded channel
+    when the report as a whole is incomplete for ``reason``."""
     out = dict(block)
     if out.get("availability") != "partial":
-        for key in PAIR_HEADLINE_FIELDS:
-            out[f"observed_{key}"] = out.get(key)
-            out[key] = None
-        out["observed_significance"] = out.get("significance")
-        out["significance"] = {"method": "unavailable", "n": 0,
-                               "p_value": None, "significant_at_0_05": False,
-                               "reason": reason}
-    out["availability"] = "partial"
+        out = withhold_paired_headline(out, reason, headline_fields=headline_fields)
+    graded = out.get("graded")
+    if isinstance(graded, dict) and graded.get("availability") == "complete":
+        out["observed_graded"] = {key: value for key, value in graded.items()
+                                  if key not in {"availability", "pairing"}}
+        out["graded"] = {"availability": "partial", "delta": None, "reason": reason,
+                         "pairing": graded.get("pairing")}
     out["design_coverage_reason"] = reason
     if isinstance(out.get("by_model"), dict):
         out["by_model"] = {model: invalidate_report_pairing(value, reason)
@@ -17072,17 +17082,21 @@ def build_benchmark_report(
         runs, results, manifest=manifest, manifest_path=path,
         case_ids=answer_case_ids, variants=variants)
     paired_summary = build_paired_summary(results, min_lift=min_lift)
+    # The edit's own effect when the run carries an old_skill arm.
+    edit_summary = paired_edit_summary(results, min_lift=min_lift)
     pairing_blocked = paired_summary.get("availability") != "complete"
     unscorable_results = [row for row in results if not scorable_run(row)]
     grading_blocked_results = [
         row for row in results
         if row.get("grading_availability") != "complete"]
-    if not design_coverage["complete"]:
-        paired_summary = invalidate_report_pairing(
-            paired_summary, "answer_design_incomplete")
-    elif grading_blocked_results:
-        paired_summary = invalidate_report_pairing(
-            paired_summary, "grading_evidence_incomplete")
+    report_pairing_reason = (
+        "answer_design_incomplete" if not design_coverage["complete"]
+        else "grading_evidence_incomplete" if grading_blocked_results else None)
+    if report_pairing_reason is not None:
+        paired_summary = invalidate_report_pairing(paired_summary, report_pairing_reason)
+        if edit_summary is not None:
+            edit_summary = invalidate_report_pairing(
+                edit_summary, report_pairing_reason, headline_fields=EDIT_HEADLINE_FIELDS)
     ablation_regressions = build_ablation_regression_report(manifest, results)
     if not design_coverage["complete"]:
         for entry in ablation_regressions:
@@ -17200,9 +17214,7 @@ def build_benchmark_report(
         # so a rubric the skill could see never inflates the held-out number.
         "qualitative_by_visibility": qualitative_surface,
         "paired_summary": paired_summary,
-        # The edit's own effect when the run carries an old_skill arm.
-        **({"paired_edit_summary": edit_summary}
-           if (edit_summary := paired_edit_summary(results, min_lift=min_lift)) is not None else {}),
+        **({"paired_edit_summary": edit_summary} if edit_summary is not None else {}),
         # 5: pass@k / pass^k per (case, variant) from the repeated-run data, plus a
         # pooled per-variant reliability headline. Uses the unbiased estimator.
         "reliability": reliability,

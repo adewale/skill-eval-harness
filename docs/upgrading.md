@@ -99,7 +99,9 @@ that file still invalidates trigger identity until those owners are extracted in
 ### Expected report and audit changes
 
 - Every paired block gains `interval` and `noise_check` (under `observed_*` when pairing is
-  incomplete). `benchmark --min-lift` adds `min_lift` to the noise check.
+  incomplete, or when the report is partial for `answer_design_incomplete` or
+  `grading_evidence_incomplete`, which also moves `graded` to `observed_graded`).
+  `benchmark --min-lift` adds `min_lift` to the noise check.
 - A case whose arms both score 0 on every scored pair gains the `floor: fails in both arms` flag
   beside `no objective lift`. `saturated/non-discriminating` still marks only the ceiling.
 - `audit-manifest --runs` reports such a case as `floor-eval` instead of `no-lift-eval`, now
@@ -138,6 +140,8 @@ that file still invalidates trigger identity until those owners are extracted in
   finished, or over a runs directory missing an arm, starts failing; point it at the complete run.
 - Paired edit comparison: `benchmark` with an `old_skill` arm selected (`--variant old_skill`
   beside the two defaults) adds `paired_edit_summary`; without that arm the report is unchanged.
+  When the report is partial because an arm has no run or an assertion could not be graded, the
+  edit's headline is withheld under `observed_*`, as `paired_summary`'s is.
 - `skill-pi-trigger-eval` writes the `skill-trigger-matrix` report: the protocol producer is
   `skill-trigger-matrix` with one `pi` adapter, and the report gains `agents` and `matrix`.
   `trigger-compare` no longer accepts the old `skill-pi-trigger-eval` producer. Each row's `ablation` is the

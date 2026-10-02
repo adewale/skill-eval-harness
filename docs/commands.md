@@ -287,7 +287,7 @@ Multi-model runs prepare with `--models a,b,c` (run dirs gain a model segment: `
 
 When the noise floor reaches the target (`min_lift`, else `headroom`), `projected_cases` scales the current unit count by `(noise_floor / target)**2`. It is an estimate of the cases needed, not a guarantee.
 
-When pairing is incomplete, both fields move to `observed_interval` / `observed_noise_check` and the headline fields read `{"availability": "unavailable", "reason": "incomplete_pairing"}`, like the other headline fields.
+When pairing is incomplete, both fields move to `observed_interval` / `observed_noise_check` and the headline fields read `{"availability": "unavailable", "reason": "incomplete_pairing"}`, like the other headline fields. When every pair forms but the report is partial because a planned arm has no run or an assertion could not be graded, the same move happens on `paired_summary`, each `by_model` entry and `paired_edit_summary`, with `reason` (and `design_coverage_reason`) reading `answer_design_incomplete` or `grading_evidence_incomplete`; `graded` then moves to `observed_graded` and reads `{"availability": "partial", "delta": null, "reason": ...}`.
 
 ### The edit against the previous revision
 
