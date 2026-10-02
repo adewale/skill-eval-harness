@@ -264,28 +264,6 @@ class SkillBenchmarkTests(unittest.TestCase):
         }
         self.assertEqual(tm.trigger_query_from_case(case), "write a README")
 
-    def test_trigger_detector_uses_copied_skill_paths_not_bare_skill_name(self):
-        copied = [Path("/tmp/pi-trigger-x/skills/good-readme/SKILL.md")]
-        repo_event = json.dumps({
-            "type": "file_read", "status": "completed",
-            "path": "good-readme/README.md"})
-        self.assertEqual(sb.detect_trigger(repo_event, copied), (False, []))
-        skill_event = json.dumps({
-            "type": "file_read", "status": "completed",
-            "path": "/tmp/pi-trigger-x/skills/good-readme/SKILL.md"})
-        triggered, evidence = sb.detect_trigger(skill_event, copied)
-        self.assertTrue(triggered)
-        self.assertIn("/tmp/pi-trigger-x/skills/good-readme/SKILL.md", evidence[0])
-
-    def test_trigger_detector_reads_command_array_events(self):
-        copied = [Path("/tmp/codex-trigger-x/.codex/skills/good-readme/SKILL.md")]
-        event = json.dumps({
-            "type": "command", "status": "completed",
-            "command": ["bash", "-lc", f"cat {copied[0]}"]})
-        triggered, evidence = sb.detect_trigger(event, copied)
-        self.assertTrue(triggered)
-        self.assertIn("SKILL.md", evidence[0])
-
     def test_prepare_includes_input_files(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

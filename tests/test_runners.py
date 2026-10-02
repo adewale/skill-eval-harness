@@ -650,17 +650,27 @@ class SharedSkillInvokedTests(unittest.TestCase):
     read — not a 'mounted => invoked' fiat."""
 
     def test_detect_trigger_is_evidence_based(self):
-        sp = Path("/ws/skills/root-0/SKILL.md")
-        read_it = json.dumps({"type": "tool_use", "name": "Read",
-                              "status": "completed",
-                              "input": {"file_path": "/ws/skills/root-0/SKILL.md"}})
-        invoked, evidence = sb.detect_trigger(read_it, [sp])
-        self.assertTrue(invoked)
-        self.assertTrue(evidence)
-        never = json.dumps({"type": "tool_use", "name": "Read",
-                            "status": "completed",
-                            "input": {"file_path": "/ws/inputs/data.csv"}})
-        self.assertEqual(sb.detect_trigger(never, [sp]), (False, []))   # mounted but unread => False
+        skill = "/ws/skills/good-readme/SKILL.md"
+        events = {
+            # label: (one completed event, expected (invoked, evidence))
+            "a Read of the mounted SKILL.md": (
+                {"type": "tool_use", "name": "Read", "input": {"file_path": skill}}, (True, [skill])),
+            "a file_read of the mounted SKILL.md": (
+                {"type": "file_read", "path": skill}, (True, [skill])),
+            "a command array that cats it": (
+                {"type": "command", "command": ["bash", "-lc", f"cat {skill}"]},
+                (True, [f"bash -lc cat {skill}"])),
+            # mounted but unread => False
+            "a Read of an input file": (
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "/ws/inputs/data.csv"}}, (False, [])),
+            # the skill's bare name is not its mounted path
+            "a repo file under a dir named like the skill": (
+                {"type": "file_read", "path": "good-readme/README.md"}, (False, [])),
+        }
+        for label, (event, expected) in events.items():
+            with self.subTest(label):
+                stream = json.dumps({**event, "status": "completed"})
+                self.assertEqual(sb.detect_trigger(stream, [Path(skill)]), expected)
 
 
 class JettyReferencesUploadTests(unittest.TestCase):

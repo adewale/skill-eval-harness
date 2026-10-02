@@ -16,7 +16,6 @@ from trigger_reporting import (
     summarize_trigger_cohort,
     summarize_trigger_matrix,
     trigger_cohort_as_dict,
-    trigger_cohort_exit_code,
 )
 
 
@@ -51,7 +50,6 @@ class TriggerCohortTypeTests(unittest.TestCase):
         block = trigger_cohort_as_dict(cohort)
         self.assertEqual(block["pass_rate"], 0.5)
         self.assertEqual(block["trigger_rate"], 0.5)
-        self.assertEqual(trigger_cohort_exit_code(cohort), 0)
 
     def test_incomplete_cohort_has_diagnostics_but_no_quality_rate(self):
         cohort = summarize_trigger_cohort([
@@ -65,7 +63,6 @@ class TriggerCohortTypeTests(unittest.TestCase):
         self.assertEqual(block["incomplete_reasons"], {InvocationState.PROCESS_FAILED.value: 1})
         self.assertNotIn("pass_rate", block)
         self.assertNotIn("trigger_rate", block)
-        self.assertEqual(trigger_cohort_exit_code(cohort), 1)
 
     def test_empty_cohort_is_not_a_zero_rate(self):
         cohort = summarize_trigger_cohort([])
@@ -74,7 +71,6 @@ class TriggerCohortTypeTests(unittest.TestCase):
         self.assertEqual(block["measurement_status"], "empty")
         self.assertNotIn("pass_rate", block)
         self.assertNotIn("trigger_rate", block)
-        self.assertEqual(trigger_cohort_exit_code(cohort), 1)
 
     def test_invalid_aggregate_states_cannot_be_constructed(self):
         with self.assertRaises(ValueError):

@@ -6,6 +6,7 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import contextlib
+import functools
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import unittest
 from pathlib import Path
 
 from helpers import (
+    assert_dies,
     attest_answer_design,
     trace_event,
     write_run,
@@ -981,21 +983,26 @@ class AssertionDependenciesTests(unittest.TestCase):
     def test_shape_rejected(self):
         p = Path("x")
         for bad in ([], 5, ["ok", 1], ""):
-            with self.assertRaises(SystemExit):
-                sb.validate_case_assertion("c", "a", 0, {"type": "contains", "value": "x", "depends_on": bad}, p)
+            with self.subTest(depends_on=bad):
+                assertion = {"type": "contains", "value": "x", "depends_on": bad}
+                assert_dies(self, functools.partial(sb.validate_case_assertion, "c", "a", 0, assertion, p),
+                            "depends_on must be a non-empty string or non-empty list of non-empty strings")
         sb.validate_case_assertion("c", "a", 0, {"type": "contains", "value": "x", "depends_on": "pre"}, p)   # ok
 
     def test_scope_unknown_ambiguous_and_cycle_rejected(self):
         p = Path("x")
         A = lambda **kw: {"type": "contains", "value": "x", **kw}
-        with self.assertRaises(SystemExit):   # unknown target
-            sb.validate_depends_on_scope("c", [A(name="dep", depends_on="missing")], p)
-        with self.assertRaises(SystemExit):   # self-cycle
-            sb.validate_depends_on_scope("c", [A(name="a", depends_on="a")], p)
-        with self.assertRaises(SystemExit):   # 2-cycle
-            sb.validate_depends_on_scope("c", [A(name="a", depends_on="b"), A(name="b", depends_on="a")], p)
-        with self.assertRaises(SystemExit):   # ambiguous target (duplicate label)
-            sb.validate_depends_on_scope("c", [A(name="pre"), A(name="pre", value="y"), A(name="dep", depends_on="pre")], p)
+        for label, assertions, message in (
+            ("unknown target", [A(name="dep", depends_on="missing")],
+             "depends_on unknown assertion 'missing'"),
+            ("self-cycle", [A(name="a", depends_on="a")], "depends_on cycle involving 'a'"),
+            ("2-cycle", [A(name="a", depends_on="b"), A(name="b", depends_on="a")],
+             "depends_on cycle involving 'a'"),
+            ("ambiguous target", [A(name="pre"), A(name="pre", value="y"), A(name="dep", depends_on="pre")],
+             "depends_on ambiguous label 'pre'"),
+        ):
+            with self.subTest(label):
+                assert_dies(self, functools.partial(sb.validate_depends_on_scope, "c", assertions, p), message)
         sb.validate_depends_on_scope("c", [A(name="pre"), A(name="dep", depends_on="pre")], p)   # valid graph
 
     def test_turn_depends_on_rejected_at_validate(self):
@@ -1224,28 +1231,24 @@ class ToolCallValidationTests(unittest.TestCase):
         self._validate({"type": "tool_call", "order": ["Read", "Edit"]})
         self._validate({"type": "tool_call", "tool": "Read"})                                # legacy pattern/count path
 
-    def test_rejects_multiple_selectors(self):
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "required_calls": ["Read"], "call_set": ["Read"]})
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "expected_no_call": True, "required_calls": ["Read"]})
-
-    def test_rejects_bad_list_types(self):
-        for bad in ("Read", [], [1, 2], ["ok", 3]):
-            with self.assertRaises(SystemExit):
-                self._validate({"type": "tool_call", "required_calls": bad})
-
-    def test_rejects_non_bool_expected_no_call(self):
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "expected_no_call": "false"})   # the string footgun
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "expected_no_call": 1})
-
-    def test_rejects_invalid_regex_in_pattern_or_order(self):
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "pattern": "["})
-        with self.assertRaises(SystemExit):
-            self._validate({"type": "tool_call", "order": ["ok", "("]})
+    def test_malformed_tool_calls_are_rejected_by_their_guard(self):
+        multiple = "tool_call sets multiple selectors"
+        not_a_list = "tool_call required_calls must be a non-empty list of non-empty strings"
+        not_a_bool = "tool_call expected_no_call must be true or false"
+        for fields, message in (
+            ({"required_calls": ["Read"], "call_set": ["Read"]}, f"{multiple} ['required_calls', 'call_set']"),
+            ({"expected_no_call": True, "required_calls": ["Read"]}, f"{multiple} ['expected_no_call', 'required_calls']"),
+            ({"required_calls": "Read"}, not_a_list),
+            ({"required_calls": []}, not_a_list),
+            ({"required_calls": [1, 2]}, not_a_list),
+            ({"required_calls": ["ok", 3]}, not_a_list),
+            ({"expected_no_call": "false"}, not_a_bool),   # the string footgun
+            ({"expected_no_call": 1}, not_a_bool),
+            ({"pattern": "["}, "tool_call invalid regex '['"),
+            ({"order": ["ok", "("]}, "tool_call invalid regex '('"),
+        ):
+            with self.subTest(fields=fields):
+                assert_dies(self, functools.partial(self._validate, {"type": "tool_call", **fields}), message)
 
     def test_literal_name_selectors_are_not_regex_validated(self):
         # required_calls/call_set are exact tool NAMES, so a regex-special name is fine

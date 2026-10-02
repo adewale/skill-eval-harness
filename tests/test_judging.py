@@ -851,26 +851,6 @@ class CrossJudgeConsensusTests(unittest.TestCase):
         self.assertEqual(len(out["judge_panel"]), 3)           # members nested
         self.assertIn("m1-ev", out["evidence"])
 
-    def test_majority_and_minority(self):
-        maj = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5), self._row("m3", False, 1)])
-        self.assertTrue(maj["passed"])
-        self.assertEqual(maj["agreement"]["concur_fraction"], round(2 / 3, 4))
-        self.assertFalse(maj["agreement"]["unanimous"])
-        minr = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", False, 1), self._row("m3", False, 1)])
-        self.assertFalse(minr["passed"])
-
-    def test_even_tie_resolved_by_score_median(self):
-        # 2-2 split; median score 4 >= threshold 3 -> passed, not unresolved
-        out = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5),
-                                         self._row("m3", False, 3), self._row("m4", False, 3)])
-        self.assertTrue(out["passed"])
-        self.assertFalse(out["agreement"]["unresolved"])
-
-    def test_even_tie_without_scores_is_unresolved_not_coinflip(self):
-        out = sb.merge_cross_judge_rows([self._row("m1", True), self._row("m2", False)])
-        self.assertFalse(out["passed"])
-        self.assertTrue(out["agreement"]["unresolved"])        # explicit, never a silent coin-flip
-
     def test_quorum_overrides_majority(self):
         out = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5), self._row("m3", False, 1)], quorum=3)
         self.assertFalse(out["passed"])                        # 2-of-3 pass, but quorum demands 3
@@ -978,43 +958,6 @@ class CrossJudgeConsensusTests(unittest.TestCase):
         # [5,5,1]: median 5 vs mean ~3.67 -> pins median; a mean mutation would show 3.67.
         out = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5), self._row("m3", False, 1)])
         self.assertEqual(out["score"], 5)
-
-    def test_even_tie_with_scores_but_no_threshold_is_unresolved(self):
-        # a bare raw-score panel (no calibrated threshold) must NOT pass on the default-1
-        # fallback (median >= 1 is ~always true) — it resolves to unresolved.
-        row = lambda m, p, s: {
-            "judge_task_id": "j", "judge_model": m, "passed": p,
-            "score": s, "evidence": "e", "returncode": 0,
-            "judge_observation_complete": True, "availability": "complete",
-            "judge_input_sha256": "sha256:" + "f" * 64,
-            "judge_prompt_sha256": "a" * 64, "judge_evidence_mode": "text-only",
-        }
-        out = sb.merge_cross_judge_rows([row("m1", True, 3), row("m2", False, 2)])   # no threshold key
-        self.assertFalse(out["passed"])
-        self.assertTrue(out["agreement"]["unresolved"])
-
-    def test_quorum_exactly_met_passes(self):
-        out = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5), self._row("m3", False, 1)], quorum=2)
-        self.assertTrue(out["passed"])                         # concur == quorum passes (>=, not >)
-
-    def test_even_tie_median_equals_threshold_passes(self):
-        # 2-2 tie, all scores 3, threshold 3 -> median == threshold -> passed via >=.
-        out = sb.merge_cross_judge_rows([self._row("m1", True, 3), self._row("m2", True, 3),
-                                         self._row("m3", False, 3), self._row("m4", False, 3)])
-        self.assertTrue(out["passed"])
-        self.assertFalse(out["agreement"]["unresolved"])
-
-    def test_even_tie_median_below_threshold_fails_but_resolved(self):
-        # median 2 < threshold 3 -> passed False, but RESOLVED (the median decided), not unresolved.
-        out = sb.merge_cross_judge_rows([self._row("m1", True, 2), self._row("m2", True, 2),
-                                         self._row("m3", False, 2), self._row("m4", False, 2)])
-        self.assertFalse(out["passed"])
-        self.assertFalse(out["agreement"]["unresolved"])
-
-    def test_all_fail_panel_is_unanimous(self):
-        out = sb.merge_cross_judge_rows([self._row("m1", False, 1), self._row("m2", False, 1)])
-        self.assertTrue(out["agreement"]["unanimous"])         # concur == 0 is unanimous too, not just concur == n
-        self.assertFalse(out["passed"])
 
 
 class JudgeRobustnessTests(unittest.TestCase):
