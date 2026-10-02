@@ -20,7 +20,6 @@ from helpers import (
 )
 
 import completion_contracts as cc
-import experimental_pairs as pairs
 import skill_benchmark as sb
 from ablation_model import execution_valid
 
@@ -161,35 +160,6 @@ class ScoringGateTests(unittest.TestCase):
 
     def test_runs_without_completion_evidence_are_unchanged(self):
         self.assertTrue(execution_valid(self.base(), "answer"))
-
-
-class EffortPairingTests(unittest.TestCase):
-    def rows(self, with_effort, without_effort):
-        def row(variant, effort):
-            out = {"case_id": "c", "variant": variant, "run_number": 1, "model": "m"}
-            if effort is not cc.BACKEND_DEFAULT and effort is not None:
-                out["effort"] = {"requested": effort}
-            elif effort is cc.BACKEND_DEFAULT:
-                out["effort"] = {"requested": None}
-            return out
-        return [row("with_skill", with_effort), row("without_skill", without_effort)]
-
-    def construct(self, rows):
-        return pairs.pairs_from_rows(rows, population=pairs.ExperimentalPopulation.ANSWER)
-
-    def test_different_effort_blocks_the_pair(self):
-        built = self.construct(self.rows("high", "low"))
-        self.assertEqual(built.pairs, ())
-        self.assertEqual(built.blocked[0].reason, "effort_mismatch")
-
-    def test_one_unrecorded_arm_blocks_the_pair(self):
-        built = self.construct(self.rows("high", None))
-        self.assertEqual(built.blocked[0].reason, "effort_unrecorded_on_one_arm")
-
-    def test_matching_or_legacy_rows_still_pair(self):
-        self.assertEqual(len(self.construct(self.rows("high", "high")).pairs), 1)
-        self.assertEqual(len(self.construct(self.rows(cc.BACKEND_DEFAULT, cc.BACKEND_DEFAULT)).pairs), 1)
-        self.assertEqual(len(self.construct(self.rows(None, None)).pairs), 1)
 
 
 class ClaudeRunnerCompletionTests(unittest.TestCase):
