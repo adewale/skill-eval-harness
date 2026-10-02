@@ -463,8 +463,14 @@ def redact_detection(detection: TriggerDetection, secrets: list[str]) -> Trigger
 
 
 def safe_trace_segment(text: str, fallback: str) -> str:
+    """A path-safe directory name for text. When sanitising changed it, a short
+    digest of the raw text keeps distinct values apart (`vendor/model-a` and
+    `vendor:model-a` both sanitise to `vendor-model-a`)."""
     label = safe_trace_label(text, fallback).strip(".-")
-    return label if label and label not in {".", ".."} else fallback
+    label = label if label and label not in {".", ".."} else fallback
+    if label != text:
+        label += "-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    return label
 
 
 class AgentAdapter:

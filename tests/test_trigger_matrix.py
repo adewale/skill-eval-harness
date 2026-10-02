@@ -608,7 +608,7 @@ class StubMatrixOfflineTests(unittest.TestCase):
         self.assertTrue(trace_dir.is_relative_to(trace_root))
         parts = trace_dir.relative_to(trace_root).parts
         self.assertNotIn("..", parts)
-        self.assertIn("bad-model", parts)
+        self.assertTrue(any(part.startswith("bad-model-") for part in parts), parts)
 
     def test_baseline_provenance_records_skill_tree_hash(self):
         report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
@@ -750,6 +750,20 @@ class StubMatrixOfflineTests(unittest.TestCase):
             tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows(), agents=["missing-agent"], models=None,
                           runs_per_query=1, timeout=30, workers=1)
         self.assertIn("AgentAdapter", str(ctx.exception))
+
+    def test_models_that_sanitise_alike_keep_separate_trace_directories(self):
+        models = ["vendor/model-a", "vendor:model-a"]
+        with tempfile.TemporaryDirectory() as td:
+            report = tm.run_matrix(DEMO_MANIFEST, demo_trigger_rows()[:1], agents=["stub"],
+                                   models=models, runs_per_query=1, timeout=30, workers=1,
+                                   trace_runs=Path(td) / "traces")
+            recorded = {
+                row["model"]: json.loads((Path(row["trace_dir"]) / "metadata.json")
+                                         .read_text(encoding="utf-8"))["model"]
+                for row in report["results"]}
+            trace_dirs = {row["trace_dir"] for row in report["results"]}
+        self.assertEqual(len(trace_dirs), 2)
+        self.assertEqual(recorded, {model: model for model in models})
 
 
 class TriggerCliStatusTests(unittest.TestCase):
