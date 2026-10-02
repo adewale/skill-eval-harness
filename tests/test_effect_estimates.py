@@ -174,6 +174,7 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
         rng = random.Random(3)
         deltas = [rng.choice([-1.0, 0.0, 0.5, 1.0]) for _ in range(30)]
         first = ee.sign_flip_interval(deltas, max_exact_n=0)
+        ee._patterns_of.cache_clear()   # as in a fresh re-grade
         second = ee.sign_flip_interval(list(reversed(deltas)), max_exact_n=0)
         self.assertEqual(first, second)
         self.assertEqual(first["method"], "sign-flip-inversion-sampled")
@@ -235,6 +236,68 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
             with self.subTest(end=end):
                 self.assertGreater(grouped_p(deltas, end + inside), 0.05)
                 self.assertLessEqual(grouped_p(deltas, end - inside), 0.05)
+
+    # How far an exact p-value may sit from alpha before the sampled decision
+    # must match it: past 2**18 patterns the bound is about 0.002 above p.
+    AMBIGUOUS = 0.004
+
+    def test_the_sampled_test_decides_like_brute_force_below_the_old_floor(self):
+        # Graded-score deltas take arbitrary values, so they sample. The
+        # sampled test decided on a Hoeffding bound that never fell below
+        # about 0.03, so it could not reject at alpha 0.01 even when the
+        # exact p was 0.0001. On 84 evals of 8-14 cases, forced onto the
+        # sampled path, it must decide as visiting every pattern does at
+        # 0.05, 0.01 and 0.005, wherever the exact p is clear of alpha.
+        rng = random.Random(23)
+        checked = 0
+        for n in range(8, 15):
+            for _ in range(12):
+                deltas = [round(rng.uniform(-0.4, 0.9), 4) for _ in range(n)]
+                exact = brute_force_p(deltas)(0.0)
+                for alpha in (0.05, 0.01, 0.005):
+                    if abs(exact - alpha) < self.AMBIGUOUS:
+                        continue
+                    sampled = ee.sign_flip_test(deltas, max_exact_n=0, alpha=alpha)
+                    with self.subTest(deltas=deltas, alpha=alpha, exact=exact):
+                        self.assertEqual(sampled["method"], "sign-flip-sampled")
+                        self.assertEqual(sampled["significant_at_0_05"], exact <= alpha)
+                        self.assertGreaterEqual(sampled["p_value_upper_bound"], exact)
+                    checked += 1
+        self.assertGreater(checked, 200)
+        # Twenty equal moves reach exact p = 2 / 2**20; the sampled bound
+        # used to stop at 0.029.
+        self.assertLess(ee.sign_flip_test([0.5] * 20, max_exact_n=0)["p_value_upper_bound"],
+                        0.003)
+
+    def test_the_sampled_path_agrees_with_the_exact_path_where_both_apply(self):
+        # 15-30 cases at three repeats are exact; sampled instead, their
+        # decision at 0.05 and 0.01 must match the exact one wherever the
+        # exact p is clear of alpha, and the sampled interval, which rejects
+        # a shift only when its upper bound clears alpha, must contain the
+        # exact one.
+        rng = random.Random(29)
+        decided = contained = 0
+        for _ in range(40):
+            deltas = thirds([rng.choice([-3, -2, -1, 0, 1, 1, 2, 3]) for _ in range(rng.randint(15, 30))])
+            for alpha in (0.05, 0.01):
+                exact = ee.sign_flip_test(deltas, alpha=alpha)
+                sampled = ee.sign_flip_test(deltas, max_exact_n=0, alpha=alpha)
+                self.assertEqual((exact["method"], sampled["method"]),
+                                 ("sign-flip-exact", "sign-flip-sampled"))
+                if abs(exact["p_value"] - alpha) >= self.AMBIGUOUS:
+                    with self.subTest(deltas=deltas, alpha=alpha):
+                        self.assertEqual(sampled["significant_at_0_05"],
+                                         exact["significant_at_0_05"])
+                    decided += 1
+            exact_interval = ee.sign_flip_interval(deltas)
+            sampled_interval = ee.sign_flip_interval(deltas, max_exact_n=0)
+            if exact_interval["bounded"] and sampled_interval["bounded"]:
+                with self.subTest(deltas=deltas):
+                    self.assertLessEqual(sampled_interval["lower"], exact_interval["lower"])
+                    self.assertGreaterEqual(sampled_interval["upper"], exact_interval["upper"])
+                contained += 1
+        self.assertGreater(decided, 60)
+        self.assertGreater(contained, 25)
 
 
 class NoiseCheckTests(unittest.TestCase):

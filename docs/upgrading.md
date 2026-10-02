@@ -200,6 +200,13 @@ that file still invalidates trigger identity until those owners are extracted in
   distinct deltas used to sample. A saved report whose `method` read `...-sampled` there reads
   `...-exact` when regraded, with the exact `p_value` (equal to `p_value_upper_bound`), and its
   `interval`, `noise_floor` and `significant_at_0_05` can change with it.
+- The sampled sign-flip test (graded-score deltas, mostly) decided on a Hoeffding bound that
+  never fell below about 0.03 at 4,096 patterns, so it could not reject at alpha 0.01, and an
+  exact p of 0.025 could still read not significant at 0.05. It now decides on a relative-entropy
+  (Chernoff) bound, about 0.002 at its floor, and draws four times as many patterns, up to 2**18,
+  while the decision at alpha is open. The patterns are drawn differently too, so a regraded
+  sampled block reads a different `p_value` and `p_value_upper_bound`, can change
+  `significant_at_0_05` and its `interval`, and gains `sampled_patterns`.
 - When every paired delta is equal (every case gained one full run, say), the interval was the
   point `[v, v]`, so `noise_check` read `noise_floor: 0` and `resolvable` for any `--min-lift`. A
   sign-flip test reads only signs and cannot bound a constant sample, so the interval now reads

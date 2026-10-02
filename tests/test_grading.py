@@ -430,9 +430,11 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertTrue(tiny["significant_at_0_05"])
 
     def test_sampled_sign_flip_is_order_invariant_and_conservative_at_gate(self):
-        # The deterministic Monte-Carlo point estimate is below .05, while
-        # exact enumeration is just above it.  A point-estimate gate would
-        # therefore manufacture a causal confirmation.
+        # Exact enumeration is just above .05, so no sample settles the
+        # decision: the sampled test draws more patterns while its bounds
+        # straddle .05, stops at its cap of 2**18, and still decides on the
+        # upper bound. A point-estimate gate, which the first 4,096 patterns
+        # put below .05, would manufacture a causal confirmation.
         # These 15 are exact by default (tenths, so their pattern sums are
         # whole numbers of tenths), so a 2**0 budget puts them on the sampled
         # path.
@@ -447,7 +449,8 @@ class GradedScoringSeverityTests(unittest.TestCase):
         # (a re-grade stays byte-identical) and independent of case order.
         self.assertEqual(sampled, reversed_sampled)
         self.assertAlmostEqual(exact["p_value"], 0.05010986328125)
-        self.assertLess(sampled["p_value"], 0.05)  # point estimate alone is unsafe
+        self.assertEqual(sampled["sampled_patterns"], 2 ** 18)
+        self.assertAlmostEqual(sampled["p_value"], exact["p_value"], delta=0.002)
         self.assertGreater(sampled["p_value_upper_bound"], 0.05)
         self.assertFalse(sampled["significant_at_0_05"])
 
