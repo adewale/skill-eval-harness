@@ -155,6 +155,11 @@ that file still invalidates trigger identity until those owners are extracted in
   did, and accepts the missing-cost block with observed parts that `normalize_cost` writes. A
   saved trigger report with an `estimated` cost row fails re-validation in `trigger-compare`;
   regenerate it.
+- Claude trigger detection also counts a `Skill` call that names the directory the skill is
+  mounted under (`skills_demo_SKILL.md` for `skills/demo/SKILL.md`), which is how Claude Code
+  2.1.269 invokes project skills. A Claude trigger report saved with such a CLI can show
+  should-fire misses that were activations; re-run it. Vibe's `skill` tool detection reads the
+  same two names.
 
 ### Removed names
 

@@ -837,7 +837,7 @@ class ClaudeDetectionTests(unittest.TestCase):
             skill_md = Path(td) / "some-dir" / "SKILL.md"
             skill_md.parent.mkdir()
             skill_md.write_text("---\nname: demo-reviewer\ndescription: x\n---\n", encoding="utf-8")
-            self.assertEqual(tm.mounted_skill_names([skill_md]), ["demo-reviewer"])
+            self.assertEqual(tm.mounted_skill_names([skill_md]), ["demo-reviewer", "some-dir"])
 
     def test_claude_invoke_seeds_portable_auth_into_isolated_config(self):
         seen = {}
@@ -919,6 +919,37 @@ class ClaudeDetectionTests(unittest.TestCase):
         self.assertIsNone(result.provider_error)
         detection = self._adapter().detect(result, ["probe-plugin:tidy-commit"], [])
         self.assertEqual(detection.legacy_evidence, ["Skill tool invoked: probe-plugin:tidy-commit"])
+
+    def test_skill_tool_called_by_mounted_directory_name_is_trigger_evidence(self):
+        # Claude Code 2.1.269 invokes a project skill by the directory it is
+        # mounted under, `skills_demo_SKILL.md` for skills/demo/SKILL.md, not by
+        # its declared name (#85 recorded 0/3 should-fire on Haiku and Sonnet
+        # for a skill a traced run showed being invoked).
+        def invoking(skill):
+            records = [
+                {"type": "system", "subtype": "init", "session_id": "s"},
+                {"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Skill", "input": {"skill": skill}}]}},
+                {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Launching skill"}]}},
+                {"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Reviewed."}]}},
+                {"type": "result", "subtype": "success", "is_error": False, "result": "Reviewed."},
+            ]
+            stdout = "".join(json.dumps(record) + "\n" for record in records)
+            return lambda plan: completed_invocation(stdout)
+
+        should_fire = [row for row in demo_trigger_rows() if row["should_trigger"]][:1]
+        for skill, triggered in (("skills_demo_SKILL.md", True), ("skills_other_SKILL.md", False)):
+            with self.subTest(skill=skill), \
+                 mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(invoking(skill))), \
+                 mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+                report = tm.run_matrix(DEMO_MANIFEST, should_fire, agents=["claude"], models=["haiku"],
+                                       runs_per_query=1, timeout=30, workers=1)
+                (row,) = report["results"]
+                self.assertEqual(report["summary"]["measurement_status"], "complete")
+                self.assertIs(row["triggered"], triggered)
+                self.assertEqual(row["evidence"], [f"Skill tool invoked: {skill}"] if triggered else [])
 
 
 class CodexAdapterTests(unittest.TestCase):
