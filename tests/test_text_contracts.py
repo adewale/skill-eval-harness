@@ -338,12 +338,15 @@ class TypedTextAssertionTests(unittest.TestCase):
         self.assertEqual(result["score"], 1.0)
 
     def test_embedding_verdict_uses_the_public_rounded_score(self):
-        with mock.patch.object(sb, "embedding_similarity", return_value=(0.79996, "")):
-            result = self.result_with_embedder(
-                {"type": "similarity", "mode": "embedding", "expected": "target", "threshold": 0.8},
-                "candidate",
-                "stub",
-            )
+        # Vectors whose cosine is 0.79996: the raw score misses the 0.8
+        # threshold, and the four-decimal public score reaches it.
+        command = ("python3 -c \"import json, math; "
+                   "print(json.dumps({'embeddings': [[1, 0], [0.79996, math.sqrt(1 - 0.79996 ** 2)]]}))\"")
+        result = self.result_with_embedder(
+            {"type": "similarity", "mode": "embedding", "expected": "target", "threshold": 0.8},
+            "candidate",
+            command,
+        )
         self.assertEqual(result["score"], 0.8)
         self.assertTrue(result["passed"])
         self.assertEqual(result["evidence"], "embedding similarity=0.8000 vs threshold=0.8")

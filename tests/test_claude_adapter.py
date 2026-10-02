@@ -4,15 +4,15 @@ in the benchmark report."""
 import argparse
 import json
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from helpers import claude_stream_records as _canonical_stream_records
+from helpers import run_cli, write_with_skill_task
 from helpers import stub_claude as _stub_claude
 from helpers import stub_claude_stream as _stub_claude_stream
-from helpers import write_with_skill_task
 
 import skill_benchmark as sb
 
@@ -444,6 +444,39 @@ class RunClaudeAdapterTests(unittest.TestCase):
                 {"type": "command_ran", "pattern": "npm test"}, base, meta)
             self.assertTrue(passed, evidence)
 
+    def test_run_agent_reads_a_recorded_claude_stream(self):
+        # Real Claude Code output (tests/fixtures/claude/README.md) rather than
+        # the canonical hand-built stream; expected values are read off its
+        # terminal result event.
+        recorded = Path(__file__).parent / "fixtures" / "claude" / "stream-json.plugin-skill.jsonl"
+        records = [json.loads(line) for line in recorded.read_text(encoding="utf-8").splitlines()]
+        served = records[1]["model"]   # the init event names the model that ran
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            _, tasks, run_dir = write_with_skill_task(td)
+            stub = td / "claude"
+            stub.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n"
+                            "assert 'stream-json' in sys.argv\n"
+                            f"sys.stdout.write(open({str(recorded)!r}, encoding='utf-8').read())\n",
+                            encoding="utf-8")
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+            result = run_cli("run-agent", "--agent", "claude", "--tasks", tasks, "--runs", td / "runs",
+                             "--model", served, "--claude-bin", stub)
+            base = td / "runs" / run_dir
+            output = (base / "output.md").read_text(encoding="utf-8")
+            meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(output, records[-1]["result"])
+        self.assertTrue(meta["trace_observation_complete"])
+        self.assertEqual((meta["stop_class"], meta["stop_reason"]), ("completed", "end_turn"))
+        self.assertEqual((meta["served_models"], meta["served_model_check"]), ([served], "match"))
+        self.assertEqual(meta["cost_normalized"]["total_cost"], 0.046597)
+        self.assertEqual(
+            {key: meta["usage_normalized"][key]
+             for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")},
+            {"input_tokens": 4, "output_tokens": 246, "cache_read_tokens": 29905, "cache_write_tokens": 9537})
+        self.assertEqual(meta["skill_invocation_evidence"], ["probe-plugin:tidy-commit Skill"])
+
 
 class ClaudeJudgeAndPanelTests(unittest.TestCase):
     def test_native_claude_judge_stamps_model_and_cost(self):
@@ -514,21 +547,18 @@ class ClaudeJudgeAndPanelTests(unittest.TestCase):
         self.assertEqual(result["observed"]["judges"], ["complete"])
 
     def test_compare_judges_rejects_blank_and_duplicate_identities_before_loading(self):
-        def rejected(message):
-            raise ValueError(message)
-
+        # None of the report files exist, so a check that ran after loading
+        # would fail on the missing file instead of naming the identity.
         for reports, message in (
-            (["=first.json", "b=second.json"], "non-empty"),
-            (["same=first.json", "same=second.json", "b=third.json"], "duplicate"),
-            (["a=", "b=second.json"], "path"),
+            (["=first.json", "b=second.json"], "--report judge name must be non-empty"),
+            (["same=first.json", "same=second.json", "b=third.json"], "duplicate --report judge name 'same'"),
+            (["a=", "b=second.json"], "--report path for judge 'a' must be non-empty"),
         ):
-            args = argparse.Namespace(report=reports, magnitude_eps=0.1, out=None)
-            with self.subTest(reports=reports), \
-                 mock.patch.object(sb, "load_json") as load_json, \
-                 mock.patch.object(sb, "die", side_effect=rejected), \
-                 self.assertRaisesRegex(ValueError, message):
-                sb.compare_judges(args)
-            load_json.assert_not_called()
+            with self.subTest(reports=reports), tempfile.TemporaryDirectory() as td:
+                argv = [arg for report in reports for arg in ("--report", report)]
+                self.assertEqual(run_cli("compare-judges", *argv, "--out", Path(td) / "out.json"),
+                                 (1, "", f"FAIL: {message}\n"))
+                self.assertFalse((Path(td) / "out.json").exists())
 
 
 if __name__ == "__main__":

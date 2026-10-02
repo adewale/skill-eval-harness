@@ -417,7 +417,7 @@ def claude_stream_records(
             {"type": "tool_use", "id": "toolu_9", "name": "Grep", "input": {"pattern": "x"}}]}})
     if served_model is not None:
         # Claude Code 2.1.x stamps each assistant message with the model that
-        # served it (recorded in PR #85's plugin-eval fixture).
+        # served it (recorded in tests/fixtures/claude/stream-json.plugin-skill.jsonl).
         for record in records:
             if record["type"] == "assistant":
                 record["message"]["model"] = served_model
@@ -675,27 +675,29 @@ def assert_dies(test: Any, callback: Any, message: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# lane A (kill matrix): drive a command through the real argument parser
+# lane D: the command line a user reaches
 # --------------------------------------------------------------------------- #
 
 
-def run_skill_benchmark(*argv: str) -> tuple[int, str]:
-    """Run `skill-benchmark ARGV...` through the real parser and handler table.
-
-    Returns the exit code (a `die()` or argparse exit included) and stderr, so
-    a gate test can assert both the code and the reason the gate printed."""
+def run_cli(*argv: str | Path) -> tuple[int, str, str]:
+    """Run `skill-benchmark ARGV` in process through the real parser, the
+    CLIInvocation validation edge, and main()'s dispatch table: the path a user
+    reaches, unlike calling a handler with a hand-built namespace. Returns
+    (exit code, stdout, stderr); a SystemExit from a parser error, die(), or a
+    refused gate becomes the exit code."""
     import contextlib
     import io
     from unittest import mock
 
     import skill_benchmark as sb
 
-    stderr = io.StringIO()
-    with mock.patch.object(sys, "argv", ["skill-benchmark", *argv]), \
-            contextlib.redirect_stderr(stderr):
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with mock.patch.object(sys, "argv", ["skill-benchmark", *map(str, argv)]), \
+            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         try:
             code = sb.main()
         except SystemExit as exc:
-            code = (0 if exc.code is None
-                    else exc.code if isinstance(exc.code, int) else 1)
-    return code, stderr.getvalue()
+            if isinstance(exc.code, str):
+                print(exc.code, file=stderr)
+            code = exc.code if isinstance(exc.code, int) else int(exc.code is not None)
+    return code, stdout.getvalue(), stderr.getvalue()

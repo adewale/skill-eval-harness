@@ -5,14 +5,12 @@ test_roadmap_features, test_followup_features, test_external_review_gaps,
 test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
-import argparse
 import contextlib
 import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 from helpers import (
     CONTAINS_APPROVED_CASE as CASE,
@@ -20,6 +18,7 @@ from helpers import (
 from helpers import (
     attest_answer_design,
     make_eval_repo,
+    run_cli,
     write_run,
 )
 from helpers import (
@@ -142,26 +141,21 @@ class EvalReadinessTests(unittest.TestCase):
             r = sb.audit_manifest_report(_manifest(rp, cases, ablations=[]))["readiness"]
             self.assertEqual(r["leak_saturated_cases"], [])
 
-    def _audit_ns(self, manifest_path, **over):
-        base = {"manifest": str(manifest_path), "skill_path": None, "runs": None, "split": None,
-                    "format": "json", "out": None, "min_positive": 5, "min_negative": 3, "min_adversarial": 3,
-                    "min_trigger_pos": 2, "min_trigger_neg": 2, "leakage_min_chars": 4, "fail_on_blockers": False}
-        base.update(over)
-        return argparse.Namespace(**base)
-
     def test_fail_on_blockers_gates_on_readiness(self):
         with tempfile.TemporaryDirectory() as td:
             rb = Path(td) / "bad"; _skill(rb)
             bad = _manifest(rb, [CASE], ablations=[{"id": "x", "removed_component": "x", "expected_regressions": ["y"]}])
-            self.assertEqual(sb.audit_manifest(self._audit_ns(bad, out=str(rb / "o.json"), fail_on_blockers=True)), 1)
-            self.assertEqual(sb.audit_manifest(self._audit_ns(bad, out=str(rb / "o.json"))), 0)   # off by default
+            code, _, stderr = run_cli("audit-manifest", bad, "--out", rb / "o.json", "--fail-on-blockers")
+            self.assertEqual(code, 1)
+            self.assertIn("audit-manifest: 2 readiness blocker(s) for 'good-pr'", stderr)
+            self.assertEqual(run_cli("audit-manifest", bad, "--out", rb / "o.json"), (0, "", ""))   # off by default
             rc = Path(td) / "clean"; _skill(rc)
             cases = [{"id": "a1", "split": "tune", "kind": "adversarial", "prompt": "a tricky near-miss to handle with care",
                       "assertions": [{"name": "k", "type": "contains", "value": "token-not-in-the-prompt"}]}]
             ab = {"id": "no-sev", "removed_component": "sev", "mechanism": "section", "class": "instructions",
                   "target": {"heading": "## Sev"}, "expected_regressions": [{"summary": "x", "cases": ["a1"], "assertions": ["k"]}]}
             clean = _manifest(rc, cases, ablations=[ab])
-            self.assertEqual(sb.audit_manifest(self._audit_ns(clean, out=str(rc / "o.json"), fail_on_blockers=True)), 0)
+            self.assertEqual(run_cli("audit-manifest", clean, "--out", rc / "o.json", "--fail-on-blockers"), (0, "", ""))
 
     def test_clean_manifest_has_no_blockers(self):
         with tempfile.TemporaryDirectory() as td:
@@ -483,13 +477,13 @@ class MigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = write_manifest(Path(td), self.v1_manifest())
             before = path.read_bytes()
-            args = SimpleNamespace(manifest=str(path), check=True, out_checklist=str(Path(td) / "checklist.json"))
-            self.assertEqual(sb.migrate_command(args), 0)
+            code, diff, _ = run_cli("migrate", path, "--check", "--out-checklist", Path(td) / "checklist.json")
+            self.assertEqual(code, 0)
+            self.assertIn('+  "version": 2,', diff)
             self.assertEqual(path.read_bytes(), before)   # --check writes nothing to the manifest
             checklist = json.loads((Path(td) / "checklist.json").read_text(encoding="utf-8"))
             self.assertTrue(checklist["checklist"])
-            args = SimpleNamespace(manifest=str(path), check=False, out_checklist=None)
-            self.assertEqual(sb.migrate_command(args), 0)
+            self.assertEqual(run_cli("migrate", path)[0], 0)
             migrated = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(migrated["version"], 2)
 
@@ -530,7 +524,7 @@ class MigrationTests(unittest.TestCase):
                 base.mkdir(parents=True)
                 (base / "output.md").write_text(text, encoding="utf-8")
             before = sb.build_benchmark_report(path, runs)
-            sb.migrate_command(SimpleNamespace(manifest=str(path), check=False, out_checklist=None))
+            self.assertEqual(run_cli("migrate", path)[0], 0)
             after = sb.build_benchmark_report(path, runs)
         for report in (before, after):
             report.pop("generated_at")
@@ -734,8 +728,6 @@ class ContaminationPerimeterTests(unittest.TestCase):
         self.assertEqual(report["cases"][0]["findings"][0]["kind"], "canary-hit")
 
     def test_the_gate_fails_on_a_finding_and_on_an_arm_it_never_read(self):
-        from types import SimpleNamespace
-
         def gate(outputs, *, armed=True):
             with tempfile.TemporaryDirectory() as td:
                 root, p = self._manifest(td, {"canary": "ZZ-CANARY-99"})
@@ -743,14 +735,11 @@ class ContaminationPerimeterTests(unittest.TestCase):
                 runs.mkdir()
                 for variant, text in outputs.items():
                     write_run(runs / "c" / variant, text)
-                args = SimpleNamespace(manifest=str(p), runs=str(runs), split="tune", ngram=8,
-                                       overlap_threshold=0.6, model_cutoff=None,
-                                       fail_on_contamination=armed, out=str(root / "c.json"))
-                stderr = io.StringIO()
-                with contextlib.redirect_stderr(stderr):
-                    code = sb.contamination_command(args)
+                code, _, stderr = run_cli(
+                    "contamination", p, "--runs", runs, "--split", "tune", "--out", root / "c.json",
+                    *(["--fail-on-contamination"] if armed else []))
                 report = json.loads((root / "c.json").read_text(encoding="utf-8"))
-            return code, report["coverage"], stderr.getvalue()
+            return code, report["coverage"], stderr
 
         clean = {"with_skill": "clean", "without_skill": "clean"}
         self.assertEqual(gate(clean)[0], 0)

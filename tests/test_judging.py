@@ -22,6 +22,7 @@ from helpers import (
 )
 from helpers import (
     make_eval_repo,
+    run_cli,
     trace_event,
     write_run,
 )
@@ -78,14 +79,11 @@ class JudgeConfigSlotTests(unittest.TestCase):
     def test_strict_judge_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as td:
             path = write_manifest(Path(td), base_manifest(judge={"model": "m"}, jetty={"model": "m"}))
-            args = SimpleNamespace(
-                manifest=str(path), skill_path=None, runs=None, split=None, format="json",
-                out=str(Path(td) / "audit.json"), min_positive=0, min_negative=0, min_adversarial=0,
-                min_trigger_pos=0, min_trigger_neg=0, leakage_min_chars=4,
-                fail_on_blockers=False, strict_judge=True)
-            self.assertEqual(sb.audit_manifest(args), 1)
-            args.strict_judge = False
-            self.assertEqual(sb.audit_manifest(args), 0)
+            audit = ("audit-manifest", path, "--out", Path(td) / "audit.json")
+            code, _, stderr = run_cli(*audit, "--strict-judge")
+            self.assertEqual(code, 1)
+            self.assertIn("strict-judge: judge model 'm' is also a model under test", stderr)
+            self.assertEqual(run_cli(*audit), (0, "", ""))
 
 
 class JudgePresetTests(unittest.TestCase):
@@ -1085,44 +1083,45 @@ class JudgeRobustnessTests(unittest.TestCase):
         out2 = sb.flipped_judge_task({"expected_behavior": "notalist"})
         self.assertEqual(out2["expected_behavior"], "notalist")                           # non-list left alone
 
-    def _cli_manifest(self, td):
+    def _cli_manifest(self, td, *, assertions=None):
         root = Path(td)
         p = make_eval_repo(root, cases=[{
             "id": "c", "split": "tune", "kind": "behavior", "prompt": "x",
-            "assertions": [{"name": "j", "type": "judge", "severity": "gate",
-                            "review_rubric": ["is it good"]}]}])
+            "assertions": assertions or [{"name": "j", "type": "judge", "severity": "gate",
+                                          "review_rubric": ["is it good"]}]}])
         runs = root / "runs"
         for variant in ("with_skill", "without_skill"):
             write_run(runs / "c" / variant, "GOODANSWER is present")
         return p, runs
 
-    def _args(self, td, p, runs, name, body, *, fail_on_findings=False):
-        from types import SimpleNamespace
-        return SimpleNamespace(cmd="judge-robustness", manifest=str(p), runs=str(runs), split="tune",
-                               variant=None, judge_cmd=self._judge(td, name, body), judge_model=None,
-                               claude_bin="claude", fail_on_findings=fail_on_findings, out=str(Path(td) / "rep.json"))
+    def _cli(self, td, p, runs, name, body, *flags):
+        return run_cli("judge-robustness", p, "--runs", runs, "--split", "tune",
+                       "--judge-cmd", self._judge(td, name, body),
+                       "--out", Path(td) / "rep.json", *flags)
 
     def test_command_exit_code_contract_end_to_end(self):
         with tempfile.TemporaryDirectory() as td:
             p, runs = self._cli_manifest(td)
             # Robust judge -> no findings -> exit 0 even with the CI gate armed.
-            self.assertEqual(sb.judge_robustness_command(self._args(td, p, runs, "robust", self.ROBUST, fail_on_findings=True)), 0)
+            self.assertEqual(self._cli(td, p, runs, "robust", self.ROBUST, "--fail-on-findings"), (0, "", ""))
             report = json.loads((Path(td) / "rep.json").read_text(encoding="utf-8"))
             self.assertEqual(report["findings"], [])
             self.assertEqual(report["summary"]["n"], 2)   # one judge task per variant (with_skill + without_skill)
-            # Always-pass judge leaks controls: findings present, and the gate flips exit code.
-            self.assertEqual(sb.judge_robustness_command(self._args(td, p, runs, "yes", self.ALWAYS_PASS, fail_on_findings=False)), 0)
-            self.assertEqual(sb.judge_robustness_command(self._args(td, p, runs, "yes", self.ALWAYS_PASS, fail_on_findings=True)), 1)
+            # Always-pass judge leaks controls: findings present, and only the armed gate flips the exit code.
+            self.assertEqual(self._cli(td, p, runs, "yes", self.ALWAYS_PASS), (0, "", ""))
+            code, _, stderr = self._cli(td, p, runs, "yes", self.ALWAYS_PASS, "--fail-on-findings")
+        self.assertEqual(code, 1)
+        self.assertIn("judge-robustness: passes-empty-control: judge PASSED a empty negative control", stderr)
 
     def test_ci_gate_fails_when_no_judge_tasks_are_available(self):
+        # A suite with no judge assertion yields no task to probe: the armed
+        # gate must fail on missing evidence rather than pass on zero findings.
         with tempfile.TemporaryDirectory() as td:
-            p, runs = self._cli_manifest(td)
-            args = self._args(
-                td, p, runs, "robust", self.ROBUST,
-                fail_on_findings=True)
-            with mock.patch.object(sb, "collect_judge_tasks", return_value=[]):
-                self.assertEqual(sb.judge_robustness_command(args), 1)
-            report = json.loads(Path(args.out).read_text(encoding="utf-8"))
+            p, runs = self._cli_manifest(td, assertions=[{"name": "k", "type": "contains", "value": "GOODANSWER"}])
+            code, _, stderr = self._cli(td, p, runs, "robust", self.ROBUST, "--fail-on-findings")
+            report = json.loads((Path(td) / "rep.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "judge-robustness: judge-robustness evidence is unavailable\n")
         self.assertEqual(report["summary"]["availability"], "unavailable")
         self.assertEqual(report["findings"], [])
 

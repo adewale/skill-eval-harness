@@ -14,7 +14,7 @@ from pathlib import Path
 from helpers import (
     claude_stream_records,
     make_eval_repo,
-    run_skill_benchmark,
+    run_cli,
     stub_claude_stream,
     write_with_skill_task,
 )
@@ -283,7 +283,7 @@ class CodexRunnerEffortTests(unittest.TestCase):
                 _, tasks, run_dir = write_with_skill_task(root)
                 fake, probe, runs = root / "fake_codex.py", root / "argv.json", root / "runs"
                 fake.write_text(FAKE_CODEX, encoding="utf-8")
-                code, stderr = run_skill_benchmark(
+                code, _, stderr = run_cli(
                     "run-codex", "--tasks", str(tasks), "--runs", str(runs),
                     "--codex-cmd", f"{sys.executable} {fake} {probe}", *flags)
                 self.assertEqual(code, 0, stderr)

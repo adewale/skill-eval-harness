@@ -18,7 +18,7 @@ from pathlib import Path
 from helpers import (
     assert_dies,
     attest_answer_design,
-    run_skill_benchmark,
+    run_cli,
     trace_event,
     write_run,
 )
@@ -518,7 +518,7 @@ class GradedScoringSeverityTests(unittest.TestCase):
             write_run(runs / "case-1" / "with_skill", "alpha")
             write_run(runs / "case-1" / "without_skill", "none")
             attest_answer_design(path, runs)
-            code, stderr = run_skill_benchmark(
+            code, _, stderr = run_cli(
                 "benchmark", str(path), "--runs", str(runs), "--out", str(out))
             report = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(code, 0, stderr)

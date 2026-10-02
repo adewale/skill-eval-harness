@@ -47,8 +47,9 @@ class StopClass(str, Enum):
 UNSCORABLE_STOP_CLASSES = frozenset({StopClass.TRUNCATED, StopClass.TURN_LIMIT})
 
 # Values from the Messages API `stop_reason`. Claude Code 2.1.269 copies the
-# final one onto its terminal result event (recorded 2026-09-23 in PR #85's
-# plugin-eval fixture), alongside `terminal_reason` and `subtype`.
+# final one onto its terminal result event (recorded 2026-09-23 in
+# tests/fixtures/claude/stream-json.plugin-skill.jsonl), alongside
+# `terminal_reason` and `subtype`.
 _MESSAGES_API_STOP = {
     "end_turn": StopClass.COMPLETED,
     "stop_sequence": StopClass.COMPLETED,

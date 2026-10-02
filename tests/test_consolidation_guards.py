@@ -31,7 +31,13 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from helpers import attest_answer_design, make_eval_repo, skill_markdown, write_run
+from helpers import (
+    attest_answer_design,
+    make_eval_repo,
+    run_cli,
+    skill_markdown,
+    write_run,
+)
 
 import ablation_model as am
 import agent_capabilities as ac
@@ -821,11 +827,6 @@ else:
         self.assertNotIn("Add OpenCode/Gemini adapters", trace_spec)
 
 
-def run_cli(*argv: str) -> int:
-    with mock.patch.object(sys, "argv", ["skill-benchmark", *argv]):
-        return sb.main()
-
-
 def run_unit(row):
     return (row.get("model"), row["variant"], row["run_number"])
 
@@ -856,8 +857,8 @@ class SharedBoundaryBehaviorTests(unittest.TestCase):
                 for variant in ("with_skill", "without_skill"):
                     write_run(runs / case_id / variant, "GOOD result")
             graded, judge_tasks = root / "grade.json", root / "judge-tasks.jsonl"
-            run_cli("grade", str(manifest), "--runs", str(runs),
-                    "--out", str(graded), "--judge-tasks", str(judge_tasks))
+            self.assertEqual(run_cli("grade", manifest, "--runs", runs, "--out", graded,
+                                     "--judge-tasks", judge_tasks)[0], 0)
             results = json.loads(graded.read_text(encoding="utf-8"))["results"]
             grade_tasks = [json.loads(line) for line in
                            judge_tasks.read_text(encoding="utf-8").splitlines()]
@@ -888,11 +889,10 @@ class SharedBoundaryBehaviorTests(unittest.TestCase):
             attest_answer_design(manifest, runs)
             graded, judge_tasks = root / "grade.json", root / "judge-tasks.jsonl"
             benchmark, contamination = root / "benchmark.json", root / "contamination.json"
-            run_cli("grade", str(manifest), "--runs", str(runs),
-                    "--out", str(graded), "--judge-tasks", str(judge_tasks))
-            run_cli("benchmark", str(manifest), "--runs", str(runs), "--out", str(benchmark))
-            run_cli("contamination", str(manifest), "--runs", str(runs),
-                    "--out", str(contamination))
+            self.assertEqual(run_cli("grade", manifest, "--runs", runs, "--out", graded,
+                                     "--judge-tasks", judge_tasks)[0], 0)
+            self.assertEqual(run_cli("benchmark", manifest, "--runs", runs, "--out", benchmark)[0], 0)
+            self.assertEqual(run_cli("contamination", manifest, "--runs", runs, "--out", contamination)[0], 0)
             discovered = {
                 "grade": {run_unit(row) for row in
                           json.loads(graded.read_text(encoding="utf-8"))["results"]},
@@ -938,10 +938,10 @@ class SharedBoundaryBehaviorTests(unittest.TestCase):
                                     "source": "provider_reported"},
             }) + "\n" for task_id, cost in (("t1", 0.02), ("t2", 0.01))), encoding="utf-8")
             benchmark, ledger_path = root / "benchmark.json", root / "cost-summary.json"
-            run_cli("benchmark", str(manifest), "--runs", str(runs),
-                    "--judge-results", str(judge_results), "--out", str(benchmark))
-            run_cli("cost-summary", "--manifest", str(manifest), "--runs", str(runs),
-                    "--judge-results", str(judge_results), "--out", str(ledger_path))
+            self.assertEqual(run_cli("benchmark", manifest, "--runs", runs,
+                                     "--judge-results", judge_results, "--out", benchmark)[0], 0)
+            self.assertEqual(run_cli("cost-summary", "--manifest", manifest, "--runs", runs,
+                                     "--judge-results", judge_results, "--out", ledger_path)[0], 0)
             report = json.loads(benchmark.read_text(encoding="utf-8"))["cost_summary"]
             ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
         self.assertEqual(report["coverage"], ledger["coverage"])

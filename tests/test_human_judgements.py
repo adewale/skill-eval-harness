@@ -4,11 +4,12 @@ The review page used to store run-level good/bad notes while judge-alignment
 read a separate {judge_task_id, passed} file, so the same verdict had to be
 typed twice. These tests pin the single store: the page writes it, alignment
 reads assertion-level verdicts from it, and error-analysis reads its notes."""
-import argparse
 import json
 import tempfile
 import unittest
 from pathlib import Path
+
+from helpers import run_cli
 
 import human_judgements as hj
 import skill_benchmark as sb
@@ -100,9 +101,9 @@ class SingleStoreTests(unittest.TestCase):
             judge_path = ws / "judge.jsonl"
             judge_path.write_text("".join(json.dumps(row) + "\n" for row in judge_rows))
             out = ws / "alignment.json"
-            sb.judge_alignment_command(argparse.Namespace(
-                labels=str(ws / "feedback.json"), judge_results=str(judge_path),
-                min_labels=1, out=str(out)))
+            code, _, _ = run_cli("judge-alignment", "--labels", ws / "feedback.json",
+                                 "--judge-results", judge_path, "--min-labels", "1", "--out", out)
+            self.assertEqual(code, 0)
             report = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(report["label_source"]["format"], "feedback")
         self.assertEqual(report["label_source"]["skipped"],

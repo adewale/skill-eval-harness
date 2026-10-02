@@ -657,19 +657,20 @@ class StubMatrixOfflineTests(unittest.TestCase):
 
 class TriggerCliStatusTests(unittest.TestCase):
     def test_matrix_cli_exits_nonzero_for_an_incomplete_report(self):
-        report = {
-            "summary": {"measurement_status": "incomplete"},
-            "matrix": [],
-            "results": [],
-        }
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(tm, "run_matrix", return_value=report), \
-             mock.patch.object(tm, "print_matrix"), \
+        # Only the Pi process boundary is replaced: the matrix itself decides
+        # that crashed queries leave the measurement incomplete.
+        def crash(plan):
+            raise RuntimeError("provider unavailable")
+
+        with tempfile.TemporaryDirectory() as td, pi_runs(crash), \
+             contextlib.redirect_stdout(io.StringIO()), \
              mock.patch.object(sys, "argv", [
-                 "skill-trigger-matrix", str(DEMO_MANIFEST), "--agent", "stub",
-                 "--out", str(Path(td) / "report.json"),
+                 "skill-trigger-matrix", str(DEMO_MANIFEST), "--agent", "pi",
+                 "--runs-per-query", "1", "--out", str(Path(td) / "report.json"),
              ]):
             self.assertEqual(tm.main(), 1)
+            report = json.loads((Path(td) / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["summary"]["measurement_status"], "incomplete")
 
     def test_a_crashed_pi_query_is_an_incomplete_row_not_a_crashed_run(self):
         def crash(plan):
@@ -827,6 +828,25 @@ class ClaudeDetectionTests(unittest.TestCase):
             result = tm.ClaudeAdapter().invoke("q", "haiku", Path(td), 1)
         self.assertIs(result.state, InvocationState.PROVIDER_FAILED)
         self.assertIn("protocol error", result.provider_error or "")
+
+    def test_a_recorded_claude_stream_is_a_complete_observation_with_skill_evidence(self):
+        # Real Claude Code output (tests/fixtures/claude/README.md): system
+        # events, thinking blocks and parent_tool_use_id: null that the
+        # canned fragments above never carry must not fail the protocol checks.
+        recorded = (Path(__file__).parent / "fixtures" / "claude"
+                    / "stream-json.plugin-skill.jsonl").read_text(encoding="utf-8")
+
+        def fake_run(*args, **kwargs):
+            return InvocationOutcome.from_process(stdout=recorded, stderr="", returncode=0, elapsed_ms=1)
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(fake_run)), \
+             mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
+            result = tm.ClaudeAdapter().invoke("q", None, Path(td), 1)
+        self.assertIs(result.state, InvocationState.COMPLETE)
+        self.assertIsNone(result.provider_error)
+        detection = self._adapter().detect(result, ["probe-plugin:tidy-commit"], [])
+        self.assertEqual(detection.legacy_evidence, ["Skill tool invoked: probe-plugin:tidy-commit"])
 
 
 class CodexAdapterTests(unittest.TestCase):

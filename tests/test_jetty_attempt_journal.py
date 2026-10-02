@@ -1,5 +1,3 @@
-import contextlib
-import io
 import json
 import os
 import subprocess
@@ -7,7 +5,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from helpers import (
@@ -15,6 +12,8 @@ from helpers import (
     attest_jetty_payload,
     jetty_payload,
     jetty_task_upload,
+    make_eval_repo,
+    run_cli,
 )
 
 import skill_benchmark as sb
@@ -47,16 +46,13 @@ class JettyAttemptJournalTests(unittest.TestCase):
         runs = root / "imported-runs"
         jetty_runs.write_text(
             json.dumps(record) + "\n", encoding="utf-8")
-        args = SimpleNamespace(
-            manifest=str(root / "manifest.json"),
-            jetty_runs=str(jetty_runs),
-            runs=str(runs),
-        )
-        with (
-            mock.patch.object(sb, "validate_manifest"),
-            self.assertRaises(SystemExit),
-        ):
-            sb.import_jetty_results(args)
+        manifest = make_eval_repo(root / "manifest")
+        rejection = ("FAIL: invalid Jetty result: attempt is not provider-terminal "
+                     f"and durably downloaded ({record['attempt_state']!r})\n")
+        self.assertEqual(
+            run_cli("import-jetty-results", "--manifest", manifest,
+                    "--jetty-runs", jetty_runs, "--runs", runs),
+            (1, "", rejection))
         self.assertFalse(runs.exists())
 
     def test_faults_at_every_remote_boundary_resume_without_duplicate_submit(self):
@@ -252,18 +248,15 @@ class JettyAttemptJournalTests(unittest.TestCase):
             out = Path(td) / "runs.jsonl"
             payloads_path.write_text(
                 json.dumps(payload) + "\n", encoding="utf-8")
-            args = SimpleNamespace(
-                payloads=str(payloads_path), out=str(out),
-                journal=str(journal_path), timeout=1, poll_interval=0,
-                resubmit_unknown=False, dry_run=False,
-            )
+            cli = ("run-jetty", "--payloads", payloads_path, "--out", out,
+                   "--journal", journal_path, "--timeout", "1", "--poll-interval", "0.01")
             with (
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
                     sb, "JettyClient", return_value=LocalTimeoutClient()),
             ):
-                self.assertEqual(sb.run_jetty(args), 1)
+                self.assertEqual(run_cli(*cli)[0], 1)
             self.assertEqual(sb.load_jsonl(out)[0]["status"], "running")
 
             restarted = FakeJettyClient()
@@ -386,18 +379,15 @@ class JettyAttemptJournalTests(unittest.TestCase):
             journal_path = root / "attempts.json"
             payloads_path.write_text(
                 json.dumps(payload) + "\n", encoding="utf-8")
-            args = SimpleNamespace(
-                payloads=str(payloads_path), out=str(out),
-                journal=str(journal_path), timeout=1, poll_interval=0,
-                resubmit_unknown=False, dry_run=False,
-            )
+            cli = ("run-jetty", "--payloads", payloads_path, "--out", out,
+                   "--journal", journal_path, "--timeout", "1", "--poll-interval", "0.01")
             client = FakeJettyClient()
 
             with (
                 mock.patch.dict(os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(sb, "JettyClient", return_value=client),
             ):
-                self.assertEqual(sb.run_jetty(args), 0)
+                self.assertEqual(run_cli(*cli)[0], 0)
 
             [record] = sb.load_jsonl(out)
             digest = payload["harness"]["jetty_task_contract_sha256"]
@@ -410,7 +400,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(sb, "JettyClient", return_value=restarted),
             ):
-                self.assertEqual(sb.run_jetty(args), 0)
+                self.assertEqual(run_cli(*cli)[0], 0)
 
             self.assertEqual(sb.load_jsonl(out), [record])
             self.assertEqual(restarted.submit_calls, 0)
@@ -435,18 +425,15 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 "".join(json.dumps(value) + "\n" for value in payloads),
                 encoding="utf-8",
             )
-            args = SimpleNamespace(
-                payloads=str(payloads_path), out=str(out),
-                journal=str(journal_path), timeout=1, poll_interval=0,
-                resubmit_unknown=False, dry_run=False,
-            )
+            cli = ("run-jetty", "--payloads", payloads_path, "--out", out,
+                   "--journal", journal_path, "--timeout", "1", "--poll-interval", "0.01")
             with (
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(
                     sb, "JettyClient", return_value=FakeJettyClient()),
             ):
-                self.assertEqual(sb.run_jetty(args), 0)
+                self.assertEqual(run_cli(*cli)[0], 0)
             committed = sb.load_jsonl(out)
             self.assertEqual(len(committed), 2)
 
@@ -460,7 +447,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 self.assertRaisesRegex(
                     RuntimeError, "omits previously durable"),
             ):
-                sb.run_jetty(args)
+                run_cli(*cli)
             self.assertEqual(sb.load_jsonl(out), committed)
             payloads_path.write_text(
                 "".join(json.dumps(value) + "\n" for value in payloads),
@@ -478,7 +465,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 ),
                 self.assertRaises(InjectedCrash),
             ):
-                sb.run_jetty(args)
+                run_cli(*cli)
             self.assertEqual(sb.load_jsonl(out), committed)
 
             def replay_one_then_crash(*args, **kwargs):
@@ -496,7 +483,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 ),
                 self.assertRaises(InjectedCrash),
             ):
-                sb.run_jetty(args)
+                run_cli(*cli)
             self.assertEqual(sb.load_jsonl(out), committed)
 
     def test_failed_artifact_checkpoint_cannot_commit_synthetic_failure(self):
@@ -508,11 +495,8 @@ class JettyAttemptJournalTests(unittest.TestCase):
             journal_path = root / "attempts.json"
             payloads_path.write_text(
                 json.dumps(payload) + "\n", encoding="utf-8")
-            args = SimpleNamespace(
-                payloads=str(payloads_path), out=str(out),
-                journal=str(journal_path), timeout=1, poll_interval=0,
-                resubmit_unknown=False, dry_run=False,
-            )
+            cli = ("run-jetty", "--payloads", payloads_path, "--out", out,
+                   "--journal", journal_path, "--timeout", "1", "--poll-interval", "0.01")
             original_persist = sb.JettyAttemptJournal._persist
             failed_once = False
 
@@ -538,7 +522,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                     fail_artifact_checkpoint_once,
                 ),
             ):
-                self.assertEqual(sb.run_jetty(args), 1)
+                self.assertEqual(run_cli(*cli)[0], 1)
 
             digest = payload["harness"]["jetty_task_contract_sha256"]
             interrupted = sb.JettyAttemptJournal(journal_path).entry(digest)
@@ -552,7 +536,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(sb, "JettyClient", return_value=restarted),
             ):
-                self.assertEqual(sb.run_jetty(args), 0)
+                self.assertEqual(run_cli(*cli)[0], 0)
 
             completed = sb.JettyAttemptJournal(journal_path).entry(digest)
             self.assertEqual(completed["state"], "result_committed")
@@ -570,11 +554,8 @@ class JettyAttemptJournalTests(unittest.TestCase):
             journal_path = root / "attempts.json"
             payloads_path.write_text(
                 json.dumps(payload) + "\n", encoding="utf-8")
-            args = SimpleNamespace(
-                payloads=str(payloads_path), out=str(out),
-                journal=str(journal_path), timeout=1, poll_interval=0,
-                resubmit_unknown=False, dry_run=False,
-            )
+            cli = ("run-jetty", "--payloads", payloads_path, "--out", out,
+                   "--journal", journal_path, "--timeout", "1", "--poll-interval", "0.01")
             client = FakeJettyClient()
 
             with (
@@ -582,9 +563,11 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(sb, "JettyClient", return_value=client),
-                self.assertRaises(SystemExit),
             ):
-                sb.run_jetty(args)
+                code, _, stderr = run_cli(*cli)
+
+            self.assertEqual(code, 1)
+            self.assertIn("FAIL: Jetty attempt journal is already owned by another run-jetty process", stderr)
 
             self.assertEqual(client.submit_calls, 0)
             self.assertFalse(out.exists())
@@ -669,21 +652,19 @@ class JettyAttemptJournalTests(unittest.TestCase):
             out = Path(str(journal_path) + ".lock")
             payloads_path.write_text(
                 json.dumps(payload) + "\n", encoding="utf-8")
-            args = SimpleNamespace(
-                payloads=str(payloads_path), out=str(out),
-                journal=str(journal_path), timeout=1, poll_interval=0,
-                resubmit_unknown=False, dry_run=False,
-            )
+            cli = ("run-jetty", "--payloads", payloads_path, "--out", out,
+                   "--journal", journal_path, "--timeout", "1", "--poll-interval", "0.01")
             client = FakeJettyClient()
 
             with (
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(sb, "JettyClient", return_value=client),
-                self.assertRaises(SystemExit),
             ):
-                sb.run_jetty(args)
+                code, _, stderr = run_cli(*cli)
 
+            self.assertEqual(code, 1)
+            self.assertEqual(stderr, "FAIL: Jetty attempt journal lock must not overwrite payload or result JSONL\n")
             self.assertEqual(client.submit_calls, 0)
             self.assertFalse(out.exists())
 
@@ -695,11 +676,8 @@ class JettyAttemptJournalTests(unittest.TestCase):
             journal_path = root / "attempts.json"
             payloads_path.write_text("", encoding="utf-8")
             out.write_text('{"stale":true}\n', encoding="utf-8")
-            args = SimpleNamespace(
-                payloads=str(payloads_path), out=str(out),
-                journal=str(journal_path), timeout=1, poll_interval=0,
-                resubmit_unknown=False, dry_run=False,
-            )
+            cli = ("run-jetty", "--payloads", payloads_path, "--out", out,
+                   "--journal", journal_path, "--timeout", "1", "--poll-interval", "0.01")
 
             with (
                 mock.patch.dict(
@@ -707,7 +685,7 @@ class JettyAttemptJournalTests(unittest.TestCase):
                 mock.patch.object(
                     sb, "JettyClient", return_value=FakeJettyClient()),
             ):
-                self.assertEqual(sb.run_jetty(args), 0)
+                self.assertEqual(run_cli(*cli)[0], 0)
 
             self.assertEqual(out.read_text(encoding="utf-8"), "")
 
@@ -716,23 +694,17 @@ class JettyAttemptJournalTests(unittest.TestCase):
             payloads_path = Path(td) / "payloads.jsonl"
             payloads_path.write_text(
                 json.dumps(jetty_payload()) + "\n", encoding="utf-8")
-            args = SimpleNamespace(
-                payloads=str(payloads_path), out=None, journal=None,
-                timeout=1, poll_interval=0, resubmit_unknown=False,
-                dry_run=False,
-            )
+            cli = ("run-jetty", "--payloads", payloads_path, "--timeout", "1", "--poll-interval", "0.01")
             client = FakeJettyClient()
-            stderr = io.StringIO()
             with (
                 mock.patch.dict(
                     os.environ, {"JETTY_API_TOKEN": "test-token"}),
                 mock.patch.object(sb, "JettyClient", return_value=client),
-                contextlib.redirect_stderr(stderr),
-                self.assertRaises(SystemExit),
             ):
-                sb.run_jetty(args)
+                code, _, stderr = run_cli(*cli)
 
-        self.assertIn("live run-jetty requires --out", stderr.getvalue())
+        self.assertEqual(code, 1)
+        self.assertIn("live run-jetty requires --out", stderr)
         self.assertEqual(client.submit_calls, 0)
 
 

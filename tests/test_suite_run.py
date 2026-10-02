@@ -1,10 +1,9 @@
-import argparse
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import make_eval_repo
+from helpers import make_eval_repo, run_cli
 
 import skill_benchmark as sb
 
@@ -67,20 +66,11 @@ class SuiteRunTests(unittest.TestCase):
         pins = self._pins(root, "allowed")
         out = root / "out"
 
-        code = sb.suite_run(argparse.Namespace(
-            suite_file=str(suite),
-            workspace_root=str(root),
-            pins=str(pins),
-            out_dir=str(out),
-            tier="preflight",
-            split="tune",
-            runs_per_variant=1,
-            include_ablations=False,
-            allow_extra_manifests=False,
-            skip_pin_check=False,
-        ))
+        code, _, stderr = run_cli("suite-run", suite, "--workspace-root", root, "--pins", pins, "--out-dir", out)
 
         self.assertEqual(code, 2)
+        self.assertIn("FAIL: extra top-level manifests not in suite allowlist: "
+                      "beautiful-mermaid/evals/shared-benchmark.json", stderr)
         written = json.loads((out / "RUN_SCOPE.json").read_text(encoding="utf-8"))
         self.assertEqual(written["status"], "blocked")
         self.assertEqual(written["extra_manifests"], ["beautiful-mermaid/evals/shared-benchmark.json"])
@@ -96,18 +86,8 @@ class SuiteRunTests(unittest.TestCase):
         pins = self._pins(root, "allowed")
         out = root / "out"
 
-        code = sb.suite_run(argparse.Namespace(
-            suite_file=str(suite),
-            workspace_root=str(root),
-            pins=str(pins),
-            out_dir=str(out),
-            tier="prepare",
-            split="tune",
-            runs_per_variant=1,
-            include_ablations=False,
-            allow_extra_manifests=False,
-            skip_pin_check=False,
-        ))
+        code, _, _ = run_cli("suite-run", suite, "--workspace-root", root, "--pins", pins,
+                             "--out-dir", out, "--tier", "prepare")
 
         self.assertEqual(code, 0)
         scope = json.loads((out / "RUN_SCOPE.json").read_text(encoding="utf-8"))
