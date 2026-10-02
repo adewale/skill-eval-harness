@@ -183,7 +183,14 @@ class ClaudeStreamTraceNormalizationTests(unittest.TestCase):
             ]}},
         ]
         _, metrics = sb.normalize_trace_records(malformed, source="claude")
-        self.assertGreaterEqual(len(metrics["trace_protocol_errors"]), 5)
+        # One error per malformed field, in record order.
+        self.assertEqual(metrics["trace_protocol_errors"], [
+            "Claude message content must be a string or list",
+            "Claude tool_use id must be a non-empty string",
+            "Claude tool_use name must be a non-empty string",
+            "Claude tool_use input must be an object",
+            "Claude tool_result is_error must be boolean",
+        ])
 
     def test_duplicate_open_tool_id_is_error_and_cannot_replace_first_call(self):
         records = [

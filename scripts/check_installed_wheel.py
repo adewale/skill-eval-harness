@@ -2,9 +2,8 @@
 
 CI's test jobs run from the source tree, where every top-level module is
 importable whether or not the wheel ships it. A module missing from
-``[tool.setuptools] py-modules``, or a runtime read of a file the wheel does
-not contain, passes every other step and breaks only for users of the
-published package. This script:
+``[tool.setuptools] py-modules`` passes every other step and breaks only for
+users of the published package. This script:
 
 1. builds a wheel from a copy of the checkout (or takes ``--wheel``);
 2. installs it into a fresh virtual environment;
@@ -14,6 +13,10 @@ published package. This script:
    script with ``--help``;
 4. deletes one installed module and requires step 3's import check to fail,
    so the check cannot pass vacuously.
+
+It only imports modules and runs ``--help``: a file the wheel does not ship
+is caught when a module reads it at import time or while building its
+parser, not when a command reads it later in a real run.
 
 Installing the wheel resolves its dependencies through pip, as CI's install
 step already does. Exit status: 0 when every check passes, 1 otherwise.
