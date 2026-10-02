@@ -178,11 +178,14 @@ the harness modules needs the replacement:
 | `skill_benchmark.register_workspace_builder` | a workspace builder on the backend's `agent_capabilities.BACKENDS` row |
 | `ablation_model.Population` | `manifest_contracts.CasePopulation` |
 | `ablation_model.Arm.harness_record` | `PreparedTask.harness_record` |
-| `run_pi_trigger_eval.run_query`, `run_trigger_matrix.run_cell_query` | `observe_query` / `observe_cell_query`, then `as_row()` |
+| `run_pi_trigger_eval.run_query`, `run_trigger_matrix.run_cell_query` | `run_trigger_matrix.observe_cell_query(adapter, tree_dir, query, should_trigger, model, timeout)` (for Pi, `PiAdapter()`), then `.as_row()` on the `TriggerObservation` it returns |
 | `run_pi_trigger_eval.detect_trigger` (re-export) | `skill_benchmark.detect_trigger` |
 | `run_pi_trigger_eval.observe_query`, `copy_skill_to_config`, `pi_trigger_protocol`, `write_trigger_trace_artifacts` | `run_trigger_matrix.run_matrix` with `agents=["pi"]`, or `observe_cell_query(PiAdapter(), ...)` |
-| `run_pi_trigger_eval.load_manifest`, `skill_name_from_manifest`, `trigger_query_from_case`, `cases_from_manifest`, `validate_trigger_rows`, `eval_rows_from_args`, `pi_argv`, `pi_invocation_outcome`, `pi_source_config_dir`, `seed_config_dir` | the same names in `run_trigger_matrix` |
+| `run_pi_trigger_eval.load_manifest`, `skill_name_from_manifest`, `trigger_query_from_case`, `cases_from_manifest`, `validate_trigger_rows`, `pi_argv`, `pi_invocation_outcome`, `pi_source_config_dir`, `seed_config_dir` | the same names in `run_trigger_matrix` |
 | `skill_benchmark.two_sample_permutation_significance`, `_combinations`, `_exact_rate`, `iteration_dirs`, `next_iteration_dir`, `final_answer_from_events`, `text_files_under`, `missing_evidence`, `resolved_task_upload_bytes`, `JETTY_TERMINAL_SUCCESS`, `JETTY_TERMINAL_FAILURE`, `JETTY_PENDING`, `run_pi_trigger_eval.pi_terminal_error`, `pi_invoke_result`, `run_trigger_matrix.matrix_capabilities`, `matrix_failure_row`, `runner_contracts.classify_runner_result`, `agent_capabilities.surface_names`, `DEDICATED_SMOKE_TARGETS`, `report_contracts.diagnostic_rates`, `ablation_model.Provenance.SCHEMA_KEYS`, `ablation_model._LEGACY_FAILURE_MARKER_ORDER` | nothing; they were dead or test-only |
+
+`run_pi_trigger_eval.eval_rows_from_args` moved to `run_trigger_matrix`; `run_pi_trigger_eval`
+imports it from there, so the old import still works.
 
 The `iteration-N/` directory convention that `render-viewer --previous-workspace` reads is
 unchanged; only the unused helpers went. Four names that a pre-release build of `main` added
