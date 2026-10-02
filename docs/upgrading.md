@@ -63,10 +63,11 @@ that file still invalidates trigger identity until those owners are extracted in
   unpinned effort records `applied_by: "backend_default"`; the values are defined in
   [`vocabulary.md`](vocabulary.md#run-artifacts).
 - A run tree written by a pre-release build of `main` may carry the earlier spellings
-  `unobserved`, `not-requested`, and `backend-default`. Such runs grade the same, `run_endings`
-  counts them under the old spelling, and their effort still pairs with new runs, because an
-  unrequested effort reads as the backend default either way. Re-run them if you want one
-  spelling in the report.
+  `unobserved`, `not-requested`, and `backend-default`. Such runs grade the same. `run_endings`
+  counts a `stop_class` or `served_model_check` under the old spelling, but counts effort by the
+  requested level, so an unpinned run recorded with `applied_by: "backend-default"` counts as
+  `backend_default` and still pairs with new runs. Re-run them if you want one spelling in the
+  report.
 - A run that reports several models credits none of them: `served_model` is `null`, and the check
   reads `mixed` (scored, counted in `run_endings.served_model_mixed`) when the requested model is
   among them, or `mismatch` (unscorable) when it is not. Claude subagent turns are not counted.
