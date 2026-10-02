@@ -41,7 +41,7 @@ This is intentionally a **control-plane abstraction**, not a lowest-common-denom
 ## What we missed and corrected
 
 - **Vibe prompt transport:** `vibe --prompt` without an argument plus stdin can fail in headless mode because Vibe attempts to reopen `/dev/tty`. The harness now passes the prompt as the `--prompt` argument and redacts that argument in saved command metadata.
-- **Vibe telemetry:** Vibe tracks `AgentStats` internally, but current `json` and `streaming` output formatters emit only `LLMMessage` data. The capability registry now marks Vibe token/dollar telemetry as missing, not provider-reported.
+- **Vibe telemetry:** Vibe tracks `AgentStats` internally, but its `json` and `streaming` output carries only `LLMMessage` data (2.22 and earlier) or public history entries (2.23 and later). The capability registry now marks Vibe token/dollar telemetry as missing, not provider-reported.
 - **Codex final-answer source:** Codex JSONL is an event/telemetry stream. The robust final-answer source is `--output-last-message`, so both Codex answer and judge paths use that sidecar while retaining JSONL for trace normalization.
 - **Credential placement:** isolated homes must not be children of the model-readable workdir. Vibe `.env` and Codex `auth.json`/`config.toml` now live in scratch homes outside the workdir; trigger rows expose only the mounted skill tree, not credential-bearing files.
 - **Codex isolation:** `--ignore-user-config` is not the same as isolating the home directory. The harness now sets isolated `CODEX_HOME` for answer, judge, and trigger paths and copies only portable auth/config files, never user skills/plugins.

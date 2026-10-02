@@ -263,7 +263,7 @@ available.
 
 ### Phase 4 — compatibility, documentation, and removal of bypasses
 
-- [x] Add `migrate-telemetry --check|--write`
+- [x] Add `migrate-telemetry` (it writes by default; `--check` reports without writing)
   with atomic writes, dry-run output, backups, and idempotence.
 - [x] Read old artifacts through the adapter. Legacy numeric values are
   `legacy_unverified` and are not eligible for causal ratios unless repaired with a

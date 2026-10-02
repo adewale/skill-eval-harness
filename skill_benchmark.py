@@ -13547,9 +13547,11 @@ def run_subagent(args: argparse.Namespace) -> int:
             if served:
                 completion["served_models"] = served
             trace, _ = parse_trace_jsonl_text(str(result.get("raw_response") or ""))
+            # Each turn is its own `claude -p` call, so its usage, cost and
+            # time are that turn's alone and sum to the run's.
             return {"answer": result.get("answer"), "returncode": result.get("returncode"),
                     "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
-                    "usage": usage, "trace": trace, **completion}
+                    "usage": usage, "trace": trace, "telemetry_scope": "turn_delta", **completion}
     return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
                               replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode(),
                               trace_source=None if agent_cmd else "claude")

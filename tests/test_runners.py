@@ -452,6 +452,23 @@ class SubagentRunnerTests(unittest.TestCase):
                                  (None, ["model-a", "model-b"], "mixed"))
                 self.assertEqual(rows["with_skill"].get("unscorable_reason"), unscorable)
 
+    def test_a_multi_turn_claude_run_sums_its_turns(self):
+        # The default backend makes one `claude -p` call per turn, so each
+        # call's usage is that turn's own spend and the run's total is their sum.
+        case = {"id": "case-1", "split": "tune",
+                "turns": [{"prompt": "first"}, {"prompt": "second"}],
+                "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}]}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            stub = stub_claude_stream(root / "claude", answer="alpha", in_tok=11, out_tok=22, cost=0.0123)
+            meta, _, base = self.subagent_then_benchmark(root, "--claude-bin", stub, cases=[case])
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+        summary = meta["multi_turn_telemetry"]
+        self.assertEqual({channel: summary[channel]["availability"] for channel in ("usage", "cost")},
+                         {"usage": "complete", "cost": "complete"})
+        self.assertEqual((metrics["input_tokens"], metrics["output_tokens"]), (22, 44))
+        self.assertAlmostEqual(metrics["cost_usd"], 0.0246)
+
     def test_an_unknown_stop_class_is_refused_with_the_vocabulary(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

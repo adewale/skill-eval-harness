@@ -224,7 +224,7 @@ Adapter choices:
 - For answer runs, use forced-load prepared-row prompting and copied skill/input files.
 - Use `--output streaming` for trace normalization; JSON-list output is accepted by the parser for tests/fallbacks.
 - Normalize Vibe messages/tool calls into existing event shapes.
-- Current Vibe `json`/`streaming` output is `LLMMessage` data and does not export `AgentStats`, so usage/cost are explicit `missing` unless a future CLI adds fields or the harness estimates them.
+- Vibe `json`/`streaming` output is `LLMMessage` data through 2.22 and public history entries from 2.23; neither exports `AgentStats`, so usage/cost are explicit `missing` unless a future CLI adds fields or the harness estimates them.
 
 ### Vibe judge backend
 
