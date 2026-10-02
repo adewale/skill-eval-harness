@@ -33,6 +33,10 @@ stricter at programmatic and persisted boundaries:
 - CLI values are validated before dispatch. Existing handlers still receive the same Namespace
   shape through the named legacy adapter, and meaningful zero values such as `--limit 0` and
   `--max-references 0` remain valid.
+- Long options must be spelled in full. argparse used to accept any unique prefix
+  (`--judge-res` for `--judge-results`, `--runs-per` for `--runs-per-query`); every entry point,
+  subcommand and script in this repository now exits 2 with `unrecognized arguments` instead.
+  Spell out any abbreviated flag in scripts and CI jobs that call the harness.
 
 Custom Python adapters should build `ProcessInvocationPlan` and use `run_argv_capture(plan)`.
 Code that supplied parallel argv/cwd/environment/timeout arguments to that internal helper must

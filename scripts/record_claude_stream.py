@@ -131,7 +131,7 @@ def served_models(records: list[dict[str, Any]]) -> list[str]:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     ap.add_argument("--claude-bin", default="claude", help="the Claude Code executable (default: claude)")
     ap.add_argument("--model", help="model to request (default: the CLI's own default)")
     ap.add_argument("--name", default=DEFAULT_NAME, help=f"fixture file stem (default: {DEFAULT_NAME})")

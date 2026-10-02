@@ -25,7 +25,7 @@ from skill_benchmark import VALID_SPLITS, write_json
 def build_arg_parser() -> argparse.ArgumentParser:
     """The runner's CLI surface, buildable without parsing (shared-constant
     guards in the tests introspect it, e.g. --split choices == VALID_SPLITS)."""
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     ap.add_argument("manifest")
     ap.add_argument("--eval-set", help="JSON file with {query, should_trigger} rows; defaults to manifest trigger cases")
     ap.add_argument("--split", choices=sorted(VALID_SPLITS))

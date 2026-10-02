@@ -9,6 +9,9 @@ the run-output contract are in the [README](../README.md#manifest-format), the a
 catalog is the [README's Assertions section](../README.md#assertions), and the reason
 grading never calls a model is [`architecture.md`](architecture.md).
 
+Long options must be spelled in full: every entry point, subcommand and script rejects a prefix
+(`--judge-res` for `--judge-results`) as an unrecognized argument and exits 2.
+
 ## Inspect agent capabilities
 
 ```bash

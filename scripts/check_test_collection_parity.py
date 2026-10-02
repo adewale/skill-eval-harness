@@ -78,7 +78,7 @@ def pytest_ids(tests_dir: str) -> set[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("tests_dir", nargs="?", default="tests",
                         help="test directory relative to the repository root (default: tests)")
     parser.add_argument("--show", type=int, default=60,

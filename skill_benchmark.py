@@ -21277,7 +21277,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """The complete CLI surface, buildable without parsing. Split out of
     main() so tests can enumerate every subcommand and flag (e.g. the
     README-coverage doc-sync guard) without invoking anything."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    # allow_abbrev=False on the parser and every subparser: a prefix of a long
+    # option is an error, not that option, so renaming a flag cannot leave its
+    # old spelling's prefix working and a user's abbreviation never silently
+    # picks a flag.
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("agent-capabilities", help="list unified backend registrations and supported surfaces")
@@ -21610,6 +21614,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-extra-manifests", action="store_true", help="do not fail when --workspace-root has top-level manifests outside the suite allowlist")
     p.add_argument("--skip-pin-check", action="store_true", help="load the suite without verifying --pins tree hashes")
 
+    for subparser in sub.choices.values():
+        subparser.allow_abbrev = False
     return parser
 
 

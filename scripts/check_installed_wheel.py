@@ -150,7 +150,7 @@ def check(wheel: Path | None) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--wheel", type=Path,
                         help="check this wheel instead of building one from the checkout")
     args = parser.parse_args(argv)
