@@ -12418,6 +12418,12 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     # Validate every newly produced verdict before it can establish pass/fail.
     # `report` controls whether diagnostics are surfaced, not whether malformed
     # provider evidence is accepted; both modes fail closed.
+    if parse_error is None and isinstance(parsed, dict):
+        # A null optional field means absent: Codex structured output makes
+        # every optional verdict field required and nullable. A null required
+        # field stays, and the schema reports it.
+        required = set(verdict_schema_for(assertion).get("required") or ())
+        parsed = {key: value for key, value in parsed.items() if value is not None or key in required}
     schema_errors = json_schema_errors(parsed, verdict_schema_for(assertion)) if (parse_error is None and isinstance(parsed, dict)) else []
     if schema_errors:
         parse_error = "verdict schema: " + "; ".join(schema_errors[:5])
@@ -13599,6 +13605,9 @@ def judge_command(args: argparse.Namespace) -> int:
         die("judge needs --judge-cmd (any provider), --judge-model/--judge-panel, or a manifest judge.model default")
     if explore and judge_backend != "claude":
         die("--judge-explore is for the native claude judge backend only")
+    if getattr(args, "quorum", None) is not None and (judge_backend == "cmd" or len(panel) < 2):
+        die("--quorum needs a --judge-panel of two or more judges; a single judge has no panel to fold "
+            "(--judge-runs repeats fold by majority)")
     backend_options = surface_option_values(args, "judge")
     tasks = collect_judge_tasks(Path(args.manifest), Path(args.runs), split=args.split, variants=args.variant)
     transcripts = Path(args.transcripts) if getattr(args, "transcripts", None) else None
@@ -14077,8 +14086,12 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
             })
             return entry
         normalized_score = float(score)
+        # A panel or repeated judge keeps its own majority or quorum pass: its
+        # score is a median, which can clear atLeast while the panel fails.
+        consensus = judged.get("verdict_kind") == "consensus"
         entry.update({
-            "passed": normalized_score >= float(at_least),
+            "passed": (bool(judged.get("passed")) if consensus
+                       else normalized_score >= float(at_least)),
             "score": normalized_score,
             "threshold": float(at_least),
             "evidence": (

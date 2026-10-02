@@ -686,6 +686,23 @@ class GradedScoringSeverityTests(unittest.TestCase):
         entry = sb.merged_qualitative_entry(assertion, panel, "j")
         self.assertEqual((entry["passed"], entry["score"], entry["raw_score"]), (False, 1.0, 5.0))
 
+    def test_an_at_least_panel_verdict_keeps_the_panels_pass(self):
+        # A panel at --quorum 3 scoring 0.9, 0.9 and 0.2 against atLeast 0.8
+        # fails, though its median (0.9) clears 0.8. Grading must keep the
+        # panel's fail; a single judge's pass is still its score against atLeast.
+        assertion = {"name": "craft", "type": "judge", "atLeast": 0.8,
+                     "rubric": ["names the first Greek letter"]}
+        cases = [
+            ({"verdict_kind": "consensus", "passed": False, "score": 0.9}, (False, 0.9)),
+            ({"verdict_kind": "consensus", "passed": True, "score": 0.9}, (True, 0.9)),
+            ({"passed": True, "score": 0.9, "threshold": 0.8}, (True, 0.9)),
+            ({"passed": False, "score": 0.7, "threshold": 0.8}, (False, 0.7)),
+        ]
+        for judged, expected in cases:
+            with self.subTest(judged=judged):
+                entry = sb.merged_qualitative_entry(assertion, judged, "j")
+                self.assertEqual((entry["passed"], entry["score"]), expected)
+
 
 class SimilarityScorerTests(unittest.TestCase):
     """1.4 — deterministic difflib similarity with a threshold and a score."""

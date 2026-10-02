@@ -853,6 +853,26 @@ class CrossJudgeConsensusTests(unittest.TestCase):
         out = sb.merge_cross_judge_rows([self._row("m1", True, 5), self._row("m2", True, 5), self._row("m3", False, 1)], quorum=3)
         self.assertFalse(out["passed"])                        # 2-of-3 pass, but quorum demands 3
 
+    def test_quorum_without_a_panel_is_refused(self):
+        # --quorum folds a panel of judges; one --judge-cmd or one model is a
+        # single judge, so the flag would be ignored. Say so instead.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = write_manifest(root, base_manifest(cases=[{
+                "id": "c1", "split": "tune", "kind": "behavior", "prompt": "Do it.",
+                "assertions": [{"name": "craft", "type": "judge", "severity": "gate",
+                                "rubric": ["names the first Greek letter"]}],
+            }]))
+            runs = root / "runs"
+            write_run(runs / "c1" / "with_skill", "alpha")
+            for extra in (["--judge-cmd", "true"], ["--judge-panel", "m1"]):
+                with self.subTest(extra=extra):
+                    code, _, stderr = run_cli("judge", manifest, "--runs", runs, *extra,
+                                              "--quorum", "2", "--out", root / "v.jsonl")
+                    self.assertEqual(code, 1)
+                    self.assertIn("--quorum needs a --judge-panel of two or more judges", stderr)
+                    self.assertFalse((root / "v.jsonl").exists())
+
     def test_consensus_is_order_independent(self):
         rows = [self._row("m1", True, 5), self._row("m2", False, 1), self._row("m3", True, 4)]
         a = sb.merge_cross_judge_rows(list(rows))
@@ -1424,6 +1444,47 @@ class StrictJudgeVerdictTests(unittest.TestCase):
             "minimum_criteria": 1, "score": 1.0, "passed": True,
         })
         self.assertEqual(dynamic["verdict_kind"], "dynamic")
+
+
+class NullOptionalVerdictFieldTests(unittest.TestCase):
+    """Codex structured output turns optional verdict fields into required,
+    nullable ones, so a judge answers `"score": null` for "no score". A null
+    optional field means absent; a null required field is still incomplete."""
+
+    def judge(self, assertion: dict, answer: dict) -> dict:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = write_manifest(root, base_manifest(cases=[{
+                "id": "c1", "split": "tune", "kind": "behavior", "prompt": "Do it.",
+                "assertions": [{"name": "craft", "type": "judge", "severity": "gate",
+                                "rubric": ["names the first Greek letter"], **assertion}],
+            }]))
+            runs = root / "runs"
+            write_run(runs / "c1" / "with_skill", "alpha")
+            stub = root / "null_judge.py"
+            stub.write_text(f"import json, sys\nsys.stdin.read()\nprint(json.dumps({answer!r}))\n",
+                            encoding="utf-8")
+            out = root / "v.jsonl"
+            code, _, stderr = run_cli("judge", manifest, "--runs", runs, "--variant", "with_skill",
+                                      "--judge-cmd", f"{sys.executable} {stub}", "--out", out)
+            self.assertEqual(code, 0, stderr)
+            return json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+
+    def test_null_optional_fields_read_as_absent(self):
+        cases = [
+            ({}, {"passed": True, "score": None, "rationale": "ok"}, True),
+            ({}, {"passed": False, "score": None, "rationale": None}, False),
+            ({"atLeast": 0.8}, {"passed": None, "score": 0.9, "rationale": "ok"}, True),
+        ]
+        for assertion, answer, passed in cases:
+            with self.subTest(assertion=assertion, answer=answer):
+                row = self.judge(assertion, answer)
+                self.assertEqual((row["availability"], row["passed"], row.get("schema_errors")),
+                                 ("complete", passed, None))
+
+    def test_a_null_required_field_is_still_incomplete(self):
+        row = self.judge({"atLeast": 0.8}, {"passed": True, "score": None})
+        self.assertEqual((row["availability"], row["passed"]), ("partial", False))
 
 
 class JudgeVerdictPassedTests(unittest.TestCase):
