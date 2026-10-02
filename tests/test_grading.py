@@ -676,6 +676,16 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertEqual((rows["without_skill"]["availability"], rows["without_skill"]["passed"],
                           rows["without_skill"]["score"]), ("complete", False, 1))
 
+    def test_a_scaled_panel_verdict_keeps_the_panels_pass(self):
+        # A panel folds its members by majority or --quorum, so its median
+        # score can clear the threshold while the panel fails: three judges
+        # scoring 5, 5 and 2 at quorum 3. Normalising the score must not
+        # re-decide the pass from the median.
+        assertion = self.scaled_judge(score_scale=[1, 5], threshold=4)
+        panel = {"verdict_kind": "consensus", "passed": False, "score": 5.0}
+        entry = sb.merged_qualitative_entry(assertion, panel, "j")
+        self.assertEqual((entry["passed"], entry["score"], entry["raw_score"]), (False, 1.0, 5.0))
+
 
 class SimilarityScorerTests(unittest.TestCase):
     """1.4 — deterministic difflib similarity with a threshold and a score."""

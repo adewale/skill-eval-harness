@@ -13963,7 +13963,9 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
     scale = judge_score_scale(assertion)
     if scale is not None:
         # Pass compares the raw score with the threshold on the declared
-        # scale; the graded channel takes the score normalised to 0-1.
+        # scale, as the judge command did (a panel or repeats keep their own
+        # majority or quorum); the graded channel takes the score normalised
+        # to 0-1.
         low, high = scale
         score = judged.get("score")
         if (isinstance(score, bool) or not isinstance(score, (int, float))
@@ -13981,7 +13983,7 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
         raw_score = float(score)
         threshold = float(assertion.get("threshold", high))
         entry.update({
-            "passed": raw_score >= threshold,
+            "passed": judge_verdict_passed(judged, default_threshold=threshold),
             "score": (raw_score - low) / (high - low),
             "threshold": (threshold - low) / (high - low),
             "raw_score": raw_score,
