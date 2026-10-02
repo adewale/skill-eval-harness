@@ -86,7 +86,7 @@ careless edit to `SKILL.md` would cause. Read `ablation_regressions` in the repo
       ],
       "confirmed_cases": ["c-review"],
       "significance": {
-        "method": "per-case-model-paired-sign-flip",
+        "method": "per-case-model-paired-sign-flip", "unit": "replicate_pair",
         "significant_at_0_05": true, "min_p_value": 0.03125
       },
       "evidence_class": "confirmed_causal",

@@ -15445,6 +15445,13 @@ def build_paired_summary(results: list[dict[str, Any]], *, min_lift: float | Non
         else:
             out["graded"] = {"availability": "complete", **graded,
                              "pairing": graded_construction.diagnostics()}
+    elif any(isinstance(r.get("graded_score"), (int, float)) and not isinstance(r.get("graded_score"), bool)
+             for r in results):
+        # Graded scores were recorded but no pair could use them (a judge that
+        # answered outside 0-1, say): report the channel as partial and why,
+        # rather than drop it from a report that reads complete.
+        out["graded"] = {"availability": "partial", "delta": None,
+                         "pairing": _metric_pair_construction(results, "graded_score").diagnostics()}
     if by_model:
         out["by_model"] = by_model
     return out

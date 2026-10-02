@@ -103,7 +103,7 @@ with the wrong mechanism is a rejection.
 | Re-grading | Re-run the judge on stored transcripts | Deterministic grading calls no model and no network (CF.4), and a re-grade is byte-identical apart from `generated_at` (CF.3) |
 | Leakage | A checklist item: read the prompts for the expected answer | `validate` warns when a contains-style assertion value (at least `--leakage-min-chars`, default 4) appears literally in its own prompt; `--strict-leakage` fails on it |
 | Judge calibration | Agreement on a few dozen human labels; well below ~90% means iterate the judge | `judge-alignment` reports Cohen's kappa, precision, recall, and F1, so a judge that passes everything on a mostly-passing set reads kappa 0.0 rather than high agreement ([`can-i-trust-my-judge.md`](can-i-trust-my-judge.md)) |
-| Small-n statistics | Noise floor ≈ `1/sqrt(n·reps)` | Exact paired sign-flip over per-case deltas (exact up to 14 cases, seeded sampling above), the interval that inverts it, and `noise_check.smallest_achievable_p` |
+| Small-n statistics | Noise floor ≈ `1/sqrt(n·reps)` | Exact paired sign-flip over per-case deltas (exact while the cases that moved take at most 2**14 sign outcomes, seeded sampling beyond), the interval that inverts it, and `noise_check.smallest_achievable_p` |
 
 ### Where the guides go further
 
@@ -243,8 +243,10 @@ mark; this table is that mapping (`findings.FindingKind`):
 | 4 | `noise-below-min-lift` | The noise is smaller than the smallest lift worth acting on | Low variance, measured against a target | `flaky-eval`, `underpowered-eval` |
 | 5 | `arms-differ-only-in-skill` | Effort and model are held fixed, the arms are paired within one run, and no answer leaks | New: takes the post's effort-consistency check | `prompt-assertion-leakage`, `leak-saturated-case`, `held-out-rubric-leak`, `arm-conditions-differ`, `served-model-mismatch`, `served-model-mixed` |
 
-Marks 1 and 2 are rated from the manifest. Marks 3–5 need `audit-manifest --runs` and a
-complete benchmark, and read `unavailable` until then, which is not the same as `ok`.
+Marks 1 and 2 are rated from the manifest. Marks 3–5 need `audit-manifest --runs`. Marks 3 and
+4 also need a complete benchmark and read `unavailable` until then, which is not the same as `ok`;
+mark 5 reads the run conditions on any benchmark, so a pair run at different effort or a run answered
+by another model counts against it even while the benchmark is partial.
 `audit-manifest` does not run `judge-robustness`, so the three robustness kinds in mark 2
 reach a gate through that command's own `--fail-on-findings`, not through `eval_health`.
 

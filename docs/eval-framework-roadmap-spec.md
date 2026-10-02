@@ -115,7 +115,7 @@ multi-model (2.1) feature built on unverified detectors only scales an unverifie
 
 ### Boundary
 The set stops here deliberately. Report-level correctness — whether the saturation, no-lift, flaky,
-and negative-delta flags (`build_benchmark_report` (`:16959`)) are computed right — sits a layer
+and negative-delta flags (`build_benchmark_report` (`:16966`)) are computed right — sits a layer
 above the raw measurement, where the golden-report tests the buckets already plan (1.2, 2.6) cover
 it. CF.1–CF.4 are the floor underneath that work: once they pass, a printed lift carries a checked
 measurement, and every feature in the buckets builds on a number that has been verified rather than
@@ -150,7 +150,7 @@ assumed.
 ### 1.3 Judge config slot and the "judge is not the model under test" guard
 - **Goal:** make an existing convention enforceable.
 - **Abstractions used or changed:** read an optional `judge` block in the manifest; add a check
-  in `audit_manifest_report` (`:20067`) comparing the declared judge model against `jetty.model`
+  in `audit_manifest_report` (`:20074`) comparing the declared judge model against `jetty.model`
   or the run metadata `model`.
 - **Design:** warn by default, error under `--strict-judge`.
 - **Testing:** unit tests for matching and differing model ids.
@@ -167,7 +167,7 @@ assumed.
 - **Status:** `docs/authoring-evals.md` shipped, alongside `architecture.md` and
   `abstractions.md`.
 - **Follow-on:** surface the guide's rules where they are checkable. Extend the messaging in
-  `prompt_assertion_leakage_findings` (`:845`) and `fixture_recommendations` (`:19561`) to point
+  `prompt_assertion_leakage_findings` (`:845`) and `fixture_recommendations` (`:19568`) to point
   at the relevant section.
 - **Testing:** assert the new hint strings appear for crafted manifests.
 
@@ -192,9 +192,9 @@ assumed.
   not name it.
 - **Abstractions used or changed:** an optional `oracle` tier on an assertion
   (`strong` / `demo` / `live`), defaulting by type (deterministic text/process are `strong`,
-  `script` is `demo` unless marked, judge/live are `live`). `build_benchmark_report` (`:16959`)
+  `script` is `demo` unless marked, judge/live are `live`). `build_benchmark_report` (`:16966`)
   reports, per case, the share of its pass rate carried by `strong` oracles;
-  `audit_manifest_report` (`:20067`) warns when a case passes only on weak ones. This extends
+  `audit_manifest_report` (`:20074`) warns when a case passes only on weak ones. This extends
   leakage lint (`:164`) from prompts to oracles.
 - **Strongest tier — the rendered-artifact oracle:** the top of the ladder is an oracle that
   builds or renders the artifact and inspects the result, not the source text.
@@ -227,9 +227,9 @@ assumed.
   past it — either way, question it. This is the inverse of the saturation flag: saturation marks
   a case as too easy *now*; staleness marks a case that has never discriminated *over time*.
 - **Abstractions used or changed:** reads the cross-run history from 2.6. A `prune` report (or a
-  flag in `build_benchmark_report` (`:16959`)) marks a case a removal candidate when, across the
+  flag in `build_benchmark_report` (`:16966`)) marks a case a removal candidate when, across the
   last N runs, it never failed and never showed lift (`with_skill` == `without_skill` every time).
-  `audit_manifest_report` (`:20067`) lists the candidates; removal stays a human decision.
+  `audit_manifest_report` (`:20074`) lists the candidates; removal stays a human decision.
 - **Design:** the harness suggests, never deletes. A case may be kept deliberately as a
   regression guard even when stale; the report says so rather than acting.
 - **Depends on:** 2.6 (needs run history to judge "never failed over time").
@@ -247,7 +247,7 @@ assumed.
   beside `variant` and `run_number`. Each row carries its target `model`, and `run_dir` gains a
   model segment (`<case>/<model>/<variant>/run-<n>`), kept backward-compatible when one model
   runs. Runners pass the row `model` through; per-run `model` already lands in `metadata.json`,
-  so grading needs no change. `build_benchmark_report` (`:16959`) groups `by_variant` within
+  so grading needs no change. `build_benchmark_report` (`:16966`) groups `by_variant` within
   `by_model`, and `build_paired_summary` (`:15391`) computes lift per (case, model).
 - **Design:** model is a third axis, not a new variant. Variants stay orthogonal, giving a
   model-by-variant grid. CLI: `--models a,b,c` on `prepare`.
@@ -298,9 +298,10 @@ assumed.
     and on the `graded` channel; no bootstrap. The confidence `interval` beside it
     (`effect_estimates.sign_flip_interval`) is that test inverted: every shift the test would not
     reject. It therefore excludes zero exactly when the test rejects "no lift". Both come from
-    one implementation: exact up to 14 paired units, and above that the same seeded sign patterns
-    and the same conservative Monte Carlo bound. With five or fewer units the interval is reported
-    `bounded: false` because no shift can be excluded at 95%. `noise_check` sits beside both and
+    one implementation: exact while the units that moved take at most 2**14 sign outcomes, and
+    beyond that the same seeded sign patterns and the same conservative Monte Carlo bound. With
+    five or fewer units, or when every delta is equal, the interval is reported `bounded: false`
+    with a reason, because no shift can be excluded at 95%. `noise_check` sits beside both and
     names what limits the eval: too few cases moved to reach p ≤ 0.05, or a noise floor (the
     interval half-width) above the `without_skill` headroom or above `benchmark --min-lift`.
   - **Reference-anchor floor:** an optional `reference_score` / `reference_graded_score` on a
@@ -369,7 +370,7 @@ assumed.
 - **Goal:** watch lift, saturation, and token drift over time.
 - **Abstractions used or changed:** a consumer of `build_benchmark_report`. Add an append-only
   history store and a `trend` subcommand that diffs successive `benchmark.json` files, reusing
-  the `compare_results` (`:18196`) logic.
+  the `compare_results` (`:18203`) logic.
 - **Severity-weighted ranking (from the macro-evals notebook):** when surfacing recurring
   failures across runs, rank them by `prevalence × severity`, not raw count, so a rare but severe
   failure outranks a common trivial one. This is the floor-raising principle made quantitative;
@@ -408,7 +409,7 @@ assumed.
 ### 2.8 Interactive served report and richer artifacts
 - **Goal:** capture feedback in the browser and render image, PDF, and xlsx artifacts, beyond the
   static `render_viewer`.
-- **Abstractions used or changed:** extend `render_viewer` (`:18997`) with a `serve` mode and
+- **Abstractions used or changed:** extend `render_viewer` (`:19004`) with a `serve` mode and
   artifact encoders. Anthropic's `eval-viewer/generate_review.py` is the blueprint, including
   `feedback.json` persistence and a `--previous-workspace` diff.
 - **Testing:** unit-test the artifact embedding and categorization and the feedback round trip;
@@ -461,7 +462,7 @@ assumed.
   the model axis, plus a viewer panel.
 - **Slice-lift concentration (from the macro-evals notebook):** compute, per slice, where lift (or
   a failure) concentrates — `slice share ÷ overall share`, the macro-eval `lift` metric one level
-  up from per-case lift. `build_slice_summary` (`:15618`) already groups by domain/difficulty/
+  up from per-case lift. `build_slice_summary` (`:15625`) already groups by domain/difficulty/
   trigger/goal, so this is a ratio over groups it already forms, not new plumbing.
 - **Testing:** a report test over a two-model by two-variant fixture grid, plus a concentration
   test asserting a failure confined to one slice scores a high ratio there.

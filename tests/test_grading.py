@@ -471,6 +471,22 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertAlmostEqual(paired["graded"]["delta"], 0.6)
         self.assertIn("significance", paired["graded"])
 
+    def test_a_graded_score_no_pair_can_use_is_reported_not_dropped(self):
+        # A plain soft judge that answers on a 1-5 scale records graded_score
+        # 5.0, outside the channel's 0-1 range. The channel must say it is
+        # partial and why, not vanish while the report reads complete.
+        results = []
+        for case_id in ["c1", "c2", "c3"]:
+            for variant, graded in [("with_skill", 5.0), ("without_skill", 0.0)]:
+                results.append({
+                    "case_id": case_id, "variant": variant, "run_number": 1, "missing_output": False,
+                    "execution_valid": True, "objective_pass_rate": 1.0, "graded_score": graded, "metadata": {},
+                })
+        graded = sb.build_paired_summary(results)["graded"]
+        self.assertEqual(graded["availability"], "partial")
+        self.assertIsNone(graded["delta"])
+        self.assertEqual(graded["pairing"]["blocked_reason_counts"], {"invalid_graded_score": 3})
+
     def test_validation_rejects_bad_shapes(self):
         bad_shapes = [
             {"assertions": [{"type": "contains", "value": "x", "severity": "fatal"}]},

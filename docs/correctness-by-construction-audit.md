@@ -424,9 +424,8 @@ observed numeric rate -> UnitRate(0 <= value <= 1)
 Answer-population ablation confirmation uses the same exact case/model/repetition pairs, requires
 symmetric named-assertion coverage, and applies a paired sign-flip test to per-pair score deltas.
 Fewer than six unanimous matched pairs cannot clear the two-sided p≤0.05 floor. The same bound
-drives `effect_estimates.py` for with/without lift: its `interval` inverts the sign-flip test, so up
-to 14 paired units, where both are exact, it cannot exclude zero while `significance` fails to
-reject, and its `noise_check` reports the moved cases and smallest reachable p that explain why.
+drives `effect_estimates.py` for with/without lift: its `interval` inverts the sign-flip test, so on
+the exact path it cannot exclude zero while `significance` fails to reject, and its `noise_check` reports the moved cases and smallest reachable p that explain why.
 
 `ablation_model.py` closes provenance over `AblationMode`, `Population`, `ComponentClass`, and
 `Mechanism`. Strict wire parsers reject unknown strings, booleans masquerading as scalar values,
@@ -438,7 +437,8 @@ provenance, so a canonical tree cannot be labeled as a materialized removal.
 
 *Note (2026-09-30): `Population` has since been replaced by `manifest_contracts.CasePopulation`, the
 one case-population enum, and the lift test and its interval now share one sign-flip core, so they
-also agree above 14 paired units.*
+also agree on the sampled path. Since 2026-10-02 the exact path is chosen on the units that moved,
+not the total, and repeated deltas are enumerated as one group.*
 
 ## Test proof
 

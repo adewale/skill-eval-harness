@@ -321,8 +321,9 @@ per-mark `observed` flag, and rates each of the five marks
 ([defined in the glossary](vocabulary.md#eval-health)): a mark with a finding of its kinds is
 `concern`, an observed mark with none is `ok`, and the rest are `unavailable`, which is not `ok`.
 `audit_manifest_report` supplies the observations: a recorded case `source` for mark 1, a graded
-reference or null answer from `known_answer_check` for mark 2, and a complete benchmark for marks
-3–5, whose run-measured findings (`run_measured_findings`) are computed only then. It feeds the
+reference or null answer from `known_answer_check` for mark 2, the run conditions for mark 5
+(`run_condition_findings`, on any benchmark), and a complete benchmark for marks 3 and 4, whose
+run-measured findings (`run_measured_findings`) are computed only then. It feeds the
 audit findings and the readiness blocker findings through the same view, so a blocker such as
 `floor-eval` counts against mark 3 like any other finding of that kind.
 
@@ -332,7 +333,7 @@ Four presets carry the older flags' meaning: `READINESS` (`blockers`), `SELF_JUD
 (`strict-judge`), `CONTAMINATION` and `JUDGE_ROBUSTNESS`. `audit-manifest --fail-on-blockers` and
 `--strict-judge` evaluate through the first two, `contamination --fail-on-contamination` and
 `judge-robustness --fail-on-findings` through the last two. Each command says when its evidence is
-incomplete: the benchmark's availability, contamination's `coverage` of answer arms, robustness's
+incomplete: the benchmark's availability, contamination's `coverage` of answer runs, robustness's
 `summary.availability`. `gate_exit` prints each reason and returns the exit code.
 `parse_fail_on` reads the kinds, severities and preset names a user passes to
 `audit-manifest --fail-on` and rejects an unknown token. Grading options such as
