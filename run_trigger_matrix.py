@@ -517,8 +517,13 @@ class AgentAdapter:
             source = inspect.getsource(type(self))
         except (OSError, TypeError):
             source = f"{type(self).__module__}.{type(self).__qualname__}"
+        module = type(self).__module__
+        if module == __name__ == "__main__":
+            # The documented direct-script entry point (`python3 run_trigger_matrix.py`)
+            # runs these same classes; name them by their canonical module.
+            module = "run_trigger_matrix"
         return {
-            "adapter": f"{type(self).__module__}.{type(self).__qualname__}",
+            "adapter": f"{module}.{type(self).__qualname__}",
             "agent": self.name,
             "implementation_sha256": "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest(),
             "producer_sha256": "sha256:" + file_sha256(Path(__file__)),

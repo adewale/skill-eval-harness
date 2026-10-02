@@ -25,6 +25,7 @@ import functools
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -2033,6 +2034,25 @@ class TriggerComparisonTests(unittest.TestCase):
                     provenance=ABLATION_PROVENANCE, tree_hash=EDIT_HASH)
                 compare = functools.partial(sb.build_trigger_comparison, make_baseline(), ablation)
                 assert_dies(self, compare, message)
+
+    def test_reports_from_the_direct_script_entry_point_pair(self):
+        # examples/demo-skill/README.md runs `python3 ../../run_trigger_matrix.py`,
+        # where the adapters are defined in `__main__`.
+        with tempfile.TemporaryDirectory() as td:
+            paths = {}
+            for arm, extra in (("baseline", []), ("ablation", ["--ablation", "weaker-description"])):
+                paths[arm] = Path(td) / f"{arm}.json"
+                subprocess.run(
+                    [sys.executable, str(ROOT / "run_trigger_matrix.py"),
+                     "evals/shared-benchmark.json", "--agent", "stub", "--runs-per-query", "1",
+                     *extra, "--out", str(paths[arm])],
+                    cwd=DEMO_MANIFEST.parents[1], check=True, capture_output=True)
+            adapter = json.loads(paths["baseline"].read_text(encoding="utf-8"))["protocol"]["adapters"][0]
+            code, stdout, stderr = run_cli("trigger-compare", "--baseline", paths["baseline"],
+                                           "--ablation", paths["ablation"])
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(json.loads(stdout)["provenance"]["verified"])
+        self.assertEqual(adapter["adapter"], "run_trigger_matrix.StubAdapter")
 
 
 if __name__ == "__main__":
