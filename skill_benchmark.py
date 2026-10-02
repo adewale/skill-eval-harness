@@ -13231,6 +13231,11 @@ def run_subagent(args: argparse.Namespace) -> int:
                 transcript = "\n\n".join(f"[user]\n{h['prompt']}\n\n[assistant]\n{h['answer']}" for h in history)
                 prompt = f"Conversation so far:\n{transcript}\n\n[user]\n{prompt}"
             result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
+            error = result.get("provider_error") or result.get("parse_error")
+            if error and result.get("returncode") == 0:
+                # An exit-zero error envelope or unreadable output is a failed
+                # run, as run-claude records it, not an answer to grade.
+                raise RuntimeError(error)
             # The provider's usage as run-claude records it, with the cost the
             # subagent contract reads from usage.cost_usd. Only numeric fields:
             # the subagent usage contract rejects labels such as `source`.
