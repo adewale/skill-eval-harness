@@ -90,7 +90,7 @@ that file still invalidates trigger identity until those owners are extracted in
   smaller denominator as a skill change. A refusal is still graded.
 - A pair whose arms ran at different effort is blocked as `effort_mismatch`, and a pair where only
   one arm recorded effort as `effort_unrecorded_on_one_arm`. Re-run an old arm rather than pairing
-  it with a new one. The ablation confirmation and `token-overhead` block these pairs too. `run-agent --agent gemini|vibe --effort …` now exits before any run, and so does a level the backend's CLI does not accept: `run-claude --effort minimal` names Claude's levels (`low`, `medium`, `high`, `xhigh`, `max`) instead of handing the CLI a level it does not accept.
+  it with a new one. The ablation confirmation and `token-overhead` block these pairs too. `run-agent --agent gemini|vibe --effort …` now exits before any run, and so does a level the backend's CLI does not accept: `run-claude --effort minimal` names Claude's levels (`low`, `medium`, `high`, `xhigh`, `max`). Claude Code 2.1.288 only warns about `minimal` and runs at its default effort, so such a run recorded `requested: "minimal"` for an effort it never ran at; re-run it at a level Claude accepts.
 
 ### Human feedback
 
