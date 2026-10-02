@@ -16,7 +16,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from helpers import (
@@ -1089,9 +1088,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             runs = root / "runs"
             with mock.patch.object(sb.shutil, "rmtree", side_effect=fail_each_codex_cleanup_once), \
                  mock.patch.object(sb.time, "sleep", return_value=None):
-                self.assertEqual(sb.run_codex(SimpleNamespace(
-                    tasks=str(tasks), runs=str(runs),
-                    codex_cmd=f"{sys.executable} {fake_codex}", timeout=30)), 0)
+                code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                          "--codex-cmd", f"{sys.executable} {fake_codex}", "--timeout", "30")
+                self.assertEqual(code, 0, stderr)
 
             self.assertEqual(len(raced), 2)
             for row in rows:
@@ -1202,9 +1201,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 with mock.patch.object(sb.tempfile, "mkdtemp", side_effect=record_invoke_temp), \
                      mock.patch.object(sb.shutil, "rmtree", side_effect=retain_invoke_temp), \
                      mock.patch.object(sb.time, "sleep", return_value=None):
-                    self.assertEqual(sb.run_codex(SimpleNamespace(
-                        tasks=str(tasks), runs=str(runs),
-                        codex_cmd=f"{sys.executable} {fake_codex}", timeout=30)), 0)
+                    code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                              "--codex-cmd", f"{sys.executable} {fake_codex}", "--timeout", "30")
+                    self.assertEqual(code, 0, stderr)
 
                 self.assertEqual(len(invoke_temps), 2)
                 self.assertEqual(len(set(invoke_temps)), 2)
@@ -1696,8 +1695,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             silent = root / "silent_codex.py"
             silent.write_text("import sys\n_ = sys.stdin.read()\n", encoding="utf-8")  # emits nothing
             runs = root / "runs"
-            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs),
-                                         codex_cmd=f"{sys.executable} {silent}", timeout=30))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                      "--codex-cmd", f"{sys.executable} {silent}", "--timeout", "30")
+            self.assertEqual(code, 0, stderr)   # the failed run is recorded, not the command
             base = runs / run_dir
             text = (base / "output.md").read_text(encoding="utf-8")
             self.assertTrue(text.startswith(f"{sb.CODEX_FAILURE}: provider produced no final answer"), text)

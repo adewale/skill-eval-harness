@@ -14,7 +14,6 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 from helpers import (
     FakeJettyClient,
@@ -781,17 +780,12 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])
             out = root / "jetty.jsonl"
-            args = SimpleNamespace(
-                manifest=str(p), split=None, runs_per_variant=1,
-                include_old_skill=False, include_ablations=True, allow_missing_prompts=False,
-                jetty_collection="skill-evals", jetty_task_prefix=None,
-                jetty_agent="claude-code", jetty_model="claude-sonnet-4-6",
-                jetty_model_provider="anthropic", jetty_snapshot="python312-uv",
-                use_trial_keys=False, out=str(out), dry_run=False,
-                ablation_dir=str(root / "abl"),
-            )
-            rc = sb.export_jetty(args)   # must NOT raise SystemExit
-            self.assertEqual(rc, 0)
+            rc, _, stderr = run_cli(
+                "export-jetty", p, "--include-ablations", "--jetty-collection", "skill-evals",
+                "--jetty-agent", "claude-code", "--jetty-model", "claude-sonnet-4-6",
+                "--jetty-model-provider", "anthropic", "--jetty-snapshot", "python312-uv",
+                "--out", out, "--ablation-dir", root / "abl")
+            self.assertEqual(rc, 0, stderr)   # must NOT die
             payloads = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
             abl = [p for p in payloads if p["harness"]["variant"] == "ablation:no-rp"]
             withs = [p for p in payloads if p["harness"]["variant"] == "with_skill"]

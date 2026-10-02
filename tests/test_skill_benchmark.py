@@ -1,4 +1,3 @@
-import contextlib
 import io
 import json
 import sys
@@ -6,7 +5,6 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
 
 from helpers import (
     attach_jetty_task_contract,
@@ -300,15 +298,11 @@ class SkillBenchmarkTests(unittest.TestCase):
             data["cases"][0]["files"] = ["fixtures/case-1/input.txt"]
             manifest.write_text(json.dumps(data), encoding="utf-8")
             out = root / "jetty-payloads.jsonl"
-            args = SimpleNamespace(
-                manifest=str(manifest), split="tune", runs_per_variant=1,
-                include_old_skill=False, include_ablations=False, allow_missing_prompts=False,
-                jetty_collection="skill-evals", jetty_task_prefix=None,
-                jetty_agent="claude-code", jetty_model="claude-sonnet-4-6",
-                jetty_model_provider="anthropic", jetty_snapshot="python312-uv",
-                use_trial_keys=False, out=str(out), dry_run=False,
-            )
-            sb.export_jetty(args)
+            code, _, stderr = run_cli(
+                "export-jetty", manifest, "--split", "tune", "--jetty-collection", "skill-evals",
+                "--jetty-agent", "claude-code", "--jetty-model", "claude-sonnet-4-6",
+                "--jetty-model-provider", "anthropic", "--jetty-snapshot", "python312-uv", "--out", out)
+            self.assertEqual(code, 0, stderr)
             rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
             self.assertEqual([r["harness"]["variant"] for r in rows], ["with_skill", "without_skill"])
             with_row, without_row = rows
@@ -408,7 +402,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             for index, record in enumerate((completed, failed), 1):
                 attach_jetty_task_contract(record, marker=index)
             jetty_runs.write_text(json.dumps(completed) + "\n" + json.dumps(failed) + "\n", encoding="utf-8")
-            sb.import_jetty_results(SimpleNamespace(manifest=str(manifest), jetty_runs=str(jetty_runs), runs=str(runs)))
+            code, _, stderr = run_cli("import-jetty-results", "--manifest", manifest,
+                                      "--jetty-runs", jetty_runs, "--runs", runs)
+            self.assertEqual(code, 0, stderr)
             self.assertEqual((runs / "case-1" / "with_skill" / "output.md").read_text(encoding="utf-8"), "alpha beta")
             meta = json.loads((runs / "case-1" / "with_skill" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["provider"], "jetty")
@@ -457,13 +453,12 @@ class SkillBenchmarkTests(unittest.TestCase):
                  "successful trajectory requires non-blank trajectory_id"),
             ]
             for records, message in cases:
-                stderr = io.StringIO()
-                with self.subTest(message=message, records=records), contextlib.redirect_stderr(stderr):
+                with self.subTest(message=message, records=records):
                     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
-                    with self.assertRaises(SystemExit):
-                        sb.import_jetty_results(SimpleNamespace(
-                            manifest=str(manifest), jetty_runs=str(path), runs=str(root / "runs")))
-                    self.assertIn(message, stderr.getvalue())
+                    code, _, stderr = run_cli("import-jetty-results", "--manifest", manifest,
+                                              "--jetty-runs", path, "--runs", root / "runs")
+                    self.assertEqual(code, 1, stderr)
+                    self.assertIn(message, stderr)
             self.assertFalse((root / "escape").exists())
 
     def test_import_jetty_persists_ablation_provenance_into_metadata(self):
@@ -483,7 +478,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             }
             attach_jetty_task_contract(rec)
             jetty_runs.write_text(json.dumps(rec) + "\n", encoding="utf-8")
-            sb.import_jetty_results(SimpleNamespace(manifest=str(manifest), jetty_runs=str(jetty_runs), runs=str(runs)))
+            code, _, stderr = run_cli("import-jetty-results", "--manifest", manifest,
+                                      "--jetty-runs", jetty_runs, "--runs", runs)
+            self.assertEqual(code, 0, stderr)
             meta = json.loads((runs / "case-1" / "ablation:no-rp" / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["ablation"], prov)
 
@@ -501,15 +498,12 @@ class SkillBenchmarkTests(unittest.TestCase):
             }]
             manifest.write_text(json.dumps(data), encoding="utf-8")
             out = root / "jetty-payloads.jsonl"
-            args = SimpleNamespace(
-                manifest=str(manifest), split="holdout", runs_per_variant=1,
-                include_old_skill=False, include_ablations=False, allow_missing_prompts=True,
-                jetty_collection="skill-evals", jetty_task_prefix=None,
-                jetty_agent="claude-code", jetty_model="claude-sonnet-4-6",
-                jetty_model_provider="anthropic", jetty_snapshot="python312-uv",
-                use_trial_keys=False, out=str(out), dry_run=True,
-            )
-            sb.export_jetty(args)
+            code, _, stderr = run_cli(
+                "export-jetty", manifest, "--split", "holdout", "--allow-missing-prompts",
+                "--jetty-collection", "skill-evals", "--jetty-agent", "claude-code",
+                "--jetty-model", "claude-sonnet-4-6", "--jetty-model-provider", "anthropic",
+                "--jetty-snapshot", "python312-uv", "--out", out, "--dry-run")
+            self.assertEqual(code, 0, stderr)
             row = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
             self.assertFalse(row["harness"]["executable"])
 
@@ -605,10 +599,10 @@ class SkillBenchmarkTests(unittest.TestCase):
             )
             out = root / "judge-results.jsonl"
             transcripts = root / "judge-transcripts"
-            sb.judge_command(SimpleNamespace(
-                manifest=str(manifest), runs=str(runs), split="tune", variant=["with_skill"],
-                judge_cmd=f"{sys.executable} {judge}", out=str(out), transcripts=str(transcripts), judge_runs=1,
-            ))
+            code, _, stderr = run_cli("judge", manifest, "--runs", runs, "--split", "tune",
+                                      "--variant", "with_skill", "--judge-cmd", f"{sys.executable} {judge}",
+                                      "--out", out, "--transcripts", transcripts)
+            self.assertEqual(code, 0, stderr)
             rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(rows[0]["judge_task_id"], "case-1::with_skill::run-1::quality")
             self.assertTrue(rows[0]["passed"])
@@ -980,7 +974,9 @@ class SkillBenchmarkTests(unittest.TestCase):
                 encoding="utf-8",
             )
             runs = root / "runs"
-            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs), codex_cmd=f"{sys.executable} {fake}", timeout=5))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                      "--codex-cmd", f"{sys.executable} {fake}", "--timeout", "5")
+            self.assertEqual(code, 0, stderr)
             base = runs / "case-1" / "with_skill"
             self.assertTrue((base / "trace.jsonl").exists())
             self.assertEqual((base / "output.md").read_text(encoding="utf-8"), "alpha beta")
@@ -999,7 +995,9 @@ class SkillBenchmarkTests(unittest.TestCase):
             fake = root / "bad_codex.py"
             fake.write_text("import sys\nprint('{not json')\nprint('plain diagnostic')\nsys.exit(2)\n", encoding="utf-8")
             runs = root / "runs"
-            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs), codex_cmd=f"{sys.executable} {fake}", timeout=5))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                      "--codex-cmd", f"{sys.executable} {fake}", "--timeout", "5")
+            self.assertEqual(code, 0, stderr)   # the failed run is recorded, not the command
             base = runs / "case-1" / "with_skill"
             self.assertIn("CODEX FAILURE", (base / "output.md").read_text(encoding="utf-8"))
             metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
@@ -1014,18 +1012,25 @@ class SkillBenchmarkTests(unittest.TestCase):
             row = sb.prepared_task_rows(manifest, sb.load_json(manifest))[0]
             tasks = root / "tasks.jsonl"
             tasks.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n", encoding="utf-8")
-            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-                sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(root / "runs"),
-                                             codex_cmd=str(root / "must-not-run"), timeout=5))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", root / "runs",
+                                      "--codex-cmd", root / "must-not-run", "--timeout", "5")
+            self.assertEqual(code, 1, stderr)
+            self.assertIn("duplicate prepared task identity", stderr)
             self.assertFalse((root / "runs").exists())
 
     def test_run_codex_rejects_unsafe_run_dir(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            # A real prepared row with only its run_dir made unsafe: a bare row
+            # died earlier on its missing run_number, a guard this test is not for.
+            manifest = self.make_manifest(root)
+            row = {**sb.prepared_task_rows(manifest, sb.load_json(manifest))[0], "run_dir": "../outside"}
             tasks = root / "tasks.jsonl"
-            tasks.write_text(json.dumps({"case_id": "case", "variant": "with_skill", "run_dir": "../outside", "prompt": "x"}) + "\n", encoding="utf-8")
-            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-                sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(root / "runs"), codex_cmd=f"{sys.executable} -c 'print(1)'", timeout=5))
+            tasks.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", root / "runs",
+                                      "--codex-cmd", f"{sys.executable} -c 'print(1)'", "--timeout", "5")
+            self.assertEqual(code, 1, stderr)
+            self.assertIn("run_dir must be a safe non-root relative path", stderr)
             self.assertFalse((root / "outside").exists())
 
     def test_run_jetty_uploads_bundle_submits_polls_and_fetches_artifacts(self):

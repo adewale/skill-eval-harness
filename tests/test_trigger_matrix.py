@@ -30,7 +30,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from helpers import (
@@ -85,6 +84,20 @@ def run_pi_cli(extra_argv, fake, out: Path):
     with mock.patch.object(sys, "argv", argv), pi_runs(fake), mock.patch("builtins.print"):
         code = tr.main()
     return code, json.loads(out.read_text(encoding="utf-8"))
+
+
+def matrix_cli(*argv: str | Path) -> tuple[int | str | None, str]:
+    """Run `skill-trigger-matrix ARGV` in process through its real parser.
+    Returns (exit status, stderr): main()'s return value, or the code of the
+    SystemExit it raised (a refusal's message is that code)."""
+    stderr = io.StringIO()
+    with mock.patch.object(sys, "argv", ["skill-trigger-matrix", *map(str, argv)]), \
+         contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+        try:
+            code: int | str | None = tm.main()
+        except SystemExit as exc:
+            code = exc.code
+    return code, stderr.getvalue()
 
 
 def fake_trigger_claude(path: Path, probe: Path, *, invoke_project_skill: bool = False,
@@ -149,10 +162,9 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "rows.json"
             path.write_text(json.dumps([{"query": "review this", "should_trigger": "false"}]), encoding="utf-8")
-            args = SimpleNamespace(eval_set=str(path), split="tune")
-            with self.assertRaises(SystemExit) as ctx:
-                tm.eval_rows_from_args(args, DEMO_MANIFEST)
-        self.assertIn("should_trigger must be true or false", str(ctx.exception))
+            code, _ = matrix_cli(DEMO_MANIFEST, "--eval-set", path, "--split", "tune", "--agent", "stub",
+                                 "--out", Path(td) / "report.json")
+        self.assertIn("should_trigger must be true or false", str(code))
 
     def test_the_protocol_rejects_nonpositive_concurrency_limits(self):
         for field, mutation in (
@@ -182,8 +194,11 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "rows.json"
             path.write_text(json.dumps({"evals": [{"query": "hello", "should_trigger": False}]}), encoding="utf-8")
-            args = SimpleNamespace(eval_set=str(path), split="tune")
-            rows = tm.eval_rows_from_args(args, DEMO_MANIFEST)
+            out = Path(td) / "report.json"
+            code, stderr = matrix_cli(DEMO_MANIFEST, "--eval-set", path, "--split", "tune", "--agent", "stub",
+                                      "--runs-per-query", "1", "--out", out)
+            self.assertEqual(code, 0, stderr)
+            rows = json.loads(out.read_text(encoding="utf-8"))["design"]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["query"], "hello")
         self.assertIs(rows[0]["should_trigger"], False)
@@ -232,9 +247,9 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             path = Path(td) / "rows.json"
             row = {"query": "one", "should_trigger": True}
             path.write_text(json.dumps({"evals": [row], "queries": [row]}), encoding="utf-8")
-            args = SimpleNamespace(eval_set=str(path), split="tune")
-            with self.assertRaisesRegex(SystemExit, "exactly one of evals or queries"):
-                tm.eval_rows_from_args(args, DEMO_MANIFEST)
+            code, _ = matrix_cli(DEMO_MANIFEST, "--eval-set", path, "--split", "tune", "--agent", "stub",
+                                 "--out", Path(td) / "report.json")
+            self.assertIn("exactly one of evals or queries", str(code))
 
     def test_pi_cli_is_the_matrix_with_pi_home_outside_its_working_directory(self):
         seen = {}
