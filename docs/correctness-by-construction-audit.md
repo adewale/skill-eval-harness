@@ -476,7 +476,9 @@ legacy artifact never recorded. In particular:
   served model; Gemini records its served model but an `unobserved` stop; Codex, Vibe,
   `run-subagent`, and Jetty imports record `unobserved` for both (now spelled `unavailable`). On
   every path but Claude's, an answer cut off at an output or turn limit still grades as an
-  ordinary miss;
+  ordinary miss. *(2026-10-02: `run-subagent` now records the stop and served model too, from
+  Claude's stream on its default backend or from `stop_class` and `served_models` in an
+  `--agent-cmd` reply; Vibe's stop stays unavailable because its output carries none.)*;
 - `RunnerOutcome` is retained as a compatibility factory, so new code should construct the explicit
   union variants directly;
 - `skill_benchmark.py` remains a shared orchestration monolith, so the conservative trigger identity
