@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from helpers import make_eval_repo, run_cli
+
 import run_pi_trigger_eval as pi_runner
 import run_trigger_matrix as tm
 import skill_benchmark as sb
@@ -150,6 +152,25 @@ class CLIInvocationTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as raised:
             sb.main()
         self.assertEqual(raised.exception.code, 2)
+
+    def test_min_lift_is_one_pass_rate_difference_for_every_command(self):
+        # benchmark and audit-manifest feed --min-lift to the same noise check,
+        # so one validator at this edge holds both to (0, 1] before any work.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_eval_repo(Path(td))
+            runs = Path(td) / "runs"
+            commands = (("benchmark", manifest, "--runs", runs),
+                        ("audit-manifest", manifest, "--out", Path(td) / "audit.json"))
+            for command in commands:
+                for value in ("10", "0", "-0.1"):
+                    with self.subTest(command=command[0], value=value):
+                        code, _, stderr = run_cli(*command, "--min-lift", value)
+                        self.assertEqual(code, 2)
+                        self.assertIn("min-lift must be a pass-rate difference in (0, 1]", stderr)
+            self.assertFalse((Path(td) / "audit.json").exists())
+        accepted = CLIInvocation.from_namespace(self.parse("audit-manifest", "m.json", "--min-lift", "1"))
+        self.assertEqual(accepted.arguments["min_lift"], 1.0)
 
 
 # --------------------------------------------------------------------------- #

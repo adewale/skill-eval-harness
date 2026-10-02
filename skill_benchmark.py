@@ -17245,10 +17245,7 @@ def build_benchmark_report(
 
 
 def benchmark(args: argparse.Namespace) -> int:
-    min_lift = getattr(args, "min_lift", None)
-    if min_lift is not None and not 0 < min_lift <= 1:
-        die("--min-lift must be a pass-rate difference in (0, 1]")
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), **grading_options(args), min_lift=min_lift)
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), **grading_options(args), min_lift=getattr(args, "min_lift", None))
     emit_report(report, args.out)
     return 0
 
