@@ -18762,7 +18762,7 @@ def cost_summary_command(args: argparse.Namespace) -> int:
     ledger = suite_cost_ledger(Path(args.manifest), Path(args.runs), benchmark_report=benchmark_report, judge_results=judge_lookup or None, top_n=int(getattr(args, "top", 10)))
     emit_report(ledger, args.out)
     if getattr(args, "md", None):
-        Path(args.md).write_text(cost_ledger_markdown(ledger), encoding="utf-8")
+        emit_text(cost_ledger_markdown(ledger), args.md)
     return 0
 
 

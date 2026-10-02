@@ -14,7 +14,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import attest_answer_design, demo_manifest, write_demo_manifest
+from helpers import (
+    attest_answer_design,
+    demo_manifest,
+    run_cli,
+    write_demo_manifest,
+    write_run,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -81,6 +87,24 @@ class TextOutputTests(unittest.TestCase):
                     text = out.read_text(encoding="utf-8")
                     self.assertTrue(text.startswith("# "))
                     self.assertEqual(table_problems(text), [])
+
+    def test_cost_summary_markdown_creates_its_output_directory(self):
+        # --md was the one text output written without the shared writer, so
+        # a path in a new directory crashed after the JSON had been written.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = write_demo_manifest(root, demo_manifest())
+            runs = root / "runs"
+            for variant in ("with_skill", "without_skill"):
+                write_run(runs / "case-1" / variant, "alpha")
+            out, md = root / "a" / "cost-summary.json", root / "b" / "c" / "cost-summary.md"
+            code, _, stderr = run_cli("cost-summary", "--manifest", manifest, "--runs", runs,
+                                      "--out", out, "--md", md)
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["coverage"]["runs_seen"], 2)
+            text = md.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("# Cost summary"))
+        self.assertEqual(table_problems(text), [])
 
     def test_without_out_the_text_goes_to_stdout(self):
         import skill_benchmark as sb
