@@ -210,6 +210,7 @@ BackendRegistration(
         answer_runner=False, autonomous_trigger=True,
         trigger_ablation=True, trace_artifacts=True,
         token_usage=True, dollar_cost="trace_normalized",
+        usage_provenance="trace_normalized", elapsed_provenance="process_measured",
         judge_backend=False, tool_replay=False, live_smoke_env=None,
     ),
     answer_route="none",
