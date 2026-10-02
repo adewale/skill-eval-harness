@@ -168,6 +168,36 @@ class PairConstructionTests(unittest.TestCase):
                 (ep.BlockedExperimentalPair(key, "also_blocked", "skill_presence"),),
             )
 
+    def test_an_identity_neither_arm_measures_is_out_of_scope_not_blocked(self):
+        # Rows for a metric only some cases declare: "rate" None with
+        # "declared" False means the case has nothing the metric measures.
+        def row(case, arm, rate, declared=True):
+            return {"case_id": case, "model": None, "run_number": 1, "variant": arm,
+                    "rate": rate, "declared": declared}
+
+        def eligible(r):
+            return (r["rate"] is not None, None if r["rate"] is not None else "missing_rate")
+
+        construction = ep.pairs_from_rows([
+            row("measured", "with_skill", 1.0), row("measured", "without_skill", 0.0),
+            row("neither", "with_skill", None, False), row("neither", "without_skill", None, False),
+            row("one-sided", "with_skill", None, False), row("one-sided", "without_skill", 0.0),
+            row("lone-arm", "with_skill", None, False),
+        ], population="answer", eligibility=eligible,
+            not_applicable=lambda r: not r["declared"])
+        self.assertEqual([pair.key.case_id for pair in construction.pairs], ["measured"])
+        self.assertEqual([key.case_id for key in construction.not_applicable], ["neither"])
+        # One arm without a value beside one with a value, or a missing arm, still blocks.
+        self.assertEqual({item.key.case_id: item.reason for item in construction.blocked},
+                         {"one-sided": "missing_rate", "lone-arm": "missing_without_skill"})
+        self.assertEqual(construction.diagnostics(), {
+            "contrast_id": "skill_presence", "eligible_pairs": 1, "blocked_pairs": 2,
+            "blocked_reason_counts": {"missing_rate": 1, "missing_without_skill": 1},
+            "not_applicable_pairs": 1})
+        with self.assertRaisesRegex(ValueError, "paired and blocked"):
+            ep.PairConstruction(ep.SKILL_PRESENCE_CONTRAST, construction.pairs, (),
+                                (construction.pairs[0].key,))
+
 
 if __name__ == "__main__":
     unittest.main()

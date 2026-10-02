@@ -8,6 +8,7 @@ from helpers import (
     attest_answer_design,
     demo_manifest,
     result_row,
+    run_cli,
     write_demo_manifest,
     write_run,
 )
@@ -137,6 +138,14 @@ class EditContrastTests(unittest.TestCase):
         # without_skill rows are not part of this contrast.
         self.assertEqual(summary["pairing"]["eligible_pairs"], 7)
 
+    def test_the_edit_noise_check_measures_headroom_on_the_previous_revision(self):
+        # Headroom is what the revision being replaced left to gain:
+        # previous rates 0.25 x3, 0.5 x4 average 2.75/7, so 1 - 2.75/7 = 4.25/7.
+        # (The current rates average 6.5/7, which would leave 0.5/7.)
+        summary = sb.paired_edit_summary(self.rows(
+            [(1.0, 0.25)] * 3 + [(1.0, 0.5)] * 3 + [(0.5, 0.5)]))
+        self.assertAlmostEqual(summary["noise_check"]["headroom"], 4.25 / 7, places=6)
+
     def test_no_old_skill_arm_means_no_edit_summary(self):
         rows = [row for row in self.rows([(1.0, 0.0)]) if row["variant"] != "old_skill"]
         self.assertIsNone(sb.paired_edit_summary(rows))
@@ -179,6 +188,46 @@ class EditContrastTests(unittest.TestCase):
         self.assertEqual([case["case_id"] for case in edit["regressed_cases"]], ["c0"])
         # Without the old arm selected, the report carries no edit block at all.
         self.assertNotIn("paired_edit_summary", plain)
+
+    def test_ungraded_evidence_withholds_the_edit_as_it_withholds_the_lift(self):
+        # Seven cases, each with a script oracle that does not run without
+        # --allow-scripts: no row is fully graded, so neither comparison may
+        # publish a headline built from the contains assertion alone.
+        cases = [{"id": f"c{i}", "split": "tune", "kind": "behavior", "prompt": "Do it.",
+                  "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"},
+                                 {"name": "oracle", "type": "script", "command": ["true"]}]}
+                 for i in range(7)]
+        manifest = demo_manifest(cases=cases, old_skill_paths=["old/SKILL.md"],
+                                 optional_variants=["old_skill"])
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_demo_manifest(root, manifest)
+            (root / "repo" / "old").mkdir()
+            (root / "repo" / "old" / "SKILL.md").write_text(
+                "---\nname: demo\ndescription: Old\n---\n", encoding="utf-8")
+            runs = root / "runs"
+            for i in range(7):
+                write_run(runs / f"c{i}" / "with_skill", "alpha")
+                write_run(runs / f"c{i}" / "old_skill", "none")
+                write_run(runs / f"c{i}" / "without_skill", "none")
+            arms = ["with_skill", "without_skill", "old_skill"]
+            attest_answer_design(path, runs, variants=arms)
+            out = root / "benchmark.json"
+            code, _, stderr = run_cli("benchmark", path, "--runs", runs, *(
+                flag for arm in arms for flag in ("--variant", arm)), "--out", out)
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(report["incomplete_reasons"], ["grading_evidence_incomplete"])
+        lift, edit = report["paired_summary"], report["paired_edit_summary"]
+        self.assertIsNone(lift["absolute_delta"])
+        self.assertEqual(edit["availability"], "partial")
+        self.assertEqual(edit["design_coverage_reason"], "grading_evidence_incomplete")
+        self.assertEqual((edit["delta"], edit["observed_delta"]), (None, 1.0))
+        self.assertEqual((edit["current_objective_pass_rate"],
+                          edit["observed_current_objective_pass_rate"]), (None, 1.0))
+        self.assertFalse(edit["significance"]["significant_at_0_05"])
+        self.assertEqual(edit["significance"]["reason"], "grading_evidence_incomplete")
+        self.assertTrue(edit["observed_significance"]["significant_at_0_05"])
 
 
 if __name__ == "__main__":

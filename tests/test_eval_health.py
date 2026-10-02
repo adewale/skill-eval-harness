@@ -9,7 +9,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import attest_answer_design, demo_manifest, run_cli, write_demo_manifest
+from helpers import (
+    attest_answer_design,
+    demo_manifest,
+    judge_with_stub,
+    run_cli,
+    write_demo_manifest,
+    write_run,
+)
 
 import skill_benchmark as sb
 from findings import CaseFlag, FindingKind
@@ -150,6 +157,98 @@ class ReadinessGateTests(unittest.TestCase):
                                  failed_kinds)
 
 
+    def test_a_case_judged_only_by_a_gate_judge_leaves_the_benchmark_complete(self):
+        # validate accepts a case whose only gate is a judge. It has no
+        # objective assertion in either arm, so it is out of scope for the
+        # objective pairing: with every verdict supplied nothing is pending,
+        # and the readiness gate passes.
+        judged = {"id": "judged", "split": "tune", "kind": "behavior", "prompt": "Do it.",
+                  "assertions": [{"name": "quality", "type": "judge", "severity": "gate",
+                                  "rubric": ["Names the first Greek letter"]}]}
+        lift = {"with_skill": "alpha", "without_skill": "none"}
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), [judged, case("b", kind="adversarial")],
+                         {"judged": lift, "b": lift})
+            verdicts = judge_with_stub(fx.path, fx.runs, Path(td) / "verdicts.jsonl",
+                                       passes_on="alpha")
+            code, stderr = fx.cli("--judge-results", verdicts, "--fail-on-blockers")
+            audit = json.loads((fx.path.parent / "audit.json").read_text(encoding="utf-8"))
+            report = sb.build_benchmark_report(fx.path, fx.runs, judge_results_path=str(verdicts))
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(audit["benchmark_availability"], "complete")
+        self.assertEqual(report["incomplete_reasons"], [])
+        self.assertEqual(report["paired_summary"]["pairing"], {
+            "contrast_id": "skill_presence", "eligible_pairs": 1, "blocked_pairs": 0,
+            "blocked_reason_counts": {}, "not_applicable_pairs": 1})
+        self.assertEqual(report["paired_summary"]["absolute_delta"], 1.0)
+
+    def test_arms_run_at_different_effort_leave_the_benchmark_incomplete(self):
+        # Case a's arms ran at different effort, so its pair is blocked. That
+        # cause is listed on its own, and beside an unscorable run elsewhere
+        # rather than hidden by it; either way the readiness gate fails.
+        def effort(level):
+            return {"effort": {"requested": level, "applied_by": "claude --effort"}}
+        rows = (
+            ("effort only", "none",
+             ["incomplete_answer_pairing"], {"effort_mismatch": 1}),
+            ("effort beside an unscorable run", None,
+             ["unscorable_answer_attempts", "incomplete_answer_pairing"],
+             {"effort_mismatch": 1, "unscorable_arm": 1}),
+        )
+        for label, b_without, reasons, blocked in rows:
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), [case("a"), case("b", kind="adversarial")])
+                write_run(fx.runs / "a" / "with_skill", "alpha", metadata=effort("high"))
+                write_run(fx.runs / "a" / "without_skill", "none", metadata=effort("low"))
+                write_run(fx.runs / "b" / "with_skill", "alpha", metadata=effort("high"))
+                if b_without is None:
+                    (fx.runs / "b" / "without_skill").mkdir(parents=True)
+                else:
+                    write_run(fx.runs / "b" / "without_skill", b_without, metadata=effort("high"))
+                attest_answer_design(fx.path, fx.runs)
+                report = sb.build_benchmark_report(fx.path, fx.runs)
+                code, stderr = fx.cli("--fail-on", "blockers")
+                self.assertEqual(report["availability"], "partial")
+                self.assertEqual(report["incomplete_reasons"], reasons)
+                self.assertEqual(report["paired_summary"]["pairing"]["blocked_reason_counts"], blocked)
+                self.assertEqual(code, 1)
+                self.assertIn("the benchmark report is incomplete", stderr)
+                self.assertIn("some pairs are blocked", stderr)
+
+    def test_run_level_causes_are_findings_even_on_an_incomplete_benchmark(self):
+        # An effort-mismatched pair or a wrong-model run is itself what makes
+        # the benchmark partial, so the finding naming it must not wait for a
+        # complete benchmark: it is raised beside benchmark-incomplete, and
+        # mark 5 reads concern rather than unavailable.
+        def metadata(effort="high", served="match"):
+            return {"effort": {"requested": effort, "applied_by": "claude --effort"},
+                    "requested_model": "m", "served_model": "m" if served == "match" else "other",
+                    "served_model_check": served}
+        rows = (
+            ("arm-conditions-differ", metadata(effort="low"), {"effort_mismatch": 1}),
+            ("served-model-mismatch", metadata(served="mismatch"), None),
+        )
+        for kind, without_metadata, evidence in rows:
+            with self.subTest(kind), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), [case("a"), case("b", kind="adversarial")])
+                write_run(fx.runs / "a" / "with_skill", "alpha", metadata=metadata())
+                write_run(fx.runs / "a" / "without_skill", "none", metadata=without_metadata)
+                write_run(fx.runs / "b" / "with_skill", "alpha", metadata=metadata())
+                write_run(fx.runs / "b" / "without_skill", "none", metadata=metadata())
+                attest_answer_design(fx.path, fx.runs)
+                code, stderr = fx.cli("--fail-on", kind)
+                audit = json.loads((fx.path.parent / "audit.json").read_text(encoding="utf-8"))
+                self.assertEqual(audit["benchmark_availability"], "partial")
+                found = [item for item in audit["findings"] if item["kind"] == kind]
+                self.assertEqual(len(found), 1)
+                if evidence is not None:
+                    self.assertEqual(found[0]["evidence"], evidence)
+                self.assertEqual(code, 1)
+                self.assertIn(f"fail-on: {kind}: ", stderr)
+                isolation = marks(audit)["arms-differ-only-in-skill"]
+                self.assertEqual(isolation["status"], "concern")
+                self.assertIn(kind, isolation["finding_kinds"])
+
 class KnownAnswerTests(unittest.TestCase):
     def test_a_reference_answer_that_fails_its_own_checks_is_a_grader_finding(self):
         with tempfile.TemporaryDirectory() as td:
@@ -224,9 +323,11 @@ class RunMeasuredFindingTests(unittest.TestCase):
                             "pairing": {"blocked_reason_counts": {
                                 "effort_mismatch": 2, "missing_without_skill": 1}}},
             run_endings={"served_model_mismatches": 1, "served_model_mixed": 2})
-        found = {item.kind: item for item in sb.run_measured_findings(report)}
+        measured = {item.kind for item in sb.run_measured_findings(report)}
+        found = {item.kind: item for item in sb.run_condition_findings(report)}
+        self.assertEqual(measured, {
+            FindingKind.SUITE_HEADROOM_EXHAUSTED, FindingKind.UNDERPOWERED_EVAL})
         self.assertEqual(set(found), {
-            FindingKind.SUITE_HEADROOM_EXHAUSTED, FindingKind.UNDERPOWERED_EVAL,
             FindingKind.ARM_CONDITIONS_DIFFER, FindingKind.SERVED_MODEL_MISMATCH,
             FindingKind.SERVED_MODEL_MIXED})
         self.assertEqual(found[FindingKind.ARM_CONDITIONS_DIFFER].evidence, {"effort_mismatch": 2})
@@ -239,6 +340,24 @@ class RunMeasuredFindingTests(unittest.TestCase):
     def test_a_resolvable_eval_raises_nothing(self):
         report = self.report(paired_summary={"noise_check": {"verdict": "resolvable"}})
         self.assertEqual(sb.run_measured_findings(report), [])
+
+    def test_a_constant_lift_says_why_mark_four_cannot_be_read(self):
+        # Every case goes from fail to pass, so every delta is +1. The test
+        # shows a lift, but its interval cannot bound a constant sample, so
+        # mark 4 cannot compare the noise with --min-lift and says why.
+        cases = [case(f"c{i}") for i in range(6)] + [case("adv", kind="adversarial")]
+        lift = {"with_skill": "alpha", "without_skill": "none"}
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), cases, {item["id"]: lift for item in cases})
+            report = sb.build_benchmark_report(fx.path, fx.runs)
+            audit = fx.audit(min_lift=0.2)
+        self.assertTrue(report["paired_summary"]["significance"]["significant_at_0_05"])
+        self.assertEqual(report["paired_summary"]["noise_check"]["verdict"], "unbounded")
+        underpowered = [item for item in audit["findings"] if item["kind"] == "underpowered-eval"]
+        self.assertEqual(len(underpowered), 1)
+        self.assertIn("every paired delta is the same", underpowered[0]["message"])
+        self.assertIn("cannot say how large", underpowered[0]["message"])
+        self.assertEqual(marks(audit)["noise-below-min-lift"]["status"], "concern")
 
 
 if __name__ == "__main__":

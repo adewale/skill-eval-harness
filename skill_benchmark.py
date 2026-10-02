@@ -15221,11 +15221,17 @@ def _metric_pair_construction(results: list[dict[str, Any]], key: str, *,
         if key in {"objective_pass_rate", "combined_pass_rate", "graded_score"} and not 0 <= float(value) <= 1:
             return False, f"invalid_{key}"
         return True, None
+
+    def no_objective_assertions(row: Mapping[str, Any]) -> bool:
+        # A case gated only by judges has no objective rate in either arm: it
+        # is out of scope for the objective pairing, not a missing value.
+        return scorable_run(row) and row.get("objective_total") == 0
     return pair_domain.pairs_from_rows(
         results,
         population=pair_domain.ExperimentalPopulation.ANSWER,
         eligibility=eligibility,
         contrast=contrast,
+        not_applicable=no_objective_assertions if key == "objective_pass_rate" else None,
     )
 
 
@@ -15304,6 +15310,27 @@ EDIT_HEADLINE_FIELDS = (
 )
 
 
+def withhold_paired_headline(block: dict[str, Any], reason: str, *,
+                             headline_fields: tuple[str, ...] = PAIR_HEADLINE_FIELDS) -> dict[str, Any]:
+    """Move a paired block's headline, significance, interval and noise check
+    under ``observed_*`` and mark the block partial for ``reason``."""
+    out = dict(block)
+    out["availability"] = "partial"
+    for key in headline_fields:
+        out[f"observed_{key}"] = out.get(key)
+        out[key] = None
+    out["observed_significance"] = out.get("significance")
+    out["significance"] = {
+        "method": "unavailable", "n": 0, "p_value": None,
+        "significant_at_0_05": False, "reason": reason,
+    }
+    for key in ("interval", "noise_check"):
+        if key in out:
+            out[f"observed_{key}"] = out[key]
+            out[key] = {"availability": "unavailable", "reason": reason}
+    return out
+
+
 def pairing_aware_block(block: dict[str, Any],
                         construction: _ResultPairConstruction, *,
                         headline_fields: tuple[str, ...] = PAIR_HEADLINE_FIELDS) -> dict[str, Any]:
@@ -15313,20 +15340,7 @@ def pairing_aware_block(block: dict[str, Any],
     if not construction.blocked:
         out["availability"] = "complete"
         return out
-    out["availability"] = "partial"
-    for key in headline_fields:
-        out[f"observed_{key}"] = out.get(key)
-        out[key] = None
-    out["observed_significance"] = out.get("significance")
-    out["significance"] = {
-        "method": "unavailable", "n": 0, "p_value": None,
-        "significant_at_0_05": False, "reason": "incomplete_pairing",
-    }
-    for key in ("interval", "noise_check"):
-        if key in out:
-            out[f"observed_{key}"] = out[key]
-            out[key] = {"availability": "unavailable", "reason": "incomplete_pairing"}
-    return out
+    return withhold_paired_headline(out, "incomplete_pairing", headline_fields=headline_fields)
 
 
 def paired_edit_summary(results: list[dict[str, Any]], *, min_lift: float | None = None) -> dict[str, Any] | None:
@@ -15952,9 +15966,12 @@ def build_ablation_regression_report(manifest: dict[str, Any], results: list[dic
             for cid, cohort_model in confirmed_cohorts:
                 matched = pairs_by_case_model[(cid, cohort_model)]
                 label = cid if cohort_model is None else f"{cid}@{cohort_model}"
-                per_case_sig[label] = sign_flip_significance(paired_combined_deltas(matched))
+                per_case_sig[label] = Estimate.from_deltas(
+                    paired_combined_deltas(matched),
+                    unit=InferenceUnit.REPLICATE_PAIR).blocks()["significance"]
             significance = {
                 "method": "per-case-model-paired-sign-flip",
+                "unit": InferenceUnit.REPLICATE_PAIR.value,
                 "significant_at_0_05": any(s.get("significant_at_0_05") for s in per_case_sig.values()),
                 "min_p_value": min((s["p_value"] for s in per_case_sig.values() if s.get("p_value") is not None), default=None),
                 "by_case": per_case_sig,
@@ -16765,17 +16782,19 @@ def answer_design_coverage(
     }
 
 
-def invalidate_report_pairing(block: dict[str, Any], reason: str) -> dict[str, Any]:
+def invalidate_report_pairing(block: dict[str, Any], reason: str, *,
+                              headline_fields: tuple[str, ...] = PAIR_HEADLINE_FIELDS) -> dict[str, Any]:
+    """Withhold a paired block, its per-model blocks and its graded channel
+    when the report as a whole is incomplete for ``reason``."""
     out = dict(block)
     if out.get("availability") != "partial":
-        for key in PAIR_HEADLINE_FIELDS:
-            out[f"observed_{key}"] = out.get(key)
-            out[key] = None
-        out["observed_significance"] = out.get("significance")
-        out["significance"] = {"method": "unavailable", "n": 0,
-                               "p_value": None, "significant_at_0_05": False,
-                               "reason": reason}
-    out["availability"] = "partial"
+        out = withhold_paired_headline(out, reason, headline_fields=headline_fields)
+    graded = out.get("graded")
+    if isinstance(graded, dict) and graded.get("availability") == "complete":
+        out["observed_graded"] = {key: value for key, value in graded.items()
+                                  if key not in {"availability", "pairing"}}
+        out["graded"] = {"availability": "partial", "delta": None, "reason": reason,
+                         "pairing": graded.get("pairing")}
     out["design_coverage_reason"] = reason
     if isinstance(out.get("by_model"), dict):
         out["by_model"] = {model: invalidate_report_pairing(value, reason)
@@ -17005,10 +17024,13 @@ def build_benchmark_report(
         n_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ns_rows)
         flags = []
         extreme = ceiling_or_floor(w_rate, n_rate)
-        if extreme is DiscriminationFailure.FLOOR:
-            # Both arms fail every scored run. That is more often a broken case
-            # or assertion than a hard task, so it is flagged apart from the
-            # ceiling and never offered to suggest-cases for hardening.
+        combined_means = combined_arm_means(pairing.pairs)
+        if (combined_means is not None
+                and ceiling_or_floor(*combined_means) is DiscriminationFailure.FLOOR):
+            # Both arms fail every scored run, judges included. That is more
+            # often a broken case or assertion than a hard task, so it is
+            # flagged apart from the ceiling and never offered to
+            # suggest-cases for hardening.
             flags.append(CaseFlag.FLOOR.render())
         if extreme is DiscriminationFailure.CEILING:
             flags.append(CaseFlag.SATURATED.render())
@@ -17066,17 +17088,21 @@ def build_benchmark_report(
         runs, results, manifest=manifest, manifest_path=path,
         case_ids=answer_case_ids, variants=variants)
     paired_summary = build_paired_summary(results, min_lift=min_lift)
-    pairing_blocked = paired_summary.get("availability") != "complete"
+    # The edit's own effect when the run carries an old_skill arm.
+    edit_summary = paired_edit_summary(results, min_lift=min_lift)
+    pairing_block_reasons = set(paired_summary["pairing"]["blocked_reason_counts"])
     unscorable_results = [row for row in results if not scorable_run(row)]
     grading_blocked_results = [
         row for row in results
         if row.get("grading_availability") != "complete"]
-    if not design_coverage["complete"]:
-        paired_summary = invalidate_report_pairing(
-            paired_summary, "answer_design_incomplete")
-    elif grading_blocked_results:
-        paired_summary = invalidate_report_pairing(
-            paired_summary, "grading_evidence_incomplete")
+    report_pairing_reason = (
+        "answer_design_incomplete" if not design_coverage["complete"]
+        else "grading_evidence_incomplete" if grading_blocked_results else None)
+    if report_pairing_reason is not None:
+        paired_summary = invalidate_report_pairing(paired_summary, report_pairing_reason)
+        if edit_summary is not None:
+            edit_summary = invalidate_report_pairing(
+                edit_summary, report_pairing_reason, headline_fields=EDIT_HEADLINE_FIELDS)
     ablation_regressions = build_ablation_regression_report(manifest, results)
     if not design_coverage["complete"]:
         for entry in ablation_regressions:
@@ -17145,15 +17171,16 @@ def build_benchmark_report(
                 block["reason"] = judge_reason
     # Why the report is partial, one code per root cause; availability is
     # derived from this list so the two cannot disagree. A pending judge
-    # verdict also leaves its row's grading partial and blocks its pair, and an
-    # unscorable run blocks its pair, so those consequences are not listed again.
+    # verdict also leaves its row's grading partial, and an unscorable run
+    # blocks its pair, so those consequences are not listed again; a pair
+    # blocked for any other reason (effort_mismatch) is listed beside them.
     incomplete_reasons = [reason for reason, present in (
         ("answer_design_incomplete", not design_coverage["complete"]),
         ("unscorable_answer_attempts", bool(unscorable_results)),
         ("deferred_judge_verdicts", bool(deferred_judge_tasks)),
         ("grading_evidence_incomplete", any(
             not row.get("deferred_judge_tasks") for row in grading_blocked_results)),
-        ("incomplete_answer_pairing", pairing_blocked and not unscorable_results),
+        ("incomplete_answer_pairing", bool(pairing_block_reasons - {"unscorable_arm"})),
     ) if present]
     if not design_coverage["complete"]:
         reason = "answer_design_incomplete"
@@ -17194,9 +17221,7 @@ def build_benchmark_report(
         # so a rubric the skill could see never inflates the held-out number.
         "qualitative_by_visibility": qualitative_surface,
         "paired_summary": paired_summary,
-        # The edit's own effect when the run carries an old_skill arm.
-        **({"paired_edit_summary": edit_summary}
-           if (edit_summary := paired_edit_summary(results, min_lift=min_lift)) is not None else {}),
+        **({"paired_edit_summary": edit_summary} if edit_summary is not None else {}),
         # 5: pass@k / pass^k per (case, variant) from the repeated-run data, plus a
         # pooled per-variant reliability headline. Uses the unbiased estimator.
         "reliability": reliability,
@@ -17223,10 +17248,7 @@ def build_benchmark_report(
 
 
 def benchmark(args: argparse.Namespace) -> int:
-    min_lift = getattr(args, "min_lift", None)
-    if min_lift is not None and not 0 < min_lift <= 1:
-        die("--min-lift must be a pass-rate difference in (0, 1]")
-    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), **grading_options(args), min_lift=min_lift)
+    report = build_benchmark_report(Path(args.manifest), Path(args.runs), args.split, args.variant, getattr(args, "judge_results", None), **grading_options(args), min_lift=getattr(args, "min_lift", None))
     emit_report(report, args.out)
     return 0
 
@@ -17358,18 +17380,10 @@ def github_summary_from_report(report: dict[str, Any]) -> str:
     paired = report.get("paired_summary", {}) or {}
     summary = report.get("summary", {}) or {}
     lines = [f"# Skill eval — {skill}", ""]
-    design = report.get("answer_design") or {}
     if report.get("availability") != "complete":
-        reasons = []
-        if design.get("complete") is not True:
-            reasons.append("answer-design coverage")
-        if report.get("deferred_judge_tasks"):
-            reasons.append("deferred judge verdicts")
-        if any(row.get("grading_availability") != "complete"
-               for row in report.get("results", [])):
-            reasons.append("blocked grading evidence")
-        if any(not scorable_run(row) for row in report.get("results", [])):
-            reasons.append("unscorable attempts")
+        # The report's own root causes, each once (build_benchmark_report owns them).
+        reasons = [incomplete_label(str(reason))
+                   for reason in report.get("incomplete_reasons") or []]
         lines.extend([
             "**Experiment status:** incomplete"
             + (f" ({', '.join(reasons)})" if reasons else ""), "",
@@ -18743,7 +18757,7 @@ def cost_summary_command(args: argparse.Namespace) -> int:
     ledger = suite_cost_ledger(Path(args.manifest), Path(args.runs), benchmark_report=benchmark_report, judge_results=judge_lookup or None, top_n=int(getattr(args, "top", 10)))
     emit_report(ledger, args.out)
     if getattr(args, "md", None):
-        Path(args.md).write_text(cost_ledger_markdown(ledger), encoding="utf-8")
+        emit_text(cost_ledger_markdown(ledger), args.md)
     return 0
 
 
@@ -19570,6 +19584,32 @@ def fixture_recommendations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 POSITIVE_OBJECTIVE_TYPES = {"contains", "contains_any", "contains_all", "regex"}
 
 
+def combined_signal(row: Mapping[str, Any]) -> float | None:
+    """A run's combined score, the rate the floor and readiness rules read.
+    Soft judges live in graded_score, not combined, so a case with no gate
+    judge blends the two; the signal rides whichever channel the judge fed."""
+    value = row.get("combined_pass_rate")
+    if value is None or (row.get("combined_total") == row.get("objective_total")
+                         and isinstance(row.get("graded_score"), (int, float))):
+        blended = [x for x in (value, row.get("graded_score")) if isinstance(x, (int, float))]
+        value = statistics.mean(blended) if blended else row.get("objective_pass_rate")
+    return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
+
+
+def combined_arm_means(pairs: Iterable[_ResultPair]) -> tuple[float, float] | None:
+    """Mean combined score per arm over the pairs where both arms have one.
+    A case is at the floor when both means are 0 (`ceiling_or_floor`), the
+    one rule behind the floor case flag and readiness's floor_cases."""
+    combined = [(combined_signal(pair.with_skill.payload), combined_signal(pair.without_skill.payload))
+                for pair in pairs]
+    present = [(left, right) for left, right in combined if left is not None and right is not None]
+    if not present:
+        return None
+    return (statistics.mean(left for left, _ in present),
+            statistics.mean(right for _, right in present))
+
+
 def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9) -> dict[str, Any]:
     """From a benchmark report's per-case scorable results, surface the cases a
     static manifest audit CANNOT see — the ones where the *measured* numbers say
@@ -19594,31 +19634,16 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
         rows, population=pair_domain.ExperimentalPopulation.ANSWER,
         eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
     )
-
-    def combined_value(row: Mapping[str, Any]) -> float | None:
-        value = row.get("combined_pass_rate")
-        # Soft judges live in graded_score, not combined; the qualitative signal
-        # this function looks for rides whichever channel the judge fed.
-        if value is None or (row.get("combined_total") == row.get("objective_total")
-                             and isinstance(row.get("graded_score"), (int, float))):
-            blended = [x for x in (value, row.get("graded_score")) if isinstance(x, (int, float))]
-            value = statistics.mean(blended) if blended else row.get("objective_pass_rate")
-        return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
-                and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
-
     by_case: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in pairing.pairs:
         by_case[pair.key.case_id].append(pair)
     base_saturated, base_saturated_expected, qualitative_only, floor = [], [], [], []
     for cid, pairs in by_case.items():
-        combined = [(combined_value(pair.with_skill.payload), combined_value(pair.without_skill.payload))
-                    for pair in pairs]
-        combined = [(left, right) for left, right in combined if left is not None and right is not None]
-        if not combined:
+        means = combined_arm_means(pairs)
+        if means is None:
             continue
-        cw = statistics.mean(left for left, _ in combined)
-        cn = statistics.mean(right for _, right in combined)
-        if cw <= eps and cn <= eps:
+        cw, cn = means
+        if ceiling_or_floor(cw, cn, eps=eps) is DiscriminationFailure.FLOOR:
             floor.append(cid)
             continue
         if abs(cw - cn) <= eps:
@@ -19656,19 +19681,32 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
     return {"availability": "complete", **observed}
 
 
-# What to do about each reason a benchmark report is partial
-# (build_benchmark_report's incomplete_reasons).
-INCOMPLETE_REMEDIES = {
-    "answer_design_incomplete": "some planned case arms have no run; finish the runs",
-    "unscorable_answer_attempts": "some runs are unscorable (cut off, wrong model, or not completed); re-run them",
-    "grading_evidence_incomplete": "some runs could not be graded; see grading_availability on the results",
-    "deferred_judge_verdicts": "judge assertions have no verdicts; pass --judge-results",
-    "incomplete_answer_pairing": "some pairs are blocked (a missing arm, or arms run at different effort); see paired_summary.pairing",
+# Each reason a benchmark report is partial (build_benchmark_report's
+# incomplete_reasons): its short name for a one-line status, and what to do.
+INCOMPLETE_CAUSES = {
+    "answer_design_incomplete": (
+        "answer-design coverage", "some planned case arms have no run; finish the runs"),
+    "unscorable_answer_attempts": (
+        "unscorable attempts",
+        "some runs are unscorable (cut off, wrong model, or not completed); re-run them"),
+    "grading_evidence_incomplete": (
+        "blocked grading evidence",
+        "some runs could not be graded; see grading_availability on the results"),
+    "deferred_judge_verdicts": (
+        "deferred judge verdicts", "judge assertions have no verdicts; pass --judge-results"),
+    "incomplete_answer_pairing": (
+        "blocked pairs",
+        ("some pairs are blocked (a missing arm, or arms run at different effort); "
+         "see paired_summary.pairing")),
 }
 
 
+def incomplete_label(reason: str) -> str:
+    return INCOMPLETE_CAUSES[reason][0] if reason in INCOMPLETE_CAUSES else reason
+
+
 def incomplete_remedy(reason: str) -> str:
-    return INCOMPLETE_REMEDIES.get(reason, reason)
+    return INCOMPLETE_CAUSES[reason][1] if reason in INCOMPLETE_CAUSES else reason
 
 
 def eval_readiness(manifest: dict[str, Any], manifest_path: Path, *, split: str | None = None, leakage_min_chars: int = 4, benchmark_report: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -19863,17 +19901,21 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
     variants = manifest.get("variants", DEFAULT_VARIANTS)
     cases_out: list[dict[str, Any]] = []
     total = 0
-    # Coverage: each answer case's arms whose output was read. A gate that
-    # never saw an arm's output cannot say that arm did not leak.
-    unscanned: list[dict[str, str]] = []
-    expected_arms = 0
+    # Coverage: every answer run discovery yields (case, model, arm, run)
+    # whose output was read. A gate that never saw a run's output cannot say
+    # that run did not leak, and another model's output does not stand in.
+    unscanned: list[dict[str, Any]] = []
+    expected_runs = 0
     for case in iter_cases(manifest, split):
         max_overlap, findings = 0.0, []
-        scanned_variants: set[str] = set()
+        answer_case = not is_trigger_case(case)
         for model_name, variant, run_number, _base, text, _path, _meta in discovered_run_units(runs, case, variants):
+            expected_runs += answer_case
             if text is None:
+                if answer_case:
+                    unscanned.append({"case_id": case["id"], "model": model_name,
+                                      "variant": variant, "run_number": run_number})
                 continue
-            scanned_variants.add(variant)
             chk = contamination_check(case, text, manifest_dir=manifest_path.parent, n=n,
                                       overlap_threshold=overlap_threshold, model_cutoff=model_cutoff)
             max_overlap = max(max_overlap, chk["overlap"])
@@ -19882,16 +19924,12 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
         total += len(findings)
         if findings or max_overlap > 0:
             cases_out.append({"case_id": case["id"], "max_overlap": round(max_overlap, 4), "findings": findings})
-        if not is_trigger_case(case):
-            expected_arms += len(variants)
-            unscanned.extend({"case_id": case["id"], "variant": variant}
-                             for variant in variants if variant not in scanned_variants)
-    scanned_arms = expected_arms - len(unscanned)
+    scanned_runs = expected_runs - len(unscanned)
     availability = (Availability.COMPLETE if not unscanned
-                    else Availability.PARTIAL if scanned_arms else Availability.UNAVAILABLE)
+                    else Availability.PARTIAL if scanned_runs else Availability.UNAVAILABLE)
     return {"cases": cases_out, "total_findings": total,
-            "coverage": {"availability": availability.value, "expected_arms": expected_arms,
-                         "scanned_arms": scanned_arms, "unscanned": unscanned},
+            "coverage": {"availability": availability.value, "expected_runs": expected_runs,
+                         "scanned_runs": scanned_runs, "unscanned": unscanned},
             "params": {"ngram": n, "overlap_threshold": overlap_threshold, "model_cutoff": model_cutoff,
                        "comparison": ComparisonProfile.RENDERED_V1.value}}
 
@@ -19907,8 +19945,8 @@ def contamination_command(args: argparse.Namespace) -> int:
     return gate_exit(gate_policy.CONTAMINATION.decide(
         [finding for case in report["cases"] for finding in case["findings"]],
         complete=coverage["availability"] == Availability.COMPLETE.value,
-        incomplete_reason=(f"contamination scanned {coverage['scanned_arms']} of "
-                           f"{coverage['expected_arms']} case arms; the rest have no saved output")),
+        incomplete_reason=(f"contamination scanned {coverage['scanned_runs']} of "
+                           f"{coverage['expected_runs']} answer runs; the rest have no saved output")),
         "contamination")
 
 
@@ -19968,29 +20006,14 @@ def known_answer_check(manifest: dict[str, Any], manifest_path: Path, *,
     }
 
 
-def run_measured_findings(report: dict[str, Any]) -> list[Finding]:
-    """Findings only a complete benchmark can support (marks 3, 4 and 5)."""
+def run_condition_findings(report: dict[str, Any]) -> list[Finding]:
+    """Mark 5 findings read from the runs present: arms run under different
+    conditions, or a run answered by another model. Each is a root cause of an
+    incomplete benchmark rather than a measurement over it, so it is raised on
+    a partial benchmark too."""
     out: list[Finding] = []
-    paired = report.get("paired_summary") or {}
-    capability = [
-        float(row["objective_pass_rate"]) for row in report.get("results", [])
-        if row.get("variant") == "without_skill" and scorable_run(row)
-        and row.get("eval_intent") != "regression"
-        and isinstance(row.get("objective_pass_rate"), (int, float))]
-    if capability and statistics.fmean(capability) >= SUITE_HEADROOM_CEILING:
-        rate = round(statistics.fmean(capability), 4)
-        out.append(Finding(
-            FindingKind.SUITE_HEADROOM_EXHAUSTED,
-            f"without_skill already passes {rate:.0%} of capability runs; there is little "
-            "room to show lift, so hold quality and optimise cost or latency instead",
-            {"without_skill_capability_rate": rate}))
-    noise = paired.get("noise_check") or {}
-    if noise.get("verdict") not in (None, "no-data", "resolvable"):
-        out.append(Finding(
-            FindingKind.UNDERPOWERED_EVAL,
-            f"the eval cannot resolve the lift it is meant to measure ({noise['verdict']})",
-            noise))
-    blocked = (paired.get("pairing") or {}).get("blocked_reason_counts") or {}
+    blocked = ((report.get("paired_summary") or {}).get("pairing") or {}).get(
+        "blocked_reason_counts") or {}
     held_fixed = {reason: count for reason, count in blocked.items()
                   if reason.endswith(("_mismatch", "_unrecorded_on_one_arm"))}
     if held_fixed:
@@ -20008,6 +20031,36 @@ def run_measured_findings(report: dict[str, Any]) -> list[Finding]:
         out.append(Finding(
             FindingKind.SERVED_MODEL_MIXED,
             f"{endings['served_model_mixed']} run(s) reported the requested model and another"))
+    return out
+
+
+def run_measured_findings(report: dict[str, Any]) -> list[Finding]:
+    """Findings only a complete benchmark can support (marks 3 and 4)."""
+    out: list[Finding] = []
+    paired = report.get("paired_summary") or {}
+    capability = [
+        float(row["objective_pass_rate"]) for row in report.get("results", [])
+        if row.get("variant") == "without_skill" and scorable_run(row)
+        and row.get("eval_intent") != "regression"
+        and isinstance(row.get("objective_pass_rate"), (int, float))]
+    if capability and statistics.fmean(capability) >= SUITE_HEADROOM_CEILING:
+        rate = round(statistics.fmean(capability), 4)
+        out.append(Finding(
+            FindingKind.SUITE_HEADROOM_EXHAUSTED,
+            f"without_skill already passes {rate:.0%} of capability runs; there is little "
+            "room to show lift, so hold quality and optimise cost or latency instead",
+            {"without_skill_capability_rate": rate}))
+    noise = paired.get("noise_check") or {}
+    if noise.get("verdict") == "unbounded" and noise.get("reason"):
+        out.append(Finding(
+            FindingKind.UNDERPOWERED_EVAL,
+            "the lift interval has no bounds, so the noise check cannot say how large the "
+            f"lift is or compare it with --min-lift ({noise['reason']})", noise))
+    elif noise.get("verdict") not in (None, "no-data", "resolvable"):
+        out.append(Finding(
+            FindingKind.UNDERPOWERED_EVAL,
+            f"the eval cannot resolve the lift it is meant to measure ({noise['verdict']})",
+            noise))
     return out
 
 
@@ -20352,8 +20405,9 @@ def audit_manifest_report(
             incomplete_remedy(cause) for cause in bench_report.get("incomplete_reasons") or [])]
     else:
         runs_notes = ["measured on runs: pass --runs"]
-    if bench_report and bench_complete:
-        for item in run_measured_findings(bench_report):
+    if bench_report:
+        measured = run_measured_findings(bench_report) if bench_complete else []
+        for item in [*measured, *run_condition_findings(bench_report)]:
             findings.append(item.as_dict())
 
     health = eval_health(
@@ -20374,8 +20428,10 @@ def audit_manifest_report(
             EvalMark.HEADROOM: runs_notes,
             EvalMark.NOISE: runs_notes,
             EvalMark.ISOLATION: runs_notes + ([(
-                "the leakage lint ran on the manifest; effort and served-model checks need a "
-                "complete benchmark")] if not bench_complete else []),
+                "the leakage lint ran on the manifest; the effort and served-model checks "
+                "read only the runs present" if bench_report else
+                "the leakage lint ran on the manifest; effort and served-model checks need "
+                "--runs")] if not bench_complete else []),
         })
 
     return {

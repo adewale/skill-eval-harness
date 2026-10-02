@@ -75,6 +75,8 @@ _NONNEGATIVE_NUMBERS = frozenset({
     "max_references", "max_modules",
 })
 _UNIT_INTERVAL_NUMBERS = frozenset({"overlap_threshold"})
+# A pass-rate difference worth acting on: above zero and at most one.
+_LIFT_NUMBERS = frozenset({"min_lift"})
 
 
 def _validated_path(value: Any, label: str) -> Path:
@@ -206,6 +208,11 @@ class ValidatedLegacyCLIInvocation:
             if value is not None and not 0 <= _number(
                 value, name.replace("_", "-")) <= 1:
                 raise ValueError(f"{name.replace('_', '-')} must be in [0, 1]")
+        for name in _LIFT_NUMBERS:
+            value = arguments.get(name)
+            if value is not None and not 0 < _number(value, name.replace("_", "-")) <= 1:
+                raise ValueError(
+                    f"{name.replace('_', '-')} must be a pass-rate difference in (0, 1]")
         port = arguments.get("port")
         if port is not None and _number(port, "port") > 65535:
             raise ValueError("port must be at most 65535")

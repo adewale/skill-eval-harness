@@ -431,11 +431,14 @@ class GradedScoringSeverityTests(unittest.TestCase):
         # The deterministic Monte-Carlo point estimate is below .05, while
         # exact enumeration is just above it.  A point-estimate gate would
         # therefore manufacture a causal confirmation.
+        # Repeated deltas keep these 15 exact by default (6144 distinct sign
+        # outcomes), so a 2**12 budget puts them on the sampled path.
         deltas = [-1, -.9, -.6, .5, .1, -.5, .4, .4, -.1, .4,
                   -.4, -1, -.8, -.6, -.6]
-        sampled = sb.sign_flip_significance(deltas)
-        reversed_sampled = sb.sign_flip_significance(list(reversed(deltas)))
+        sampled = sb.sign_flip_significance(deltas, max_exact_n=12)
+        reversed_sampled = sb.sign_flip_significance(list(reversed(deltas)), max_exact_n=12)
         exact = sb.sign_flip_significance(deltas, max_exact_n=20)
+        self.assertEqual(sb.sign_flip_significance(deltas), exact)
         self.assertEqual(sampled["method"], "sign-flip-sampled")
         # Equal across two calls on reordered input: the sample is seeded
         # (a re-grade stays byte-identical) and independent of case order.
@@ -449,7 +452,7 @@ class GradedScoringSeverityTests(unittest.TestCase):
         # (b+1)/(m+1): the observed sign pattern is itself a valid permutation,
         # so a sampled p can never be an impossible 0.0, even when no sampled
         # pattern reaches the observed mean.
-        result = sb.sign_flip_significance([0.5] * 20)
+        result = sb.sign_flip_significance([0.5] * 20, max_exact_n=4)
         self.assertEqual(result["method"], "sign-flip-sampled")
         self.assertAlmostEqual(result["p_value"], 1 / 4097)
 

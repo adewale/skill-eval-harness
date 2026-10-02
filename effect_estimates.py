@@ -8,7 +8,7 @@ per-case deltas. This module adds the two numbers that test cannot give:
   interval excludes zero exactly when the test rejects "no lift". The test
   (``sign_flip_test``) and the interval read one set of sign patterns and one
   decision rule, including the conservative Monte Carlo bound once there are
-  too many cases to enumerate, so they cannot disagree.
+  too many sign outcomes to enumerate, so they cannot disagree.
 * ``noise_check`` says whether the eval could have seen a lift at all. It
   reports the smallest p-value the observed data could ever produce, the
   interval half-width (the noise floor), and the headroom left in the
@@ -24,9 +24,11 @@ byte-identical (CF.3).
 from __future__ import annotations
 
 import bisect
+import itertools
 import math
 import random
 import statistics
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -34,9 +36,12 @@ from typing import Any
 
 DEFAULT_ALPHA = 0.05
 DEFAULT_CONFIDENCE = 0.95
-# Exact enumeration of 2**n sign patterns up to this many cases. The pattern
-# sums are grouped by pattern weight and sorted once, so each p-value
-# evaluation during the interval search is a handful of binary searches.
+# Exact enumeration while the non-zero deltas have at most 2**14 distinct sign
+# outcomes: 14 distinct non-zero deltas, or more when deltas repeat. Zero
+# deltas cost a factor of (zeros + 1) in the interval search rather than
+# 2**zeros, bounded at 2**16 against the moved units. The pattern sums are
+# grouped by pattern weight and sorted once, so each p-value evaluation during
+# the interval search is a handful of binary searches.
 MAX_EXACT_CASES = 14
 SAMPLED_PATTERNS = 4096
 _TOLERANCE = 1e-12
@@ -139,29 +144,50 @@ class _SignPatterns:
     statistic is ``|A_s - delta * B_s|`` where ``A_s = sum(s_i * d_i)`` and
     ``B_s = sum(s_i)``. ``B_s`` takes few values, so grouping the ``A_s`` by
     ``B_s`` and sorting each group turns a tail count into binary searches.
+    Each group carries the running count of patterns behind its sorted sums,
+    and ``zero_offsets`` the ``(B, count)`` spread of the zero deltas, which
+    move ``B`` but never ``A``.
     """
 
-    groups: tuple[tuple[int, tuple[float, ...]], ...]
+    groups: tuple[tuple[int, tuple[float, ...], tuple[int, ...]], ...]
+    zero_offsets: tuple[tuple[int, int], ...]
     total: int
     exact: bool
 
 
+def _exact_fits(deltas: Sequence[float], max_exact_n: int) -> bool:
+    """Whether exact enumeration fits the budget. Equal deltas are
+    exchangeable, so a value seen c times contributes c + 1 outcomes, and the
+    zeros only widen each tail count by their (zeros + 1) spread."""
+    counts = Counter(v for v in deltas if v != 0)
+    moved = sum(counts.values())
+    zeros = len(deltas) - moved
+    return (math.prod(count + 1 for count in counts.values()) <= 1 << max_exact_n
+            and (moved + 1) * (zeros + 1) <= 1 << (max_exact_n + 2))
+
+
 def _exact_patterns(deltas: Sequence[float]) -> _SignPatterns:
-    # Subset sums of flipped cases, grouped by how many cases were flipped:
-    # flipping subset S gives A = sum(d) - 2*sum(d_S) and B = n - 2*|S|.
-    by_size: list[list[float]] = [[0.0]]
-    for value in deltas:
-        grown: list[list[float]] = [list(bucket) for bucket in by_size] + [[]]
-        for size, bucket in enumerate(by_size):
-            grown[size + 1].extend(total + value for total in bucket)
-        by_size = grown
-    whole = math.fsum(deltas)
-    n = len(deltas)
-    groups = tuple(
-        (n - 2 * size, tuple(sorted(whole - 2 * flipped for flipped in bucket)))
-        for size, bucket in enumerate(by_size)
-    )
-    return _SignPatterns(groups=groups, total=1 << n, exact=True)
+    # Flipping j of c equal deltas v gives the same (A, B) in comb(c, j) ways:
+    # A gains v * (c - 2j) and B gains c - 2j. Zeros only move B, so they
+    # stay one binomial spread instead of multiplying the outcomes.
+    counts = Counter(v for v in deltas if v != 0)
+    zeros = len(deltas) - sum(counts.values())
+    outcomes: list[tuple[float, int, int]] = [(0.0, 0, 1)]
+    for value, count in sorted(counts.items()):
+        outcomes = [(a + value * (count - 2 * j), b + count - 2 * j, w * math.comb(count, j))
+                    for a, b, w in outcomes for j in range(count + 1)]
+    by_b: dict[int, list[tuple[float, int]]] = {}
+    for a, b, w in outcomes:
+        by_b.setdefault(b, []).append((a, w))
+    groups = []
+    for b, items in sorted(by_b.items()):
+        items.sort()
+        groups.append((b, tuple(a for a, _ in items),
+                       tuple(itertools.accumulate((w for _, w in items), initial=0))))
+    return _SignPatterns(groups=tuple(groups),
+                         zero_offsets=tuple((zeros - 2 * j, math.comb(zeros, j))
+                                            for j in range(zeros + 1)),
+                         total=1 << len(deltas), exact=True)
 
 
 def _sampled_patterns(deltas: Sequence[float], samples: int, seed: int) -> _SignPatterns:
@@ -180,8 +206,9 @@ def _sampled_patterns(deltas: Sequence[float], samples: int, seed: int) -> _Sign
             a += flip * abs(value)
             b += flip if value >= 0 else -flip
         grouped.setdefault(b, []).append(a)
-    groups = tuple((b, tuple(sorted(values))) for b, values in sorted(grouped.items()))
-    return _SignPatterns(groups=groups, total=samples, exact=False)
+    groups = tuple((b, tuple(sorted(values)), tuple(range(len(values) + 1)))
+                   for b, values in sorted(grouped.items()))
+    return _SignPatterns(groups=groups, zero_offsets=((0, 1),), total=samples, exact=False)
 
 
 def monte_carlo_upper_bound(hits: int, samples: int, *, failure_probability: float = 0.001) -> float:
@@ -202,15 +229,19 @@ def _tail(patterns: _SignPatterns, whole: float, n: int, delta: float) -> tuple[
     decision uses: a point estimate just under alpha is not evidence.
     """
     threshold = abs(whole - n * delta) - _TOLERANCE
+    # Unshifted, the zeros' B never matters, so their spread folds into one.
+    offsets = (patterns.zero_offsets if delta != 0
+               else ((0, sum(count for _, count in patterns.zero_offsets)),))
     hits = 0
-    for b, values in patterns.groups:
-        centre = b * delta
-        # |A - centre| >= threshold  <=>  A >= centre + t  or  A <= centre - t
-        if threshold <= 0:
-            hits += len(values)
-            continue
-        hits += len(values) - bisect.bisect_left(values, centre + threshold)
-        hits += bisect.bisect_right(values, centre - threshold)
+    for b, values, counts in patterns.groups:
+        for offset, weight in offsets:
+            centre = (b + offset) * delta
+            # |A - centre| >= threshold  <=>  A >= centre + t  or  A <= centre - t
+            if threshold <= 0:
+                hits += weight * counts[-1]
+                continue
+            hits += weight * (counts[-1] - counts[bisect.bisect_left(values, centre + threshold)]
+                              + counts[bisect.bisect_right(values, centre - threshold)])
     if patterns.exact:
         p = hits / patterns.total
         return p, p
@@ -224,7 +255,7 @@ def _rejects(patterns: _SignPatterns, whole: float, n: int, delta: float, alpha:
 
 def _patterns(values: Sequence[float], max_exact_n: int, samples: int,
               seed: int) -> _SignPatterns:
-    if len(values) <= max_exact_n:
+    if _exact_fits(values, max_exact_n):
         return _exact_patterns(values)
     return _sampled_patterns(values, samples, seed)
 
@@ -236,9 +267,10 @@ def sign_flip_test(deltas: Sequence[float], *, max_exact_n: int = MAX_EXACT_CASE
 
     Under the null (the skill does nothing) each case's delta is equally
     likely to have either sign, so p is the share of sign patterns whose
-    |mean| reaches the observed |mean|. Exact enumeration up to
-    ``max_exact_n`` cases, then a seeded sample, so a re-grade stays
-    byte-identical (CF.3). The sampled decision uses the upper bound.
+    |mean| reaches the observed |mean|. Exact enumeration while the non-zero
+    deltas take at most ``2**max_exact_n`` sign outcomes (zeros never count,
+    since flipping one changes no sum), then a seeded sample, so a re-grade
+    stays byte-identical (CF.3). The sampled decision uses the upper bound.
     """
     n = len(deltas)
     if n == 0:
@@ -288,7 +320,9 @@ def sign_flip_interval(deltas: Sequence[float], *, confidence: float = DEFAULT_C
     Returns ``bounded: False`` with null endpoints when the test cannot reject
     any shift at all, which happens when there are too few cases (five or fewer
     at 95%, since 2 / 2**5 > 0.05): the data cannot rule anything out, and
-    printing an interval would claim a precision the eval does not have.
+    printing an interval would claim a precision the eval does not have. It
+    does the same when every delta is equal: the test reads only signs, so it
+    rejects every shift but that value, and the point it leaves is no bound.
     """
     if not 0 < confidence < 1:
         raise ValueError("confidence must lie strictly between 0 and 1")
@@ -320,6 +354,10 @@ def sign_flip_interval(deltas: Sequence[float], *, confidence: float = DEFAULT_C
                 "reason": (f"{n} paired case(s) cannot exclude any lift at "
                            f"{confidence:.0%}; the test needs at least "
                            f"{cases_needed_for_alpha(alpha)} cases that differ between arms")}
+    if values[0] == values[-1]:
+        return {**base, "method": method, "lower": None, "upper": None, "bounded": False,
+                "reason": (f"every paired delta is the same ({values[0]:g}); a sign-flip "
+                           "test reads only signs, so it cannot bound a constant sample")}
     return {**base, "method": method, "lower": round(lower, 6), "upper": round(upper, 6),
             "bounded": True}
 
@@ -331,7 +369,9 @@ def noise_check(deltas: Sequence[float], without_rates: Sequence[float], *,
 
     * ``smallest_achievable_p``: with ``k`` cases whose delta is non-zero, the
       exact test can never report less than ``2 / 2**k``. Below
-      ``cases_needed_for_alpha`` moved cases, significance is impossible.
+      ``cases_needed_for_alpha`` moved cases, significance is impossible. The
+      test decides on the same non-zero deltas, and up to ``MAX_EXACT_CASES``
+      of them it is always exact, so this floor is the decision's floor.
     * ``noise_floor``: the interval half-width. A lift smaller than this is
       indistinguishable from run-to-run noise at the current case count.
     * ``headroom``: ``1 - without_skill`` rate, the largest lift the eval can
@@ -373,6 +413,8 @@ def noise_check(deltas: Sequence[float], without_rates: Sequence[float], *,
         "noise_floor": floor,
         "headroom": headroom,
     }
+    if verdict is NoiseVerdict.UNBOUNDED and interval.get("reason"):
+        out["reason"] = interval["reason"]
     if min_lift is not None:
         out["min_lift"] = min_lift
     target = min_lift if min_lift is not None else headroom

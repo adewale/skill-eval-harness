@@ -104,9 +104,13 @@ that file still invalidates trigger identity until those owners are extracted in
 ### Expected report and audit changes
 
 - Every paired block gains `interval` and `noise_check` (under `observed_*` when pairing is
-  incomplete). `benchmark --min-lift` adds `min_lift` to the noise check.
+  incomplete, or when the report is partial for `answer_design_incomplete` or
+  `grading_evidence_incomplete`, which also moves `graded` to `observed_graded`).
+  `benchmark --min-lift` adds `min_lift` to the noise check.
 - A case whose arms both score 0 on every scored pair gains the `floor: fails in both arms` flag
-  beside `no objective lift`. `saturated/non-discriminating` still marks only the ceiling.
+  beside `no objective lift`. The score is the combined one readiness reads, so a judge that
+  passes one arm keeps the case off the floor. `saturated/non-discriminating` still marks only
+  the ceiling.
 - `audit-manifest --runs` reports such a case as `floor-eval` instead of `no-lift-eval`, now
   including regression-intent cases, and `suggest-cases` no longer seeds it.
 - Readiness moves a case whose combined score is 0 in both arms out of `base_saturated_cases` into
@@ -115,7 +119,8 @@ that file still invalidates trigger identity until those owners are extracted in
   `audit-manifest --fail-on-blockers` can start failing on a suite that passed under 0.6.0.
   Audit the case and its assertions rather than removing the regression intent.
 - Every paired `significance`, `interval`, and `noise_check` block gains `unit`, the inference unit
-  its test counts (`case` for benchmark lift).
+  its test counts (`case` for benchmark lift, `replicate_pair` for an ablation regression's
+  `significance` and each of its `by_case` tests).
 - Ablation pairing diagnostics read `contrast_id: "ablation:<id>"` (0.6.0 wrote `skill_presence`),
   and a missing ablation run blocks as `missing_ablation:<id>` instead of `missing_without_skill`.
   Update any script that filters on those strings.
@@ -133,14 +138,23 @@ that file still invalidates trigger identity until those owners are extracted in
   fields on one case, an inline `reference_answer` on a `holdout` or `holdback` case, and either
   field on a trigger case.
 - `benchmark` output gains `incomplete_reasons`, the root causes behind a `partial` availability. The
-  `benchmark-incomplete` readiness blocker names them in its message and evidence.
+  `benchmark-incomplete` readiness blocker names them in its message and evidence, and
+  `report --format github` prints them, each once, in its experiment status; a `benchmark.json`
+  written by 0.6.0 has no such list, so its status reads just `incomplete`.
+- A case with no objective assertion in either arm (gated only by judges) no longer blocks the
+  objective pairing as `missing_objective_pass_rate`. Its pairs are left out of it and counted in
+  `pairing.not_applicable_pairs`, so `paired_summary` can read `complete` where 0.6.0 read
+  `partial`. A pair with a missing or unscorable arm still blocks.
 - `contamination` output gains `coverage`, and `--fail-on-contamination` now fails when an answer
-  case arm has no saved output, as well as on a finding. A CI job that ran the gate before the runs
-  finished, or over a runs directory missing an arm, starts failing; point it at the complete run.
+  run has no saved output, as well as on a finding. Coverage counts every (case, model, arm, run)
+  that run discovery finds, so one model's missing arm is not covered by another model's output.
+  A CI job that ran the gate before the runs finished, or over a runs directory missing an arm,
+  starts failing; point it at the complete run.
 - Paired edit comparison: `benchmark` with an `old_skill` arm selected adds
   `paired_edit_summary`; without that arm the report is unchanged. `--variant` replaces the
   default arms, so pass all three: `--variant with_skill --variant without_skill --variant
-  old_skill`.
+  old_skill`. When the report is partial because an arm has no run or an assertion could not be
+  graded, the edit's headline is withheld under `observed_*`, as `paired_summary`'s is.
 - `skill-pi-trigger-eval` writes the `skill-trigger-matrix` report: the protocol producer is
   `skill-trigger-matrix` with one `pi` adapter, and the report gains `agents` and `matrix`.
   `trigger-compare` no longer accepts the old `skill-pi-trigger-eval` producer. Each row's `ablation` is the
@@ -163,6 +177,22 @@ that file still invalidates trigger identity until those owners are extracted in
   your `benchmark` command uses them, or the numbers will differ.
 
 ### Fixes that change saved numbers
+
+- The sign-flip test and the lift interval chose between exact enumeration and sampling on the
+  total unit count, so unchanged units (zero deltas, which no sign flip can move) pushed any
+  paired block over 14 units onto the sampled path, whose decision uses a Monte Carlo upper
+  bound. Six units that all moved by +1 beside nine unchanged ones read `p_value_upper_bound`
+  0.061, not significant, while `noise_check` called the eval resolvable. The choice now rests
+  on the units that moved, and equal deltas are enumerated as one group, so that block reads the
+  exact p = 0.03125 and is significant. A saved report with more than 14 paired units can
+  change `significance`, `interval` and `method` (from `...-sampled` to `...-exact`) when
+  regraded.
+- When every paired delta is equal (every case gained one full run, say), the interval was the
+  point `[v, v]`, so `noise_check` read `noise_floor: 0` and `resolvable` for any `--min-lift`. A
+  sign-flip test reads only signs and cannot bound a constant sample, so the interval now reads
+  `bounded: false` with a `reason`, the noise check reads `unbounded` with the same `reason`, and
+  `audit-manifest --runs` reports `underpowered-eval` (mark 4 `concern`). `significance` is
+  unchanged.
 
 - Codex trace normalization no longer counts the stream's opening `thread.started` event as a
   file read. `file_reads` was one too high on every Codex run; the count is written when a trace

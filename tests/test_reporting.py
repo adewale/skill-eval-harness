@@ -153,6 +153,29 @@ class ReportFormatsTests(unittest.TestCase):
             reports = json.loads(out.read_text(encoding="utf-8"))["reports"]
             self.assertEqual([report["skill_name"] for report in reports], ["demo", "other"])
 
+    def test_github_status_names_each_cause_once_from_incomplete_reasons(self):
+        # A gate judge with no verdict leaves every row's grading partial;
+        # incomplete_reasons lists the root cause once, and the job summary
+        # prints that list rather than re-deriving a second one.
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"].append(
+            {"name": "quality", "type": "judge", "severity": "gate", "rubric": ["complete"]})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, manifest)
+            runs, bench, summary = root / "runs", root / "benchmark.json", root / "summary.md"
+            write_run(runs / "case-1" / "with_skill", "alpha")
+            write_run(runs / "case-1" / "without_skill", "none")
+            attest_answer_design(path, runs)
+            self.assertEqual(run_cli("benchmark", path, "--runs", runs, "--out", bench)[0], 0)
+            report = json.loads(bench.read_text(encoding="utf-8"))
+            self.assertEqual(run_cli("report", "--benchmark", bench, "--format", "github",
+                                     "--out", summary)[0], 0)
+            status = [line for line in summary.read_text(encoding="utf-8").splitlines()
+                      if line.startswith("**Experiment status:**")]
+        self.assertEqual(report["incomplete_reasons"], ["deferred_judge_verdicts"])
+        self.assertEqual(status, ["**Experiment status:** incomplete (deferred judge verdicts)"])
+
 
 class MultiModelFanOutTests(unittest.TestCase):
     """2.1 — model as a third fan-out axis beside variant and run_number."""
