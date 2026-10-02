@@ -795,6 +795,23 @@ class TriggerCliStatusTests(unittest.TestCase):
         self.assertEqual({row["error"] for row in report["results"]},
                          {"RuntimeError: provider unavailable"})
 
+    def test_an_empty_model_is_an_argument_error_not_a_traceback(self):
+        def unreachable(plan):
+            raise AssertionError("no agent may run with an empty model")
+
+        with tempfile.TemporaryDirectory() as td:
+            out = str(Path(td) / "report.json")
+            for main, argv in (
+                    (tm.main, ["skill-trigger-matrix", str(DEMO_MANIFEST), "--agent", "pi",
+                               "--model", "", "--out", out]),
+                    (tr.main, ["skill-pi-trigger-eval", str(DEMO_MANIFEST), "--model", "",
+                               "--out", out])):
+                with self.subTest(argv[0]):
+                    with mock.patch.object(sys, "argv", argv), pi_runs(unreachable), \
+                         self.assertRaises(SystemExit) as ctx:
+                        main()
+                    self.assertIn("must be None or a non-empty string", str(ctx.exception.code))
+
 
 class ClaudeDetectionTests(unittest.TestCase):
     """Canned claude -p stream-json fragments; no subprocess."""

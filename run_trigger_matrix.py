@@ -1245,9 +1245,14 @@ def run_matrix(manifest_path: Path, rows: list[dict[str, Any]], agents: list[str
         # One skill tree for the whole matrix: every cell mounts the exact same
         # bytes, and the recorded hash/provenance proves which revision was measured.
         tree_dir, tree_hash, provenance = trigger_tree_for_manifest(repo_root, manifest, Path(td), ablation)
-        protocol = trigger_protocol(
-            adapters, models, runs_per_query=runs_per_query,
-            timeout=timeout, workers=workers)
+        try:
+            protocol = trigger_protocol(
+                adapters, models, runs_per_query=runs_per_query,
+                timeout=timeout, workers=workers)
+        except ValueError as exc:
+            # A model or command the protocol cannot record unambiguously
+            # (an empty --model, an unfingerprintable wrapper) is a usage error.
+            raise SystemExit(str(exc)) from exc
         protocol_sha256 = canonical_json_sha256(protocol)
         manifest_identity = trigger_manifest_identity(manifest)
         trace_root = None
