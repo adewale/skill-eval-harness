@@ -19987,8 +19987,36 @@ def known_answer_check(manifest: dict[str, Any], manifest_path: Path, *,
     }
 
 
+def run_condition_findings(report: dict[str, Any]) -> list[Finding]:
+    """Mark 5 findings read from the runs present: arms run under different
+    conditions, or a run answered by another model. Each is a root cause of an
+    incomplete benchmark rather than a measurement over it, so it is raised on
+    a partial benchmark too."""
+    out: list[Finding] = []
+    blocked = ((report.get("paired_summary") or {}).get("pairing") or {}).get(
+        "blocked_reason_counts") or {}
+    held_fixed = {reason: count for reason, count in blocked.items()
+                  if reason.endswith(("_mismatch", "_unrecorded_on_one_arm"))}
+    if held_fixed:
+        out.append(Finding(
+            FindingKind.ARM_CONDITIONS_DIFFER,
+            f"{sum(held_fixed.values())} pair(s) were blocked because their arms ran under "
+            "different conditions", held_fixed))
+    endings = report.get("run_endings") or {}
+    if endings.get("served_model_mismatches"):
+        out.append(Finding(
+            FindingKind.SERVED_MODEL_MISMATCH,
+            f"{endings['served_model_mismatches']} run(s) were answered by a model other than "
+            "the one requested"))
+    if endings.get("served_model_mixed"):
+        out.append(Finding(
+            FindingKind.SERVED_MODEL_MIXED,
+            f"{endings['served_model_mixed']} run(s) reported the requested model and another"))
+    return out
+
+
 def run_measured_findings(report: dict[str, Any]) -> list[Finding]:
-    """Findings only a complete benchmark can support (marks 3, 4 and 5)."""
+    """Findings only a complete benchmark can support (marks 3 and 4)."""
     out: list[Finding] = []
     paired = report.get("paired_summary") or {}
     capability = [
@@ -20009,24 +20037,6 @@ def run_measured_findings(report: dict[str, Any]) -> list[Finding]:
             FindingKind.UNDERPOWERED_EVAL,
             f"the eval cannot resolve the lift it is meant to measure ({noise['verdict']})",
             noise))
-    blocked = (paired.get("pairing") or {}).get("blocked_reason_counts") or {}
-    held_fixed = {reason: count for reason, count in blocked.items()
-                  if reason.endswith(("_mismatch", "_unrecorded_on_one_arm"))}
-    if held_fixed:
-        out.append(Finding(
-            FindingKind.ARM_CONDITIONS_DIFFER,
-            f"{sum(held_fixed.values())} pair(s) were blocked because their arms ran under "
-            "different conditions", held_fixed))
-    endings = report.get("run_endings") or {}
-    if endings.get("served_model_mismatches"):
-        out.append(Finding(
-            FindingKind.SERVED_MODEL_MISMATCH,
-            f"{endings['served_model_mismatches']} run(s) were answered by a model other than "
-            "the one requested"))
-    if endings.get("served_model_mixed"):
-        out.append(Finding(
-            FindingKind.SERVED_MODEL_MIXED,
-            f"{endings['served_model_mixed']} run(s) reported the requested model and another"))
     return out
 
 
@@ -20371,8 +20381,9 @@ def audit_manifest_report(
             incomplete_remedy(cause) for cause in bench_report.get("incomplete_reasons") or [])]
     else:
         runs_notes = ["measured on runs: pass --runs"]
-    if bench_report and bench_complete:
-        for item in run_measured_findings(bench_report):
+    if bench_report:
+        measured = run_measured_findings(bench_report) if bench_complete else []
+        for item in [*measured, *run_condition_findings(bench_report)]:
             findings.append(item.as_dict())
 
     health = eval_health(
@@ -20393,8 +20404,10 @@ def audit_manifest_report(
             EvalMark.HEADROOM: runs_notes,
             EvalMark.NOISE: runs_notes,
             EvalMark.ISOLATION: runs_notes + ([(
-                "the leakage lint ran on the manifest; effort and served-model checks need a "
-                "complete benchmark")] if not bench_complete else []),
+                "the leakage lint ran on the manifest; the effort and served-model checks "
+                "read only the runs present" if bench_report else
+                "the leakage lint ran on the manifest; effort and served-model checks need "
+                "--runs")] if not bench_complete else []),
         })
 
     return {

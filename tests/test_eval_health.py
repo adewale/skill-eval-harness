@@ -215,6 +215,40 @@ class ReadinessGateTests(unittest.TestCase):
                 self.assertIn("the benchmark report is incomplete", stderr)
                 self.assertIn("some pairs are blocked", stderr)
 
+    def test_run_level_causes_are_findings_even_on_an_incomplete_benchmark(self):
+        # An effort-mismatched pair or a wrong-model run is itself what makes
+        # the benchmark partial, so the finding naming it must not wait for a
+        # complete benchmark: it is raised beside benchmark-incomplete, and
+        # mark 5 reads concern rather than unavailable.
+        def metadata(effort="high", served="match"):
+            return {"effort": {"requested": effort, "applied_by": "claude --effort"},
+                    "requested_model": "m", "served_model": "m" if served == "match" else "other",
+                    "served_model_check": served}
+        rows = (
+            ("arm-conditions-differ", metadata(effort="low"), {"effort_mismatch": 1}),
+            ("served-model-mismatch", metadata(served="mismatch"), None),
+        )
+        for kind, without_metadata, evidence in rows:
+            with self.subTest(kind), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), [case("a"), case("b", kind="adversarial")])
+                write_run(fx.runs / "a" / "with_skill", "alpha", metadata=metadata())
+                write_run(fx.runs / "a" / "without_skill", "none", metadata=without_metadata)
+                write_run(fx.runs / "b" / "with_skill", "alpha", metadata=metadata())
+                write_run(fx.runs / "b" / "without_skill", "none", metadata=metadata())
+                attest_answer_design(fx.path, fx.runs)
+                code, stderr = fx.cli("--fail-on", kind)
+                audit = json.loads((fx.path.parent / "audit.json").read_text(encoding="utf-8"))
+                self.assertEqual(audit["benchmark_availability"], "partial")
+                found = [item for item in audit["findings"] if item["kind"] == kind]
+                self.assertEqual(len(found), 1)
+                if evidence is not None:
+                    self.assertEqual(found[0]["evidence"], evidence)
+                self.assertEqual(code, 1)
+                self.assertIn(f"fail-on: {kind}: ", stderr)
+                isolation = marks(audit)["arms-differ-only-in-skill"]
+                self.assertEqual(isolation["status"], "concern")
+                self.assertIn(kind, isolation["finding_kinds"])
+
 class KnownAnswerTests(unittest.TestCase):
     def test_a_reference_answer_that_fails_its_own_checks_is_a_grader_finding(self):
         with tempfile.TemporaryDirectory() as td:
@@ -289,9 +323,11 @@ class RunMeasuredFindingTests(unittest.TestCase):
                             "pairing": {"blocked_reason_counts": {
                                 "effort_mismatch": 2, "missing_without_skill": 1}}},
             run_endings={"served_model_mismatches": 1, "served_model_mixed": 2})
-        found = {item.kind: item for item in sb.run_measured_findings(report)}
+        measured = {item.kind for item in sb.run_measured_findings(report)}
+        found = {item.kind: item for item in sb.run_condition_findings(report)}
+        self.assertEqual(measured, {
+            FindingKind.SUITE_HEADROOM_EXHAUSTED, FindingKind.UNDERPOWERED_EVAL})
         self.assertEqual(set(found), {
-            FindingKind.SUITE_HEADROOM_EXHAUSTED, FindingKind.UNDERPOWERED_EVAL,
             FindingKind.ARM_CONDITIONS_DIFFER, FindingKind.SERVED_MODEL_MISMATCH,
             FindingKind.SERVED_MODEL_MIXED})
         self.assertEqual(found[FindingKind.ARM_CONDITIONS_DIFFER].evidence, {"effort_mismatch": 2})
