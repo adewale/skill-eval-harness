@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from helpers import attest_answer_design, make_eval_repo, result_row, write_run
+from helpers import attest_answer_design, make_eval_repo, result_row, run_cli, write_run
 
 import skill_benchmark as sb
 
@@ -543,13 +543,13 @@ class TelemetryMigrationTests(unittest.TestCase):
                         "cost_usd": 0.0, "elapsed_ms": 0}
             (base / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
             report_path = Path(td) / "migration.json"
-            check = SimpleNamespace(runs=str(runs), check=True, out=str(report_path))
-            self.assertEqual(sb.migrate_telemetry_command(check), 0)
+            check = ("migrate-telemetry", "--runs", runs, "--check", "--out", report_path)
+            self.assertEqual(run_cli(*check), (0, "", ""))
             self.assertEqual(json.loads(report_path.read_text(encoding="utf-8"))["changed"], 1)
             self.assertEqual(json.loads((base / "metadata.json").read_text(encoding="utf-8")), metadata)
 
-            write = SimpleNamespace(runs=str(runs), check=False, out=str(report_path))
-            self.assertEqual(sb.migrate_telemetry_command(write), 0)
+            write = ("migrate-telemetry", "--runs", runs, "--out", report_path)
+            self.assertEqual(run_cli(*write), (0, "", ""))
             migrated_meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
             migrated_metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
             self.assertEqual(migrated_meta["telemetry_schema_version"], 3)
@@ -557,7 +557,7 @@ class TelemetryMigrationTests(unittest.TestCase):
             self.assertEqual(migrated_meta["telemetry"]["measurements"]["total_tokens"]["availability"], "available")
             self.assertEqual(migrated_meta["telemetry"]["measurements"]["total_tokens"]["value"], 0)
             self.assertEqual(migrated_meta["telemetry"]["measurements"]["cost"]["provenance"], "legacy_unverified")
-            self.assertEqual(sb.migrate_telemetry_command(write), 0)
+            self.assertEqual(run_cli(*write), (0, "", ""))
 
             v2 = runs / "c2" / "with_skill"
             v2.mkdir(parents=True)
@@ -565,7 +565,7 @@ class TelemetryMigrationTests(unittest.TestCase):
                 "provider": "test-provider", "model": "test-model",
                 "cost_normalized": {"currency": "USD", "total_cost": 0.25, "source": "provider_reported"},
             }), encoding="utf-8")
-            self.assertEqual(sb.migrate_telemetry_command(write), 0)
+            self.assertEqual(run_cli(*write), (0, "", ""))
             v2_metrics = json.loads((v2 / "metrics.json").read_text(encoding="utf-8"))
             self.assertEqual(v2_metrics["telemetry"]["measurements"]["cost"]["provenance"], "legacy_unverified")
 
@@ -586,7 +586,7 @@ class TelemetryMigrationTests(unittest.TestCase):
 
             with mock.patch.object(sb.os, "replace", side_effect=fail_second_backup):
                 with self.assertRaises(OSError):
-                    sb.migrate_telemetry_command(SimpleNamespace(runs=str(runs), check=False, out=str(Path(td) / "report.json")))
+                    run_cli("migrate-telemetry", "--runs", runs, "--out", Path(td) / "report.json")
             for name in ("metadata.json", "metrics.json"):
                 self.assertEqual(json.loads((base / name).read_text(encoding="utf-8")), original)
 

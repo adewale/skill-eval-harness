@@ -650,3 +650,32 @@ def write_with_skill_task(root: Path, **repo: Any) -> tuple[Path, Path, str]:
     tasks = root / "tasks.jsonl"
     tasks.write_text(json.dumps(row) + "\n", encoding="utf-8")
     return manifest, tasks, row["run_dir"]
+
+
+# --------------------------------------------------------------------------- #
+# lane D: the command line a user reaches
+# --------------------------------------------------------------------------- #
+
+
+def run_cli(*argv: str | Path) -> tuple[int, str, str]:
+    """Run `skill-benchmark ARGV` in process through the real parser, the
+    CLIInvocation validation edge, and main()'s dispatch table: the path a user
+    reaches, unlike calling a handler with a hand-built namespace. Returns
+    (exit code, stdout, stderr); a SystemExit from a parser error, die(), or a
+    refused gate becomes the exit code."""
+    import contextlib
+    import io
+    from unittest import mock
+
+    import skill_benchmark as sb
+
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with mock.patch.object(sys, "argv", ["skill-benchmark", *map(str, argv)]), \
+            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            code = sb.main()
+        except SystemExit as exc:
+            if isinstance(exc.code, str):
+                print(exc.code, file=stderr)
+            code = exc.code if isinstance(exc.code, int) else int(exc.code is not None)
+    return code, stdout.getvalue(), stderr.getvalue()

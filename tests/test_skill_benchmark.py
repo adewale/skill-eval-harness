@@ -13,6 +13,7 @@ from helpers import (
     attest_answer_design,
     demo_manifest,
     load_example_module,
+    run_cli,
     write_demo_manifest,
     write_run,
 )
@@ -677,7 +678,7 @@ class SkillBenchmarkTests(unittest.TestCase):
                     "input_tokens": 80, "output_tokens": 20}},
             ]
             trace.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-            sb.import_trace(SimpleNamespace(source="codex", trace=str(trace), run_dir=str(run_dir), out_events=None, out_metrics=None, write_metadata=False))
+            self.assertEqual(run_cli("import-trace", "--source", "codex", "--trace", trace, "--run-dir", run_dir)[0], 0)
             self.assertTrue((run_dir / "metadata.json").is_file())
             events = json.loads((run_dir / "events.json").read_text(encoding="utf-8"))
             metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
@@ -710,9 +711,7 @@ class SkillBenchmarkTests(unittest.TestCase):
             trace = root / "trace.jsonl"
             trace.write_text('{"type":"event","status":"completed"}\n',
                              encoding="utf-8")
-            sb.import_trace(SimpleNamespace(
-                source="generic", trace=str(trace), run_dir=str(run),
-                out_events=None, out_metrics=None))
+            self.assertEqual(run_cli("import-trace", "--trace", trace, "--run-dir", run)[0], 0)
             metrics = json.loads(
                 (run / "metrics.json").read_text(encoding="utf-8"))
             self.assertTrue(metrics["process_observation_complete"])
@@ -721,9 +720,7 @@ class SkillBenchmarkTests(unittest.TestCase):
             invalid_trace = root / "invalid.jsonl"
             invalid_trace.write_bytes(
                 b'{"type":"message","content":"\xff"}\n')
-            sb.import_trace(SimpleNamespace(
-                source="generic", trace=str(invalid_trace),
-                run_dir=str(invalid_run), out_events=None, out_metrics=None))
+            self.assertEqual(run_cli("import-trace", "--trace", invalid_trace, "--run-dir", invalid_run)[0], 0)
             invalid_metrics = json.loads(
                 (invalid_run / "metrics.json").read_text(encoding="utf-8"))
             self.assertFalse(invalid_metrics["trace_observation_complete"])

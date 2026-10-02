@@ -2,14 +2,13 @@
 
 Each test drives the real report builders from run files on disk, so a flag or
 finding renamed at its producer breaks the consumer test that reads it."""
-import argparse
 import contextlib
 import io
 import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import attest_answer_design, demo_manifest, write_demo_manifest
+from helpers import attest_answer_design, demo_manifest, run_cli, write_demo_manifest
 
 import skill_benchmark as sb
 from findings import CaseFlag, FindingKind
@@ -42,21 +41,12 @@ class Fixture:
             self.path, runs=str(self.runs) if self.runs.exists() else None, **options)
 
     def cli(self, *flags):
-        args = argparse.Namespace(
-            manifest=str(self.path), skill_path=None,
-            runs=str(self.runs) if self.runs.exists() else None, split=None,
-            format="json", out=str(self.path.parent / "audit.json"), min_positive=0,
-            min_negative=0, min_adversarial=0, min_trigger_pos=0, min_trigger_neg=0,
-            leakage_min_chars=4, fail_on_blockers="--fail-on-blockers" in flags,
-            strict_judge=False, expensive_case_usd=1.0, min_lift=None,
-            fail_on=[flag.split("=", 1)[1] for flag in flags if flag.startswith("--fail-on=")] or None)
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            try:
-                code = sb.audit_manifest(args)
-            except SystemExit as exc:
-                code = exc.code
-        return code, stderr.getvalue()
+        runs = ("--runs", self.runs) if self.runs.exists() else ()
+        code, _, stderr = run_cli(
+            "audit-manifest", self.path, *runs, "--out", self.path.parent / "audit.json",
+            "--min-positive", "0", "--min-negative", "0", "--min-adversarial", "0",
+            "--min-trigger-pos", "0", "--min-trigger-neg", "0", *flags)
+        return code, stderr
 
 
 def kinds(report):
