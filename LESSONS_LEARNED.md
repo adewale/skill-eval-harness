@@ -762,3 +762,51 @@ replaced, and why "stronger models score higher" became a per-arm diagnostic, is
   no longer seeds from it, and a floor case is not counted as a regression guard holding.
 - Keep human verdicts in one store: the `feedback.json` that `render-viewer --serve` writes feeds
   `judge-alignment --labels` and `error-analysis --feedback` directly.
+
+## 2026-10-02 — Coverage is shown by breaking the code, not by reading the tests
+
+**Problem:** A second test audit asked whether the suite would notice if a central production
+behaviour broke, and answered it by breaking things in scratch copies:
+
+- 6 of 45 faults seeded into central behaviours failed no test at all. They included
+  `audit-manifest --fail-on blockers` ignoring readiness blockers on a complete benchmark, a judge
+  with no verdict publishing the lift, Codex `--effort` never reaching the CLI, and a weakened
+  Jetty upload check.
+- Two production guards could be deleted with the suite green. Ablation provenance verification
+  was tested with one run per arm, which can never confirm, so "not confirmed" held regardless of
+  provenance. The trigger-report design-agreement check had a negative control that died earlier
+  on an unrelated guard.
+- Removing `--fail-on-contamination` from the parser left the suite green. Command tests built
+  their argument namespaces by hand, and the commands read flags with `getattr` defaults.
+- The gates had gaps:
+  - a test docstring cited a collection-parity script that existed only on another branch;
+  - renaming a `RUN_*` variable silently skipped its live smoke;
+  - `|| true` on a CI step would have passed every guard;
+  - CI never installed the built wheel;
+  - the release workflow uploaded a wheel without running a test.
+- A wire format was a belief, not an observation. Offline fixtures put Claude's `result` event
+  last; a real Claude Code 2.1.269 run (#85) appends a `system` record, so every real run would
+  have parsed as an empty answer with its stop class unreadable.
+- An upgrade note said `trigger-compare` still read old Pi reports. A report produced on `main`
+  showed it refused them: the identity's module set had changed without a version bump.
+
+**Lesson:** A test proves only what would make it fail. A negative control proves the guard
+whose message it asserts, not the command that exits. A command test proves the wiring only if
+it goes through the parser. A parser test proves the wire format only if it reads recorded real
+output. A gate proves nothing until a planted violation turns it red, and a compatibility claim
+proves nothing until an old artifact is read.
+
+**Rule:**
+- Before calling a behaviour covered, seed one realistic fault in it, in a scratch copy, and record
+  which test fails and why. An import error or a doc line-reference shift is not a detection.
+- Assert the message of the guard a negative control names (`assert_dies`), not a bare `SystemExit`.
+- Drive commands through `run_cli`. `tests/test_cli_contracts.py` fails when a command reads a flag
+  its parser lacks or defines one no handler reads.
+- Test provider parsers against recorded real output (`tests/fixtures/claude/`). When a real run
+  disagrees with a hand-built fixture, the recorded sample wins and becomes a fixture.
+- Give every gate a test with a planted violation. `tests/test_gate_integrity.py` rejects a CI step
+  that cannot fail and requires every skip to be a ledgered live smoke or platform gate. A release
+  runs the same suite as a pull request and checks the exact wheel it uploads.
+- A guard cited by name must exist on this branch and run in CI; a guard on another branch is a plan.
+- Bump an identity version whenever its inventory changes, and test any "still reads" claim in an
+  upgrade note against an artifact the previous release produced.
