@@ -17021,10 +17021,13 @@ def build_benchmark_report(
         n_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ns_rows)
         flags = []
         extreme = ceiling_or_floor(w_rate, n_rate)
-        if extreme is DiscriminationFailure.FLOOR:
-            # Both arms fail every scored run. That is more often a broken case
-            # or assertion than a hard task, so it is flagged apart from the
-            # ceiling and never offered to suggest-cases for hardening.
+        combined_means = combined_arm_means(pairing.pairs)
+        if (combined_means is not None
+                and ceiling_or_floor(*combined_means) is DiscriminationFailure.FLOOR):
+            # Both arms fail every scored run, judges included. That is more
+            # often a broken case or assertion than a hard task, so it is
+            # flagged apart from the ceiling and never offered to
+            # suggest-cases for hardening.
             flags.append(CaseFlag.FLOOR.render())
         if extreme is DiscriminationFailure.CEILING:
             flags.append(CaseFlag.SATURATED.render())
@@ -19589,6 +19592,32 @@ def fixture_recommendations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 POSITIVE_OBJECTIVE_TYPES = {"contains", "contains_any", "contains_all", "regex"}
 
 
+def combined_signal(row: Mapping[str, Any]) -> float | None:
+    """A run's combined score, the rate the floor and readiness rules read.
+    Soft judges live in graded_score, not combined, so a case with no gate
+    judge blends the two; the signal rides whichever channel the judge fed."""
+    value = row.get("combined_pass_rate")
+    if value is None or (row.get("combined_total") == row.get("objective_total")
+                         and isinstance(row.get("graded_score"), (int, float))):
+        blended = [x for x in (value, row.get("graded_score")) if isinstance(x, (int, float))]
+        value = statistics.mean(blended) if blended else row.get("objective_pass_rate")
+    return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
+
+
+def combined_arm_means(pairs: Iterable[_ResultPair]) -> tuple[float, float] | None:
+    """Mean combined score per arm over the pairs where both arms have one.
+    A case is at the floor when both means are 0 (`ceiling_or_floor`), the
+    one rule behind the floor case flag and readiness's floor_cases."""
+    combined = [(combined_signal(pair.with_skill.payload), combined_signal(pair.without_skill.payload))
+                for pair in pairs]
+    present = [(left, right) for left, right in combined if left is not None and right is not None]
+    if not present:
+        return None
+    return (statistics.mean(left for left, _ in present),
+            statistics.mean(right for _, right in present))
+
+
 def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9) -> dict[str, Any]:
     """From a benchmark report's per-case scorable results, surface the cases a
     static manifest audit CANNOT see — the ones where the *measured* numbers say
@@ -19613,31 +19642,16 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
         rows, population=pair_domain.ExperimentalPopulation.ANSWER,
         eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
     )
-
-    def combined_value(row: Mapping[str, Any]) -> float | None:
-        value = row.get("combined_pass_rate")
-        # Soft judges live in graded_score, not combined; the qualitative signal
-        # this function looks for rides whichever channel the judge fed.
-        if value is None or (row.get("combined_total") == row.get("objective_total")
-                             and isinstance(row.get("graded_score"), (int, float))):
-            blended = [x for x in (value, row.get("graded_score")) if isinstance(x, (int, float))]
-            value = statistics.mean(blended) if blended else row.get("objective_pass_rate")
-        return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
-                and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
-
     by_case: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in pairing.pairs:
         by_case[pair.key.case_id].append(pair)
     base_saturated, base_saturated_expected, qualitative_only, floor = [], [], [], []
     for cid, pairs in by_case.items():
-        combined = [(combined_value(pair.with_skill.payload), combined_value(pair.without_skill.payload))
-                    for pair in pairs]
-        combined = [(left, right) for left, right in combined if left is not None and right is not None]
-        if not combined:
+        means = combined_arm_means(pairs)
+        if means is None:
             continue
-        cw = statistics.mean(left for left, _ in combined)
-        cn = statistics.mean(right for _, right in combined)
-        if cw <= eps and cn <= eps:
+        cw, cn = means
+        if ceiling_or_floor(cw, cn, eps=eps) is DiscriminationFailure.FLOOR:
             floor.append(cid)
             continue
         if abs(cw - cn) <= eps:

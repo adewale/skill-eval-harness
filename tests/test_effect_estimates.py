@@ -283,6 +283,35 @@ class FloorEndToEndTests(unittest.TestCase):
         self.assertNotIn("no-lift-eval", kinds)
         self.assertIn("noise_check", report["paired_summary"])
 
+    def test_a_gate_judge_that_passes_in_one_arm_keeps_the_case_off_the_floor(self):
+        # The contains check fails in both arms, but the gate judge passes the
+        # with-skill answer: combined 0.5 against 0. The flag, the audit and
+        # readiness decide the floor on one rule, so none of them calls this
+        # case a floor, and readiness keeps it as qualitative-only.
+        manifest = demo_manifest()
+        manifest["cases"][0]["assertions"].append(
+            {"name": "quality", "type": "judge", "severity": "gate",
+             "rubric": ["Names the third Greek letter"]})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_demo_manifest(root, manifest)
+            runs = root / "runs"
+            write_run(runs / "case-1" / "with_skill", "gamma")
+            write_run(runs / "case-1" / "without_skill", "none")
+            attest_answer_design(path, runs)
+            verdicts = judge_with_stub(path, runs, root / "verdicts.jsonl", passes_on="gamma")
+            report = sb.build_benchmark_report(path, runs, judge_results_path=str(verdicts))
+            audit = sb.audit_manifest_report(path, runs=str(runs),
+                                             judge_results_path=str(verdicts))
+        self.assertEqual([(row["variant"], row["objective_pass_rate"], row["combined_pass_rate"])
+                          for row in report["results"]],
+                         [("with_skill", 0.0, 0.5), ("without_skill", 0.0, 0.0)])
+        flags = report["case_flags"][0]["flags"]
+        self.assertNotIn(CaseFlag.FLOOR.value, flags)
+        self.assertNotIn("floor-eval", {finding["kind"] for finding in audit["findings"]})
+        self.assertEqual(audit["readiness"]["floor_cases"], [])
+        self.assertEqual(audit["readiness"]["qualitative_only_cases"], ["case-1"])
+
 
 class EstimateTests(unittest.TestCase):
     def test_test_interval_and_noise_come_from_one_set_of_deltas(self):

@@ -103,7 +103,9 @@ that file still invalidates trigger identity until those owners are extracted in
   `grading_evidence_incomplete`, which also moves `graded` to `observed_graded`).
   `benchmark --min-lift` adds `min_lift` to the noise check.
 - A case whose arms both score 0 on every scored pair gains the `floor: fails in both arms` flag
-  beside `no objective lift`. `saturated/non-discriminating` still marks only the ceiling.
+  beside `no objective lift`. The score is the combined one readiness reads, so a judge that
+  passes one arm keeps the case off the floor. `saturated/non-discriminating` still marks only
+  the ceiling.
 - `audit-manifest --runs` reports such a case as `floor-eval` instead of `no-lift-eval`, now
   including regression-intent cases, and `suggest-cases` no longer seeds it.
 - Readiness moves a case whose combined score is 0 in both arms out of `base_saturated_cases` into
