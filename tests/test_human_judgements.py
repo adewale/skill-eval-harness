@@ -134,6 +134,34 @@ class SingleStoreTests(unittest.TestCase):
         self.assertEqual(queue[0]["human_verdict"], "fail")
         self.assertEqual(queue[0]["run_number"], 1)
 
+    def test_labels_for_one_run_on_two_models_both_reach_alignment(self):
+        # A multi-model eval runs each case once per model, and each model's
+        # judge task carries its own model segment. A label that lost its model
+        # would replace the other model's label on save and match neither task.
+        models = ("claude-haiku-4-5", "claude-sonnet-5-5")
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            for model, verdict in zip(models, ("pass", "fail")):
+                sb.persist_feedback(ws, {"case_id": "c", "variant": "with_skill", "run_number": 1,
+                                         "model": model, "assertion": "quality", "verdict": verdict})
+            judge_rows = [
+                {"judge_task_id": sb.judge_task_id("c", "with_skill", 1, {"name": "quality"}, model),
+                 "passed": True, "returncode": 0, "judge_observation_complete": True,
+                 "availability": "complete", "judge_input_sha256": "sha256:" + "f" * 64,
+                 "judge_prompt_sha256": "a" * 64, "judge_evidence_mode": "text-only"}
+                for model in models
+            ]
+            judge_path = ws / "judge.jsonl"
+            judge_path.write_text("".join(json.dumps(row) + "\n" for row in judge_rows))
+            out = ws / "alignment.json"
+            code, _, stderr = run_cli("judge-alignment", "--labels", ws / "feedback.json",
+                                      "--judge-results", judge_path, "--min-labels", "1", "--out", out)
+            self.assertEqual(code, 0, stderr)
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(report["n"], 2)
+        # The judge passed both runs; the human passed the haiku run only.
+        self.assertEqual(report["confusion"], {"tp": 1, "fp": 1, "fn": 0, "tn": 0})
+
 
 if __name__ == "__main__":
     unittest.main()

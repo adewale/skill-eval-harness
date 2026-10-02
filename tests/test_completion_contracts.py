@@ -20,7 +20,6 @@ from helpers import (
 )
 
 import completion_contracts as cc
-import experimental_pairs as pairs
 import skill_benchmark as sb
 from ablation_model import execution_valid
 
@@ -35,6 +34,8 @@ class StopClassificationTests(unittest.TestCase):
             "end_turn": cc.StopClass.COMPLETED,
             "stop_sequence": cc.StopClass.COMPLETED,
             "max_tokens": cc.StopClass.TRUNCATED,
+            # The answer ran out of context window: cut off, like max_tokens.
+            "model_context_window_exceeded": cc.StopClass.TRUNCATED,
             "refusal": cc.StopClass.REFUSED,
             "pause_turn": cc.StopClass.OTHER,
         }
@@ -161,35 +162,6 @@ class ScoringGateTests(unittest.TestCase):
         self.assertTrue(execution_valid(self.base(), "answer"))
 
 
-class EffortPairingTests(unittest.TestCase):
-    def rows(self, with_effort, without_effort):
-        def row(variant, effort):
-            out = {"case_id": "c", "variant": variant, "run_number": 1, "model": "m"}
-            if effort is not cc.BACKEND_DEFAULT and effort is not None:
-                out["effort"] = {"requested": effort}
-            elif effort is cc.BACKEND_DEFAULT:
-                out["effort"] = {"requested": None}
-            return out
-        return [row("with_skill", with_effort), row("without_skill", without_effort)]
-
-    def construct(self, rows):
-        return pairs.pairs_from_rows(rows, population=pairs.ExperimentalPopulation.ANSWER)
-
-    def test_different_effort_blocks_the_pair(self):
-        built = self.construct(self.rows("high", "low"))
-        self.assertEqual(built.pairs, ())
-        self.assertEqual(built.blocked[0].reason, "effort_mismatch")
-
-    def test_one_unrecorded_arm_blocks_the_pair(self):
-        built = self.construct(self.rows("high", None))
-        self.assertEqual(built.blocked[0].reason, "effort_unrecorded_on_one_arm")
-
-    def test_matching_or_legacy_rows_still_pair(self):
-        self.assertEqual(len(self.construct(self.rows("high", "high")).pairs), 1)
-        self.assertEqual(len(self.construct(self.rows(cc.BACKEND_DEFAULT, cc.BACKEND_DEFAULT)).pairs), 1)
-        self.assertEqual(len(self.construct(self.rows(None, None)).pairs), 1)
-
-
 class ClaudeRunnerCompletionTests(unittest.TestCase):
     def test_parser_reads_stop_reason_and_served_models(self):
         parsed = sb.parse_claude_cli_json(stream(claude_stream_records(
@@ -256,8 +228,21 @@ class ClaudeRunnerCompletionTests(unittest.TestCase):
         self.assertFalse(execution_valid(meta, "token-XYZ"))
 
     def test_backend_without_effort_control_refuses_before_running(self):
-        with tempfile.TemporaryDirectory() as t, self.assertRaises(SystemExit):
-            sb.run_agent_tasks([], Path(t), sb.registered_agent_backend("vibe"), effort="high")
+        # Vibe has no known effort control: a requested level must stop the
+        # suite before any spend, not run and record a level it never applied.
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            _, tasks, _ = write_with_skill_task(root)
+            fake, probe, runs = root / "fake_vibe.py", root / "invoked", root / "runs"
+            fake.write_text("import pathlib, sys\npathlib.Path(sys.argv[1]).touch()\n",
+                            encoding="utf-8")
+            code, _, stderr = run_cli(
+                "run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", runs,
+                "--vibe-cmd", f"{sys.executable} {fake} {probe}", "--effort", "high")
+            self.assertIn("vibe backend has no known effort control", stderr)
+            self.assertEqual(code, 1)
+            self.assertFalse(runs.exists())
+            self.assertFalse(probe.exists())
 
 
 # A protocol-valid `codex exec --json` turn that also records the argv it got.

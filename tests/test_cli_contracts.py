@@ -213,6 +213,15 @@ def _constant(function: Callable[..., Any], node: ast.expr) -> Any:
     return _UNKNOWN
 
 
+def assignment(node: ast.AST) -> tuple[list[ast.expr], ast.expr | None]:
+    """The targets and value of `x = v` or `x: T = v`; ([], None) for anything else."""
+    if isinstance(node, ast.Assign):
+        return node.targets, node.value
+    if isinstance(node, ast.AnnAssign) and node.value is not None:
+        return [node.target], node.value
+    return [], None
+
+
 def collect_namespace_reads(function: Callable[..., Any], names: set[str],
                             found: NamespaceReads | None = None) -> NamespaceReads:
     """Walk `function`, where `names` hold the parsed namespace: record
@@ -230,8 +239,9 @@ def collect_namespace_reads(function: Callable[..., Any], names: set[str],
     parents = {child: parent for parent in ast.walk(node) for child in ast.iter_child_nodes(parent)}
     aliases = set(names)
     for sub in ast.walk(node):
-        if (isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Name) and sub.value.id in aliases):
-            aliases.update(t.id for t in sub.targets if isinstance(t, ast.Name))
+        targets, value = assignment(sub)
+        if isinstance(value, ast.Name) and value.id in aliases:
+            aliases.update(t.id for t in targets if isinstance(t, ast.Name))
 
     def held(expr: ast.expr) -> bool:
         return isinstance(expr, ast.Name) and expr.id in aliases
@@ -241,11 +251,16 @@ def collect_namespace_reads(function: Callable[..., Any], names: set[str],
 
     followed: set[int] = set()
     for sub in ast.walk(node):
+        targets, value = assignment(sub)
         if isinstance(sub, ast.Attribute) and held(sub.value):
             found.read(sub.attr, site(sub))
             followed.add(id(sub.value))
-        elif isinstance(sub, ast.Assign) and held(sub.value):
-            followed.add(id(sub.value))
+        elif value is not None and held(value):
+            followed.add(id(value))
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    found.unresolved.append(f"{site(sub)}: namespace stored in "
+                                            f"{ast.unparse(target)}, which the walk cannot follow")
         elif isinstance(sub, ast.Call):
             passed = [arg for arg in [*sub.args, *(kw.value for kw in sub.keywords)] if held(arg)]
             if not passed:
@@ -369,9 +384,11 @@ def subcommand_parsers(parser: argparse.ArgumentParser) -> dict[str, argparse.Ar
 
 
 # The check's own known-good and known-bad inputs: one small parser, a handler
-# wired to it correctly, and one carrying a misspelled read two calls deep under
-# a renamed parameter, a getattr default that drifted from the parser, and a
-# flag nobody reads.
+# wired to it correctly (directly and through an annotated alias), one carrying
+# a misspelled read two calls deep under a renamed parameter, a getattr default
+# that drifted from the parser, and a flag nobody reads, and handlers that put
+# the namespace where the walk cannot follow it (a dict, a list slot, an object
+# attribute).
 def _planted_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("manifest")
@@ -398,6 +415,23 @@ def _miswired_helper(manifest, *, options):
 
 def _escaping_handler(args):
     return {"args": args}
+
+
+def _annotated_alias_handler(args):
+    ns: argparse.Namespace = args
+    return _wired_helper(ns.manifest, options=ns)
+
+
+def _subscript_store_handler(args):
+    holder = [None]
+    holder[0] = args
+    return getattr(holder[0], "undefined_flag", None)
+
+
+def _attribute_store_handler(args):
+    box = types.SimpleNamespace()
+    box.args = args
+    return box.args.undefined_flag
 
 
 class ArgumentWiringTests(unittest.TestCase):
@@ -429,8 +463,10 @@ class ArgumentWiringTests(unittest.TestCase):
                                     command=runner.__name__), [])
 
     def test_the_check_passes_a_wired_handler_and_names_each_planted_fault(self):
-        self.assertEqual(
-            wiring_findings(_planted_parser(), _wired_handler, {"args"}, command="planted"), [])
+        for handler in (_wired_handler, _annotated_alias_handler):
+            with self.subTest(handler=handler.__name__):
+                self.assertEqual(
+                    wiring_findings(_planted_parser(), handler, {"args"}, command="planted"), [])
         findings = wiring_findings(_planted_parser(), _miswired_handler, {"args"}, command="planted")
         self.assertEqual(len(findings), 3, findings)
         self.assertRegex(findings[0], r"^reads 'not_a_flag', which the parser does not define "
@@ -440,8 +476,17 @@ class ArgumentWiringTests(unittest.TestCase):
                                       r"parser defaults it to 4 \(.*_miswired_helper:\d+\)$")
 
     def test_the_check_fails_closed_when_the_namespace_escapes_the_walk(self):
-        findings = wiring_findings(_planted_parser(), _escaping_handler, {"args"}, command="planted")
-        self.assertRegex(findings[0], r"_escaping_handler:\d+: namespace escapes the walk$")
+        cases = {
+            _escaping_handler: r"_escaping_handler:\d+: namespace escapes the walk$",
+            _subscript_store_handler: (r"_subscript_store_handler:\d+: namespace stored in "
+                                       r"holder\[0\], which the walk cannot follow$"),
+            _attribute_store_handler: (r"_attribute_store_handler:\d+: namespace stored in "
+                                       r"box\.args, which the walk cannot follow$"),
+        }
+        for handler, expected in cases.items():
+            with self.subTest(handler=handler.__name__):
+                findings = wiring_findings(_planted_parser(), handler, {"args"}, command="planted")
+                self.assertRegex(findings[0], expected)
 
 
 if __name__ == "__main__":

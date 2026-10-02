@@ -14,11 +14,15 @@ from helpers import (
 
 import experimental_pairs as ep
 import skill_benchmark as sb
+from completion_contracts import BACKEND_DEFAULT
 
 
 def row(case, variant, *, effort=None, run=1):
+    """A result row; effort None predates recording, BACKEND_DEFAULT ran at the default."""
     out = {"case_id": case, "variant": variant, "run_number": run}
-    if effort is not None:
+    if effort == BACKEND_DEFAULT:
+        out["effort"] = {"requested": None}
+    elif effort is not None:
         out["effort"] = {"requested": effort}
     return out
 
@@ -33,6 +37,7 @@ class HeldFixedTests(unittest.TestCase):
             ("high", "high", None),
             ("high", "low", "effort_mismatch"),
             ("high", None, "effort_unrecorded_on_one_arm"),
+            (BACKEND_DEFAULT, BACKEND_DEFAULT, None),  # both ran at the backend default
             (None, None, None),  # both predate effort recording: still a pair
         ]
         for left, right, reason in cases:

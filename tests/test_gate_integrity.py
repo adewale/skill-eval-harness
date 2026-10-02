@@ -8,11 +8,15 @@ skip on an ordinary test; or a live smoke whose gate variable was renamed.
 These tests close those holes:
 
 * ``WorkflowGateTests`` parse the workflows and require every gate command to
-  run unconditionally, in the job that owns it, on every supported Python;
+  run unconditionally, in the job that owns it, on every supported Python, on
+  an unfiltered gated event, and in a shell that fails the step at the first
+  failing command;
 * ``CollectionParityCheckTests`` feed ``scripts/check_test_collection_parity.py``
   planted pytest-only and unittest-only tests;
-* ``SkipLedgerTests`` require every skip to be ledgered with its reason, and
-  each live smoke to run exactly when its documented variable is set.
+* ``SkipLedgerTests`` require every skip to be ledgered with its reason (a
+  runtime skip with the test that holds it and the one capability call its
+  ``try`` guards), and each live smoke to run exactly when its documented
+  variable is set and never to return early.
 
 Each rule has a teeth test: a planted violation it must report.
 """
@@ -83,8 +87,18 @@ REQUIRED_GATE_COMMANDS = {
 # the publish job gates every release.
 REQUIRED_TRIGGERS = {"ci.yml": "pull_request", "publish.yml": "release"}
 
+# Trigger filters that skip a workflow on changes they do not match: on the
+# gated event, any of them lets a pull request or release bypass the gates.
+TRIGGER_FILTERS = ("branches", "branches-ignore", "paths", "paths-ignore")
+
 # Shell spellings that turn a failing command into a passing step.
 FAILURE_SWALLOWERS = ("|| true", "|| :", "|| exit 0", "set +e", "--exit-zero")
+
+# GitHub runs the `bash` and `sh` keywords with -e, so the first failing command
+# fails the step; a custom template (`bash {0}`) must ask for -e itself. pwsh,
+# powershell and cmd report only the last command's exit code.
+ERREXIT_SHELLS = ("bash", "sh")
+LAST_STATUS_SHELLS = ("pwsh", "powershell", "cmd")
 
 
 def load_workflows() -> dict[str, dict]:
@@ -94,6 +108,30 @@ def load_workflows() -> dict[str, dict]:
 
 def run_lines(step: dict) -> list[str]:
     return [line.strip() for line in str(step.get("run", "")).splitlines() if line.strip()]
+
+
+def step_shell(workflow: dict, job: dict, step: dict, windows: bool) -> str:
+    """The shell a run step uses: its own, its job's or workflow's default, or the runner's."""
+    for scope in (step, ((job.get("defaults") or {}).get("run") or {}),
+                  ((workflow.get("defaults") or {}).get("run") or {})):
+        if scope.get("shell"):
+            return str(scope["shell"])
+    return "pwsh" if windows else "bash"
+
+
+def shell_violation(shell: str, lines: list[str]) -> str | None:
+    """Why a step's shell can let a failing command pass, if it can."""
+    words = shell.split()
+    program = words[0].rsplit("/", 1)[-1] if words else ""
+    if program in LAST_STATUS_SHELLS:
+        return (f"a multi-command {program} step hides every failure but the last"
+                if len(lines) > 1 else None)
+    if program not in ERREXIT_SHELLS:
+        return f"shell {shell!r} is not known to stop at a failing command"
+    flags = [word[1:] for word in words[1:] if word.startswith("-") and not word.startswith("--")]
+    if len(words) > 1 and not any("e" in flag for flag in flags) and "errexit" not in words:
+        return f"shell {shell!r} drops errexit, so a failing command does not fail the step"
+    return None
 
 
 def declared_python_versions(pyproject: str) -> tuple[str, set[str]]:
@@ -115,6 +153,12 @@ def workflow_violations(workflows: dict[str, dict], required: dict[str, dict[str
         trigger = REQUIRED_TRIGGERS.get(name)
         if name in required and trigger not in triggers:
             found.append(f"{name}: does not run on {trigger}")
+        elif name in required and isinstance(triggers, dict):
+            config = triggers.get(trigger)
+            for key in TRIGGER_FILTERS:
+                if isinstance(config, dict) and key in config:
+                    found.append(f"{name}: a {key!r} filter on {trigger} skips the gates "
+                                 "on changes it does not match")
         for job_id, job in jobs.items():
             where = f"{name} job {job_id}"
             if "continue-on-error" in job:
@@ -129,10 +173,9 @@ def workflow_violations(workflows: dict[str, dict], required: dict[str, dict[str
                     for swallower in FAILURE_SWALLOWERS:
                         if swallower in line:
                             found.append(f"{label}: {swallower!r} discards the exit status")
-                if windows and "shell" not in step and len(lines) > 1:
-                    # pwsh reports only the last command's exit code.
-                    found.append(f"{label}: a multi-command pwsh step hides "
-                                 "every failure but the last")
+                problem = shell_violation(step_shell(workflow, job, step, windows), lines) if lines else None
+                if problem:
+                    found.append(f"{label}: {problem}")
         for job_id, commands in required.get(name, {}).items():
             job = jobs.get(job_id)
             if job is None:
@@ -178,13 +221,45 @@ class WorkflowGateTests(unittest.TestCase):
         def remove_step(job, command):
             job["steps"].remove(step(job, command))
 
+        def rewrite(job, command, **fields):
+            step(job, command).update(fields)
+
         ty = "ty check --error-on-warning --output-format github"
         parity = "python scripts/check_test_collection_parity.py"
+        unit = "python -m unittest discover tests -v"
+        wheel = "python scripts/check_installed_wheel.py"
+        text = 'python -m unittest discover -s tests -p "test_text_contracts.py" -v'
         plants = {
-            "or-true": (lambda ci: append_to_run(ci["jobs"]["test"], "python -m unittest discover tests -v", " || true"),
+            "or-true": (lambda ci: append_to_run(ci["jobs"]["test"], unit, " || true"),
                         "'|| true' discards the exit status"),
+            "or-colon": (lambda ci: append_to_run(ci["jobs"]["test"], parity, " || :"),
+                         "'|| :' discards the exit status"),
+            "or-exit-0": (lambda ci: append_to_run(ci["jobs"]["test"], wheel, " || exit 0"),
+                          "'|| exit 0' discards the exit status"),
+            "set-plus-e": (lambda ci: rewrite(ci["jobs"]["test"], unit, run=f"set +e\n{unit}"),
+                           "'set +e' discards the exit status"),
             "exit-zero": (lambda ci: append_to_run(ci["jobs"]["test"], "ruff check .", " --exit-zero"),
-                          "gate command missing: ruff check ."),
+                          "'--exit-zero' discards the exit status"),
+            "branch-filter": (lambda ci: ci[True].update({"pull_request": {"branches": ["main"]}}),
+                              "a 'branches' filter on pull_request skips the gates"),
+            "paths-filter": (lambda ci: ci[True].update({"pull_request": {"paths": ["docs/**"]}}),
+                             "a 'paths' filter on pull_request skips the gates"),
+            "bash-without-errexit": (lambda ci: rewrite(ci["jobs"]["test"], unit, shell="bash {0}",
+                                                        run=f"{unit}\necho done"),
+                                     "'Run unit tests': shell 'bash {0}' drops errexit"),
+            "job-default-shell": (lambda ci: ci["jobs"]["test"].update(
+                                      {"defaults": {"run": {"shell": "bash -o pipefail {0}"}}}),
+                                  "'Run unit tests': shell 'bash -o pipefail {0}' drops errexit"),
+            "workflow-default-shell": (lambda ci: ci.update({"defaults": {"run": {"shell": "sh {0}"}}}),
+                                       "'Run unit tests': shell 'sh {0}' drops errexit"),
+            "unknown-shell": (lambda ci: rewrite(ci["jobs"]["test"], unit, shell="zsh {0}"),
+                              "shell 'zsh {0}' is not known to stop at a failing command"),
+            "explicit-pwsh-multiline": (lambda ci: rewrite(ci["jobs"]["windows-text-contracts"], text,
+                                                           shell="pwsh", run=f"{text}\necho done"),
+                                        "'Run text-contract tests': a multi-command pwsh step hides"),
+            "powershell-multiline": (lambda ci: rewrite(ci["jobs"]["test"], parity, shell="powershell",
+                                                        run=f"{parity}\necho done"),
+                                     "a multi-command powershell step hides every failure but the last"),
             "continue-on-error": (lambda ci: step(ci["jobs"]["test"], ty).update({"continue-on-error": True}),
                                   "continue-on-error lets the step fail green"),
             "if-false": (lambda ci: step(ci["jobs"]["windows-text-contracts"], ty).update({"if": False}),
@@ -205,6 +280,29 @@ class WorkflowGateTests(unittest.TestCase):
                 plant(workflows["ci.yml"])
                 violations = workflow_violations(workflows, REQUIRED_GATE_COMMANDS, self.pyproject)
                 self.assertTrue(any(expected in v for v in violations), violations)
+
+    def test_edits_that_keep_every_gate_able_to_fail_are_not_reported(self):
+        unit = "python -m unittest discover tests -v"
+
+        def rewrite(**fields):
+            return lambda ci: next(s for s in ci["jobs"]["test"]["steps"]
+                                   if unit in run_lines(s)).update(fields)
+
+        edits = {
+            "bash-keyword": rewrite(shell="bash", run=f"{unit}\necho done"),
+            "bash-errexit": rewrite(shell="bash -e {0}", run=f"{unit}\necho done"),
+            "bash-errexit-pipefail": rewrite(shell="bash --noprofile --norc -eo pipefail {0}",
+                                             run=f"{unit}\necho done"),
+            "single-command-pwsh": rewrite(shell="pwsh"),
+            "push-branch-filter": lambda ci: ci[True].update({"push": {"branches": ["main"]}}),
+            "timeout": rewrite(**{"timeout-minutes": 20}),
+        }
+        for label, edit in edits.items():
+            with self.subTest(edit=label):
+                workflows = copy.deepcopy(self.workflows)
+                edit(workflows["ci.yml"])
+                self.assertEqual(
+                    workflow_violations(workflows, REQUIRED_GATE_COMMANDS, self.pyproject), [])
 
 
 # --------------------------------------------------------------------------- #
@@ -291,10 +389,17 @@ PLATFORM_SKIPS = {
     "process-group cleanup requires POSIX": lambda: not hasattr(os, "killpg"),
 }
 
-# Runtime skips (skipTest / SkipTest / pytest.skip) per test file. Each must be
-# a capability probe that cannot hide a product failure: the two Jetty journal
-# skips fire only when the OS cannot create a symlink.
-RUNTIME_SKIP_SITES = {"test_jetty_attempt_journal.py": 2}
+# Runtime skips (skipTest / SkipTest / pytest.skip), keyed by the test that
+# holds them, with the one call the guarding ``try`` may make. Each skip must
+# sit in that try's ``except`` and the try body must be that call alone, so the
+# skip is a capability probe that cannot hide a product failure: the two Jetty
+# journal skips fire only when the OS cannot create a symlink.
+RUNTIME_SKIP_SITES = {
+    "test_jetty_attempt_journal.JettyAttemptJournalTests."
+    "test_journal_symlink_alias_uses_the_same_lock_identity": "symlink_to",
+    "test_jetty_attempt_journal.JettyAttemptJournalTests."
+    "test_lock_symlink_is_rejected_without_modifying_its_target": "symlink_to",
+}
 
 
 def iter_tests(suite):
@@ -378,37 +483,75 @@ def is_runtime_skip(node: ast.AST) -> bool:
     return False
 
 
-def runtime_skip_sites(source: str) -> list[tuple[str, int]]:
-    """(enclosing class or function, line) of each runtime skip."""
+def runtime_skip_sites(tree: ast.AST) -> list[tuple[str, int, list[ast.stmt] | None]]:
+    """(enclosing class or function, line, guard) of each runtime skip, where
+    guard is the body of the ``try`` whose ``except`` holds the skip, or None."""
     sites = []
 
-    def visit(node, owner):
+    def visit(node, owner, guard):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            owner, guard = (f"{owner}.{node.name}" if owner else node.name), None
+        if is_runtime_skip(node):
+            sites.append((owner, node.lineno, guard))
         for child in ast.iter_child_nodes(node):
-            name = owner
-            if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                name = f"{owner}.{child.name}" if owner else child.name
-            if is_runtime_skip(child):
-                sites.append((name, child.lineno))
-            visit(child, name)
+            in_handler = isinstance(node, ast.Try) and any(child is h for h in node.handlers)
+            visit(child, owner, node.body if in_handler else guard)
 
-    visit(ast.parse(source), "")
+    visit(tree, "", None)
     return sites
 
 
-def runtime_skip_violations(sources: dict[str, str], allowed: dict[str, int],
+def guards_only(guard: list[ast.stmt] | None, call: str) -> bool:
+    """Whether a ``try`` body is one ``something.call(...)`` statement."""
+    return (guard is not None and len(guard) == 1 and isinstance(guard[0], ast.Expr)
+            and isinstance(guard[0].value, ast.Call)
+            and isinstance(guard[0].value.func, ast.Attribute)
+            and guard[0].value.func.attr == call)
+
+
+def returns_in(function: ast.AST) -> list[int]:
+    """Lines of the ``return`` statements in a function's own body."""
+    lines = []
+    for child in ast.iter_child_nodes(function):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(child, ast.Return):
+            lines.append(child.lineno)
+        lines.extend(returns_in(child))
+    return lines
+
+
+def runtime_skip_violations(sources: dict[str, str], allowed: dict[str, str],
                             live: dict[str, str]) -> list[str]:
+    """Every runtime skip or early return that can turn a failing test into a pass."""
     found = []
     smoke_classes = {test_id.rsplit(".", 1)[0] for test_id in live}
+    seen = set()
     for filename, source in sorted(sources.items()):
-        sites = runtime_skip_sites(source)
         module = filename.removesuffix(".py")
-        for owner, line in sites:
-            if any(f"{module}.{owner}".startswith(cls) for cls in smoke_classes):
+        tree = ast.parse(source)
+        for owner, line, guard in runtime_skip_sites(tree):
+            test = f"{module}.{owner}"
+            seen.add(test)
+            if any(test.startswith(cls) for cls in smoke_classes):
                 found.append(f"{filename}:{line}: a live smoke skips at run time ({owner}); "
                              "once its variable is set it must fail, not skip")
-        if len(sites) != allowed.get(filename, 0):
-            found.append(f"{filename}: {len(sites)} runtime skip(s) {sites}, "
-                         f"ledger allows {allowed.get(filename, 0)}")
+            elif test not in allowed:
+                found.append(f"{filename}:{line}: unledgered runtime skip in {owner}")
+            elif not guards_only(guard, allowed[test]):
+                found.append(f"{filename}:{line}: the runtime skip in {owner} must sit in the "
+                             f"except of a try whose only statement calls .{allowed[test]}()")
+        methods = {f"{cls.name}.{fn.name}": fn for cls in tree.body if isinstance(cls, ast.ClassDef)
+                   for fn in cls.body if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for test_id in sorted(live):
+            owner = test_id.removeprefix(module + ".")
+            if test_id.startswith(module + ".") and owner in methods:
+                for line in returns_in(methods[owner]):
+                    found.append(f"{filename}:{line}: a live smoke returns early ({owner}); "
+                                 "once its variable is set it must fail, not pass")
+    for test in sorted(set(allowed) - seen):
+        if f"{test.split('.', 1)[0]}.py" in sources:
+            found.append(f"{test}: ledgered runtime skip no longer exists")
     return found
 
 
@@ -486,10 +629,63 @@ class SkipLedgerTests(unittest.TestCase):
             self.assertEqual(enablement_violations(Path(td), {smoke: "RUN_PLANTED_SMOKE"}), [])
             violations = runtime_skip_violations({"test_planted.py": path.read_text(encoding="utf-8")},
                                                  {}, {smoke: "RUN_PLANTED_SMOKE"})
-        self.assertEqual(len(violations), 2, violations)
-        self.assertIn("a live smoke skips at run time (PlantedSmokeTests.test_live)", violations[0])
-        self.assertIn("2 runtime skip(s)", violations[1])
-        self.assertIn("('OrdinaryTests.test_symlink', 22)", violations[1])
+        self.assertEqual(violations, [
+            ("test_planted.py:10: a live smoke skips at run time (PlantedSmokeTests.test_live); "
+             "once its variable is set it must fail, not skip"),
+            "test_planted.py:22: unledgered runtime skip in OrdinaryTests.test_symlink",
+        ])
+
+    PLANTED_RUNTIME = """
+        import shutil
+        import unittest
+
+        class PlantedSmokeTests(unittest.TestCase):
+            def test_live(self):
+                def installed():
+                    return shutil.which("planted-cli")
+                if not installed():
+                    return
+                self.assertTrue(installed())
+
+        class JournalTests(unittest.TestCase):
+            def test_capability_probe(self):
+                try:
+                    self.path.symlink_to(self.target)
+                except OSError as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
+                self.assertTrue(self.lock())
+
+            def test_skip_wraps_the_product_call(self):
+                self.path.symlink_to(self.target)
+                try:
+                    self.assertTrue(self.lock())
+                except AssertionError as exc:
+                    self.skipTest(f"lock rejection unavailable: {exc}")
+
+            def test_probe_and_product_call_share_the_try(self):
+                try:
+                    self.path.symlink_to(self.target)
+                    self.assertTrue(self.lock())
+                except (OSError, AssertionError) as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
+    """
+
+    def test_planted_runtime_skips_and_early_returns_are_reported(self):
+        journal = "test_planted.JournalTests."
+        allowed = {journal + name: "symlink_to" for name in (
+            "test_capability_probe", "test_skip_wraps_the_product_call",
+            "test_probe_and_product_call_share_the_try", "test_removed")}
+        violations = runtime_skip_violations(
+            {"test_planted.py": textwrap.dedent(self.PLANTED_RUNTIME)}, allowed,
+            {"test_planted.PlantedSmokeTests.test_live": "RUN_PLANTED_SMOKE"})
+        guard = "must sit in the except of a try whose only statement calls .symlink_to()"
+        self.assertEqual(violations, [
+            f"test_planted.py:26: the runtime skip in JournalTests.test_skip_wraps_the_product_call {guard}",
+            f"test_planted.py:33: the runtime skip in JournalTests.test_probe_and_product_call_share_the_try {guard}",
+            ("test_planted.py:10: a live smoke returns early (PlantedSmokeTests.test_live); "
+             "once its variable is set it must fail, not pass"),
+            "test_planted.JournalTests.test_removed: ledgered runtime skip no longer exists",
+        ])
 
 
 if __name__ == "__main__":
