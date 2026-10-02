@@ -87,7 +87,6 @@ SERVED_MODEL_CHECKS = (
     ("sonnet[1m]", "claude-sonnet-4-5-20250929", MATCH),
     ("claude-sonnet-4-5[1m]", "claude-sonnet-4-5-20250929", MATCH),
     ("claude-sonnet-4-0", "claude-sonnet-4-20250514", MATCH),
-    ("claude-3-5-haiku-latest", "claude-3-5-haiku-20241022", MATCH),
     ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "claude-sonnet-4-5-20250929", MATCH),
     ("claude-sonnet-4-5", "us.anthropic.claude-sonnet-4-5-20250929-v1:0", MATCH),
     ("claude-opus-4-1@20250805", "claude-opus-4-1-20250805", MATCH),
@@ -95,6 +94,14 @@ SERVED_MODEL_CHECKS = (
     ("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4",
      "claude-sonnet-4-5-20250929", UNVERIFIABLE),
     ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5", UNVERIFIABLE),
+    # A `-latest` alias names whichever snapshot the provider serves today, so
+    # the harness cannot tell whether a dated answer is the one it resolved to.
+    ("claude-3-5-haiku-latest", "claude-3-5-haiku-20241022", UNVERIFIABLE),
+    ("claude-3-7-sonnet-latest", "claude-3-7-sonnet-20250219", UNVERIFIABLE),
+    ("claude-3-opus-latest", "claude-3-opus-20240229", UNVERIFIABLE),
+    ("claude-3-5-haiku-latest", "claude-3-5-haiku", UNVERIFIABLE),
+    ("claude-3-5-haiku-20241022", "claude-3-5-haiku-latest", UNVERIFIABLE),
+    ("claude-3-5-haiku-latest", "claude-3-5-haiku-latest", MATCH),
     # A clear difference behind the same spellings still blocks scoring.
     ("haiku", "claude-sonnet-4-5-20250929", MISMATCH),
     ("sonnet[1m]", "claude-haiku-4-5-20251001", MISMATCH),
@@ -272,6 +279,38 @@ class ClaudeRunnerCompletionTests(unittest.TestCase):
             self.assertFalse(runs.exists())
             self.assertFalse(probe.exists())
 
+    def test_a_level_claude_does_not_accept_is_refused_before_any_run(self):
+        # `claude --help` of Claude Code 2.1.288 lists `--effort <level>` as
+        # (low, medium, high, xhigh, max); `minimal` is only Codex's word.
+        for command in (["run-claude"], ["run-agent", "--agent", "claude"]):
+            with self.subTest(command=command[0]), tempfile.TemporaryDirectory() as t:
+                root = Path(t)
+                _, tasks, _ = write_with_skill_task(root)
+                probe, runs = root / "argv.json", root / "runs"
+                stub = stub_claude_stream(root / "claude", probe_path=probe)
+                code, _, stderr = run_cli(*command, "--tasks", tasks, "--runs", runs,
+                                          "--claude-bin", stub, "--effort", "minimal")
+                self.assertIn(
+                    "claude --effort accepts low, medium, high, xhigh, max; got minimal", stderr)
+                self.assertEqual(code, 1)
+                self.assertFalse(runs.exists())
+                self.assertFalse(probe.exists())
+
+    def test_every_level_claude_accepts_reaches_its_cli(self):
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            with self.subTest(level=level), tempfile.TemporaryDirectory() as t:
+                root = Path(t)
+                _, tasks, run_dir = write_with_skill_task(root)
+                probe, runs = root / "argv.json", root / "runs"
+                stub = stub_claude_stream(root / "claude", probe_path=probe)
+                code, _, stderr = run_cli("run-claude", "--tasks", tasks, "--runs", runs,
+                                          "--claude-bin", stub, "--effort", level)
+                self.assertEqual(code, 0, stderr)
+                argv = json.loads(probe.read_text(encoding="utf-8"))
+                self.assertEqual(argv[argv.index("--effort") + 1], level)
+                self.assertEqual(sb.read_metrics_base(runs / run_dir)["effort"],
+                                 {"requested": level, "applied_by": "claude --effort"})
+
 
 # A protocol-valid `codex exec --json` turn that also records the argv it got.
 FAKE_CODEX = """import json, pathlib, sys
@@ -305,6 +344,29 @@ class CodexRunnerEffortTests(unittest.TestCase):
                 self.assertEqual(
                     [argv[i + 1] for i, item in enumerate(argv[:-1]) if item == "-c"], overrides)
                 self.assertEqual(meta["effort"], effort)
+
+    def test_every_harness_level_reaches_the_codex_cli(self):
+        # Codex parses model_reasoning_effort as none, minimal, low, medium,
+        # high, xhigh, max, ultra or persistent (rust-v0.160.0,
+        # codex-rs/protocol/src/openai_models.rs), and since 0.140 passes any
+        # other non-empty value to the model; which level a model honours is
+        # the model's call. So no harness level is refused for Codex.
+        for level in ("minimal", "low", "medium", "high", "xhigh", "max"):
+            with self.subTest(level=level), tempfile.TemporaryDirectory() as t:
+                root = Path(t)
+                _, tasks, run_dir = write_with_skill_task(root)
+                fake, probe, runs = root / "fake_codex.py", root / "argv.json", root / "runs"
+                fake.write_text(FAKE_CODEX, encoding="utf-8")
+                code, _, stderr = run_cli(
+                    "run-codex", "--tasks", str(tasks), "--runs", str(runs),
+                    "--codex-cmd", f"{sys.executable} {fake} {probe}", "--effort", level)
+                self.assertEqual(code, 0, stderr)
+                argv = json.loads(probe.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    [argv[i + 1] for i, item in enumerate(argv[:-1]) if item == "-c"],
+                    [f"model_reasoning_effort={level}"])
+                self.assertEqual(sb.read_metrics_base(runs / run_dir)["effort"],
+                                 {"requested": level, "applied_by": "codex -c model_reasoning_effort"})
 
 
 class RunEndingsReportTests(unittest.TestCase):

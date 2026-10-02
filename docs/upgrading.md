@@ -71,7 +71,14 @@ that file still invalidates trigger identity until those owners are extracted in
 - A pre-release build of `main` read a realistic alias as a served-model `mismatch`, so a run that
   requested `sonnet[1m]`, `claude-sonnet-4-0`, a `-latest` id, a Bedrock id such as
   `us.anthropic.claude-sonnet-4-5-20250929-v1:0`, or a Vertex `@date` id was unscorable. The check
-  is stored when the run is recorded, so re-run those runs; new runs read them as `match`.
+  is stored when the run is recorded, so re-run those runs; new runs read them as `match`, except
+  a `-latest` id, which reads `unverifiable` (scored): the harness cannot know which dated
+  snapshot the alias resolved to.
+- `run-subagent` records completion evidence. Its default Claude backend now runs
+  `claude -p --output-format stream-json --verbose` (it ran `--output-format json`), so a
+  `max_tokens` stop records `truncated` and is unscorable, as in `run-claude`. An `--agent-cmd`
+  reply may add `stop_class`, `stop_reason`, and `served_models`; a reply without them still runs
+  and records `unavailable`.
 - A run that reports several models credits none of them: `served_model` is `null`, and the check
   reads `mixed` (scored, counted in `run_endings.served_model_mixed`) when the requested model is
   among them, or `mismatch` (unscorable) when it is not. Claude subagent turns are not counted.
@@ -83,7 +90,7 @@ that file still invalidates trigger identity until those owners are extracted in
   smaller denominator as a skill change. A refusal is still graded.
 - A pair whose arms ran at different effort is blocked as `effort_mismatch`, and a pair where only
   one arm recorded effort as `effort_unrecorded_on_one_arm`. Re-run an old arm rather than pairing
-  it with a new one. The ablation confirmation and `token-overhead` block these pairs too. `run-agent --agent gemini|vibe --effort …` now exits before any run.
+  it with a new one. The ablation confirmation and `token-overhead` block these pairs too. `run-agent --agent gemini|vibe --effort …` now exits before any run, and so does a level the backend's CLI does not accept: `run-claude --effort minimal` names Claude's levels (`low`, `medium`, `high`, `xhigh`, `max`). Claude Code 2.1.288 only warns about `minimal` and runs at its default effort, so such a run recorded `requested: "minimal"` for an effort it never ran at; re-run it at a level Claude accepts.
 
 ### Human feedback
 

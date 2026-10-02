@@ -198,6 +198,8 @@ Vibe, `run-subagent`, and Jetty imports record `stop_class: "unobserved"`. The f
 table is in [`commands.md`](commands.md#effort-and-how-answer-runs-ended).
 *Update (2026-09-30): that value is now spelled `unavailable`; [`vocabulary.md`](vocabulary.md#run-artifacts)
 owns the current stop classes.*
+*Update (2026-10-02): `run-subagent` now records the stop its backend reports (Claude's stream-json
+fields by default, or an `--agent-cmd` reply's `stop_class`).*
 
 ## Manifest taxonomy additions
 
