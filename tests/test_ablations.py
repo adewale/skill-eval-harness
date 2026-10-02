@@ -7,6 +7,7 @@ subject; docstrings citing finding/roadmap ids are preserved.
 """
 import argparse
 import contextlib
+import functools
 import hashlib
 import io
 import json
@@ -18,6 +19,7 @@ from types import SimpleNamespace
 
 from helpers import (
     FakeJettyClient,
+    assert_dies,
     load_example_module,
     make_eval_repo,
 )
@@ -67,6 +69,9 @@ Revert the fix mentally and re-run.
 
 Pick a verdict. See [the severity guide](references/severity.md).
 """
+SEVERITY_GUIDE = "# Severity\n\nBlocking, Minor, Clean.\n"
+# The one case a materialization test needs: ablation tests grade nothing.
+ANY_CASE = {"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}
 
 
 FAKE_PI = '''#!/usr/bin/env python3
@@ -116,23 +121,9 @@ CORPUS_DIR = ROOT / "tests" / "corpus"
 
 class SkillAblationTests(unittest.TestCase):
     def build(self, root: Path, *, skill_paths=None, ablations=None) -> Path:
-        repo = root / "repo"
-        skill_dir = repo / "skills" / "good-pr"
-        (skill_dir / "references").mkdir(parents=True, exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(SKILL_FIXTURE, encoding="utf-8")
-        (skill_dir / "references" / "severity.md").write_text("# Severity\n\nBlocking, Minor, Clean.\n", encoding="utf-8")
-        (repo / "evals").mkdir(exist_ok=True)
-        manifest = {
-            "version": 1,
-            "skill_name": "good-pr",
-            "skill_paths": skill_paths or ["skills/good-pr/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [{"id": "c1", "split": "tune", "prompt": "Review.", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-            "ablations": ablations if ablations is not None else [],
-        }
-        path = repo / "evals" / "shared-benchmark.json"
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        return path
+        return make_eval_repo(root, skill_name="good-pr", skill_text=SKILL_FIXTURE, skill_paths=skill_paths,
+                              references={"references/severity.md": SEVERITY_GUIDE},
+                              cases=[ANY_CASE], ablations=ablations)
 
     def materialize_one(self, root: Path, ablation: dict, out_name="out") -> dict:
         path = self.build(root, ablations=[ablation])
@@ -200,7 +191,7 @@ class SkillAblationTests(unittest.TestCase):
             res = sb.materialize_ablation(sb.repo_root_for_manifest(path), manifest, ab, root / "out")
             self.assertNotIn("Revert the fix mentally", self.skill_text(res))
             # a '+'-bearing patch is a swap, not an ablation
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, r"deletion-only; '\+' lines indicate a swap"):
                 sb.patch_delete_ops(SKILL_FIXTURE, f"@@ -{n},1 +{n},1 @@\n-Revert the fix mentally and re-run.\n+Optionally revert.\n")
 
     def _patch_ablation(self, root: Path, patch_text: str, *, cls=None):
@@ -293,13 +284,11 @@ class SkillAblationTests(unittest.TestCase):
         # field and allowed it; structural ownership attributes them to description.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"; sd = repo / "skills" / "good-pr"; sd.mkdir(parents=True)
             skill = ("---\nname: good-pr\ndescription: >\n  first line of the description\n"
                      "  second line of the description\nallowed-tools: Read\n---\n\n# Body\n\nText.\n")
-            (sd / "SKILL.md").write_text(skill, encoding="utf-8")
-            (repo / "evals" / "ablations").mkdir(parents=True)
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-            p = repo / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="good-pr", skill_text=skill, cases=[ANY_CASE])
+            repo = p.parents[1]
+            (repo / "evals" / "ablations").mkdir()
             lines = skill.split("\n")
             n = lines.index("  first line of the description") + 1
             (repo / "evals" / "ablations" / "p.patch").write_text(
@@ -347,11 +336,11 @@ class SkillAblationTests(unittest.TestCase):
             manifest = sb.validate_manifest(path)
             repo_root = sb.repo_root_for_manifest(path)
             skill_dir = repo_root / "skills" / "good-pr"
-            with self.assertRaises(sb.AblationError):                 # equal to a skill root
+            with self.assertRaisesRegex(sb.AblationError, "is a source skill root"):                 # equal to a skill root
                 sb.materialize_ablation(repo_root, manifest, ab, skill_dir)
-            with self.assertRaises(sb.AblationError):                 # inside a skill root
+            with self.assertRaisesRegex(sb.AblationError, "is inside source skill root"):                 # inside a skill root
                 sb.materialize_ablation(repo_root, manifest, ab, skill_dir / "out")
-            with self.assertRaises(sb.AblationError):                 # contains a skill root
+            with self.assertRaisesRegex(sb.AblationError, "contains source skill root"):                 # contains a skill root
                 sb.materialize_ablation(repo_root, manifest, ab, repo_root)
             # a sibling output dir is fine
             res = sb.materialize_ablation(repo_root, manifest, ab, root / "safe-out")
@@ -370,8 +359,8 @@ class SkillAblationTests(unittest.TestCase):
             skill_dir = repo_root / "skills" / "good-pr"
             before = {p.relative_to(skill_dir).as_posix() for p in skill_dir.rglob("*")}
             bad_out = skill_dir / "_ablations"                 # inside a source skill root
-            with self.assertRaises(SystemExit):
-                sb.materialize_declared_ablations(repo_root, manifest, bad_out)
+            assert_dies(self, lambda: sb.materialize_declared_ablations(repo_root, manifest, bad_out),
+                        "is inside source skill root")
             self.assertFalse(bad_out.exists())                 # never created
             self.assertEqual({p.relative_to(skill_dir).as_posix() for p in skill_dir.rglob("*")}, before)
 
@@ -388,8 +377,8 @@ class SkillAblationTests(unittest.TestCase):
             (bad_out / sb._ABLATION_MARKER).write_text("owned\n", encoding="utf-8")
             sentinel = bad_out / "keep.txt"
             sentinel.write_text("precious", encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sb.materialize_ablations(argparse.Namespace(manifest=str(path), out_dir=str(bad_out), out=None))
+            assert_dies(self, lambda: sb.materialize_ablations(argparse.Namespace(manifest=str(path), out_dir=str(bad_out), out=None)),
+                        "is inside source skill root")
             self.assertTrue(sentinel.exists())                 # not cleared before reject
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "precious")
 
@@ -398,21 +387,16 @@ class SkillAblationTests(unittest.TestCase):
         # copying the ancestor would include an UNABLATED duplicate of the audit skill.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"
-            (repo / "skills" / "audit").mkdir(parents=True)
-            (repo / "SKILL.md").write_text("---\nname: top\ndescription: Top. Use for top.\n---\n\n# Top\n\n## A\n\nbody\n", encoding="utf-8")
-            (repo / "skills" / "audit" / "SKILL.md").write_text("---\nname: audit\ndescription: Audit. Use for audits.\n---\n\n# Audit\n\n## A\n\nx\n", encoding="utf-8")
-            (repo / "evals").mkdir()
-            m = {"version": 1, "skill_name": "top", "skill_paths": ["SKILL.md", "skills/audit/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-            p = repo / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="top", skill_paths=["SKILL.md", "skills/audit/SKILL.md"],
+                               skill_text="---\nname: top\ndescription: Top. Use for top.\n---\n\n# Top\n\n## A\n\nbody\n",
+                               cases=[ANY_CASE])
             manifest = sb.validate_manifest(p)
             repo_root = sb.repo_root_for_manifest(p)
             ab = {"id": "x", "removed_component": "audit-a", "mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/audit/SKILL.md", "heading": "## A"}}
             with self.assertRaises(sb.AblationError) as cm:
                 sb.materialize_ablation(repo_root, manifest, ab, root / "out")
             self.assertIn("ancestor", str(cm.exception))
-            with self.assertRaises(sb.AblationError):   # the canonical with_skill tree rejects too
+            with self.assertRaisesRegex(sb.AblationError, "is an ancestor of skill root"):   # the canonical with_skill tree rejects too
                 sb.build_canonical_skill_tree(repo_root, manifest, root / "wst")
 
     def test_multi_component_is_order_independent(self):
@@ -428,14 +412,14 @@ class SkillAblationTests(unittest.TestCase):
 
     def test_overlapping_components_refused(self):
         with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "components overlap"):
                 self.materialize_one(Path(td), {"id": "overlap", "removed_component": "x", "components": [
                     {"mechanism": "section", "class": "instructions", "target": {"heading": "## Review checklist"}},
                     {"mechanism": "list_item", "class": "instructions", "target": {"section": "## Review checklist", "contains": ["Naming"]}},
                 ]})
 
     def test_layer_cohesion_refuses_discovery_plus_answer(self):
-        with self.assertRaises(sb.AblationError):
+        with self.assertRaisesRegex(sb.AblationError, "layer cohesion"):
             sb.derived_population([
                 {"mechanism": "frontmatter_field", "target": {"field": "when_to_use"}},
                 {"mechanism": "section", "target": {"heading": "## x"}},
@@ -454,28 +438,28 @@ class SkillAblationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = self.build(root, ablations=[{"id": "x", "removed_component": "y"}])
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "declares no removal"):
                 sb.materialize_ablation(sb.repo_root_for_manifest(path), sb.validate_manifest(path), {"id": "x", "removed_component": "y"}, root / "out")
 
-    def test_validate_rejects_bad_and_duplicate_ids(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.build(root, ablations=[{"id": "Bad_ID", "removed_component": "x"}]))
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.build(root, ablations=[{"id": "dup", "removed_component": "x"}, {"id": "dup", "removed_component": "y"}]))
-
-    def test_validate_rejects_path_traversal_and_missing_skill_root(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.build(root, ablations=[{"id": "esc", "removed_component": "x", "mechanism": "reference", "target": {"path": "../../etc/passwd", "remove": "content"}}]))
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.build(root, skill_paths=["SKILL.md", "skills/audit/SKILL.md"], ablations=[{"id": "noroot", "removed_component": "x", "mechanism": "section", "target": {"heading": "## X"}}]))
+    def test_validate_rejects_malformed_ablation_declarations(self):
+        rejected = {
+            # label: (ablations, skill_paths, the validator's message)
+            "an id that is not a slug": (
+                [{"id": "Bad_ID", "removed_component": "x"}], None, "id must be a slug"),
+            "a repeated id": (
+                [{"id": "dup", "removed_component": "x"}, {"id": "dup", "removed_component": "y"}], None,
+                "ablation id 'dup' is not unique"),
+            "a path that escapes the skill": (
+                [{"id": "esc", "removed_component": "x", "mechanism": "reference", "target": {"path": "../../etc/passwd", "remove": "content"}}],
+                None, "unsafe path (absolute or traversal)"),
+            "a component with no skill_root among several": (
+                [{"id": "noroot", "removed_component": "x", "mechanism": "section", "target": {"heading": "## X"}}],
+                ["SKILL.md", "skills/audit/SKILL.md"], "component target missing skill_root"),
+        }
+        for label, (ablations, skill_paths, message) in rejected.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                path = self.build(Path(td), skill_paths=skill_paths, ablations=ablations)
+                assert_dies(self, functools.partial(sb.validate_manifest, path), message)
 
 
 class AblationRunnerIntegrationTests(unittest.TestCase):
@@ -484,24 +468,11 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
     SIM_ABL = {"id": "sim", "removed_component": "something"}
 
     def repo(self, root: Path, ablations: list) -> Path:
-        repo = root / "repo"
-        sd = repo / "skills" / "good-pr"
-        (sd / "references").mkdir(parents=True, exist_ok=True)
-        (sd / "SKILL.md").write_text(SKILL_FIXTURE, encoding="utf-8")
-        (sd / "references" / "severity.md").write_text("# Severity\n\nBlocking.\n", encoding="utf-8")
-        (repo / "evals").mkdir(exist_ok=True)
-        manifest = {
-            "version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
-            "variants": ["with_skill", "without_skill"],
-            "cases": [
-                {"id": "ans", "split": "tune", "kind": "behavior", "prompt": "Review.", "assertions": [{"name": "a", "type": "contains", "value": "x"}]},
-                {"id": "trig", "split": "tune", "kind": "trigger", "should_trigger": True, "prompt": "Trigger decision eval. User prompt: review my PR", "expected_behavior": ["should trigger"], "assertions": []},
-            ],
-            "ablations": ablations,
-        }
-        p = repo / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps(manifest), encoding="utf-8")
-        return p
+        return make_eval_repo(root, skill_name="good-pr", skill_text=SKILL_FIXTURE,
+                              references={"references/severity.md": SEVERITY_GUIDE}, ablations=ablations, cases=[
+            {"id": "ans", "split": "tune", "kind": "behavior", "prompt": "Review.", "assertions": [{"name": "a", "type": "contains", "value": "x"}]},
+            {"id": "trig", "split": "tune", "kind": "trigger", "should_trigger": True, "prompt": "Trigger decision eval. User prompt: review my PR", "expected_behavior": ["should trigger"], "assertions": []},
+        ])
 
     def test_pi_smoke_mounts_materialized_tree_not_original(self):
         with tempfile.TemporaryDirectory() as td:
@@ -767,8 +738,9 @@ class AblationRunnerIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             p = self.repo(root, [self.SECTION_ABL])
-            with self.assertRaises(SystemExit):  # must materialize, never label original skill materialized
-                sb.prepared_task_rows(p, sb.validate_manifest(p), include_ablations=True)
+            # must materialize, never label the original skill materialized
+            assert_dies(self, lambda: sb.prepared_task_rows(p, sb.validate_manifest(p), include_ablations=True),
+                        "materialized ablations require --ablation-dir")
 
     def test_prepare_ablation_dir_points_rows_at_altered_tree(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1390,7 +1362,7 @@ class AblationCoverageTests(unittest.TestCase):
             (Path(td) / "secret.txt").write_text("s", encoding="utf-8")
             link = base / "link"
             link.symlink_to(Path(td) / "secret.txt")
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "path escapes"):
                 sb._safe_under(base, link)   # resolves outside base
             (base / "ok.txt").write_text("x", encoding="utf-8")
             self.assertTrue(str(sb._safe_under(base, base / "ok.txt")).endswith("ok.txt"))
@@ -1398,15 +1370,9 @@ class AblationCoverageTests(unittest.TestCase):
     def test_preprocess_mechanism_removes_inline_command(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"
-            sd = repo / "skills" / "good-pr"
-            sd.mkdir(parents=True)
-            (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# PR\n\n## Gather\n\n!`git diff --stat`\n\nThen review.\n", encoding="utf-8")
-            (repo / "evals").mkdir()
             ablation = {"id": "no-pre", "removed_component": "diff preprocess", "mechanism": "preprocess", "class": "preprocess", "target": {"skill_root": "skills/good-pr/SKILL.md", "contains": ["git diff"]}}
-            manifest = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": [ablation]}
-            p = repo / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps(manifest), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="good-pr", cases=[ANY_CASE], ablations=[ablation],
+                               skill_text="---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# PR\n\n## Gather\n\n!`git diff --stat`\n\nThen review.\n")
             m = sb.validate_manifest(p)
             res = sb.materialize_ablation(sb.repo_root_for_manifest(p), m, ablation, root / "out")
             text = Path(res["skill_files"]["skills/good-pr/SKILL.md"]).read_text(encoding="utf-8")
@@ -1429,16 +1395,9 @@ class AblationCoverageTests(unittest.TestCase):
 
 class AblationSpecCompletenessTests(unittest.TestCase):
     def repo(self, root: Path, ablations: list) -> Path:
-        repo = root / "repo"
-        sd = repo / "skills" / "good-pr"
-        (sd / "references").mkdir(parents=True, exist_ok=True)
-        (sd / "SKILL.md").write_text(SKILL_FIXTURE, encoding="utf-8")
-        (sd / "references" / "severity.md").write_text("# sev\n", encoding="utf-8")
-        (repo / "evals").mkdir(exist_ok=True)
-        manifest = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "ans", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": ablations}
-        p = repo / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps(manifest), encoding="utf-8")
-        return p
+        return make_eval_repo(root, skill_name="good-pr", skill_text=SKILL_FIXTURE,
+                              references={"references/severity.md": SEVERITY_GUIDE},
+                              cases=[ANY_CASE], ablations=ablations)
 
     def test_invalid_skill_mode_allows_required_field_removal(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1567,19 +1526,9 @@ class AblationReviewFixesTests(unittest.TestCase):
             merged["skill_tree_hash"] = merged["ablation"]["parent_skill_hash"]
         return sb.PreparedTask.from_row(merged)
 
-    def manifest(self, root: Path, ablations: list, skill_paths=None, second_root=False) -> Path:
-        repo = root / "repo"
-        sd = repo / "skills" / "good-pr"
-        sd.mkdir(parents=True)
-        (sd / "SKILL.md").write_text(self.MIN_SKILL, encoding="utf-8")
-        if second_root:
-            (repo / "skills" / "audit").mkdir(parents=True)
-            (repo / "skills" / "audit" / "SKILL.md").write_text("---\nname: audit\ndescription: Audit. Use for audits.\n---\n\n# Audit\n", encoding="utf-8")
-        (repo / "evals").mkdir()
-        m = {"version": 1, "skill_name": "good-pr", "skill_paths": skill_paths or ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": ablations}
-        p = repo / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps(m), encoding="utf-8")
-        return p
+    def manifest(self, root: Path, ablations: list, skill_paths=None) -> Path:
+        return make_eval_repo(root, skill_name="good-pr", skill_text=self.MIN_SKILL,
+                              skill_paths=skill_paths, cases=[ANY_CASE], ablations=ablations)
 
     # --- #7 parsing ---
     def test_block_scalar_with_blank_line_removed_cleanly(self):
@@ -1622,7 +1571,7 @@ class AblationReviewFixesTests(unittest.TestCase):
             (src / "SKILL.md").write_text(self.MIN_SKILL, encoding="utf-8")
             (root / "secret.txt").write_text("secret", encoding="utf-8")
             (src / "link").symlink_to(root / "secret.txt")
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "symlink escaping the root"):
                 sb._copy_skill_root(src, root / "dst")
 
     def test_ensure_ablation_dir_refuses_nonempty_unowned(self):
@@ -1630,8 +1579,7 @@ class AblationReviewFixesTests(unittest.TestCase):
             d = Path(td) / "user-data"
             d.mkdir()
             (d / "important.txt").write_text("keep", encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sb._ensure_ablation_dir(d)
+            assert_dies(self, lambda: sb._ensure_ablation_dir(d), "is non-empty and not a harness-created ablation dir")
             self.assertTrue((d / "important.txt").exists())   # never deleted
 
     # --- #6 gate soundness ---
@@ -1643,8 +1591,8 @@ class AblationReviewFixesTests(unittest.TestCase):
 
     def test_validate_rejects_resource_targeting_skill_md(self):
         with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(SystemExit):
-                sb.validate_manifest(self.manifest(Path(td), [{"id": "x", "removed_component": "x", "mechanism": "asset", "class": "resource", "target": {"path": "SKILL.md"}}]))
+            path = self.manifest(Path(td), [{"id": "x", "removed_component": "x", "mechanism": "asset", "class": "resource", "target": {"path": "SKILL.md"}}])
+            assert_dies(self, lambda: sb.validate_manifest(path), "asset may not target the skill's SKILL.md")
 
     def test_two_components_deleting_same_file_refused(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1656,7 +1604,7 @@ class AblationReviewFixesTests(unittest.TestCase):
                 {"mechanism": "script", "class": "resource", "target": {"path": "scripts/x.py"}},
                 {"mechanism": "asset", "class": "resource", "target": {"path": "scripts/x.py"}},
             ]}
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "both delete x.py"):
                 sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
 
     # --- #3a all roots ---
@@ -1664,7 +1612,7 @@ class AblationReviewFixesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             ab = {"id": "a-only", "removed_component": "x", "mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/good-pr/SKILL.md", "heading": "## A"}}
-            p = self.manifest(root, [ab], skill_paths=["skills/good-pr/SKILL.md", "skills/audit/SKILL.md"], second_root=True)
+            p = self.manifest(root, [ab], skill_paths=["skills/good-pr/SKILL.md", "skills/audit/SKILL.md"])
             res = sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
             self.assertEqual(set(res["skill_files"]), {"skills/good-pr/SKILL.md", "skills/audit/SKILL.md"})  # B not dropped
             self.assertTrue(Path(res["skill_files"]["skills/audit/SKILL.md"]).exists())
@@ -1744,20 +1692,12 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
     )
 
     def repo(self, root: Path) -> Path:
-        sd = root / "repo" / "skills" / "good-pr"
-        (sd / "references").mkdir(parents=True)
-        (sd / "scripts").mkdir()
-        (sd / "assets").mkdir()
-        (sd / "SKILL.md").write_text(self.SKILL, encoding="utf-8")
-        (sd / "references" / "severity.md").write_text("# Severity\n\nBlocking, Minor, Clean.\n", encoding="utf-8")
-        (sd / "scripts" / "run.py").write_text("print('hi')\n", encoding="utf-8")
-        (sd / "assets" / "tmpl.txt").write_text("template\n", encoding="utf-8")
-        (sd / "NOTES.md").write_text("arbitrary extra file\n", encoding="utf-8")  # not in references/scripts/assets
-        (root / "repo" / "evals").mkdir()
-        m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-        p = root / "repo" / "evals" / "shared-benchmark.json"
-        p.write_text(json.dumps(m), encoding="utf-8")
-        return p
+        return make_eval_repo(root, skill_name="good-pr", skill_text=self.SKILL, cases=[ANY_CASE], references={
+            "references/severity.md": SEVERITY_GUIDE,
+            "scripts/run.py": "print('hi')\n",
+            "assets/tmpl.txt": "template\n",
+            "NOTES.md": "arbitrary extra file\n",   # not in references/scripts/assets
+        })
 
     def pair(self, root: Path, p: Path, ablation: dict, tag: str):
         manifest = sb.validate_manifest(p)
@@ -1973,13 +1913,8 @@ class AblationParserExactnessTests(unittest.TestCase):
     def test_crlf_is_preserved_through_materialization(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            sd = root / "repo" / "skills" / "good-pr"
-            sd.mkdir(parents=True)
-            (sd / "SKILL.md").write_bytes(SKILL_FIXTURE.replace("\n", "\r\n").encode("utf-8"))
-            (root / "repo" / "evals").mkdir()
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-            p = root / "repo" / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="good-pr", cases=[ANY_CASE])
+            (p.parents[1] / "skills" / "good-pr" / "SKILL.md").write_bytes(SKILL_FIXTURE.replace("\n", "\r\n").encode("utf-8"))
             manifest = sb.validate_manifest(p)
             ab = {"id": "x", "removed_component": "rp", "mechanism": "section", "class": "instructions", "target": {"heading": "## Regression-proof requirement"}}
             res = sb.materialize_ablation(sb.repo_root_for_manifest(p), manifest, ab, root / "out")
@@ -2035,13 +1970,7 @@ class SkillCorpusConformanceTests(unittest.TestCase):
         self.assertIsNotNone(heading, "real skill should have a level-2 heading to ablate")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            sd = root / "repo" / "skills" / "good-pr"
-            sd.mkdir(parents=True)
-            (sd / "SKILL.md").write_text(text, encoding="utf-8")
-            (root / "repo" / "evals").mkdir()
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-            p = root / "repo" / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="good-pr", skill_text=text, cases=[ANY_CASE])
             manifest = sb.validate_manifest(p)
             repo_root = sb.repo_root_for_manifest(p)
             with_dir = sb.build_canonical_skill_tree(repo_root, manifest, root / "w")
@@ -2062,16 +1991,11 @@ class P1_BomFrontmatterTests(unittest.TestCase):
 
     def test_bom_prefixed_skill_is_ablatable(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td); rp = root / "repo"; sd = rp / "skills" / "good-pr"; sd.mkdir(parents=True)
+            root = Path(td)
             body = "---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# G\n\n## Drop\n\ngone\n\n## Keep\n\nkeep\n"
-            (sd / "SKILL.md").write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))   # UTF-8 BOM prefix
-            (rp / "evals").mkdir()
             abl = {"id": "d", "removed_component": "drop", "mechanism": "section", "class": "instructions", "target": {"heading": "## Drop"}}
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
-                 "variants": ["with_skill", "without_skill"],
-                 "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-                 "ablations": [abl]}
-            p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="good-pr", skill_text="\ufeff" + body,   # UTF-8 BOM prefix
+                               cases=[ANY_CASE], ablations=[abl])
             manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
             arm = sb.materialize(sb.ValidatedAblation.validate(repo_root, manifest, abl), root / "abl")   # must not raise
             txt = Path(arm.skill_files["skills/good-pr/SKILL.md"]).read_text(encoding="utf-8-sig")
@@ -2085,20 +2009,14 @@ class P3_KeyCollisionTests(unittest.TestCase):
 
     def test_colliding_sanitized_roots_raise_ablation_error(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td); rp = root / "repo"
-            for name in ("skill+x", "skill_x"):   # both sanitize to skill_x_SKILL.md
-                d = rp / name; d.mkdir(parents=True)
-                (d / "SKILL.md").write_text("---\nname: s\ndescription: d. Use it.\n---\n\n# A\n\n## S\n\nx\n", encoding="utf-8")
-            (rp / "evals").mkdir()
+            root = Path(td)
             abl = {"id": "a", "removed_component": "s", "mechanism": "section", "class": "instructions",
                    "target": {"skill_root": "skill+x/SKILL.md", "heading": "## S"}}
-            m = {"version": 1, "skill_name": "s", "skill_paths": ["skill+x/SKILL.md", "skill_x/SKILL.md"],
-                 "variants": ["with_skill", "without_skill"],
-                 "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-                 "ablations": [abl]}
-            p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            p = make_eval_repo(root, skill_name="s", skill_paths=["skill+x/SKILL.md", "skill_x/SKILL.md"],   # both sanitize to skill_x_SKILL.md
+                               skill_text="---\nname: s\ndescription: d. Use it.\n---\n\n# A\n\n## S\n\nx\n",
+                               cases=[ANY_CASE], ablations=[abl])
             manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
-            with self.assertRaises(sb.AblationError):
+            with self.assertRaisesRegex(sb.AblationError, "both map to tree key"):
                 sb.ValidatedAblation.validate(repo_root, manifest, abl)
 
 
@@ -2122,16 +2040,12 @@ class R2_InstructionSimSurfaceTests(unittest.TestCase):
 
     def test_instruction_sim_matches_with_skill_surface(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td); rp = root / "repo"; sd = rp / "skills" / "good-pr"; (sd / "references").mkdir(parents=True)
-            (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: d. Use it.\n---\n\n# B\n\nSee [g](references/g.md).\n\n## Sev\n\np\n", encoding="utf-8")
-            (sd / "references" / "g.md").write_text("guide\n", encoding="utf-8")
-            (rp / "evals").mkdir()
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"],
-                 "variants": ["with_skill", "without_skill"],
-                 "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-                 "ablations": [{"id": "mat", "removed_component": "sev", "mechanism": "section", "class": "instructions", "target": {"heading": "## Sev"}},
-                               {"id": "sim", "removed_component": "something"}]}
-            p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
+            root = Path(td)
+            p = make_eval_repo(
+                root, skill_name="good-pr", references={"references/g.md": "guide\n"}, cases=[ANY_CASE],
+                skill_text="---\nname: good-pr\ndescription: d. Use it.\n---\n\n# B\n\nSee [g](references/g.md).\n\n## Sev\n\np\n",
+                ablations=[{"id": "mat", "removed_component": "sev", "mechanism": "section", "class": "instructions", "target": {"heading": "## Sev"}},
+                           {"id": "sim", "removed_component": "something"}])
             manifest = sb.validate_manifest(p); repo_root = sb.repo_root_for_manifest(p)
             trees = sb.materialize_declared_ablations(repo_root, manifest, root / "abl")
             wsdir = sb.build_canonical_skill_tree(repo_root, manifest, root / "abl" / "_ws")
@@ -2176,15 +2090,15 @@ class MaterializedArmTests(unittest.TestCase):
 
     def test_materialized_without_an_edit_is_unrepresentable(self):
         # The round-3 lie: "materialized" while the original tree is mounted.
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "must attest an edited tree"):
             am.MaterializedArm(arm=self.arm(edited="C"), dir="/x", skill_files={}, isolation_warnings=())
 
     def test_materialized_requires_provenance(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "must carry provenance"):
             am.MaterializedArm(arm=self.arm(provenance=False), dir="/x", skill_files={}, isolation_warnings=())
 
     def test_materialized_arm_must_be_blind(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "must be blind"):
             am.MaterializedArm(arm=self.arm(blind=False), dir="/x", skill_files={}, isolation_warnings=())
 
     def test_materialized_arm_identity_must_equal_provenance_identity(self):
@@ -2232,7 +2146,7 @@ class AblationRecordTests(unittest.TestCase):
         sim = am.ablation_record_from_dict({"id": "x", "mode": "instruction_simulated", "population": "answer"})
         self.assertIsInstance(mat, am.Provenance)
         self.assertIsInstance(sim, am.InstructionSimulated)
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "unknown ablation record mode"):
             am.ablation_record_from_dict({"id": "x", "mode": "make-believe"})   # no third inhabitant
 
     def test_instruction_simulated_is_not_a_provenance(self):
@@ -2282,9 +2196,9 @@ class ConsumersTakeAPreparedTaskTests(unittest.TestCase):
 
     def test_workspace_and_prompt_helpers_reject_drafts(self):
         draft = am.PreparedTaskDraft.from_row({"variant": "with_skill"})
-        with tempfile.TemporaryDirectory() as td, self.assertRaises(TypeError):
+        with tempfile.TemporaryDirectory() as td, self.assertRaisesRegex(TypeError, "build_skill_workspace requires a validated PreparedTask"):
             sb.build_skill_workspace(draft, Path(td))
-        with self.assertRaises(TypeError):
+        with self.assertRaisesRegex(TypeError, "build_task_prompt requires a validated PreparedTask"):
             sb.build_task_prompt(draft)
 
     def test_safe_task_json_model_visible_variant_is_owned_by_the_object(self):
@@ -2336,19 +2250,11 @@ class OldSkillParityTests(unittest.TestCase):
     OLD = "---\nname: good-pr\ndescription: Review PRs. Use for PRs.\n---\n\n# Old\n\nOLD-MARKER\n"
 
     def repo(self, root: Path):
-        rp = root / "repo"
-        cur = rp / "skills" / "good-pr"; cur.mkdir(parents=True)
-        (cur / "SKILL.md").write_text(self.CUR, encoding="utf-8")
-        old = rp / "old-skills" / "good-pr"; old.mkdir(parents=True)
+        p = make_eval_repo(root, skill_name="good-pr", skill_text=self.CUR, cases=[ANY_CASE],
+                           extra={"old_skill_paths": ["old-skills/good-pr/SKILL.md"]})
+        old = p.parents[1] / "old-skills" / "good-pr"
+        old.mkdir(parents=True)
         (old / "SKILL.md").write_text(self.OLD, encoding="utf-8")
-        (rp / "evals").mkdir()
-        m = {"version": 1, "skill_name": "good-pr",
-             "skill_paths": ["skills/good-pr/SKILL.md"],
-             "old_skill_paths": ["old-skills/good-pr/SKILL.md"],
-             "variants": ["with_skill", "without_skill"],
-             "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}],
-             "ablations": []}
-        p = rp / "evals" / "shared-benchmark.json"; p.write_text(json.dumps(m), encoding="utf-8")
         return p
 
     def old_row(self, p):
@@ -2449,8 +2355,8 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
             row = next(item for item in rows if item["variant"] == "with_skill")
             source = Path(row["skill_paths"][0]).parent / "references" / "guide.md"
             source.write_text("changed after prepare\n", encoding="utf-8")
-            with self.assertRaises(SystemExit):
-                sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd))
+            assert_dies(self, lambda: sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd)),
+                        "mounted skill tree hash")
 
     def test_materialized_mount_matches_edited_not_parent_hash(self):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as wd:
@@ -2469,9 +2375,9 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
                 row["ablation"]["parent_skill_hash"])
             Path(row["skill_paths"][0]).write_text(
                 "changed after materialization\n", encoding="utf-8")
-            with tempfile.TemporaryDirectory() as changed_wd, self.assertRaises(SystemExit):
-                sb.build_skill_workspace(
-                    sb.PreparedTask.from_row(row), Path(changed_wd))
+            with tempfile.TemporaryDirectory() as changed_wd:
+                assert_dies(self, lambda: sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(changed_wd)),
+                            "mounted skill tree hash")
 
     def test_answer_runner_persists_recomputed_mount_and_fixture_hashes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2503,8 +2409,8 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
             first.write_text("one", encoding="utf-8")
             second.write_text("two", encoding="utf-8")
             row["input_files"] = [str(first), str(second)]
-            with self.assertRaises(SystemExit):
-                sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd))
+            assert_dies(self, lambda: sb.build_skill_workspace(sb.PreparedTask.from_row(row), Path(wd)),
+                        "input fixture destination collision(s): data.txt")
             self.assertFalse((Path(wd) / "inputs").exists())
 
     def test_jetty_rejects_multi_turn_before_writing_export(self):
@@ -2512,8 +2418,8 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
             root = Path(td)
             path = self.manifest(root, multi_turn=True)
             out = root / "jetty.jsonl"
-            with self.assertRaises(SystemExit):
-                sb.export_jetty(argparse.Namespace(manifest=str(path), out=str(out)))
+            assert_dies(self, lambda: sb.export_jetty(argparse.Namespace(manifest=str(path), out=str(out))),
+                        "Jetty export does not support multi-turn prepared tasks")
             self.assertFalse(out.exists())
 
     def test_jetty_execution_rechecks_attested_upload_bytes(self):
