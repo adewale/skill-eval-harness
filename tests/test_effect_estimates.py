@@ -4,14 +4,18 @@ The interval is the sign-flip test inverted, so it must exclude zero exactly
 when the exact test rejects "no lift". The noise check must say when an eval
 could not have shown a lift at all. A case both arms fail must never be sent
 to suggest-cases for hardening."""
+import bisect
+import collections
 import itertools
 import json
 import math
 import random
 import statistics
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from helpers import (
     attest_answer_design,
@@ -31,6 +35,22 @@ from findings import CaseFlag
 def thirds(values: list[int]) -> list[float]:
     """Per-case deltas at three repeats per arm, the blog's customer-support shape."""
     return [value / 3 for value in values]
+
+
+def grouped_p(deltas: list[float], shift: float) -> float:
+    """The two-sided sign-flip p-value of ``d - shift``, counted over how many
+    of each distinct delta are flipped (zeros included), each count weighted
+    by its binomial coefficient: no pattern sums are grouped or sorted."""
+    counts = sorted(collections.Counter(deltas).items())
+    n = len(deltas)
+    observed = abs(math.fsum(deltas) - n * shift) - 1e-12
+    hits = 0
+    for flips in itertools.product(*(range(count + 1) for _, count in counts)):
+        statistic = math.fsum((value - shift) * (count - 2 * j)
+                              for (value, count), j in zip(counts, flips))
+        if abs(statistic) >= observed:
+            hits += math.prod(math.comb(count, j) for (_, count), j in zip(counts, flips))
+    return hits / 2 ** n
 
 
 def brute_force_p(deltas: list[float]):
@@ -154,6 +174,7 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
         rng = random.Random(3)
         deltas = [rng.choice([-1.0, 0.0, 0.5, 1.0]) for _ in range(30)]
         first = ee.sign_flip_interval(deltas, max_exact_n=0)
+        ee._patterns_of.cache_clear()   # as in a fresh re-grade
         second = ee.sign_flip_interval(list(reversed(deltas)), max_exact_n=0)
         self.assertEqual(first, second)
         self.assertEqual(first["method"], "sign-flip-inversion-sampled")
@@ -162,6 +183,121 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
         self.assertFalse(ee.sign_flip_interval([])["bounded"])
         with self.assertRaises(ValueError):
             ee.sign_flip_interval([float("nan"), 1.0])
+
+    def test_a_300_case_exact_interval_takes_few_evaluations(self):
+        # 300 cases: 120 gained a run, 60 lost one, 120 did not move. Equal
+        # deltas group and unchanged cases only spread the pattern weight, so
+        # the path is exact, but each p-value evaluation visited every (pattern
+        # weight, unchanged-case count) pair, and the search bisected 60 times
+        # a side: 122 evaluations and about 1.5 s for one interval.
+        deltas = [1.0] * 120 + [-1.0] * 60 + [0.0] * 120
+        # The deterministic guards: how many evaluations, and how many binary
+        # searches each takes (one per unchanged-case count, not one per
+        # pattern weight as well).
+        with mock.patch.object(ee, "_tail", wraps=ee._tail) as tail, \
+                mock.patch.object(bisect, "bisect_left", wraps=bisect.bisect_left) as search:
+            ee.sign_flip_interval(deltas)
+        self.assertLessEqual(tail.call_count, 60)
+        self.assertLessEqual(search.call_count, tail.call_count * (120 + 1))
+        started = time.perf_counter()
+        interval = ee.sign_flip_interval(deltas)
+        elapsed = time.perf_counter() - started
+        # The endpoints the 60-step search recorded before the change.
+        self.assertEqual((interval["method"], interval["lower"], interval["upper"]),
+                         ("sign-flip-inversion-exact", 0.114865, 0.284848))
+        self.assertLess(elapsed, 0.5)   # about 0.1 s here; generous, not a tight timer
+
+    def test_unchanged_cases_keep_the_interval_exact(self):
+        # An independent count over how many +1, -1 and 0 deltas flip agrees
+        # with the interval on both sides of each endpoint.
+        deltas = [1.0] * 14 + [-1.0] * 6 + [0.0] * 10
+        interval = ee.sign_flip_interval(deltas)
+        self.assertEqual(interval["method"], "sign-flip-inversion-exact")
+        for end, inside in ((interval["lower"], 1e-5), (interval["upper"], -1e-5)):
+            with self.subTest(end=end):
+                self.assertGreater(grouped_p(deltas, end + inside), 0.05)
+                self.assertLessEqual(grouped_p(deltas, end - inside), 0.05)
+
+    def test_pass_rate_deltas_past_the_outcome_budget_stay_exact(self):
+        # 29 cases at three repeats: six distinct non-zero deltas, 5 or 4 of
+        # each, take 6*5*6*5*6*5 = 27000 > 2**14 flip-count outcomes, so the
+        # test and the interval sampled. As thirds they are whole numbers of
+        # runs, and their pattern sums take far fewer values, so both are
+        # exact: the p-value and the interval's endpoints match a count over
+        # every combination of flips.
+        deltas = thirds([1] * 5 + [-1] * 4 + [2] * 5 + [-2] * 4 + [3] * 5 + [-3] * 4 + [0] * 2)
+        significance = ee.sign_flip_test(deltas)
+        interval = ee.sign_flip_interval(deltas)
+        self.assertEqual((significance["method"], interval["method"]),
+                         ("sign-flip-exact", "sign-flip-inversion-exact"))
+        self.assertAlmostEqual(significance["p_value"], grouped_p(deltas, 0.0), places=12)
+        self.assertTrue(interval["bounded"])
+        for end, inside in ((interval["lower"], 1e-5), (interval["upper"], -1e-5)):
+            with self.subTest(end=end):
+                self.assertGreater(grouped_p(deltas, end + inside), 0.05)
+                self.assertLessEqual(grouped_p(deltas, end - inside), 0.05)
+
+    # How far an exact p-value may sit from alpha before the sampled decision
+    # must match it: past 2**18 patterns the bound is about 0.002 above p.
+    AMBIGUOUS = 0.004
+
+    def test_the_sampled_test_decides_like_brute_force_below_the_old_floor(self):
+        # Graded-score deltas take arbitrary values, so they sample. The
+        # sampled test decided on a Hoeffding bound that never fell below
+        # about 0.03, so it could not reject at alpha 0.01 even when the
+        # exact p was 0.0001. On 84 evals of 8-14 cases, forced onto the
+        # sampled path, it must decide as visiting every pattern does at
+        # 0.05, 0.01 and 0.005, wherever the exact p is clear of alpha.
+        rng = random.Random(23)
+        checked = 0
+        for n in range(8, 15):
+            for _ in range(12):
+                deltas = [round(rng.uniform(-0.4, 0.9), 4) for _ in range(n)]
+                exact = brute_force_p(deltas)(0.0)
+                for alpha in (0.05, 0.01, 0.005):
+                    if abs(exact - alpha) < self.AMBIGUOUS:
+                        continue
+                    sampled = ee.sign_flip_test(deltas, max_exact_n=0, alpha=alpha)
+                    with self.subTest(deltas=deltas, alpha=alpha, exact=exact):
+                        self.assertEqual(sampled["method"], "sign-flip-sampled")
+                        self.assertEqual(sampled["significant_at_0_05"], exact <= alpha)
+                        self.assertGreaterEqual(sampled["p_value_upper_bound"], exact)
+                    checked += 1
+        self.assertGreater(checked, 200)
+        # Twenty equal moves reach exact p = 2 / 2**20; the sampled bound
+        # used to stop at 0.029.
+        self.assertLess(ee.sign_flip_test([0.5] * 20, max_exact_n=0)["p_value_upper_bound"],
+                        0.003)
+
+    def test_the_sampled_path_agrees_with_the_exact_path_where_both_apply(self):
+        # 15-30 cases at three repeats are exact; sampled instead, their
+        # decision at 0.05 and 0.01 must match the exact one wherever the
+        # exact p is clear of alpha, and the sampled interval, which rejects
+        # a shift only when its upper bound clears alpha, must contain the
+        # exact one.
+        rng = random.Random(29)
+        decided = contained = 0
+        for _ in range(40):
+            deltas = thirds([rng.choice([-3, -2, -1, 0, 1, 1, 2, 3]) for _ in range(rng.randint(15, 30))])
+            for alpha in (0.05, 0.01):
+                exact = ee.sign_flip_test(deltas, alpha=alpha)
+                sampled = ee.sign_flip_test(deltas, max_exact_n=0, alpha=alpha)
+                self.assertEqual((exact["method"], sampled["method"]),
+                                 ("sign-flip-exact", "sign-flip-sampled"))
+                if abs(exact["p_value"] - alpha) >= self.AMBIGUOUS:
+                    with self.subTest(deltas=deltas, alpha=alpha):
+                        self.assertEqual(sampled["significant_at_0_05"],
+                                         exact["significant_at_0_05"])
+                    decided += 1
+            exact_interval = ee.sign_flip_interval(deltas)
+            sampled_interval = ee.sign_flip_interval(deltas, max_exact_n=0)
+            if exact_interval["bounded"] and sampled_interval["bounded"]:
+                with self.subTest(deltas=deltas):
+                    self.assertLessEqual(sampled_interval["lower"], exact_interval["lower"])
+                    self.assertGreaterEqual(sampled_interval["upper"], exact_interval["upper"])
+                contained += 1
+        self.assertGreater(decided, 60)
+        self.assertGreater(contained, 25)
 
 
 class NoiseCheckTests(unittest.TestCase):
@@ -388,6 +524,73 @@ class FloorEndToEndTests(unittest.TestCase):
         self.assertNotIn("floor-eval", {finding["kind"] for finding in audit["findings"]})
         self.assertEqual(audit["readiness"]["floor_cases"], [])
         self.assertEqual(audit["readiness"]["qualitative_only_cases"], ["case-1"])
+
+    def test_a_case_gated_only_by_judges_is_flagged_on_the_score_readiness_reads(self):
+        # A judge-only case has no objective rate, so it is outside the
+        # objective pairing. Its flags must come from the combined score that
+        # readiness reads, or readiness lists a floor case no flag or finding
+        # names. Each case below exercises one flag; the stub judge passes an
+        # answer that says "gamma" (score 1.0) and fails the rest (score 0.0).
+        def judge(name, severity):
+            return {"name": name, "type": "judge", "severity": severity,
+                    "rubric": ["Names the third Greek letter"]}
+        outputs = {  # case -> (with_skill runs, without_skill runs)
+            "floor": (["none", "none"], ["none", "none"]),
+            "ceiling": (["gamma", "gamma"], ["gamma", "gamma"]),
+            "flaky": (["gamma", "none"], ["none", "none"]),
+            "critical": (["gamma", "gamma"], ["none", "none"]),
+            "graded": (["none", "none"], ["gamma", "gamma"]),
+        }
+        assertions = {"floor": [judge("quality", "gate")], "ceiling": [judge("quality", "gate")],
+                      "flaky": [judge("quality", "gate")],
+                      "critical": [judge("quality", "critical")],
+                      "graded": [judge("quality", "gate"), judge("polish", "soft")]}
+        cases = [{"id": cid, "split": "tune", "kind": "behavior", "prompt": "Do the task.",
+                  "assertions": assertions[cid],
+                  **({"reference_score": 0.5} if cid == "graded" else {})} for cid in outputs]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_demo_manifest(root, demo_manifest(cases=cases))
+            runs = root / "runs"
+            for cid, arms in outputs.items():
+                for variant, texts in zip(("with_skill", "without_skill"), arms):
+                    for number, text in enumerate(texts, 1):
+                        write_run(runs / cid / variant / f"run-{number}", text)
+            attest_answer_design(path, runs)
+            verdicts = judge_with_stub(path, runs, root / "verdicts.jsonl",
+                                       passes_on="gamma", scored=True)
+            code, _, stderr = run_cli("benchmark", path, "--runs", runs, "--judge-results",
+                                      verdicts, "--out", root / "benchmark.json")
+            self.assertEqual(code, 0, stderr)
+            report = json.loads((root / "benchmark.json").read_text(encoding="utf-8"))
+            code, _, stderr = run_cli("audit-manifest", path, "--runs", runs, "--judge-results",
+                                      verdicts, "--out", root / "audit.json")
+            self.assertEqual(code, 0, stderr)
+            audit = json.loads((root / "audit.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["availability"], "complete")
+        flags = {entry["case_id"]: entry for entry in report["case_flags"]}
+        self.assertEqual({cid: flags[cid]["flags"] for cid in flags}, {
+            "floor": [CaseFlag.FLOOR.value, "no objective lift", "with-skill failure"],
+            "ceiling": ["saturated/non-discriminating", "no objective lift"],
+            "flaky": ["with-skill failure", "flaky repeated pass rates: with_skill"],
+            "critical": ["critical-failure: without_skill (quality)"],
+            "graded": ["no objective lift", "with-skill failure",
+                       "below-reference-floor: polish"],
+        })
+        self.assertEqual({cid: (flags[cid]["with_skill"], flags[cid]["without_skill"])
+                          for cid in flags},
+                         {"floor": (0.0, 0.0), "ceiling": (1.0, 1.0), "flaky": (0.5, 0.0),
+                          "critical": (1.0, 0.0), "graded": (0.0, 1.0)})
+        self.assertEqual({flags[cid]["signal"] for cid in flags}, {"combined"})
+        # Readiness and the flags name the same floor and ceiling cases.
+        self.assertEqual(audit["readiness"]["floor_cases"], ["floor"])
+        self.assertEqual(audit["readiness"]["base_saturated_cases"], ["ceiling"])
+        found = {(finding["kind"], finding["evidence"].get("case_id"))
+                 for finding in audit["findings"] if isinstance(finding.get("evidence"), dict)}
+        self.assertLessEqual({("floor-eval", "floor"), ("saturated-eval", "ceiling"),
+                              ("no-lift-eval", "ceiling"), ("no-lift-eval", "graded"),
+                              ("flaky-eval", "flaky")}, found)
+        self.assertNotIn(("no-lift-eval", "floor"), found)
 
 
 class EstimateTests(unittest.TestCase):

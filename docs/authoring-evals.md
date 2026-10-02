@@ -195,7 +195,9 @@ Open the outputs and write the smallest assertions that capture the behavior, in
    missing test", "does not invent an API parameter"), rather than one judge asked how good the
    answer is. The run records the fraction met as `soft_passed` / `soft_total`; `graded_score`
    averages only verdicts that include a `score` (optional in the plain judge contract), so have
-   the judge return `score` 1 or 0 if you want the fraction in the paired `graded` channel. Keep
+   the judge return `score` 1 or 0 if you want the fraction in the paired `graded` channel. A judge
+   that scores on its own scale (1–5, say) declares `score_scale: [1, 5]` so the channel can
+   normalize it; without it, a 1–5 score leaves the channel `partial`. Keep
    anchored 1-5 `graded_dimensions` for properties that are ordinal, where a 3 sits between a 2
    and a 4. When a property is fuzzy and the question is which arm did better, compare the arms
    directly: `compare-tasks` exports each run's `with_skill` and `without_skill` outputs as a

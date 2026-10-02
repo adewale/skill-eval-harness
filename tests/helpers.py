@@ -784,3 +784,29 @@ def claude_streams_ending_after_result() -> list[tuple[str, str]]:
     stand_in = (CLAUDE_FIXTURES / "stream-json.plugin-skill.jsonl").read_text(encoding="utf-8")
     return [(f"stream-json.plugin-skill.jsonl + hand-built task_summary ({NO_TRAILING_RECORDING})",
              stand_in.rstrip("\n") + "\n" + json.dumps(HAND_BUILT_TRAILING_RECORD) + "\n")]
+
+
+# --------------------------------------------------------------------------- #
+# lane S: judges that answer on their own score scale
+# --------------------------------------------------------------------------- #
+
+
+def judge_with_scores(manifest: Path, runs: Path, out: Path, *,
+                      scores: dict[str, float]) -> Path:
+    """Write judge verdicts through the real `skill-benchmark judge` command
+    with a local stub judge (no model) that answers only a `score`: the score
+    of the first marker in `scores` that appears in its prompt. For judges
+    that declare a `score_scale`, whose pass/fail the harness derives."""
+    stub = out.parent / "score_judge.py"
+    stub.write_text(
+        "import json, sys\n"
+        "prompt = sys.stdin.read()\n"
+        f"scores = {scores!r}\n"
+        "score = next(value for marker, value in scores.items() if marker in prompt)\n"
+        "print(json.dumps({'score': score, 'rationale': 'stub'}))\n",
+        encoding="utf-8")
+    code, _, stderr = run_cli("judge", manifest, "--runs", runs,
+                              "--judge-cmd", f"{sys.executable} {stub}", "--out", out)
+    if code != 0:
+        raise AssertionError(f"judge stub failed: {stderr}")
+    return out

@@ -356,15 +356,15 @@ ASSERTION_TYPE_FIELDS: dict[str, set[str]] = {
     "command_count_le": {"max", "value"},
     "judge": {
         "preset", "prompt", "rubric", "review_rubric", "threshold",
-        "graded_dimensions", "dynamic_rubric", "per_step",
+        "graded_dimensions", "dynamic_rubric", "per_step", "score_scale",
     },
     "rubric": {
         "preset", "prompt", "rubric", "review_rubric", "threshold",
-        "graded_dimensions", "dynamic_rubric", "per_step",
+        "graded_dimensions", "dynamic_rubric", "per_step", "score_scale",
     },
     "factuality": {
         "preset", "prompt", "rubric", "review_rubric", "threshold",
-        "graded_dimensions", "dynamic_rubric", "per_step",
+        "graded_dimensions", "dynamic_rubric", "per_step", "score_scale",
     },
 }
 # 1.1: the factuality preset is a named, anchored rubric — no new execution
@@ -1153,6 +1153,16 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
                 die(f"{where} qualitative threshold must be a finite number")
             if dims is not None and not 1 <= float(threshold) <= 5:
                 die(f"{where} graded-dimension threshold must be in [1, 5]")
+        if "score_scale" in assertion:
+            scale = judge_score_scale(assertion)
+            if scale is None:
+                die(f"{where} score_scale must be [low, high]: two finite numbers with low < high")
+            for key in ("atLeast", "graded_dimensions", "dynamic_rubric", "per_step"):
+                if key in expand_judge_preset(assertion):
+                    die(f"{where} score_scale cannot combine with {key}; it scales a plain judge's score")
+            threshold = expand_judge_preset(assertion).get("threshold", scale[1])
+            if not scale[0] <= float(threshold) <= scale[1]:
+                die(f"{where} threshold must lie on its score_scale [{scale[0]:g}, {scale[1]:g}]")
         for key in ("rubric", "review_rubric"):
             if key in assertion and (not isinstance(assertion[key], list)
                                      or not assertion[key]
@@ -11700,6 +11710,18 @@ def extract_json_object(text: str) -> dict[str, Any]:
     return found[0]
 
 
+def judge_score_scale(assertion: Mapping[str, Any]) -> tuple[float, float] | None:
+    """A plain judge's declared ``score_scale`` as (low, high), or None when
+    it declares none or an unusable one (validation refuses that)."""
+    scale = assertion.get("score_scale")
+    if (not isinstance(scale, list) or len(scale) != 2
+            or any(isinstance(x, bool) or not isinstance(x, (int, float))
+                   or not math.isfinite(float(x)) for x in scale)
+            or not float(scale[0]) < float(scale[1])):
+        return None
+    return float(scale[0]), float(scale[1])
+
+
 def is_per_step_assertion(assertion: dict[str, Any]) -> bool:
     """Presence, rather than truthiness, owns the per-step assertion shape."""
     return "per_step" in assertion and assertion.get("per_step") is not None
@@ -11785,7 +11807,7 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
     if assertion.get("dynamic_rubric"):
         minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
         return _criteria_verdict_schema(minimum)
-    required = ["score"] if "atLeast" in assertion else ["passed"]
+    required = ["score"] if "atLeast" in assertion or "score_scale" in assertion else ["passed"]
     return {"type": "object", "required": required,
             "properties": {"passed": {"type": "boolean"}, "score": {"type": "number"}, "rationale": {"type": "string"}}}
 
@@ -11863,10 +11885,15 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
             + schema_hint
             + json.dumps(payload, indent=2, ensure_ascii=False)
         )
+    scale = judge_score_scale(assertion)
     plain_contract = (
         "Return only JSON with keys: score (required normalized number in [0, 1]), "
         "rationale (string). The harness derives pass/fail from atLeast.\n"
         if "atLeast" in assertion else
+        f"Return only JSON with keys: score (required number from {scale[0]:g} to {scale[1]:g}, "
+        "on the scale the rubric describes), rationale (string). The harness derives "
+        "pass/fail from the assertion's threshold on that scale.\n"
+        if scale is not None else
         "Return only JSON with keys: passed (boolean), score (number optional), "
         "rationale (string).\n"
     )
@@ -12395,12 +12422,20 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     if schema_errors:
         parse_error = "verdict schema: " + "; ".join(schema_errors[:5])
     at_least = assertion.get("atLeast")
+    scale = judge_score_scale(assertion)
     score = parsed.get("score")
     if (at_least is not None and parse_error is None
             and (isinstance(score, bool) or not isinstance(score, (int, float))
                  or not math.isfinite(float(score)) or not 0 <= float(score) <= 1)):
         parse_error = "atLeast judge verdict requires a finite normalized score in [0, 1]"
+    if (scale is not None and parse_error is None
+            and (isinstance(score, bool) or not isinstance(score, (int, float))
+                 or not math.isfinite(float(score))
+                 or not scale[0] <= float(score) <= scale[1])):
+        parse_error = (f"judge verdict requires a finite score in [{scale[0]:g}, "
+                       f"{scale[1]:g}] (score_scale)")
     threshold = (at_least if at_least is not None
+                 else assertion.get("threshold", scale[1]) if scale is not None
                  else assertion.get("threshold", parsed.get("threshold", 1)))
     graded_payload: dict[str, Any] = {}
     if assertion.get("graded_dimensions") and isinstance(parsed.get("dimension_scores"), dict):
@@ -12440,10 +12475,11 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         if "dimension_scores" in graded_payload:
             threshold = graded_entry.get("threshold")
     else:
-        if at_least is not None:
+        if at_least is not None or scale is not None:
+            # The harness, not the judge, decides pass from the score.
             passed = (
                 parse_error is None and isinstance(score, (int, float))
-                and not isinstance(score, bool) and float(score) >= float(at_least)
+                and not isinstance(score, bool) and float(score) >= float(threshold)
             )
         else:
             plain_payload = ({**parsed, "threshold": threshold}
@@ -14051,6 +14087,40 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
             ),
         })
         return entry
+    scale = judge_score_scale(assertion)
+    if scale is not None:
+        # Pass compares the raw score with the threshold on the declared
+        # scale, as the judge command did (a panel or repeats keep their own
+        # majority or quorum); the graded channel takes the score normalised
+        # to 0-1.
+        low, high = scale
+        score = judged.get("score")
+        if (isinstance(score, bool) or not isinstance(score, (int, float))
+                or not math.isfinite(float(score)) or not low <= float(score) <= high):
+            entry.update({
+                "passed": None,
+                "score": None,
+                "availability": "partial",
+                "evidence": (
+                    "score_scale judge verdict is incomplete: expected a finite "
+                    f"score in [{low:g}, {high:g}]; {evidence}"
+                ),
+            })
+            return entry
+        raw_score = float(score)
+        threshold = float(assertion.get("threshold", high))
+        entry.update({
+            "passed": judge_verdict_passed(judged, default_threshold=threshold),
+            "score": (raw_score - low) / (high - low),
+            "threshold": (threshold - low) / (high - low),
+            "raw_score": raw_score,
+            "score_scale": [low, high],
+            "evidence": (
+                f"score={raw_score:g} on [{low:g}, {high:g}], threshold={threshold:g}; "
+                f"{evidence}"
+            ),
+        })
+        return entry
     entry.update({
         "passed": judge_verdict_passed(judged),
         "score": judged.get("score"),
@@ -14443,7 +14513,9 @@ def grade_case_variant(
         **completion_row_fields(metadata),
         "objective_passed": objective_passed,
         "objective_total": objective_total,
-        "objective_pass_rate": (0.0 if vetoed else objective_passed / objective_total) if objective_total else (0.0 if vetoed else None),
+        # With no objective check the rate is not applicable, vetoed or not;
+        # the veto zeroes the combined rate that carries the judges.
+        "objective_pass_rate": (0.0 if vetoed else objective_passed / objective_total) if objective_total else None,
         "process_passed": process_passed,
         "process_total": len(process_rows),
         "process_pass_rate": (0.0 if vetoed else process_passed / len(process_rows)) if process_rows else None,
@@ -17150,15 +17222,28 @@ def build_benchmark_report(
         case_rows = everything.where(case_id=cid).all
         by_var_case = ResultSet(case_rows).by_variant()
         pairing = _metric_pair_construction(case_rows, "objective_pass_rate")
+        signal = "objective"
+        rate: Callable[[Mapping[str, Any]], float | None] = (
+            lambda row: row.get("objective_pass_rate"))
+        if not pairing.pairs and pairing.not_applicable:
+            # Gated only by judges: no objective rate exists, so every flag
+            # reads the combined score readiness reads, over its pairs.
+            pairing = combined_pair_construction(case_rows)
+            signal, rate = "combined", combined_signal
         if not pairing.pairs:
             continue
         ws_rows = [pair.with_skill.payload for pair in pairing.pairs]
         ns_rows = [pair.without_skill.payload for pair in pairing.pairs]
-        w_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ws_rows)
-        n_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ns_rows)
+        combined_means = combined_arm_means(pairing.pairs)
+        if signal == "objective":
+            w_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ws_rows)
+            n_rate = statistics.mean(float(r["objective_pass_rate"]) for r in ns_rows)
+        elif combined_means is not None:
+            w_rate, n_rate = combined_means
+        else:
+            continue
         flags = []
         extreme = ceiling_or_floor(w_rate, n_rate)
-        combined_means = combined_arm_means(pairing.pairs)
         if (combined_means is not None
                 and ceiling_or_floor(*combined_means) is DiscriminationFailure.FLOOR):
             # Both arms fail every scored run, judges included. That is more
@@ -17179,7 +17264,7 @@ def build_benchmark_report(
         if w_rate is not None and w_rate < 1:
             flags.append(CaseFlag.WITH_SKILL_FAILURE.render())
         for variant, vrows in by_var_case.items():
-            rr = [r["objective_pass_rate"] for r in vrows if r["objective_pass_rate"] is not None]
+            rr = [value for r in vrows if (value := rate(r)) is not None]
             if len(rr) > 1 and len(set(rr)) > 1:
                 flags.append(CaseFlag.FLAKY.render(variant))
             # A critical (absorbing-barrier) failure is surfaced on its own,
@@ -17192,7 +17277,8 @@ def build_benchmark_report(
             flags.append(CaseFlag.BELOW_REFERENCE_FLOOR.render(', '.join(floor_hits)))
         if flags:
             case_flags.append({"case_id": cid, "flags": flags, "with_skill": w_rate,
-                               "without_skill": n_rate, "pairing": pairing.diagnostics(),
+                               "without_skill": n_rate, "signal": signal,
+                               "pairing": pairing.diagnostics(),
                                "eval_intent": ws_rows[0].get("eval_intent", "capability")})
 
     # 1.7: per case, how much of the pass rate rests on strong oracles. A case
@@ -19731,6 +19817,15 @@ def combined_signal(row: Mapping[str, Any]) -> float | None:
             and math.isfinite(float(value)) and 0 <= float(value) <= 1 else None)
 
 
+def combined_pair_construction(rows: Iterable[Mapping[str, Any]]) -> _ResultPairConstruction:
+    """The pairs the combined signal is read over: every scorable arm, with
+    no objective rate required, so a case gated only by judges pairs too."""
+    return pair_domain.pairs_from_rows(
+        rows, population=pair_domain.ExperimentalPopulation.ANSWER,
+        eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
+    )
+
+
 def combined_arm_means(pairs: Iterable[_ResultPair]) -> tuple[float, float] | None:
     """Mean combined score per arm over the pairs where both arms have one.
     A case is at the floor when both means are 0 (`ceiling_or_floor`), the
@@ -19764,10 +19859,7 @@ def readiness_run_signals(benchmark_report: dict[str, Any], *, eps: float = 1e-9
     intent: dict[Any, str] = {}
     for row in rows:
         intent.setdefault(row.get("case_id"), row.get("eval_intent", "capability"))
-    pairing = pair_domain.pairs_from_rows(
-        rows, population=pair_domain.ExperimentalPopulation.ANSWER,
-        eligibility=lambda row: ((True, None) if scorable_run(row) else (False, "unscorable_arm")),
-    )
+    pairing = combined_pair_construction(rows)
     by_case: dict[str, list[_ResultPair]] = collections.defaultdict(list)
     for pair in pairing.pairs:
         by_case[pair.key.case_id].append(pair)
@@ -20317,7 +20409,8 @@ def audit_manifest_report(
                 finding(FindingKind.SATURATED_EVAL, f"Case {flag['case_id']} is saturated/non-discriminating.", flag)
             if (CaseFlag.NO_OBJECTIVE_LIFT in present and CaseFlag.FLOOR not in present
                     and not guard):
-                finding(FindingKind.NO_LIFT_EVAL, f"Case {flag['case_id']} shows no objective lift.", flag)
+                measure = "judge-gated" if flag.get("signal") == "combined" else "objective"
+                finding(FindingKind.NO_LIFT_EVAL, f"Case {flag['case_id']} shows no {measure} lift.", flag)
             if CaseFlag.FLAKY in present:
                 finding(FindingKind.FLAKY_EVAL, f"Case {flag['case_id']} has repeated-run variance.", flag)
         assertion_rows = []
