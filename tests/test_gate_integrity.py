@@ -266,7 +266,7 @@ def workflow_violations(workflows: dict[str, dict], required: dict[str, dict[str
         for command in required.get("ci.yml", {}).get("test", []):
             if RELEASE_FORMS.get(command, command) not in release:
                 found.append(f"publish.yml job publish: does not repeat the pull request gate {command}")
-    test_job =workflows.get("ci.yml", {}).get("jobs", {}).get("test", {})
+    test_job = workflows.get("ci.yml", {}).get("jobs", {}).get("test", {})
     matrix = {str(version) for version in
               ((test_job.get("strategy") or {}).get("matrix") or {}).get("python-version", [])}
     floor, classifiers = declared_python_versions(pyproject)
@@ -939,7 +939,8 @@ class SkipLedgerTests(unittest.TestCase):
             path = Path(td) / "test_planted_bypass.py"
             path.write_text(textwrap.dedent(self.PLANTED_BYPASSES), encoding="utf-8")
             violations = stranded_smoke_violations(Path(td), live)
-            # The static rule sees none of these: no skip or return in a smoke's own body.
+            # The static rule misses the helper's return and both conditional bodies;
+            # it sees the helper's skip only as an unledgered skip.
             static = runtime_skip_violations({path.name: path.read_text(encoding="utf-8")},
                                              {}, live)
         where = "with RUN_PLANTED_SMOKE=1 and no agent binary or credentials"
