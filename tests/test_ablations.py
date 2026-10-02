@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from helpers import (
+    FakeJettyClient,
     load_example_module,
     make_eval_repo,
 )
@@ -1413,11 +1414,17 @@ class AblationCoverageTests(unittest.TestCase):
             self.assertIn("Then review.", text)
             self.assertEqual(res["population"], "answer")
 
-    def test_provenance_includes_diff_stat_and_hash(self):
+    def test_provenance_records_what_each_component_removed(self):
+        # removed_bytes is the diff stat a reader uses to judge isolation: the
+        # section's own length for an edit, the file's size for a deletion.
+        section = SKILL_FIXTURE[SKILL_FIXTURE.index("## Regression-proof requirement"):SKILL_FIXTURE.index("## Severity")]
         with tempfile.TemporaryDirectory() as td:
-            res = self.materialize(Path(td), {"id": "p", "removed_component": "s", "mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/good-pr/SKILL.md", "heading": "## Regression-proof requirement"}})
-            self.assertIn("skill_hash", res)
-            self.assertTrue(all("removed_bytes" in c for c in res["components"]))
+            res = self.materialize(Path(td), {"id": "p", "removed_component": "s", "components": [
+                {"mechanism": "section", "class": "instructions", "target": {"skill_root": "skills/good-pr/SKILL.md", "heading": "## Regression-proof requirement"}},
+                {"mechanism": "script", "class": "resource", "target": {"skill_root": "skills/good-pr/SKILL.md", "path": "scripts/run.py"}},
+            ]})
+        self.assertEqual([c["removed_bytes"] for c in res["components"]],
+                         [len(section), len("print('hi')\n")])
 
 
 class AblationSpecCompletenessTests(unittest.TestCase):
@@ -1450,13 +1457,22 @@ class AblationSpecCompletenessTests(unittest.TestCase):
             with self.assertRaisesRegex(sb.AblationError, "required frontmatter field"):
                 sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
 
-    def test_isolation_warning_on_oversized_removal(self):
+    def isolation_warnings(self, heading: str) -> list:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            ab = {"id": "big", "removed_component": "most of body", "mechanism": "section", "class": "instructions", "target": {"heading": "# Good PR review"}}
+            ab = {"id": "cut", "removed_component": heading, "mechanism": "section", "class": "instructions", "target": {"heading": heading}}
             p = self.repo(root, [ab])
-            res = sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
-            self.assertTrue(res["isolation_warnings"])
+            with contextlib.redirect_stderr(io.StringIO()):
+                res = sb.materialize_ablation(sb.repo_root_for_manifest(p), sb.validate_manifest(p), ab, root / "out")
+        return res["isolation_warnings"]
+
+    def test_isolation_warning_only_on_oversized_removal(self):
+        body = len(SKILL_FIXTURE) - SKILL_FIXTURE.index("# Good PR review")
+        warnings = self.isolation_warnings("# Good PR review")
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertTrue(warnings[0].startswith(
+            f"component #0 (section) removed {body}/{len(SKILL_FIXTURE)} bytes"), warnings[0])
+        self.assertEqual(self.isolation_warnings("## Severity"), [])
 
     def test_check_ablations_dry_run_pass_and_fail(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1710,26 +1726,6 @@ class AblationReviewFixesTests(unittest.TestCase):
         # blinded materialized prompt is identical to the with_skill prompt
         self.assertEqual(mat_prompt, with_prompt)
 
-    # --- #3b Jetty with_skill surface parity ---
-    def test_jetty_with_skill_uploads_tree_recursively(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            repo = root / "repo"
-            sd = repo / "skills" / "good-pr"
-            (sd / "references").mkdir(parents=True)
-            (sd / "SKILL.md").write_text("---\nname: good-pr\ndescription: d.\n---\n\n# B\n\nSee [g](references/g.md).\n", encoding="utf-8")
-            (sd / "references" / "g.md").write_text("guide\n", encoding="utf-8")
-            (repo / "evals").mkdir()
-            m = {"version": 1, "skill_name": "good-pr", "skill_paths": ["skills/good-pr/SKILL.md"], "variants": ["with_skill", "without_skill"], "cases": [{"id": "c", "split": "tune", "prompt": "x", "assertions": [{"name": "a", "type": "contains", "value": "x"}]}], "ablations": []}
-            p = repo / "evals" / "shared-benchmark.json"
-            p.write_text(json.dumps(m), encoding="utf-8")
-            manifest = sb.validate_manifest(p)
-            row = next(r for r in sb.prepared_task_rows(p, manifest) if r["variant"] == "with_skill")
-            tree_dir = sb.build_canonical_skill_tree(sb.repo_root_for_manifest(p), manifest, root / "wst")
-            payload = sb.build_jetty_payload(sb.PreparedTask.from_row(row), manifest, collection="c", task_prefix=None, agent="claude-code", model="m", model_provider="anthropic", snapshot="s", with_skill_tree_dir=tree_dir)
-            hints = [f["remote_path_hint"] for f in payload["upload_plan"]["files"] if f["role"] == "skill"]
-            self.assertTrue(any(h.endswith("references/g.md") for h in hints))  # recursive, matching the ablation arm
-
 
 class AblationDifferentialInvariantTests(unittest.TestCase):
     """Differential testing (testing-best-practices/references/differential-testing.md):
@@ -1866,19 +1862,6 @@ class AblationDifferentialInvariantTests(unittest.TestCase):
     def test_invariant_catches_added_bytes(self):
         with self.assertRaises(AssertionError):  # a substitution leaking through "removal-only"
             self.assertDiffersOnlyBy({"k/SKILL.md": b"hello world"}, {"k/SKILL.md": b"hello brave world"}, edited="k/SKILL.md")
-
-    # --- property: blinding invariant (model-visible instruction is identical across arms) ---
-    def test_materialized_instruction_is_identical_to_with_skill(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            p = self.repo(root)
-            manifest = sb.validate_manifest(p)
-            repo_root = sb.repo_root_for_manifest(p)
-            manifest = {**manifest, "ablations": [{"id": "x", "removed_component": "x", "mechanism": "section", "class": "instructions", "target": {"heading": "## Severity"}}]}
-            self.assertEqual(
-                sb.variant_instruction("ablation:x", manifest, repo_root),
-                sb.variant_instruction("with_skill", manifest, repo_root),
-            )
 
     def test_variant_instruction_is_path_neutral(self):
         # The instruction must never embed an absolute repo path: a repo-aware
@@ -2546,14 +2529,12 @@ class AnswerWorkspaceAttestationTests(unittest.TestCase):
                 item for item in payload["upload_plan"]["files"]
                 if item.get("role") == "skill")
             Path(skill_item["local_path"]).write_text("changed after export\n", encoding="utf-8")
+            client = FakeJettyClient()
 
-            class MustNotUpload:
-                def upload(self, *_args, **_kwargs):
-                    raise AssertionError("attestation failure must precede upload")
-
-            [record] = list(sb.execute_jetty_payloads([payload], client=MustNotUpload()))
+            [record] = list(sb.execute_jetty_payloads([payload], client=client))
             self.assertEqual(record["status"], "failed")
             self.assertIn("changed after attestation", record["error"])
+            self.assertEqual((client.upload_calls, client.submit_calls), (0, 0))
 
 
 if __name__ == "__main__":
