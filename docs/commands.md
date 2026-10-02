@@ -130,7 +130,7 @@ skill-benchmark run-agent --agent codex --tasks tasks.jsonl --runs ../repo/eval-
   --effort high
 ```
 
-Every run records `effort: {requested, applied_by}`, for example `{"requested": "high", "applied_by": "claude --effort"}`. Without `--effort` it records `{"requested": null, "applied_by": "backend_default"}`, because defaults differ by model and CLI version: the claude-api skill lists Claude Opus 5.5's API default effort as `medium` and Claude Opus 5's as `high`.
+Every run records `effort: {requested, applied_by}`; the Codex run above records `{"requested": "high", "applied_by": "codex -c model_reasoning_effort"}`, and `run-claude` records `"applied_by": "claude --effort"`. Without `--effort` it records `{"requested": null, "applied_by": "backend_default"}`, because defaults differ by model and CLI version: the claude-api skill lists Claude Opus 5.5's API default effort as `medium` and Claude Opus 5's as `high`.
 
 The same `metadata.json` records how the run stopped and which model answered:
 
