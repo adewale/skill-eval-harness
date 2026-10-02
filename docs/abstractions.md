@@ -198,9 +198,9 @@ checked against. The judge's explore-surface digest frames directories too and s
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10456`), Claude (`run_claude:10654`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10469`), Claude (`run_claude:10667`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13224`, which hosts record/replay tool I/O via `ToolReplayStore`),
+subagent runner (`run_subagent:13237`, which hosts record/replay tool I/O via `ToolReplayStore`),
 Jetty (`JettyClient:4024` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
@@ -223,7 +223,8 @@ cannot omit or disagree about process inputs after the plan boundary. The same m
 shared `InvocationState` vocabulary: `InvocationResult` admits only process-boundary states, while
 provider or harness failures remain semantic classifications and never rewrite the observed return
 code. `InvocationRequest.effort` carries a requested effort level; `run_agent_tasks` refuses it
-before any spend when the backend declares no `effort_control`.
+before any spend when the backend declares no `effort_control` or the level is not among its
+`effort_levels`.
 
 `completion_contracts.py` records how each answer run ended. `StopObservation` normalizes a
 provider's stop reason into the closed `StopClass` (`completed`, `truncated`, `turn_limit`,

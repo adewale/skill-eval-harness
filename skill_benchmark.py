@@ -10175,6 +10175,9 @@ class AgentBackend:
     # known control. A request for effort on such a backend is refused before
     # any run, rather than recorded as a setting that was never applied.
     effort_control: str | None = None
+    # The levels of EFFORT_LEVELS that control accepts; another level is
+    # refused before any run instead of failing (or being ignored) mid-suite.
+    effort_levels: tuple[str, ...] = ()
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         raise NotImplementedError
@@ -10183,6 +10186,10 @@ class AgentBackend:
 class CodexBackend(AgentBackend):
     name = "codex"
     effort_control = "codex -c model_reasoning_effort"
+    # Codex parses none, minimal, low, medium, high, xhigh, max, ultra and
+    # persistent (rust-v0.160.0) and passes other values to the model, so
+    # every harness level reaches it; releases before 0.140 reject `max`.
+    effort_levels = EFFORT_LEVELS
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         result = codex_cli_invoke(
@@ -10212,6 +10219,9 @@ class CodexBackend(AgentBackend):
 class ClaudeBackend(AgentBackend):
     name = "claude"
     effort_control = "claude --effort"
+    # `claude --help`, Claude Code 2.1.288: `--effort <level>` (low, medium,
+    # high, xhigh, max).
+    effort_levels = ("low", "medium", "high", "xhigh", "max")
 
     def invoke_answer(self, request: InvocationRequest, **options: Any) -> AnswerOutcome:
         # stream-json, not the single envelope: the stream is the run's raw
@@ -10354,11 +10364,14 @@ def run_agent_tasks(tasks: list[dict[str, Any]], runs: Path, backend: AgentBacke
     `run-agent` command exposes it directly. Provider-specific code returns a
     RunnerOutcome; this loop owns PreparedTask handling, workspace construction,
     provenance, and the run-output contract. Every run records the effort it
-    asked for; a backend with no known effort control refuses a request before
-    any spend instead of recording a level it never applied."""
+    asked for; a backend with no known effort control, or whose CLI does not
+    accept the requested level, refuses it before any spend instead of
+    recording a level it never applied."""
     if effort is not None and backend.effort_control is None:
         die(f"{backend.name} backend has no known effort control; omit --effort "
             "(runs then record effort as the backend default)")
+    if effort is not None and effort not in backend.effort_levels:
+        die(f"{backend.effort_control} accepts {', '.join(backend.effort_levels)}; got {effort}")
     effort_setting = (EffortSetting(effort, str(backend.effort_control))
                       if effort is not None else EffortSetting.default())
     workspace_builder = registered_workspace_builder(backend.name)
@@ -21117,7 +21130,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
-    p.add_argument("--effort", choices=EFFORT_LEVELS, help="requested reasoning effort, recorded on every run; omit to run at the backend default (also recorded, since defaults differ by model and CLI)" + "; refused on backends with no known effort control")
+    p.add_argument("--effort", choices=EFFORT_LEVELS, help="requested reasoning effort, recorded on every run; omit to run at the backend default (also recorded, since defaults differ by model and CLI)" + "; refused on backends with no known effort control or for a level the backend's CLI does not accept")
     add_surface_cli_options(p, "answer")
 
     p = sub.add_parser("run-subagent", help="run prepared tasks through an in-process subagent backend (Claude CLI by default, --agent-cmd for any provider); hosts tool replay")

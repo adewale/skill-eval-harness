@@ -463,7 +463,7 @@ above is the five commands you need first (`validate`, `prepare`, `benchmark`,
 |---|---|
 | `skill-benchmark run-codex` | Drive prepared rows through isolated `codex exec --json --output-last-message`; save trace, events, metrics, answer. `--effort` sets `model_reasoning_effort`. |
 | `skill-benchmark run-claude` | Drive `claude -p --output-format stream-json`, capturing real per-run cost + token usage AND the full tool-use stream as the run's trace (`trace.jsonl`/`events.json`), so process assertions have evidence on Claude answer runs. Records the stop reason and served model; `--effort` passes `claude --effort`. |
-| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, `--agent gemini`, or `--agent vibe`); compatibility wrappers delegate here. `--effort` is refused for Gemini and Vibe. |
+| `skill-benchmark run-agent` | Provider-neutral native runner over registered backends (`--agent claude`, `--agent codex`, `--agent gemini`, or `--agent vibe`); compatibility wrappers delegate here. `--effort` is refused for Gemini and Vibe, and for a level the backend's CLI does not accept (`minimal` on Claude). |
 | `skill-benchmark run-subagent` | In-process backend seam: any provider via `--agent-cmd`, tool replay, multi-turn `turns`. |
 | `skill-benchmark import-trace` | Normalize a raw JSONL trace into `events.json`/`metrics.json` for process/efficiency checks. |
 
