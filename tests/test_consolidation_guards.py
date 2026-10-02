@@ -994,13 +994,16 @@ class TimeoutConventionTests(unittest.TestCase):
     """One timeout encoding: timed_out=True (the flag execution_valid keys on)
     plus returncode 124, on every path that spawns a process."""
 
-    def test_default_runner_timeout_is_one_constant(self):
+    def test_every_runner_timeout_flag_defaults_to_the_one_constant(self):
         parser = sb.build_arg_parser()
-        defaults = []
-        for action in SharedOwnerIdentityTests._walk_actions(parser):
-            if "--timeout" in getattr(action, "option_strings", ()) and action.default == sb.DEFAULT_RUNNER_TIMEOUT_S:
-                defaults.append(action)
-        self.assertGreaterEqual(len(defaults), 4, "the runner --timeout flags no longer share DEFAULT_RUNNER_TIMEOUT_S")
+        subs = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
+        runners = sorted(name for name in subs.choices if name.startswith("run-"))
+        self.assertGreaterEqual(len(runners), 5)
+        for name in runners:
+            with self.subTest(command=name):
+                [timeout] = [action for action in subs.choices[name]._actions
+                             if "--timeout" in action.option_strings]
+                self.assertEqual(timeout.default, sb.DEFAULT_RUNNER_TIMEOUT_S)
 
     def test_every_answer_runner_failure_commits_the_run_contract(self):
         # Every answer runner adapts its outcome through the one run-contract
