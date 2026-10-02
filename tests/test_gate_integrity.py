@@ -117,14 +117,31 @@ REQUIRED_ACTIVITY_TYPES = {
     "release": {"published"},
 }
 
-# Shell spellings that turn a failing command into a passing step.
-FAILURE_SWALLOWERS = ("|| true", "|| :", "|| exit 0", "set +e", "--exit-zero")
+# Spellings that turn a failing command into a passing step, matched in any
+# spacing: `set +e` (or any `+...e...` flag set, or `+o errexit`) and a linter's
+# `--exit-zero`.
+STATUS_DISCARDERS = (
+    re.compile(r"(?<![\w-])set\s+(?:[-+]\w+\s+)*?\+\w*e\w*"),
+    re.compile(r"(?<![\w-])set\s+\+o\s+errexit\b"),
+    re.compile(r"--exit-zero\b"),
+)
+
+# `cmd || fallback` keeps cmd's failure only if the fallback fails too: `exit`
+# with cmd's status (bare or `$?`) or a nonzero one, or `false`; or a
+# `{ echo ...; exit 1; }` group, where `$?` is already echo's status. Any other
+# fallback hides it.
+FALLBACK = re.compile(r"\|\|\s*(?P<fallback>.*)$")
+RERAISE = re.compile(r"(?:exit(?:\s+(?:[1-9]\d*|\$\?))?|false"
+                     r"|\{\s*(?:(?:echo|printf)\b[^;{}|&]*;\s*)*(?:exit\s+[1-9]\d*|false)\s*;\s*\})\s*;?")
 
 # GitHub runs the `bash` and `sh` keywords with -e, so the first failing command
 # fails the step; a custom template (`bash {0}`) must ask for -e itself. pwsh,
-# powershell and cmd report only the last command's exit code.
+# powershell and cmd report only the last command's exit code. A Python script
+# exits nonzero on an uncaught exception or sys.exit(n), so its status is the
+# script's own. Any other shell fails closed.
 ERREXIT_SHELLS = ("bash", "sh")
 LAST_STATUS_SHELLS = ("pwsh", "powershell", "cmd")
+SCRIPT_STATUS_SHELLS = ("python", "python3")
 
 
 def load_workflows() -> dict[str, dict]:
@@ -134,6 +151,23 @@ def load_workflows() -> dict[str, dict]:
 
 def run_lines(step: dict) -> list[str]:
     return [line.strip() for line in str(step.get("run", "")).splitlines() if line.strip()]
+
+
+def discarded_status(line: str) -> list[str]:
+    """Each part of a run line that lets its command fail without failing the step."""
+    found = [match.group(0) for pattern in STATUS_DISCARDERS for match in pattern.finditer(line)]
+    fallback = FALLBACK.search(line)
+    if fallback and not RERAISE.fullmatch(fallback.group("fallback").strip()):
+        found.append(fallback.group(0).strip())
+    return found
+
+
+def gate_line(line: str) -> str:
+    """The command a run line runs, without a `||` fallback that re-raises."""
+    fallback = FALLBACK.search(line)
+    if fallback and RERAISE.fullmatch(fallback.group("fallback").strip()):
+        return line[:fallback.start()].strip()
+    return line
 
 
 def step_shell(workflow: dict, job: dict, step: dict, windows: bool) -> str:
@@ -152,6 +186,8 @@ def shell_violation(shell: str, lines: list[str]) -> str | None:
     if program in LAST_STATUS_SHELLS:
         return (f"a multi-command {program} step hides every failure but the last"
                 if len(lines) > 1 else None)
+    if program in SCRIPT_STATUS_SHELLS:
+        return None
     if program not in ERREXIT_SHELLS:
         return f"shell {shell!r} is not known to stop at a failing command"
     flags = [word[1:] for word in words[1:] if word.startswith("-") and not word.startswith("--")]
@@ -201,9 +237,8 @@ def workflow_violations(workflows: dict[str, dict], required: dict[str, dict[str
                     found.append(f"{label}: continue-on-error lets the step fail green")
                 lines = run_lines(step)
                 for line in lines:
-                    for swallower in FAILURE_SWALLOWERS:
-                        if swallower in line:
-                            found.append(f"{label}: {swallower!r} discards the exit status")
+                    for swallower in discarded_status(line):
+                        found.append(f"{label}: {swallower!r} discards the exit status")
                 problem = shell_violation(step_shell(workflow, job, step, windows), lines) if lines else None
                 if problem:
                     found.append(f"{label}: {problem}")
@@ -216,7 +251,8 @@ def workflow_violations(workflows: dict[str, dict], required: dict[str, dict[str
             if "if" in job:
                 found.append(f"{where}: a conditional job can stop running its gates")
             for command in commands:
-                steps = [step for step in job.get("steps") or [] if command in run_lines(step)]
+                steps = [step for step in job.get("steps") or []
+                         if command in map(gate_line, run_lines(step))]
                 if not steps:
                     found.append(f"{where}: gate command missing: {command}")
                 elif any("if" in step for step in steps):
@@ -276,6 +312,22 @@ class WorkflowGateTests(unittest.TestCase):
                            "'set +e' discards the exit status"),
             "exit-zero": (lambda ci: append_to_run(ci["jobs"]["test"], "ruff check .", " --exit-zero"),
                           "'--exit-zero' discards the exit status"),
+            "or-true-unspaced": (lambda ci: append_to_run(ci["jobs"]["test"], unit, "||true"),
+                                 "'||true' discards the exit status"),
+            "or-colon-unspaced": (lambda ci: append_to_run(ci["jobs"]["test"], parity, " ||:"),
+                                  "'||:' discards the exit status"),
+            "or-echo": (lambda ci: append_to_run(ci["jobs"]["test"], unit, " || echo x"),
+                        "'|| echo x' discards the exit status"),
+            "or-echo-then-exit-0": (lambda ci: append_to_run(ci["jobs"]["test"], unit,
+                                                             " || { echo failed; exit 0; }"),
+                                    "'|| { echo failed; exit 0; }' discards the exit status"),
+            "set-two-spaces-plus-e": (lambda ci: rewrite(ci["jobs"]["test"], unit, run=f"set  +e\n{unit}"),
+                                      "'set  +e' discards the exit status"),
+            "set-plus-eu": (lambda ci: rewrite(ci["jobs"]["test"], unit, run=f"set -x +eu\n{unit}"),
+                            "'set -x +eu' discards the exit status"),
+            "set-plus-o-errexit": (lambda ci: rewrite(ci["jobs"]["test"], unit,
+                                                      run=f"set +o errexit\n{unit}"),
+                                   "'set +o errexit' discards the exit status"),
             "branch-filter": (lambda ci: ci[True].update({"pull_request": {"branches": ["main"]}}),
                               "a 'branches' filter on pull_request skips the gates"),
             "paths-filter": (lambda ci: ci[True].update({"pull_request": {"paths": ["docs/**"]}}),
@@ -336,6 +388,17 @@ class WorkflowGateTests(unittest.TestCase):
             "extra-activity-type": lambda ci: ci[True].update({"pull_request": {
                 "types": ["opened", "synchronize", "reopened", "ready_for_review"]}}),
             "timeout": rewrite(**{"timeout-minutes": 20}),
+            "or-exit-1": rewrite(run=f"{unit} || exit 1"),
+            "or-exit-status": rewrite(run=f"{unit} || exit $?"),
+            "or-echo-then-exit-1": rewrite(run=f'{unit} || {{ echo "unit tests failed"; exit 1; }}'),
+            "set-plus-x": rewrite(run=f"set +x\n{unit}"),
+            # An uncaught exception or sys.exit(n) is the step's exit status.
+            "python-script-step": lambda ci: ci["jobs"]["test"]["steps"].append({
+                "name": "Python script", "shell": "python {0}",
+                "run": "import subprocess\nsubprocess.run(['ruff', 'check', '.'], check=True)\n"}),
+            "python-keyword-step": lambda ci: ci["jobs"]["test"]["steps"].append({
+                "name": "Python keyword", "shell": "python",
+                "run": "import sys\nprint(sys.version)\n"}),
         }
         for label, edit in edits.items():
             with self.subTest(edit=label):
