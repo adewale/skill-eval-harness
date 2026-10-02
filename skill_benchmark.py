@@ -256,7 +256,7 @@ KNOWN_ANSWER_ASSERTIONS = frozenset({
 # A capability suite whose without_skill arm already passes this share of runs
 # has little room to show lift; quality at lower cost is the better objective.
 SUITE_HEADROOM_CEILING = 0.95
-TRIGGER_HARNESS_IDENTITY_VERSION = 2
+TRIGGER_HARNESS_IDENTITY_VERSION = 3
 # Conservative at module granularity: skill_benchmark.py still combines trigger
 # and non-trigger orchestration, so every edit to that monolith invalidates the
 # trigger identity until its owners are extracted.
@@ -264,6 +264,7 @@ TRIGGER_IDENTITY_MODULES = (
     "ablation_model.py",
     "agent_capabilities.py",
     "completion_contracts.py",
+    "content_digests.py",
     "experimental_pairs.py",
     "invocation_contracts.py",
     "json_contracts.py",
@@ -3012,8 +3013,12 @@ def validate_trigger_harness_identity(identity: Any, label: str) -> dict[str, An
     if not isinstance(identity, dict):
         raise TypeError(f"{label} harness_identity must be an object")
     payload = {key: value for key, value in identity.items() if key != "identity_sha256"}
-    if (type(identity.get("schema_version")) is not int
-            or identity.get("schema_version") != TRIGGER_HARNESS_IDENTITY_VERSION
+    version = identity.get("schema_version")
+    if type(version) is int and version != TRIGGER_HARNESS_IDENTITY_VERSION:
+        raise ValueError(
+            f"{label} was produced by trigger harness identity v{version}; this harness "
+            f"reads v{TRIGGER_HARNESS_IDENTITY_VERSION}. Regenerate the report.")
+    if (type(version) is not int
             or canonical_json_sha256(payload) != identity.get("identity_sha256")):
         raise ValueError(f"{label} harness_identity does not match its identity_sha256")
     modules = identity.get("modules")
@@ -14691,22 +14696,19 @@ def _validated_trigger_protocol(
                 die(
                     f"{label} matrix protocol adapter {agent!r} must use "
                     f"{known_implementation}, got {implementation}")
-            # The first set is what the adapter requires today; any later set
-            # is an earlier protocol that reports already saved may declare.
             known_requirements = {
-                "claude": ({"config_isolated": True},),
-                "codex": ({"codex_home_outside_workdir": True},),
-                "pi": ({"config_isolated": True, "pi_home_outside_workdir": True},
-                       {"config_isolated": True}),
-                "stub": ({},),
-                "vibe": ({"config_isolated": True,
-                          "vibe_home_outside_workdir": True},),
+                "claude": {"config_isolated": True},
+                "codex": {"codex_home_outside_workdir": True},
+                "pi": {"config_isolated": True, "pi_home_outside_workdir": True},
+                "stub": {},
+                "vibe": {"config_isolated": True,
+                         "vibe_home_outside_workdir": True},
             }.get(agent)
             if (known_requirements is not None
-                    and required_mapping not in known_requirements):
+                    and required_mapping != known_requirements):
                 die(
                     f"{label} matrix protocol adapter {agent!r} must require "
-                    f"{known_requirements[0]}, got {required_mapping}")
+                    f"{known_requirements}, got {required_mapping}")
             if agent in requirements:
                 die(f"{label} matrix protocol duplicates adapter {agent!r}")
             requirements[agent] = {
@@ -14720,34 +14722,8 @@ def _validated_trigger_protocol(
                 if pair in configured_pairs:
                     die(f"{label} matrix protocol duplicates agent/model {pair!r}")
                 configured_pairs.add(pair)
-    elif producer == "skill-pi-trigger-eval":
-        model = protocol.get("model")
-        required = protocol.get("required_observations")
-        required_mapping = (
-            string_keyed_dict(
-                required, f"{label} Pi protocol required_observations")
-            if isinstance(required, dict) else None
-        )
-        if (protocol.get("adapter") != "pi"
-                or (model is not None and (not isinstance(model, str) or not model.strip()))
-                or not isinstance(protocol.get("command"), dict)
-                or not isinstance(protocol.get("producer_sha256"), str)
-                or re.fullmatch(
-                    r"sha256:[0-9a-f]{64}", protocol.get("producer_sha256", "")) is None
-                or required_mapping is None
-                or any(not isinstance(key, str) or type(value) is not bool
-                       for key, value in required_mapping.items())):
-            die(f"{label} Pi trigger protocol is malformed")
-        configured_pairs.add(("pi", model))
-        if required_mapping != {"config_isolated": True}:
-            die(
-                f"{label} Pi trigger protocol must require config_isolated=true")
-        requirements["pi"] = {
-            key: value for key, value in required_mapping.items()
-            if type(value) is bool
-        }
     else:
-        die(f"{label} protocol producer must be skill-trigger-matrix or skill-pi-trigger-eval")
+        die(f"{label} protocol producer must be skill-trigger-matrix")
     if configured_pairs != design_pairs:
         die(
             f"{label} protocol agent/model design disagrees with its report: "

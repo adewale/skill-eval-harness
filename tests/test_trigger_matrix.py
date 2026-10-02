@@ -1433,9 +1433,10 @@ def trigger_report(rows, *, ablation=None, provenance=None, tree_hash=BASE_HASH,
 
 
 class PiProtocolRequirementTests(unittest.TestCase):
-    """A Pi report declares the isolation controls it ran under. Reports made
-    before Pi's home moved out of its working directory stay readable; any
-    other control set is refused."""
+    """A Pi report declares the isolation controls it ran under, and only the
+    controls the adapter requires today are accepted. Reports from before Pi's
+    home moved out of its working directory carry an older harness identity
+    and are refused before this check."""
 
     def protocol(self, required):
         adapter = tm.PiAdapter().protocol_parameters()
@@ -1453,15 +1454,21 @@ class PiProtocolRequirementTests(unittest.TestCase):
         declared = tm.PiAdapter().protocol_parameters()["required_observations"]
         self.assertEqual(self.validate(declared), {"pi": declared})
 
-    def test_a_report_from_before_the_move_is_still_read(self):
-        self.assertEqual(self.validate({"config_isolated": True}),
-                         {"pi": {"config_isolated": True}})
-
     def test_any_other_control_set_is_refused(self):
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
-            self.validate({"pi_home_outside_workdir": True})
-        self.assertIn("must require", stderr.getvalue())
+        for required in ({"config_isolated": True}, {"pi_home_outside_workdir": True}):
+            stderr = io.StringIO()
+            with self.subTest(required=required), contextlib.redirect_stderr(stderr), \
+                    self.assertRaises(SystemExit):
+                self.validate(required)
+            self.assertIn("must require", stderr.getvalue())
+
+    def test_a_report_from_an_older_harness_identity_is_refused_by_name(self):
+        identity = sb.trigger_harness_identity()
+        payload = {key: value for key, value in identity.items() if key != "identity_sha256"}
+        payload["schema_version"] = sb.TRIGGER_HARNESS_IDENTITY_VERSION - 1
+        older = {**payload, "identity_sha256": sb.canonical_json_sha256(payload)}
+        with self.assertRaisesRegex(ValueError, "identity v2; this harness reads v3. Regenerate"):
+            sb.validate_trigger_harness_identity(older, "baseline")
 
 
 class TriggerComparisonTests(unittest.TestCase):
