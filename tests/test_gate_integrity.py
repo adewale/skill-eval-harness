@@ -10,7 +10,7 @@ These tests close those holes:
 * ``WorkflowGateTests`` parse the workflows and require every gate command to
   run unconditionally, in the job that owns it, on every supported Python, on
   an unfiltered gated event, and in a shell that fails the step at the first
-  failing command;
+  failing command, and require the release to repeat every gate CI runs;
 * ``CollectionParityCheckTests`` feed ``scripts/check_test_collection_parity.py``
   planted pytest-only and unittest-only tests;
 * ``SkipLedgerTests`` require every skip to be ledgered with its reason (a
@@ -74,13 +74,32 @@ REQUIRED_GATE_COMMANDS = {
         ],
     },
     # A release is cut from a tag CI may never have run, so the publish job
-    # runs the suite and checks the exact wheel it uploads.
+    # repeats every gate of CI's test job (RELEASE_FORMS) and checks the exact
+    # wheel it uploads.
     "publish.yml": {
         "publish": [
-            "python -m unittest discover tests",
+            ("python -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py "
+             "examples/demo-skill/*.py type_tests/*.py tests/*.py"),
+            "ruff check .",
+            "ty check --error-on-warning --output-format github",
+            "python -m unittest discover tests -v",
+            "python scripts/check_test_collection_parity.py",
             "python scripts/check_installed_wheel.py --wheel dist/*.whl",
+            "/tmp/skill-eval-wheel-smoke/bin/skill-benchmark --help",
+            "/tmp/skill-eval-wheel-smoke/bin/skill-pi-trigger-eval --help",
+            "/tmp/skill-eval-wheel-smoke/bin/skill-trigger-matrix --help",
         ],
     },
+}
+
+# The release form of a CI test-job gate that the publish job runs differently:
+# against the wheel it built and installed rather than the checkout. Every
+# other CI test-job gate must appear in the publish job as the same line.
+RELEASE_FORMS = {
+    "python scripts/check_installed_wheel.py": "python scripts/check_installed_wheel.py --wheel dist/*.whl",
+    "python skill_benchmark.py --help": "/tmp/skill-eval-wheel-smoke/bin/skill-benchmark --help",
+    "python run_pi_trigger_eval.py --help": "/tmp/skill-eval-wheel-smoke/bin/skill-pi-trigger-eval --help",
+    "python run_trigger_matrix.py --help": "/tmp/skill-eval-wheel-smoke/bin/skill-trigger-matrix --help",
 }
 
 # The event each gated workflow must run on: CI gates every pull request, and
@@ -202,7 +221,12 @@ def workflow_violations(workflows: dict[str, dict], required: dict[str, dict[str
                     found.append(f"{where}: gate command missing: {command}")
                 elif any("if" in step for step in steps):
                     found.append(f"{where}: gate command runs conditionally: {command}")
-    test_job = workflows.get("ci.yml", {}).get("jobs", {}).get("test", {})
+    if "publish.yml" in required:
+        release = set(required["publish.yml"].get("publish", []))
+        for command in required.get("ci.yml", {}).get("test", []):
+            if RELEASE_FORMS.get(command, command) not in release:
+                found.append(f"publish.yml job publish: does not repeat the pull request gate {command}")
+    test_job =workflows.get("ci.yml", {}).get("jobs", {}).get("test", {})
     matrix = {str(version) for version in
               ((test_job.get("strategy") or {}).get("matrix") or {}).get("python-version", [])}
     floor, classifiers = declared_python_versions(pyproject)
@@ -319,6 +343,30 @@ class WorkflowGateTests(unittest.TestCase):
                 edit(workflows["ci.yml"])
                 self.assertEqual(
                     workflow_violations(workflows, REQUIRED_GATE_COMMANDS, self.pyproject), [])
+
+    def test_a_release_that_skips_a_pull_request_gate_is_reported(self):
+        released = (
+            ("python -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py "
+             "examples/demo-skill/*.py type_tests/*.py tests/*.py"),
+            "ruff check .",
+            "ty check --error-on-warning --output-format github",
+            "python -m unittest discover tests -v",
+            "python scripts/check_test_collection_parity.py",
+            "python scripts/check_installed_wheel.py --wheel dist/*.whl",
+        )
+        for command in released:
+            with self.subTest(removed=command):
+                workflows = copy.deepcopy(self.workflows)
+                job = workflows["publish.yml"]["jobs"]["publish"]
+                job["steps"] = [s for s in job["steps"] if command not in run_lines(s)]
+                self.assertIn(f"publish.yml job publish: gate command missing: {command}",
+                              workflow_violations(workflows, REQUIRED_GATE_COMMANDS, self.pyproject))
+        # A gate added to CI's table but not to the release's.
+        required = copy.deepcopy(REQUIRED_GATE_COMMANDS)
+        required["ci.yml"]["test"].append("python scripts/new_gate.py")
+        self.assertIn("publish.yml job publish: does not repeat the pull request gate "
+                      "python scripts/new_gate.py",
+                      workflow_violations(self.workflows, required, self.pyproject))
 
 
 # --------------------------------------------------------------------------- #

@@ -806,9 +806,9 @@ proves nothing until an old artifact is read.
   disagrees with a hand-built fixture, the recorded sample wins and becomes a fixture.
 - Give every gate a test with a planted violation. `tests/test_gate_integrity.py` rejects a CI step
   that cannot fail and requires every skip to be a ledgered live smoke or platform gate. A release
-  runs the unit tests on the release tag and checks the exact wheel it uploads; it does not repeat
-  the compile, ruff, ty, or collection-parity gates a pull request runs, so tag a commit whose CI
-  passed.
+  repeats every gate of CI's test job on the release tag (compile, ruff, ty, the unit tests,
+  collection parity) and checks the exact wheel it uploads; the gate test fails when a CI gate has
+  no release counterpart.
 - A guard cited by name must exist on this branch and run in CI; a guard on another branch is a plan.
 - Bump an identity version whenever its inventory changes, and test any "still reads" claim in an
   upgrade note against an artifact the previous release produced.
