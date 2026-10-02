@@ -656,19 +656,20 @@ class StubMatrixOfflineTests(unittest.TestCase):
 
 class TriggerCliStatusTests(unittest.TestCase):
     def test_matrix_cli_exits_nonzero_for_an_incomplete_report(self):
-        report = {
-            "summary": {"measurement_status": "incomplete"},
-            "matrix": [],
-            "results": [],
-        }
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(tm, "run_matrix", return_value=report), \
-             mock.patch.object(tm, "print_matrix"), \
+        # Only the Pi process boundary is replaced: the matrix itself decides
+        # that crashed queries leave the measurement incomplete.
+        def crash(plan):
+            raise RuntimeError("provider unavailable")
+
+        with tempfile.TemporaryDirectory() as td, pi_runs(crash), \
+             contextlib.redirect_stdout(io.StringIO()), \
              mock.patch.object(sys, "argv", [
-                 "skill-trigger-matrix", str(DEMO_MANIFEST), "--agent", "stub",
-                 "--out", str(Path(td) / "report.json"),
+                 "skill-trigger-matrix", str(DEMO_MANIFEST), "--agent", "pi",
+                 "--runs-per-query", "1", "--out", str(Path(td) / "report.json"),
              ]):
             self.assertEqual(tm.main(), 1)
+            report = json.loads((Path(td) / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["summary"]["measurement_status"], "incomplete")
 
     def test_a_crashed_pi_query_is_an_incomplete_row_not_a_crashed_run(self):
         def crash(plan):
