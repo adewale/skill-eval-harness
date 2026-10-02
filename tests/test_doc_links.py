@@ -24,6 +24,7 @@ skills whose `references/*.md` live in the source repo, not this tree); so is
 `.github/` templating, which is not narrative docs.
 """
 import re
+import tempfile
 import unittest
 from pathlib import Path
 from urllib.parse import unquote
@@ -129,28 +130,62 @@ def relative_targets(text):
         yield target, path, frag
 
 
-class DocLinkTests(unittest.TestCase):
-    def _slugs_for(self, md, path):
-        target = md if not path else (md.parent / path)
-        if target.suffix == ".md" and target.exists():
-            return heading_slugs(target.read_text(encoding="utf-8"))
-        return None
+def _slugs_for(md, path):
+    target = md if not path else (md.parent / path)
+    if target.suffix == ".md" and target.exists():
+        return heading_slugs(target.read_text(encoding="utf-8"))
+    return None
 
+
+def broken_links(doc_files, root):
+    """(broken links, number of relative links checked) across ``doc_files``."""
+    broken, checked = [], 0
+    for md in doc_files:
+        text = md.read_text(encoding="utf-8")
+        for target, path, frag in relative_targets(text):
+            checked += 1
+            if path and not (md.parent / path).exists():
+                broken.append(f"{md.relative_to(root)} -> {target} (missing file)")
+                continue
+            if frag:
+                slugs = _slugs_for(md, path)
+                # case-exact: GitHub ids are lowercase, so a mixed-case #Anchor
+                # does not navigate even when the slug exists.
+                if slugs is not None and frag not in slugs:
+                    broken.append(f"{md.relative_to(root)} -> {target} (missing anchor #{frag})")
+    return broken, checked
+
+
+class DocLinkTests(unittest.TestCase):
     def test_relative_doc_links_resolve(self):
-        broken = []
-        for md in DOC_FILES:
-            text = md.read_text(encoding="utf-8")
-            for target, path, frag in relative_targets(text):
-                if path and not (md.parent / path).exists():
-                    broken.append(f"{md.relative_to(ROOT)} -> {target} (missing file)")
-                    continue
-                if frag:
-                    slugs = self._slugs_for(md, path)
-                    # case-exact: GitHub ids are lowercase, so a mixed-case #Anchor
-                    # does not navigate even when the slug exists.
-                    if slugs is not None and frag not in slugs:
-                        broken.append(f"{md.relative_to(ROOT)} -> {target} (missing anchor #{frag})")
+        broken, checked = broken_links(DOC_FILES, ROOT)
+        # A link pattern that stopped matching would pass vacuously.
+        self.assertGreater(checked, 200, "the link scanner found suspiciously few links")
         self.assertEqual(broken, [], "broken relative doc links:\n" + "\n".join(broken))
+
+    def test_planted_broken_links_are_reported_and_examples_are_not(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "target.md").write_text(
+                "# Real Heading\n\nSetext Heading\n--------------\n\n# Real Heading\n",
+                encoding="utf-8")
+            (root / "source.md").write_text(
+                "---\nlink: [front](missing-front.md)\n---\n"
+                "[ok](target.md) [anchor](target.md#real-heading) [repeat](target.md#real-heading-1)\n"
+                "[setext](target.md#setext-heading) [spaced](<target.md>) [web](https://example.com/x.md)\n"
+                "[gone](missing.md) [bad anchor](target.md#no-such-heading) [case](target.md#Real-Heading)\n"
+                "[ref]: also-missing.md\n"
+                "Inline `[code](missing.md)` and ``[double](missing.md)`` are examples.\n"
+                "~~~~md\n[fenced](missing.md)\n~~~\n[still fenced](missing.md)\n~~~~\n",
+                encoding="utf-8")
+            broken, checked = broken_links([root / "source.md"], root)
+        self.assertEqual(checked, 9)  # the external link and the five code or frontmatter examples are not checked
+        self.assertEqual(broken, [
+            "source.md -> missing.md (missing file)",
+            "source.md -> target.md#no-such-heading (missing anchor #no-such-heading)",
+            "source.md -> target.md#Real-Heading (missing anchor #Real-Heading)",
+            "source.md -> also-missing.md (missing file)",
+        ])
 
 
 if __name__ == "__main__":
