@@ -146,8 +146,9 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
         self.assertFalse(interval["bounded"])
         self.assertIsNone(interval["lower"])
         self.assertIn("at least 6", interval["reason"])
-        # 2 / 2**6 = 0.03125 <= 0.05: the sixth case makes a bound possible.
-        self.assertTrue(ee.sign_flip_interval([0.5] * 6)["bounded"])
+        # 2 / 2**6 = 0.03125 <= 0.05: the sixth case makes a bound possible
+        # (one that differs, since a constant sample cannot be bounded).
+        self.assertTrue(ee.sign_flip_interval([0.5] * 5 + [0.25])["bounded"])
 
     def test_sampled_path_is_deterministic_and_order_invariant(self):
         rng = random.Random(3)
@@ -191,7 +192,7 @@ class NoiseCheckTests(unittest.TestCase):
         self.assertGreater(result["projected_cases"], len(deltas))
 
     def test_resolvable_when_the_floor_is_small(self):
-        deltas = [0.5] * 12
+        deltas = [0.5] * 11 + [0.25]
         result = self.check(deltas, [0.2] * 12, min_lift=0.3)
         self.assertEqual(result["verdict"], "resolvable")
 
@@ -202,16 +203,34 @@ class NoiseCheckTests(unittest.TestCase):
         self.assertEqual(ee.cases_needed_for_alpha(0.01), 8)
 
     def test_six_cases_moving_together_are_enough(self):
-        # The boundary next to the blog split: six cases that all gain one full
-        # run reach p = 2/2**6 = 0.03125 <= 0.05. Every shift but +1 leaves six
-        # same-sign deltas the test rejects, so the interval is the point
-        # [1, 1], the noise floor is 0 and the eval can resolve the lift.
-        result = self.check([1.0] * 6, [0.0] * 6)
+        # The boundary next to the blog split: six cases that all improve reach
+        # p = 2/2**6 = 0.03125 <= 0.05. Five gain all three runs and one gains
+        # two: every shift outside [2/3, 1] leaves six same-sign deltas the
+        # test rejects, so the noise floor is (1 - 2/3) / 2.
+        result = self.check([1.0] * 5 + [2 / 3], [0.0] * 6)
         self.assertEqual(result["cases_moved"], 6)
         self.assertEqual(result["smallest_achievable_p"], 0.03125)
-        self.assertEqual(result["noise_floor"], 0.0)
+        self.assertAlmostEqual(result["noise_floor"], 1 / 6, places=5)
         self.assertEqual(result["verdict"], "resolvable")
 
+
+    def test_a_constant_sample_cannot_be_bounded(self):
+        # The sign-flip test reads only signs, so it rejects every shift but
+        # the common value of a constant sample; the point [v, v] that
+        # inverting it gives is no measure of how large the lift is. The
+        # interval says so, and the noise check cannot call any --min-lift
+        # resolvable, though the lift itself is significant.
+        for deltas in ([1.0] * 6, [0.5] * 12, [0.0] * 7):
+            with self.subTest(deltas=deltas):
+                interval = ee.sign_flip_interval(deltas)
+                self.assertFalse(interval["bounded"])
+                self.assertEqual((interval["lower"], interval["upper"]), (None, None))
+                self.assertIn("every paired delta is the same", interval["reason"])
+        result = self.check([1.0] * 6, [0.0] * 6, min_lift=0.5)
+        self.assertEqual(result["verdict"], "unbounded")
+        self.assertIsNone(result["noise_floor"])
+        self.assertIn("every paired delta is the same", result["reason"])
+        self.assertTrue(ee.sign_flip_test([1.0] * 6)["significant_at_0_05"])
 
 class PairedSummaryTests(unittest.TestCase):
     def rows(self, pairs):
@@ -223,14 +242,14 @@ class PairedSummaryTests(unittest.TestCase):
         return out
 
     def test_summary_carries_interval_and_noise_check(self):
-        summary = sb.build_paired_summary(self.rows([(1.0, 0.0)] * 8), min_lift=0.2)
+        summary = sb.build_paired_summary(self.rows([(1.0, 0.0)] * 7 + [(1.0, 0.5)]), min_lift=0.2)
         self.assertTrue(summary["interval"]["bounded"])
         self.assertGreater(summary["interval"]["lower"], 0)
         self.assertEqual(summary["noise_check"]["cases_moved"], 8)
         self.assertEqual(summary["noise_check"]["min_lift"], 0.2)
 
     def test_blocked_pairing_moves_both_to_observed(self):
-        rows = self.rows([(1.0, 0.0)] * 8)
+        rows = self.rows([(1.0, 0.0)] * 7 + [(1.0, 0.5)])
         rows.append(result_row("orphan", "with_skill", rate=1.0, run_number=1))
         summary = sb.build_paired_summary(rows)
         self.assertEqual(summary["availability"], "partial")

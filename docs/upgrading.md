@@ -166,6 +166,12 @@ that file still invalidates trigger identity until those owners are extracted in
   exact p = 0.03125 and is significant. A saved report with more than 14 paired units can
   change `significance`, `interval` and `method` (from `...-sampled` to `...-exact`) when
   regraded.
+- When every paired delta is equal (every case gained one full run, say), the interval was the
+  point `[v, v]`, so `noise_check` read `noise_floor: 0` and `resolvable` for any `--min-lift`. A
+  sign-flip test reads only signs and cannot bound a constant sample, so the interval now reads
+  `bounded: false` with a `reason`, the noise check reads `unbounded` with the same `reason`, and
+  `audit-manifest --runs` reports `underpowered-eval` (mark 4 `concern`). `significance` is
+  unchanged.
 
 - Codex trace normalization no longer counts the stream's opening `thread.started` event as a
   file read. `file_reads` was one too high on every Codex run; the count is written when a trace

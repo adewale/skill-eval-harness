@@ -20046,7 +20046,12 @@ def run_measured_findings(report: dict[str, Any]) -> list[Finding]:
             "room to show lift, so hold quality and optimise cost or latency instead",
             {"without_skill_capability_rate": rate}))
     noise = paired.get("noise_check") or {}
-    if noise.get("verdict") not in (None, "no-data", "resolvable"):
+    if noise.get("verdict") == "unbounded" and noise.get("reason"):
+        out.append(Finding(
+            FindingKind.UNDERPOWERED_EVAL,
+            "the lift interval has no bounds, so the noise check cannot say how large the "
+            f"lift is or compare it with --min-lift ({noise['reason']})", noise))
+    elif noise.get("verdict") not in (None, "no-data", "resolvable"):
         out.append(Finding(
             FindingKind.UNDERPOWERED_EVAL,
             f"the eval cannot resolve the lift it is meant to measure ({noise['verdict']})",

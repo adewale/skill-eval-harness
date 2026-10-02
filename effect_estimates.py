@@ -320,7 +320,9 @@ def sign_flip_interval(deltas: Sequence[float], *, confidence: float = DEFAULT_C
     Returns ``bounded: False`` with null endpoints when the test cannot reject
     any shift at all, which happens when there are too few cases (five or fewer
     at 95%, since 2 / 2**5 > 0.05): the data cannot rule anything out, and
-    printing an interval would claim a precision the eval does not have.
+    printing an interval would claim a precision the eval does not have. It
+    does the same when every delta is equal: the test reads only signs, so it
+    rejects every shift but that value, and the point it leaves is no bound.
     """
     if not 0 < confidence < 1:
         raise ValueError("confidence must lie strictly between 0 and 1")
@@ -352,6 +354,10 @@ def sign_flip_interval(deltas: Sequence[float], *, confidence: float = DEFAULT_C
                 "reason": (f"{n} paired case(s) cannot exclude any lift at "
                            f"{confidence:.0%}; the test needs at least "
                            f"{cases_needed_for_alpha(alpha)} cases that differ between arms")}
+    if values[0] == values[-1]:
+        return {**base, "method": method, "lower": None, "upper": None, "bounded": False,
+                "reason": (f"every paired delta is the same ({values[0]:g}); a sign-flip "
+                           "test reads only signs, so it cannot bound a constant sample")}
     return {**base, "method": method, "lower": round(lower, 6), "upper": round(upper, 6),
             "bounded": True}
 
@@ -407,6 +413,8 @@ def noise_check(deltas: Sequence[float], without_rates: Sequence[float], *,
         "noise_floor": floor,
         "headroom": headroom,
     }
+    if verdict is NoiseVerdict.UNBOUNDED and interval.get("reason"):
+        out["reason"] = interval["reason"]
     if min_lift is not None:
         out["min_lift"] = min_lift
     target = min_lift if min_lift is not None else headroom

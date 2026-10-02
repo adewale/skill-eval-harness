@@ -341,6 +341,24 @@ class RunMeasuredFindingTests(unittest.TestCase):
         report = self.report(paired_summary={"noise_check": {"verdict": "resolvable"}})
         self.assertEqual(sb.run_measured_findings(report), [])
 
+    def test_a_constant_lift_says_why_mark_four_cannot_be_read(self):
+        # Every case goes from fail to pass, so every delta is +1. The test
+        # shows a lift, but its interval cannot bound a constant sample, so
+        # mark 4 cannot compare the noise with --min-lift and says why.
+        cases = [case(f"c{i}") for i in range(6)] + [case("adv", kind="adversarial")]
+        lift = {"with_skill": "alpha", "without_skill": "none"}
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), cases, {item["id"]: lift for item in cases})
+            report = sb.build_benchmark_report(fx.path, fx.runs)
+            audit = fx.audit(min_lift=0.2)
+        self.assertTrue(report["paired_summary"]["significance"]["significant_at_0_05"])
+        self.assertEqual(report["paired_summary"]["noise_check"]["verdict"], "unbounded")
+        underpowered = [item for item in audit["findings"] if item["kind"] == "underpowered-eval"]
+        self.assertEqual(len(underpowered), 1)
+        self.assertIn("every paired delta is the same", underpowered[0]["message"])
+        self.assertIn("cannot say how large", underpowered[0]["message"])
+        self.assertEqual(marks(audit)["noise-below-min-lift"]["status"], "concern")
+
 
 if __name__ == "__main__":
     unittest.main()
