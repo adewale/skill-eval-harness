@@ -17084,7 +17084,7 @@ def build_benchmark_report(
     paired_summary = build_paired_summary(results, min_lift=min_lift)
     # The edit's own effect when the run carries an old_skill arm.
     edit_summary = paired_edit_summary(results, min_lift=min_lift)
-    pairing_blocked = paired_summary.get("availability") != "complete"
+    pairing_block_reasons = set(paired_summary["pairing"]["blocked_reason_counts"])
     unscorable_results = [row for row in results if not scorable_run(row)]
     grading_blocked_results = [
         row for row in results
@@ -17165,15 +17165,16 @@ def build_benchmark_report(
                 block["reason"] = judge_reason
     # Why the report is partial, one code per root cause; availability is
     # derived from this list so the two cannot disagree. A pending judge
-    # verdict also leaves its row's grading partial and blocks its pair, and an
-    # unscorable run blocks its pair, so those consequences are not listed again.
+    # verdict also leaves its row's grading partial, and an unscorable run
+    # blocks its pair, so those consequences are not listed again; a pair
+    # blocked for any other reason (effort_mismatch) is listed beside them.
     incomplete_reasons = [reason for reason, present in (
         ("answer_design_incomplete", not design_coverage["complete"]),
         ("unscorable_answer_attempts", bool(unscorable_results)),
         ("deferred_judge_verdicts", bool(deferred_judge_tasks)),
         ("grading_evidence_incomplete", any(
             not row.get("deferred_judge_tasks") for row in grading_blocked_results)),
-        ("incomplete_answer_pairing", pairing_blocked and not unscorable_results),
+        ("incomplete_answer_pairing", bool(pairing_block_reasons - {"unscorable_arm"})),
     ) if present]
     if not design_coverage["complete"]:
         reason = "answer_design_incomplete"

@@ -15,6 +15,7 @@ from helpers import (
     judge_with_stub,
     run_cli,
     write_demo_manifest,
+    write_run,
 )
 
 import skill_benchmark as sb
@@ -180,6 +181,39 @@ class ReadinessGateTests(unittest.TestCase):
             "contrast_id": "skill_presence", "eligible_pairs": 1, "blocked_pairs": 0,
             "blocked_reason_counts": {}, "not_applicable_pairs": 1})
         self.assertEqual(report["paired_summary"]["absolute_delta"], 1.0)
+
+    def test_arms_run_at_different_effort_leave_the_benchmark_incomplete(self):
+        # Case a's arms ran at different effort, so its pair is blocked. That
+        # cause is listed on its own, and beside an unscorable run elsewhere
+        # rather than hidden by it; either way the readiness gate fails.
+        def effort(level):
+            return {"effort": {"requested": level, "applied_by": "claude --effort"}}
+        rows = (
+            ("effort only", "none",
+             ["incomplete_answer_pairing"], {"effort_mismatch": 1}),
+            ("effort beside an unscorable run", None,
+             ["unscorable_answer_attempts", "incomplete_answer_pairing"],
+             {"effort_mismatch": 1, "unscorable_arm": 1}),
+        )
+        for label, b_without, reasons, blocked in rows:
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), [case("a"), case("b", kind="adversarial")])
+                write_run(fx.runs / "a" / "with_skill", "alpha", metadata=effort("high"))
+                write_run(fx.runs / "a" / "without_skill", "none", metadata=effort("low"))
+                write_run(fx.runs / "b" / "with_skill", "alpha", metadata=effort("high"))
+                if b_without is None:
+                    (fx.runs / "b" / "without_skill").mkdir(parents=True)
+                else:
+                    write_run(fx.runs / "b" / "without_skill", b_without, metadata=effort("high"))
+                attest_answer_design(fx.path, fx.runs)
+                report = sb.build_benchmark_report(fx.path, fx.runs)
+                code, stderr = fx.cli("--fail-on", "blockers")
+                self.assertEqual(report["availability"], "partial")
+                self.assertEqual(report["incomplete_reasons"], reasons)
+                self.assertEqual(report["paired_summary"]["pairing"]["blocked_reason_counts"], blocked)
+                self.assertEqual(code, 1)
+                self.assertIn("the benchmark report is incomplete", stderr)
+                self.assertIn("some pairs are blocked", stderr)
 
 class KnownAnswerTests(unittest.TestCase):
     def test_a_reference_answer_that_fails_its_own_checks_is_a_grader_finding(self):
