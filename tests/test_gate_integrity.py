@@ -8,7 +8,9 @@ skip on an ordinary test; or a live smoke whose gate variable was renamed.
 These tests close those holes:
 
 * ``WorkflowGateTests`` parse the workflows and require every gate command to
-  run unconditionally, in the job that owns it, on every supported Python;
+  run unconditionally, in the job that owns it, on every supported Python, on
+  an unfiltered gated event, and in a shell that fails the step at the first
+  failing command;
 * ``CollectionParityCheckTests`` feed ``scripts/check_test_collection_parity.py``
   planted pytest-only and unittest-only tests;
 * ``SkipLedgerTests`` require every skip to be ledgered with its reason, and
@@ -83,8 +85,18 @@ REQUIRED_GATE_COMMANDS = {
 # the publish job gates every release.
 REQUIRED_TRIGGERS = {"ci.yml": "pull_request", "publish.yml": "release"}
 
+# Trigger filters that skip a workflow on changes they do not match: on the
+# gated event, any of them lets a pull request or release bypass the gates.
+TRIGGER_FILTERS = ("branches", "branches-ignore", "paths", "paths-ignore")
+
 # Shell spellings that turn a failing command into a passing step.
 FAILURE_SWALLOWERS = ("|| true", "|| :", "|| exit 0", "set +e", "--exit-zero")
+
+# GitHub runs the `bash` and `sh` keywords with -e, so the first failing command
+# fails the step; a custom template (`bash {0}`) must ask for -e itself. pwsh,
+# powershell and cmd report only the last command's exit code.
+ERREXIT_SHELLS = ("bash", "sh")
+LAST_STATUS_SHELLS = ("pwsh", "powershell", "cmd")
 
 
 def load_workflows() -> dict[str, dict]:
@@ -94,6 +106,30 @@ def load_workflows() -> dict[str, dict]:
 
 def run_lines(step: dict) -> list[str]:
     return [line.strip() for line in str(step.get("run", "")).splitlines() if line.strip()]
+
+
+def step_shell(workflow: dict, job: dict, step: dict, windows: bool) -> str:
+    """The shell a run step uses: its own, its job's or workflow's default, or the runner's."""
+    for scope in (step, ((job.get("defaults") or {}).get("run") or {}),
+                  ((workflow.get("defaults") or {}).get("run") or {})):
+        if scope.get("shell"):
+            return str(scope["shell"])
+    return "pwsh" if windows else "bash"
+
+
+def shell_violation(shell: str, lines: list[str]) -> str | None:
+    """Why a step's shell can let a failing command pass, if it can."""
+    words = shell.split()
+    program = words[0].rsplit("/", 1)[-1] if words else ""
+    if program in LAST_STATUS_SHELLS:
+        return (f"a multi-command {program} step hides every failure but the last"
+                if len(lines) > 1 else None)
+    if program not in ERREXIT_SHELLS:
+        return f"shell {shell!r} is not known to stop at a failing command"
+    flags = [word[1:] for word in words[1:] if word.startswith("-") and not word.startswith("--")]
+    if len(words) > 1 and not any("e" in flag for flag in flags) and "errexit" not in words:
+        return f"shell {shell!r} drops errexit, so a failing command does not fail the step"
+    return None
 
 
 def declared_python_versions(pyproject: str) -> tuple[str, set[str]]:
@@ -115,6 +151,12 @@ def workflow_violations(workflows: dict[str, dict], required: dict[str, dict[str
         trigger = REQUIRED_TRIGGERS.get(name)
         if name in required and trigger not in triggers:
             found.append(f"{name}: does not run on {trigger}")
+        elif name in required and isinstance(triggers, dict):
+            config = triggers.get(trigger)
+            for key in TRIGGER_FILTERS:
+                if isinstance(config, dict) and key in config:
+                    found.append(f"{name}: a {key!r} filter on {trigger} skips the gates "
+                                 "on changes it does not match")
         for job_id, job in jobs.items():
             where = f"{name} job {job_id}"
             if "continue-on-error" in job:
@@ -129,10 +171,9 @@ def workflow_violations(workflows: dict[str, dict], required: dict[str, dict[str
                     for swallower in FAILURE_SWALLOWERS:
                         if swallower in line:
                             found.append(f"{label}: {swallower!r} discards the exit status")
-                if windows and "shell" not in step and len(lines) > 1:
-                    # pwsh reports only the last command's exit code.
-                    found.append(f"{label}: a multi-command pwsh step hides "
-                                 "every failure but the last")
+                problem = shell_violation(step_shell(workflow, job, step, windows), lines) if lines else None
+                if problem:
+                    found.append(f"{label}: {problem}")
         for job_id, commands in required.get(name, {}).items():
             job = jobs.get(job_id)
             if job is None:
@@ -178,13 +219,45 @@ class WorkflowGateTests(unittest.TestCase):
         def remove_step(job, command):
             job["steps"].remove(step(job, command))
 
+        def rewrite(job, command, **fields):
+            step(job, command).update(fields)
+
         ty = "ty check --error-on-warning --output-format github"
         parity = "python scripts/check_test_collection_parity.py"
+        unit = "python -m unittest discover tests -v"
+        wheel = "python scripts/check_installed_wheel.py"
+        text = 'python -m unittest discover -s tests -p "test_text_contracts.py" -v'
         plants = {
-            "or-true": (lambda ci: append_to_run(ci["jobs"]["test"], "python -m unittest discover tests -v", " || true"),
+            "or-true": (lambda ci: append_to_run(ci["jobs"]["test"], unit, " || true"),
                         "'|| true' discards the exit status"),
+            "or-colon": (lambda ci: append_to_run(ci["jobs"]["test"], parity, " || :"),
+                         "'|| :' discards the exit status"),
+            "or-exit-0": (lambda ci: append_to_run(ci["jobs"]["test"], wheel, " || exit 0"),
+                          "'|| exit 0' discards the exit status"),
+            "set-plus-e": (lambda ci: rewrite(ci["jobs"]["test"], unit, run=f"set +e\n{unit}"),
+                           "'set +e' discards the exit status"),
             "exit-zero": (lambda ci: append_to_run(ci["jobs"]["test"], "ruff check .", " --exit-zero"),
-                          "gate command missing: ruff check ."),
+                          "'--exit-zero' discards the exit status"),
+            "branch-filter": (lambda ci: ci[True].update({"pull_request": {"branches": ["main"]}}),
+                              "a 'branches' filter on pull_request skips the gates"),
+            "paths-filter": (lambda ci: ci[True].update({"pull_request": {"paths": ["docs/**"]}}),
+                             "a 'paths' filter on pull_request skips the gates"),
+            "bash-without-errexit": (lambda ci: rewrite(ci["jobs"]["test"], unit, shell="bash {0}",
+                                                        run=f"{unit}\necho done"),
+                                     "'Run unit tests': shell 'bash {0}' drops errexit"),
+            "job-default-shell": (lambda ci: ci["jobs"]["test"].update(
+                                      {"defaults": {"run": {"shell": "bash -o pipefail {0}"}}}),
+                                  "'Run unit tests': shell 'bash -o pipefail {0}' drops errexit"),
+            "workflow-default-shell": (lambda ci: ci.update({"defaults": {"run": {"shell": "sh {0}"}}}),
+                                       "'Run unit tests': shell 'sh {0}' drops errexit"),
+            "unknown-shell": (lambda ci: rewrite(ci["jobs"]["test"], unit, shell="zsh {0}"),
+                              "shell 'zsh {0}' is not known to stop at a failing command"),
+            "explicit-pwsh-multiline": (lambda ci: rewrite(ci["jobs"]["windows-text-contracts"], text,
+                                                           shell="pwsh", run=f"{text}\necho done"),
+                                        "'Run text-contract tests': a multi-command pwsh step hides"),
+            "powershell-multiline": (lambda ci: rewrite(ci["jobs"]["test"], parity, shell="powershell",
+                                                        run=f"{parity}\necho done"),
+                                     "a multi-command powershell step hides every failure but the last"),
             "continue-on-error": (lambda ci: step(ci["jobs"]["test"], ty).update({"continue-on-error": True}),
                                   "continue-on-error lets the step fail green"),
             "if-false": (lambda ci: step(ci["jobs"]["windows-text-contracts"], ty).update({"if": False}),
@@ -205,6 +278,29 @@ class WorkflowGateTests(unittest.TestCase):
                 plant(workflows["ci.yml"])
                 violations = workflow_violations(workflows, REQUIRED_GATE_COMMANDS, self.pyproject)
                 self.assertTrue(any(expected in v for v in violations), violations)
+
+    def test_edits_that_keep_every_gate_able_to_fail_are_not_reported(self):
+        unit = "python -m unittest discover tests -v"
+
+        def rewrite(**fields):
+            return lambda ci: next(s for s in ci["jobs"]["test"]["steps"]
+                                   if unit in run_lines(s)).update(fields)
+
+        edits = {
+            "bash-keyword": rewrite(shell="bash", run=f"{unit}\necho done"),
+            "bash-errexit": rewrite(shell="bash -e {0}", run=f"{unit}\necho done"),
+            "bash-errexit-pipefail": rewrite(shell="bash --noprofile --norc -eo pipefail {0}",
+                                             run=f"{unit}\necho done"),
+            "single-command-pwsh": rewrite(shell="pwsh"),
+            "push-branch-filter": lambda ci: ci[True].update({"push": {"branches": ["main"]}}),
+            "timeout": rewrite(**{"timeout-minutes": 20}),
+        }
+        for label, edit in edits.items():
+            with self.subTest(edit=label):
+                workflows = copy.deepcopy(self.workflows)
+                edit(workflows["ci.yml"])
+                self.assertEqual(
+                    workflow_violations(workflows, REQUIRED_GATE_COMMANDS, self.pyproject), [])
 
 
 # --------------------------------------------------------------------------- #
