@@ -275,12 +275,12 @@ def eval_rows_from_args(args: Any, manifest_path: Path) -> list[dict[str, Any]]:
 def mounted_skill_names(copied: list[Path]) -> list[str]:
     """Every name an agent may use to invoke a mounted skill: the `name:` its
     SKILL.md declares (parsed with the harness's real frontmatter parser) and
-    the directory it is mounted under. Claude Code 2.1.269 invokes project
-    skills by directory name (`Skill` called with `skills_demo_SKILL.md`),
-    while older builds and other agents use the declared name, so both are
-    load evidence. Each is an exact-match needle for the Claude and Vibe
-    skill-tool detectors; a name in prose or another skill firing never
-    matches."""
+    the directory it is mounted under, the skill's own directory name (`demo`
+    for skills/demo/SKILL.md). Claude Code 2.1.269 invokes project skills by
+    directory name, while older builds and other agents use the declared
+    name, so both are load evidence. Each is an exact-match needle for the
+    Claude and Vibe skill-tool detectors; a name in prose or another skill
+    firing never matches."""
     names: list[str] = []
     for p in copied:
         skill_md = p if p.name == "SKILL.md" else p / "SKILL.md"

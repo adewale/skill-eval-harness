@@ -98,6 +98,12 @@ smoke earlier the same day had that same Haiku cell pass 1/1 — one sample sat 
 the lucky side of a 1-in-3 rate and hid it. The JSON report keeps per-query
 trigger rates and per-run evidence for the cells that disagree.
 
+That run predates two changes that can move these rates: the skill now mounts as
+`demo` (its own directory name) rather than `skills_demo_SKILL.md`, and a run that logs
+in through the environment is now isolated from personal and organisation skills.
+Re-run the command before comparing a new reading with it; a published rate is dated
+evidence, not a property of the description.
+
 The same run is wired into a manual smoke test (it spends real tokens, so CI skips
 it):
 
@@ -165,6 +171,12 @@ Each rule below exists because its violation produced a wrong number at least on
   declared name or its mounted directory name (Claude Code 2.1.269 calls skills by
   directory name). The skill's name appearing in the answer text proves nothing — reading
   `good-readme/README.md` once looked like loading the `good-readme` skill.
+- **Mount the skill under the name your users see.** Agents list a skill by the
+  directory it sits in, so the matrix mounts `skills/demo/SKILL.md` as `demo`, the
+  name a user's install shows. Before that change it mounted the flattened manifest
+  path, and Claude Code offered the model a skill called `skills_demo_SKILL.md`; a rate
+  measured under that name is not comparable with one measured under the real name.
+  Two skill roots with the same directory name fail validation for the same reason.
 - **Isolate the sandbox, keep the harness.** Each run gets a fresh config dir so
   the experimenter's personal skills can't shadow the one under test. The dir sits
   beside the working directory, not inside it, so the copied credentials are out of

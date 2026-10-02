@@ -43,7 +43,7 @@ import zipfile
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass as _dataclass
 from decimal import ROUND_CEILING, Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn, Protocol, cast
 
 # Direct ``python skill_benchmark.py`` execution must share the canonical module
@@ -1228,6 +1228,13 @@ def validate_manifest(path: Path, allow_missing_holdback: bool = True) -> dict[s
         die("manifest.skill_name is required")
     if not isinstance(manifest.get("skill_paths", []), list) or not manifest.get("skill_paths") or not all(isinstance(p, str) for p in manifest.get("skill_paths", [])):
         die("manifest.skill_paths must be a non-empty list of strings")
+    for label in ("skill_paths", "old_skill_paths"):
+        roots = manifest.get(label) or []
+        if not isinstance(roots, list) or not all(isinstance(root, str) for root in roots):
+            continue
+        for first, second, key in skill_root_key_collisions(roots):
+            die(f"manifest.{label}: {first!r} and {second!r} both mount as skill directory {key!r}; "
+                "agents list skills by directory name, so rename one directory")
     variants = manifest.get("variants", DEFAULT_VARIANTS)
     if (not isinstance(variants, list) or len(variants) != len(set(variants))
             or set(variants) != {"with_skill", "without_skill"}):
@@ -2305,12 +2312,39 @@ def resolve_skill_root(comp: dict[str, Any], skill_paths: list[str]) -> str | No
 
 
 def _skill_root_key(rel: str) -> str:
-    """Sanitized directory name for a skill root inside a built tree. The SAME
-    function must name the canonical (with_skill) tree and the materialized pre-edit
-    tree, because skill_tree_hash includes this directory name — any divergence would make
-    canonical_skill_tree_hash != the ablation's parent_skill_hash and break
-    TreeIdentity.same_revision_as."""
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", rel)
+    """The directory a skill root is mounted under inside a built tree: the
+    skill's own directory name, sanitized (`demo` for skills/demo/SKILL.md).
+    Agents list and invoke a skill by this name, so it is the one a user's
+    install shows. The SAME function must name the canonical (with_skill) tree
+    and the materialized pre-edit tree, because skill_tree_hash includes this
+    directory name — any divergence would make canonical_skill_tree_hash != the
+    ablation's parent_skill_hash and break TreeIdentity.same_revision_as.
+    Distinct roots that share a directory name are rejected at validation
+    (skill_root_key_collisions).
+
+    The key once flattened the whole manifest path (`skills_demo_SKILL.md`),
+    which Claude Code 2.1.269 showed the model as the skill's name (PR #85).
+    A root given as a file (anything with a suffix, normally SKILL.md) names
+    its parent directory; a root at the repository top keeps the old form."""
+    path = PurePosixPath(str(rel).replace("\\", "/"))
+    name = path.parent.name if path.suffix else path.name
+    key = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    if not key or key in {".", ".."}:
+        key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(rel))
+    return key
+
+
+def skill_root_key_collisions(paths: Sequence[str]) -> list[tuple[str, str, str]]:
+    """(first root, second root, shared key) for every pair of distinct skill
+    roots that would mount under the same directory name."""
+    seen: dict[str, str] = {}
+    collisions: list[tuple[str, str, str]] = []
+    for root in paths:
+        key = _skill_root_key(root)
+        if key in seen and seen[key] != root:
+            collisions.append((seen[key], root, key))
+        seen.setdefault(key, root)
+    return collisions
 
 
 def derived_population(components: list[dict[str, Any]]) -> str:
@@ -2756,14 +2790,12 @@ def _reject_overlapping_skill_roots(repo_root: Path, manifest: dict[str, Any]) -
                 raise AblationError(f"skill roots {ri!r} and {rj!r} are copied from the same directory {di}; the ablated copy and an unablated copy would coexist — declare a single root")
             if di in dj.parents:
                 raise AblationError(f"skill root {ri!r} (dir {di}) is an ancestor of skill root {rj!r}; copying it would include an unablated duplicate of {rj!r} — declare non-overlapping roots")
-    # Distinct roots whose sanitized tree-key collides would overwrite each other in
-    # the built tree (an otherwise-unwrapped FileExistsError); reject as an AblationError.
-    seen_keys: dict[str, str] = {}
-    for r in manifest.get("skill_paths", []):
-        k = _skill_root_key(r)
-        if k in seen_keys:
-            raise AblationError(f"skill roots {seen_keys[k]!r} and {r!r} both map to tree key {k!r}; rename one so their built directories do not collide")
-        seen_keys[k] = r
+    # Distinct roots that mount under one directory name would overwrite each other
+    # in the built tree (an otherwise-unwrapped FileExistsError); validate_manifest
+    # refuses them first, and callers that skip it get an AblationError.
+    for first, second, key in skill_root_key_collisions(list(manifest.get("skill_paths", []))):
+        raise AblationError(f"skill roots {first!r} and {second!r} both mount as skill directory {key!r}; "
+                            "rename one so their built directories do not collide")
 
 
 def _copy_skill_root(src_dir: Path, dst_dir: Path) -> None:

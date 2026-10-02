@@ -484,6 +484,28 @@ class RunClaudeAdapterTests(unittest.TestCase):
             {"input_tokens": 4, "output_tokens": 246, "cache_read_tokens": 29905, "cache_write_tokens": 9537})
         self.assertEqual(meta["skill_invocation_evidence"], ["probe-plugin:tidy-commit Skill"])
 
+    def test_the_answer_run_mounts_the_skill_under_its_own_directory_name(self):
+        # skills/demo/SKILL.md is installed as a skill directory named `demo`;
+        # the with_skill workspace mounts it there and the prompt points the
+        # model at that path, not at the flattened manifest path.
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            _, tasks, _ = write_with_skill_task(td)
+            seen = td / "seen.json"
+            stub = td / "claude"
+            stub.write_text(
+                f"#!{sys.executable}\nimport json, os, sys\nprompt = sys.stdin.read()\n"
+                "files = sorted(os.path.relpath(os.path.join(r, f)) for r, _, fs in os.walk('.') for f in fs)\n"
+                f"open({str(seen)!r}, 'w').write(json.dumps({{'prompt': prompt, 'files': files}}))\n"
+                f"sys.stdout.write({stream_text(claude_stream_records())!r})\n", encoding="utf-8")
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+            code, _, stderr = run_cli("run-agent", "--agent", "claude", "--tasks", tasks,
+                                      "--runs", td / "runs", "--claude-bin", stub)
+            observed = json.loads(seen.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("skills/demo/SKILL.md", observed["files"])
+        self.assertIn("\n- skills/demo/SKILL.md", observed["prompt"])
+
 
 class ClaudeJudgeAndPanelTests(unittest.TestCase):
     def test_native_claude_judge_stamps_model_and_cost(self):

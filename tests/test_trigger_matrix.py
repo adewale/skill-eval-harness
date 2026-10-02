@@ -82,12 +82,14 @@ def run_pi_cli(extra_argv, fake, out: Path):
     return code, json.loads(out.read_text(encoding="utf-8"))
 
 
-def fake_trigger_claude(path: Path, probe: Path) -> Path:
+def fake_trigger_claude(path: Path, probe: Path, *, invoke_project_skill: bool = False) -> Path:
     """A fake `claude` for trigger runs. Its init event lists the skills Claude
     Code offers the model: one bundled skill, the project skills mounted in the
-    working directory, the personal skills in its config dir, and an
-    organisation skill when CLAUDE_CODE_SYNC_SKILLS is set. It records where it
-    looked, and echoes any auth token it was given, as a leaky CLI would."""
+    working directory (by directory name, as Claude Code 2.1.269 lists them),
+    the personal skills in its config dir, and an organisation skill when
+    CLAUDE_CODE_SYNC_SKILLS is set. It records what it was offered and where it
+    looked, and echoes any auth token it was given, as a leaky CLI would. With
+    invoke_project_skill it calls the first project skill by that name."""
     path.write_text(f"""#!{sys.executable}
 import json, os, sys
 from pathlib import Path
@@ -98,17 +100,24 @@ if (config / "skills").is_dir():
     skills += sorted(p.name for p in (config / "skills").iterdir())
 if os.environ.get("CLAUDE_CODE_SYNC_SKILLS"):
     skills.append("org-synced-skill")
+project = sorted(p.name for p in (Path.cwd() / ".claude" / "skills").iterdir())
 with open({str(probe)!r}, "a", encoding="utf-8") as handle:
-    handle.write(json.dumps({{"config": str(config), "cwd": os.getcwd(),
+    handle.write(json.dumps({{"config": str(config), "cwd": os.getcwd(), "skills": skills,
                              "sync_skills": "CLAUDE_CODE_SYNC_SKILLS" in os.environ}}) + "\\n")
 token = " ".join(os.environ.get(name, "") for name in
                  ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")).strip()
 sys.stderr.write("auth: " + token + "\\n")
-for record in ({{"type": "system", "subtype": "init", "session_id": "s", "skills": skills}},
-               {{"type": "assistant", "message": {{"role": "assistant", "content": [
-                   {{"type": "text", "text": "Answered with " + token}}]}}}},
-               {{"type": "result", "subtype": "success", "is_error": False,
-                 "result": "Answered.", "total_cost_usd": 0.001}}):
+records = [{{"type": "system", "subtype": "init", "session_id": "s", "skills": skills}}]
+if {invoke_project_skill!r}:
+    records += [{{"type": "assistant", "message": {{"role": "assistant", "content": [
+                    {{"type": "tool_use", "id": "toolu_1", "name": "Skill", "input": {{"skill": project[0]}}}}]}}}},
+                {{"type": "user", "message": {{"role": "user", "content": [
+                    {{"type": "tool_result", "tool_use_id": "toolu_1", "content": "Launching skill"}}]}}}}]
+records += [{{"type": "assistant", "message": {{"role": "assistant", "content": [
+                {{"type": "text", "text": "Answered with " + token}}]}}}},
+            {{"type": "result", "subtype": "success", "is_error": False,
+              "result": "Answered.", "total_cost_usd": 0.001}}]
+for record in records:
     print(json.dumps(record))
 """, encoding="utf-8")
     path.chmod(0o755)
@@ -1017,9 +1026,10 @@ class ClaudeDetectionTests(unittest.TestCase):
 
     def test_skill_tool_called_by_mounted_directory_name_is_trigger_evidence(self):
         # Claude Code 2.1.269 invokes a project skill by the directory it is
-        # mounted under, `skills_demo_SKILL.md` for skills/demo/SKILL.md, not by
-        # its declared name (#85 recorded 0/3 should-fire on Haiku and Sonnet
-        # for a skill a traced run showed being invoked).
+        # mounted under, `demo` for skills/demo/SKILL.md, not by its declared
+        # name `demo-reviewer` (#85 recorded 0/3 should-fire on Haiku and Sonnet
+        # for a skill a traced run showed being invoked). The flattened mount
+        # key of earlier versions is not a name anything is mounted under now.
         def invoking(skill):
             records = [
                 {"type": "system", "subtype": "init", "session_id": "s"},
@@ -1035,7 +1045,7 @@ class ClaudeDetectionTests(unittest.TestCase):
             return lambda plan: completed_invocation(stdout)
 
         should_fire = [row for row in demo_trigger_rows() if row["should_trigger"]][:1]
-        for skill, triggered in (("skills_demo_SKILL.md", True), ("skills_other_SKILL.md", False)):
+        for skill, triggered in (("demo", True), ("skills_demo_SKILL.md", False), ("other", False)):
             with self.subTest(skill=skill), \
                  mock.patch.object(tm.ClaudeAdapter, "_run_argv", staticmethod(invoking(skill))), \
                  mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
@@ -1167,6 +1177,30 @@ class ClaudeDetectionTests(unittest.TestCase):
                 self.assertEqual(json.loads(stdout)["paired"]["blocked"], [])
                 for name, text in artifacts.items():
                     self.assertNotIn(token, text, name)
+
+    def test_the_model_is_offered_the_skill_under_its_own_directory_name(self):
+        # A user who installs skills/demo/ sees a skill named `demo`; the trigger
+        # run must offer the model that name, not the flattened manifest path.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            probe = root / "probe.jsonl"
+            claude = fake_trigger_claude(root / "claude", probe, invoke_project_skill=True)
+            out = root / "report.json"
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 mock.patch.object(sys, "argv", [
+                     "skill-trigger-matrix", str(DEMO_MANIFEST), "--agent", "claude", "--model", "haiku",
+                     "--runs-per-query", "1", "--workers", "1", "--claude-bin", str(claude),
+                     "--out", str(out)]):
+                self.assertEqual(tm.main(), 0)
+            report = json.loads(out.read_text(encoding="utf-8"))
+            offered = [json.loads(line)["skills"] for line in probe.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(offered)
+        for skills in offered:
+            self.assertEqual(skills, ["update-config", "demo"])
+        for row in report["results"]:
+            self.assertEqual(row["evidence"], ["Skill tool invoked: demo"])
+            self.assertIs(row["trigger_evidence_observed"], True)
 
 
 class CodexAdapterTests(unittest.TestCase):

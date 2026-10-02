@@ -213,10 +213,25 @@ that file still invalidates trigger identity until those owners are extracted in
   saved trigger report with an `estimated` cost row fails re-validation in `trigger-compare`;
   regenerate it.
 - Claude trigger detection also counts a `Skill` call that names the directory the skill is
-  mounted under (`skills_demo_SKILL.md` for `skills/demo/SKILL.md`), which is how Claude Code
-  2.1.269 invokes project skills. A Claude trigger report saved with such a CLI can show
-  should-fire misses that were activations; re-run it. Vibe's `skill` tool detection reads the
-  same two names.
+  mounted under (`demo` for `skills/demo/SKILL.md`), which is how Claude Code 2.1.269 invokes
+  project skills. A Claude trigger report saved with such a CLI can show should-fire misses that
+  were activations; re-run it. Vibe's `skill` tool detection reads the same two names.
+- Skills now mount under their own directory name: `skills/demo/SKILL.md` mounts as `demo`, the
+  name a user's install shows, where 0.6.0 used the flattened manifest path
+  (`skills_demo_SKILL.md`). Claude Code showed the model that flattened string as the skill's
+  name, so trigger rates were measured for a name no user sees, and answer prompts pointed the
+  model at `skills/skills_demo_SKILL.md/SKILL.md`. The mount name is part of every skill-tree
+  hash, so `skill_tree_hash`, `skill_root_keys`, the planned skill tree and the task digest change
+  on every skill-bearing prepared task and run (the demo skill's tree hash moves from
+  `6bcbd3be…` to `4bbf2c1f…`); `without_skill` rows are unchanged. `benchmark` over runs
+  prepared before the change reads `partial` with `answer_design_incomplete` ("prepared skill
+  treatment does not match current manifest"): re-prepare and re-run them. Trigger reports were
+  already incomparable across the change, because the trigger protocol fingerprints the harness
+  modules. A `--pins` file or `examples/skill-pins.json`-style pin holds the old layout's
+  hash: recompute it with `canonical_skill_tree_hash` (this repository's pins were recomputed from
+  the pinned commits). Two skill roots that share a directory name (`team-a/review/SKILL.md` and
+  `team-b/review/SKILL.md`) now fail `validate`, because an agent would list two skills with one
+  name; rename one directory.
 
 ### Removed names
 
