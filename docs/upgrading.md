@@ -146,6 +146,9 @@ that file still invalidates trigger identity until those owners are extracted in
   an incomplete row (exit 1) instead of stopping the whole run.
 - Pi's `PI_CODING_AGENT_DIR` now sits beside its working directory instead of inside it, so a
   Pi report's protocol requires `pi_home_outside_workdir` and its rows record it.
+- Codex trigger rows record the files seeded into `CODEX_HOME` as `codex_home_files` instead of
+  `codex_home_files_copied`. `trigger-compare` read that list as an unsafe protocol observation
+  and blocked every Codex cell; the regenerated reports the identity bump already requires pair.
 - `aggregate` and `export-anthropic` accept `--strict` and `--embed-cmd`; pass them there too if
   your `benchmark` command uses them, or the numbers will differ.
 

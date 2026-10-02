@@ -32,7 +32,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from helpers import assert_dies
+from helpers import assert_dies, run_cli
 
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
@@ -1220,6 +1220,38 @@ class CodexAdapterTests(unittest.TestCase):
             second = tm.executable_identity(f"{sys.executable} {script}")
         self.assertNotEqual(first, second)
         self.assertIn(str(script.resolve()), first["argument_files"])
+
+    def test_codex_baseline_and_ablation_reports_pair_in_trigger_compare(self):
+        # A fake `codex exec --json` that ends its turn without loading the skill.
+        fake_codex = (
+            "import json\n"
+            "for record in ({'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},\n"
+            "               {'type': 'item.completed', 'item': {'id': 'i', 'type': 'agent_message', 'text': 'ok'}},\n"
+            "               {'type': 'turn.completed', 'usage': {'input_tokens': 1, 'output_tokens': 1}}):\n"
+            "    print(json.dumps(record))\n")
+        rows = [{"query_id": "negative", "query": "ordinary chat", "should_trigger": False}]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "fake_codex.py").write_text(fake_codex, encoding="utf-8")
+            user_codex = root / "user-codex"
+            user_codex.mkdir()
+            (user_codex / "auth.json").write_text('{"token": "codex-user-token"}', encoding="utf-8")
+            paths = {}
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(user_codex)}):
+                for arm, ablation in (("baseline", None), ("ablation", "weaker-description")):
+                    report = tm.run_matrix(
+                        DEMO_MANIFEST, rows, agents=["codex"], models=[None], runs_per_query=1,
+                        timeout=30, workers=1, codex_cmd=f"{sys.executable} {root / 'fake_codex.py'}",
+                        ablation=ablation)
+                    self.assertEqual(report["summary"]["measurement_status"], "complete")
+                    paths[arm] = root / f"{arm}.json"
+                    paths[arm].write_text(json.dumps(report), encoding="utf-8")
+            code, stdout, stderr = run_cli("trigger-compare", "--baseline", paths["baseline"],
+                                           "--ablation", paths["ablation"])
+        self.assertEqual(code, 0, stderr)
+        compared = json.loads(stdout)
+        self.assertEqual(compared["paired"]["blocked"], [])
+        self.assertTrue(compared["provenance"]["verified"])
 
 
 class VibeAdapterTests(unittest.TestCase):

@@ -688,8 +688,11 @@ class CodexAdapter(AgentAdapter):
         if result.observation_complete:
             result = result.with_provider_error(
                 codex_stream_protocol_error(result.stdout))
+        # Which files were seeded is a record, not an isolation control, so it
+        # is kept under a key that is not a (boolean) protocol observation.
         return result.with_metadata(
-            {k: v for k, v in meta.items() if k != "codex_home"},
+            {k: v for k, v in meta.items() if k not in {"codex_home", "codex_home_files_copied"}},
+            codex_home_files=list(meta.get("codex_home_files_copied") or ()),
             codex_home_outside_workdir=True,
         )
 
