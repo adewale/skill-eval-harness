@@ -531,6 +531,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, validation commands, a
 ```bash
 pip install -e ".[test]"
 python3 -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
+ruff check .
 ty check --error-on-warning
 python3 -m unittest discover tests -v
 python3 scripts/check_test_collection_parity.py
@@ -603,6 +604,7 @@ skill-eval-harness/
 ```bash
 pip install -e ".[test]"
 python3 -m py_compile *.py scripts/*.py examples/adewale-workspace/*.py examples/demo-skill/*.py type_tests/*.py tests/*.py
+ruff check .
 ty check --error-on-warning
 python3 -m unittest discover tests -v
 python3 scripts/check_test_collection_parity.py
