@@ -69,7 +69,19 @@ REQUIRED_GATE_COMMANDS = {
             "skill-benchmark --help",
         ],
     },
+    # A release is cut from a tag CI may never have run, so the publish job
+    # runs the suite and checks the exact wheel it uploads.
+    "publish.yml": {
+        "publish": [
+            "python -m unittest discover tests",
+            "python scripts/check_installed_wheel.py --wheel dist/*.whl",
+        ],
+    },
 }
+
+# The event each gated workflow must run on: CI gates every pull request, and
+# the publish job gates every release.
+REQUIRED_TRIGGERS = {"ci.yml": "pull_request", "publish.yml": "release"}
 
 # Shell spellings that turn a failing command into a passing step.
 FAILURE_SWALLOWERS = ("|| true", "|| :", "|| exit 0", "set +e", "--exit-zero")
@@ -100,8 +112,9 @@ def workflow_violations(workflows: dict[str, dict], required: dict[str, dict[str
     for name, workflow in workflows.items():
         triggers = workflow.get("on", workflow.get(True)) or {}
         jobs = workflow.get("jobs") or {}
-        if name in required and "pull_request" not in triggers:
-            found.append(f"{name}: does not run on pull_request")
+        trigger = REQUIRED_TRIGGERS.get(name)
+        if name in required and trigger not in triggers:
+            found.append(f"{name}: does not run on {trigger}")
         for job_id, job in jobs.items():
             where = f"{name} job {job_id}"
             if "continue-on-error" in job:
