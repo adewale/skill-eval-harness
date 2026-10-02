@@ -18,6 +18,7 @@ from pathlib import Path
 from helpers import (
     assert_dies,
     attest_answer_design,
+    judge_with_stub,
     run_cli,
     trace_event,
     write_run,
@@ -550,6 +551,32 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertEqual(paired["design_coverage_reason"], "grading_evidence_incomplete")
         self.assertIsNone(paired["absolute_delta"])
         self.assertEqual(paired["observed_absolute_delta"], 1.0)
+
+    def test_a_critical_judge_veto_on_a_judge_only_case_is_reported(self):
+        # A case gated only by a critical judge has no objective assertion.
+        # A failed verdict vetoes the run, which must zero its combined rate
+        # and leave its objective rate not applicable; a vetoed run once read
+        # objective 0.0 beside objective_total 0, and the report refused it.
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"] = [
+            {"name": "quality", "type": "judge", "severity": "critical",
+             "rubric": ["Names the third Greek letter"]}]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, manifest)
+            runs, out = root / "runs", root / "benchmark.json"
+            write_run(runs / "case-1" / "with_skill", "gamma")
+            write_run(runs / "case-1" / "without_skill", "none")
+            attest_answer_design(path, runs)
+            verdicts = judge_with_stub(path, runs, root / "verdicts.jsonl", passes_on="gamma")
+            code, _, stderr = run_cli("benchmark", path, "--runs", runs,
+                                      "--judge-results", verdicts, "--out", out)
+            self.assertEqual(code, 0, stderr)
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(report["availability"], "complete")
+        self.assertEqual([(row["variant"], row["vetoed"], row["objective_pass_rate"],
+                           row["combined_pass_rate"]) for row in report["results"]],
+                         [("with_skill", False, None, 1.0), ("without_skill", True, None, 0.0)])
 
 
 class SimilarityScorerTests(unittest.TestCase):

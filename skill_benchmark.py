@@ -14316,7 +14316,9 @@ def grade_case_variant(
         **completion_row_fields(metadata),
         "objective_passed": objective_passed,
         "objective_total": objective_total,
-        "objective_pass_rate": (0.0 if vetoed else objective_passed / objective_total) if objective_total else (0.0 if vetoed else None),
+        # With no objective check the rate is not applicable, vetoed or not;
+        # the veto zeroes the combined rate that carries the judges.
+        "objective_pass_rate": (0.0 if vetoed else objective_passed / objective_total) if objective_total else None,
         "process_passed": process_passed,
         "process_total": len(process_rows),
         "process_pass_rate": (0.0 if vetoed else process_passed / len(process_rows)) if process_rows else None,
