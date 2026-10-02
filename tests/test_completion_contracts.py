@@ -88,7 +88,6 @@ SERVED_MODEL_CHECKS = (
     ("sonnet[1m]", "claude-sonnet-4-5-20250929", MATCH),
     ("claude-sonnet-4-5[1m]", "claude-sonnet-4-5-20250929", MATCH),
     ("claude-sonnet-4-0", "claude-sonnet-4-20250514", MATCH),
-    ("claude-3-5-haiku-latest", "claude-3-5-haiku-20241022", MATCH),
     ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "claude-sonnet-4-5-20250929", MATCH),
     ("claude-sonnet-4-5", "us.anthropic.claude-sonnet-4-5-20250929-v1:0", MATCH),
     ("claude-opus-4-1@20250805", "claude-opus-4-1-20250805", MATCH),
@@ -96,6 +95,14 @@ SERVED_MODEL_CHECKS = (
     ("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4",
      "claude-sonnet-4-5-20250929", UNVERIFIABLE),
     ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5", UNVERIFIABLE),
+    # A `-latest` alias names whichever snapshot the provider serves today, so
+    # the harness cannot tell whether a dated answer is the one it resolved to.
+    ("claude-3-5-haiku-latest", "claude-3-5-haiku-20241022", UNVERIFIABLE),
+    ("claude-3-7-sonnet-latest", "claude-3-7-sonnet-20250219", UNVERIFIABLE),
+    ("claude-3-opus-latest", "claude-3-opus-20240229", UNVERIFIABLE),
+    ("claude-3-5-haiku-latest", "claude-3-5-haiku", UNVERIFIABLE),
+    ("claude-3-5-haiku-20241022", "claude-3-5-haiku-latest", UNVERIFIABLE),
+    ("claude-3-5-haiku-latest", "claude-3-5-haiku-latest", MATCH),
     # A clear difference behind the same spellings still blocks scoring.
     ("haiku", "claude-sonnet-4-5-20250929", MISMATCH),
     ("sonnet[1m]", "claude-haiku-4-5-20251001", MISMATCH),

@@ -71,7 +71,9 @@ that file still invalidates trigger identity until those owners are extracted in
 - A pre-release build of `main` read a realistic alias as a served-model `mismatch`, so a run that
   requested `sonnet[1m]`, `claude-sonnet-4-0`, a `-latest` id, a Bedrock id such as
   `us.anthropic.claude-sonnet-4-5-20250929-v1:0`, or a Vertex `@date` id was unscorable. The check
-  is stored when the run is recorded, so re-run those runs; new runs read them as `match`.
+  is stored when the run is recorded, so re-run those runs; new runs read them as `match`, except
+  a `-latest` id, which reads `unverifiable` (scored): the harness cannot know which dated
+  snapshot the alias resolved to.
 - A run that reports several models credits none of them: `served_model` is `null`, and the check
   reads `mixed` (scored, counted in `run_endings.served_model_mixed`) when the requested model is
   among them, or `mismatch` (unscorable) when it is not. Claude subagent turns are not counted.

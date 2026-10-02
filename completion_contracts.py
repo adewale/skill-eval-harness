@@ -136,8 +136,10 @@ _FAMILY_ALIASES = frozenset({"haiku", "sonnet", "opus", "fable", "mythos"})
 _SNAPSHOT_SUFFIX = re.compile(r"[-@]\d{8}")
 # Spellings that name the same model as the bare id: Claude Code's context
 # window suffix (``sonnet[1m]``), Bedrock's region and vendor prefix and
-# version suffix (``us.anthropic.claude-x-20250929-v1:0``), Vertex's snapshot
-# separator (``claude-x@20250805``) and the ``-latest`` alias.
+# version suffix (``us.anthropic.claude-x-20250929-v1:0``) and Vertex's
+# snapshot separator (``claude-x@20250805``). A ``-latest`` alias names
+# whichever snapshot the provider serves today, so it is kept on the tail and
+# read by ``served_model_check``.
 _CONTEXT_SUFFIX = re.compile(r"\[[^\]]*\]$")
 _BEDROCK_PREFIX = re.compile(r"^(?:[a-z]+(?:-[a-z]+)*\.)?anthropic\.")
 _BEDROCK_VERSION = re.compile(r"-v\d+:\d+$")
@@ -155,7 +157,7 @@ def _model_tail(model: str) -> str:
     suffix, a Bedrock version suffix, and a Vertex ``@date`` snapshot."""
     tail = _CONTEXT_SUFFIX.sub("", model.strip().casefold()).rsplit("/", 1)[-1]
     tail = _BEDROCK_VERSION.sub("", _BEDROCK_PREFIX.sub("", tail))
-    return _VERTEX_SNAPSHOT.sub(r"-\1", tail).removesuffix("-latest")
+    return _VERTEX_SNAPSHOT.sub(r"-\1", tail)
 
 
 def _claude_id(model: str) -> tuple[str, tuple[int, ...], str | None] | None:
@@ -176,8 +178,10 @@ def served_model_check(requested: str | None, served: str | None) -> ServedModel
     Both ids are first reduced to the bare model id (``_model_tail``). Two
     Claude ids match when family and version agree (``-4-0`` is version 4) and
     the request either names no snapshot or the served one; a request for a
-    snapshot answered by an undated id is ``unverifiable``. A bare family
-    alias (``sonnet``) matches any served id of that family. Other ids match
+    snapshot answered by an undated id is ``unverifiable``. A ``-latest`` id
+    on either side is ``unverifiable`` when the rest agrees, because the
+    harness cannot know which snapshot it resolved to. A bare family alias
+    (``sonnet``) matches any served id of that family. Other ids match
     themselves or themselves plus a dated snapshot suffix. An alias or id the
     harness cannot resolve is ``unverifiable``, which does not block scoring;
     only a clear mismatch does.
@@ -190,6 +194,10 @@ def served_model_check(requested: str | None, served: str | None) -> ServedModel
     got = _model_tail(served)
     if want == got:
         return ServedModelCheck.MATCH
+    latest = want.endswith("-latest") or got.endswith("-latest")
+    want, got = want.removesuffix("-latest"), got.removesuffix("-latest")
+    if want == got:
+        return ServedModelCheck.UNVERIFIABLE
     want_id, got_id = _claude_id(want), _claude_id(got)
     if want in _FAMILY_ALIASES:
         if got_id is not None:
@@ -199,6 +207,8 @@ def served_model_check(requested: str | None, served: str | None) -> ServedModel
     if want_id is not None and got_id is not None:
         if want_id[:2] != got_id[:2]:
             return ServedModelCheck.MISMATCH
+        if latest:
+            return ServedModelCheck.UNVERIFIABLE
         if want_id[2] is None or want_id[2] == got_id[2]:
             return ServedModelCheck.MATCH
         return (ServedModelCheck.UNVERIFIABLE if got_id[2] is None
@@ -206,7 +216,7 @@ def served_model_check(requested: str | None, served: str | None) -> ServedModel
     if want_id is not None or got_id is not None:
         return ServedModelCheck.UNVERIFIABLE
     if got.startswith(want) and _SNAPSHOT_SUFFIX.fullmatch(got[len(want):]):
-        return ServedModelCheck.MATCH
+        return ServedModelCheck.UNVERIFIABLE if latest else ServedModelCheck.MATCH
     if not any(char.isdigit() for char in want):
         return ServedModelCheck.UNVERIFIABLE
     return ServedModelCheck.MISMATCH
