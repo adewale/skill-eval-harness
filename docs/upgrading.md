@@ -157,6 +157,16 @@ that file still invalidates trigger identity until those owners are extracted in
 
 ### Fixes that change saved numbers
 
+- The sign-flip test and the lift interval chose between exact enumeration and sampling on the
+  total unit count, so unchanged units (zero deltas, which no sign flip can move) pushed any
+  paired block over 14 units onto the sampled path, whose decision uses a Monte Carlo upper
+  bound. Six units that all moved by +1 beside nine unchanged ones read `p_value_upper_bound`
+  0.061, not significant, while `noise_check` called the eval resolvable. The choice now rests
+  on the units that moved, and equal deltas are enumerated as one group, so that block reads the
+  exact p = 0.03125 and is significant. A saved report with more than 14 paired units can
+  change `significance`, `interval` and `method` (from `...-sampled` to `...-exact`) when
+  regraded.
+
 - Codex trace normalization no longer counts the stream's opening `thread.started` event as a
   file read. `file_reads` was one too high on every Codex run; the count is written when a trace
   is normalized, so a saved run keeps the old count until its `trace.jsonl` is normalized again

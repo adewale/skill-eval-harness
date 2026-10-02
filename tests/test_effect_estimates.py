@@ -4,8 +4,11 @@ The interval is the sign-flip test inverted, so it must exclude zero exactly
 when the exact test rejects "no lift". The noise check must say when an eval
 could not have shown a lift at all. A case both arms fail must never be sent
 to suggest-cases for hardening."""
+import itertools
 import json
+import math
 import random
+import statistics
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +33,19 @@ def thirds(values: list[int]) -> list[float]:
     return [value / 3 for value in values]
 
 
+def brute_force_p(deltas: list[float]):
+    """The two-sided sign-flip p-value of ``d - shift`` by visiting all 2**n
+    sign patterns one at a time: the definition, with no grouping."""
+    n = len(deltas)
+    sums = [(math.fsum(s * d for s, d in zip(signs, deltas)), sum(signs))
+            for signs in itertools.product((1, -1), repeat=n)]
+
+    def p(shift: float) -> float:
+        observed = abs(math.fsum(deltas) - n * shift)
+        return sum(1 for a, b in sums if abs(a - shift * b) >= observed - 1e-12) / 2 ** n
+    return p
+
+
 class IntervalAgreesWithTheTestTests(unittest.TestCase):
     def test_interval_excludes_zero_exactly_when_the_exact_test_rejects(self):
         rng = random.Random(7)
@@ -52,9 +68,11 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
         self.assertGreater(checked, 100)
 
     def test_sampled_interval_agrees_with_the_sampled_test(self):
-        # Past 14 cases both sample sign patterns. The test gates on a
+        # Past the exact budget both sample sign patterns. The test gates on a
         # conservative upper bound, so an interval that gated on the point
         # estimate excluded zero where the test reported no significance.
+        # These deltas repeat, which keeps them exact by default, so the
+        # budget is set to 2**0 to put every one on the sampled path.
         rng = random.Random(11)
         choices = [-3, -2, -1, 0, 0, 1, 2, 3]
         checked = 0
@@ -63,8 +81,8 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
                 deltas = thirds([rng.choice(choices) for _ in range(n)])
                 if all(abs(value) < 1e-12 for value in deltas):
                     continue
-                interval = ee.sign_flip_interval(deltas)
-                significance = sb.sign_flip_significance(deltas)
+                interval = ee.sign_flip_interval(deltas, max_exact_n=0)
+                significance = sb.sign_flip_significance(deltas, max_exact_n=0)
                 self.assertEqual(interval["method"], "sign-flip-inversion-sampled")
                 if not interval["bounded"]:
                     continue
@@ -73,6 +91,46 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
                     self.assertEqual(zero_inside, not significance["significant_at_0_05"])
                     checked += 1
         self.assertGreater(checked, 100)
+
+    def test_grouped_enumeration_matches_every_sign_pattern(self):
+        # Equal deltas are counted as one binomial group and zeros as a spread
+        # over the pattern weight, so evals with repeats or unchanged cases
+        # stay exact past 14 units. The p-value at the shifts the interval
+        # inverts, and the interval itself, must match visiting all 2**n
+        # patterns; the accepted shifts must form one interval that excludes
+        # zero exactly when the test rejects.
+        inputs = [
+            [1.0] * 6 + [0.0] * 8,
+            [1.0] * 6 + [0.0] * 9,
+            thirds([1, 1, 2, 0, 0, -1, 1, 2, 0, 1, 1, -2, 0, 1]),
+            [0.5, 0.5, -0.5, 1.0, 1.0, 1.0, 0.0, 0.25, 0.25, -1.0, 0.5, 0.0],
+            thirds([3, 2, 1, -1, -2, 0, 1, 2, 3, 3]),
+        ]
+        for deltas in inputs:
+            p = brute_force_p(deltas)
+            interval = ee.sign_flip_interval(deltas)
+            significance = ee.sign_flip_test(deltas)
+            with self.subTest(deltas=deltas):
+                self.assertTrue(interval["method"].endswith("exact"))
+                self.assertTrue(interval["bounded"])
+                lower, upper = interval["lower"], interval["upper"]
+                shifts = sorted({0.0, statistics.fmean(deltas), *deltas,
+                                 lower - 1e-5, lower + 1e-5, upper - 1e-5, upper + 1e-5})
+                for shift in shifts:
+                    shifted = [d - shift for d in deltas]
+                    self.assertAlmostEqual(ee.sign_flip_test(shifted)["p_value"], p(shift),
+                                           places=12, msg=f"shift={shift}")
+                self.assertGreater(p(lower + 1e-5), 0.05)
+                self.assertGreater(p(upper - 1e-5), 0.05)
+                self.assertLessEqual(p(lower - 1e-5), 0.05)
+                self.assertLessEqual(p(upper + 1e-5), 0.05)
+                grid = [min(deltas) - 0.5 + step * 0.05
+                        for step in range(int((max(deltas) - min(deltas) + 1) / 0.05) + 1)]
+                accepted = [shift for shift in grid if p(shift) > 0.05]
+                self.assertEqual(accepted, [s for s in grid if accepted[0] <= s <= accepted[-1]])
+                self.assertTrue(lower - 1e-5 <= accepted[0] and accepted[-1] <= upper + 1e-5)
+                self.assertEqual(not lower <= 0 <= upper, significance["significant_at_0_05"])
+                self.assertEqual(significance["p_value"], p(0.0))
 
     def test_interval_contains_the_observed_mean(self):
         deltas = thirds([1, 2, 0, 3, 1, -1, 2, 1])
@@ -94,8 +152,8 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
     def test_sampled_path_is_deterministic_and_order_invariant(self):
         rng = random.Random(3)
         deltas = [rng.choice([-1.0, 0.0, 0.5, 1.0]) for _ in range(30)]
-        first = ee.sign_flip_interval(deltas)
-        second = ee.sign_flip_interval(list(reversed(deltas)))
+        first = ee.sign_flip_interval(deltas, max_exact_n=0)
+        second = ee.sign_flip_interval(list(reversed(deltas)), max_exact_n=0)
         self.assertEqual(first, second)
         self.assertEqual(first["method"], "sign-flip-inversion-sampled")
 
@@ -325,6 +383,23 @@ class EstimateTests(unittest.TestCase):
                          ee.sign_flip_interval(deltas))
         self.assertEqual({blocks[name]["unit"] for name in blocks}, {"case"})
         self.assertEqual(blocks["noise_check"]["min_lift"], 0.2)
+
+    def test_unchanged_cases_do_not_move_a_lift_onto_the_sampled_path(self):
+        # Flipping a zero delta changes no sum, so six cases that all moved +1
+        # reach the exact p of 2 / 2**6 whatever number of cases did not move,
+        # and the noise check's floor is the p the test reports.
+        for zeros in (8, 9, 40):
+            with self.subTest(zeros=zeros):
+                deltas = [1.0] * 6 + [0.0] * zeros
+                estimate = ee.Estimate.from_deltas(deltas, unit=ee.InferenceUnit.CASE,
+                                                   without_rates=[0.0] * len(deltas))
+                self.assertEqual(estimate.significance["method"], "sign-flip-exact")
+                self.assertEqual(estimate.significance["p_value"], 0.03125)
+                self.assertTrue(estimate.significant)
+                self.assertEqual(estimate.interval["method"], "sign-flip-inversion-exact")
+                self.assertGreater(estimate.interval["lower"], 0)
+                self.assertEqual(estimate.noise["smallest_achievable_p"], 0.03125)
+                self.assertEqual(estimate.noise["verdict"], "resolvable")
 
     def test_without_baseline_rates_there_is_no_noise_check(self):
         estimate = ee.Estimate.from_deltas([1.0] * 6, unit=ee.InferenceUnit.QUERY)
