@@ -281,8 +281,10 @@ class ServedModel:
         }
 
 
-# Effort levels documented for Claude Code's `--effort`; Codex's
-# `model_reasoning_effort` also accepts `minimal`.
+# Every effort level some answer backend accepts: Claude Code's `--effort`
+# takes `low` through `max`, and Codex's `model_reasoning_effort` also takes
+# `minimal`. Each backend's `effort_levels` names its own subset, and a level
+# outside it is refused before any run.
 EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
 BACKEND_DEFAULT = "backend_default"
 
