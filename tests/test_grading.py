@@ -16,6 +16,7 @@ from pathlib import Path
 
 from helpers import (
     attest_answer_design,
+    run_skill_benchmark,
     trace_event,
     write_run,
 )
@@ -500,6 +501,34 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertEqual(result["objective_pass_rate"], 1.0)
         self.assertEqual(result["combined_pass_rate"], 1.0)
         self.assertEqual(result["deferred_judge_tasks"], 1)
+
+    def test_a_judge_without_a_verdict_keeps_the_runs_and_the_lift_partial(self):
+        # A gate judge with no verdict is deferred, not graded: every run's
+        # grading stays partial and the benchmark withholds the paired lift,
+        # keeping the objective-only delta as observed, until verdicts arrive.
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"].append(
+            {"name": "quality", "type": "judge", "severity": "gate", "rubric": ["complete"]})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, manifest)
+            runs, out = root / "runs", root / "benchmark.json"
+            write_run(runs / "case-1" / "with_skill", "alpha")
+            write_run(runs / "case-1" / "without_skill", "none")
+            attest_answer_design(path, runs)
+            code, stderr = run_skill_benchmark(
+                "benchmark", str(path), "--runs", str(runs), "--out", str(out))
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(report["deferred_judge_tasks"]), 2)
+        self.assertEqual(report["incomplete_reasons"], ["deferred_judge_verdicts"])
+        self.assertEqual([row["grading_availability"] for row in report["results"]],
+                         ["partial", "partial"])
+        paired = report["paired_summary"]
+        self.assertEqual(paired["availability"], "partial")
+        self.assertEqual(paired["design_coverage_reason"], "grading_evidence_incomplete")
+        self.assertIsNone(paired["absolute_delta"])
+        self.assertEqual(paired["observed_absolute_delta"], 1.0)
 
 
 class SimilarityScorerTests(unittest.TestCase):
