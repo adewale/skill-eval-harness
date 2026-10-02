@@ -143,7 +143,10 @@ that file still invalidates trigger identity until those owners are extracted in
   `trigger-compare` no longer accepts the old `skill-pi-trigger-eval` producer. Each row's `ablation` is the
   ablation id; the provenance is the report's `provenance`, as in the matrix. Traces written
   with `--trace-runs` land in a `matrix-*` directory under it. A query whose run crashes is now
-  an incomplete row (exit 1) instead of stopping the whole run.
+  an incomplete row (exit 1) instead of stopping the whole run. Its `--timeout` now defaults to
+  240 seconds, the matrix's default, instead of 120; the timeout is part of the protocol, so a
+  report left at the old default does not pair with a matrix report. Pass `--timeout 120` to keep
+  the old window.
 - Pi's `PI_CODING_AGENT_DIR` now sits beside its working directory instead of inside it, so a
   Pi report's protocol requires `pi_home_outside_workdir` and its rows record it.
 - The Claude trigger adapter's isolated `CLAUDE_CONFIG_DIR`, with the copied OAuth credentials,

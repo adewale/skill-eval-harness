@@ -518,6 +518,30 @@ class TriggerRowBoundaryTests(unittest.TestCase):
                 self.assertTrue(any(name.endswith("trace.jsonl") and "[REDACTED]" in text
                                     for name, text in written.items()))
 
+    def test_a_pi_cli_baseline_pairs_with_a_matrix_ablation_at_default_settings(self):
+        # skill-pi-trigger-eval is the matrix with the Pi adapter; left at their
+        # defaults, the two entry points must run one experimental protocol.
+        def stops(plan):
+            return completed_invocation(pi_stream(PI_STOP))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            eval_set = write_rows(root, [{"query_id": "negative", "query": "ordinary chat",
+                                          "should_trigger": False}])
+            common = ["--eval-set", str(eval_set), "--runs-per-query", "1", "--workers", "1"]
+            code, baseline = run_pi_cli(common, stops, root / "baseline.json")
+            self.assertEqual(code, 0)
+            argv = ["skill-trigger-matrix", str(DEMO_MANIFEST), "--agent", "pi", *common,
+                    "--ablation", "weaker-description", "--out", str(root / "ablation.json")]
+            with mock.patch.object(sys, "argv", argv), pi_runs(stops), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(tm.main(), 0)
+            code, stdout, stderr = run_cli("trigger-compare", "--baseline", root / "baseline.json",
+                                           "--ablation", root / "ablation.json")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["provenance"]["reasons"], [])
+        self.assertEqual(baseline["protocol"]["timeout_seconds"], 240)
+
 
 class StubMatrixOfflineTests(unittest.TestCase):
     def test_every_matrix_adapter_has_an_explicit_trace_dialect(self):

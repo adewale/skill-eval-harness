@@ -139,6 +139,9 @@ from trigger_reporting import (
 
 STOPWORDS = {"this", "that", "with", "have", "what", "your", "from", "each", "then", "them", "were", "will", "would", "should", "could", "please", "give", "tell"}
 DEFAULT_CODEX_CMD = CODEX_TRIGGER_DEFAULT_CMD
+# Seconds one agent run gets. Part of the experimental protocol, so every
+# entry point (this CLI and skill-pi-trigger-eval) defaults to this one value.
+DEFAULT_TIMEOUT_S = 240
 CLAUDE_PORTABLE_AUTH_FILES = (".credentials.json",)
 SENSITIVE_WORKSPACE_FILES = (
     ".codex/auth.json",
@@ -1327,7 +1330,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--agent", action="append", choices=sorted(ADAPTERS), help="agent adapter, repeatable (default: claude)")
     ap.add_argument("--model", action="append", help="model for every selected agent, repeatable (default: the adapter's own list; claude = haiku, sonnet, opus)")
     ap.add_argument("--runs-per-query", type=int, default=3, help="repetitions per (agent, model, query); a trigger RATE needs repetition (default 3)")
-    ap.add_argument("--timeout", type=int, default=240)
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-turns", type=int, default=6, help="claude/vibe adapters: turns the model gets to load the skill (its observation window)")
     ap.add_argument("--trace-runs", help="optional directory for per-run trace.jsonl/events.json/metrics.json artifacts for every selected agent")
