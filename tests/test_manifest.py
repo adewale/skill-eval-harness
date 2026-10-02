@@ -750,11 +750,31 @@ class ContaminationPerimeterTests(unittest.TestCase):
         code, coverage, stderr = gate({"with_skill": "clean"})
         self.assertEqual(code, 1)
         self.assertEqual(coverage["availability"], "partial")
-        self.assertEqual(coverage["unscanned"], [{"case_id": "c", "variant": "without_skill"}])
-        self.assertIn("scanned 1 of 2 case arms", stderr)
+        self.assertEqual(coverage["unscanned"], [
+            {"case_id": "c", "model": None, "variant": "without_skill", "run_number": 1}])
+        self.assertIn("scanned 1 of 2 answer runs", stderr)
         self.assertEqual(gate({}, armed=True)[1]["availability"], "unavailable")
         # Unarmed, the command reports and exits 0.
         self.assertEqual(gate({}, armed=False)[0], 0)
+
+    def test_coverage_counts_every_model_and_run_not_only_each_arm(self):
+        # Model m2 ran with_skill but saved no without_skill output. Model m1's
+        # without_skill output does not cover it: coverage is per run.
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._manifest(td, {"canary": "ZZ-CANARY-99"})
+            runs = root / "runs"
+            for model in ("m1", "m2"):
+                write_run(runs / "c" / model / "with_skill", "clean")
+            write_run(runs / "c" / "m1" / "without_skill", "clean")
+            code, _, stderr = run_cli("contamination", p, "--runs", runs, "--split", "tune",
+                                      "--out", root / "c.json", "--fail-on-contamination")
+            coverage = json.loads((root / "c.json").read_text(encoding="utf-8"))["coverage"]
+        self.assertEqual(coverage["availability"], "partial")
+        self.assertEqual((coverage["expected_runs"], coverage["scanned_runs"]), (4, 3))
+        self.assertEqual(coverage["unscanned"], [
+            {"case_id": "c", "model": "m2", "variant": "without_skill", "run_number": 1}])
+        self.assertEqual(code, 1)
+        self.assertIn("scanned 3 of 4 answer runs", stderr)
 
 
 class ClosedManifestBoundaryTests(unittest.TestCase):

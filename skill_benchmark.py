@@ -19896,17 +19896,21 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
     variants = manifest.get("variants", DEFAULT_VARIANTS)
     cases_out: list[dict[str, Any]] = []
     total = 0
-    # Coverage: each answer case's arms whose output was read. A gate that
-    # never saw an arm's output cannot say that arm did not leak.
-    unscanned: list[dict[str, str]] = []
-    expected_arms = 0
+    # Coverage: every answer run discovery yields (case, model, arm, run)
+    # whose output was read. A gate that never saw a run's output cannot say
+    # that run did not leak, and another model's output does not stand in.
+    unscanned: list[dict[str, Any]] = []
+    expected_runs = 0
     for case in iter_cases(manifest, split):
         max_overlap, findings = 0.0, []
-        scanned_variants: set[str] = set()
+        answer_case = not is_trigger_case(case)
         for model_name, variant, run_number, _base, text, _path, _meta in discovered_run_units(runs, case, variants):
+            expected_runs += answer_case
             if text is None:
+                if answer_case:
+                    unscanned.append({"case_id": case["id"], "model": model_name,
+                                      "variant": variant, "run_number": run_number})
                 continue
-            scanned_variants.add(variant)
             chk = contamination_check(case, text, manifest_dir=manifest_path.parent, n=n,
                                       overlap_threshold=overlap_threshold, model_cutoff=model_cutoff)
             max_overlap = max(max_overlap, chk["overlap"])
@@ -19915,16 +19919,12 @@ def contamination_report(manifest_path: Path, runs: Path, *, split: str | None =
         total += len(findings)
         if findings or max_overlap > 0:
             cases_out.append({"case_id": case["id"], "max_overlap": round(max_overlap, 4), "findings": findings})
-        if not is_trigger_case(case):
-            expected_arms += len(variants)
-            unscanned.extend({"case_id": case["id"], "variant": variant}
-                             for variant in variants if variant not in scanned_variants)
-    scanned_arms = expected_arms - len(unscanned)
+    scanned_runs = expected_runs - len(unscanned)
     availability = (Availability.COMPLETE if not unscanned
-                    else Availability.PARTIAL if scanned_arms else Availability.UNAVAILABLE)
+                    else Availability.PARTIAL if scanned_runs else Availability.UNAVAILABLE)
     return {"cases": cases_out, "total_findings": total,
-            "coverage": {"availability": availability.value, "expected_arms": expected_arms,
-                         "scanned_arms": scanned_arms, "unscanned": unscanned},
+            "coverage": {"availability": availability.value, "expected_runs": expected_runs,
+                         "scanned_runs": scanned_runs, "unscanned": unscanned},
             "params": {"ngram": n, "overlap_threshold": overlap_threshold, "model_cutoff": model_cutoff,
                        "comparison": ComparisonProfile.RENDERED_V1.value}}
 
@@ -19940,8 +19940,8 @@ def contamination_command(args: argparse.Namespace) -> int:
     return gate_exit(gate_policy.CONTAMINATION.decide(
         [finding for case in report["cases"] for finding in case["findings"]],
         complete=coverage["availability"] == Availability.COMPLETE.value,
-        incomplete_reason=(f"contamination scanned {coverage['scanned_arms']} of "
-                           f"{coverage['expected_arms']} case arms; the rest have no saved output")),
+        incomplete_reason=(f"contamination scanned {coverage['scanned_runs']} of "
+                           f"{coverage['expected_runs']} answer runs; the rest have no saved output")),
         "contamination")
 
 

@@ -138,8 +138,10 @@ that file still invalidates trigger identity until those owners are extracted in
   `pairing.not_applicable_pairs`, so `paired_summary` can read `complete` where 0.6.0 read
   `partial`. A pair with a missing or unscorable arm still blocks.
 - `contamination` output gains `coverage`, and `--fail-on-contamination` now fails when an answer
-  case arm has no saved output, as well as on a finding. A CI job that ran the gate before the runs
-  finished, or over a runs directory missing an arm, starts failing; point it at the complete run.
+  run has no saved output, as well as on a finding. Coverage counts every (case, model, arm, run)
+  that run discovery finds, so one model's missing arm is not covered by another model's output.
+  A CI job that ran the gate before the runs finished, or over a runs directory missing an arm,
+  starts failing; point it at the complete run.
 - Paired edit comparison: `benchmark` with an `old_skill` arm selected (`--variant old_skill`
   beside the two defaults) adds `paired_edit_summary`; without that arm the report is unchanged.
   When the report is partial because an arm has no run or an assertion could not be graded, the
