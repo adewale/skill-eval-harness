@@ -863,3 +863,35 @@ names and the order the author assumed.
   token the agent writes during the run.
 - Test identity and parsing checks against a table of real identifiers, not only the canonical
   spelling.
+
+## 2026-10-02 — A run records what the harness asked for; check that the agent got it
+
+**Problem:** The second fix round found settings the harness recorded faithfully that the agent
+never received:
+
+- `claude --effort minimal` prints a warning, ignores the level and runs at the default, so runs
+  recorded `requested: minimal` while running at another effort.
+- `run-subagent`'s default backend ran Claude in an empty temporary directory, so a `with_skill`
+  run could not read the skill its prompt named, and its tool-use trace was dropped.
+- Claude trigger runs that logged in through environment variables were not isolated, so the
+  user's own skills could compete with the one under test.
+- Every skill mounted under a flattened name (`skills_demo_SKILL.md`) that no real install shows,
+  so activation was measured for a name users never see.
+- Vibe 2.23 changed its output to public history entries, and every current-Vibe trigger cell
+  read as incomplete.
+- A whitelist of record types allowed after Claude's `result` would have made every real run
+  unreadable the day Claude Code added one more metadata record.
+
+**Lesson:** A recorded setting is a request, not an observation. When a CLI warns and continues,
+drops a field, or changes its output, the run records what the harness meant to do, and every
+number built on it is about a different experiment.
+
+**Rule:**
+- Validate each setting against what the backend's CLI accepts before the run (`effort_levels`),
+  and record evidence of what the agent actually ran with wherever the CLI exposes it.
+- Run each agent where its prompt says the files are, and keep its trace on every backend.
+- Mount the skill as a user's install would, and isolate the agent's config on every login path.
+- Parse a provider's output by the shape you see, one parser per known version, and reject only
+  what breaks the contract (session content after the end), not whatever is unfamiliar.
+- Keep a runbook of live checks (`docs/live-verification.md`) for everything CI can only fake, and
+  run it after any CLI upgrade.
