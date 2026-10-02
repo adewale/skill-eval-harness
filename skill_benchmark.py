@@ -10521,22 +10521,26 @@ def run_codex(args: argparse.Namespace) -> int:
 # thing every other adapter leaves the caller to reconstruct out of band.
 # --------------------------------------------------------------------------- #
 
-# Record types Claude Code may emit after the terminal result event without
-# changing the session's outcome (observed: `system`/`task_summary`, 2.1.269).
-CLAUDE_POST_RESULT_RECORD_TYPES = frozenset({"system"})
+# Record types that carry the session itself. One of them (or any record with a
+# `message` object) after the terminal result means the session went on past
+# its final word. Every other record type is metadata and may follow the result
+# (observed: `system`/`task_summary`, 2.1.269), so a metadata record type a
+# later Claude Code adds there does not make every run unreadable.
+CLAUDE_SESSION_CONTENT_RECORD_TYPES = frozenset({"assistant", "user", "result", "stream_event"})
 
 
 def claude_terminal_result_index(records: Sequence[Mapping[str, Any]]) -> int | None:
     """The one owner of Claude's terminal-event rule, shared by the answer
-    parser and the trace dialect: exactly one `result` record, followed only
-    by informational `system` records. Anything else (no result, two results,
-    session content after the result) is None: the stream has no final word."""
+    parser, the trace dialect and the trigger adapter: exactly one `result`
+    record, and no session content after it. Anything else (no result, two
+    results, a turn after the result) is None: the stream has no final word."""
     results = [i for i, record in enumerate(records) if record.get("type") == "result"]
     if len(results) != 1:
         return None
-    trailing = records[results[0] + 1:]
-    if any(record.get("type") not in CLAUDE_POST_RESULT_RECORD_TYPES for record in trailing):
-        return None
+    for record in records[results[0] + 1:]:
+        if (record.get("type") in CLAUDE_SESSION_CONTENT_RECORD_TYPES
+                or isinstance(record.get("message"), Mapping)):
+            return None
     return results[0]
 
 

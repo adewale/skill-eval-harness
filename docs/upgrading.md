@@ -223,6 +223,13 @@ that file still invalidates trigger identity until those owners are extracted in
   mounted under (`demo` for `skills/demo/SKILL.md`), which is how Claude Code 2.1.269 invokes
   project skills. A Claude trigger report saved with such a CLI can show should-fire misses that
   were activations; re-run it. Vibe's `skill` tool detection reads the same two names.
+- The Claude trigger adapter now reads a stream by the answer parser's rule: exactly one `result`
+  record and no session content after it (`assistant`, `user`, `result`, `stream_event`, or a
+  record with a `message` object). It took the last `result` and accepted a turn after it, so a
+  cell whose stream had two results or a late turn counted as a complete observation; it is now
+  incomplete. Any other record after `result` (`system`, `rate_limit_event`, a metadata type a
+  later Claude Code adds) is metadata, in answer runs, judges and trigger cells alike; before,
+  only `system` was, so a run ending in a `rate_limit_event` graded as an empty answer.
 - Skills now mount under their own directory name: `skills/demo/SKILL.md` mounts as `demo`, the
   name a user's install shows, where 0.6.0 used the flattened manifest path
   (`skills_demo_SKILL.md`). Claude Code showed the model that flattened string as the skill's

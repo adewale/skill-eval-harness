@@ -28,8 +28,10 @@ writer keeps records after `result` is not known. No recording in this
 repository or on PR #85's branch holds the trailing record yet.
 
 The rule that tolerates it (`claude_terminal_result_index`: exactly one
-`result`, followed only by `system` records) is tested with the hand-built
-record `{"type": "system", "subtype": "task_summary"}`, the only shape 8b7ef17
+`result`, and no session content after it: no `assistant`, `user`, `result` or
+`stream_event` record and no record with a `message` object; every other record
+type is metadata) is tested with the hand-built record
+`{"type": "system", "subtype": "task_summary"}`, the only shape 8b7ef17
 reported, and with every recording in this directory whose `result` is
 followed by more records (`tests/helpers.py`,
 `recorded_claude_streams_after_result`):
@@ -45,6 +47,17 @@ followed by more records (`tests/helpers.py`,
 Each runs one subTest per source. Until a recording exists, the hand-built
 source's label says so (and the two run-level tests use this file with the
 hand-built record appended, labelled the same way).
+
+Which record types may follow `result` is tested from one hand-built table,
+`CLAUDE_POST_RESULT_RECORDS` in `tests/helpers.py` (`system`/`task_summary`,
+`rate_limit_event` and an unknown metadata type allowed; `assistant`, `user`, a
+second `result`, `stream_event` and an unknown type carrying a `message`
+rejected), at the answer parser and the trace dialect
+(`tests/test_claude_adapter.py`) and at the trigger adapter through
+`run_matrix` (`tests/test_trigger_matrix.py`,
+`test_the_trigger_adapter_applies_the_answer_parsers_rule_after_the_result`).
+Its `rate_limit_event` fields are illustrative: the recording above removed
+that line.
 
 ## Recording the trailing record
 

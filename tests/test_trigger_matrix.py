@@ -33,7 +33,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from helpers import assert_dies, claude_streams_ending_after_result, run_cli
+from helpers import (
+    CLAUDE_POST_RESULT_RECORDS,
+    assert_dies,
+    claude_streams_ending_after_result,
+    run_cli,
+)
 
 import run_pi_trigger_eval as tr
 import run_trigger_matrix as tm
@@ -82,14 +87,16 @@ def run_pi_cli(extra_argv, fake, out: Path):
     return code, json.loads(out.read_text(encoding="utf-8"))
 
 
-def fake_trigger_claude(path: Path, probe: Path, *, invoke_project_skill: bool = False) -> Path:
+def fake_trigger_claude(path: Path, probe: Path, *, invoke_project_skill: bool = False,
+                        trailing_records: list[dict] | None = None) -> Path:
     """A fake `claude` for trigger runs. Its init event lists the skills Claude
     Code offers the model: one bundled skill, the project skills mounted in the
     working directory (by directory name, as Claude Code 2.1.269 lists them),
     the personal skills in its config dir, and an organisation skill when
     CLAUDE_CODE_SYNC_SKILLS is set. It records what it was offered and where it
     looked, and echoes any auth token it was given, as a leaky CLI would. With
-    invoke_project_skill it calls the first project skill by that name."""
+    invoke_project_skill it calls the first project skill by that name;
+    trailing_records are written after the `result` record."""
     path.write_text(f"""#!{sys.executable}
 import json, os, sys
 from pathlib import Path
@@ -117,6 +124,7 @@ records += [{{"type": "assistant", "message": {{"role": "assistant", "content": 
                 {{"type": "text", "text": "Answered with " + token}}]}}}},
             {{"type": "result", "subtype": "success", "is_error": False,
               "result": "Answered.", "total_cost_usd": 0.001}}]
+records += json.loads({json.dumps(trailing_records or [])!r})
 for record in records:
     print(json.dumps(record))
 """, encoding="utf-8")
@@ -1218,6 +1226,30 @@ class ClaudeDetectionTests(unittest.TestCase):
         for row in report["results"]:
             self.assertEqual(row["evidence"], ["Skill tool invoked: demo"])
             self.assertIs(row["trigger_evidence_observed"], True)
+
+    def test_the_trigger_adapter_applies_the_answer_parsers_rule_after_the_result(self):
+        # The matrix reads Claude's stream by the rule the answer parser and the
+        # trace dialect share: metadata after the one `result` keeps the cell a
+        # complete observation; a second result or a late turn leaves it
+        # incomplete, so it cannot count as a trigger or a miss.
+        should_fire = [row for row in demo_trigger_rows() if row["should_trigger"]][:1]
+        for label, trailing, allowed in CLAUDE_POST_RESULT_RECORDS:
+            with self.subTest(trailing=label), tempfile.TemporaryDirectory() as td, \
+                 mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+                claude = fake_trigger_claude(Path(td) / "claude", Path(td) / "probe.jsonl",
+                                             invoke_project_skill=True, trailing_records=[trailing])
+                report = tm.run_matrix(DEMO_MANIFEST, should_fire, agents=["claude"], models=["haiku"],
+                                       runs_per_query=1, timeout=30, workers=1, claude_bin=str(claude))
+                row = report["results"][0]
+                self.assertIs(row["observation_complete"], allowed, row.get("provider_error"))
+                if allowed:
+                    self.assertEqual((row["triggered"], row["evidence"]), (True, ["Skill tool invoked: demo"]))
+                    self.assertEqual(report["summary"]["measurement_status"], "complete")
+                else:
+                    self.assertEqual(row["provider_error"],
+                                     "Claude JSON stream must contain exactly one terminal result event, "
+                                     "with no session content after it")
+                    self.assertEqual(report["summary"]["measurement_status"], "incomplete")
 
 
 class CodexAdapterTests(unittest.TestCase):

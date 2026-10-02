@@ -92,6 +92,7 @@ from skill_benchmark import (
     build_vibe_cli_argv,
     canonical_json_sha256,
     canonical_trigger_query,
+    claude_terminal_result_index,
     codex_env_for_home,
     detect_trigger_detection,
     detect_trigger_records,
@@ -655,12 +656,12 @@ class ClaudeAdapter(AgentAdapter):
             result = result.as_agent_window_complete()
         if result.observation_complete:
             error = json_stream_protocol_error(result.stdout, self.name)
-            records, _ = parse_trace_jsonl_text(result.stdout)
-            terminal = next((record for record in reversed(records)
-                             if record.get("type") == "result"), None)
+            terminal = self._terminal_record(result.stdout)
             if error is None and terminal is None:
-                error = "Claude JSON stream has no terminal result event"
+                error = ("Claude JSON stream must contain exactly one terminal result event, "
+                         "with no session content after it")
             if error is None:
+                records, _ = parse_trace_jsonl_text(result.stdout)
                 _, metrics = normalize_trace_records(records, source="claude")
                 protocol_errors = metrics.get("trace_protocol_errors")
                 if isinstance(protocol_errors, list) and protocol_errors:
@@ -673,12 +674,18 @@ class ClaudeAdapter(AgentAdapter):
         return result
 
     @staticmethod
-    def _terminal_stop(stdout: str) -> StopObservation:
+    def _terminal_record(stdout: str) -> dict[str, Any] | None:
+        # claude_terminal_result_index owns which record ends a Claude stream,
+        # for the answer parser, the trace dialect and this adapter alike.
+        records, _ = parse_trace_jsonl_text(stdout)
+        index = claude_terminal_result_index(records)
+        return records[index] if index is not None else None
+
+    @classmethod
+    def _terminal_stop(cls, stdout: str) -> StopObservation:
         # completion_contracts owns what a Claude result event means; the
         # answer runner reads the same classification.
-        terminal = next((event for event in iter_json_objects(stdout)
-                         if isinstance(event, dict) and event.get("type") == "result"), None)
-        return claude_result_stop(terminal)
+        return claude_result_stop(cls._terminal_record(stdout))
 
     def detect(self, invocation: InvocationOutcome, skill_names: list[str], copied: list[Path]) -> TriggerDetection:
         # Primary evidence: the Skill tool invoked with a mounted skill's name.
