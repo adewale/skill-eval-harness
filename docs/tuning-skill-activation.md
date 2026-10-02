@@ -159,11 +159,14 @@ Each rule below exists because its violation produced a wrong number at least on
 - **Run the real prompt.** A meta-prompt ("Would the skill trigger on: …?") tests
   the model's opinion of the classifier, not skill discovery.
 - **Detect loading from evidence, not names.** The detector matches the mounted
-  skill's temp path (or Claude Code's `Skill` tool call carrying the mounted skill's
-  name). The skill's name appearing in the answer text proves nothing — reading
+  skill's temp path, or Claude Code's `Skill` tool call carrying either the skill's
+  declared name or its mounted directory name (Claude Code 2.1.269 calls skills by
+  directory name). The skill's name appearing in the answer text proves nothing — reading
   `good-readme/README.md` once looked like loading the `good-readme` skill.
 - **Isolate the sandbox, keep the harness.** Each run gets a fresh config dir so
-  the experimenter's personal skills can't shadow the one under test. The agent's
+  the experimenter's personal skills can't shadow the one under test. The dir sits
+  beside the working directory, not inside it, so the copied credentials are out of
+  the model's reach, and it is removed when the cell ends. The agent's
   built-in skills stay, because your users run against them too — losing a routing
   fight to a built-in is a real activation failure.
 - **A passing answer benchmark proves nothing about discovery.** The answer runners
@@ -218,6 +221,11 @@ BackendRegistration(
     trigger=SurfaceBinding(ObjectRef("run_trigger_matrix", "MyAgentAdapter")),
 )
 ```
+
+An adapter that copies credentials into a home outside the workspace (as Claude
+Code, Codex and Pi do) also overrides `secret_files(workspace)`, so tokens the agent
+refreshes during the run are redacted from the artifacts, and `release(workspace)`,
+which removes that home once the cell ends, even after a failed mount or invoke.
 
 The default `detect()` already scans any JSON event stream for reads of the mounted
 skill paths; override it only when an agent reports skill loads some other way, as
