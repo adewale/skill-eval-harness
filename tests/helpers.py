@@ -726,3 +726,29 @@ def judge_with_stub(manifest: Path, runs: Path, out: Path, *, passes_on: str,
     if code != 0:
         raise AssertionError(f"judge stub failed: {stderr}")
     return out
+
+
+# --------------------------------------------------------------------------- #
+# lane S: judges that answer on their own score scale
+# --------------------------------------------------------------------------- #
+
+
+def judge_with_scores(manifest: Path, runs: Path, out: Path, *,
+                      scores: dict[str, float]) -> Path:
+    """Write judge verdicts through the real `skill-benchmark judge` command
+    with a local stub judge (no model) that answers only a `score`: the score
+    of the first marker in `scores` that appears in its prompt. For judges
+    that declare a `score_scale`, whose pass/fail the harness derives."""
+    stub = out.parent / "score_judge.py"
+    stub.write_text(
+        "import json, sys\n"
+        "prompt = sys.stdin.read()\n"
+        f"scores = {scores!r}\n"
+        "score = next(value for marker, value in scores.items() if marker in prompt)\n"
+        "print(json.dumps({'score': score, 'rationale': 'stub'}))\n",
+        encoding="utf-8")
+    code, _, stderr = run_cli("judge", manifest, "--runs", runs,
+                              "--judge-cmd", f"{sys.executable} {stub}", "--out", out)
+    if code != 0:
+        raise AssertionError(f"judge stub failed: {stderr}")
+    return out

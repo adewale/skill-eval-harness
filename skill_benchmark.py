@@ -355,15 +355,15 @@ ASSERTION_TYPE_FIELDS: dict[str, set[str]] = {
     "command_count_le": {"max", "value"},
     "judge": {
         "preset", "prompt", "rubric", "review_rubric", "threshold",
-        "graded_dimensions", "dynamic_rubric", "per_step",
+        "graded_dimensions", "dynamic_rubric", "per_step", "score_scale",
     },
     "rubric": {
         "preset", "prompt", "rubric", "review_rubric", "threshold",
-        "graded_dimensions", "dynamic_rubric", "per_step",
+        "graded_dimensions", "dynamic_rubric", "per_step", "score_scale",
     },
     "factuality": {
         "preset", "prompt", "rubric", "review_rubric", "threshold",
-        "graded_dimensions", "dynamic_rubric", "per_step",
+        "graded_dimensions", "dynamic_rubric", "per_step", "score_scale",
     },
 }
 # 1.1: the factuality preset is a named, anchored rubric — no new execution
@@ -1152,6 +1152,16 @@ def validate_case_assertion(cid: str, label: str, index: int, assertion: Any, pa
                 die(f"{where} qualitative threshold must be a finite number")
             if dims is not None and not 1 <= float(threshold) <= 5:
                 die(f"{where} graded-dimension threshold must be in [1, 5]")
+        if "score_scale" in assertion:
+            scale = judge_score_scale(assertion)
+            if scale is None:
+                die(f"{where} score_scale must be [low, high]: two finite numbers with low < high")
+            for key in ("atLeast", "graded_dimensions", "dynamic_rubric", "per_step"):
+                if key in expand_judge_preset(assertion):
+                    die(f"{where} score_scale cannot combine with {key}; it scales a plain judge's score")
+            threshold = expand_judge_preset(assertion).get("threshold", scale[1])
+            if not scale[0] <= float(threshold) <= scale[1]:
+                die(f"{where} threshold must lie on its score_scale [{scale[0]:g}, {scale[1]:g}]")
         for key in ("rubric", "review_rubric"):
             if key in assertion and (not isinstance(assertion[key], list)
                                      or not assertion[key]
@@ -11649,6 +11659,18 @@ def extract_json_object(text: str) -> dict[str, Any]:
     return found[0]
 
 
+def judge_score_scale(assertion: Mapping[str, Any]) -> tuple[float, float] | None:
+    """A plain judge's declared ``score_scale`` as (low, high), or None when
+    it declares none or an unusable one (validation refuses that)."""
+    scale = assertion.get("score_scale")
+    if (not isinstance(scale, list) or len(scale) != 2
+            or any(isinstance(x, bool) or not isinstance(x, (int, float))
+                   or not math.isfinite(float(x)) for x in scale)
+            or not float(scale[0]) < float(scale[1])):
+        return None
+    return float(scale[0]), float(scale[1])
+
+
 def is_per_step_assertion(assertion: dict[str, Any]) -> bool:
     """Presence, rather than truthiness, owns the per-step assertion shape."""
     return "per_step" in assertion and assertion.get("per_step") is not None
@@ -11734,7 +11756,7 @@ def verdict_schema_for(assertion: dict[str, Any]) -> dict[str, Any]:
     if assertion.get("dynamic_rubric"):
         minimum = (assertion.get("dynamic_rubric") or {}).get("minimum_criteria", 3)
         return _criteria_verdict_schema(minimum)
-    required = ["score"] if "atLeast" in assertion else ["passed"]
+    required = ["score"] if "atLeast" in assertion or "score_scale" in assertion else ["passed"]
     return {"type": "object", "required": required,
             "properties": {"passed": {"type": "boolean"}, "score": {"type": "number"}, "rationale": {"type": "string"}}}
 
@@ -11812,10 +11834,15 @@ def judge_prompt(task: dict[str, Any], output_text: str, *, trajectory: list | N
             + schema_hint
             + json.dumps(payload, indent=2, ensure_ascii=False)
         )
+    scale = judge_score_scale(assertion)
     plain_contract = (
         "Return only JSON with keys: score (required normalized number in [0, 1]), "
         "rationale (string). The harness derives pass/fail from atLeast.\n"
         if "atLeast" in assertion else
+        f"Return only JSON with keys: score (required number from {scale[0]:g} to {scale[1]:g}, "
+        "on the scale the rubric describes), rationale (string). The harness derives "
+        "pass/fail from the assertion's threshold on that scale.\n"
+        if scale is not None else
         "Return only JSON with keys: passed (boolean), score (number optional), "
         "rationale (string).\n"
     )
@@ -12344,12 +12371,20 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
     if schema_errors:
         parse_error = "verdict schema: " + "; ".join(schema_errors[:5])
     at_least = assertion.get("atLeast")
+    scale = judge_score_scale(assertion)
     score = parsed.get("score")
     if (at_least is not None and parse_error is None
             and (isinstance(score, bool) or not isinstance(score, (int, float))
                  or not math.isfinite(float(score)) or not 0 <= float(score) <= 1)):
         parse_error = "atLeast judge verdict requires a finite normalized score in [0, 1]"
+    if (scale is not None and parse_error is None
+            and (isinstance(score, bool) or not isinstance(score, (int, float))
+                 or not math.isfinite(float(score))
+                 or not scale[0] <= float(score) <= scale[1])):
+        parse_error = (f"judge verdict requires a finite score in [{scale[0]:g}, "
+                       f"{scale[1]:g}] (score_scale)")
     threshold = (at_least if at_least is not None
+                 else assertion.get("threshold", scale[1]) if scale is not None
                  else assertion.get("threshold", parsed.get("threshold", 1)))
     graded_payload: dict[str, Any] = {}
     if assertion.get("graded_dimensions") and isinstance(parsed.get("dimension_scores"), dict):
@@ -12389,10 +12424,11 @@ def run_one_judge_task(task: dict[str, Any], judge_cmd: str | None = None, trans
         if "dimension_scores" in graded_payload:
             threshold = graded_entry.get("threshold")
     else:
-        if at_least is not None:
+        if at_least is not None or scale is not None:
+            # The harness, not the judge, decides pass from the score.
             passed = (
                 parse_error is None and isinstance(score, (int, float))
-                and not isinstance(score, bool) and float(score) >= float(at_least)
+                and not isinstance(score, bool) and float(score) >= float(threshold)
             )
         else:
             plain_payload = ({**parsed, "threshold": threshold}
@@ -13920,6 +13956,38 @@ def merged_qualitative_entry(assertion: dict[str, Any], judged: dict[str, Any], 
             "threshold": float(at_least),
             "evidence": (
                 f"score={normalized_score:g}, atLeast={float(at_least):g}; "
+                f"{evidence}"
+            ),
+        })
+        return entry
+    scale = judge_score_scale(assertion)
+    if scale is not None:
+        # Pass compares the raw score with the threshold on the declared
+        # scale; the graded channel takes the score normalised to 0-1.
+        low, high = scale
+        score = judged.get("score")
+        if (isinstance(score, bool) or not isinstance(score, (int, float))
+                or not math.isfinite(float(score)) or not low <= float(score) <= high):
+            entry.update({
+                "passed": None,
+                "score": None,
+                "availability": "partial",
+                "evidence": (
+                    "score_scale judge verdict is incomplete: expected a finite "
+                    f"score in [{low:g}, {high:g}]; {evidence}"
+                ),
+            })
+            return entry
+        raw_score = float(score)
+        threshold = float(assertion.get("threshold", high))
+        entry.update({
+            "passed": raw_score >= threshold,
+            "score": (raw_score - low) / (high - low),
+            "threshold": (threshold - low) / (high - low),
+            "raw_score": raw_score,
+            "score_scale": [low, high],
+            "evidence": (
+                f"score={raw_score:g} on [{low:g}, {high:g}], threshold={threshold:g}; "
                 f"{evidence}"
             ),
         })

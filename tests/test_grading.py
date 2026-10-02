@@ -18,6 +18,7 @@ from pathlib import Path
 from helpers import (
     assert_dies,
     attest_answer_design,
+    judge_with_scores,
     judge_with_stub,
     run_cli,
     trace_event,
@@ -577,6 +578,99 @@ class GradedScoringSeverityTests(unittest.TestCase):
         self.assertEqual([(row["variant"], row["vetoed"], row["objective_pass_rate"],
                            row["combined_pass_rate"]) for row in report["results"]],
                          [("with_skill", False, None, 1.0), ("without_skill", True, None, 0.0)])
+
+    @staticmethod
+    def scaled_judge(**fields):
+        return {"name": "craft", "type": "judge", "rubric": ["5 = polished; 1 = careless"],
+                **fields}
+
+    def test_validate_refuses_a_score_scale_it_cannot_normalise(self):
+        refusals = [
+            ({"score_scale": [5, 1]}, "score_scale must be [low, high]"),
+            ({"score_scale": [3, 3]}, "score_scale must be [low, high]"),
+            ({"score_scale": [1]}, "score_scale must be [low, high]"),
+            ({"score_scale": [1, "5"]}, "score_scale must be [low, high]"),
+            ({"score_scale": [True, 5]}, "score_scale must be [low, high]"),
+            ({"score_scale": "1-5"}, "score_scale must be [low, high]"),
+            ({"score_scale": [1, 5], "threshold": 6}, "threshold must lie on its score_scale [1, 5]"),
+            ({"score_scale": [1, 5], "atLeast": 0.5}, "score_scale cannot combine with atLeast"),
+            ({"score_scale": [1, 5],
+              "graded_dimensions": [{"name": "d", "rubric": "5 = good; 1 = bad"}]},
+             "score_scale cannot combine with graded_dimensions"),
+        ]
+        for fields, message in refusals:
+            manifest = base_manifest()
+            manifest["cases"][0]["assertions"].append(self.scaled_judge(**fields))
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as td:
+                code, _, stderr = run_cli("validate", write_manifest(Path(td), manifest))
+                self.assertEqual(code, 1)
+                self.assertIn(message, stderr)
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"].append(self.scaled_judge(score_scale=[1, 5], threshold=4))
+        with tempfile.TemporaryDirectory() as td:
+            code, _, stderr = run_cli("validate", write_manifest(Path(td), manifest))
+        self.assertEqual(code, 0, stderr)
+
+    def test_a_judge_on_its_own_scale_feeds_the_graded_channel(self):
+        # A soft judge answering 1-5 declares score_scale [1, 5]: its score is
+        # normalised to 0-1 for the graded channel, (score - 1) / 4, while pass
+        # or fail still compares the raw score with threshold 4.
+        raw = {"c1": (5, 2), "c2": (4, 4), "c3": (5, 1)}   # case -> (with, without)
+        cases = [{"id": cid, "split": "tune", "kind": "behavior", "prompt": "Do the task.",
+                  "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"},
+                                 self.scaled_judge(score_scale=[1, 5], threshold=4)]}
+                 for cid in raw]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, base_manifest(cases=cases))
+            runs, out = root / "runs", root / "benchmark.json"
+            for cid, scores in raw.items():
+                for variant, score in zip(("with_skill", "without_skill"), scores):
+                    write_run(runs / cid / variant, f"alpha mark-{cid}-{variant}")
+            attest_answer_design(path, runs)
+            verdicts = judge_with_scores(path, runs, root / "verdicts.jsonl", scores={
+                f"mark-{cid}-{variant}": score for cid, scores in raw.items()
+                for variant, score in zip(("with_skill", "without_skill"), scores)})
+            code, _, stderr = run_cli("benchmark", path, "--runs", runs,
+                                      "--judge-results", verdicts, "--out", out)
+            self.assertEqual(code, 0, stderr)
+            report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(report["availability"], "complete")
+        judged = {(row["case_id"], row["variant"]): row["qualitative_assertions"][0]
+                  for row in report["results"]}
+        self.assertEqual({key: (entry["passed"], entry["raw_score"], entry["score"])
+                          for key, entry in judged.items()}, {
+            ("c1", "with_skill"): (True, 5.0, 1.0), ("c1", "without_skill"): (False, 2.0, 0.25),
+            ("c2", "with_skill"): (True, 4.0, 0.75), ("c2", "without_skill"): (True, 4.0, 0.75),
+            ("c3", "with_skill"): (True, 5.0, 1.0), ("c3", "without_skill"): (False, 1.0, 0.0),
+        })
+        graded = report["paired_summary"]["graded"]
+        self.assertEqual(graded["availability"], "complete")
+        # Normalised deltas 0.75, 0 and 1: mean 1.75 / 3.
+        self.assertEqual(graded["delta"], round(1.75 / 3, 4))
+        self.assertEqual(graded["with_skill_mean_score"], round(2.75 / 3, 4))
+        self.assertEqual(graded["without_skill_mean_score"], round(1.0 / 3, 4))
+
+    def test_a_score_off_the_declared_scale_is_refused_as_a_parse_error(self):
+        manifest = base_manifest()
+        manifest["cases"][0]["assertions"].append(
+            self.scaled_judge(score_scale=[1, 5], threshold=4))
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_manifest(root, manifest)
+            runs = root / "runs"
+            write_run(runs / "case-1" / "with_skill", "alpha high")
+            write_run(runs / "case-1" / "without_skill", "alpha none")
+            attest_answer_design(path, runs)
+            verdicts = judge_with_scores(path, runs, root / "verdicts.jsonl",
+                                         scores={"alpha high": 7, "alpha none": 1})
+            rows = {json.loads(line)["variant"]: json.loads(line)
+                    for line in verdicts.read_text(encoding="utf-8").splitlines()}
+        self.assertEqual(rows["with_skill"]["availability"], "partial")
+        self.assertFalse(rows["with_skill"]["passed"])
+        self.assertIn("score in [1, 5] (score_scale)", rows["with_skill"]["evidence"])
+        self.assertEqual((rows["without_skill"]["availability"], rows["without_skill"]["passed"],
+                          rows["without_skill"]["score"]), ("complete", False, 1))
 
 
 class SimilarityScorerTests(unittest.TestCase):
