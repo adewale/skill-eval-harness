@@ -258,8 +258,21 @@ class ClaudeRunnerCompletionTests(unittest.TestCase):
         self.assertFalse(execution_valid(meta, "token-XYZ"))
 
     def test_backend_without_effort_control_refuses_before_running(self):
-        with tempfile.TemporaryDirectory() as t, self.assertRaises(SystemExit):
-            sb.run_agent_tasks([], Path(t), sb.registered_agent_backend("vibe"), effort="high")
+        # Vibe has no known effort control: a requested level must stop the
+        # suite before any spend, not run and record a level it never applied.
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            _, tasks, _ = write_with_skill_task(root)
+            fake, probe, runs = root / "fake_vibe.py", root / "invoked", root / "runs"
+            fake.write_text("import pathlib, sys\npathlib.Path(sys.argv[1]).touch()\n",
+                            encoding="utf-8")
+            code, _, stderr = run_cli(
+                "run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", runs,
+                "--vibe-cmd", f"{sys.executable} {fake} {probe}", "--effort", "high")
+            self.assertIn("vibe backend has no known effort control", stderr)
+            self.assertEqual(code, 1)
+            self.assertFalse(runs.exists())
+            self.assertFalse(probe.exists())
 
 
 # A protocol-valid `codex exec --json` turn that also records the argv it got.
