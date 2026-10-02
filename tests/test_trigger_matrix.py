@@ -193,6 +193,7 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             seen.update({
                 "argv": list(plan.argv), "cwd": cwd, "config": config,
                 "auth_copied": (config / "auth.json").is_file(),
+                "home": sorted(path.name for path in config.iterdir()),
                 "mounted": sorted(path.name for path in (config / "skills").iterdir()),
                 # What Pi's read/grep/find/ls tools can reach from where it runs.
                 "reachable": sorted(path.name for path in cwd.rglob("*")),
@@ -203,6 +204,9 @@ class TriggerRowBoundaryTests(unittest.TestCase):
             user_home = Path(td) / "user-pi"
             user_home.mkdir()
             (user_home / "auth.json").write_text('{"token": "user-token-123"}', encoding="utf-8")
+            # Settings and a system prompt change behaviour; only auth is copied.
+            (user_home / "settings.json").write_text('{"defaultThinkingLevel": "high"}', encoding="utf-8")
+            (user_home / "AGENTS.md").write_text("Always load every skill.\n", encoding="utf-8")
             eval_set = write_rows(Path(td), [{"query_id": "negative", "query": "ordinary chat",
                                               "should_trigger": False}])
             with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": str(user_home)}):
@@ -219,12 +223,13 @@ class TriggerRowBoundaryTests(unittest.TestCase):
         self.assertNotEqual(seen["config"], user_home)
         self.assertFalse(seen["config"].is_relative_to(seen["cwd"]))
         self.assertTrue(seen["auth_copied"])
+        self.assertEqual(seen["home"], ["auth.json", "skills"])
         self.assertTrue(seen["mounted"])
         self.assertNotIn("auth.json", seen["reachable"])
         self.assertNotIn("SKILL.md", seen["reachable"])
         self.assertFalse(seen["config"].exists(), "the Pi home and its copied auth are removed")
 
-    def test_an_agent_home_is_removed_even_when_the_mount_is_refused(self):
+    def test_an_agent_home_is_removed_when_the_mounted_tree_fails_its_hash_check(self):
         for adapter in (tm.PiAdapter(), tm.CodexAdapter()):
             with self.subTest(agent=adapter.name), tempfile.TemporaryDirectory() as td:
                 tree = Path(td) / "tree" / "demo"
@@ -243,6 +248,27 @@ class TriggerRowBoundaryTests(unittest.TestCase):
                                           metadata={"skill_tree_hash": "0" * 64})
                 home = (adapter._pi_home if adapter.name == "pi" else adapter._codex_home)(created[0])
                 self.assertFalse(home.exists())
+
+    def test_an_agent_home_is_removed_when_the_agent_crashes(self):
+        # The home outlives invoke() so its credentials can be scanned for
+        # redaction; the cell still removes it when the agent process raises.
+        def crash(plan):
+            homes.append(Path(dict(plan.environment or {})[home_var]))
+            raise RuntimeError("provider unavailable")
+
+        for adapter_cls, home_var in ((tm.PiAdapter, "PI_CODING_AGENT_DIR"),
+                                      (tm.CodexAdapter, "CODEX_HOME")):
+            homes = []
+            with self.subTest(agent=adapter_cls.name), tempfile.TemporaryDirectory() as td, \
+                 mock.patch.object(adapter_cls, "_run_argv", staticmethod(crash)):
+                tree = Path(td) / "tree"
+                (tree / "demo").mkdir(parents=True)
+                (tree / "demo" / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
+                    tm.observe_cell_query(adapter_cls(), tree, "q", True, None, 5,
+                                          metadata={"skill_tree_hash": sb.skill_tree_hash(tree)})
+                self.assertEqual(len(homes), 1)
+                self.assertFalse(homes[0].exists())
 
     def test_pi_ablation_report_names_the_edited_tree_on_every_repetition(self):
         with tempfile.TemporaryDirectory() as td:
