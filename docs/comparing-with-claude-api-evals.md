@@ -103,7 +103,7 @@ with the wrong mechanism is a rejection.
 | Re-grading | Re-run the judge on stored transcripts | Deterministic grading calls no model and no network (CF.4), and a re-grade is byte-identical apart from `generated_at` (CF.3) |
 | Leakage | A checklist item: read the prompts for the expected answer | `validate` warns when a contains-style assertion value (at least `--leakage-min-chars`, default 4) appears literally in its own prompt; `--strict-leakage` fails on it |
 | Judge calibration | Agreement on a few dozen human labels; well below ~90% means iterate the judge | `judge-alignment` reports Cohen's kappa, precision, recall, and F1, so a judge that passes everything on a mostly-passing set reads kappa 0.0 rather than high agreement ([`can-i-trust-my-judge.md`](can-i-trust-my-judge.md)) |
-| Small-n statistics | Noise floor ≈ `1/sqrt(n·reps)` | Exact paired sign-flip over per-case deltas (exact while the cases that moved take at most 2**14 sign outcomes, seeded sampling beyond), the interval that inverts it, and `noise_check.smallest_achievable_p` |
+| Small-n statistics | Noise floor ≈ `1/sqrt(n·reps)` | Exact paired sign-flip over per-case deltas (exact while the sign patterns of the cases that moved reach at most 2**14 distinct sums, which pass-rate deltas at the usual repeats do; seeded sampling beyond), the interval that inverts it, and `noise_check.smallest_achievable_p` |
 
 ### Where the guides go further
 

@@ -433,12 +433,13 @@ class GradedScoringSeverityTests(unittest.TestCase):
         # The deterministic Monte-Carlo point estimate is below .05, while
         # exact enumeration is just above it.  A point-estimate gate would
         # therefore manufacture a causal confirmation.
-        # Repeated deltas keep these 15 exact by default (6144 distinct sign
-        # outcomes), so a 2**12 budget puts them on the sampled path.
+        # These 15 are exact by default (tenths, so their pattern sums are
+        # whole numbers of tenths), so a 2**0 budget puts them on the sampled
+        # path.
         deltas = [-1, -.9, -.6, .5, .1, -.5, .4, .4, -.1, .4,
                   -.4, -1, -.8, -.6, -.6]
-        sampled = sb.sign_flip_significance(deltas, max_exact_n=12)
-        reversed_sampled = sb.sign_flip_significance(list(reversed(deltas)), max_exact_n=12)
+        sampled = sb.sign_flip_significance(deltas, max_exact_n=0)
+        reversed_sampled = sb.sign_flip_significance(list(reversed(deltas)), max_exact_n=0)
         exact = sb.sign_flip_significance(deltas, max_exact_n=20)
         self.assertEqual(sb.sign_flip_significance(deltas), exact)
         self.assertEqual(sampled["method"], "sign-flip-sampled")

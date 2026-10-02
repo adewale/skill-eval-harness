@@ -298,8 +298,8 @@ assumed.
     and on the `graded` channel; no bootstrap. The confidence `interval` beside it
     (`effect_estimates.sign_flip_interval`) is that test inverted: every shift the test would not
     reject. It therefore excludes zero exactly when the test rejects "no lift". Both come from
-    one implementation: exact while the units that moved take at most 2**14 sign outcomes, and
-    beyond that the same seeded sign patterns and the same conservative Monte Carlo bound. With
+    one implementation: exact while the sign patterns of the units that moved reach at most 2**14
+    distinct sums (pass-rate deltas are summed as whole numbers of runs), and beyond that the same seeded sign patterns and the same conservative Monte Carlo bound. With
     five or fewer units, or when every delta is equal, the interval is reported `bounded: false`
     with a reason, because no shift can be excluded at 95%. `noise_check` sits beside both and
     names what limits the eval: too few cases moved to reach p ≤ 0.05, or a noise floor (the

@@ -5,6 +5,7 @@ when the exact test rejects "no lift". The noise check must say when an eval
 could not have shown a lift at all. A case both arms fail must never be sent
 to suggest-cases for hardening."""
 import bisect
+import collections
 import itertools
 import json
 import math
@@ -36,20 +37,19 @@ def thirds(values: list[int]) -> list[float]:
     return [value / 3 for value in values]
 
 
-def three_value_p(up: int, down: int, zeros: int, shift: float) -> float:
-    """The two-sided sign-flip p-value of ``d - shift`` for ``up`` deltas of
-    +1, ``down`` of -1 and ``zeros`` of 0, counted over how many of each kind
-    are flipped, each count weighted by its binomial coefficients."""
-    n = up + down + zeros
-    observed = abs(up - down - n * shift) - 1e-12
+def grouped_p(deltas: list[float], shift: float) -> float:
+    """The two-sided sign-flip p-value of ``d - shift``, counted over how many
+    of each distinct delta are flipped (zeros included), each count weighted
+    by its binomial coefficient: no pattern sums are grouped or sorted."""
+    counts = sorted(collections.Counter(deltas).items())
+    n = len(deltas)
+    observed = abs(math.fsum(deltas) - n * shift) - 1e-12
     hits = 0
-    for i in range(up + 1):
-        for k in range(down + 1):
-            a = (up - 2 * i) - (down - 2 * k)
-            b = (up - 2 * i) + (down - 2 * k)
-            for j in range(zeros + 1):   # j zeros flipped: B gains zeros - 2j
-                if abs(a - shift * (b + zeros - 2 * j)) >= observed:
-                    hits += math.comb(up, i) * math.comb(down, k) * math.comb(zeros, j)
+    for flips in itertools.product(*(range(count + 1) for _, count in counts)):
+        statistic = math.fsum((value - shift) * (count - 2 * j)
+                              for (value, count), j in zip(counts, flips))
+        if abs(statistic) >= observed:
+            hits += math.prod(math.comb(count, j) for (_, count), j in zip(counts, flips))
     return hits / 2 ** n
 
 
@@ -209,13 +209,32 @@ class IntervalAgreesWithTheTestTests(unittest.TestCase):
     def test_unchanged_cases_keep_the_interval_exact(self):
         # An independent count over how many +1, -1 and 0 deltas flip agrees
         # with the interval on both sides of each endpoint.
-        up, down, zeros = 14, 6, 10
-        interval = ee.sign_flip_interval([1.0] * up + [-1.0] * down + [0.0] * zeros)
+        deltas = [1.0] * 14 + [-1.0] * 6 + [0.0] * 10
+        interval = ee.sign_flip_interval(deltas)
         self.assertEqual(interval["method"], "sign-flip-inversion-exact")
         for end, inside in ((interval["lower"], 1e-5), (interval["upper"], -1e-5)):
             with self.subTest(end=end):
-                self.assertGreater(three_value_p(up, down, zeros, end + inside), 0.05)
-                self.assertLessEqual(three_value_p(up, down, zeros, end - inside), 0.05)
+                self.assertGreater(grouped_p(deltas, end + inside), 0.05)
+                self.assertLessEqual(grouped_p(deltas, end - inside), 0.05)
+
+    def test_pass_rate_deltas_past_the_outcome_budget_stay_exact(self):
+        # 29 cases at three repeats: six distinct non-zero deltas, 5 or 4 of
+        # each, take 6*5*6*5*6*5 = 27000 > 2**14 flip-count outcomes, so the
+        # test and the interval sampled. As thirds they are whole numbers of
+        # runs, and their pattern sums take far fewer values, so both are
+        # exact: the p-value and the interval's endpoints match a count over
+        # every combination of flips.
+        deltas = thirds([1] * 5 + [-1] * 4 + [2] * 5 + [-2] * 4 + [3] * 5 + [-3] * 4 + [0] * 2)
+        significance = ee.sign_flip_test(deltas)
+        interval = ee.sign_flip_interval(deltas)
+        self.assertEqual((significance["method"], interval["method"]),
+                         ("sign-flip-exact", "sign-flip-inversion-exact"))
+        self.assertAlmostEqual(significance["p_value"], grouped_p(deltas, 0.0), places=12)
+        self.assertTrue(interval["bounded"])
+        for end, inside in ((interval["lower"], 1e-5), (interval["upper"], -1e-5)):
+            with self.subTest(end=end):
+                self.assertGreater(grouped_p(deltas, end + inside), 0.05)
+                self.assertLessEqual(grouped_p(deltas, end - inside), 0.05)
 
 
 class NoiseCheckTests(unittest.TestCase):

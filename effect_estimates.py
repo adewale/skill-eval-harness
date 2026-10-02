@@ -32,18 +32,26 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from fractions import Fraction
 from typing import Any
 
 DEFAULT_ALPHA = 0.05
 DEFAULT_CONFIDENCE = 0.95
-# Exact enumeration while the non-zero deltas have at most 2**14 distinct sign
-# outcomes: 14 distinct non-zero deltas, or more when deltas repeat. Zero
-# deltas cost a factor of (zeros + 1) in the interval search rather than
-# 2**zeros, bounded at 2**16 against the moved units. The pattern sums are
-# grouped by pattern weight and sorted once, so each p-value evaluation during
-# the interval search is a handful of binary searches.
+# Exact enumeration while the non-zero deltas' sign patterns take at most
+# 2**14 distinct (sum, weight) outcomes: 14 distinct non-zero deltas, or many
+# more when deltas repeat or are whole numbers of runs. Zero deltas cost a
+# factor of (zeros + 1) in the interval search rather than 2**zeros, bounded
+# at 2**16 against the moved units. The pattern sums are grouped by pattern
+# weight and sorted once, so each p-value evaluation during the interval
+# search is a handful of binary searches.
 MAX_EXACT_CASES = 14
 SAMPLED_PATTERNS = 4096
+# Merging outcomes stops (and the test samples) past this many dict updates.
+_EXACT_WORK = 1 << 18
+# Deltas within this relative distance of a fraction with a denominator up to
+# _MAX_DENOMINATOR are counted on that fraction's lattice.
+_MAX_DENOMINATOR = 10**6
+_LATTICE_SLACK = 1e-12
 _TOLERANCE = 1e-12
 _SEARCH_STEPS = 60
 _DECIMALS = 6
@@ -165,27 +173,53 @@ class _SignPatterns:
     last_order: list[int] = field(default_factory=list, compare=False, repr=False)
 
 
-def _exact_fits(deltas: Sequence[float], max_exact_n: int) -> bool:
-    """Whether exact enumeration fits the budget. Equal deltas are
-    exchangeable, so a value seen c times contributes c + 1 outcomes, and the
-    zeros only widen each tail count by their (zeros + 1) spread."""
+def _lattice_scale(values: Sequence[float]) -> int | None:
+    """The common denominator of the deltas when every one is a fraction with
+    a small denominator, as pass-rate deltas are (whole runs and assertions
+    over the repeats), so pattern sums can be counted as whole numbers."""
+    scale = 1
+    for value in values:
+        fraction = Fraction(value).limit_denominator(_MAX_DENOMINATOR)
+        if fraction == 0 or abs(float(fraction) - value) > _LATTICE_SLACK * max(1.0, abs(value)):
+            return None
+        scale = math.lcm(scale, fraction.denominator)
+        if scale > _MAX_DENOMINATOR:
+            return None
+    return scale
+
+
+def _exact_patterns(deltas: Sequence[float], max_exact_n: int) -> _SignPatterns | None:
+    """Every sign pattern's (A, B), counted, or None past the exact budget.
+
+    Flipping j of c equal deltas v gives the same (A, B) in comb(c, j) ways:
+    A gains v * (c - 2j) and B gains c - 2j. Zeros only move B, so they stay
+    one binomial spread instead of multiplying the outcomes. Outcomes with
+    the same (A, B) merge, so the budget is on distinct outcomes: on a
+    fraction lattice (pass-rate deltas) A is a whole number of steps and
+    many more evals fit than the product of the counts suggests.
+    """
     counts = Counter(v for v in deltas if v != 0)
     moved = sum(counts.values())
     zeros = len(deltas) - moved
-    return (math.prod(count + 1 for count in counts.values()) <= 1 << max_exact_n
-            and (moved + 1) * (zeros + 1) <= 1 << (max_exact_n + 2))
-
-
-def _exact_patterns(deltas: Sequence[float]) -> _SignPatterns:
-    # Flipping j of c equal deltas v gives the same (A, B) in comb(c, j) ways:
-    # A gains v * (c - 2j) and B gains c - 2j. Zeros only move B, so they
-    # stay one binomial spread instead of multiplying the outcomes.
-    counts = Counter(v for v in deltas if v != 0)
-    zeros = len(deltas) - sum(counts.values())
-    outcomes: list[tuple[float, int, int]] = [(0.0, 0, 1)]
+    if (moved + 1) * (zeros + 1) > 1 << (max_exact_n + 2):
+        return None
+    scale = _lattice_scale(list(counts))
+    cells: dict[tuple[float, int], int] = {(0, 0): 1}
+    work = 0
     for value, count in sorted(counts.items()):
-        outcomes = [(a + value * (count - 2 * j), b + count - 2 * j, w * math.comb(count, j))
-                    for a, b, w in outcomes for j in range(count + 1)]
+        step = round(value * scale) if scale else value
+        work += len(cells) * (count + 1)
+        if work > _EXACT_WORK:
+            return None
+        merged: dict[tuple[float, int], int] = {}
+        for (a, b), w in cells.items():
+            for j in range(count + 1):
+                key = (a + step * (count - 2 * j), b + count - 2 * j)
+                merged[key] = merged.get(key, 0) + w * math.comb(count, j)
+        if len(merged) > 1 << max_exact_n:
+            return None
+        cells = merged
+    outcomes = [(a / scale if scale else float(a), b, w) for (a, b), w in cells.items()]
     by_b: dict[int, list[tuple[float, int]]] = {}
     for a, b, w in outcomes:
         by_b.setdefault(b, []).append((a, w))
@@ -284,8 +318,9 @@ def _rejects(patterns: _SignPatterns, whole: float, n: int, delta: float, alpha:
 
 def _patterns(values: Sequence[float], max_exact_n: int, samples: int,
               seed: int) -> _SignPatterns:
-    if _exact_fits(values, max_exact_n):
-        return _exact_patterns(values)
+    exact = _exact_patterns(values, max_exact_n)
+    if exact is not None:
+        return exact
     return _sampled_patterns(values, samples, seed)
 
 

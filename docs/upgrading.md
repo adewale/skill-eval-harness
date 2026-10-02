@@ -193,6 +193,13 @@ that file still invalidates trigger identity until those owners are extracted in
   exact p = 0.03125 and is significant. A saved report with more than 14 paired units can
   change `significance`, `interval` and `method` (from `...-sampled` to `...-exact`) when
   regraded.
+- Pass-rate deltas are whole numbers of runs (or assertions) over the repeats, so the sign-flip
+  test now sums them as whole numbers and counts the patterns that reach one sum once. Every
+  paired block whose moved units have at most 2**14 distinct pattern sums is exact, which covers
+  pass-rate lift at the usual repeats: 15–40 cases at 3 or more repeats per arm with several
+  distinct deltas used to sample. A saved report whose `method` read `...-sampled` there reads
+  `...-exact` when regraded, with the exact `p_value` (equal to `p_value_upper_bound`), and its
+  `interval`, `noise_floor` and `significant_at_0_05` can change with it.
 - When every paired delta is equal (every case gained one full run, say), the interval was the
   point `[v, v]`, so `noise_check` read `noise_floor: 0` and `resolvable` for any `--min-lift`. A
   sign-flip test reads only signs and cannot bound a constant sample, so the interval now reads
