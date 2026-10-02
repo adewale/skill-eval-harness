@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from helpers import make_eval_repo
+from helpers import make_eval_repo, run_cli
 
 import content_digests as cd
 import skill_benchmark as sb
@@ -50,6 +50,8 @@ class PersistedDigestTests(unittest.TestCase):
             digests = {
                 "skill tree": sb.skill_tree_hash(tree),
                 "oracle tree": cd.directory_tree_sha256(tree, reject_symlinks=True),
+                # A stand-in task, not an argument namespace: the hash reads
+                # only the task's input_files.
                 "prepared fixtures": sb.prepared_fixture_tree_hash(
                     SimpleNamespace(input_files=[str(path) for path in fixtures])),
                 "planned fixtures": sb.planned_file_surface_hash(
@@ -87,13 +89,11 @@ class TreeOrderTests(unittest.TestCase):
                                       references={"references/x.md": "x",
                                                   "references-v2.md": "v2"})
             out = root / "payloads.jsonl"
-            sb.export_jetty(SimpleNamespace(
-                manifest=str(manifest), split="tune", runs_per_variant=1,
-                include_old_skill=False, include_ablations=False,
-                allow_missing_prompts=False, jetty_collection="c",
-                jetty_task_prefix="t", jetty_agent="claude-code", jetty_model="m",
-                jetty_model_provider="anthropic", jetty_snapshot="s",
-                use_trial_keys=False, out=str(out)))
+            code, _, stderr = run_cli(
+                "export-jetty", manifest, "--split", "tune", "--jetty-collection", "c",
+                "--jetty-task-prefix", "t", "--jetty-agent", "claude-code", "--jetty-model", "m",
+                "--jetty-model-provider", "anthropic", "--jetty-snapshot", "s", "--out", out)
+            self.assertEqual(code, 0, stderr)
             payloads = sb.load_jsonl(out)
         with_skill = [p for p in payloads if p["harness"]["variant"] == "with_skill"]
         self.assertTrue(with_skill)

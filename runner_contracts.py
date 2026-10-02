@@ -53,12 +53,20 @@ class OutcomeContext:
     metrics_extra: Mapping[str, Any] = field(default_factory=dict)
     environment: Mapping[str, Any] | None = None
     diagnose_returncode: bool = True
+    # The provider whose wire format the trace is in, when it is not the
+    # runner's own: run-subagent's default backend drives Claude's CLI.
+    trace_source: Provider | None = None
 
     def __post_init__(self) -> None:
         try:
             object.__setattr__(self, "provider", Provider(self.provider))
         except ValueError as exc:
             raise ValueError(f"unknown runner provider {self.provider!r}") from exc
+        if self.trace_source is not None:
+            try:
+                object.__setattr__(self, "trace_source", Provider(self.trace_source))
+            except ValueError as exc:
+                raise ValueError(f"unknown trace source {self.trace_source!r}") from exc
         if self.model is not None and (not isinstance(self.model, str) or not self.model.strip()):
             raise ValueError("runner model must be None or a non-empty string")
         if self.model is not None:
@@ -226,7 +234,8 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
                   metrics_extra: Mapping[str, Any] | None = None,
                   environment: Mapping[str, Any] | None = None,
                   diagnose_returncode: bool = True,
-                  invocation_state: InvocationState | str | None = None) -> AnswerOutcome:
+                  invocation_state: InvocationState | str | None = None,
+                  trace_source: str | None = None) -> AnswerOutcome:
     """Strict compatibility factory for the historical constructor spelling."""
     if not isinstance(timed_out, bool):
         raise TypeError("timed_out must be boolean")
@@ -256,6 +265,7 @@ def RunnerOutcome(*, provider: str, answer: str | None = None,
         metadata_extra={} if metadata_extra is None else metadata_extra,
         metrics_extra={} if metrics_extra is None else metrics_extra,
         environment=environment, diagnose_returncode=diagnose_returncode,
+        trace_source=None if trace_source is None else Provider(trace_source),
     )
     if timed_out:
         if returncode not in {None, 124}:

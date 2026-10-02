@@ -1,16 +1,14 @@
-import contextlib
-import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from helpers import (
     attach_jetty_task_contract,
     demo_manifest,
     make_eval_repo,
+    run_cli,
     write_demo_manifest,
 )
 
@@ -141,18 +139,16 @@ class JettyImportTransactionTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def invoke(self, manifest: Path, records_path: Path, runs: Path) -> None:
-        sb.import_jetty_results(SimpleNamespace(
-            manifest=str(manifest), jetty_runs=str(records_path), runs=str(runs)
-        ))
+    def invoke(self, manifest: Path, records_path: Path, runs: Path) -> tuple[int, str, str]:
+        return run_cli("import-jetty-results", "--manifest", manifest,
+                       "--jetty-runs", records_path, "--runs", runs)
 
     def assert_import_rejected(
         self, manifest: Path, records_path: Path, runs: Path, message: str,
     ) -> None:
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
-            self.invoke(manifest, records_path, runs)
-        self.assertIn(message, stderr.getvalue())
+        code, _, stderr = self.invoke(manifest, records_path, runs)
+        self.assertEqual(code, 1, stderr)
+        self.assertIn(message, stderr)
 
     def test_preflight_failure_writes_neither_design_nor_any_run(self):
         with tempfile.TemporaryDirectory() as td:
@@ -239,7 +235,8 @@ class JettyImportTransactionTests(unittest.TestCase):
             records_path = root / "jetty.jsonl"
             self.write_records(records_path, records)
 
-            self.invoke(manifest, records_path, runs)
+            code, _, stderr = self.invoke(manifest, records_path, runs)
+            self.assertEqual(code, 0, stderr)
 
             persisted = json.loads(
                 (runs / sb.ANSWER_DESIGN_NAME).read_text(encoding="utf-8")

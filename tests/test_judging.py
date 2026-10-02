@@ -6,7 +6,6 @@ test_cbc) and test_skill_benchmark, which accreted by merge rather than by
 subject; docstrings citing finding/roadmap ids are preserved.
 """
 import contextlib
-import io
 import json
 import os
 import stat
@@ -14,7 +13,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from helpers import (
@@ -1357,15 +1355,10 @@ class ToolUsingJudgeTests(unittest.TestCase):
     def test_command_rejects_explore_with_shell_judge_cmd(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            args = SimpleNamespace(manifest=str(make_eval_repo(root)), runs=str(root / "runs"),
-                                   split=None, variant=None,
-                                   judge_cmd="cat x", judge_model=None, judge_panel=None, claude_bin="claude",
-                                   judge_runs=1, strict_judge_schema=False, judge_trajectory=False,
-                                   judge_explore=True, quorum=None, transcripts=None, out=None)
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
-                sb.judge_command(args)
-        self.assertIn("--judge-explore is for the native claude judge backend only", stderr.getvalue())
+            code, _, stderr = run_cli("judge", make_eval_repo(root), "--runs", root / "runs",
+                                      "--judge-cmd", "cat x", "--judge-explore")
+        self.assertEqual(code, 1, stderr)
+        self.assertIn("--judge-explore is for the native claude judge backend only", stderr)
 
 
 class StrictJudgeVerdictTests(unittest.TestCase):

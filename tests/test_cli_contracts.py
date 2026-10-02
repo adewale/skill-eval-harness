@@ -1,8 +1,13 @@
 import argparse
 import ast
 import builtins
+import contextlib
+import functools
+import importlib.util
 import inspect
+import io
 import sys
+import tempfile
 import textwrap
 import types
 import unittest
@@ -27,6 +32,8 @@ from cli_contracts import (
     ValidatedLegacyCLIInvocation,
 )
 from manifest_contracts import ExecutionVariant, ModelId, Split
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class CLIInvocationTests(unittest.TestCase):
@@ -511,6 +518,67 @@ class ArgumentWiringTests(unittest.TestCase):
             with self.subTest(handler=handler.__name__):
                 findings = wiring_findings(_planted_parser(), handler, {"args"}, command="planted")
                 self.assertRegex(findings[0], expected)
+
+    def test_no_parser_the_package_builds_accepts_an_abbreviated_option(self):
+        # argparse matches a unique prefix of a long option by default, so a
+        # renamed flag still answers to its old spelling's prefix, a user's
+        # abbreviation silently works, and no argv test can catch a rename that
+        # lengthens a flag. Every parser and subparser is collected as it is
+        # built, by each console script's parser builder and by each script's
+        # and example's own `--help` path, so a new one is covered unedited.
+        built: list[argparse.ArgumentParser] = []
+        original_init = argparse.ArgumentParser.__init__
+
+        def recording_init(parser, *args, **kwargs):
+            original_init(parser, *args, **kwargs)
+            built.append(parser)
+
+        sources = {"skill-benchmark": sb.build_arg_parser, "skill-trigger-matrix": tm.build_arg_parser,
+                   "skill-pi-trigger-eval": pi_runner.build_arg_parser}
+        for path in sorted([*ROOT.glob("scripts/*.py"), *ROOT.glob("examples/*/*.py")]):
+            if "argparse" in path.read_text(encoding="utf-8"):
+                sources[str(path.relative_to(ROOT))] = functools.partial(_run_script_help, path)
+        abbreviating: dict[str, list[str]] = {}
+        with mock.patch.object(argparse.ArgumentParser, "__init__", recording_init):
+            for source, build in sources.items():
+                with self.subTest(source=source):
+                    built.clear()
+                    build()
+                    self.assertTrue(built, f"{source} built no parser")
+                    abbreviating[source] = sorted(parser.prog for parser in built if parser.allow_abbrev)
+        self.maxDiff = None
+        self.assertEqual({source: progs for source, progs in abbreviating.items() if progs}, {})
+
+    def test_an_abbreviated_option_is_an_unrecognized_argument(self):
+        # Each console script, at the command line: `--judge-res` for
+        # `--judge-results`, `--runs-per` for `--runs-per-query`.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_eval_repo(root)
+            judged = root / "judge-results.jsonl"
+            judged.write_text("", encoding="utf-8")
+            code, _, stderr = run_cli("grade", manifest, "--runs", root / "runs", "--judge-res", judged)
+            self.assertEqual(code, 2, stderr)
+            self.assertIn("unrecognized arguments: --judge-res", stderr)
+            for runner in (tm, pi_runner):
+                with self.subTest(runner=runner.__name__), \
+                     mock.patch.object(sys, "argv", [runner.__name__, str(manifest), "--runs-per", "1",
+                                                     "--out", str(root / "report.json")]), \
+                     contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as ctx:
+                    runner.main()
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("unrecognized arguments: --runs-per", err.getvalue())
+
+
+def _run_script_help(path: Path) -> None:
+    """Build a script's parser the way a user does, through `--help`."""
+    spec = importlib.util.spec_from_file_location(f"_abbrev_probe_{path.stem}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with mock.patch.object(sys, "argv", [str(path), "--help"]), \
+            contextlib.redirect_stdout(io.StringIO()), contextlib.suppress(SystemExit):
+        module.main()
 
 
 if __name__ == "__main__":

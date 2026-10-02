@@ -214,7 +214,7 @@ def assess_trigger_report(path: Path, report: dict[str, Any], agent: str = "pi")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--out-dir", required=True, help="persistent directory for tasks, run artifacts, reports, and smoke.json; never cleaned by this command")
     parser.add_argument("--live", action="store_true", help="required acknowledgement before any model CLI is invoked")
     supported = ",".join(SMOKE_TARGETS)

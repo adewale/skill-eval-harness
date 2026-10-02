@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:11653`, merged in `grade_case_variant:14157`).
+threshold, evidence}` (`load_judge_results:11777`, merged in `grade_case_variant:14289`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -167,6 +167,9 @@ Mistral support should mean first-class Vibe CLI support, not a raw chat-complet
 - [x] Add Vibe offline conformance fixtures matching the Gemini fixture set, including tool-call /
       skill-activation evidence and missing-telemetry cases.
 - [x] Run token-backed Vibe live smokes after `MISTRAL_API_KEY` is available: direct no-tools prompt, `run-agent --agent vibe`, native `judge --judge-backend vibe`, `RUN_AGENT_INVOKE_SMOKE=1`, and `RUN_VIBE_TRIGGER_SMOKE=1` passed on 2026-07-09; Vibe usage/cost telemetry was absent and normalized as explicit `missing`.
+- [ ] Record a real Vibe 2.23+ `--output streaming` run that loads a skill and replace the
+      fixtures built from source in `tests/fixtures/vibe/` (steps in its README: `vibe --version`,
+      record, check the dialect reads it), then re-run `RUN_VIBE_TRIGGER_SMOKE=1`.
 
 ## Cross-provider registry/docs
 

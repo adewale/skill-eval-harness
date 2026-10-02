@@ -810,3 +810,29 @@ def judge_with_scores(manifest: Path, runs: Path, out: Path, *,
     if code != 0:
         raise AssertionError(f"judge stub failed: {stderr}")
     return out
+
+
+# --------------------------------------------------------------------------- #
+# lane F: what may follow Claude's terminal `result` record
+# --------------------------------------------------------------------------- #
+
+# (label, record, may follow `result`): the rule is exactly one `result`, and
+# no session content after it; any other record is metadata. Hand-built: the
+# only recorded trailing shape is system/task_summary (#85). `rate_limit_event`
+# is a record type Claude Code writes (the plugin-skill recording dropped one,
+# tests/fixtures/claude/README.md); its fields here are illustrative.
+CLAUDE_POST_RESULT_RECORDS: list[tuple[str, dict[str, Any], bool]] = [
+    ("system task_summary", {"type": "system", "subtype": "task_summary"}, True),
+    ("rate_limit_event", {"type": "rate_limit_event", "session_id": "s",
+                          "rate_limit_info": {"status": "allowed", "rateLimitType": "five_hour"}}, True),
+    ("unknown metadata type", {"type": "session_metrics", "session_id": "s", "detail": {"turns": 3}}, True),
+    ("assistant", {"type": "assistant", "message": {
+        "role": "assistant", "content": [{"type": "text", "text": "late"}]}}, False),
+    ("user", {"type": "user", "message": {"role": "user", "content": "more"}}, False),
+    ("second result", {"type": "result", "subtype": "success", "result": "second attempt",
+                       "total_cost_usd": 0.09}, False),
+    ("stream_event", {"type": "stream_event", "event": {
+        "type": "content_block_delta", "delta": {"type": "text_delta", "text": "late"}}}, False),
+    ("unknown type carrying a message", {"type": "session_turn", "message": {
+        "role": "assistant", "content": [{"type": "text", "text": "late"}]}}, False),
+]

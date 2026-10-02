@@ -8,13 +8,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import claude_stream_records as _canonical_stream_records
 from helpers import (
+    CLAUDE_POST_RESULT_RECORDS,
     claude_streams_ending_after_result,
     claude_trailing_record_sources,
     run_cli,
     write_with_skill_task,
 )
+from helpers import claude_stream_records as _canonical_stream_records
 from helpers import stub_claude as _stub_claude
 from helpers import stub_claude_stream as _stub_claude_stream
 
@@ -116,16 +117,29 @@ class ParseClaudeStreamTests(unittest.TestCase):
                 _, metrics = sb.normalize_trace_records(tolerated, source="claude")
                 self.assertTrue(metrics["skill_invoked"])
 
-    def test_session_content_after_the_result_is_protocol_invalid(self):
-        for trailing in (
-            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "late"}]}},
-            {"type": "user", "message": {"role": "user", "content": "more"}},
-            {"type": "rate_limit_event"},
-        ):
-            with self.subTest(trailing=trailing["type"]):
+    def test_the_parser_rejects_session_content_after_the_result_and_reads_past_metadata(self):
+        # One `result`, then metadata only: a record type Claude Code adds
+        # after the result must not make every real run unreadable, while a
+        # second result or a late turn still means the stream has no final word.
+        for label, trailing, allowed in CLAUDE_POST_RESULT_RECORDS:
+            with self.subTest(trailing=label):
                 p = sb.parse_claude_cli_json(stream_text(claude_stream_records() + [trailing]))
-                self.assertEqual(p["answer"], "")
-                self.assertIn("after its terminal result event", p["parse_error"])
+                if allowed:
+                    self.assertIsNone(p["parse_error"])
+                    self.assertEqual((p["answer"], p["cost_usd"]), ("All tests pass.", 0.05))
+                else:
+                    self.assertEqual(p["answer"], "")
+                    self.assertIsNotNone(p["parse_error"])
+
+    def test_the_trace_dialect_applies_the_same_rule_after_the_result(self):
+        dialect = sb.trace_dialect_for("claude")
+        for label, trailing, allowed in CLAUDE_POST_RESULT_RECORDS:
+            with self.subTest(trailing=label):
+                error = dialect.protocol_error(claude_stream_records() + [trailing], None)
+                if allowed:
+                    self.assertIsNone(error)
+                else:
+                    self.assertEqual(error, "Claude trace must contain exactly one final result event")
 
     def test_malformed_line_before_terminal_result_is_protocol_invalid(self):
         text = "not-json\n" + stream_text(claude_stream_records())

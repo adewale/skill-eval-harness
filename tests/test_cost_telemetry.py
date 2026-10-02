@@ -10,7 +10,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from helpers import attest_answer_design, make_eval_repo, result_row, run_cli, write_run
@@ -526,9 +525,9 @@ class SuiteLedgerTests(unittest.TestCase):
             path, runs = self.build_repo(Path(td))
             out = Path(td) / "cost-summary.json"
             md = Path(td) / "cost-summary.md"
-            rc = sb.cost_summary_command(SimpleNamespace(manifest=str(path), runs=str(runs), benchmark=None,
-                                                         judge_results=None, top=10, out=str(out), md=str(md)))
-            self.assertEqual(rc, 0)
+            rc, _, stderr = run_cli("cost-summary", "--manifest", path, "--runs", runs,
+                                    "--out", out, "--md", md)
+            self.assertEqual(rc, 0, stderr)
             self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["coverage"]["runs_seen"], 4)
             self.assertIn("Cost summary", md.read_text(encoding="utf-8"))
 

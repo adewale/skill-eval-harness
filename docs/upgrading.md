@@ -33,6 +33,10 @@ stricter at programmatic and persisted boundaries:
 - CLI values are validated before dispatch. Existing handlers still receive the same Namespace
   shape through the named legacy adapter, and meaningful zero values such as `--limit 0` and
   `--max-references 0` remain valid.
+- Long options must be spelled in full. argparse used to accept any unique prefix
+  (`--judge-res` for `--judge-results`, `--runs-per` for `--runs-per-query`); every entry point,
+  subcommand and script in this repository now exits 2 with `unrecognized arguments` instead.
+  Spell out any abbreviated flag in scripts and CI jobs that call the harness.
 
 Custom Python adapters should build `ProcessInvocationPlan` and use `run_argv_capture(plan)`.
 Code that supplied parallel argv/cwd/environment/timeout arguments to that internal helper must
@@ -79,6 +83,12 @@ that file still invalidates trigger identity until those owners are extracted in
   `max_tokens` stop records `truncated` and is unscorable, as in `run-claude`. An `--agent-cmd`
   reply may add `stop_class`, `stop_reason`, and `served_models`; a reply without them still runs
   and records `unavailable`.
+- `run-subagent`'s default Claude backend ran `claude` in an empty temporary directory, so the
+  skill and input paths its prompt named did not exist there, and it kept no trace, so every
+  process assertion on its runs failed for missing evidence. It now runs in the run's workspace
+  and keeps the stream as the trace (`metrics.json` `source: "claude"`, read by the Claude trace
+  dialect, as for `run-claude`). Re-run saved default-backend `run-subagent` runs: their
+  `with_skill` answers were produced without access to the skill.
 - A run that reports several models credits none of them: `served_model` is `null`, and the check
   reads `mixed` (scored, counted in `run_endings.served_model_mixed`) when the requested model is
   among them, or `mismatch` (unscorable) when it is not. Claude subagent turns are not counted.
@@ -243,6 +253,19 @@ that file still invalidates trigger identity until those owners are extracted in
   mounted under (`demo` for `skills/demo/SKILL.md`), which is how Claude Code 2.1.269 invokes
   project skills. A Claude trigger report saved with such a CLI can show should-fire misses that
   were activations; re-run it. Vibe's `skill` tool detection reads the same two names.
+- Vibe 2.23 and later write `--output streaming` as public history entries instead of
+  `LLMMessage` records. Every such line was a trace protocol error, so a `run-agent --agent vibe`
+  run with a current Vibe had `trace_observation_complete: false` and failed its process
+  assertions for missing evidence, and every `skill-trigger-matrix --agent vibe` cell was
+  incomplete. Both shapes now read; re-run Vibe answer runs and trigger reports made with Vibe
+  2.23 or later.
+- The Claude trigger adapter now reads a stream by the answer parser's rule: exactly one `result`
+  record and no session content after it (`assistant`, `user`, `result`, `stream_event`, or a
+  record with a `message` object). It took the last `result` and accepted a turn after it, so a
+  cell whose stream had two results or a late turn counted as a complete observation; it is now
+  incomplete. Any other record after `result` (`system`, `rate_limit_event`, a metadata type a
+  later Claude Code adds) is metadata, in answer runs, judges and trigger cells alike; before,
+  only `system` was, so a run ending in a `rate_limit_event` graded as an empty answer.
 - Skills now mount under their own directory name: `skills/demo/SKILL.md` mounts as `demo`, the
   name a user's install shows, where 0.6.0 used the flattened manifest path
   (`skills_demo_SKILL.md`). Claude Code showed the model that flattened string as the skill's

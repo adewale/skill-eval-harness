@@ -16,7 +16,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from helpers import (
@@ -480,6 +479,56 @@ class SubagentRunnerTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)) as caught:
                     sb.validate_subagent_response({"answer": "alpha", **fields})
                 self.assertIn(message, str(caught.exception))
+
+    def test_a_claude_run_carries_the_same_process_evidence_under_run_subagent_as_run_claude(self):
+        # The canonical stub stream runs `npm test` through Bash and Reads the
+        # skill's SKILL.md before answering; the process assertions below can
+        # only pass on that tool-use evidence, never on the answer text. The
+        # fake also records the files in its working directory: the prompt
+        # names the skill by its path in the run's workspace.
+        case = {"id": "case-1", "split": "tune", "prompt": "Run the tests.",
+                "assertions": [
+                    {"name": "ran-tests", "type": "command_ran", "pattern": "npm test"},
+                    {"name": "loaded-skill", "type": "skill_invoked", "expected": True}]}
+        evidence = {}
+        for command in ("run-claude", "run-subagent"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                manifest = make_eval_repo(root, cases=[case])
+                tasks, runs, bench = root / "tasks.jsonl", root / "runs", root / "benchmark.json"
+                stub, calls = stub_claude_stream(root / "claude-stream"), root / "calls.jsonl"
+                claude = root / "claude"
+                claude.write_text(
+                    f"#!{sys.executable}\nimport json, os, sys\n"
+                    "prompt = sys.stdin.read()\n"
+                    "files = sorted(os.path.relpath(os.path.join(d, f)) for d, _, fs in os.walk('.') for f in fs)\n"
+                    f"print(json.dumps([prompt, files]), file=open({str(calls)!r}, 'a'))\n"
+                    f"os.execv({str(stub)!r}, [{str(stub)!r}, *sys.argv[1:]])\n", encoding="utf-8")
+                claude.chmod(0o755)
+                for argv in (("prepare", manifest, "--out", tasks),
+                             (command, "--tasks", tasks, "--runs", runs, "--claude-bin", claude),
+                             ("benchmark", manifest, "--runs", runs, "--out", bench)):
+                    code, _, stderr = run_cli(*argv)
+                    self.assertEqual(code, 0, f"{argv[0]}: {stderr}")
+                seen = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(sorted("skills/demo/SKILL.md" in files
+                                        for prompt, files in seen if "skills/demo/SKILL.md" in prompt), [True])
+                base = runs / "case-1" / "with_skill"
+                events = json.loads((base / "events.json").read_text(encoding="utf-8"))
+                metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+                row = next(row for row in json.loads(bench.read_text(encoding="utf-8"))["results"]
+                           if row["variant"] == "with_skill")
+                self.assertEqual([(e["type"], e["name"], e["input_summary"]) for e in events["events"]
+                                  if e["status"] == "completed" and e.get("name")],
+                                 [("command", "Bash", "npm test"),
+                                  ("skill_load", "Read", "skills/demo/SKILL.md")])
+                self.assertEqual({a["name"]: a["passed"] for a in row["assertions"]},
+                                 {"ran-tests": True, "loaded-skill": True})
+                # Read through the Claude stream dialect, as run-claude reads it.
+                self.assertEqual(metrics["source"], "claude")
+                self.assertTrue(metrics["trace_observation_complete"])
+                evidence[command] = (metrics["commands"], metrics["tool_calls"], metrics["skill_invoked"])
+        self.assertEqual(evidence.get("run-subagent"), evidence.get("run-claude"))
 
 
 class ToolReplayTests(unittest.TestCase):
@@ -1039,9 +1088,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             runs = root / "runs"
             with mock.patch.object(sb.shutil, "rmtree", side_effect=fail_each_codex_cleanup_once), \
                  mock.patch.object(sb.time, "sleep", return_value=None):
-                self.assertEqual(sb.run_codex(SimpleNamespace(
-                    tasks=str(tasks), runs=str(runs),
-                    codex_cmd=f"{sys.executable} {fake_codex}", timeout=30)), 0)
+                code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                          "--codex-cmd", f"{sys.executable} {fake_codex}", "--timeout", "30")
+                self.assertEqual(code, 0, stderr)
 
             self.assertEqual(len(raced), 2)
             for row in rows:
@@ -1152,9 +1201,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                 with mock.patch.object(sb.tempfile, "mkdtemp", side_effect=record_invoke_temp), \
                      mock.patch.object(sb.shutil, "rmtree", side_effect=retain_invoke_temp), \
                      mock.patch.object(sb.time, "sleep", return_value=None):
-                    self.assertEqual(sb.run_codex(SimpleNamespace(
-                        tasks=str(tasks), runs=str(runs),
-                        codex_cmd=f"{sys.executable} {fake_codex}", timeout=30)), 0)
+                    code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                              "--codex-cmd", f"{sys.executable} {fake_codex}", "--timeout", "30")
+                    self.assertEqual(code, 0, stderr)
 
                 self.assertEqual(len(invoke_temps), 2)
                 self.assertEqual(len(set(invoke_temps)), 2)
@@ -1646,8 +1695,9 @@ class RunnerOutcomeContractTests(unittest.TestCase):
             silent = root / "silent_codex.py"
             silent.write_text("import sys\n_ = sys.stdin.read()\n", encoding="utf-8")  # emits nothing
             runs = root / "runs"
-            sb.run_codex(SimpleNamespace(tasks=str(tasks), runs=str(runs),
-                                         codex_cmd=f"{sys.executable} {silent}", timeout=30))
+            code, _, stderr = run_cli("run-codex", "--tasks", tasks, "--runs", runs,
+                                      "--codex-cmd", f"{sys.executable} {silent}", "--timeout", "30")
+            self.assertEqual(code, 0, stderr)   # the failed run is recorded, not the command
             base = runs / run_dir
             text = (base / "output.md").read_text(encoding="utf-8")
             self.assertTrue(text.startswith(f"{sb.CODEX_FAILURE}: provider produced no final answer"), text)
@@ -1681,6 +1731,45 @@ class RunnerOutcomeContractTests(unittest.TestCase):
                          ("unavailable", None, "vibe output carries no stop reason"))
         self.assertEqual(meta["served_model_check"], "unavailable")
         self.assertTrue(am.execution_valid(meta, "alpha"))
+
+    def test_a_vibe_2_23_history_entry_stream_carries_answer_tool_calls_and_skill_load(self):
+        # Vibe 2.23 and later write public history entries, not LLMMessage
+        # dumps (tests/fixtures/vibe/README.md: built from Vibe 2.25.8's own
+        # code, not recorded). The stream loads the `demo` skill, reads its
+        # SKILL.md and answers; the expected values are read off the fixture.
+        fixture = ROOT / "tests" / "fixtures" / "vibe" / "streaming.2.25.8.skill-load.jsonl"
+        case = {"id": "case-1", "split": "tune", "prompt": "Review this pull request description.",
+                "assertions": [{"name": "loaded-skill", "type": "skill_invoked", "expected": True},
+                               {"name": "answered", "type": "contains", "value": "demo skill"}]}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_eval_repo(root, cases=[case])
+            tasks, runs, bench = root / "tasks.jsonl", root / "runs", root / "benchmark.json"
+            fake_vibe = root / "fake_vibe.py"
+            fake_vibe.write_text(f"import sys\nsys.stdout.write(open({str(fixture)!r}, encoding='utf-8').read())\n",
+                                 encoding="utf-8")
+            for argv in (("prepare", manifest, "--out", tasks),
+                         ("run-agent", "--agent", "vibe", "--tasks", tasks, "--runs", runs,
+                          "--vibe-cmd", f"{sys.executable} {fake_vibe}"),
+                         ("benchmark", manifest, "--runs", runs, "--out", bench)):
+                code, _, stderr = run_cli(*argv)
+                self.assertEqual(code, 0, f"{argv[0]}: {stderr}")
+            base = runs / "case-1" / "with_skill"
+            output = (base / "output.md").read_text(encoding="utf-8")
+            metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8"))
+            events = json.loads((base / "events.json").read_text(encoding="utf-8"))["events"]
+            row = next(row for row in json.loads(bench.read_text(encoding="utf-8"))["results"]
+                       if row["variant"] == "with_skill")
+        self.assertEqual(output, "Reviewed with the demo skill.")
+        self.assertEqual(metrics.get("trace_protocol_errors"), None)
+        self.assertTrue(metrics["trace_observation_complete"])
+        self.assertEqual([(e["type"], e["name"], e["input_summary"]) for e in events
+                          if e["status"] == "completed" and e.get("name")],
+                         # A read of a SKILL.md is a skill load too, as for run-claude.
+                         [("skill_load", "skill", "demo"),
+                          ("skill_load", "read_file", "/work/.agents/skills/demo/SKILL.md")])
+        self.assertEqual({a["name"]: a["passed"] for a in row["assertions"]},
+                         {"loaded-skill": True, "answered": True})
 
 
 class TraceDialectRegistryTests(unittest.TestCase):
@@ -1734,6 +1823,49 @@ class TraceDialectRegistryTests(unittest.TestCase):
         self.assertFalse(metrics["operation_observation_complete"])
         self.assertFalse(passed)
         self.assertIn("trace_observation_incomplete", evidence)
+
+    def test_the_vibe_dialect_reads_each_record_shape_by_its_own_rules(self):
+        # Vibe 2.22 wrote LLMMessage dumps; 2.23 and later write public history
+        # entries (tests/fixtures/vibe/README.md). The first record picks the
+        # parser, and each shape keeps its own terminal-answer rule.
+        fixture = ROOT / "tests" / "fixtures" / "vibe" / "streaming.2.25.8.skill-load.jsonl"
+        entries = [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines()]
+        effect, answer = entries[2], entries[-1]
+        # A session-title notice as Vibe 2.25.8's EventProjector writes it.
+        notice = {"id": "notice-1", "sessionId": answer["sessionId"], "turnId": "turn-1",
+                  "createdAt": 1790979551670, "updatedAt": 1790979551670, "generationStatus": "completed",
+                  "relatedEntryId": None, "type": "notice", "level": "info", "message": "Session title updated",
+                  "detail": {"kind": "session_title_updated", "title": "Review a pull request"}}
+        llm_messages = [
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call-1", "function": {"name": "skill", "arguments": json.dumps({"name": "demo"})}}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "loaded"},
+            {"role": "assistant", "content": "done"}]
+        terminal = "Vibe trace must end with one non-empty assistant response"
+        # (label, records, trace protocol errors, skill invoked)
+        cases = (
+            ("2.22 LLMMessage stream", llm_messages, [], True),
+            ("2.25.8 history entries", entries, [], True),
+            ("a notice after the answer is metadata", [*entries, notice], [], True),
+            ("a tool call after the answer", [*entries, {**effect, "id": "late"}], [terminal], True),
+            ("a tool the harness does not enable", [
+                *entries[:2], {**effect, "detail": {**effect["detail"], "toolName": "bash"}}, *entries[3:]],
+             ["Vibe tool call function 'bash' is unsupported"], True),
+            ("an entry Vibe had not finished", [
+                *entries[:-1], {**answer, "generationStatus": "in_progress"}],
+             ["Vibe history entry 'msg-assistant-2' is not completed"], True),
+            ("an LLMMessage record in a history-entry stream", [*entries, llm_messages[-1]],
+             ["Vibe history entry id must be a non-empty string"], True),
+        )
+        for label, records, errors, invoked in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                sb.write_trace_artifacts(
+                    Path(td) / "run", "".join(json.dumps(record) + "\n" for record in records),
+                    source="vibe", process_observation_complete=True, provider_response_complete=True)
+                metrics = json.loads((Path(td) / "run" / "metrics.json").read_text(encoding="utf-8"))
+                self.assertEqual(metrics.get("trace_protocol_errors", []), errors)
+                self.assertEqual(metrics["trace_observation_complete"], not errors)
+                self.assertIs(metrics["skill_invoked"], invoked)
 
 
 if __name__ == "__main__":

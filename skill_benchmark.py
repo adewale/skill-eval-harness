@@ -7673,9 +7673,127 @@ def identity_flat_records(records: list[dict[str, Any]], *,
             for i, record in enumerate(records, 1)]
 
 
+# Vibe's `--output streaming` record shape changed in 2.23. Through 2.22 it
+# wrote one LLMMessage dump per line (`role`, string `content`, OpenAI-style
+# `tool_calls`; vibe/core/output_formatters.py). From 2.23 it writes public
+# history entries (vibe/cli/programmatic.py, vibe/app_server/models.py): each
+# carries a `type`, fields are camelCase, a `message` entry holds its text as
+# content blocks, and one `effect` entry is one finished tool call. A stream's
+# first record says which shape it is in; each shape has its own parser.
+VIBE_HISTORY_CONTENT_ENTRY_TYPES = frozenset({"message", "reasoning", "effect", "callback"})
+VIBE_HISTORY_METADATA_ENTRY_TYPES = frozenset({"checkpoint", "notice"})
+
+
+def vibe_records_are_history_entries(records: Sequence[Mapping[str, Any]]) -> bool:
+    """True for a Vibe 2.23+ stream of public history entries, False for the
+    LLMMessage dumps Vibe 2.22 and earlier wrote (they carry no `type`)."""
+    return bool(records) and "type" in records[0]
+
+
+def vibe_entry_text(entry: Mapping[str, Any]) -> str:
+    """The text of a Vibe 2.23+ `message` entry, joined as Vibe's own
+    PublicMessageEntry.text joins it."""
+    content = entry.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "\n\n".join(block["text"] for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                        and isinstance(block.get("text"), str))
+
+
+def _vibe_tool_flat_record(name: str, arguments: Mapping[str, Any]) -> dict[str, Any] | None:
+    """One Vibe tool call in the harness trace vocabulary, for the tools the
+    harness enables (VIBE_READ_ONLY_TOOLS); None for any other tool. Reads the
+    LLMMessage argument spellings and the 2.23+ camelCase effect input."""
+    if name == "skill":
+        return {"type": "skill_load", "name": name,
+                "path": str(arguments.get("name") or arguments.get("skill") or "")}
+    if name == "read_file":
+        return {"type": "file_read", "name": name,
+                "path": str(arguments.get("path") or arguments.get("file_path")
+                            or arguments.get("filePath") or "")}
+    if name == "grep":
+        return {"type": "tool_use", "tool": name, "input": dict(arguments)}
+    return None
+
+
 def vibe_stream_flat_records(records: list[dict[str, Any]], *,
                              record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
-    """Flatten Vibe's OpenAI-style message/tool lifecycle without dropping it."""
+    """Flatten a Vibe stream in whichever record shape it is in."""
+    if vibe_records_are_history_entries(records):
+        return vibe_history_entry_flat_records(records, record_lines=record_lines)
+    return vibe_llm_message_flat_records(records, record_lines=record_lines)
+
+
+def vibe_history_entry_flat_records(
+    records: list[dict[str, Any]], *, record_lines: list[int] | None = None,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten Vibe 2.23+ public history entries. Vibe writes an entry once it
+    is completed, so an `effect` entry is a whole tool call: its input under
+    `detail`, its outcome under `state`."""
+    if record_lines is not None and len(record_lines) != len(records):
+        raise ValueError("record_lines must have one physical line per trace record")
+    flat: list[tuple[int, dict[str, Any]]] = []
+    seen: set[str] = set()
+
+    def invalid(line: int, message: str) -> None:
+        flat.append((line, _claude_protocol_error(f"Vibe {message}")))
+
+    for ordinal, record in enumerate(records, 1):
+        line = record_lines[ordinal - 1] if record_lines is not None else ordinal
+        kind, entry_id = record.get("type"), record.get("id")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            invalid(line, "history entry id must be a non-empty string")
+            continue
+        if entry_id in seen:
+            invalid(line, f"history entry id {entry_id!r} is duplicated")
+            continue
+        seen.add(entry_id)
+        if record.get("generationStatus") != "completed":
+            invalid(line, f"history entry {entry_id!r} is not completed")
+            continue
+        if kind == "message":
+            role, content = record.get("role"), record.get("content")
+            if role not in {"user", "assistant", "system"}:
+                invalid(line, f"message role {role!r} is unsupported")
+            elif not isinstance(content, list) or not all(isinstance(block, dict) for block in content):
+                invalid(line, "message content must be a list of content blocks")
+            elif vibe_entry_text(record).strip():
+                flat.append((line, {"type": "message", "role": role, "text": vibe_entry_text(record)}))
+        elif kind == "effect":
+            detail, state = record.get("detail"), record.get("state")
+            name = detail.get("toolName") if isinstance(detail, dict) else None
+            arguments = detail.get("input") if isinstance(detail, dict) else None
+            if not isinstance(name, str) or not name.strip() or not isinstance(state, dict):
+                invalid(line, "effect must carry a detail.toolName and a state")
+                continue
+            spec = _vibe_tool_flat_record(name, arguments if isinstance(arguments, dict) else {})
+            if spec is None:
+                invalid(line, f"tool call function {name!r} is unsupported")
+                continue
+            status = state.get("status")
+            if status not in {"completed", "failed", "cancelled", "skipped"}:
+                invalid(line, f"effect {entry_id!r} state {status!r} is not a finished tool call")
+                continue
+            flat.append((line, {**spec, "status": "completed" if status == "completed" else "failed",
+                                **({} if status == "completed" else {"is_error": True}),
+                                "output": stringify_trace_value(
+                                    state.get("output") if status == "completed"
+                                    else state.get("error") or state.get("reason"))[:1000],
+                                "_raw_call_line": line, "_raw_result_line": line}))
+        elif kind == "reasoning":
+            if not isinstance(record.get("text"), str):
+                invalid(line, "reasoning entry text must be a string")
+        elif kind == "callback" or kind in VIBE_HISTORY_METADATA_ENTRY_TYPES:
+            flat.append((line, record))
+        else:
+            invalid(line, f"history entry type {kind!r} is unsupported")
+    return flat
+
+
+def vibe_llm_message_flat_records(records: list[dict[str, Any]], *,
+                                  record_lines: list[int] | None = None) -> list[tuple[int, dict[str, Any]]]:
+    """Flatten Vibe 2.22's OpenAI-style message/tool lifecycle without dropping it."""
     if record_lines is not None and len(record_lines) != len(records):
         raise ValueError("record_lines must have one physical line per trace record")
     flat: list[tuple[int, dict[str, Any]]] = []
@@ -7721,15 +7839,8 @@ def vibe_stream_flat_records(records: list[dict[str, Any]], *,
                 if not isinstance(arguments, dict):
                     invalid(line, "tool call arguments must be an object")
                     continue
-                if name == "skill":
-                    spec = {"type": "skill_load", "name": name,
-                            "path": str(arguments.get("name") or arguments.get("skill") or "")}
-                elif name == "read_file":
-                    spec = {"type": "file_read", "name": name,
-                            "path": str(arguments.get("path") or arguments.get("file_path") or "")}
-                elif name == "grep":
-                    spec = {"type": "tool_use", "tool": name, "input": arguments}
-                else:
+                spec = _vibe_tool_flat_record(name, arguments)
+                if spec is None:
                     invalid(line, f"tool call function {name!r} is unsupported")
                     continue
                 flat.append((line, {**spec, "status": "in_progress"}))
@@ -7949,9 +8060,18 @@ def _claude_trace_protocol_error(
 def _vibe_trace_protocol_error(
     records: list[dict[str, Any]], pi_stream: PiStream | None,
 ) -> str | None:
-    terminal_answer = (records and records[-1].get("role") == "assistant"
-                       and isinstance(records[-1].get("content"), str)
-                       and bool(records[-1]["content"].strip()))
+    if vibe_records_are_history_entries(records):
+        # Session content ends with the answer; a checkpoint or notice entry
+        # (metadata) may still follow it.
+        content = [record for record in records
+                   if record.get("type") in VIBE_HISTORY_CONTENT_ENTRY_TYPES]
+        terminal_answer = (bool(content) and content[-1].get("type") == "message"
+                           and content[-1].get("role") == "assistant"
+                           and bool(vibe_entry_text(content[-1]).strip()))
+    else:
+        terminal_answer = (bool(records) and records[-1].get("role") == "assistant"
+                           and isinstance(records[-1].get("content"), str)
+                           and bool(records[-1]["content"].strip()))
     if not terminal_answer:
         return "Vibe trace must end with one non-empty assistant response"
     return None
@@ -8652,7 +8772,7 @@ def _write_runner_outcome_files(run_dir: Path, outcome: AnswerOutcome,
                      "invocation_state": invocation_state.value,
                      **({"elapsed_ms": elapsed} if elapsed is not None else {})}
     events, metrics = write_trace_artifacts(
-        run_dir, trace_text, source=context.provider.value, metadata=metadata,
+        run_dir, trace_text, source=(context.trace_source or context.provider).value, metadata=metadata,
         extra_metrics=extra_metrics,
         environment=dict(context.environment) if context.environment is not None else None,
         write_metadata=True, write_raw_trace=bool(trace_text),
@@ -10047,8 +10167,8 @@ def parse_vibe_messages_with_errors(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Parse Vibe --output json (one list) or --output streaming (JSONL).
 
-    The Vibe CLI emits LLMMessage dictionaries, not a provider-enforced answer
-    schema. The harness therefore treats the final assistant message content as
+    The Vibe CLI emits LLMMessage dictionaries (through 2.22) or public
+    history entries (2.23 and later), not a provider-enforced answer schema. The harness therefore treats the final assistant message content as
     the answer/verdict, while preserving all parsed messages as trace JSONL."""
     text = coerce_text(stdout).strip()
     if not text:
@@ -10531,22 +10651,26 @@ def run_codex(args: argparse.Namespace) -> int:
 # thing every other adapter leaves the caller to reconstruct out of band.
 # --------------------------------------------------------------------------- #
 
-# Record types Claude Code may emit after the terminal result event without
-# changing the session's outcome (observed: `system`/`task_summary`, 2.1.269).
-CLAUDE_POST_RESULT_RECORD_TYPES = frozenset({"system"})
+# Record types that carry the session itself. One of them (or any record with a
+# `message` object) after the terminal result means the session went on past
+# its final word. Every other record type is metadata and may follow the result
+# (observed: `system`/`task_summary`, 2.1.269), so a metadata record type a
+# later Claude Code adds there does not make every run unreadable.
+CLAUDE_SESSION_CONTENT_RECORD_TYPES = frozenset({"assistant", "user", "result", "stream_event"})
 
 
 def claude_terminal_result_index(records: Sequence[Mapping[str, Any]]) -> int | None:
     """The one owner of Claude's terminal-event rule, shared by the answer
-    parser and the trace dialect: exactly one `result` record, followed only
-    by informational `system` records. Anything else (no result, two results,
-    session content after the result) is None: the stream has no final word."""
+    parser, the trace dialect and the trigger adapter: exactly one `result`
+    record, and no session content after it. Anything else (no result, two
+    results, a turn after the result) is None: the stream has no final word."""
     results = [i for i, record in enumerate(records) if record.get("type") == "result"]
     if len(results) != 1:
         return None
-    trailing = records[results[0] + 1:]
-    if any(record.get("type") not in CLAUDE_POST_RESULT_RECORD_TYPES for record in trailing):
-        return None
+    for record in records[results[0] + 1:]:
+        if (record.get("type") in CLAUDE_SESSION_CONTENT_RECORD_TYPES
+                or isinstance(record.get("message"), Mapping)):
+            return None
     return results[0]
 
 
@@ -13089,6 +13213,7 @@ def run_subagent_tasks(
     model: str | None = None,
     live_tools: dict[str, Any] | None = None,
     replay_mode: str | None = None,
+    trace_source: str | None = None,
 ) -> int:
     """The built-in subagent runner (roadmap 2.7): no external CLI required —
     `agent_fn(prompt, workspace, model, tool_executor)` is the seam (a Claude
@@ -13098,7 +13223,10 @@ def run_subagent_tasks(
     events.json, metrics.json), so grading stays file-based and re-runnable.
     Multi-turn telemetry aggregates only when every response declares
     ``telemetry_scope: turn_delta``; every attempted turn is retained under
-    ``turn-N/`` regardless. Tool replay (2.3) wraps the executor per run."""
+    ``turn-N/`` regardless. Tool replay (2.3) wraps the executor per run.
+    ``trace_source`` names the provider whose stream records a backend returns
+    as ``trace`` (the default Claude backend's), so they normalize through that
+    provider's trace dialect instead of the generic one."""
     mode = replay_mode or tool_replay_mode()
     workspace_builder = registered_workspace_builder("subagent")
     validated: list[tuple[dict[str, Any], PreparedTask, str | None, Path]] = []
@@ -13247,8 +13375,8 @@ def run_subagent_tasks(
                         provider="subagent", answer=turn_answer,
                         returncode=int(turn_rc), timed_out=bool(turn_timed_out),
                         error=turn_error, elapsed_ms=turn_elapsed,
-                        trace_text=turn_trace_text, usage=turn_usage,
-                        cost_usd=turn_cost, model=row_model,
+                        trace_text=turn_trace_text, trace_source=trace_source,
+                        usage=turn_usage, cost_usd=turn_cost, model=row_model,
                         metadata_extra={
                             "tool_replay_mode": mode, **prov_extra,
                             "billing_scope": "turn", "turn_number": n,
@@ -13340,7 +13468,7 @@ def run_subagent_tasks(
             # TIMEOUT marker, not the provider marker, heads the body.
             error=error or ("subagent timed out" if timed_out else None),
             elapsed_ms=(int(elapsed_ms) if isinstance(elapsed_ms, (int, float)) else None),
-            trace_text=trace_text,
+            trace_text=trace_text, trace_source=trace_source,
             usage=raw_usage, cost_usd=aggregate_cost_usd, model=row_model,
             metadata_extra={"tool_replay_mode": mode, **prov_extra, **multi_turn_extra,
                             **completion},
@@ -13391,10 +13519,12 @@ def run_subagent(args: argparse.Namespace) -> int:
                 transcript = "\n\n".join(f"[user]\n{h['prompt']}\n\n[assistant]\n{h['answer']}" for h in history)
                 prompt = f"Conversation so far:\n{transcript}\n\n[user]\n{prompt}"
             # stream-json, as run-claude reads it: the terminal result event
-            # carries the stop reason and the main-thread assistant messages
-            # name the model that served each turn.
+            # carries the stop reason, the main-thread assistant messages name
+            # the model that served each turn, and the stream is the run's
+            # trace. Claude runs in the run's workspace, where the prompt's
+            # skill and input paths are.
             result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout,
-                                       output_format="stream-json")
+                                       cwd=workspace, output_format="stream-json")
             error = result.get("provider_error") or result.get("parse_error")
             if error and result.get("returncode") == 0:
                 # An exit-zero error envelope or unreadable output is a failed
@@ -13416,11 +13546,13 @@ def run_subagent(args: argparse.Namespace) -> int:
                       if isinstance(item, str) and item.strip()]
             if served:
                 completion["served_models"] = served
+            trace, _ = parse_trace_jsonl_text(str(result.get("raw_response") or ""))
             return {"answer": result.get("answer"), "returncode": result.get("returncode"),
                     "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
-                    "usage": usage, **completion}
+                    "usage": usage, "trace": trace, **completion}
     return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
-                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode())
+                              replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode(),
+                              trace_source=None if agent_cmd else "claude")
 
 
 JUDGE_NEGATIVE_CONTROLS = {
@@ -21251,7 +21383,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """The complete CLI surface, buildable without parsing. Split out of
     main() so tests can enumerate every subcommand and flag (e.g. the
     README-coverage doc-sync guard) without invoking anything."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    # allow_abbrev=False on the parser and every subparser: a prefix of a long
+    # option is an error, not that option, so renaming a flag cannot leave its
+    # old spelling's prefix working and a user's abbreviation never silently
+    # picks a flag.
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("agent-capabilities", help="list unified backend registrations and supported surfaces")
@@ -21584,6 +21720,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-extra-manifests", action="store_true", help="do not fail when --workspace-root has top-level manifests outside the suite allowlist")
     p.add_argument("--skip-pin-check", action="store_true", help="load the suite without verifying --pins tree hashes")
 
+    for subparser in sub.choices.values():
+        subparser.allow_abbrev = False
     return parser
 
 
