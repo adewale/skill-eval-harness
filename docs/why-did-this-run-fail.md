@@ -164,10 +164,12 @@ the same offline stub run, re-run 2026-09-30, trimmed to the fields below):
 Read `stop_class` first, because a clean exit code does not prove the answer finished:
 
 - `truncated` or `turn_limit`: the model was cut off by an output or turn limit. The
-  run is excluded from scoring ([execution validity](vocabulary.md#run-artifacts)), its
-  result row carries `unscorable_reason`
-  (`stopped:truncated` or `stopped:turn_limit`), and `error-analysis` files it under
-  `execution-error`, not under an assertion.
+  run is excluded from scoring ([execution validity](vocabulary.md#run-artifacts)), and its
+  result row carries `unscorable_reason` (`stopped:truncated` or `stopped:turn_limit`).
+  An unscorable run makes the benchmark `partial` (`incomplete_reasons:
+  ["unscorable_answer_attempts"]`), so `error-analysis` withholds its headline: `taxonomy`
+  and `review_queue` are empty, and the run is filed under `execution-error`, not under an
+  assertion, only in `observed.taxonomy` and `observed.review_queue`.
 - `refused`: the model declined. The run is still graded, so its zero is a refusal
   rather than a capability miss, and the benchmark's `run_endings` block counts it.
 - `unavailable`: the runner exposes no stop signal. Codex, Vibe, the subagent runner,
