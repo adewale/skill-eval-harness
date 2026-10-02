@@ -74,6 +74,11 @@ that file still invalidates trigger identity until those owners are extracted in
   is stored when the run is recorded, so re-run those runs; new runs read them as `match`, except
   a `-latest` id, which reads `unverifiable` (scored): the harness cannot know which dated
   snapshot the alias resolved to.
+- `run-subagent` records completion evidence. Its default Claude backend now runs
+  `claude -p --output-format stream-json --verbose` (it ran `--output-format json`), so a
+  `max_tokens` stop records `truncated` and is unscorable, as in `run-claude`. An `--agent-cmd`
+  reply may add `stop_class`, `stop_reason`, and `served_models`; a reply without them still runs
+  and records `unavailable`.
 - A run that reports several models credits none of them: `served_model` is `null`, and the check
   reads `mixed` (scored, counted in `run_endings.served_model_mixed`) when the requested model is
   among them, or `mismatch` (unscorable) when it is not. Claude subagent turns are not counted.

@@ -32,7 +32,6 @@ from helpers import (
 from helpers import (
     make_eval_repo,
     run_cli,
-    stub_claude,
     stub_claude_stream,
     write_with_skill_task,
 )
@@ -291,18 +290,19 @@ class SubagentRunnerTests(unittest.TestCase):
             self.assertFalse(metrics["operation_observation_complete"])
 
     def test_run_subagent_without_agent_cmd_runs_the_claude_cli(self):
-        # The default backend drives `claude -p` and reports its usage and cost.
+        # The default backend drives `claude -p --output-format stream-json`,
+        # as run-claude does, and reports its usage and cost.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _, tasks, run_dir = write_with_skill_task(root)
-            stub = stub_claude(root / "claude")
+            stub = stub_claude_stream(root / "claude")
             code, _, stderr = run_cli("run-subagent", "--tasks", tasks, "--runs", root / "runs",
                                       "--claude-bin", stub)
             base = root / "runs" / run_dir
             output = (base / "output.md").read_text(encoding="utf-8")
             meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(output, "STUB ANSWER token-XYZ")
+        self.assertEqual(output, "STREAM ANSWER token-XYZ")
         usage = meta["usage_normalized"]
         self.assertEqual(
             [usage[key] for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")],
@@ -332,6 +332,155 @@ class SubagentRunnerTests(unittest.TestCase):
         self.assertNotIn("API Error: 529 overloaded", output)
         self.assertIn("Claude provider error (HTTP 529)", output)
         self.assertNotEqual(meta["invocation_state"], "complete")
+
+    # --- how a run-subagent run stopped and which model served it ----------
+
+    # A fake --agent-cmd: answers each turn with the next reply from a JSON
+    # list, indexed by how many turns the request's history already holds.
+    AGENT_CMD_REPLIES = (
+        "import json, sys\n"
+        "request = json.load(sys.stdin)\n"
+        "replies = json.load(open(sys.argv[1], encoding='utf-8'))\n"
+        "print(json.dumps(replies[len(request.get('history') or [])]))\n")
+
+    def agent_cmd(self, root: Path, replies: list[dict]) -> tuple[str, str]:
+        script, replies_path = root / "agent.py", root / "replies.json"
+        script.write_text(self.AGENT_CMD_REPLIES, encoding="utf-8")
+        replies_path.write_text(json.dumps(replies), encoding="utf-8")
+        return "--agent-cmd", f"{sys.executable} {script} {replies_path}"
+
+    def subagent_then_benchmark(self, root: Path, *backend: str | Path,
+                                model: str | None = None,
+                                cases: list[dict] | None = None) -> tuple[dict, dict, Path]:
+        """prepare, run-subagent and benchmark through the CLI. Returns the
+        with_skill run's metadata, the benchmark rows by variant, and the
+        with_skill run directory."""
+        manifest = make_eval_repo(root, cases=cases)
+        tasks, runs, bench = root / "tasks.jsonl", root / "runs", root / "benchmark.json"
+        for argv in (("prepare", manifest, "--out", tasks),
+                     ("run-subagent", "--tasks", tasks, "--runs", runs, *backend,
+                      *(("--model", model) if model else ())),
+                     ("benchmark", manifest, "--runs", runs, "--out", bench)):
+            code, _, stderr = run_cli(*argv)
+            self.assertEqual(code, 0, f"{argv[0]}: {stderr}")
+        base = runs / "case-1" / "with_skill"
+        meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+        rows = {row["variant"]: row
+                for row in json.loads(bench.read_text(encoding="utf-8"))["results"]}
+        return meta, rows, base
+
+    def test_run_subagent_records_how_the_claude_run_stopped_and_its_model(self):
+        # A Claude answer cut off at max_tokens exits 0 with a partial answer.
+        # run-claude records it as truncated, which makes it unscorable; the
+        # default run-subagent backend drives the same CLI and must too.
+        for stop_reason, stop_class, unscorable in (
+                ("max_tokens", "truncated", "stopped:truncated"),
+                ("end_turn", "completed", None)):
+            with self.subTest(stop_reason=stop_reason), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                stub = stub_claude_stream(root / "claude", answer="alpha, then", stop_reason=stop_reason,
+                                          served_model="claude-haiku-4-5-20251001")
+                meta, rows, _ = self.subagent_then_benchmark(
+                    root, "--claude-bin", stub, model="claude-haiku-4-5")
+                self.assertEqual((meta["stop_class"], meta["stop_reason"]), (stop_class, stop_reason))
+                self.assertEqual(
+                    (meta["requested_model"], meta["served_model"], meta["served_models"],
+                     meta["served_model_check"]),
+                    ("claude-haiku-4-5", "claude-haiku-4-5-20251001",
+                     ["claude-haiku-4-5-20251001"], "match"))
+                self.assertEqual(rows["with_skill"].get("unscorable_reason"), unscorable)
+                self.assertEqual(rows["with_skill"]["execution_valid"], unscorable is None)
+
+    def test_agent_cmd_reports_its_stop_class_and_served_models(self):
+        # (reply, stop_class, stop_reason, served_model_check, unscorable_reason)
+        cases = (
+            # An agent command written before these fields still runs, and its
+            # run records unavailable evidence and stays scorable.
+            ({"answer": "alpha"}, "unavailable", None, "unavailable", None),
+            ({"answer": "alpha", "stop_class": "truncated", "stop_reason": "length",
+              "served_models": ["gpt-5"]}, "truncated", "length", "match", "stopped:truncated"),
+            ({"answer": "alpha", "stop_class": "completed", "stop_reason": "stop",
+              "served_models": ["gpt-5-mini"]}, "completed", "stop", "mismatch",
+             "served_model_mismatch"),
+            ({"answer": "alpha", "stop_class": "refused", "served_models": ["gpt-5"]},
+             "refused", None, "match", None),
+            # Providers name their stops differently, so a raw reason without a
+            # class is kept as evidence but not mapped to one.
+            ({"answer": "alpha", "stop_reason": "length"}, "unavailable", None, "unavailable", None),
+        )
+        for reply, stop_class, stop_reason, check, unscorable in cases:
+            with self.subTest(reply=reply), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                meta, rows, _ = self.subagent_then_benchmark(
+                    root, *self.agent_cmd(root, [reply]), model="gpt-5")
+                self.assertEqual((meta["stop_class"], meta["stop_reason"], meta["served_model_check"]),
+                                 (stop_class, stop_reason, check))
+                self.assertEqual(rows["with_skill"].get("unscorable_reason"), unscorable)
+                self.assertEqual(rows["with_skill"]["execution_valid"], unscorable is None)
+                if "stop_reason" in reply and "stop_class" not in reply:
+                    self.assertIn("'length'", meta["stop_source"])
+
+    def test_a_cut_off_middle_turn_makes_the_multi_turn_run_unscorable(self):
+        case = {"id": "case-1", "split": "tune",
+                "turns": [{"prompt": "first"}, {"prompt": "second"}],
+                "assertions": [{"name": "has-alpha", "type": "contains", "value": "alpha"}]}
+        # (turn replies, run stop_class and stop_reason, unscorable_reason)
+        cases = (
+            # Turn 1 was cut off, so turn 2 answered a broken transcript.
+            ([{"answer": "alpha, then", "stop_class": "truncated", "stop_reason": "length",
+               "served_models": ["model-a"]},
+              {"answer": "alpha", "stop_class": "completed", "stop_reason": "stop",
+               "served_models": ["model-b"]}],
+             ("truncated", "length"), "stopped:truncated"),
+            # Otherwise the run ends the way its last turn did.
+            ([{"answer": "alpha", "stop_class": "completed", "served_models": ["model-a"]},
+              {"answer": "alpha", "stop_class": "refused", "stop_reason": "content_filter",
+               "served_models": ["model-b"]}],
+             ("refused", "content_filter"), None),
+        )
+        for replies, stop, unscorable in cases:
+            with self.subTest(stop=stop), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                meta, rows, base = self.subagent_then_benchmark(
+                    root, *self.agent_cmd(root, replies), model="model-a", cases=[case])
+                self.assertEqual((meta["stop_class"], meta["stop_reason"]), stop)
+                turns = [json.loads((base / f"turn-{n}" / "metadata.json").read_text(encoding="utf-8"))
+                         for n in (1, 2)]
+                self.assertEqual([turn["stop_class"] for turn in turns],
+                                 [reply["stop_class"] for reply in replies])
+                # Two models answered: neither is credited, and the requested
+                # one is among them.
+                self.assertEqual((meta["served_model"], meta["served_models"], meta["served_model_check"]),
+                                 (None, ["model-a", "model-b"], "mixed"))
+                self.assertEqual(rows["with_skill"].get("unscorable_reason"), unscorable)
+
+    def test_an_unknown_stop_class_is_refused_with_the_vocabulary(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, tasks, run_dir = write_with_skill_task(root)
+            code, _, stderr = run_cli(
+                "run-subagent", "--tasks", tasks, "--runs", root / "runs",
+                *self.agent_cmd(root, [{"answer": "alpha", "stop_class": "cut_off"}]))
+            output = (root / "runs" / run_dir / "output.md").read_text(encoding="utf-8")
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("subagent response stop_class must be one of completed, truncated, "
+                      "turn_limit, refused, other; got 'cut_off'", output)
+
+    def test_subagent_response_completion_fields_are_validated(self):
+        cases = (
+            ({"stop_class": "unavailable"}, "stop_class must be one of"),
+            ({"stop_class": 3}, "stop_class must be one of"),
+            ({"stop_reason": ""}, "stop_reason must be a non-empty string"),
+            ({"stop_reason": ["length"]}, "stop_reason must be a non-empty string"),
+            ({"served_models": "gpt-5"}, "served_models must be a list of non-empty strings"),
+            ({"served_models": ["gpt-5", ""]}, "served_models must be a list of non-empty strings"),
+            ({"served_models": [None]}, "served_models must be a list of non-empty strings"),
+        )
+        for fields, message in cases:
+            with self.subTest(fields=fields):
+                with self.assertRaises((TypeError, ValueError)) as caught:
+                    sb.validate_subagent_response({"answer": "alpha", **fields})
+                self.assertIn(message, str(caught.exception))
 
 
 class ToolReplayTests(unittest.TestCase):

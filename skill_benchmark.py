@@ -133,6 +133,7 @@ from completion_contracts import (
     EFFORT_LEVELS,
     EffortSetting,
     ServedModel,
+    StopClass,
     StopObservation,
     claude_result_stop,
     completion_unscorable_reason,
@@ -12756,11 +12757,17 @@ def tool_replay_mode(default: str = "off") -> str:
     return mode if mode in TOOL_REPLAY_MODES else default
 
 
+# The stop classes a subagent response may report. Leaving stop_class out is
+# how a response says it does not know, so `unavailable` is not spelled.
+SUBAGENT_STOP_CLASSES = tuple(
+    item.value for item in StopClass if item is not StopClass.UNAVAILABLE)
+
+
 def validate_subagent_response(value: Any) -> dict[str, Any]:
     value = string_keyed_dict(value, "subagent response")
     allowed = {
         "answer", "trace", "usage", "returncode", "timed_out", "elapsed_ms",
-        "telemetry_scope",
+        "telemetry_scope", "stop_class", "stop_reason", "served_models",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -12801,7 +12808,49 @@ def validate_subagent_response(value: Any) -> dict[str, Any]:
         raise ValueError(
             "subagent response telemetry_scope must be turn_delta or "
             "conversation_cumulative")
+    if "stop_class" in value and value["stop_class"] not in SUBAGENT_STOP_CLASSES:
+        raise ValueError(
+            f"subagent response stop_class must be one of {', '.join(SUBAGENT_STOP_CLASSES)}; "
+            f"got {value['stop_class']!r} (omit it when the stop is unknown)")
+    if "stop_reason" in value:
+        if not isinstance(value["stop_reason"], str) or not value["stop_reason"].strip():
+            raise TypeError("subagent response stop_reason must be a non-empty string")
+        validate_json_text(value["stop_reason"], "subagent response stop_reason")
+    if "served_models" in value:
+        models = value["served_models"]
+        if not isinstance(models, list) or not all(
+                isinstance(item, str) and item.strip() for item in models):
+            raise TypeError(
+                "subagent response served_models must be a list of non-empty strings")
+        for item in models:
+            validate_json_text(item, "subagent response served model")
     return value
+
+
+def subagent_stop(response: Mapping[str, Any], source: str) -> StopObservation:
+    """The stop a validated subagent response reported. A raw stop_reason
+    without a stop_class is not mapped, because each provider names its stops
+    differently; the source text keeps it as evidence instead."""
+    stop_class, raw = response.get("stop_class"), response.get("stop_reason")
+    if isinstance(stop_class, str):
+        return StopObservation(StopClass(stop_class), raw if isinstance(raw, str) else None, source)
+    if isinstance(raw, str):
+        return StopObservation.unavailable(
+            f"{source} gave stop_reason {raw!r} without a stop_class; raw reasons are not mapped")
+    return StopObservation.unavailable(f"{source} carries no stop_class")
+
+
+def subagent_served_models(response: Mapping[str, Any]) -> list[str]:
+    """The model ids a validated subagent response says answered it."""
+    models = response.get("served_models")
+    return [item for item in models if isinstance(item, str)] if isinstance(models, list) else []
+
+
+def subagent_run_stop(turn_stops: Sequence[StopObservation]) -> StopObservation:
+    """How a multi-turn run stopped: a truncated or turn-limited turn spoils
+    the transcript every later turn answered, so its stop is the run's;
+    otherwise the run stopped the way its last turn did."""
+    return next((stop for stop in turn_stops if not stop.scorable), turn_stops[-1])
 
 
 def _subagent_trace_text(records: Any) -> str:
@@ -13029,6 +13078,8 @@ def run_subagent_tasks(
         turns = [str(t) for t in task.get("turns") or [] if str(t)]
         multi_turn_extra: dict[str, Any] = {}
         aggregate_cost_usd: float | None = None
+        turn_stops: list[StopObservation] = []
+        served_reported: list[str] = []
         with tempfile.TemporaryDirectory(prefix="subagent-ws-") as wd:
             ws = Path(wd)
             workspace = workspace_builder(pt, ws)
@@ -13110,6 +13161,9 @@ def run_subagent_tasks(
                         if isinstance(raw_turn_usage, dict) else None
                     )
                     turn_cost = _subagent_cost_usd(turn_response)
+                    turn_stops.append(subagent_stop(turn_response, f"subagent response, turn {n}"))
+                    turn_served = subagent_served_models(turn_response)
+                    served_reported.extend(turn_served)
                     turn_ro = RunnerOutcome(
                         provider="subagent", answer=turn_answer,
                         returncode=int(turn_rc), timed_out=bool(turn_timed_out),
@@ -13121,6 +13175,8 @@ def run_subagent_tasks(
                             "billing_scope": "turn", "turn_number": n,
                             "expected_turns": len(turns),
                             "telemetry_scope": turn_response.get("telemetry_scope"),
+                            **turn_stops[-1].as_metadata(),
+                            **ServedModel.observe(row_model, turn_served).as_metadata(),
                         },
                         diagnose_returncode=False,
                     )
@@ -13172,8 +13228,14 @@ def run_subagent_tasks(
                     if isinstance(raw_single_usage, dict) else None
                 )
                 aggregate_cost_usd = _subagent_cost_usd(outcome)
+                turn_stops.append(subagent_stop(outcome, "subagent response"))
+                served_reported.extend(subagent_served_models(outcome))
         if store is not None:
             store.save()
+        completion = {
+            **subagent_run_stop(turn_stops).as_metadata(),
+            **ServedModel.observe(row_model, served_reported).as_metadata(),
+        }
         # The subagent seam returns structured trace records; single-turn traces
         # remain direct. Multi-turn root traces are safe composites whose exact
         # provider records live under turn-<n>/trace.jsonl.
@@ -13201,7 +13263,8 @@ def run_subagent_tasks(
             elapsed_ms=(int(elapsed_ms) if isinstance(elapsed_ms, (int, float)) else None),
             trace_text=trace_text,
             usage=raw_usage, cost_usd=aggregate_cost_usd, model=row_model,
-            metadata_extra={"tool_replay_mode": mode, **prov_extra, **multi_turn_extra},
+            metadata_extra={"tool_replay_mode": mode, **prov_extra, **multi_turn_extra,
+                            **completion},
             diagnose_returncode=False)
         try:
             write_runner_outcome(base, ro, sidecars=sidecars)
@@ -13213,7 +13276,7 @@ def run_subagent_tasks(
 def shell_agent_backend(agent_cmd: str, timeout: int = DEFAULT_RUNNER_TIMEOUT_S) -> Any:
     """Adapt a shell command into the subagent seam: the prompt arrives as JSON
     on stdin, the reply is JSON on stdout ({answer, trace?, usage?,
-    telemetry_scope?})."""
+    telemetry_scope?, stop_class?, stop_reason?, served_models?})."""
     def backend(*, prompt: str, workspace: Path, model: str | None, tool_executor: Any, history: list | None = None) -> dict[str, Any]:
         payload = {"prompt": prompt, "model": model, "workspace": str(workspace)}
         if history:
@@ -13248,7 +13311,11 @@ def run_subagent(args: argparse.Namespace) -> int:
             if history:
                 transcript = "\n\n".join(f"[user]\n{h['prompt']}\n\n[assistant]\n{h['answer']}" for h in history)
                 prompt = f"Conversation so far:\n{transcript}\n\n[user]\n{prompt}"
-            result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout)
+            # stream-json, as run-claude reads it: the terminal result event
+            # carries the stop reason and the main-thread assistant messages
+            # name the model that served each turn.
+            result = claude_cli_invoke(prompt, model=model, claude_bin=claude_bin, timeout=timeout,
+                                       output_format="stream-json")
             error = result.get("provider_error") or result.get("parse_error")
             if error and result.get("returncode") == 0:
                 # An exit-zero error envelope or unreadable output is a failed
@@ -13260,9 +13327,19 @@ def run_subagent(args: argparse.Namespace) -> int:
             usage = dict(result.get("usage") or {})
             if isinstance(result.get("cost_usd"), (int, float)):
                 usage["cost_usd"] = result["cost_usd"]
+            completion: dict[str, Any] = {}
+            stop = result.get("stop")
+            if isinstance(stop, StopObservation) and stop.stop_class is not StopClass.UNAVAILABLE:
+                completion["stop_class"] = stop.stop_class.value
+                if stop.raw is not None:
+                    completion["stop_reason"] = stop.raw
+            served = [item for item in result.get("served_models") or []
+                      if isinstance(item, str) and item.strip()]
+            if served:
+                completion["served_models"] = served
             return {"answer": result.get("answer"), "returncode": result.get("returncode"),
                     "timed_out": result.get("timed_out", False), "elapsed_ms": result.get("elapsed_ms"),
-                    "usage": usage}
+                    "usage": usage, **completion}
     return run_subagent_tasks(tasks, runs, backend, model=getattr(args, "model", None),
                               replay_mode=getattr(args, "tool_replay", None) or tool_replay_mode())
 
@@ -21137,7 +21214,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--tasks", required=True, help="prepared task JSONL from skill-benchmark prepare")
     p.add_argument("--runs", required=True, help="output runs directory")
     p.add_argument("--model", help="model id passed to the backend; a row-level model wins")
-    p.add_argument("--agent-cmd", help="shell command reading {prompt, model, workspace} JSON on stdin and emitting {answer, trace?, usage?} JSON on stdout")
+    p.add_argument("--agent-cmd", help="shell command reading {prompt, model, workspace} JSON on stdin and emitting {answer, trace?, usage?, stop_class?, stop_reason?, served_models?} JSON on stdout")
     p.add_argument("--claude-bin", default="claude", help="path to the claude executable for the default backend")
     p.add_argument("--timeout", type=int, default=DEFAULT_RUNNER_TIMEOUT_S)
     p.add_argument("--tool-replay", choices=sorted(TOOL_REPLAY_MODES), help=f"tool replay mode; defaults from ${TOOL_REPLAY_ENV} (off)")

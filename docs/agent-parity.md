@@ -23,7 +23,7 @@ Two answer-run surfaces are not registry capabilities yet: effort is an `effort_
 - `codex`: `--effort` passes `-c model_reasoning_effort=<level>` for every harness level; stop reason and served model are `unavailable`.
 - `gemini`: no effort control, so `run-agent --agent gemini --effort …` is refused before any run; the served model is the stream's resolved model, and the stop reason is `unavailable`.
 - `vibe`: no effort control (refused the same way); stop reason and served model are `unavailable`.
-- `subagent`: no `--effort` flag, so runs record `backend_default`; stop reason and served model are `unavailable`.
+- `subagent`: no `--effort` flag, so runs record `backend_default`. The default Claude backend records the stop reason and served model as `claude` does; an `--agent-cmd` reply may report `stop_class`, `stop_reason`, and `served_models` ([reply fields](commands.md#run-subagent-tasks-in-process-seam-tool-replay-multi-turn)), and a reply without them records `unavailable`.
 - `jetty`: imports record `unavailable` stop and served-model fields and `backend_default` effort; Jetty exposes no effort control.
 
 ## What changed for Gemini CLI
