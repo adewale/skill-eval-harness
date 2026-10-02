@@ -812,3 +812,54 @@ proves nothing until an old artifact is read.
 - A guard cited by name must exist on this branch and run in CI; a guard on another branch is a plan.
 - Bump an identity version whenever its inventory changes, and test any "still reads" claim in an
   upgrade note against an artifact the previous release produced.
+
+## 2026-10-02 — The paths no test runs carry the bugs a test audit cannot see
+
+**Problem:** After the fault-seeding audit above, four auditors ran this branch's entry points with
+fake `claude`, `codex` and `pi` executables, re-ran every quoted doc command, and planted
+violations against the gates. Seeding faults into tested code could not have found most of what
+they found, because no test ran those paths:
+
+- `run-subagent` without `--agent-cmd` failed every run (`usage.source must be finite`), on `main`
+  too. No test ran it.
+- Every Codex cell was blocked in `trigger-compare`. A file list ended in `_copied`, which made it a
+  protocol observation, and protocol observations must be booleans.
+- Claude Code 2.1.269 calls a project skill by its mounted directory name, so every should-fire
+  Claude cell read as a miss while the matrix reported a complete measurement.
+- A gate that fails closed could never go green: a case gated only by judges has no objective rate,
+  its pairs were blocked, and `audit-manifest --fail-on-blockers` failed on every complete run.
+- Two registered finding kinds, `arm-conditions-differ` and `served-model-mismatch`, could never be
+  raised. Only complete benchmarks raised them, and the conditions they describe make a benchmark
+  partial.
+- Moving Pi's home out of the working directory deleted it before the secret scan, so a token Pi
+  refreshed during the run reached the artifacts unredacted.
+- Real model ids (`sonnet[1m]`, Bedrock and Vertex ids, `-latest` aliases) read as a served-model
+  mismatch, which made every run unscorable.
+- One more tied case flipped a significant lift to not significant, because the exact/sampled
+  switch counted zero deltas. Six equal deltas gave a point interval and a zero noise floor.
+- Five of eleven faults seeded into this branch's own new code survived, among them deleting the
+  line that makes an effort-mismatched benchmark partial.
+- The gate tests passed every plant they had, yet missed a branch, path or `types` filter on the
+  gated event, a shell without errexit, a multi-line PowerShell step, an early `return` in a live
+  smoke, and a runtime skip wrapped around a product assertion.
+
+**Lesson:** Seeding faults measures the tests that exist; it says nothing about the paths no test
+runs. A gate that fails closed must also be shown to pass on each valid input shape, and a
+registered finding exists only if a public command can raise it. Real identifiers and real
+lifecycles (aliases, directory names, a token refreshed mid-run) break checks written against the
+names and the order the author assumed.
+
+**Rule:**
+- Keep a list of entry points (each command, backend and run layout the docs show) and one
+  end-to-end test per entry that reaches a non-error result through `run_cli` or the real script,
+  with fake executables standing in for agents.
+- Give each gate a planted violation that turns it red and a complete valid input of each
+  supported shape (judge-only, multi-model, three arms) that keeps it green.
+- For every finding kind or report value a command can emit, keep a test that produces it through
+  the command.
+- Test numeric switches on both sides of the threshold (14 and 15 moved units, a sample with no
+  spread).
+- Scan for secrets after the agent exits and before anything it wrote is deleted, and test with a
+  token the agent writes during the run.
+- Test identity and parsing checks against a table of real identifiers, not only the canonical
+  spelling.
