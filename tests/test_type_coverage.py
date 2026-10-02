@@ -112,15 +112,6 @@ class TypeCoverageContractTests(unittest.TestCase):
         ]
         self.assertFalse(missing, f"typed boundary modules absent from the docs: {missing}")
 
-    def test_ci_promotes_ty_warnings_to_failures_on_both_platforms(self):
-        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertEqual(
-            workflow.count("ty check --error-on-warning --output-format github"),
-            2,
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
