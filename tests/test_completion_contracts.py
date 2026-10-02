@@ -35,6 +35,8 @@ class StopClassificationTests(unittest.TestCase):
             "end_turn": cc.StopClass.COMPLETED,
             "stop_sequence": cc.StopClass.COMPLETED,
             "max_tokens": cc.StopClass.TRUNCATED,
+            # The answer ran out of context window: cut off, like max_tokens.
+            "model_context_window_exceeded": cc.StopClass.TRUNCATED,
             "refusal": cc.StopClass.REFUSED,
             "pause_turn": cc.StopClass.OTHER,
         }
