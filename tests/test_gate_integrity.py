@@ -25,6 +25,7 @@ import importlib.util
 import io
 import os
 import re
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -317,10 +318,14 @@ def skip_ledger_violations(skipped: dict[str, str], live: dict[str, str]) -> lis
 
 
 def module_tests(path: Path, *, enabled: str | None, gates: set[str]) -> list[unittest.TestCase]:
-    """Load a test file afresh with every gate variable unset except ``enabled``."""
+    """Load a test file afresh with every gate variable unset except ``enabled``.
+
+    The module is executed again, so its import-time side effects (a
+    ``sys.path`` insert in test_smoke_jetty) are rolled back afterwards.
+    """
     spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
-    with mock.patch.dict(os.environ):
+    with mock.patch.dict(os.environ), mock.patch.object(sys, "path", list(sys.path)):
         for name in gates:
             os.environ.pop(name, None)
         if enabled:
@@ -397,7 +402,8 @@ def runtime_skip_violations(sources: dict[str, str], allowed: dict[str, int],
 class SkipLedgerTests(unittest.TestCase):
     def test_every_load_time_skip_is_ledgered(self):
         loader = unittest.TestLoader()
-        tests = list(iter_tests(loader.discover(str(TESTS), top_level_dir=str(TESTS))))
+        with mock.patch.object(sys, "path", list(sys.path)):  # discover inserts TESTS
+            tests = list(iter_tests(loader.discover(str(TESTS), top_level_dir=str(TESTS))))
         self.assertEqual(loader.errors, [])
         ids = {test.id() for test in tests}
         self.assertGreater(len(ids), 1000, "discovery found suspiciously few tests")
