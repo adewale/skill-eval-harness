@@ -188,6 +188,7 @@ the harness modules needs the replacement:
 | `skill_benchmark.read_output`, `read_metadata` | `read_output_base`, `read_metrics_base` |
 | `skill_benchmark.judge_cost_usd` | `judge_cost_block` |
 | `skill_benchmark.CLAUDE_USAGE_KEYS` | `telemetry.USAGE_ALIASES` |
+| `skill_benchmark.claude_run_metrics` | the `usage` and `cost_usd` fields `claude_cli_invoke` returns |
 | `skill_benchmark.TRIGGER_SEMANTIC_MODULES`, `HARNESS_SEMANTIC_MODULES` | `TRIGGER_IDENTITY_MODULES` |
 | `skill_benchmark.GEMINI_AUTH_FILES` | `GEMINI_AUTH_FILES_BY_TYPE` |
 | `skill_benchmark.load_trace_jsonl` | `parse_trace_jsonl_text` |
