@@ -726,3 +726,61 @@ def judge_with_stub(manifest: Path, runs: Path, out: Path, *, passes_on: str,
     if code != 0:
         raise AssertionError(f"judge stub failed: {stderr}")
     return out
+
+
+# --------------------------------------------------------------------------- #
+# lane G: recorded Claude streams that continue after `result`
+# --------------------------------------------------------------------------- #
+
+CLAUDE_FIXTURES = ROOT / "tests" / "fixtures" / "claude"
+# The only shape PR #85 reported for the record Claude Code 2.1.269 writes
+# after `result` (commit 8b7ef17 kept no copy of the stream).
+HAND_BUILT_TRAILING_RECORD = {"type": "system", "subtype": "task_summary"}
+NO_TRAILING_RECORDING = ("no recorded stream in tests/fixtures/claude/ continues after `result` yet; "
+                         "record one with scripts/record_claude_stream.py")
+
+
+def claude_records_after_result(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The records a Claude stream carries after its first `result` event."""
+    for index, record in enumerate(records):
+        if record.get("type") == "result":
+            return records[index + 1:]
+    return []
+
+
+def recorded_claude_streams_after_result() -> list[Path]:
+    """Every recorded stream in tests/fixtures/claude/ whose `result` event is
+    followed by more records, so a committed recording is exercised with no
+    test edits."""
+    found: list[Path] = []
+    for path in sorted(CLAUDE_FIXTURES.glob("*.jsonl")):
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if claude_records_after_result(records):
+            found.append(path)
+    return found
+
+
+def claude_trailing_record_sources() -> list[tuple[str, list[dict[str, Any]]]]:
+    """(source, records after `result`): the hand-built record, then those of
+    every recording that has some. While no recording exists, the hand-built
+    source's label says so, so each subTest names the gap instead of the loop
+    passing over nothing."""
+    recorded = recorded_claude_streams_after_result()
+    label = "hand-built task_summary" + ("" if recorded else f" ({NO_TRAILING_RECORDING})")
+    sources = [(label, [dict(HAND_BUILT_TRAILING_RECORD)])]
+    for path in recorded:
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        sources.append((f"recorded {path.name}", claude_records_after_result(records)))
+    return sources
+
+
+def claude_streams_ending_after_result() -> list[tuple[str, str]]:
+    """(source, stream text) for every recording whose `result` is followed by
+    more records. Until one exists, the plugin-skill recording with the
+    hand-built record appended stands in, labelled as such."""
+    recorded = recorded_claude_streams_after_result()
+    if recorded:
+        return [(f"recorded {path.name}", path.read_text(encoding="utf-8")) for path in recorded]
+    stand_in = (CLAUDE_FIXTURES / "stream-json.plugin-skill.jsonl").read_text(encoding="utf-8")
+    return [(f"stream-json.plugin-skill.jsonl + hand-built task_summary ({NO_TRAILING_RECORDING})",
+             stand_in.rstrip("\n") + "\n" + json.dumps(HAND_BUILT_TRAILING_RECORD) + "\n")]

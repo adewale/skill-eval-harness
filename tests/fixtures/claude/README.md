@@ -25,21 +25,48 @@ record with `subtype: "task_summary"` after the terminal `result` event (PR #85,
 commit `8b7ef17`, which kept no copy of that stream). This recording ends at
 `result`. It was captured as `claude plugin eval`'s trace file, and whether that
 writer keeps records after `result` is not known. No recording in this
-repository or on PR #85's branch holds the trailing record.
+repository or on PR #85's branch holds the trailing record yet.
 
-So the rule that tolerates it (`claude_terminal_result_index`: exactly one
-`result`, followed only by `system` records) is tested with hand-built records
-in the only shape 8b7ef17 reported, `{"type": "system", "subtype":
-"task_summary"}` (one test adds `"session_id": "stub"`), copied from that
-commit's tests:
+The rule that tolerates it (`claude_terminal_result_index`: exactly one
+`result`, followed only by `system` records) is tested with the hand-built
+record `{"type": "system", "subtype": "task_summary"}`, the only shape 8b7ef17
+reported, and with every recording in this directory whose `result` is
+followed by more records (`tests/helpers.py`,
+`recorded_claude_streams_after_result`):
 
-- `tests/test_claude_adapter.py`: `test_system_records_after_the_result_are_tolerated`
-  and `test_parser_and_trace_dialect_share_one_terminal_rule`;
+- `tests/test_claude_adapter.py`: `test_system_records_after_the_result_are_tolerated`,
+  `test_parser_and_trace_dialect_share_one_terminal_rule`, and
+  `test_run_agent_reads_a_recorded_claude_stream`;
 - `tests/test_completion_contracts.py`: `test_a_system_record_after_the_result_still_ends_the_run`,
-  through `stub_claude_stream(trailing_records=...)`.
+  through `stub_claude_stream(trailing_records=...)`;
+- `tests/test_trigger_matrix.py`:
+  `test_a_recorded_claude_stream_is_a_complete_observation_with_skill_evidence`.
 
-The real record's other fields are unknown. A redacted `claude -p --output-format
-stream-json` stdout from Claude Code 2.1.269 or later that ends with the
-trailing record should be added beside this file, with its provenance in this
-README, and those tests should read the trailing record from it instead of
-building one.
+Each runs one subTest per source. Until a recording exists, the hand-built
+source's label says so (and the two run-level tests use this file with the
+hand-built record appended, labelled the same way).
+
+## Recording the trailing record
+
+On a machine with a credentialed Claude Code 2.1.269 or later:
+
+```bash
+python3 scripts/record_claude_stream.py --model haiku
+```
+
+It runs `claude -p "<prompt>" --output-format stream-json --verbose
+--no-session-persistence` in an empty temporary directory, on a prompt that
+starts a background task with the Task tool (`--prompt` replaces it,
+`--claude-bin` and `--name` choose the executable and the file name). It masks
+session ids, UUIDs, and message, request and tool-use ids consistently, blanks
+thinking signatures, replaces the working directory and home paths, and
+removes credential values (the environment's provider keys and tokens, the
+Claude credentials file, and API-key or bearer-token shapes), then checks the
+result for each before writing. It prints the records that follow `result`
+and writes `stream-json.after-result.jsonl` plus
+`stream-json.after-result.provenance.json` (Claude Code version, date,
+requested and served models, the exact command and prompt) here. When no
+record follows `result` it writes nothing and exits 1: run it again, or try
+another `--prompt`. Commit both files; the tests above pick the recording up
+with no edits, and `tests/test_record_claude_stream.py` requires every
+recording here to carry its provenance.

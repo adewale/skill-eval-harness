@@ -170,6 +170,7 @@ Everything under `docs/` is indexed once, in [`docs/README.md`](docs/README.md):
 | `examples/skill-pins.json` | Exact commit SHAs and canonical tree hashes for the ten skills in [`docs/ablation-study-walkthrough.md`](docs/ablation-study-walkthrough.md), so that study reproduces without vendoring any skill content. |
 | `examples/adewale-workspace/` | Adewale-specific Pi smoke runner and cross-repo aggregate report (the trigger runners are the top-level `skill-pi-trigger-eval` and `skill-trigger-matrix`). |
 | `scripts/smoke_supported_clis.py` | Opt-in, low-cost smoke across native Claude/Codex/Gemini/Vibe answer paths and Pi trigger path using a disposable demo-skill eval. |
+| `scripts/record_claude_stream.py` | Records one redacted `claude -p --output-format stream-json` stream, with its provenance, into `tests/fixtures/claude/` for the parser tests; spends one real model call. |
 | `tests/test_skill_benchmark.py` | Executable examples for grading, leakage lint, script assertions, judge commands, Jetty export/import, trace artifacts, and trigger detection. |
 
 ## Manifest format

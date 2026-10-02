@@ -10,7 +10,7 @@
       "skill_paths": [
         "skills/anti-slop-writing/SKILL.md"
       ],
-      "tree_hash": "a706f93bcc13d7c8ffaeebb1d567c924d83819dbe071a616239839e973417ed0",
+      "tree_hash": "995941e0c1c512de3b63d9a744c27de6ee181154e64c4f60fb4f12ab63a0d79e",
       "verified": true
     },
     "audit-skill": {
@@ -21,7 +21,7 @@
       "skill_paths": [
         "skills/audit/SKILL.md"
       ],
-      "tree_hash": "437779bbef4d38c8df83a338d14dceaeeddb0061837294e85dcbf9561923a54e",
+      "tree_hash": "4e31462087b29dc017e2e0638397d1dac2eb0db7be79ad02b619d9fc3f0d1ff9",
       "verified": true
     },
     "cfdoctor": {
@@ -32,7 +32,7 @@
       "skill_paths": [
         "skills/cloudflare-doctor/SKILL.md"
       ],
-      "tree_hash": "092a119644309fb30ff18cf69bb7ea4657f962a42f1776963c8917a98f6bbf9a",
+      "tree_hash": "f147c4f415e53d64979749a72f688bb84cb5007f30bae6d3fc87860e7877fc4c",
       "verified": true
     },
     "good-pr": {
@@ -43,7 +43,7 @@
       "skill_paths": [
         "skills/good-pr/SKILL.md"
       ],
-      "tree_hash": "e6db327cbacb0b9f810183d89d41bd09bbc9d6dc3e78418430ee110bf2e3be41",
+      "tree_hash": "a872dcb1625560ef485ed1a70e6781f4bc3c75e003b03272c7ab5b0fabaff2a1",
       "verified": true
     },
     "good-readme": {
@@ -54,7 +54,7 @@
       "skill_paths": [
         "skills/good-readme/SKILL.md"
       ],
-      "tree_hash": "fc3b08304b6bb6daf43e53ff261f044d22ecc58d54213420d9404846e4dd25c7",
+      "tree_hash": "7f9509427cb3968fdb3c486a36c5a0a5087694ff8231548b01e00654ebf39985",
       "verified": true
     },
     "good-repo": {
@@ -65,7 +65,7 @@
       "skill_paths": [
         "skills/good-repo/SKILL.md"
       ],
-      "tree_hash": "46727dedf81bc56a4140aab17479fe3820175d5f3c095bdb7da5846c56e62fc4",
+      "tree_hash": "12b2415999dd937019b62834261c23c544fdac3e8f247de4de6bf448dfb030ac",
       "verified": true
     },
     "guardrails-skill": {
@@ -76,7 +76,7 @@
       "skill_paths": [
         "skills/guardrails/SKILL.md"
       ],
-      "tree_hash": "193c293e805797c51076f139f80f63d0b1c17f7afb04ca71c3fbab3820a448a9",
+      "tree_hash": "8a893080bcd64ae3b62de2e3639b6b9af49963c5a481b0ce29dfbca7b9737d4c",
       "verified": true
     },
     "slide-maker": {
@@ -87,7 +87,7 @@
       "skill_paths": [
         "skills/slide-maker/SKILL.md"
       ],
-      "tree_hash": "6f965aed70a8221efd36bfaea48dcccc2252398563b8b554fc70e0ad48d9ade7",
+      "tree_hash": "cbd01e6e0c6859a30ca3e7f0094e39784775fd4e296407c1832c9f2c39efd671",
       "verified": true
     },
     "swiss-poster-skill": {
@@ -98,7 +98,7 @@
       "skill_paths": [
         "swiss-poster/SKILL.md"
       ],
-      "tree_hash": "ea1b4952f2896bfd0c841def23c711dee88c3c17ac0775d465d1ee4e5ba5f8b8",
+      "tree_hash": "b83054edba560aa2634996553dbc797969fc11b22802d10ae9293ad9039948bb",
       "verified": true
     },
     "testing-best-practices": {
@@ -109,7 +109,7 @@
       "skill_paths": [
         "testing-best-practices/SKILL.md"
       ],
-      "tree_hash": "d6339ae9c6cd4840792164e88e5210a9b0c5291f0d11872b6cf8763cd6690d24",
+      "tree_hash": "cdb4e1e97e1df381d560f7c57561cc01a49939da8a6ea3d9c38b3b8a1bc29868",
       "verified": true
     }
   }

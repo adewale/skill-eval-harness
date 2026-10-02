@@ -9,7 +9,12 @@ import unittest
 from pathlib import Path
 
 from helpers import claude_stream_records as _canonical_stream_records
-from helpers import run_cli, write_with_skill_task
+from helpers import (
+    claude_streams_ending_after_result,
+    claude_trailing_record_sources,
+    run_cli,
+    write_with_skill_task,
+)
 from helpers import stub_claude as _stub_claude
 from helpers import stub_claude_stream as _stub_claude_stream
 
@@ -89,24 +94,27 @@ class ParseClaudeStreamTests(unittest.TestCase):
 
     def test_system_records_after_the_result_are_tolerated(self):
         # Claude Code 2.1.269 appends `system`/`task_summary` after the result
-        # (observed in a real run on 2026-09-23, PR #85); the envelope is still final.
-        records = claude_stream_records() + [
-            {"type": "system", "subtype": "task_summary", "session_id": "stub"}]
-        p = sb.parse_claude_cli_json(stream_text(records))
-        self.assertIsNone(p["parse_error"])
-        self.assertEqual((p["answer"], p["cost_usd"]), ("All tests pass.", 0.05))
+        # (observed in a real run on 2026-09-23, PR #85); the envelope is still
+        # final. Every recording that continues after `result` runs here too.
+        for source, trailing in claude_trailing_record_sources():
+            with self.subTest(source=source):
+                p = sb.parse_claude_cli_json(stream_text(claude_stream_records() + trailing))
+                self.assertIsNone(p["parse_error"])
+                self.assertEqual((p["answer"], p["cost_usd"]), ("All tests pass.", 0.05))
 
     def test_parser_and_trace_dialect_share_one_terminal_rule(self):
-        tolerated = claude_stream_records() + [{"type": "system", "subtype": "task_summary"}]
         rejected = claude_stream_records() + [{"type": "assistant", "message": {"content": []}}]
-        self.assertIsNotNone(sb.claude_terminal_result_index(tolerated))
         self.assertIsNone(sb.claude_terminal_result_index(rejected))
         self.assertIsNone(sb.claude_terminal_result_index(claude_stream_records(result_event=False)))
         dialect = sb.trace_dialect_for("claude")
-        self.assertIsNone(dialect.protocol_error(tolerated, None))
         self.assertIsNotNone(dialect.protocol_error(rejected, None))
-        _, metrics = sb.normalize_trace_records(tolerated, source="claude")
-        self.assertTrue(metrics["skill_invoked"])
+        for source, trailing in claude_trailing_record_sources():
+            with self.subTest(source=source):
+                tolerated = claude_stream_records() + trailing
+                self.assertIsNotNone(sb.claude_terminal_result_index(tolerated))
+                self.assertIsNone(dialect.protocol_error(tolerated, None))
+                _, metrics = sb.normalize_trace_records(tolerated, source="claude")
+                self.assertTrue(metrics["skill_invoked"])
 
     def test_session_content_after_the_result_is_protocol_invalid(self):
         for trailing in (
@@ -487,6 +495,52 @@ class RunClaudeAdapterTests(unittest.TestCase):
              for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")},
             {"input_tokens": 4, "output_tokens": 246, "cache_read_tokens": 29905, "cache_write_tokens": 9537})
         self.assertEqual(meta["skill_invocation_evidence"], ["probe-plugin:tidy-commit Skill"])
+        # Every recording that continues after `result` reads the same way; its
+        # expected values come from its own terminal event.
+        for source, text in claude_streams_ending_after_result():
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as t:
+                records = [json.loads(line) for line in text.splitlines() if line.strip()]
+                terminal = next(record for record in records if record.get("type") == "result")
+                td = Path(t)
+                _, tasks, run_dir = write_with_skill_task(td)
+                (td / "stream.jsonl").write_text(text, encoding="utf-8")
+                stub = td / "claude"
+                stub.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n"
+                                "assert 'stream-json' in sys.argv\n"
+                                f"sys.stdout.write(open({str(td / 'stream.jsonl')!r}, encoding='utf-8').read())\n",
+                                encoding="utf-8")
+                stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+                code, _, stderr = run_cli("run-agent", "--agent", "claude", "--tasks", tasks,
+                                          "--runs", td / "runs", "--claude-bin", stub)
+                base = td / "runs" / run_dir
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual((base / "output.md").read_text(encoding="utf-8"), terminal["result"])
+                meta = json.loads((base / "metadata.json").read_text(encoding="utf-8"))
+                self.assertTrue(meta["trace_observation_complete"])
+                self.assertEqual(meta["stop_reason"], terminal.get("stop_reason"))
+                self.assertEqual(meta["cost_normalized"]["total_cost"], terminal["total_cost_usd"])
+
+    def test_the_answer_run_mounts_the_skill_under_its_own_directory_name(self):
+        # skills/demo/SKILL.md is installed as a skill directory named `demo`;
+        # the with_skill workspace mounts it there and the prompt points the
+        # model at that path, not at the flattened manifest path.
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            _, tasks, _ = write_with_skill_task(td)
+            seen = td / "seen.json"
+            stub = td / "claude"
+            stub.write_text(
+                f"#!{sys.executable}\nimport json, os, sys\nprompt = sys.stdin.read()\n"
+                "files = sorted(os.path.relpath(os.path.join(r, f)) for r, _, fs in os.walk('.') for f in fs)\n"
+                f"open({str(seen)!r}, 'w').write(json.dumps({{'prompt': prompt, 'files': files}}))\n"
+                f"sys.stdout.write({stream_text(claude_stream_records())!r})\n", encoding="utf-8")
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+            code, _, stderr = run_cli("run-agent", "--agent", "claude", "--tasks", tasks,
+                                      "--runs", td / "runs", "--claude-bin", stub)
+            observed = json.loads(seen.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("skills/demo/SKILL.md", observed["files"])
+        self.assertIn("\n- skills/demo/SKILL.md", observed["prompt"])
 
 
 class ClaudeJudgeAndPanelTests(unittest.TestCase):

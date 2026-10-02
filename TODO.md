@@ -71,7 +71,7 @@ Jetty runbooks emit a standardized machine-readable `validation_report.json` per
 (`jettyio/jettyio-skills`, `skills/create-runbook/SKILL.md`). Rubric evaluation scores 3-7
 dimensions on a 1-5 scale; programmatic evaluation returns `PASS` / `PARTIAL` / `FAIL`. The
 items below map that report onto the harness judge-result row `{judge_task_id, passed, score,
-threshold, evidence}` (`load_judge_results:11611`, merged in `grade_case_variant:14042`).
+threshold, evidence}` (`load_judge_results:11643`, merged in `grade_case_variant:14074`).
 
 - [ ] Export qualitative judge tasks to Jetty workflows using `simple_judge` where useful.
       Carry `judge_task_id` (`case::variant::run-n::assertion`) into the Jetty task so the
@@ -109,7 +109,7 @@ threshold, evidence}` (`load_judge_results:11611`, merged in `grade_case_variant
 - [ ] Add opt-in live smoke gated by `RUN_JETTY_SMOKE=1` and `JETTY_API_TOKEN`; never run it in default CI.
 - [ ] Live smoke should exercise one fixture-free tune case, one fixture-backed tune case, and one cheap failure/timeout path if Jetty exposes one.
 - [ ] Add README live-smoke notes after API behavior is verified with a real account.
-- [ ] Record a redacted `claude -p --output-format stream-json` stdout (Claude Code ≥ 2.1.269) that ends with the trailing `system`/`task_summary` record, commit it beside `tests/fixtures/claude/stream-json.plugin-skill.jsonl`, and feed the three trailing-record tests from it; they use hand-built records today (see `tests/fixtures/claude/README.md`).
+- [ ] Record a redacted `claude -p --output-format stream-json` stdout (Claude Code ≥ 2.1.269) that ends with the trailing `system`/`task_summary` record: run `python3 scripts/record_claude_stream.py --model haiku` on a credentialed machine and commit the `.jsonl` and `.provenance.json` it writes to `tests/fixtures/claude/`. The trailing-record tests pick it up with no edits; until then they run on hand-built records (see `tests/fixtures/claude/README.md`).
 
 ## Open questions to verify against current Jetty docs/API
 

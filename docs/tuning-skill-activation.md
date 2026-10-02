@@ -51,8 +51,10 @@ loop:
      Keep editing.
    - *isolation or competing skills*: another skill won the routing. If the run's
      metadata records `config_isolated: false`, a personal skill may have leaked
-     in, so fix the sandbox. A built-in winning is a real routing loss (see below),
-     so treat it as a description gap against that competitor.
+     in, so fix the sandbox (log in through the environment; see below). The row's
+     `competing_skills` names every other skill the model was offered. A built-in
+     winning is a real routing loss (see below), so treat it as a description gap
+     against that competitor.
    - *ambiguous query*: a domain expert could argue either polarity. Rewrite or drop
      the query, not the description.
    - *variance*: the cell flips across identical re-runs by as much as the round
@@ -95,6 +97,12 @@ routed Sonnet and Opus 3/3 loaded on only one of Haiku's three runs. A single-ru
 smoke earlier the same day had that same Haiku cell pass 1/1 — one sample sat on
 the lucky side of a 1-in-3 rate and hid it. The JSON report keeps per-query
 trigger rates and per-run evidence for the cells that disagree.
+
+That run predates two changes that can move these rates: the skill now mounts as
+`demo` (its own directory name) rather than `skills_demo_SKILL.md`, and a run that logs
+in through the environment is now isolated from personal and organisation skills.
+Re-run the command before comparing a new reading with it; a published rate is dated
+evidence, not a property of the description.
 
 The same run is wired into a manual smoke test (it spends real tokens, so CI skips
 it):
@@ -163,12 +171,26 @@ Each rule below exists because its violation produced a wrong number at least on
   declared name or its mounted directory name (Claude Code 2.1.269 calls skills by
   directory name). The skill's name appearing in the answer text proves nothing — reading
   `good-readme/README.md` once looked like loading the `good-readme` skill.
+- **Mount the skill under the name your users see.** Agents list a skill by the
+  directory it sits in, so the matrix mounts `skills/demo/SKILL.md` as `demo`, the
+  name a user's install shows. Before that change it mounted the flattened manifest
+  path, and Claude Code offered the model a skill called `skills_demo_SKILL.md`; a rate
+  measured under that name is not comparable with one measured under the real name.
+  Two skill roots with the same directory name fail validation for the same reason.
 - **Isolate the sandbox, keep the harness.** Each run gets a fresh config dir so
   the experimenter's personal skills can't shadow the one under test. The dir sits
   beside the working directory, not inside it, so the copied credentials are out of
   the model's reach, and it is removed when the cell ends. The agent's
   built-in skills stay, because your users run against them too — losing a routing
-  fight to a built-in is a real activation failure.
+  fight to a built-in is a real activation failure. Claude isolation needs portable
+  auth: an API key, auth token, OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`, what
+  `claude setup-token` prints for CI), `ANTHROPIC_BASE_URL`, or Bedrock or Vertex in
+  the environment, or a credentials file it can copy. A keychain login cannot move
+  into a fresh config, so those runs keep your normal config and read
+  `config_isolated: false`, and `trigger-compare` will not compare them. Isolated runs
+  also drop `CLAUDE_CODE_SYNC_SKILLS`, so your organisation's skills stay out, and every
+  row lists the skills that did compete as `competing_skills`. Never compare an
+  isolated rate with an unisolated one.
 - **A passing answer benchmark proves nothing about discovery.** The answer runners
   force-load the skill (`prepare` refuses to even emit trigger-case rows for them).
   Only an autonomous-trigger run measures whether the skill loads by itself.

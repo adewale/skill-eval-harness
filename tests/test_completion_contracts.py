@@ -12,6 +12,7 @@ from pathlib import Path
 
 from helpers import (
     claude_stream_records,
+    claude_trailing_record_sources,
     make_eval_repo,
     run_cli,
     stub_claude_stream,
@@ -248,13 +249,15 @@ class ClaudeRunnerCompletionTests(unittest.TestCase):
 
     def test_a_system_record_after_the_result_still_ends_the_run(self):
         # Claude Code 2.1.269 writes `system`/`task_summary` after the result
-        # (observed on a real run in PR #85); the run must stay scorable.
-        with tempfile.TemporaryDirectory() as t:
-            meta, _ = self.run_claude(
-                Path(t), served_model="claude-haiku-4-5-20251001", stop_reason="end_turn",
-                trailing_records=[{"type": "system", "subtype": "task_summary"}])
-        self.assertEqual((meta["stop_class"], meta["served_model_check"]), ("completed", "match"))
-        self.assertTrue(execution_valid(meta, "token-XYZ"))
+        # (observed on a real run in PR #85); the run must stay scorable. Every
+        # recording that continues after `result` runs here too.
+        for source, trailing in claude_trailing_record_sources():
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as t:
+                meta, _ = self.run_claude(
+                    Path(t), served_model="claude-haiku-4-5-20251001", stop_reason="end_turn",
+                    trailing_records=trailing)
+                self.assertEqual((meta["stop_class"], meta["served_model_check"]), ("completed", "match"))
+                self.assertTrue(execution_valid(meta, "token-XYZ"))
 
     def test_truncated_run_is_excluded_from_scoring(self):
         with tempfile.TemporaryDirectory() as t:

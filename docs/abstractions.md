@@ -193,15 +193,16 @@ records and verifies; `tree_sha256` hashes a file tree as (relative path, bytes)
 path component, each framed as path, NUL, then content. The canonical `skill_tree_hash`, the
 workspace fixture hash, the script-oracle trees in the eval contract, and the Jetty upload plan
 all go through it, so a digest computed from the upload plan equals the canonical one it is
-checked against. The judge's explore-surface digest frames directories too and stays separate.
+checked against. Each skill root sits in a skill tree under its own directory name, so the
+hashed paths are the paths an agent lists. The judge's explore-surface digest frames directories too and stays separate.
 
 ## Runner / adapter
 
 An **answer runner** consumes prepared task rows and produces the run-output contract. The repo
-ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10475`), Claude (`run_claude:10673`, capturing real
+ships Pi answer smoke (`examples/adewale-workspace/run_pi_smoke.py`), Codex (`run_codex:10507`), Claude (`run_claude:10705`, capturing real
 per-run cost), Gemini CLI and Mistral Vibe (`run-agent --agent gemini|vibe`, using isolated provider homes outside the workdir), the in-process
-subagent runner (`run_subagent:13305`, which hosts record/replay tool I/O via `ToolReplayStore`),
-Jetty (`JettyClient:4025` and the export/run/import commands), and any runner that writes the
+subagent runner (`run_subagent:13337`, which hosts record/replay tool I/O via `ToolReplayStore`),
+Jetty (`JettyClient:4057` and the export/run/import commands), and any runner that writes the
 contract directly. Each answer runner registers a workspace builder so one cross-runner invariant
 proves its `without_skill` arm is skill-free (CF.2). Autonomous trigger runners are separate: they
 read trigger cases from the manifest directly, never consume answer task rows, and emit trigger

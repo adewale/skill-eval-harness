@@ -17,8 +17,9 @@ Five adapters ship:
               skill; loading is detected from the Skill tool-use event and,
               as a fallback, path evidence of the model reading the mounted
               SKILL.md. It uses an isolated CLAUDE_CONFIG_DIR beside the
-              workspace when auth can be copied, otherwise preserves the
-              normal Claude config so OAuth/keychain logins still work.
+              workspace when auth comes from the environment or can be
+              copied, otherwise preserves the normal Claude config so
+              OAuth/keychain logins still work.
 - `codex`   — Codex CLI (`codex exec --json` by default), with skills mounted
               under an isolated external `$CODEX_HOME/skills` and exposed as a
               skills-only read root. It is detected through the shared
@@ -150,6 +151,15 @@ SENSITIVE_WORKSPACE_FILES = (
 )
 SENSITIVE_ENV_VARS = ("MISTRAL_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN",
                       "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
+# Claude Code authenticates from these without any config file, so a fresh,
+# empty CLAUDE_CONFIG_DIR still logs in (PR #85 verified it on 2.1.281 behind
+# an ANTHROPIC_BASE_URL auth proxy). A wrong guess fails closed: the run
+# reports a provider failure and is an incomplete observation.
+CLAUDE_ENV_AUTH_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                        "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX")
+# Environment-managed skill sources that would put an organisation's skills in
+# front of the model beside the one under test; dropped from isolated runs.
+CLAUDE_ENV_SKILL_SOURCES = ("CLAUDE_CODE_SYNC_SKILLS",)
 
 
 # Trigger rows: the manifest's trigger cases or an --eval-set file, validated
@@ -265,12 +275,12 @@ def eval_rows_from_args(args: Any, manifest_path: Path) -> list[dict[str, Any]]:
 def mounted_skill_names(copied: list[Path]) -> list[str]:
     """Every name an agent may use to invoke a mounted skill: the `name:` its
     SKILL.md declares (parsed with the harness's real frontmatter parser) and
-    the directory it is mounted under. Claude Code 2.1.269 invokes project
-    skills by directory name (`Skill` called with `skills_demo_SKILL.md`),
-    while older builds and other agents use the declared name, so both are
-    load evidence. Each is an exact-match needle for the Claude and Vibe
-    skill-tool detectors; a name in prose or another skill firing never
-    matches."""
+    the directory it is mounted under, the skill's own directory name (`demo`
+    for skills/demo/SKILL.md). Claude Code 2.1.269 invokes project skills by
+    directory name, while older builds and other agents use the declared
+    name, so both are load evidence. Each is an exact-match needle for the
+    Claude and Vibe skill-tool detectors; a name in prose or another skill
+    firing never matches."""
     names: list[str] = []
     for p in copied:
         skill_md = p if p.name == "SKILL.md" else p / "SKILL.md"
@@ -333,6 +343,20 @@ def vibe_stream_protocol_error(stdout: str) -> str | None:
                        and bool(records[-1]["content"].strip()))
     if not terminal_answer:
         return "Vibe JSON stream must end with one non-empty assistant response"
+    return None
+
+
+def claude_competing_skills(stdout: str, workspace: Path) -> list[str] | None:
+    """The skills Claude Code's init event offered the model, minus the ones
+    this run mounted; None when the stream carries no init skill list."""
+    mounted_dir = workspace / ".claude" / "skills"
+    mounted = {path.name for path in mounted_dir.iterdir() if path.is_dir()} if mounted_dir.is_dir() else set()
+    for event in iter_json_objects(stdout):
+        if isinstance(event, dict) and event.get("type") == "system" and event.get("subtype") == "init":
+            skills = event.get("skills")
+            if not isinstance(skills, list):
+                return None
+            return sorted({skill for skill in skills if isinstance(skill, str)} - mounted)
     return None
 
 
@@ -575,17 +599,19 @@ class ClaudeAdapter(AgentAdapter):
             "command": executable_identity(self.claude_bin),
             "max_turns": self.max_turns,
             "allowed_tools": ["Skill", "Read", "Glob", "Grep"],
-            "isolation_policy": ("isolated config outside the workdir when portable auth exists; "
-                                 "otherwise normal config"),
+            "isolation_policy": ("isolated config outside the workdir and no synced skills when auth is "
+                                 "portable (environment or credentials file); otherwise normal config"),
             "required_observations": {"config_isolated": True, "claude_config_outside_workdir": True},
         }
 
     def invoke(self, query: str, model: str | None, workspace: Path, timeout: int) -> InvocationOutcome:
-        # Use a fresh config dir when auth is portable, so personal config does
-        # not bleed into the run. Claude Code's current OAuth/keychain login is
-        # not file-seedable; pointing CLAUDE_CONFIG_DIR at an empty directory
-        # turns a valid login into "not logged in", so preserve the normal CLI
-        # config path in that case.
+        # Use a fresh config dir when auth is portable (environment credentials,
+        # or a seedable credentials file), so personal config and synced
+        # organisation skills do not compete with the skill under test. Claude
+        # Code's OAuth/keychain login is not file-seedable; pointing
+        # CLAUDE_CONFIG_DIR at an empty directory turns a valid login into "not
+        # logged in", so preserve the normal CLI config path in that case and
+        # say so in the metadata.
         config_dir = self._config_dir(workspace)
         argv = [self.claude_bin, "-p", query, "--output-format", "stream-json", "--verbose",
                 "--max-turns", str(self.max_turns),
@@ -594,8 +620,14 @@ class ClaudeAdapter(AgentAdapter):
             argv += ["--model", model]
         env = os.environ.copy()
         config_isolated = False
-        if os.environ.get("ANTHROPIC_API_KEY") or seed_claude_config_dir(config_dir):
+        # Seed first: a credentials file still helps when the environment only
+        # names an endpoint (ANTHROPIC_BASE_URL) or carries a second login.
+        seeded = seed_claude_config_dir(config_dir)
+        if seeded or any(os.environ.get(name) for name in CLAUDE_ENV_AUTH_VARS):
+            config_dir.mkdir(parents=True, exist_ok=True)
             env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+            for name in CLAUDE_ENV_SKILL_SOURCES:
+                env.pop(name, None)
             config_isolated = True
         result = validate_invoke_result(
             self.name, self._run_argv(ProcessInvocationPlan.from_values(
@@ -606,6 +638,10 @@ class ClaudeAdapter(AgentAdapter):
         # or the user's own.
         metadata: dict[str, Any] = {"config_isolated": config_isolated,
                                     "claude_config_outside_workdir": True}
+        competing = claude_competing_skills(result.stdout, workspace)
+        if competing is not None:
+            # Evidence, not inference: every other skill the model was offered.
+            metadata["competing_skills"] = competing
         if not config_isolated:
             metadata["config_isolation_warning"] = (
                 "Claude OAuth/keychain auth was not portable; preserved the normal Claude config, "

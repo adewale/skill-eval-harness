@@ -177,6 +177,16 @@ that file still invalidates trigger identity until those owners are extracted in
   moved from `.trigger-config/` inside the working directory, where the model's Read and Glob
   could reach it, to a directory beside it. A Claude report's protocol requires
   `claude_config_outside_workdir` and its rows record it.
+- The Claude trigger adapter now also isolates its config when authentication comes from the
+  environment (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `ANTHROPIC_BASE_URL`, or the Bedrock and Vertex switches), not only when a credentials file can
+  be copied. Under `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_AUTH_TOKEN`, the usual CI login, rows
+  read `config_isolated: false` and `trigger-compare` blocked every cell
+  (`protocol_observation_unsafe`). An isolated run also drops `CLAUDE_CODE_SYNC_SKILLS`, so
+  organisation skills no longer compete with the skill under test, and each row lists the other
+  skills Claude Code offered the model as `competing_skills`. A rate measured with
+  `config_isolated: false` could include personal and organisation skills; re-measure it rather
+  than compare it with an isolated one.
 - Codex trigger rows record the files seeded into `CODEX_HOME` as `codex_home_files` instead of
   `codex_home_files_copied`. `trigger-compare` read that list as an unsafe protocol observation
   and blocked every Codex cell; the regenerated reports the identity bump already requires pair.
@@ -210,10 +220,25 @@ that file still invalidates trigger identity until those owners are extracted in
   saved trigger report with an `estimated` cost row fails re-validation in `trigger-compare`;
   regenerate it.
 - Claude trigger detection also counts a `Skill` call that names the directory the skill is
-  mounted under (`skills_demo_SKILL.md` for `skills/demo/SKILL.md`), which is how Claude Code
-  2.1.269 invokes project skills. A Claude trigger report saved with such a CLI can show
-  should-fire misses that were activations; re-run it. Vibe's `skill` tool detection reads the
-  same two names.
+  mounted under (`demo` for `skills/demo/SKILL.md`), which is how Claude Code 2.1.269 invokes
+  project skills. A Claude trigger report saved with such a CLI can show should-fire misses that
+  were activations; re-run it. Vibe's `skill` tool detection reads the same two names.
+- Skills now mount under their own directory name: `skills/demo/SKILL.md` mounts as `demo`, the
+  name a user's install shows, where 0.6.0 used the flattened manifest path
+  (`skills_demo_SKILL.md`). Claude Code showed the model that flattened string as the skill's
+  name, so trigger rates were measured for a name no user sees, and answer prompts pointed the
+  model at `skills/skills_demo_SKILL.md/SKILL.md`. The mount name is part of every skill-tree
+  hash, so `skill_tree_hash`, `skill_root_keys`, the planned skill tree and the task digest change
+  on every skill-bearing prepared task and run (the demo skill's tree hash moves from
+  `6bcbd3be…` to `4bbf2c1f…`); `without_skill` rows are unchanged. `benchmark` over runs
+  prepared before the change reads `partial` with `answer_design_incomplete` ("prepared skill
+  treatment does not match current manifest"): re-prepare and re-run them. Trigger reports were
+  already incomparable across the change, because the trigger protocol fingerprints the harness
+  modules. A `--pins` file or `examples/skill-pins.json`-style pin holds the old layout's
+  hash: recompute it with `canonical_skill_tree_hash` (this repository's pins were recomputed from
+  the pinned commits). Two skill roots that share a directory name (`team-a/review/SKILL.md` and
+  `team-b/review/SKILL.md`) now fail `validate`, because an agent would list two skills with one
+  name; rename one directory.
 
 ### Removed names
 
