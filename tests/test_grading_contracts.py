@@ -20,25 +20,50 @@ class AssertionObservationTests(unittest.TestCase):
             **changes,
         }
 
-    def test_pass_fail_unavailable_and_skipped_are_distinct(self):
-        self.assertIsInstance(
-            gc.assertion_observation_from_row(self.row()),
-            gc.SatisfiedAssertion,
-        )
-        self.assertIsInstance(
-            gc.assertion_observation_from_row(self.row(passed=False, score=0.0)),
-            gc.FailedAssertion,
-        )
-        self.assertIsInstance(
-            gc.assertion_observation_from_row(self.row(
-                passed=None, score=None, availability="partial")),
-            gc.UnavailableAssertion,
-        )
-        self.assertIsInstance(
-            gc.assertion_observation_from_row(self.row(
-                skipped=True, skip_reason="prerequisite failed")),
-            gc.SkippedAssertion,
-        )
+    # Every (skipped, availability, passed) row shape, with the state it must
+    # grade as and the availability its projection must carry. Hand-derived
+    # from the grading rules: a skipped row is dropped from every count
+    # whatever it observed; a partial or unobserved row is unavailable, never
+    # a pass or a failure; only a complete observed row is satisfied/failed.
+    STATE_TABLE = (
+        # skipped, availability, passed, state, projected availability
+        (False, "complete", True, gc.AssertionState.SATISFIED, "complete"),
+        (False, "complete", False, gc.AssertionState.FAILED, "complete"),
+        (False, "complete", None, gc.AssertionState.UNAVAILABLE, "partial"),
+        (False, "partial", True, gc.AssertionState.UNAVAILABLE, "partial"),
+        (False, "partial", False, gc.AssertionState.UNAVAILABLE, "partial"),
+        (False, "partial", None, gc.AssertionState.UNAVAILABLE, "partial"),
+        (True, "complete", True, gc.AssertionState.SKIPPED, "complete"),
+        (True, "complete", False, gc.AssertionState.SKIPPED, "complete"),
+        (True, "complete", None, gc.AssertionState.SKIPPED, "complete"),
+        (True, "partial", True, gc.AssertionState.SKIPPED, "partial"),
+        (True, "partial", False, gc.AssertionState.SKIPPED, "partial"),
+        (True, "partial", None, gc.AssertionState.SKIPPED, "partial"),
+    )
+
+    def test_every_row_shape_grades_as_exactly_one_state(self):
+        for skipped, availability, passed, state, projected in self.STATE_TABLE:
+            raw = self.row(passed=passed, availability=availability)
+            if skipped:
+                raw.update(skipped=True, skip_reason="prerequisite 'grounded' failed")
+            with self.subTest(skipped=skipped, availability=availability, passed=passed):
+                observation = gc.assertion_observation_from_row(raw)
+                self.assertEqual(observation.state, state)
+                row = observation.to_row()
+                self.assertIs(row["passed"], passed)
+                self.assertEqual(row["availability"], projected)
+                self.assertEqual(row.get("skipped", False), skipped)
+                if skipped:
+                    self.assertEqual(row["skip_reason"], "prerequisite 'grounded' failed")
+                # The projection is what gets serialized and re-read later.
+                self.assertEqual(gc.assertion_observation_from_row(row), observation)
+
+    def test_rows_without_severity_or_oracle_grade_as_strong_gates(self):
+        raw = self.row()
+        del raw["severity"], raw["oracle"]
+        row = gc.assertion_observation_from_row(raw).to_row()
+        self.assertEqual(row["severity"], "gate")
+        self.assertEqual(row["oracle"], "strong")
 
     def test_projection_preserves_nonsemantic_fields(self):
         observation = gc.assertion_observation_from_row(self.row(
@@ -91,10 +116,19 @@ class JudgeTaskTests(unittest.TestCase):
         self.assertEqual(task.to_row(), self.task_row())
 
     def test_bad_digest_and_run_identity_fail_before_judging(self):
-        with self.assertRaises(ValueError):
-            gc.JudgeTask.from_row({**self.task_row(), "judge_input_sha256": "short"})
+        for digest in ("short", "A" * 64, "sha1:" + "a" * 64, "a" * 65):
+            with self.subTest(digest=digest), self.assertRaises(ValueError):
+                gc.JudgeTask.from_row({**self.task_row(), "judge_input_sha256": digest})
         with self.assertRaises(ValueError):
             gc.JudgeTask.from_row({**self.task_row(), "run_number": 0})
+
+    def test_optional_digest_and_prefixed_digest_survive_the_wire(self):
+        row = {
+            **self.task_row(),
+            "judge_input_sha256": "sha256:" + "b" * 64,
+            "trajectory_steps_sha256": "c" * 64,
+        }
+        self.assertEqual(gc.JudgeTask.from_row(row).to_row(), row)
 
     def test_nested_payloads_are_detached_frozen_and_wire_thawed(self):
         row = self.task_row()

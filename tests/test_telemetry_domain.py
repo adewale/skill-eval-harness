@@ -5,6 +5,7 @@ an unavailable observation, and a non-comparable pair remain different states.
 """
 from __future__ import annotations
 
+import itertools
 import unittest
 from decimal import Decimal
 
@@ -169,6 +170,33 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(buckets["USD"].value, Decimal("1.00"))
         self.assertEqual(buckets["EUR"].availability, "complete")
         self.assertEqual(buckets["EUR"].value, Decimal("2.00"))
+
+    def test_every_mix_of_states_conserves_rows_and_claims_complete_only_when_all_observed(self):
+        kinds = {
+            "available": Measurement.available(3, provenance="provider_reported"),
+            "unavailable": Measurement.unavailable("trace_absent"),
+            "not_applicable": Measurement.not_applicable("offline_stub"),
+        }
+        for mix in itertools.chain.from_iterable(
+            itertools.product(kinds, repeat=size) for size in (1, 2, 3)
+        ):
+            with self.subTest(mix=mix):
+                aggregate = aggregate_numeric([kinds[kind] for kind in mix])
+                observed = mix.count("available")
+                self.assertEqual(aggregate.observed_count, observed)
+                self.assertEqual(aggregate.unavailable_count, mix.count("unavailable"))
+                self.assertEqual(aggregate.not_applicable_count, mix.count("not_applicable"))
+                if observed == len(mix):
+                    self.assertEqual(aggregate.availability, "complete")
+                    self.assertEqual(aggregate.value, 3 * observed)
+                elif observed:
+                    self.assertEqual(aggregate.availability, "partial")
+                    self.assertIsNone(aggregate.value)
+                    self.assertEqual(aggregate.known_subtotal, 3 * observed)
+                elif "unavailable" in mix:
+                    self.assertEqual(aggregate.availability, "unavailable")
+                else:
+                    self.assertEqual(aggregate.availability, "not_applicable")
 
     def test_unavailable_rows_do_not_change_known_subtotal(self):
         complete = aggregate_numeric([
